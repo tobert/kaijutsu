@@ -966,6 +966,15 @@ The review proposes a bounded analysis executor, distinct from the kernel's
 music state and audiod's hardware timing. `docs/audio-inference.md` records
 the evidence and the limits; no model or service was moved.
 
+Amy clarified the performance model: "near-term latent decisions", models
+"dancing at their own pace, integrated just in time for the performance."
+Seconds of model work and SFTP transfer fit when anticipation supplies the
+lead time. The relevant measurement is valid work ready for its musical
+moment on the shared pulse. That points back to the existing resolver and
+commit contract. She also questioned beat analysis as a core `kj` verb;
+an optional tool with a resolver adapter is a candidate, with its eventual
+home still undecided.
+
 ## The file that answered a question the code already knew (September 9)
 
 Amy read `contrib/kj-expectations.toml` and said something felt off without

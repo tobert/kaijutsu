@@ -2167,6 +2167,18 @@ model family, without audio or weight hashes; caching or durable musical
 use needs immutable provenance. Executor placement, including possible
 lfm2d ownership, remains undecided. Hardware timing stays with audiod.
 
+Amy's workload is near-term musical decisions on a shared pulse, with
+seconds available for models and media transfer. Evaluate readiness across
+queueing, computation, and transfer, and use the existing resolver contract
+for basis validation and commit-time fallback. Beat analysis is a candidate
+for an optional tool/resolver adapter; retaining a core `kj` verb is not a
+requirement. Packaging and relocation remain undecided.
+
+The latency doctrine in `docs/midi.md` also needs measured targets: its
+"99.99%" readiness claim has no supporting measurement here, and "a few
+seconds — 16–32 bars" conflates durations (at 120 BPM in 4/4, that is
+32–64 seconds). Derive horizons from tempo and measured end-to-end costs.
+
 ## Audio nodes — follow-up after daemon extraction
 
 - **Keep jobs are in-memory on both sides** — `KeepJobs`

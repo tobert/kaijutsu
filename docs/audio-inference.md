@@ -4,6 +4,31 @@ Evaluation as of September 17, 2026. Execution still lives in the kernel;
 placement in lfm2d or another process is undecided. Amy's scope: "for now
 we'll evaluate kaijutsu's tradeoffs, and decide later about the new home."
 
+## The performance this serves
+
+Amy describes the music workload as "near-term latent decisions":
+"predicting a few tokens into the future, on the same pulse," with models
+"dancing at their own pace, integrated just in time for the performance."
+Seconds of computation are acceptable when the work starts far enough ahead
+to inform the intended musical moment. Binary media can travel over SFTP
+within that lead time. Different producers can work at different cadences
+while participating in the same performance.
+
+Evaluate useful readiness against the shared pulse: queueing, inference,
+media transfer, and preparation all spend the available lead time. A fast
+answer can become obsolete when its input context changes; a slower answer
+can still arrive with time to spare. Cost measurements therefore inform
+anticipation and resource budgets, not a requirement that every model
+respond within a hardware audio buffer.
+
+The existing design already gives this a place: `docs/hyoushigi.md`, "The
+core contract", describes resolver cost estimates, speculative work, basis
+validation, and explicit fallback at the commit point. `docs/tracks.md`
+describes producer wakeup cadences; `docs/midi.md`, "The one timebase",
+owns clock and sink timing. Model integration should use those contracts.
+This review does not establish that `kj audio beats` participates in them;
+today it is a synchronous request/response analysis command.
+
 ## Current implementation
 
 `kj audio beats <host-path>` loads a mel spectrogram graph and a beat graph
@@ -103,18 +128,28 @@ The proposed boundary separates three responsibilities:
 
 | Owner | Responsibility |
 |---|---|
-| Kernel | Accept intent and identity; retain media references and analysis provenance; sequence accepted music state; map analysis timestamps into clips, tracks, and transport decisions. |
-| Analysis executor | Decode and resample; choose and load models; bound queued/running work and input size; own compute budgets, caching, cancellation, and failure reporting. |
+| Kernel | Accept intent and identity; retain media references and analysis provenance; coordinate the shared pulse, speculative work, and commitment of musical decisions. |
+| Analysis executor | Decode and resample; choose and load models; bound queued/running work and input size; report cost and readiness; own compute budgets, caching, cancellation, and failure reporting. |
 | Audio daemon | Own devices, capture buffers, sample timing, and scheduled physical playback. |
 
-This is a proposed analysis interface, not an implemented service contract.
-`kj audio beats` can remain the public verb under either implementation.
-An executor could initially remain in process; a process boundary would be
-needed for hard termination of inference that cannot cooperate with cancel.
-Whether lfm2d should implement that interface is a separate decision.
+This is a proposed division of responsibilities, not an implemented service
+contract. Amy: "`kj audio beats` feels like a stretch to have that core to
+kj." Beat analysis is a candidate for an optional tool, with a resolver
+adapter when its result contributes to the score. Its existence does not
+require a permanent core `kj` verb or a kernel dependency on a particular
+model. Ordinary kaish tool composition and the existing resolver seam are
+the first places to consider; this review does not propose another generic
+job protocol.
+
+A bounded executor could initially remain in process; a process boundary
+would be needed for hard termination of inference that cannot cooperate
+with cancel. Whether lfm2d should host the computation, and how the tool
+should be packaged, remain separate decisions. No verb is removed here.
 
 Before expanding music inference, define admission limits, oversized-input
 refusal, and what cancellation promises. Before relocating it, evaluate
 representative music, repeated calls, overlapping kernel work, and immutable
-media/model identities. A live audio model would need a separate latency
-and buffering contract; this offline tracker does not establish one.
+media/model identities. Measure readiness across queueing, computation and
+transfer against the intended musical moment, including late and obsolete
+results. The useful comparison is how reliably different producers deliver
+valid work within their lead time while the shared pulse continues.
