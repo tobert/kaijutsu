@@ -3,11 +3,9 @@
 //! downbeat tracking via the Beat This! model (ISMIR 2024) through the
 //! pure-Rust `beat-this` crate.
 //!
-//! `beat-this` runs inference on [rten] — the same pure-Rust ONNX backend
-//! kaijutsu-index's `RtenEmbedder` uses (`beat-this`'s `ort` feature is
-//! deliberately NOT enabled: no external ONNX Runtime dependency, and no
-//! second inference backend to keep in sync). Both crates are pinned to
-//! rten 0.24 so the workspace never carries two copies of the runtime.
+//! `beat-this` runs inference through RTen, a pure-Rust runtime for ONNX
+//! models. Its `ort` feature is disabled, so no external ONNX Runtime library
+//! is required. Semantic embeddings use the separate lfm2d service.
 //!
 //! The kernel never touches audio hardware here — this is pure offline CPU
 //! analysis (decode via symphonia, resample via rubato, infer via rten),
@@ -98,10 +96,8 @@ pub(crate) struct BeatsResult {
     pub downbeats: Vec<f32>,
 }
 
-/// The beat-this model directory: `~/.local/share/kaijutsu/models/beat-this/`.
-/// Same XDG root `kaish_kernel::xdg_data_home()` the server uses for the
-/// kernel's own data dir (`crates/kaijutsu-server/src/rpc.rs`), joined the
-/// same way kaijutsu-index's embedding models are found.
+/// Resolve beat models under `$XDG_DATA_HOME/kaijutsu/models/beat-this/`,
+/// defaulting to `~/.local/share/kaijutsu/models/beat-this/`.
 pub(crate) fn beat_this_model_dir() -> PathBuf {
     kaish_kernel::xdg_data_home()
         .join("kaijutsu")
@@ -109,21 +105,9 @@ pub(crate) fn beat_this_model_dir() -> PathBuf {
         .join("beat-this")
 }
 
-/// Run the beat-this pipeline against `audio_path`, resolving models from
-/// `model_dir`. Factored out of the `kj audio beats` verb so both the CLI
-/// dispatch and the integration test drive the exact same code path.
-///
-/// Synchronous/blocking (model load + rten inference is CPU-bound and can
-/// take low seconds) — async callers MUST run this inside
-/// `tokio::task::spawn_blocking`, mirroring the index embed path
-/// (`kaijutsu-index`'s `Embedder` trait: "Methods are sync — callers should
-/// use `spawn_blocking`").
-///
-/// Deliberately builds a fresh `BeatThis` (and reloads both ONNX graphs) on
-/// every call — model load is tens of milliseconds against an analysis that
-/// takes seconds, and this is a low-traffic spike verb. No caching /
-/// resident-model machinery here on purpose; revisit if `kj audio beats`
-/// becomes a hot path.
+/// Load both ONNX graphs and analyze `audio_path` using models in `model_dir`.
+/// The graphs live for this call; there is no resident model cache.
+/// Async callers must use `tokio::task::spawn_blocking` for loading and inference.
 pub(crate) fn run_beats(model_dir: &Path, audio_path: &Path) -> Result<BeatsResult, String> {
     if !audio_path.is_file() {
         return Err(format!(

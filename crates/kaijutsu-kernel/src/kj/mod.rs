@@ -349,12 +349,9 @@ pub struct KjDispatcher {
     /// call site to thread an Arc through. Set via `set_self_arc` after
     /// `Arc::new(KjDispatcher::new(...))`.
     weak_self: parking_lot::RwLock<Option<std::sync::Weak<KjDispatcher>>>,
-    /// The kernel's semantic index, installed by the server at bootstrap via
-    /// [`Self::set_semantic_index`] (the index needs an ONNX embedder built in
-    /// the server crate, so the kernel can't construct it itself). `None` when
-    /// embeddings aren't configured. In-kernel shell materialization
-    /// ([`crate::mcp::servers::ShellServer`]) reads it so the model's `kj`
-    /// search/synthesis tools work — without it the model shell is degraded.
+    /// The semantic index installed by the host after connecting its embedding
+    /// service. Contextual shells use it for search and synthesis. `None` means
+    /// the index is unavailable, either unconfigured or unable to initialize.
     semantic_index: parking_lot::RwLock<Option<Arc<kaijutsu_index::SemanticIndex>>>,
 }
 
@@ -416,11 +413,9 @@ impl KjDispatcher {
         *self.weak_self.write() = Some(Arc::downgrade(self));
     }
 
-    /// Install the kernel's semantic index (built in the server crate, which
-    /// owns the ONNX embedder). Call once at bootstrap after `Arc::new`, like
-    /// [`Self::set_self_arc`]. Pass `None` when embeddings aren't configured —
-    /// the model shell then degrades to non-semantic `kj` search rather than
-    /// failing.
+    /// Install the host's service-backed semantic index at bootstrap.
+    /// Pass `None` when unavailable; consumers must report unavailability or
+    /// select a supported non-semantic operation.
     pub fn set_semantic_index(&self, index: Option<Arc<kaijutsu_index::SemanticIndex>>) {
         *self.semantic_index.write() = index;
     }

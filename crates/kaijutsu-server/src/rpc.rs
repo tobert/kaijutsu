@@ -2046,10 +2046,8 @@ pub async fn create_shared_kernel(
     // lifecycle, kaish hook bodies) can construct KjBuiltin without
     // threading an Arc through every method.
     kj_dispatcher.set_self_arc();
-    // Install the semantic index so in-kernel shell materialization
-    // (the model's `shell` / `read_only_shell`) can pair it with a
-    // block-backed source — the index is built here (it needs the ONNX
-    // embedder) but consumed kernel-side. `None` when embeddings are off.
+    // Contextual shells pair the service-backed index with a block source
+    // for search and synthesis. None means index initialization was unavailable.
     kj_dispatcher.set_semantic_index(semantic_index.clone());
     // Wire the dispatcher into the broker so HookBody::Kaish can
     // register `kj` as a tool inside hook kaish sessions.
