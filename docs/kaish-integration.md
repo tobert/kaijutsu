@@ -148,6 +148,10 @@ These are source observations, not promises that all paths behave alike.
   outcome. Dropped review waits, cancellation and panic recovery share that
   exact result without reading SQLite. Settlement faults still reach retention;
   jobs finish with the captured result before an original panic is resumed.
+  Terminal retention also closes the invocation's unanswered review asks in
+  the same transaction. Ask-update or audit-event failure rolls back the
+  result and closure; the existing retry owner keeps both pending. Successful
+  retry announces closure once. Already decided asks keep their decisions.
   Linking an executable ask to an existing model pair now adopts that pair into
   the same receipt registry. Model Waiting content, statuses, ask link and
   receipt commit together. A non-executable ask only links its pair. Links
@@ -327,8 +331,9 @@ These are source observations, not promises that all paths behave alike.
   `hook_result` origin, no executable source, and a digest binding the phase,
   call, and captured result. The generic execution/resume driver excludes them;
   retry redemption cannot consume another execution owner's answer.
-  Cancellation or dropping the wait abandons the ask and retains the outcome;
-  restart reports interrupted review without re-entering the lost hook snapshot.
+  The command owner handles cancellation. Dropping its wait retains the
+  outcome and closes unanswered asks together; restart uses the same retention
+  transaction and reports interruption without re-entering the lost hook snapshot.
   The same review store retains quiet results without transcript blocks. Every
   sequential ask links to its invocation and optional operation receipt.
   `kj ledger show <request-id>` exposes captured and terminal results.
@@ -351,7 +356,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
-| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; abrupt worker destruction and failed ask abandonment remain open |
+| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; abrupt worker destruction and preparation/refusal lookup disposition remain open |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
@@ -431,9 +436,10 @@ sequential ask retains its link to that invocation. Captured execution remains
 inspectable after completion. Tracked review completion commits atomically with
 terminal outcome preparation; quiet review completion stores an immutable result
 without a transcript pair. Ordinary quiet calls create no review record. The
-checkpoint schema migration preserves interrupted tracked reviews. A dropped
-wait or cancellation abandons an unanswered ask;
-restart retains the execution and reports interrupted review even if the answer
+checkpoint schema migration preserves interrupted tracked reviews. Terminal
+retention abandons linked pending/claimed asks atomically with the outcome;
+storage failure keeps the immutable result for retry. Existing decisions remain
+unchanged. Restart retains execution and reports interrupted review even if the answer
 arrived before shutdown. It cannot reconstruct the in-memory hook snapshot.
 
 `kj ledger show <request-id>` includes `result_review.captured` and

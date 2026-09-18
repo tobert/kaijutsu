@@ -2304,6 +2304,26 @@ and retry under interrupted-review retention faults. DeepSeek found no concrete
 regression in the cached receipt, interruption result, or lock ordering.
 Workspace all-targets checking also passed.
 
+Terminal review outcomes now commit with closure of their unanswered asks. A
+failed abandonment could leave a pending ask beside an already settled result;
+the regression reproduced that state. Retention closes only pending/claimed
+asks linked to the invocation, preserving reviewer decisions and unrelated
+execution asks. Ask-update or audit-event failure rolls back both the result
+and closure. Nested ledger SQLite errors keep the same immutable retry owner;
+successful retry publishes a ledger notification without repeating a transition.
+
+Removed independent abandonment from review waits and restart recovery. The
+command owner already handles cancellation, so the wait's duplicate cancellation
+branch was removed too. Cancellation coverage now exercises the actual MCP
+caller; storage regressions cover pending/claimed asks, tracked and receipt-free
+results, event rollback, shutdown refusal/retry and preserved decisions. The
+ledger sweep comment now describes its existing transaction-joining behavior.
+Validation passed 3,195 kernel tests (6 ignored) and all 32 SSH gate tests.
+DeepSeek raised a decision-race concern excluded by the held DB guard and SQLite
+write transaction, and an abandonment-loop concern contradicted by the wait's
+terminal return. The review disposition records both checks. Workspace
+all-targets checking also passed.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

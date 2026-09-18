@@ -1940,6 +1940,11 @@ mod tests {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }).await.unwrap();
+                if matches!(decision, "cancel" | "shutdown") {
+                    assert_eq!(d.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+                        approval_ledger::types::ApprovalStatus::Abandoned);
+                    assert!(d.kernel_db().lock().redeem_ask(&ask.request_id).is_err(), "cancellation must not authorize anything");
+                }
                 let envelope = settled.envelope();
                 let expected_job = settled.exec_result();
                 assert_eq!(envelope.is_error(), !allow);

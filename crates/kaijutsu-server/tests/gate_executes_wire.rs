@@ -1467,7 +1467,7 @@ fn sequential_result_reviews_keep_the_same_hook_snapshot() {
 #[test]
 fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
     run_local(async {
-        for (quiet, storage_fault) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (quiet, storage_fault, abandon_fault) in [(false, false, false), (true, false, false), (false, true, false), (true, true, false), (false, true, true), (true, true, true)] {
             let s = seats().await;
             s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
                 id: HookId("structured-shutdown-review".into()), match_instance: None,
@@ -1484,7 +1484,10 @@ fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
             let ask = refusal.ask.unwrap().request_id;
             let conn = rusqlite::Connection::open(&s.db_path).unwrap();
             if storage_fault {
-                conn.execute_batch(if quiet {
+                conn.execute_batch(if abandon_fault {
+                    "CREATE TRIGGER fail_interrupt BEFORE UPDATE OF status ON approvals WHEN NEW.status='abandoned'
+                     BEGIN SELECT RAISE(ABORT, 'interrupted abandonment fault'); END;"
+                } else if quiet {
                     "CREATE TRIGGER fail_interrupt BEFORE UPDATE OF final_json ON shell_result_reviews BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
                 } else {
                     "CREATE TRIGGER fail_interrupt BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
@@ -1493,7 +1496,10 @@ fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
             let shutdown = tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
                 .await.expect("shutdown must finish interrupted execution");
             if storage_fault {
-                assert!(shutdown.unwrap_err().contains("interrupted retention fault"));
+                assert!(shutdown.unwrap_err().contains(if abandon_fault { "interrupted abandonment fault" } else { "interrupted retention fault" }));
+                assert!(s.kernel.kernel.shell_operations().result_review_for_ask(&ask, s.worker).unwrap().unwrap().settled.is_none());
+                assert_eq!(s.kernel.kernel_db.lock().get_approval(&ask).unwrap().unwrap().status, kaijutsu_kernel::ApprovalStatus::Pending,
+                    "failed retention must not commit ask closure independently");
                 conn.execute_batch("DROP TRIGGER fail_interrupt").unwrap();
                 s.kernel.kernel.shutdown_runtime_worker().await.unwrap();
             } else { shutdown.unwrap(); }

@@ -1,4 +1,5 @@
 //! Retain execution through result review, with or without a transcript pair.
+//! The command owner cancels the wait; terminal retention closes unanswered asks.
 
 use std::sync::Arc;
 use kaijutsu_types::{AskRef, BlockId, Status};
@@ -23,29 +24,11 @@ struct ReviewGuard<'a> {
     armed: bool,
 }
 
-impl ReviewGuard<'_> {
-    fn abandon(&self) -> Result<(), String> {
-        use approval_ledger::types::ApprovalStatus;
-        {
-            let db = self.owner.kernel.kernel_db().lock();
-            if let Some(row) = db.get_approval(&self.ask.request_id).map_err(|e| e.to_string())?
-                && matches!(row.status, ApprovalStatus::Pending | ApprovalStatus::Claimed)
-            {
-                approval_ledger::decide::abandon(db.conn_for_ledger(), &self.ask.request_id,
-                    Some("result review stopped; captured execution was not repeated")).map_err(|e| e.to_string())?;
-            }
-        }
-        crate::kj::gate::announce_ledger_change(self.owner.kernel.kernel_db(), self.owner.kernel.ledger_flows());
-        Ok(())
-    }
-}
-
 impl Drop for ReviewGuard<'_> {
     fn drop(&mut self) {
         if !self.armed { return; }
         let outcome = self.owner.interrupt(
             "Result review was interrupted; captured execution was not repeated.", Some(&self.ask.request_id));
-        if let Err(error) = self.abandon() { tracing::error!("could not abandon interrupted result review: {error}"); }
         if let Err(error) = self.owner.settle(&outcome)
         {
             tracing::error!("could not settle interrupted result review: {error}");
@@ -72,7 +55,6 @@ impl crate::mcp::broker::ResultReview for CommandResultReview {
         let mut guard = ReviewGuard { owner: self, ask, armed: true };
         let result = self.wait_inner(ask).await;
         guard.armed = false;
-        if result.is_err() { guard.abandon().map_err(McpError::Protocol)?; }
         result
     }
 }
@@ -91,7 +73,9 @@ impl CommandResultReview {
     pub(super) fn settle(&self, outcome: &CommandOutcome) -> Result<(), String> {
         match self.pair {
             Some((command, output)) => super::command::settle_known_outcome(&self.kernel, self.call.context_id, &command, &output, outcome, None, self.operation.as_ref()),
-            None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome),
+            None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome).map(|changed| {
+                if changed { crate::kj::gate::announce_ledger_change(self.kernel.kernel_db(), self.kernel.ledger_flows()); }
+            }),
         }
     }
 
@@ -158,12 +142,6 @@ impl CommandResultReview {
                     "Result review did not approve publication; source was not run again."));
             }
             tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    let db = self.kernel.kernel_db().lock();
-                    approval_ledger::decide::abandon(db.conn_for_ledger(), &ask.request_id,
-                        Some("result review cancelled; captured execution was not repeated"))
-                        .map_err(|e| McpError::Protocol(e.to_string()))?;
-                }
                 _ = changes.recv() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
@@ -209,6 +187,75 @@ mod tests {
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
             tokio_util::sync::CancellationToken::new(), None);
         (review, ask, operation)
+    }
+
+    #[tokio::test]
+    async fn failed_review_abandonment_retries_with_terminal_retention() {
+        for (authored, event_fault) in [(true, false), (false, false), (true, true), (false, true)] {
+            let (review, ask, operation) = fixture(authored).await;
+            review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
+            let mut wait = Box::pin(review.wait_for_review(&ask));
+            std::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            }).await;
+            {
+                let db = review.kernel.kernel_db().lock();
+                if event_fault { approval_ledger::claim::claim(db.conn_for_ledger(), &ask.request_id, PrincipalId::new().as_bytes()).unwrap(); }
+                db.conn_for_ledger().execute_batch(if event_fault {
+                    "CREATE TRIGGER fail_review_abandon BEFORE INSERT ON approval_events WHEN NEW.kind='abandoned'
+                     BEGIN SELECT RAISE(ABORT, 'injected abandonment fault'); END;"
+                } else {
+                    "CREATE TRIGGER fail_review_abandon BEFORE UPDATE OF status ON approvals WHEN NEW.status='abandoned'
+                     BEGIN SELECT RAISE(ABORT, 'injected abandonment fault'); END;"
+                }).unwrap();
+            }
+            drop(wait);
+            let store = review.kernel.shell_operations();
+            assert!(store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.is_none(),
+                "terminal result must not commit while its unanswered ask remains actionable");
+            assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+                if event_fault { approval_ledger::types::ApprovalStatus::Claimed } else { approval_ledger::types::ApprovalStatus::Pending });
+            assert_eq!(store.pending_retention(10).unwrap().len(), 1, "ledger storage faults must keep the live retry owner");
+            if let Some(operation) = &operation { assert!(store.outcome(operation, review.call.context_id).unwrap().is_none()); }
+            assert!(review.kernel.shutdown_runtime_worker().await.unwrap_err().contains("injected abandonment fault"));
+            review.kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_review_abandon").unwrap();
+            let mut changes = review.kernel.ledger_flows().subscribe("ledger.changed");
+            review.kernel.shutdown_runtime_worker().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv()).await.expect("retention retry must announce its ask closure").unwrap();
+            assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+                approval_ledger::types::ApprovalStatus::Abandoned);
+            let saved = store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.unwrap();
+            assert_eq!(saved.exec_result(), review.interrupted_outcome("repeat").exec_result());
+            assert!(store.retention_failures().is_empty());
+            review.settle(&saved).unwrap();
+            assert!(changes.try_recv().is_none(), "a repeat settlement must not announce another transition");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_review_retention_preserves_existing_decisions() {
+        use approval_ledger::types::ApprovalStatus;
+        for authored in [true, false] {
+            for status in [ApprovalStatus::Allowed, ApprovalStatus::Denied, ApprovalStatus::Expired] {
+                let (review, ask, _) = fixture(authored).await;
+                let before = {
+                    let db = review.kernel.kernel_db().lock();
+                    db.in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
+                    if status == ApprovalStatus::Expired { approval_ledger::decide::expire(db.conn_for_ledger(), &ask.request_id).unwrap(); }
+                    else {
+                        approval_ledger::decide::decide(db.conn_for_ledger(), &ask.request_id,
+                            approval_ledger::decide::DecideInput { allow: status == ApprovalStatus::Allowed,
+                                auto_reason: Some("test rule"), ..Default::default() }).unwrap();
+                    }
+                    approval_ledger::ask::list_events(db.conn_for_ledger(), &ask.request_id).unwrap().len()
+                };
+                review.settle(&review.interrupted_outcome("stopped after decision")).unwrap();
+                let db = review.kernel.kernel_db().lock();
+                assert_eq!(db.get_approval(&ask.request_id).unwrap().unwrap().status, status);
+                assert_eq!(approval_ledger::ask::list_events(db.conn_for_ledger(), &ask.request_id).unwrap().len(), before);
+            }
+        }
     }
 
     #[tokio::test]
@@ -279,18 +326,6 @@ mod tests {
         assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
             approval_ledger::types::ApprovalStatus::Abandoned);
         assert_eq!(review.kernel.blocks().get_block_snapshot(review.call.context_id, &review.pair.unwrap().1).unwrap().unwrap().status, Status::Error);
-    }
-
-    #[tokio::test]
-    async fn cancelling_review_abandons_the_wait_without_authorizing_anything() {
-        let (review, ask, _) = fixture(true).await;
-        review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
-        review.cancel.cancel();
-        let error = review.wait_for_review(&ask).await.unwrap_err();
-        assert!(error.as_refusal().is_some());
-        assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
-            approval_ledger::types::ApprovalStatus::Abandoned);
-        assert!(review.kernel.kernel_db().lock().redeem_ask(&ask.request_id).is_err());
     }
 
     #[tokio::test]

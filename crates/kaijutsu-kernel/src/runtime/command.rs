@@ -115,7 +115,9 @@ pub(super) fn settle_known_outcome(
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
-        kernel.shell_operations().prepare_settlement(&operation.receipt.operation_id, outcome)?;
+        if kernel.shell_operations().prepare_settlement(&operation.receipt.operation_id, outcome)? {
+            crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
+        }
     }
     let documents = kernel.blocks();
     let raw = match (&outcome.hook, &outcome.execution) {
@@ -179,7 +181,9 @@ pub(crate) fn retry_retained_outcomes(kernel: &Kernel, limit: usize) -> Result<(
                 let receipt = operation.receipt;
                 settle_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)
             }),
-            RetentionKey::Review(id) => registry.finish_result_review(id, &outcome),
+            RetentionKey::Review(id) => registry.finish_result_review(id, &outcome).map(|changed| {
+                if changed { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
+            }),
         };
         if let Err(error) = result { tracing::error!(?key, %error, "captured result retry failed"); }
     }

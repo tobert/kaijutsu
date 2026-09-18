@@ -190,8 +190,10 @@ together; a failed checkpoint leaves no ask and becomes a terminal hook refusal.
 Dropped review waits and outer cancellation/panic recovery now share the first
 interrupted outcome in memory. Settlement uses the admitted receipt, so read
 faults cannot prevent handing capture to retention or completing the job.
-Failed ask abandonment and receipt lookup during preparation/refusal settlement
-still need explicit disposition. Job results now preserve the captured outcome
+Terminal retention now closes linked pending/claimed result asks atomically;
+ask-update or audit-event failure retains the same result for retry. Existing
+decisions stay intact, and successful retry announces closure. Receipt lookup
+during preparation/refusal settlement still needs explicit disposition. Job results now preserve the captured outcome
 when projection fails; they agree with retained and committed receipts. The
 persistence error remains separate, and an unfinished operation still needs
 projection recovery even when its job has finished.
@@ -257,7 +259,7 @@ repeat an already written seed. Denied/cancelled pair failures now retain the
 answer, and model refusal notifications consume it atomically with their block.
 Claimed approvals now retain completion ownership through notification failures;
 source is never replayed to recover a message. Continue the live terminal-result
-audit for abrupt worker destruction and failed result-review ask abandonment. Session
+audit for abrupt worker destruction and preparation/refusal lookup disposition. Session
 refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
 settling them. Periodic scans now drain larger backlogs; the four-item cap still

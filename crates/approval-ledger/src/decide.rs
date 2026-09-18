@@ -278,20 +278,11 @@ pub fn abandon(conn: &Connection, request_id: &str, reason: Option<&str>) -> Res
 /// and `expired` are already terminal and untouched for the same reason
 /// [`abandon`] never overwrites a terminal row.
 ///
-/// One [`abandon`] call per row — each already opens its own `BEGIN
-/// IMMEDIATE` transaction ([`transition`]'s doc), and SQLite has no
-/// nested transactions on one connection, so this cannot be one
-/// transaction wrapped around the whole sweep. A row that raced away from
-/// non-terminal between [`ask::list_unresolved`]'s read and this call's own
-/// `abandon` ([`LedgerError::AlreadyDecided`]) is not a sweep failure —
-/// something else already gave that row a terminal state, which is
-/// exactly this sweep's goal for it, reached by a different path; it is
-/// skipped and not counted. Any other error is a real database failure,
-/// not a race, and aborts the sweep immediately rather than being
-/// swallowed and continuing past it — rows already abandoned by this call
-/// stay abandoned regardless (each one already committed on its own), but
-/// a database that cannot complete a write is not one this function
-/// should keep hammering.
+/// Each abandonment joins the caller's transaction, or commits independently
+/// when no transaction is open. A caller-supplied transaction must roll back
+/// the sweep on error. Without one, earlier successful abandonments stay
+/// committed. A row that becomes terminal before abandonment is skipped;
+/// other failures stop the sweep and are returned to the caller.
 pub fn abandon_unresolved_on_restart(conn: &Connection, reason: &str) -> Result<usize> {
     let unresolved = crate::ask::list_unresolved(conn)?;
     let mut swept = 0usize;

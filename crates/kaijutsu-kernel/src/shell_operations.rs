@@ -389,14 +389,15 @@ impl ShellOperationRegistry {
 
     /// Finish a receipt-free review if it opened an ask. Calls without an ask
     /// retain no record. A published result is immutable, including on retry.
-    pub(crate) fn finish_result_review(&self, review_id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+    /// Returns whether retention closed any unanswered review asks.
+    pub(crate) fn finish_result_review(&self, review_id: &str, outcome: &CommandOutcome) -> OperationResult<bool> {
         if !matches!(outcome.block_status(), kaijutsu_types::Status::Done | kaijutsu_types::Status::Error) {
             return Err("result review completion is not terminal".into());
         }
         self.retain_terminal(RetentionKey::Review(review_id.into()), outcome)
     }
 
-    fn finish_result_review_durable(&self, review_id: &str, json: &str) -> KernelDbResult<()> {
+    fn finish_result_review_durable(&self, review_id: &str, json: &str) -> KernelDbResult<bool> {
         let db = self.db.lock();
         let tx = db.conn_for_ledger().unchecked_transaction()?;
         let prior: Option<(Option<String>, Option<String>)> = tx.query_row(
@@ -408,7 +409,9 @@ impl ShellOperationRegistry {
         }
         tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE review_id=?1 AND final_json IS NULL",
             rusqlite::params![review_id, json])?;
-        tx.commit().map_err(Into::into)
+        let changed = close_result_review_asks(&tx, &RetentionKey::Review(review_id.into()))?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn result_review_for_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ResultReviewState>> {
@@ -437,33 +440,27 @@ impl ShellOperationRegistry {
         for (review_id, operation, json) in reviews {
             let mut outcome: CommandOutcome = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             let reason = "kernel restarted during result review; captured execution was retained and source was not run again";
-            let ask = outcome.envelope().ask_id.ok_or("interrupted review lost its ask id")?;
-            {
-                let db = self.db.lock();
-                let row = db.get_approval(&ask).map_err(|e| e.to_string())?.ok_or("interrupted review lost its ask")?;
-                if matches!(row.status, approval_ledger::types::ApprovalStatus::Pending | approval_ledger::types::ApprovalStatus::Claimed) {
-                    approval_ledger::decide::abandon(db.conn_for_ledger(), &ask, Some(reason)).map_err(|e| e.to_string())?;
-                }
-            }
+            outcome.envelope().ask_id.ok_or("interrupted review lost its ask id")?;
             outcome.settlement_error = Some(reason.into());
             match operation {
                 Some(id) => self.prepare_settlement(&id, &outcome)?,
                 None => self.finish_result_review(&review_id, &outcome)?,
-            }
+            };
         }
         Ok(())
     }
 
     /// Retain a terminal outcome before its projections can fail. An existing
     /// record is immutable; a retry must carry exactly the same outcome.
-    pub fn prepare_settlement(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<()> {
+    /// Returns whether retention closed any unanswered review asks.
+    pub fn prepare_settlement(&self, id: &str, outcome: &CommandOutcome) -> OperationResult<bool> {
         if matches!(outcome.envelope().status, ShellStatus::Running | ShellStatus::Waiting) {
             return Err("cannot prepare terminal settlement for a running or waiting command".into());
         }
         self.retain_terminal(RetentionKey::Operation(id.into()), outcome)
     }
 
-    fn prepare_settlement_durable(&self, id: &str, json: &str) -> KernelDbResult<()> {
+    fn prepare_settlement_durable(&self, id: &str, json: &str) -> KernelDbResult<bool> {
         let db = self.db.lock();
         let tx = db.conn_for_ledger().unchecked_transaction()?;
         let completed: Option<Option<i64>> = tx.query_row(
@@ -490,12 +487,14 @@ impl ShellOperationRegistry {
         if inconsistent { return Err(KernelDbError::Validation("result review already has a different outcome".into())); }
         tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE operation_id=?1 AND final_json IS NULL",
             rusqlite::params![id, json])?;
-        tx.commit().map_err(Into::into)
+        let changed = close_result_review_asks(&tx, &RetentionKey::Operation(id.into()))?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Keep the first terminal result in memory if its database write fails.
     /// Lock order is retention, then database; callers must not hold the DB guard.
-    fn retain_terminal(&self, key: RetentionKey, outcome: &CommandOutcome) -> OperationResult<()> {
+    fn retain_terminal(&self, key: RetentionKey, outcome: &CommandOutcome) -> OperationResult<bool> {
         let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
         let mut pending = self.pending_retention.lock();
         if pending.get(&key).is_some_and(|prior| prior.json != json) {
@@ -506,11 +505,11 @@ impl ShellOperationRegistry {
             RetentionKey::Review(id) => self.finish_result_review_durable(id, &json),
         };
         match result {
-            Ok(()) => { pending.remove(&key); Ok(()) }
+            Ok(changed) => { pending.remove(&key); Ok(changed) }
             Err(error) => {
                 // Domain conflicts do not create retry work. A prior live owner
                 // remains available for diagnosis if durable state later conflicts.
-                if matches!(&error, KernelDbError::Db(_)) || pending.contains_key(&key) {
+                if matches!(&error, KernelDbError::Db(_) | KernelDbError::Ledger(approval_ledger::error::LedgerError::Db(_))) || pending.contains_key(&key) {
                     pending.insert(key, PendingRetention { json, error: error.to_string(), attempted: std::time::Instant::now() });
                 }
                 Err(error.to_string())
@@ -771,6 +770,27 @@ fn decode_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShellOperationState
         envelope: envelope.map(|json| serde_json::from_str(&json)
             .map_err(|e| invalid(10, &e.to_string()))).transpose()?,
     })
+}
+
+/// Close only this invocation's unanswered asks in the terminal-result transaction.
+/// A decided ask keeps its reviewer choice, including a decision that arrived late.
+fn close_result_review_asks(conn: &rusqlite::Connection, key: &RetentionKey) -> KernelDbResult<bool> {
+    let (column, id) = match key {
+        RetentionKey::Operation(id) => ("r.operation_id", id),
+        RetentionKey::Review(id) => ("r.review_id", id),
+    };
+    let requests: Vec<String> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT a.request_id FROM approvals a JOIN shell_result_review_asks l USING(request_id)
+             JOIN shell_result_reviews r USING(review_id) WHERE {column}=?1 AND a.status IN ('pending','claimed')"
+        ))?;
+        stmt.query_map([id], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    for request in &requests {
+        approval_ledger::decide::abandon(conn, request,
+            Some("result review stopped; captured execution was retained and source was not repeated"))?;
+    }
+    Ok(!requests.is_empty())
 }
 
 fn require_changed(changed: usize, id: &str) -> OperationResult<()> {
