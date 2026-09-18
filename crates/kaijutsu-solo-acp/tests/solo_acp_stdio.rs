@@ -815,6 +815,60 @@ fn a_state_dir_inside_the_operators_kaijutsu_refuses() {
     }
 }
 
+/// A model-spawned process running as the same uid as this agent must not
+/// be able to read the provider API key out of `/proc/<pid>/environ` — see
+/// docs/solo-acp.md, "The key and /proc". This proves it from the outside,
+/// the way any other same-uid process on the host would try: reading
+/// `/proc/<agent pid>/environ` once the agent is up must fail with
+/// permission denied, never succeed and hand back a sentinel we set in this
+/// process's own environment when we spawned it.
+#[test]
+fn proc_environ_is_unreadable_to_same_uid_readers() {
+    // SAFETY: geteuid takes no arguments and only reads this process's own
+    // credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "skipping proc_environ_is_unreadable_to_same_uid_readers: this test \
+             process runs as root, which can always read /proc/<pid>/environ \
+             regardless of PR_SET_DUMPABLE"
+        );
+        return;
+    }
+
+    let sentinel = format!("SOLO_ACP_PROC_ENVIRON_SENTINEL_{}", std::process::id());
+    let mut command = Command::new(BIN);
+    command
+        .arg("--backend-kind")
+        .arg("mock")
+        .arg("--model")
+        .arg("solo-mock")
+        .env("KJ_MOCK_SCRIPT_DIR", mock_scripts("chat"))
+        .env("TMPDIR", scratch_dir("tmp"))
+        .env("RUST_LOG", "info")
+        .env(&sentinel, "leaked-if-this-is-readable");
+    let agent = Agent::spawn(command);
+    agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+
+    let pid = agent.child.id();
+    let environ_path = format!("/proc/{pid}/environ");
+    match std::fs::read(&environ_path) {
+        Err(e) => {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{environ_path} must be unreadable to a same-uid process with EACCES, got {e}"
+            );
+        }
+        Ok(bytes) => {
+            let leaked = String::from_utf8_lossy(&bytes).contains(&sentinel);
+            panic!(
+                "{environ_path} was readable by a same-uid process (sentinel present: \
+                 {leaked}); the PR_SET_DUMPABLE mitigation is missing or not taking effect"
+            );
+        }
+    }
+}
+
 #[test]
 fn stdin_eof_exits_clean_and_removes_the_temp_state() {
     let mut agent = Agent::spawn_mock("chat");

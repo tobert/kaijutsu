@@ -174,7 +174,34 @@ fn skip_cwd_reason(cwd: &Path) -> Option<String> {
         .map(|reason| format!("the launch directory cannot be mounted: {reason}"))
 }
 
+/// Clears this process's dumpable flag before any thread starts, so a
+/// same-uid process cannot read our memory or environment. Exits non-zero
+/// on failure rather than continuing with the provider key readable.
+///
+/// This is not a defense against root, and a benchmark task container
+/// commonly runs the agent's own process as root, where a same-uid
+/// process is root too and the key stays readable regardless — there the
+/// defense is a run-scoped key in a disposable container, not this call.
+/// Clearing dumpable also disables core dumps and same-uid `ptrace` of
+/// this process. See `docs/solo-acp.md`, "The key and /proc".
+#[cfg(target_os = "linux")]
+fn harden_process() {
+    // SAFETY: PR_SET_DUMPABLE takes one further argument (the new value)
+    // and mutates only this process's own dumpable flag.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("kaijutsu-solo-acp: prctl(PR_SET_DUMPABLE, 0) failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harden_process() {}
+
 fn main() -> ExitCode {
+    harden_process();
+
     // stderr only — stdout carries the ACP protocol.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()

@@ -36,9 +36,9 @@ distribution (`src/harbor/agents/installed/acp.py`, `AcpRegistryEntry` and
 
 ```json
 {
-  "id": "kaijutsu",
+  "id": "kaijutsu-solo-acp",
   "name": "kaijutsu",
-  "version": "0.1.0",
+  "version": "git-<short-rev>",
   "description": "kaijutsu with its own kernel, over ACP v1",
   "distribution": {
     "local": {
@@ -48,6 +48,13 @@ distribution (`src/harbor/agents/installed/acp.py`, `AcpRegistryEntry` and
   }
 }
 ```
+
+`id` becomes the agent's name in every benchmark result, so it must be
+`kaijutsu-solo-acp` — not a shorter alias. `version` should identify the
+build that ran, not a static number: `contrib/bench/harbor/`'s working
+adapter derives it from the git revision this binary was built at
+(`git-<short head>`, plus `-dirty` for an uncommitted tree), and that is the
+working example to copy rather than hand-writing a version string here.
 
 The provider key rides the environment the runner launches with, or the key
 file the backend row names. It never belongs in this file.
@@ -72,6 +79,24 @@ or `OPENAI_API_KEY` is set. Zero keys, or several, is a refusal naming what to
 set: guessing would send a first prompt to a provider nobody chose. A named
 provider may take its key from the file the factory backend row names
 (`~/.deepseek-key` and the like) instead of the environment.
+
+## The key and /proc
+
+The provider key lives in this process's own environment, so a process the
+model spawns, running as the same uid, could otherwise read it straight out
+of `/proc/<this pid>/environ`. This binary clears its dumpable flag
+(`prctl(PR_SET_DUMPABLE, 0)`) at the very start of `main`, before any thread
+starts, which makes `/proc/<pid>/environ` (and `mem`, and `maps`) owned by
+root and unreadable to a same-uid reader. The process exits with a
+non-zero status if that call fails, rather than continuing with the key
+readable.
+
+Two limits. It is not a defense against root: a benchmark task container
+commonly runs the agent's own process as root, where a same-uid process is
+root too and the key stays readable regardless — there the defense is a
+run-scoped key in a disposable container, not this mitigation. It also
+disables core dumps and same-uid `ptrace` of this process, as a side effect
+of the same flag.
 
 ## The workspace
 
