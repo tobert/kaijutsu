@@ -1,0 +1,15 @@
+# The coder stance for the coder-driven prompt variant: one procedure, the
+# shell mechanics a worker needs to read its own results, and the verdict line
+# that ends a turn.
+#
+# One register for every model, where the shipped stance branches on the
+# resolved model id and carries two full procedures. Plain imperative
+# sentences, one idea each, no metaphor — the register `docs/delegated-coder.md`
+# argues for. Dropping the branch is a second variable in any A/B against a
+# frontier model; see the README beside this file.
+#
+# The text lives in the companion Markdown rather than a shell string: a
+# redirect keeps trailing newlines and skips stdout limits, and the prose is
+# then diffable against the shipped stance without reading around quoting.
+set -e
+kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"

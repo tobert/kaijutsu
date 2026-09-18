@@ -1,0 +1,13 @@
+# The driven worker's contract, for the coder-driven prompt variant.
+#
+# This replaces the link to ../../lib/create/S00-base.md with a copy owned by
+# the coder type. The shared base is written for a context a person is sitting
+# with: it offers to ask when a decision needs judgment, and it names a handoff
+# as the place unfinished work goes. Both are exits a driven worker should not
+# take mid-task. Other types keep the shared base unchanged.
+#
+# Same construct as the file it replaces: read the companion Markdown through a
+# redirect, so the text keeps its trailing newline and never passes through
+# stdout limits. `$0` is this script's invoked VFS path.
+set -e
+kj block create --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
