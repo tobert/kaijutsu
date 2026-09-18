@@ -252,6 +252,10 @@ command's completion are distinct conditions. A kaish job reports the captured
 command result. If durable publication fails, the job can finish while its
 operation remains pending; use `--operation` to inspect durable completion and
 notification status. Publication failure does not change the command's exit.
+A terminal-result write failure reports `state.retention_error` while the kernel
+keeps the first result in memory and retries persistence. Result-review ledger
+reads report `result_review.retention_error`. Recovery never reruns the command
+or its result hooks. Shutdown reports results that remain non-durable.
 Waiting must not hold a context
 execution lock that prevents another invocation from writing a handoff or
 observing completion. Preserve the rule that no RPC waits indefinitely.

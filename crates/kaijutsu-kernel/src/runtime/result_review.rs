@@ -281,6 +281,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receipt_free_review_retries_terminal_retention_after_shutdown_refusal() {
+        let (review, ask, _) = fixture(false).await;
+        let store = review.kernel.shell_operations();
+        let mut checkpoint = review.captured.clone();
+        checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
+            waiting: true, ask_id: Some(ask.request_id.clone()) });
+        store.checkpoint_result_review(&review.review_id, None, &review.call, &checkpoint).unwrap();
+        review.kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_review_retention BEFORE UPDATE OF final_json ON shell_result_reviews
+             BEGIN SELECT RAISE(ABORT, 'injected review retention fault'); END;"
+        ).unwrap();
+        assert!(store.finish_result_review(&review.review_id, &review.captured).is_err());
+        let mut different = review.captured.clone();
+        different.elapsed_ms += 1;
+        assert!(store.finish_result_review(&review.review_id, &different).unwrap_err().contains("different live retention owner"));
+        assert!(review.kernel.shutdown_runtime_worker().await.unwrap_err().contains("injected review retention fault"));
+        assert!(store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.is_none());
+        review.kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_review_retention").unwrap();
+        review.kernel.shutdown_runtime_worker().await.unwrap();
+        let saved = store.result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().settled.unwrap();
+        assert_eq!(saved.exec_result(), review.captured.exec_result());
+        assert_eq!(saved.elapsed_ms, review.captured.elapsed_ms);
+        assert!(store.retention_failures().is_empty());
+    }
+
+    #[tokio::test]
     async fn review_storage_preserves_captured_execution_and_terminal_results() {
         let (review, ask, _) = fixture(false).await;
         let mut checkpoint = review.captured.clone();

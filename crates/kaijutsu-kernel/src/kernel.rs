@@ -437,11 +437,17 @@ impl Kernel {
     /// Stop accepting work and join commands, turns, and approval delivery.
     pub async fn shutdown_runtime_worker(&self) -> Result<(), String> {
         self.stop_runtime_worker();
-        match self.runtime_worker.get() {
+        let joined = match self.runtime_worker.get() {
             Some(Ok(worker)) => worker.join().await,
             Some(Err(error)) => Err(error.clone()),
             None => Ok(()),
-        }
+        };
+        let retried = crate::runtime::command::retry_retained_outcomes(self, usize::MAX);
+        let mut failures = self.shell_operations().retention_failures();
+        if let Err(error) = joined { failures.push(error); }
+        if let Err(error) = retried { failures.push(error); }
+        if failures.is_empty() { Ok(()) }
+        else { Err(format!("kernel shutdown has unresolved work: {}", failures.join("; "))) }
     }
 
     /// Stable kernel identity.

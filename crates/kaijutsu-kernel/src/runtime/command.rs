@@ -94,7 +94,14 @@ pub fn settle_outcome(
     ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
     let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
-    if operation.as_ref().is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
+    settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref())
+}
+
+fn settle_known_outcome(
+    kernel: &Kernel, context_id: ContextId, command_block_id: &BlockId, output_block_id: &BlockId,
+    outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>, operation: Option<&crate::shell_operations::ShellOperationState>,
+) -> Result<(), String> {
+    if operation.is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
         return Err("shell operation command block does not match its receipt".into());
     }
     let status = outcome.block_status();
@@ -158,6 +165,23 @@ pub fn settle_outcome(
     }
     if ask_owner.is_some() && envelope.ask_id.is_some() {
         crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
+    }
+    Ok(())
+}
+
+/// Retry captured results on the existing worker; source and hooks never run.
+pub(crate) fn retry_retained_outcomes(kernel: &Kernel, limit: usize) -> Result<(), String> {
+    use crate::shell_operations::RetentionKey;
+    let registry = kernel.shell_operations();
+    for (key, outcome) in registry.pending_retention(limit)? {
+        let result = match &key {
+            RetentionKey::Operation(id) => registry.operation_for_retention(id).and_then(|operation| {
+                let receipt = operation.receipt;
+                settle_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)
+            }),
+            RetentionKey::Review(id) => registry.finish_result_review(id, &outcome),
+        };
+        if let Err(error) = result { tracing::error!(?key, %error, "captured result retry failed"); }
     }
     Ok(())
 }
@@ -278,8 +302,9 @@ pub async fn run_into_blocks(
     if let Some(stdin) = run.stdin.take() {
         options = options.with_stdin(stdin);
     }
-    let tracked_job = match kernel.shell_operations().get_by_output(output_block_id, context_id) {
-        Ok(Some(operation)) => {
+    let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
+    let tracked_job = match &operation {
+        Some(operation) => {
             let manager = kernel.context_job_manager(context_id);
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let job = manager.register(code.to_owned(), receiver).await;
@@ -297,8 +322,7 @@ pub async fn run_into_blocks(
             }
             Some((manager, job, sender))
         }
-        Ok(None) => None,
-        Err(error) => return Err(error),
+        None => None,
     };
 
     let streams = if matches!(run.job_output, CommandJobOutput::LiveExecution) {
@@ -310,7 +334,7 @@ pub async fn run_into_blocks(
     let attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
         Some((*command_block_id, *output_block_id)), options, run, streams).await?;
     let outcome = &attempt.outcome;
-    let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, outcome, None);
+    let settled = settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, None, operation.as_ref());
     if let Some((manager, job, sender)) = tracked_job {
         let result = outcome.exec_result();
         let streams_result = match job_output {
@@ -744,6 +768,113 @@ mod fill_tests {
             assert_eq!(final_output.status, Status::Done);
             assert_eq!(final_output.content, "synthetic output");
         }
+    }
+
+    struct CountedCapture(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl kaish_kernel::Tool for CountedCapture {
+        fn name(&self) -> &str { "counted-capture" }
+        fn schema(&self) -> kaish_kernel::tools::ToolSchema {
+            kaish_kernel::tools::ToolSchema::new("counted-capture", "Capture once")
+        }
+        async fn execute(&self, _: kaish_kernel::tools::ToolArgs, _: &mut dyn kaish_kernel::tools::ToolCtx) -> kaish_kernel::interpreter::ExecResult {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            kaish_kernel::interpreter::ExecResult::success("captured exactly once")
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_to_discard_a_non_durable_outcome() {
+        let kernel = Arc::new(Kernel::new_ephemeral("retention-shutdown").await);
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = kernel.blocks().insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = kernel.blocks().insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(), command, output,
+            "never replay", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("retained")), 7);
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_retention BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'injected shutdown retention fault'); END;"
+        ).unwrap();
+        assert!(settle_outcome(&kernel, context, &command, &output, &outcome, None).is_err());
+        assert!(kernel.shutdown_runtime_worker().await.unwrap_err().contains("injected shutdown retention fault"));
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_retention").unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
+        assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
+        assert_eq!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap().exec_result(), outcome.exec_result());
+        assert!(kernel.shell_operations().retention_failures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_retry_preserves_durable_recovery_when_the_document_is_poisoned() {
+        let kernel = Arc::new(Kernel::new_ephemeral("retention-poison").await);
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = kernel.blocks().insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = kernel.blocks().insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(), command, output,
+            "never replay", None).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("retained")), 7);
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_retention BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'retention fault'); END;"
+        ).unwrap();
+        assert!(settle_outcome(&kernel, context, &command, &output, &outcome, None).is_err());
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "DROP TRIGGER fail_retention;
+             CREATE TRIGGER fail_acceptance BEFORE INSERT ON oplog BEGIN SELECT RAISE(ABORT, 'acceptance fault'); END;"
+        ).unwrap();
+        assert!(kernel.blocks().set_status(context, &output, Status::Error).is_err());
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_acceptance").unwrap();
+        retry_retained_outcomes(&kernel, 4).unwrap();
+        assert!(kernel.shell_operations().retention_failures().is_empty(), "the result is now durable");
+        assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_none());
+        assert_eq!(kernel.shell_operations().pending_projections().unwrap().len(), 1);
+        assert_eq!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap().exec_result(), outcome.exec_result());
+        let db = kernel.kernel_db().clone();
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = Kernel::new("retention-recovered", dir.path(), blocks, db).await;
+        assert_eq!(recovered.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().envelope.unwrap().stdout, "retained");
+    }
+
+    #[tokio::test]
+    async fn initial_retention_failure_retries_without_execution() {
+        let kernel = Arc::new(Kernel::new_ephemeral("retention-retry").await);
+        let context = ContextId::new();
+        let documents = kernel.blocks();
+        documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(), command, output,
+            "counted-capture", None).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let kaish = EmbeddedKaish::with_identity("retention-retry", documents.clone(), kernel.clone(), None,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                reviewer: None, context, session: kaijutsu_types::SessionId::new() },
+            crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+            super::super::embedded_kaish::OutputProfile::Internal, move |_, _, tools| { tools.register(CountedCapture(count)); }).unwrap();
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_retention BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'injected retention fault'); END;"
+        ).unwrap();
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
+        assert!(run_into_blocks(&kaish, "counted-capture", context, &command, &output, &kernel, &call,
+            CommandRunOptions::default()).await.unwrap_err().contains("injected retention fault"));
+        assert!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().is_none());
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_retention").unwrap();
+        kernel.start_approval_delivery().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("the live retention owner must persist and project without a new event");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap().envelope().stdout, "captured exactly once");
+        assert_eq!(documents.get_block_snapshot(context, &output).unwrap().unwrap().content, "captured exactly once");
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

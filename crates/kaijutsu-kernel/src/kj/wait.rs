@@ -75,7 +75,7 @@ impl TailFilter {
 )]
 pub(crate) struct WaitArgs {
     /// Wait for this shell operation to finish, including any approval wait.
-    /// Reports completion-notification status when one was reserved.
+    /// Reports completion-notification status and any pending outcome-retention error.
     #[arg(long, conflicts_with_all = ["ask", "job", "since"])]
     operation: Option<String>,
     /// Wait for this ask's decision. Approval may start work that is still running.
@@ -366,6 +366,8 @@ impl KjDispatcher {
                     Err(error) => return KjResult::Err(format!("kj wait: could not read completion notifications: {error}")),
                 };
                 value["notifications"] = serde_json::json!(notifications);
+                value["retention_error"] = serde_json::json!(self.kernel().shell_operations().retention_error(
+                    &crate::shell_operations::RetentionKey::Operation(id.clone())));
                 ("operation", id.clone(), state.completed_at.is_some(), value)
             } else {
                 let id = kaish_kernel::scheduler::JobId(args.job.expect("one work selector"));

@@ -182,12 +182,19 @@ identity; the broker no longer applies PostCall to admission receipts. A kernel
 worker owns accepted tasks beyond caller-runtime and transport shutdown.
 Streaming RPC also honors every hook verdict. Startup recovers retained pending
 projections without rerunning commands or hooks, preserving edits made after
-terminal publication. Initial outcome-retention failures still need live
-reporting/retry: background interactive callers log the error and approval
-resumes report it to the model. Job results now preserve the captured outcome
+terminal publication. Failed terminal-outcome writes now retain an immutable
+live owner and retry on the existing worker. Shutdown reports any results still
+not durable. `kj wait --operation` and result-review `kj ledger show` expose
+retention errors. Failures while checkpointing a result review before terminal
+retention still need an ownership audit; a read failure in receipt lookup on
+preparation/refusal settlement also needs explicit disposition. Job results now preserve the captured outcome
 when projection fails; they agree with retained and committed receipts. The
 persistence error remains separate, and an unfinished operation still needs
 projection recovery even when its job has finished.
+The live retention copy cannot survive process loss before SQLite accepts it.
+Retries are bounded to four per scan and rotate past failures; a prolonged
+storage fault can still accumulate retained results as new work is admitted.
+Include that memory pressure in the execution admission audit.
 A failed document acceptance poisons that context until restart. Structured
 inspection from that context also refuses; inspect the target operation from a
 healthy context. The SSH fault regression exercises this distinction.
@@ -246,7 +253,7 @@ repeat an already written seed. Denied/cancelled pair failures now retain the
 answer, and model refusal notifications consume it atomically with their block.
 Claimed approvals now retain completion ownership through notification failures;
 source is never replayed to recover a message. Continue the live terminal-result
-audit for abrupt caller destruction and initial outcome-retention faults. Session
+audit for abrupt worker destruction and result-review checkpoint faults. Session
 refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
 settling them. Periodic scans now drain larger backlogs; the four-item cap still

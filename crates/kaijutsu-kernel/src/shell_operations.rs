@@ -185,10 +185,20 @@ pub struct ShellOperationFinishedSummary {
     pub finished_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RetentionKey { Operation(String), Review(String) }
+
+struct PendingRetention {
+    json: String,
+    error: String,
+    attempted: std::time::Instant,
+}
+
 pub struct ShellOperationRegistry {
     db: Arc<Mutex<KernelDb>>,
     managers: Mutex<HashMap<ContextId, Arc<JobManager>>>,
     jobs: Mutex<HashMap<String, (JobId, Arc<JobManager>)>>,
+    pending_retention: Mutex<HashMap<RetentionKey, PendingRetention>>,
 }
 
 fn initialize_review_store(conn: &rusqlite::Connection) -> OperationResult<()> {
@@ -261,7 +271,7 @@ impl ShellOperationRegistry {
              CREATE UNIQUE INDEX IF NOT EXISTS shell_operations_ask ON shell_operations(ask_id);"
         ).map_err(|e| e.to_string())?;
         initialize_review_store(db.lock().conn_for_ledger())?;
-        Ok(Self { db, managers: Mutex::new(HashMap::new()), jobs: Mutex::new(HashMap::new()) })
+        Ok(Self { db, managers: Mutex::new(HashMap::new()), jobs: Mutex::new(HashMap::new()), pending_retention: Mutex::new(HashMap::new()) })
     }
 
     pub fn context_job_manager(&self, context: ContextId) -> Arc<JobManager> {
@@ -376,19 +386,22 @@ impl ShellOperationRegistry {
         if !matches!(outcome.block_status(), kaijutsu_types::Status::Done | kaijutsu_types::Status::Error) {
             return Err("result review completion is not terminal".into());
         }
-        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        self.retain_terminal(RetentionKey::Review(review_id.into()), outcome)
+    }
+
+    fn finish_result_review_durable(&self, review_id: &str, json: &str) -> KernelDbResult<()> {
         let db = self.db.lock();
-        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = db.conn_for_ledger().unchecked_transaction()?;
         let prior: Option<(Option<String>, Option<String>)> = tx.query_row(
             "SELECT operation_id,final_json FROM shell_result_reviews WHERE review_id=?1",
-            [review_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(|e| e.to_string())?;
+            [review_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         if let Some((operation, prior)) = prior {
-            if operation.is_some() { return Err("tracked result review requires operation outcome preparation".into()); }
-            if let Some(prior) = prior && prior != json { return Err("result review already has a different outcome".into()); }
+            if operation.is_some() { return Err(KernelDbError::Validation("tracked result review requires operation outcome preparation".into())); }
+            if let Some(prior) = prior && prior != json { return Err(KernelDbError::Validation("result review already has a different outcome".into())); }
         }
         tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE review_id=?1 AND final_json IS NULL",
-            rusqlite::params![review_id, json]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+            rusqlite::params![review_id, json])?;
+        tx.commit().map_err(Into::into)
     }
 
     pub(crate) fn settled_result_review(&self, review: &str, context: ContextId) -> OperationResult<Option<CommandOutcome>> {
@@ -448,34 +461,85 @@ impl ShellOperationRegistry {
         if matches!(outcome.envelope().status, ShellStatus::Running | ShellStatus::Waiting) {
             return Err("cannot prepare terminal settlement for a running or waiting command".into());
         }
-        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        self.retain_terminal(RetentionKey::Operation(id.into()), outcome)
+    }
+
+    fn prepare_settlement_durable(&self, id: &str, json: &str) -> KernelDbResult<()> {
         let db = self.db.lock();
-        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = db.conn_for_ledger().unchecked_transaction()?;
         let completed: Option<Option<i64>> = tx.query_row(
             "SELECT completed_at FROM shell_operations WHERE operation_id=?1", [id], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
-        let completed = completed.ok_or_else(|| format!("shell operation {id} is missing"))?;
+        ).optional()?;
+        let completed = completed.ok_or_else(|| KernelDbError::NotFound(format!("shell operation {id} is missing")))?;
         let prior: Option<String> = tx.query_row(
             "SELECT outcome_json FROM shell_operation_outcomes WHERE operation_id=?1", [id], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
+        ).optional()?;
         match prior {
-            Some(prior) if prior != json => return Err(format!("shell operation {id} already has a different outcome")),
+            Some(prior) if prior != json => return Err(KernelDbError::Validation(format!("shell operation {id} already has a different outcome"))),
             Some(_) => {}
-            None if completed.is_some() => return Err(format!("shell operation {id} completed without a recoverable outcome")),
+            None if completed.is_some() => return Err(KernelDbError::Validation(format!("shell operation {id} completed without a recoverable outcome"))),
             None => {
                 tx.execute("INSERT INTO shell_operation_outcomes(operation_id,outcome_json) VALUES(?1,?2)",
-                    rusqlite::params![id, json]).map_err(|e| e.to_string())?;
+                    rusqlite::params![id, json])?;
             }
         }
         tx.execute("INSERT OR IGNORE INTO shell_operation_projections(operation_id) VALUES(?1)", [id])
-            .map_err(|e| e.to_string())?;
+            ?;
         let inconsistent: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM shell_result_reviews WHERE operation_id=?1 AND final_json IS NOT NULL AND final_json != ?2)",
-            rusqlite::params![id, json], |r| r.get(0)).map_err(|e| e.to_string())?;
-        if inconsistent { return Err("result review already has a different outcome".into()); }
+            rusqlite::params![id, json], |r| r.get(0))?;
+        if inconsistent { return Err(KernelDbError::Validation("result review already has a different outcome".into())); }
         tx.execute("UPDATE shell_result_reviews SET final_json=?2 WHERE operation_id=?1 AND final_json IS NULL",
-            rusqlite::params![id, json]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+            rusqlite::params![id, json])?;
+        tx.commit().map_err(Into::into)
+    }
+
+    /// Keep the first terminal result in memory if its database write fails.
+    /// Lock order is retention, then database; callers must not hold the DB guard.
+    fn retain_terminal(&self, key: RetentionKey, outcome: &CommandOutcome) -> OperationResult<()> {
+        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
+        let mut pending = self.pending_retention.lock();
+        if pending.get(&key).is_some_and(|prior| prior.json != json) {
+            return Err("terminal result already has a different live retention owner".into());
+        }
+        let result = match &key {
+            RetentionKey::Operation(id) => self.prepare_settlement_durable(id, &json),
+            RetentionKey::Review(id) => self.finish_result_review_durable(id, &json),
+        };
+        match result {
+            Ok(()) => { pending.remove(&key); Ok(()) }
+            Err(error) => {
+                // Domain conflicts do not create retry work. A prior live owner
+                // remains available for diagnosis if durable state later conflicts.
+                if matches!(&error, KernelDbError::Db(_)) || pending.contains_key(&key) {
+                    pending.insert(key, PendingRetention { json, error: error.to_string(), attempted: std::time::Instant::now() });
+                }
+                Err(error.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn retention_error(&self, key: &RetentionKey) -> Option<String> {
+        self.pending_retention.lock().get(key).map(|pending| pending.error.clone())
+    }
+
+    pub(crate) fn pending_retention(&self, limit: usize) -> OperationResult<Vec<(RetentionKey, CommandOutcome)>> {
+        let mut pending = self.pending_retention.lock();
+        let mut entries: Vec<_> = pending.iter().collect();
+        entries.sort_by_key(|(_, value)| value.attempted);
+        let selected = entries.into_iter().take(limit).map(|(key, value)| Ok((key.clone(),
+            serde_json::from_str(&value.json).map_err(|e| e.to_string())?))).collect::<OperationResult<Vec<_>>>()?;
+        for (key, _) in &selected { pending.get_mut(key).expect("selected retention owner exists").attempted = std::time::Instant::now(); }
+        Ok(selected)
+    }
+
+    pub(crate) fn retention_failures(&self) -> Vec<String> {
+        self.pending_retention.lock().iter().map(|(key, value)| format!("{key:?}: {}", value.error)).collect()
+    }
+
+    pub(crate) fn operation_for_retention(&self, id: &str) -> OperationResult<ShellOperationState> {
+        self.db.lock().conn_for_ledger().query_row(&format!("{SELECT_STATE} WHERE operation_id=?1"),
+            [id], decode_state).map_err(|e| e.to_string())
     }
 
     pub fn pending_projections(&self) -> OperationResult<Vec<ShellOperationState>> {
@@ -810,6 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn retention_scan_rotates_past_repeated_failures() {
+        use crate::runtime::command_outcome::CommandExecution;
+        let db = Arc::new(Mutex::new(KernelDb::temporary().unwrap()));
+        let registry = ShellOperationRegistry::new(db.clone()).unwrap();
+        db.lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_retention BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'retry fault'); END;"
+        ).unwrap();
+        let outcome = CommandOutcome::new(CommandExecution::Completed(kaish_kernel::interpreter::ExecResult::success("captured")), 1);
+        for _ in 0..5 {
+            let receipt = register(&registry, ContextId::new());
+            assert!(registry.prepare_settlement(&receipt.operation_id, &outcome).is_err());
+        }
+        let first = registry.pending_retention(4).unwrap();
+        for (key, outcome) in &first {
+            let RetentionKey::Operation(id) = key else { unreachable!() };
+            assert!(registry.prepare_settlement(id, outcome).is_err());
+        }
+        let next = registry.pending_retention(1).unwrap();
+        assert!(!first.iter().any(|(key, _)| *key == next[0].0), "repeated failures must not starve later captured results");
+    }
+
+    #[test]
     fn prepared_settlement_is_atomic_and_cannot_be_abandoned_or_replaced() {
         use crate::runtime::command_outcome::CommandExecution;
         let db = Arc::new(Mutex::new(KernelDb::open(":memory:").unwrap()));
@@ -825,6 +911,11 @@ mod tests {
         assert!(registry.prepare_settlement(&receipt.operation_id, &outcome).is_err());
         assert!(registry.outcome(&receipt.operation_id, context).unwrap().is_none());
         assert!(registry.pending_projections().unwrap().is_empty());
+        assert_eq!(registry.pending_retention(8).unwrap().len(), 1);
+        let mut conflict = outcome.clone();
+        conflict.elapsed_ms += 1;
+        assert!(registry.prepare_settlement(&receipt.operation_id, &conflict).unwrap_err().contains("different live retention owner"));
+        assert_eq!(registry.pending_retention(8).unwrap()[0].1.elapsed_ms, outcome.elapsed_ms);
         db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_prepare;").unwrap();
         registry.prepare_settlement(&receipt.operation_id, &outcome).unwrap();
         registry.prepare_settlement(&receipt.operation_id, &outcome).unwrap();

@@ -121,6 +121,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
 #[test]
 fn job_completion_reports_execution_while_operation_publication_is_pending() {
     common::run_local(async {
+        for retention_fault in [false, true] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
@@ -139,8 +140,11 @@ fn job_completion_reports_execution_while_operation_publication_is_pending() {
         let context = common::create_context(&kj, "job-publication").await.unwrap();
         let observer = common::create_context(&kj, "publication-observer").await.unwrap();
         let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TRIGGER fail_receipt BEFORE UPDATE OF completed_at ON shell_operations
-            BEGIN SELECT RAISE(ABORT, 'injected receipt fault'); END;").unwrap();
+        conn.execute_batch(if retention_fault {
+            "CREATE TRIGGER fail_receipt BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'injected outcome retention fault'); END;"
+        } else {
+            "CREATE TRIGGER fail_receipt BEFORE UPDATE OF completed_at ON shell_operations BEGIN SELECT RAISE(ABORT, 'injected receipt fault'); END;"
+        }).unwrap();
         let command = kj.shell_execute("echo observed; echo warning >&2", context, false).await.unwrap();
         let operation = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -166,16 +170,32 @@ fn job_completion_reports_execution_while_operation_publication_is_pending() {
             "--timeout".into(), "0".into(), context.to_hex(),
         ]).await.unwrap();
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
-        assert_eq!(result.data.unwrap()["timed_out"], true);
+        let data = result.data.unwrap();
+        assert_eq!(data["timed_out"], true);
+        if retention_fault {
+            assert!(data["state"]["retention_error"].as_str().unwrap().contains("injected outcome retention fault"));
+            assert!(shared.kernel.shell_operations().outcome(&operation.receipt.operation_id, context).unwrap().is_none());
+            conn.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+            let recovered = kj.execute_kj_quiet(observer, &[
+                "wait".into(), "--operation".into(), operation.receipt.operation_id.clone(),
+                "--timeout".into(), "5".into(), context.to_hex(),
+            ]).await.unwrap();
+            assert_eq!(recovered.exit_code, 0, "{}", recovered.stderr);
+            let data = recovered.data.unwrap();
+            assert_eq!(data["timed_out"], false);
+            assert!(data["state"]["retention_error"].is_null());
+            assert_eq!(data["state"]["envelope"]["stdout"], "observed\n");
+        }
         let retained = shared.kernel.shell_operations().outcome(&operation.receipt.operation_id, context).unwrap().unwrap();
         assert_eq!(retained.envelope().exit_code, Some(0));
         assert_eq!(retained.envelope().stdout, "observed\n");
         assert_eq!(retained.envelope().stderr, "warning\n");
-        conn.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+        if !retention_fault { conn.execute_batch("DROP TRIGGER fail_receipt").unwrap(); }
         drop(kj);
         drop(client);
         shared.kernel.shutdown_runtime_worker().await.unwrap();
         server.abort();
         let _ = server.await;
+        }
     });
 }

@@ -609,6 +609,9 @@ async fn run_delivery(
         }
         let Some(owner) = owner.upgrade() else { return; };
         let kernel = &owner;
+        if let Err(error) = super::command::retry_retained_outcomes(kernel, DELIVERY_CAP_PER_SCAN) {
+            tracing::error!(%error, "could not retry captured outcomes");
+        }
         let retained: Vec<_> = pending_messages.keys().take(DELIVERY_CAP_PER_SCAN).cloned().collect();
         for source in retained {
             let message: &String = &pending_messages[&source];

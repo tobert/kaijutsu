@@ -2241,6 +2241,28 @@ no concrete defect; its remaining questions were checked against read-only
 policy lookup, retained worker ownership, and hook-processed result conversion.
 Initial outcome-retention failures remain unfinished work.
 
+The first terminal-outcome write now has a live retry owner. The receipt
+registry retains its immutable serialized result on a SQLite failure; domain
+conflicts cannot replace it. Final receipt-free result reviews use the same
+mechanism. The command runner keeps its admitted receipt through execution, so
+post-execution lookup failure cannot discard capture. The existing worker retries
+up to four oldest attempts per scan, rotating even after lookup failure. Source
+and hooks do not run again. Once SQLite accepts the result, durable projection
+recovery owns it. A poisoned document refuses settlement with a restart-required
+error rather than panicking the retry worker.
+
+Shutdown joins execution, attempts retention again, and reports any results still
+held only in memory. A later shutdown call can finish after storage recovers.
+Operation waits and result-review ledger reads expose retention errors. The SSH
+client sees the failed write, then completed output after the fault is removed.
+Tests cover source execution once, immutable conflicting retries, receipt-free
+review completion, shutdown refusal and retry, fair scans, and poisoned-document
+recovery. Live copies remain volatile until SQLite accepts them; review checkpoint
+faults before terminal retention and prolonged-fault admission pressure remain
+in the inventory. DeepSeek review questioned missing or contradictory receipt
+states; retaining the live owner and refusing clean shutdown is intentional,
+and no receipt-deletion path was found in the kernel.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

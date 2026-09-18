@@ -1598,7 +1598,10 @@ impl BlockStore {
         if content.is_none() && ansi.is_some() {
             return Err(BlockStoreError::Validation("ANSI projection requires replacement text".into()));
         }
-        let mut entry = self.get_mut(context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        let mut entry = self.documents.get_mut(&context_id).ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        if entry.poisoned {
+            return Err(BlockStoreError::Validation(format!("document {context_id} failed acceptance; restart to recover durable state")));
+        }
         self.accept_locked_recorded(context_id, &mut entry, None, |entry| {
             let command = entry.doc.get_block_header(call).ok_or_else(|| BlockStoreError::Validation("tool call is missing".into()))?;
             let output = entry.doc.get_block_snapshot(result).ok_or_else(|| BlockStoreError::Validation("tool result is missing".into()))?;

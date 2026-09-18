@@ -972,9 +972,15 @@ impl KjDispatcher {
                 Some(result) => lines.push(format!("settled_result: {}", serde_json::to_string(result).expect("shell envelope serializes"))),
                 None => lines.push("settled_result: awaiting review processing".into()),
             }
+            let key = match &review.operation_id {
+                Some(id) => crate::shell_operations::RetentionKey::Operation(id.clone()),
+                None => crate::shell_operations::RetentionKey::Review(review.review_id.clone()),
+            };
+            let retention_error = self.kernel().shell_operations().retention_error(&key);
+            if let Some(error) = &retention_error { lines.push(format!("retention_error: {error}")); }
             data["result_review"] = serde_json::json!({
                 "review_id": review.review_id, "operation_id": review.operation_id,
-                "captured": captured, "settled": settled,
+                "captured": captured, "settled": settled, "retention_error": retention_error,
             });
         }
         if show_signals {
