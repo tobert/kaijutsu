@@ -349,13 +349,25 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-09-18 | `kj-hw-1`, `kj-fixgit-1` | not recorded (predates provenance) | deepseek-v4-flash | shipped coder, collaborative, 16K ceiling, multiplier 5 and 2 | 2 (hello-world, fix-git) | 2 | 43K and 1.39M | 0 | 0 | 0 | no verdict line |
 | 2026-09-18 | `kj-calib-1` | `e9802591…` → `c9ad92c4` (dirty) | deepseek-v4-flash | shipped coder, collaborative, 16K ceiling, multiplier 1 | 3 (openssl-selfsigned-cert, regex-log, sqlite-with-gcov) | 1 | 756K | 0 | 0 | 2 | no verdict line |
-| TBD | `kj-tb2-armA-shipped` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | TBD | TBD | TBD | TBD | TBD | TBD |
-| TBD | `kj-tb2-armB-driven` | TBD | deepseek-v4-flash | `coder-driven` overlay, autonomous, 32768 ceiling, multiplier 5 | 20 (tb2-subset) | TBD | TBD | TBD | TBD | TBD | TBD |
+| 2026-09-18 | `kj-tb2-armA-shipped` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | 14 (0.70) | 3.29M | 0 | 0 | 6 | no verdict line in this arm |
+| TBD | `kj-tb2-armB-driven` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | `coder-driven` overlay, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | TBD | TBD | TBD | TBD | TBD | TBD |
+| 2026-09-18 | `ctl-tb2-miniswe` (control) | mini-swe-agent as Harbor installs it | deepseek/deepseek-v4-flash | step limit 100, cost limit $0.25 per task, multiplier 1, ran beside arm A | 20 (tb2-subset) | 18 (0.90) | 1.79M | n/a | n/a | 2 | n/a |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
 failed; `sqlite-with-gcov` ended `iteration_cap` at 50 collaborative
 iterations, with nobody there to send the follow-up it asked for.
+
+How arm A's six losses ended, from `summarize_job.py`: three turns stopped at
+the output ceiling after 4, 9 and 16 inferences (`headless-terminal`,
+`model-extraction-relu-logits`, `raman-fitting`), one reached the 100-iteration
+cap (`dna-assembly`), one failed on a dropped provider stream
+(`db-wal-recovery`), and one hit Harbor's agent timeout (`chess-best-move`).
+The control solved all six of those tasks. Its own two losses,
+`configure-git-webserver` and `query-optimize`, were both solved by arm A. Median time for a solved task was 374 s for arm A and 291 s for the
+control. The control's transcript for `db-wal-recovery` contained the provider
+key, because the model ran `env` and mini-swe-agent's shell inherits the
+process environment; the post-run scan caught it and the file was scrubbed.
 
 ## Known limits
 
