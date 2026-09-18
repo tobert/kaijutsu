@@ -1,12 +1,11 @@
-//! The rc lifecycle run log — "a checklist table of the rc scripts that
-//! ran, snapshotted" (Amy, filing this crate: the concrete incident this
-//! answers is a morning where an assistant seat's startup rc scripts
-//! silently never ran, and nothing recorded that — a durable run log would
-//! have made it visible on run one instead of by review).
+//! Durable records for rc lifecycle runs and their scripts.
 //!
-//! Loosely coupled to the approval side of this crate: an `approvals` row
-//! may optionally point at the `rc_run_id` it happened during
-//! (`approvals.rc_run_id`), but `rc_runs` has no opinion about approvals.
+//! A script is begun before execution, then retains its result and records
+//! its context-log projection. A run finishes only after its begun scripts
+//! are settled.
+//!
+//! An approval may refer to an rc run, but this module does not require an
+//! approval to exist.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -27,7 +26,7 @@ pub fn start_run(conn: &Connection, context_id: &[u8], context_type: &str, verb:
 /// Mark a run finished. Fails loudly on a run that's already finished
 /// (same reasoning as a decided approval: outcome doesn't silently
 /// change) rather than overwriting `finished_at`/`outcome`.
-pub fn finish_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result<()> {
+fn finish_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result<()> {
     let now = crate::time::now_millis();
     let rows = conn.execute(
         "UPDATE rc_runs SET finished_at = ?1, outcome = ?2 WHERE run_id = ?3 AND finished_at IS NULL",
@@ -42,13 +41,8 @@ pub fn finish_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result
     }
 }
 
-/// Record how many scripts this run intends to execute, once its script
-/// list has been loaded (before any of them run). Refuses a second write
-/// loudly rather than overwriting it (same immutability spirit as
-/// `finish_run`'s outcome): `script_count` is set exactly once per run, and
-/// a reader compares recorded `rc_run_scripts` rows against it to tell a
-/// run cancelled part-way from a run where a script actually failed — a
-/// silently-changing target would defeat that comparison.
+/// Record the discovered script count once, before any source executes.
+/// Fewer begun script rows mean the run stopped before attempting the full set.
 pub fn set_run_script_count(conn: &Connection, run_id: &str, count: usize) -> Result<()> {
     let count = i64::try_from(count).expect("a run's script_count fits in i64");
     let rows = conn.execute(
@@ -69,33 +63,24 @@ pub fn set_run_script_count(conn: &Connection, run_id: &str, count: usize) -> Re
 /// actually fire" without already knowing a `run_id` to look up.
 pub fn list_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
     let mut stmt = conn.prepare(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs ORDER BY started_at DESC",
     )?;
     let rows = stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// Filter + page for [`list_runs_filtered`] — `kj ledger runs`'s
-/// `--limit`/`--since`/`--context`/`--verb`. [`list_runs`] above stays
-/// unfiltered/unbounded for its existing caller (`kj rc` lifecycle
-/// bookkeeping in `kaijutsu-kernel`); this struct is the CLI's own query,
-/// kept separate so that caller's signature never has to change.
+/// Filters and pagination for [`list_runs_filtered`].
 #[derive(Debug, Clone, Default)]
 pub struct RunListFilter {
     pub context_id: Option<Vec<u8>>,
     pub verb: Option<String>,
-    /// `started_at >= since_ms`, if set — an absolute epoch-ms cutoff the
-    /// caller resolves against "now" before calling in (same convention
-    /// as [`crate::ask::AskListFilter::since_ms`]).
+    /// Include runs started at or after this epoch-millisecond cutoff.
     pub since_ms: Option<i64>,
     pub limit: i64,
 }
 
-/// Run `filter` against `rc_runs`, newest-started first, and return the
-/// page plus the COUNT of every matching row before `LIMIT` — the number
-/// `kj ledger runs` needs to say "showing N of TOTAL" when a listing was
-/// cut (same reasoning as [`crate::ask::list_asks_filtered`]'s doc).
+/// Return the newest matching page and the count before the limit.
 pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(Vec<RcRunRow>, i64)> {
     use rusqlite::types::Value;
 
@@ -122,7 +107,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
         conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
 
     let select_sql = format!(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs {where_clause} ORDER BY started_at DESC LIMIT ?"
     );
     let mut select_params = params;
@@ -136,7 +121,7 @@ pub fn list_runs_filtered(conn: &Connection, filter: &RunListFilter) -> Result<(
 
 pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RcRunRow>> {
     conn.query_row(
-        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
          FROM rc_runs WHERE run_id = ?1",
         params![run_id],
         row_to_run,
@@ -163,53 +148,253 @@ fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RcRunRow> {
         finished_at: row.get(5)?,
         outcome,
         script_count: row.get(7)?,
+        intended_outcome: row
+            .get::<_, Option<String>>(8)?
+            .map(|raw| parse_enum::<RcOutcome>("intended_outcome", &raw))
+            .transpose()
+            .map_err(|e| match e {
+                LedgerError::Db(inner) => inner,
+                other => rusqlite::Error::InvalidColumnType(8, other.to_string(), rusqlite::types::Type::Text),
+            })?,
     })
 }
 
-/// Store a script body content-addressed (same pattern as `hook_scripts`
-/// in `kernel_db.rs` and `approval_statements` in this crate): identical text
-/// across many runs stores once. Returns the sha256 hex digest, computed
-/// here — callers never supply their own hash, so it can't disagree with
-/// what's actually stored.
-pub fn insert_script_body(conn: &Connection, body: &str) -> Result<String> {
-    let sha256 = hex::encode_sha256(body.as_bytes());
-    conn.execute(
-        "INSERT INTO script_bodies (sha256, body) VALUES (?1, ?2)
-         ON CONFLICT(sha256) DO NOTHING",
-        params![sha256, body],
-    )?;
-    Ok(sha256)
-}
-
-/// Record one script's execution within a run, in order.
-///
-/// `started_at` must be captured by the caller *before* the script runs —
-/// not left to the `rc_run_scripts.started_at` SQL `DEFAULT`, which fires
-/// at INSERT time and is therefore always at or after `finished_at` (the
-/// script has already finished by the time anything calls this function).
-/// The schema `DEFAULT` stays in place as a backstop for any other writer,
-/// but this is the one caller and it always supplies an explicit value.
-pub fn record_run_script(
+/// Persist a script body and its ordered start record before executing it.
+pub fn begin_run_script(
     conn: &Connection,
     run_id: &str,
     path: &str,
-    body_sha256: &str,
-    exit_code: Option<i64>,
+    body: &str,
     started_at: i64,
-    finished_at: Option<i64>,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO rc_run_scripts (run_id, seq, path, body_sha256, exit_code, started_at, finished_at)
-         VALUES (?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM rc_run_scripts WHERE run_id = ?1),
-                 ?2, ?3, ?4, ?5, ?6)",
-        params![run_id, path, body_sha256, exit_code, started_at, finished_at],
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let run = tx
+        .query_row(
+            "SELECT finished_at, script_count, intended_outcome FROM rc_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((finished_at, script_count, intended_outcome)) = run else {
+        return Err(LedgerError::RunNotFound(run_id.to_string()));
+    };
+    if finished_at.is_some() {
+        return Err(LedgerError::RunAlreadyFinished(run_id.to_string()));
+    }
+    if intended_outcome.is_some() {
+        return Err(LedgerError::RunSettlementStarted(run_id.to_string()));
+    }
+    let Some(script_count) = script_count else {
+        return Err(LedgerError::RunScriptCountUnset(run_id.to_string()));
+    };
+    let seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM rc_run_scripts WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
     )?;
-    Ok(())
+    if seq >= script_count {
+        return Err(LedgerError::RunScriptCountReached { run_id: run_id.to_string(), script_count });
+    }
+    let body_sha256 = hex::encode_sha256(body.as_bytes());
+    tx.execute(
+        "INSERT INTO script_bodies (sha256, body) VALUES (?1, ?2)
+         ON CONFLICT(sha256) DO NOTHING",
+        params![body_sha256, body],
+    )?;
+    tx.execute(
+        "INSERT INTO rc_run_scripts (run_id, seq, path, body_sha256, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_id, seq, path, body_sha256, started_at],
+    )?;
+    tx.commit()?;
+    Ok(seq)
+}
+
+/// Retain one script's opaque execution result before projecting output.
+/// A retry with the same result and exit code does not change the row.
+pub fn retain_run_script_result(
+    conn: &Connection,
+    run_id: &str,
+    seq: i64,
+    result_json: &str,
+    exit_code: Option<i64>,
+    finished_at: i64,
+) -> Result<bool> {
+    let rows = conn.execute(
+        "UPDATE rc_run_scripts SET result_json = ?1, exit_code = ?2, finished_at = ?3
+         WHERE run_id = ?4 AND seq = ?5 AND result_json IS NULL
+           AND EXISTS (SELECT 1 FROM rc_runs WHERE run_id = ?4 AND finished_at IS NULL)",
+        params![result_json, exit_code, finished_at, run_id, seq],
+    )?;
+    if rows > 0 {
+        return Ok(true);
+    }
+    let run = get_run(conn, run_id)?.ok_or_else(|| LedgerError::RunNotFound(run_id.to_string()))?;
+    let existing = conn
+        .query_row(
+            "SELECT result_json, exit_code FROM rc_run_scripts WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| LedgerError::RunScriptNotFound { run_id: run_id.to_string(), seq })?;
+    if let Some(existing_json) = existing.0 {
+        if existing_json == result_json && existing.1 == exit_code {
+            return Ok(false);
+        }
+        return Err(LedgerError::RunScriptResultConflict { run_id: run_id.to_string(), seq });
+    }
+    if run.finished_at.is_some() {
+        return Err(LedgerError::RunAlreadyFinished(run_id.to_string()));
+    }
+    Err(LedgerError::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
+/// Record the context-log projection of a retained script result.
+pub fn mark_run_script_projected(
+    conn: &Connection,
+    run_id: &str,
+    seq: i64,
+    output_block_id: Option<&str>,
+    projected_at: i64,
+) -> Result<bool> {
+    let rows = conn.execute(
+        "UPDATE rc_run_scripts SET output_block_id = ?1, projected_at = ?2
+         WHERE run_id = ?3 AND seq = ?4 AND result_json IS NOT NULL AND projected_at IS NULL
+           AND EXISTS (SELECT 1 FROM rc_runs WHERE run_id = ?3 AND finished_at IS NULL)",
+        params![output_block_id, projected_at, run_id, seq],
+    )?;
+    if rows > 0 {
+        return Ok(true);
+    }
+    let run = get_run(conn, run_id)?.ok_or_else(|| LedgerError::RunNotFound(run_id.to_string()))?;
+    let script = conn
+        .query_row(
+            "SELECT result_json, projected_at, output_block_id FROM rc_run_scripts WHERE run_id = ?1 AND seq = ?2",
+            params![run_id, seq],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| LedgerError::RunScriptNotFound { run_id: run_id.to_string(), seq })?;
+    if script.0.is_none() {
+        return Err(LedgerError::RunScriptResultNotRetained { run_id: run_id.to_string(), seq });
+    }
+    if script.1.is_some() {
+        if script.2.as_deref() == output_block_id {
+            return Ok(false);
+        }
+        return Err(LedgerError::RunScriptProjectionConflict { run_id: run_id.to_string(), seq });
+    }
+    if run.finished_at.is_some() {
+        return Err(LedgerError::RunAlreadyFinished(run_id.to_string()));
+    }
+    Err(LedgerError::Db(rusqlite::Error::QueryReturnedNoRows))
+}
+
+/// List runs that have not reached a terminal outcome.
+pub fn list_unfinished_runs(conn: &Connection) -> Result<Vec<RcRunRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count, intended_outcome
+         FROM rc_runs WHERE finished_at IS NULL ORDER BY started_at DESC",
+    )?;
+    Ok(stmt.query_map([], row_to_run)?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// List retained results that still need a context-log projection.
+pub fn list_pending_script_projections(conn: &Connection) -> Result<Vec<(RcRunRow, RcRunScriptRow)>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.run_id, r.context_id, r.context_type, r.verb, r.started_at, r.finished_at, r.outcome, r.script_count, r.intended_outcome,
+                s.seq, s.path, s.body_sha256, s.exit_code, s.started_at, s.finished_at, s.result_json, s.projected_at, s.output_block_id
+         FROM rc_runs r JOIN rc_run_scripts s ON s.run_id = r.run_id
+         WHERE s.result_json IS NOT NULL AND s.projected_at IS NULL
+         ORDER BY r.started_at DESC, s.seq",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let run = row_to_run(row)?;
+            Ok((
+                run,
+                RcRunScriptRow {
+                    seq: row.get(9)?,
+                    path: row.get(10)?,
+                    body_sha256: row.get(11)?,
+                    exit_code: row.get(12)?,
+                    started_at: row.get(13)?,
+                    finished_at: row.get(14)?,
+                    result_json: row.get(15)?,
+                    projected_at: row.get(16)?,
+                    output_block_id: row.get(17)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Finish a run only after every begun script has both durable settlement
+/// records. Failed and abandoned runs may have begun fewer scripts than the
+/// recorded script count; an ok run may not.
+pub fn finish_settled_run(conn: &Connection, run_id: &str, outcome: RcOutcome) -> Result<()> {
+    conn.execute(
+        "UPDATE rc_runs SET intended_outcome = ?1
+         WHERE run_id = ?2 AND finished_at IS NULL AND intended_outcome IS NULL",
+        params![outcome.as_str(), run_id],
+    )?;
+    let run = get_run(conn, run_id)?.ok_or_else(|| LedgerError::RunNotFound(run_id.to_string()))?;
+    if run.finished_at.is_some() {
+        return Err(LedgerError::RunAlreadyFinished(run_id.to_string()));
+    }
+    if let Some(recorded) = run.intended_outcome {
+        if recorded != outcome {
+            return Err(LedgerError::RunIntendedOutcomeConflict {
+                run_id: run_id.to_string(),
+                recorded: recorded.as_str().to_string(),
+                requested: outcome.as_str().to_string(),
+            });
+        }
+    } else {
+        return Err(LedgerError::Db(rusqlite::Error::QueryReturnedNoRows));
+    }
+    let unsettled: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM rc_run_scripts
+         WHERE run_id = ?1 AND (result_json IS NULL OR projected_at IS NULL)",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    if unsettled > 0 {
+        return Err(LedgerError::RunNotSettled(run_id.to_string()));
+    }
+    if outcome == RcOutcome::Ok {
+        let Some(script_count) = run.script_count else {
+            return Err(LedgerError::RunNotSettled(run_id.to_string()));
+        };
+        let begun: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rc_run_scripts WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if begun != script_count {
+            return Err(LedgerError::RunNotSettled(run_id.to_string()));
+        }
+    }
+    finish_run(conn, run_id, outcome)
 }
 
 pub fn list_run_scripts(conn: &Connection, run_id: &str) -> Result<Vec<RcRunScriptRow>> {
     let mut stmt = conn.prepare(
-        "SELECT seq, path, body_sha256, exit_code, started_at, finished_at
+        "SELECT seq, path, body_sha256, exit_code, started_at, finished_at, result_json, projected_at, output_block_id
          FROM rc_run_scripts WHERE run_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt
@@ -221,16 +406,17 @@ pub fn list_run_scripts(conn: &Connection, run_id: &str) -> Result<Vec<RcRunScri
                 exit_code: row.get(3)?,
                 started_at: row.get(4)?,
                 finished_at: row.get(5)?,
+                result_json: row.get(6)?,
+                projected_at: row.get(7)?,
+                output_block_id: row.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// A tiny local shim so `insert_script_body` reads as "hex-encode a
-/// sha256" at the call site without pulling in the `hex` crate for one
-/// line — `sha2::Sha256` + `format!("{:x}", ...)` already gives lowercase
-/// hex.
+/// A tiny local shim for the script-body digest without pulling in the
+/// `hex` crate for one line.
 mod hex {
     use super::{Digest, Sha256};
 
@@ -246,6 +432,10 @@ mod hex {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use rusqlite::hooks::{AuthAction, Authorization};
+
     use crate::fixtures::open_memory;
 
     use super::*;
@@ -259,7 +449,8 @@ mod tests {
         assert!(row.finished_at.is_none());
         assert!(row.outcome.is_none());
 
-        finish_run(&conn, &run_id, RcOutcome::Ok).unwrap();
+        set_run_script_count(&conn, &run_id, 0).unwrap();
+        finish_settled_run(&conn, &run_id, RcOutcome::Ok).unwrap();
         let row = get_run(&conn, &run_id).unwrap().unwrap();
         assert!(row.finished_at.is_some());
         assert_eq!(row.outcome, Some(RcOutcome::Ok));
@@ -268,15 +459,16 @@ mod tests {
     #[test]
     fn finishing_an_unknown_run_is_not_found() {
         let conn = open_memory();
-        assert!(matches!(finish_run(&conn, "nope", RcOutcome::Ok).unwrap_err(), LedgerError::RunNotFound(_)));
+        assert!(matches!(finish_settled_run(&conn, "nope", RcOutcome::Ok).unwrap_err(), LedgerError::RunNotFound(_)));
     }
 
     #[test]
     fn finishing_twice_is_refused_not_overwritten() {
         let conn = open_memory();
         let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
-        finish_run(&conn, &run_id, RcOutcome::Ok).unwrap();
-        let err = finish_run(&conn, &run_id, RcOutcome::Failed).unwrap_err();
+        set_run_script_count(&conn, &run_id, 0).unwrap();
+        finish_settled_run(&conn, &run_id, RcOutcome::Ok).unwrap();
+        let err = finish_settled_run(&conn, &run_id, RcOutcome::Failed).unwrap_err();
         assert!(matches!(err, LedgerError::RunAlreadyFinished(_)));
         // Still `ok` — the second call's `Failed` must not have landed.
         assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().outcome, Some(RcOutcome::Ok));
@@ -318,7 +510,8 @@ mod tests {
         let first = start_run(&conn, b"ctx-a", "coder", "create").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2)); // distinct started_at
         let second = start_run(&conn, b"ctx-b", "musician", "fork").unwrap();
-        finish_run(&conn, &first, RcOutcome::Ok).unwrap();
+        set_run_script_count(&conn, &first, 0).unwrap();
+        finish_settled_run(&conn, &first, RcOutcome::Ok).unwrap();
 
         let runs = list_runs(&conn).unwrap();
         let ids: Vec<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
@@ -336,9 +529,12 @@ mod tests {
     #[test]
     fn identical_script_bodies_dedupe_to_one_row() {
         let conn = open_memory();
-        let a = insert_script_body(&conn, "echo hi").unwrap();
-        let b = insert_script_body(&conn, "echo hi").unwrap();
-        assert_eq!(a, b);
+        let first = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        let second = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &first, 1).unwrap();
+        set_run_script_count(&conn, &second, 1).unwrap();
+        begin_run_script(&conn, &first, "S00.kai", "echo hi", 1).unwrap();
+        begin_run_script(&conn, &second, "S00.kai", "echo hi", 1).unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM script_bodies", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
     }
@@ -347,10 +543,9 @@ mod tests {
     fn run_scripts_round_trip_in_order() {
         let conn = open_memory();
         let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
-        let sha_a = insert_script_body(&conn, "S00-stance.kai body").unwrap();
-        let sha_b = insert_script_body(&conn, "S10-tools.kai body").unwrap();
-        record_run_script(&conn, &run_id, "S00-stance.kai", &sha_a, Some(0), 1, Some(2)).unwrap();
-        record_run_script(&conn, &run_id, "S10-tools.kai", &sha_b, Some(0), 3, Some(4)).unwrap();
+        set_run_script_count(&conn, &run_id, 2).unwrap();
+        begin_run_script(&conn, &run_id, "S00-stance.kai", "S00-stance.kai body", 1).unwrap();
+        begin_run_script(&conn, &run_id, "S10-tools.kai", "S10-tools.kai body", 3).unwrap();
 
         let scripts = list_run_scripts(&conn, &run_id).unwrap();
         assert_eq!(scripts.len(), 2);
@@ -364,27 +559,17 @@ mod tests {
     /// `finished_at`, and a script that takes measurable time must record a
     /// `started_at` measurably before its `finished_at`.
     ///
-    /// Before the fix, `record_run_script` didn't accept a `started_at` at
-    /// all — the SQL `DEFAULT` on `rc_run_scripts.started_at` fired at
-    /// *insert* time, which is necessarily after the caller already
-    /// captured `finished_at` (the script already ran by the time anyone
-    /// calls this function). This test pins the real ordering: capture
-    /// `finished_at`, let measurable time pass, THEN call the recording
-    /// function — reproducing exactly the shape of the bug (insert
-    /// happens strictly after the timestamp the caller is trying to
-    /// record against) instead of relying on it showing up at ms
-    /// resolution by chance, which is why it was hidden in production.
     #[test]
     fn started_at_is_measurably_before_finished_at() {
         let conn = open_memory();
         let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
-        let sha = insert_script_body(&conn, "S00-stance.kai body").unwrap();
+        set_run_script_count(&conn, &run_id, 1).unwrap();
 
         let started_at = crate::time::now_millis();
+        begin_run_script(&conn, &run_id, "S00-stance.kai", "S00-stance.kai body", started_at).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50)); // measurable script runtime
         let finished_at = crate::time::now_millis();
-
-        record_run_script(&conn, &run_id, "S00-stance.kai", &sha, Some(0), started_at, Some(finished_at)).unwrap();
+        retain_run_script_result(&conn, &run_id, 0, "ok", Some(0), finished_at).unwrap();
 
         let scripts = list_run_scripts(&conn, &run_id).unwrap();
         assert_eq!(scripts.len(), 1);
@@ -402,6 +587,145 @@ mod tests {
             row.started_at,
             recorded_finished_at
         );
+    }
+
+    #[test]
+    fn a_script_is_begun_before_execution_and_settled_in_two_durable_steps() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &run_id, 1).unwrap();
+
+        assert_eq!(begin_run_script(&conn, &run_id, "S00.kai", "echo ready", 10).unwrap(), 0);
+        let script = &list_run_scripts(&conn, &run_id).unwrap()[0];
+        let body_sha256: String = conn
+            .query_row("SELECT body_sha256 FROM rc_run_scripts WHERE run_id = ?1 AND seq = 0", params![run_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(script.body_sha256, body_sha256);
+        assert_eq!(script.result_json, None);
+
+        assert!(retain_run_script_result(&conn, &run_id, 0, r#"{\"completed\":true}"#, Some(0), 20).unwrap());
+        assert!(mark_run_script_projected(&conn, &run_id, 0, Some("block-1"), 30).unwrap());
+        let script = &list_run_scripts(&conn, &run_id).unwrap()[0];
+        assert_eq!(script.result_json.as_deref(), Some(r#"{\"completed\":true}"#));
+        assert_eq!(script.exit_code, Some(0));
+        assert_eq!(script.finished_at, Some(20));
+        assert_eq!(script.projected_at, Some(30));
+        assert_eq!(script.output_block_id.as_deref(), Some("block-1"));
+    }
+
+    #[test]
+    fn retained_results_and_projections_are_idempotent_but_conflicts_fail() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &run_id, 1).unwrap();
+        begin_run_script(&conn, &run_id, "S00.kai", "echo ready", 10).unwrap();
+
+        assert!(retain_run_script_result(&conn, &run_id, 0, "first", Some(0), 20).unwrap());
+        assert!(!retain_run_script_result(&conn, &run_id, 0, "first", Some(0), 99).unwrap());
+        assert!(matches!(
+            retain_run_script_result(&conn, &run_id, 0, "second", Some(0), 20).unwrap_err(),
+            LedgerError::RunScriptResultConflict { .. }
+        ));
+        assert!(mark_run_script_projected(&conn, &run_id, 0, None, 30).unwrap());
+        assert!(!mark_run_script_projected(&conn, &run_id, 0, None, 99).unwrap());
+        assert!(matches!(
+            mark_run_script_projected(&conn, &run_id, 0, Some("other"), 30).unwrap_err(),
+            LedgerError::RunScriptProjectionConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn result_retention_does_not_overwrite_a_writer_that_commits_after_its_read() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_owned();
+        let setup = Connection::open(&path).unwrap();
+        crate::migrate(&setup).unwrap();
+        let run_id = start_run(&setup, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&setup, &run_id, 1).unwrap();
+        begin_run_script(&setup, &run_id, "S00.kai", "echo ready", 10).unwrap();
+        drop(setup);
+
+        let entered_update = Arc::new(Barrier::new(2));
+        let release_update = Arc::new(Barrier::new(2));
+        let thread_run = run_id.clone();
+        let thread_path = path.clone();
+        let entered = Arc::clone(&entered_update);
+        let release = Arc::clone(&release_update);
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(thread_path).unwrap();
+            conn.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Update { table_name, column_name }
+                    if table_name == "rc_run_scripts" && column_name == "result_json")
+                {
+                    entered.wait();
+                    release.wait();
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+            retain_run_script_result(&conn, &thread_run, 0, "late", Some(0), 20)
+        });
+
+        entered_update.wait();
+        let winner = Connection::open(&path).unwrap();
+        winner.execute(
+            "UPDATE rc_run_scripts SET result_json = 'first', exit_code = 0, finished_at = 15
+             WHERE run_id = ?1 AND seq = 0",
+            params![run_id],
+        ).unwrap();
+        release_update.wait();
+
+        assert!(matches!(writer.join().unwrap().unwrap_err(), LedgerError::RunScriptResultConflict { .. }));
+        let script = list_run_scripts(&winner, &run_id).unwrap().pop().unwrap();
+        assert_eq!(script.result_json.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn settled_finish_requires_every_ok_script_and_no_unsettled_begin() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &run_id, 2).unwrap();
+        begin_run_script(&conn, &run_id, "S00.kai", "one", 10).unwrap();
+        assert!(matches!(finish_settled_run(&conn, &run_id, RcOutcome::Failed).unwrap_err(), LedgerError::RunNotSettled(_)));
+        assert_eq!(get_run(&conn, &run_id).unwrap().unwrap().intended_outcome, Some(RcOutcome::Failed));
+        assert!(matches!(
+            begin_run_script(&conn, &run_id, "S10.kai", "two", 11).unwrap_err(),
+            LedgerError::RunSettlementStarted(_)
+        ));
+        assert!(matches!(
+            finish_settled_run(&conn, &run_id, RcOutcome::Abandoned).unwrap_err(),
+            LedgerError::RunIntendedOutcomeConflict { .. }
+        ));
+        retain_run_script_result(&conn, &run_id, 0, "failed", Some(1), 20).unwrap();
+        mark_run_script_projected(&conn, &run_id, 0, None, 30).unwrap();
+        finish_settled_run(&conn, &run_id, RcOutcome::Failed).unwrap();
+
+        let ok_run = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &ok_run, 2).unwrap();
+        begin_run_script(&conn, &ok_run, "S00.kai", "one", 10).unwrap();
+        retain_run_script_result(&conn, &ok_run, 0, "ok", Some(0), 20).unwrap();
+        mark_run_script_projected(&conn, &ok_run, 0, None, 30).unwrap();
+        assert!(matches!(finish_settled_run(&conn, &ok_run, RcOutcome::Ok).unwrap_err(), LedgerError::RunNotSettled(_)));
+    }
+
+    #[test]
+    fn unfinished_and_pending_projection_lists_expose_recovery_work() {
+        let conn = open_memory();
+        let run_id = start_run(&conn, b"ctx", "coder", "create").unwrap();
+        set_run_script_count(&conn, &run_id, 1).unwrap();
+        begin_run_script(&conn, &run_id, "S00.kai", "one", 10).unwrap();
+        retain_run_script_result(&conn, &run_id, 0, "ok", Some(0), 20).unwrap();
+
+        assert_eq!(list_unfinished_runs(&conn).unwrap().iter().map(|run| &run.run_id).collect::<Vec<_>>(), vec![&run_id]);
+        let pending = list_pending_script_projections(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.run_id, run_id);
+        assert_eq!(pending[0].1.seq, 0);
+
+        mark_run_script_projected(&conn, &run_id, 0, None, 30).unwrap();
+        finish_settled_run(&conn, &run_id, RcOutcome::Ok).unwrap();
+        assert!(list_unfinished_runs(&conn).unwrap().is_empty());
+        assert!(list_pending_script_projections(&conn).unwrap().is_empty());
     }
 
     // ── `list_runs_filtered` (kj ledger runs --limit/--since/--context/--verb) ──

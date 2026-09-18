@@ -2566,6 +2566,51 @@ tests, 29 kernel integration tests, and workspace all-targets checking. Emitted
 help was read from the current clap command tree. No deployment or reseed was
 performed.
 
+
+Rc now records each script's body and begun state before execution, then retains
+the complete returned kaish result before projecting its output. The old runner
+warned and continued after bookkeeping failures and discarded all but a 4 KiB
+tail, including on success. Regressions exposed both behaviors. Returned stdout,
+stderr, binary and structured data, original exit, MIME type, and spill metadata
+now remain in the existing run ledger. Kaish's upstream internal output limit
+still applies; rc no longer adds another lossy capture step.
+
+Output blocks, ANSI provenance, and the script's projection marker commit in
+one journal transaction. A live owner retries failed result writes; durable
+pending projections survive restart. Recovery never executes source or starts
+later scripts. An interrupted script with no captured result becomes explicitly
+uncertain; a run without retained finish intent becomes abandoned. Legacy records keep their known exit and
+timestamp without inventing output. Failed journal transactions still require
+document recovery. Shutdown reports unresolved settlement instead of claiming
+that accepted work finished cleanly. The real-script fault test caught a retry
+reading the poisoned document's tail before the checked write; append positioning
+now happens under the same document guard, so shutdown returns the unresolved
+fault and restart can recover.
+
+Lifecycle callers report the context or drift delivery already committed and
+stop later turn/provider admission when rc infrastructure fails. Normal script
+nonzero exits retain their existing continue-to-the-next-script behavior.
+`kj ledger runs <id>` exposes retained results and pending settlement; guarded
+ledger writes preserve the first accepted result across retries and competing
+database connections. Tests use denied host execution, builtin waits, and a
+real kernel and SSH client for output and ledger reads.
+
+Validation passed on top of the eight incoming benchmark/solo-ACP commits:
+176 approval-ledger tests, 3,277 kernel unit tests (6 ignored), 31 kernel
+integration tests, 156 MCP tests, 478 server tests, and one kernel doctest
+(3 ignored). The actual-client cases include complete rc output, retained
+ledger data, nested cancellation, disconnect/archive survival, and musical
+commitment. Emitted `kj ledger runs --help` was read and its structured result
+was decoded by the SSH test. Workspace all-targets and diff checks passed.
+No deployment or reseed was performed.
+
+Kaibo/DeepSeek Flash reviewed the source (45,559 input / 2,600 output tokens).
+The response hit its cap while reconsidering its own claims. Local verification
+found no reachable runtime defect in those claims; the poisoned-document retry
+bug came from the separate fault test and was fixed afterward. The packet,
+response, and disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/rc-settlement-*`.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

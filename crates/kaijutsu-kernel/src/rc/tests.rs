@@ -407,13 +407,13 @@
             )
             .await;
         assert!(
-            result.is_ok(),
-            "create preserves its diagnostic context: {}",
+            !result.is_ok(),
+            "failed discovery must report the retained diagnostic context: {}",
             result.message()
         );
         assert!(
-            result.message().contains("WARNING") && result.message().contains("no loadout"),
-            "creation must report the inert result and repair: {}",
+            result.message().contains("committed") && result.message().contains("S00-broken.kai"),
+            "creation must name committed state and the lifecycle fault: {}",
             result.message()
         );
         let new_id = lookup_context_id(&d, "ctx-broken-link");
@@ -508,6 +508,144 @@
             "escape-free rc output must not write a provenance row"
         );
     }
+
+    #[test]
+    fn rc_retains_both_streams_beyond_the_diagnostic_tail() {
+        crate::spawn_kaish_thread("rc-output-test", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(rc_retains_both_streams_beyond_the_diagnostic_tail_body());
+        }).unwrap().join().unwrap();
+    }
+
+    async fn rc_retains_both_streams_beyond_the_diagnostic_tail_body() {
+        for failed in [false, true] {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let context = register_context(&d, Some("full-rc-output"), None, PrincipalId::new());
+            set_context_type(&d, context, "full-output");
+            let stdout = format!("stdout-first-{}-stdout-last", "音".repeat(3000));
+            let stderr = format!("stderr-first-{}-stderr-last", "err".repeat(3000));
+            let ending = if failed { "false" } else { "true" };
+            install_rc_script_file(&d, "/config/rc/full-output/create/S00-output.kai",
+                &format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2; {ending}")).await;
+            let admission = admit(&d, context);
+            crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(context))
+                .await.unwrap();
+            let blocks = d.block_store().block_snapshots(context).unwrap();
+            let capture = blocks.iter().find(|block| block.kind == if failed { BlockKind::Error } else { BlockKind::Trace })
+                .expect("rc output must be retained");
+            assert!(capture.content.contains(&stdout), "complete stdout must survive rc capture (failed={failed})");
+            assert!(capture.content.contains(&stderr), "complete stderr must survive rc capture (failed={failed})");
+        }
+    }
+
+    #[test]
+    fn rc_settlement_fault_retains_output_and_never_repeats_source() {
+        crate::spawn_kaish_thread("rc-settlement-test", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(async {
+                    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+                    for column in ["result_json", "projected_at"] {
+                        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+                        d.set_self_arc();
+                        let context = register_context(&d, Some("rc-settlement-fault"), None, PrincipalId::new());
+                        set_context_type(&d, context, "settlement-fault");
+                        install_rc_script_file(&d, "/config/rc/settlement-fault/create/S00-once.kai",
+                            "kj block create --role system --kind text --content executed-once; while test ! -e /config/rc/release-output; do sleep 0.01; done; echo retained-after-storage-fault").await;
+                        install_rc_script_file(&d, "/config/rc/settlement-fault/create/S10-later.kai",
+                            "kj block create --role system --kind text --content later-must-not-run").await;
+                        let admission = admit(&d, context);
+                        let caller = caller_with_context(context);
+                        let run = crate::rc::run(&d, test_invocation("create", &admission), &caller);
+                        tokio::pin!(run);
+                        let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            loop {
+                                tokio::select! {
+                                    result = &mut run => panic!("rc ended before fault injection: {result:?}"),
+                                    _ = inspect.tick() => {
+                                        if block_contents_in(&d, context).iter().any(|body| body == "executed-once") { break; }
+                                    }
+                                }
+                            }
+                        }).await.expect("script must commit its effect before fault injection");
+                        d.kernel_db().lock().conn_for_ledger().authorizer(Some(move |auth: AuthContext<'_>| {
+                            match auth.action {
+                                AuthAction::Update { table_name: "rc_run_scripts", column_name } if column_name == column => Authorization::Deny,
+                                _ => Authorization::Allow,
+                            }
+                        })).unwrap();
+                        install_rc_script_file(&d, "/config/rc/release-output", "release").await;
+                        let result = tokio::time::timeout(std::time::Duration::from_secs(3), &mut run).await.unwrap();
+                        assert!(result.is_err(), "{column} fault must stop the lifecycle");
+                        assert!(d.kernel().shutdown_runtime_worker().await.is_err(), "unsettled output must make shutdown fail");
+                        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                        let contents = if column == "projected_at" {
+                            assert!(d.kernel().shutdown_runtime_worker().await.is_err(),
+                                "a failed block journal transaction requires document recovery");
+                            let db = d.kernel_db().clone();
+                            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+                            let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+                            let recovered = crate::rc::settlement::RcSettlements::new(db, blocks.clone());
+                            recovered.recover().expect("restart projects retained output without execution");
+                            recovered.recover().expect("recovery is idempotent");
+                            blocks.block_snapshots(context).unwrap().into_iter().map(|block| block.content).collect::<Vec<_>>()
+                        } else {
+                            d.kernel().shutdown_runtime_worker().await.expect("repair retries settlement without execution");
+                            d.kernel().shutdown_runtime_worker().await.expect("settlement retry is idempotent");
+                            block_contents_in(&d, context)
+                        };
+                        assert_eq!(contents.iter().filter(|body| *body == "executed-once").count(), 1);
+                        assert_eq!(contents.iter().filter(|body| body.contains("retained-after-storage-fault")).count(), 1);
+                        assert!(!contents.iter().any(|body| body == "later-must-not-run"));
+                        let row = find_run_for_context(&d, context, "create").unwrap();
+                        assert_eq!(row.outcome, Some(RcOutcome::Failed), "retry must preserve the lifecycle's failed settlement");
+                    }
+                });
+        }).unwrap().join().unwrap();
+    }
+
+    fn check_rc_bookkeeping_admission(stage: &'static str) {
+        crate::spawn_kaish_thread("rc-record-test", move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(async move {
+                    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+                    let d = std::sync::Arc::new(test_dispatcher_rc().await);
+                    d.set_self_arc();
+                    let context = register_context(&d, Some("rc-record-refusal"), None, PrincipalId::new());
+                    set_context_type(&d, context, "record-refusal");
+                    install_rc_script_file(&d, "/config/rc/record-refusal/create/S00-mutation.kai",
+                        "kj block create --role system --kind text --content must-not-execute-unrecorded").await;
+                    let admission = admit(&d, context);
+                    d.kernel_db().lock().conn_for_ledger().authorizer(Some(move |auth: AuthContext<'_>| {
+                        let denied = match auth.action {
+                            AuthAction::Insert { table_name } => table_name == stage,
+                            AuthAction::Update { table_name: "rc_runs", column_name: "script_count" } => stage == "script_count",
+                            _ => false,
+                        };
+                        if denied { Authorization::Deny } else { Authorization::Allow }
+                    })).unwrap();
+                    let result = crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(context)).await;
+                    d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                    assert!(result.is_err(), "a {stage} write failure must be returned");
+                    let blocks = d.block_store().block_snapshots(context).unwrap_or_default();
+                    assert!(!blocks.iter().any(|block| block.content == "must-not-execute-unrecorded"),
+                        "{stage} must be durable before source execution");
+                });
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn rc_bookkeeping_start_failure_prevents_execution() { check_rc_bookkeeping_admission("rc_runs"); }
+
+    #[test]
+    fn rc_bookkeeping_count_failure_prevents_execution() { check_rc_bookkeeping_admission("script_count"); }
+
+    #[test]
+    fn rc_bookkeeping_body_failure_prevents_execution() { check_rc_bookkeeping_admission("script_bodies"); }
+
+    #[test]
+    fn rc_bookkeeping_script_failure_prevents_execution() { check_rc_bookkeeping_admission("rc_run_scripts"); }
 
     /// The lifecycle resolves `context_type` before any script runs
     /// (`row.context_type`, read once in `rc::run`) but never
@@ -1235,7 +1373,8 @@
                 &caller,
             )
             .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
+        assert!(!result.is_ok(), "invalid discovery must report partial completion: {}", result.message());
+        assert!(result.message().contains("committed"), "{}", result.message());
 
         let new_id = lookup_context_id(&d, "ctx-stray");
         let kinds = block_kinds_in(&d, new_id);

@@ -149,6 +149,20 @@ These are source observations, not promises that all paths behave alike.
   admitted turns remain retained. A cancelled lifecycle does not admit a later
   fork turn or commit a rotation. Character-root callers preserve session,
   recursion depth, and owner while selecting the new root performer.
+- `rc/settlement.rs` retains each script's complete returned `ExecResult` before
+  projecting its Trace or Error block. The run log records the source and start
+  before execution. A bookkeeping fault stops later scripts; it never retries
+  source. Output bytes, structured data, MIME type, physical exit, spill state,
+  and cancellation remain distinguishable. Diagnostic blocks are plain text;
+  their ANSI spans, original bytes, and projection marker commit atomically.
+  `kj ledger runs <run-id>` exposes retained results and pending settlement.
+  In-memory ownership bridges failed result writes; the existing kernel retries
+  settlement before later rc work and at shutdown. Unresolved writes make
+  shutdown fail. Restart restores pending projections without executing source;
+  a begun script with no retained result records that effects may have occurred
+  and output is unavailable. Interrupted runs without a retained finish intent
+  become `abandoned`; recorded intent remains authoritative. Historical
+  completed script records retain their known exit when output is unavailable.
 - `runtime/rc_lifecycle.rs` queues scheduled tick/rotate work on the existing
   kernel runtime with the scheduler's original admission and transport snapshot.
   The beat thread runs only clock/transport work. Archive and client disconnect
@@ -440,14 +454,14 @@ remove the obsolete API in the same change as its final caller.
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
-| Partial | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; lifecycle bookkeeping faults and output policy still need their audit |
+| Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; durable script admission, full returned results, atomic projections, retry/restart without replay, and truthful committed-state failures |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
 | Partial | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |
 | Pending | Job/receipt readers and controllers | kernel `shell_operations.rs`, `kj/wait.rs`, `kj/context.rs`, runtime job builtins | In-memory jobs and durable receipts keep their distinct lifetimes |
 | Pending | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `ps_builtin`, synthesis | Use kaish's backend/tool interfaces directly where they implement those interfaces |
 | Pending | Gate planning and parsing | `kj/gate*`, `hook_gate`, `shell_gate`, `plan_clauses`, `readonly` | Kaish remains the syntax authority; preserve clause plans and approval semantics |
-| Partial | Tests and fixtures | kernel and server unit/integration tests | SSH and kernel rc fixtures deny host execution by default; explicit subprocess cases opt in; real kernel/SSH and container cases cover resolution and lifecycle; remaining direct-engine fixtures need their contract audit |
+| Migrated | Tests and fixtures | kernel and server unit/integration tests | SSH, kernel rc, and direct interpreter fixtures deny host execution by default; explicit subprocess cases opt in. Direct engine tests cover settlement/cancellation without contextual dispatch; builtin fixtures test their kaish interfaces; gate/parser fixtures only parse or plan. Real kernel/SSH and container tests cover contextual behavior, resolution, and lifecycle. |
 
 This inventory includes support code as well as execution calls. A search for
 `kaish_kernel::` will still find legitimate backend implementations, builtin

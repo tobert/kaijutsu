@@ -1,22 +1,22 @@
 //! Project ANSI output into clean text while retaining its original bytes.
 //!
 //! `project` returns `None` without allocation when no transform is needed.
-//! Command and model-tool settlement commit clean text, spans, provenance,
+//! Command, model-tool, and rc settlement commit clean text, spans, provenance,
 //! and related execution state in one block-journal transaction. A failed
 //! transaction leaves the prior result intact and reports the storage error.
-//!
-//! Rc diagnostic blocks still use `record` after writing clean text. That
-//! separate, best-effort path stores original bytes before attaching a tag;
-//! it does not provide atomic replacement of an existing projection.
 //!
 //! General text edits and model token streams are not ANSI ingest sites.
 //! See `docs/ansi-and-beyond.md`.
 
 use std::borrow::Cow;
 
-use kaijutsu_ansi::{PARSER_VERSION, TRANSFORM_NAME, StyleSpan};
+use kaijutsu_ansi::StyleSpan;
+#[cfg(test)]
+use kaijutsu_ansi::{PARSER_VERSION, TRANSFORM_NAME};
+#[cfg(test)]
 use kaijutsu_types::{BlockId, ContextId};
 
+#[cfg(test)]
 use crate::block_store::BlockStore;
 
 /// The ESC byte that starts every sequence this transform recognizes.
@@ -40,9 +40,9 @@ pub struct AnsiProjection {
 /// would have gone, set no spans, write no provenance row, leave the block
 /// tag-free. That is the common case and it costs one `memchr`.
 ///
-/// `Some` means the block is a projection of something else. Tool settlement
-/// commits its text, spans and original bytes together; other consumers call
-/// [`record`] after writing the clean text.
+/// `Some` means the block is a projection of something else. Settlement
+/// commits its text, spans, original bytes, and related terminal state
+/// together.
 ///
 /// The second guard — escape bytes present, but the projection is
 /// byte-identical with no spans — is the pathological leftover (a lone ESC
@@ -64,7 +64,9 @@ pub(crate) fn is_noop_projection(text: &str, spans: &[StyleSpan], raw: &[u8]) ->
     spans.is_empty() && text.as_bytes() == raw
 }
 
-/// Land the projection on a block that **already holds the clean text**.
+/// Test helper for landing a projection on an existing clean-text block.
+/// Production writers use recorded BlockStore acceptance so content, spans,
+/// provenance, and settlement state commit together.
 ///
 /// Order is load-bearing twice over:
 ///
@@ -73,17 +75,10 @@ pub(crate) fn is_noop_projection(text: &str, spans: &[StyleSpan], raw: &[u8]) ->
 /// 2. The provenance row is written before the tag, so the durable state can
 ///    never claim an original that was not stored.
 ///
-/// Failures are logged, not propagated: a lost span map degrades a block to
-/// unstyled-but-correct, and no ingest path should fail a command because the
-/// styling metadata could not be recorded. The content is already durable by
-/// the time this runs.
-///
-/// On a store with no db (replica stores, most kernel unit tests)
-/// [`BlockStore::store_provenance`] no-ops and the block still gets its spans
-/// and its tag. That is a tag with no row — exactly the gap
-/// docs/ansi-and-beyond.md describes: `kj block original` reports it instead of
-/// inventing bytes, and the CI invariant skips with a warning. Spans are still
-/// worth having, so this does not suppress them.
+/// This helper preserves the older two-step behavior so provenance fixtures
+/// can exercise missing rows and partial metadata. Production settlement must
+/// propagate any storage failure from its atomic transaction.
+#[cfg(test)]
 pub fn record(
     blocks: &BlockStore,
     context_id: ContextId,

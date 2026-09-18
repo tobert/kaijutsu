@@ -118,9 +118,11 @@ Terminal command outcomes are retained first so startup can finish projection
 without repeating execution. Replacing styled output with plain text clears
 its spans and tag.
 
-Rc diagnostics still call `record` after writing clean text. This best-effort
-path stores the original before attaching the tag, but does not commit all
-three together. Its failure policy remains in the rc lifecycle audit.
+Rc script results are retained in the run ledger before projection. Their
+Trace/Error text, ANSI spans, original bytes, and projection marker commit in
+one block-journal transaction. Recovery projects the retained result without
+executing source again. Pre-execution discovery and recursion diagnostics use
+the same atomic block insertion and return storage failures to their caller.
 
 **Current ingest paths.**
 
@@ -132,7 +134,7 @@ three together. Its failure policy remains in the rc lifecycle audit.
 - **One projection policy.** `ansi_ingest::project(raw)` returns clean text
   and spans when a transform is needed. The no-escape fast path allocates
   nothing. Transactional tool settlement stores the original with that
-  projection; rc uses `record`. `raw_stdout(&ExecResult)` reads the original
+  projection, including rc output. `raw_stdout(&ExecResult)` reads the original
   payload bytes because `text_out()` is lossy on the `Bytes` arm.
 - **One completed result has one projection.** An asynchronous operation does
   not interleave stdout and stderr chunks into its output block. Project the

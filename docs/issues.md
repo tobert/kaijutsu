@@ -301,11 +301,16 @@ arbitrary descendant trees after SIGKILL need their own evidence.
 Inline rc now inherits its execution owner through `KjCaller`, and scheduled
 tick/rotate runs on the joined kernel runtime with the original admission proof.
 Cancellation preserves committed work and stops later unadmitted effects.
-Rc run-record failures still log and continue; audit their durability policy
-before considering lifecycle ownership complete. Hook evaluation also needs
-its own cancellation audit: the broker's ledger-only `KjCaller` values do not
-execute commands, and carrying a token on those records alone would not cancel
-hook bodies or join their cleanup.
+Rc stops on run-record or projection faults and retains captured results for
+settlement retry without source replay. Hook execution still loses the caller's
+cancellation token between `Broker::call_tool`, `evaluate_phase`, and
+`run_kaish_hook`; the hook receives its timeout but no owner token. Result-hook
+cancellation drops the active future instead of joining cleanup, and
+`CommandResultReview::wait_inner` does not observe the token it stores.
+Propagate ownership through actual hook execution and test cancellation while
+a builtin wait is active. Add a real hook-timeout test alongside synthetic exit
+classification. The classifier also calls its diagnostic a stderr tail while
+taking the first 512 characters; preserve the documented suffix.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while
@@ -2319,17 +2324,15 @@ resize" cleanup.
 
 ---
 
-## Rc output limiting still hides physical exits
+## Internal output limits and hook verdicts
 
-Rc diagnostics still write clean text before best-effort ANSI provenance and
-spans. Audit that output disposition with rc lifecycle failure policy; command
-and model result settlement now require these writes to commit together.
-
-Rc lifecycle `.kai` execution matches `exec.code == 0` and persists the control
-code in failure records. Audit the distinction between script failure and
-bounded diagnostic stdout: record the physical exit and spill separately.
-Kaish can expose remapped `3` through script `$?`, so changing only the final
-record cannot undo control-flow decisions already made inside a script.
+Rc retains the complete result kaish returned, including physical exit, raw
+bytes, structured data, and spill state. Its output blocks no longer discard
+a second 4 KiB tail, and ANSI projection is atomic with its ledger marker.
+Kaish can still expose remapped `3` through script `$?` when the internal
+4 MiB ceiling is exceeded. Recording the physical exit does not undo those
+control-flow decisions. Scripts needing larger artifacts should write them
+to files rather than print them as diagnostics.
 
 Editor reads explicitly refuse truncated output before splicing. They must
 not accept a successful physical exit as proof that the returned text is

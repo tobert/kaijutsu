@@ -1480,10 +1480,11 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
 
-        // Run rc create-lifecycle scripts after committing the context. A
-        // lifecycle failure retains the context and its Error blocks so
-        // `kj context rebind` can repair a missing loadout.
-        if let Err(e) = crate::rc::run(
+        // Run rc create-lifecycle scripts after committing the context. Script
+        // failures retain their Error blocks. Lifecycle bookkeeping faults
+        // report the committed state; retained settlement retries without
+        // running source. Rebind only repairs a missing loadout.
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 parent: parent_id,
@@ -1491,10 +1492,7 @@ impl KjDispatcher {
             },
             caller,
         )
-            .await
-        {
-            tracing::warn!("rc create lifecycle: {e}");
-        }
+            .await;
 
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
@@ -1502,6 +1500,12 @@ impl KjDispatcher {
                  create lifecycle was cancelled",
                 label,
                 new_id.short()
+            ));
+        }
+        if let Err(e) = lifecycle {
+            return KjResult::Err(format!(
+                "kj context create: context '{}' ({}) was committed, but its rc create lifecycle could not settle: {e}",
+                label, new_id.short()
             ));
         }
 
@@ -2239,19 +2243,21 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel) },
             caller,
         )
-        .await
-        {
-            tracing::warn!("rc create lifecycle for rotation successor: {e}");
-        }
+        .await;
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj context rotate: owner cancelled after creating successor {successor_id}; \
                  {name} stays live"
+            ));
+        }
+        if let Err(e) = lifecycle {
+            return KjResult::Err(format!(
+                "kj context rotate: successor {successor_id} was created, but its rc create lifecycle could not settle; {name} stays live: {e}"
             ));
         }
         match self.has_usable_loadout(successor_id) {
@@ -2971,6 +2977,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_create_reports_rc_admission_write_failure_after_committing_context() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("rc-admission-fault-parent"), None, principal);
+        let c = caller_with_context(parent);
+        {
+            let db = d.kernel_db().lock();
+            db.conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+                AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })).unwrap();
+        }
+
+        let result = d.dispatch(
+            &[s("context"), s("create"), s("rc-admission-fault-child")], &c,
+        ).await;
+        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "rc admission fault must not report a clean create");
+        assert!(result.message().contains("was committed"), "{}", result.message());
+        assert!(result.message().contains("could not settle"), "{}", result.message());
+        assert!(
+            d.kernel_db().lock().find_context_by_label("rc-admission-fault-child").unwrap().is_some(),
+            "the already committed context remains available for diagnosis and rebind"
+        );
+    }
+
+    #[tokio::test]
     async fn context_review_assignment_belongs_to_the_director() {
         let d = test_dispatcher().await;
         let amy_id = test_reviewer_principal();
@@ -3319,6 +3355,26 @@ mod tests {
             }),
             "the committed successor remains available for diagnosis"
         );
+    }
+
+    #[tokio::test]
+    async fn rc_admission_fault_rotation_leaves_predecessor_live() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let f = rotation_fixture().await;
+        let caller = rotation_caller(f.seat, f.banto);
+        f.d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+        let result = f.d.dispatch(&[s("context"), s("rotate")], &caller).await;
+        f.d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "rc admission fault must report a partial rotation");
+        assert!(result.message().contains("stays live"), "{}", result.message());
+        let db = f.d.kernel_db().lock();
+        assert!(db.get_context(f.seat).unwrap().unwrap().archived_at.is_none());
+        assert_eq!(db.resolve_context("banto").unwrap(), f.seat);
     }
 
     #[test]

@@ -802,9 +802,9 @@ impl KjDispatcher {
         // original ContextRow construction defaulted to "default".
         inherit_parent_context_type(self, new_id, source_id);
 
-        // Run rc fork-lifecycle scripts. Failures surface as Error
-        // blocks in the new context — they don't abort the fork.
-        if let Err(e) = crate::rc::run(
+        // Run rc fork-lifecycle scripts. Script failures surface as Error
+        // blocks; a lifecycle bookkeeping fault stops later child admission.
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 parent: Some(source_id),
@@ -813,15 +813,18 @@ impl KjDispatcher {
             },
             caller,
         )
-            .await
-        {
-            tracing::warn!("rc fork lifecycle: {e}");
-        }
+            .await;
 
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj fork: child {} was committed, but its rc lifecycle was cancelled; \
                  no child turn was admitted",
+                new_id.short()
+            ));
+        }
+        if let Err(e) = lifecycle {
+            return KjResult::Err(format!(
+                "kj fork: child {} was committed, but its rc lifecycle could not settle: {e}; no child turn was admitted",
                 new_id.short()
             ));
         }
@@ -1084,7 +1087,7 @@ impl KjDispatcher {
             tracing::warn!("kj fork --compact: failed to inject fork marker: {e}");
         }
 
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 parent: Some(source_id),
@@ -1093,15 +1096,18 @@ impl KjDispatcher {
             },
             caller,
         )
-            .await
-        {
-            tracing::warn!("rc fork lifecycle (compact): {e}");
-        }
+            .await;
 
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj fork --compact: child {} was committed, but its rc lifecycle was \
                  cancelled; no child turn was admitted",
+                new_id.short()
+            ));
+        }
+        if let Err(e) = lifecycle {
+            return KjResult::Err(format!(
+                "kj fork --compact: child {} was committed, but its rc lifecycle could not settle: {e}; no child turn was admitted",
                 new_id.short()
             ));
         }
@@ -1379,7 +1385,7 @@ impl KjDispatcher {
         }
 
         inherit_parent_context_type(self, new_root_id, source_id);
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 parent: Some(source_id),
@@ -1388,15 +1394,18 @@ impl KjDispatcher {
             },
             caller,
         )
-            .await
-        {
-            tracing::warn!("rc fork lifecycle (subtree): {e}");
-        }
+            .await;
 
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj fork --as: subtree root {} was committed, but its rc lifecycle \
                  was cancelled; no child turn was admitted",
+                new_root_id.short()
+            ));
+        }
+        if let Err(e) = lifecycle {
+            return KjResult::Err(format!(
+                "kj fork --as: subtree root {} was committed, but its rc lifecycle could not settle: {e}; no child turn was admitted",
                 new_root_id.short()
             ));
         }
@@ -3240,6 +3249,33 @@ mod tests {
             "the forked child remains committed"
         );
         assert!(sub.try_recv().is_none(), "cancellation must stop the later prompt turn");
+    }
+
+    #[tokio::test]
+    async fn rc_admission_fault_retains_child_without_admitting_prompt_turn() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("rc-fault-parent"), None, principal);
+        d.block_store().create_document(source, crate::DocumentKind::Conversation, None).unwrap();
+        let c = caller_with_context(source);
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+
+        let result = d.dispatch(
+            &[s("fork"), s("--name"), s("rc-fault-child"), s("--prompt"), s("must not start")], &c,
+        ).await;
+        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "rc admission fault must report partial fork");
+        assert!(result.message().contains("was committed"), "{}", result.message());
+        assert!(result.message().contains("no child turn was admitted"), "{}", result.message());
+        assert!(d.kernel_db().lock().find_context_by_label("rc-fault-child").unwrap().is_some());
+        assert!(sub.try_recv().is_none(), "lifecycle fault must stop later prompt admission");
     }
 
     #[tokio::test]

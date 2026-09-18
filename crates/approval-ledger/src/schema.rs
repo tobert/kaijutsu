@@ -755,20 +755,11 @@ BEGIN
 END;
 
 -- ── rc run log (the "checklist of what ran") ────────────────────────
--- One row per rc-lifecycle invocation (create/fork/drift/…) for a
--- context. This is what would have made a silently-inert startup rc
--- sweep visible on run one instead of by incident review — a durable,
--- queryable record of which scripts actually fired, not just that the
--- lifecycle verb was called.
--- `script_count` is how many scripts this run intended to execute, set once
--- the run's script list is loaded (before any of them run) — NULL until
--- then, and forever NULL for a run that failed before reaching that point.
--- It is what lets a reader tell a run cancelled part-way (recorded
--- `rc_run_scripts` rows < `script_count`) apart from a run where a script
--- actually failed (rows == `script_count`, one row's `exit_code` nonzero):
--- both leave `outcome = 'failed'` and are otherwise indistinguishable. See
--- `add_rc_runs_script_count_column_if_missing` below — an already-existing
--- database does not get this column from `CREATE TABLE IF NOT EXISTS` alone.
+-- One row per accepted rc lifecycle. `script_count` records the discovered
+-- source set before execution; fewer script rows mean the run stopped early.
+-- It stays NULL when discovery or its recording fails. `intended_outcome`
+-- freezes the requested finish while captured results or projections remain
+-- unsettled; `outcome` and `finished_at` require those dependencies to settle.
 CREATE TABLE IF NOT EXISTS rc_runs (
     run_id       TEXT    NOT NULL PRIMARY KEY,
     context_id   BLOB    NOT NULL,
@@ -778,16 +769,17 @@ CREATE TABLE IF NOT EXISTS rc_runs (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     finished_at  INTEGER,
     outcome      TEXT,
+    intended_outcome TEXT,
     script_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_rc_runs_context_started
     ON rc_runs(context_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_rc_runs_unfinished_started
+    ON rc_runs(started_at DESC) WHERE finished_at IS NULL;
 
--- One row per script the run executed, in order, pointing at its
--- content-addressed body. CASCADE is correct here (unlike
--- `approval_statement_*` above): a run's script log is wholly owned by
--- that run, not shared across runs the way a statement can be shared
--- across asks.
+-- One row per begun script, committed with its content-addressed body before
+-- execution. A begun row without a retained result cannot prove which effects
+-- occurred. The run owns its script rows; bodies can be shared across runs.
 CREATE TABLE IF NOT EXISTS rc_run_scripts (
     run_id      TEXT    NOT NULL REFERENCES rc_runs(run_id) ON DELETE CASCADE,
     seq         INTEGER NOT NULL,
@@ -797,9 +789,11 @@ CREATE TABLE IF NOT EXISTS rc_run_scripts (
     started_at  INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     finished_at INTEGER,
+    result_json TEXT,
+    projected_at INTEGER,
+    output_block_id TEXT,
     PRIMARY KEY (run_id, seq)
 );
-
 -- Content-addressed rc script bodies (same pattern as `hook_scripts` in
 -- kernel_db.rs and `approval_statements` above): identical script text
 -- across many runs stores once. No cascade target — a body must survive
@@ -828,6 +822,9 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // list, so any column an old database is missing has to exist before
     // that copy runs or the SELECT names a column that is not there.
     add_approvals_columns_if_missing(conn)?;
+    add_rc_runs_script_count_column_if_missing(conn)?;
+    add_rc_runs_intended_outcome_column_if_missing(conn)?;
+    add_rc_run_script_settlement_columns_if_missing(conn)?;
     if drop_legacy_value_enum_checks(conn)? {
         // A rebuilt table's indexes and triggers were dropped along with
         // it. A second `DDL` pass puts them back; every other statement is
@@ -835,7 +832,11 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         // rebuilds nothing and should not pay for a second pass.
         conn.execute_batch(DDL)?;
     }
-    add_rc_runs_script_count_column_if_missing(conn)
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_rc_run_scripts_pending_projection
+         ON rc_run_scripts(run_id, seq) WHERE result_json IS NOT NULL AND projected_at IS NULL;",
+    )?;
+    Ok(())
 }
 
 /// Columns `approvals` gained after it shipped. Same shape and the same
@@ -984,8 +985,9 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
                 DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
             finished_at  INTEGER,
             outcome      TEXT,
+            intended_outcome TEXT,
             script_count INTEGER",
-        columns: "run_id, context_id, context_type, verb, started_at, finished_at, outcome, script_count",
+        columns: "run_id, context_id, context_type, verb, started_at, finished_at, outcome, intended_outcome, script_count",
     },
     ValueEnumRebuildSpec {
         table: "approvals",
@@ -1243,6 +1245,32 @@ fn add_rc_runs_script_count_column_if_missing(conn: &Connection) -> SqliteResult
     Ok(())
 }
 
+fn add_rc_runs_intended_outcome_column_if_missing(conn: &Connection) -> SqliteResult<()> {
+    let has_column = conn
+        .prepare("PRAGMA table_info(rc_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<SqliteResult<Vec<String>>>()?
+        .iter()
+        .any(|name| name == "intended_outcome");
+    if !has_column {
+        conn.execute_batch("ALTER TABLE rc_runs ADD COLUMN intended_outcome TEXT")?;
+    }
+    Ok(())
+}
+
+fn add_rc_run_script_settlement_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(rc_run_scripts)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<SqliteResult<Vec<String>>>()?;
+    for (column, ty) in [("result_json", "TEXT"), ("projected_at", "INTEGER"), ("output_block_id", "TEXT")] {
+        if !existing.iter().any(|name| name == column) {
+            conn.execute_batch(&format!("ALTER TABLE rc_run_scripts ADD COLUMN {column} {ty}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,6 +1329,53 @@ mod tests {
 
         // A second migrate() must not try to add the column again.
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrate_adds_rc_script_settlement_columns_to_an_existing_run_log() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE script_bodies (sha256 TEXT NOT NULL PRIMARY KEY, body TEXT NOT NULL, first_seen_at INTEGER NOT NULL);
+             CREATE TABLE rc_runs (
+                 run_id TEXT NOT NULL PRIMARY KEY, context_id BLOB NOT NULL, context_type TEXT NOT NULL,
+                 verb TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, outcome TEXT, script_count INTEGER
+             );
+             CREATE TABLE rc_run_scripts (
+                 run_id TEXT NOT NULL, seq INTEGER NOT NULL, path TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+                 exit_code INTEGER, started_at INTEGER NOT NULL, finished_at INTEGER, PRIMARY KEY (run_id, seq)
+             );
+             INSERT INTO script_bodies VALUES ('body', 'echo ready', 1);
+             INSERT INTO rc_runs VALUES ('run', X'01', 'coder', 'create', 1, NULL, NULL, 1);
+             INSERT INTO rc_run_scripts VALUES ('run', 0, 'S00.kai', 'body', NULL, 1, NULL);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        for column in ["result_json", "projected_at", "output_block_id"] {
+            let found = conn
+                .prepare("PRAGMA table_info(rc_run_scripts)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<SqliteResult<Vec<_>>>()
+                .unwrap()
+                .iter()
+                .any(|name| name == column);
+            assert!(found, "{column} must be added to an existing rc_run_scripts table");
+        }
+        let retained: Option<String> = conn
+            .query_row("SELECT result_json FROM rc_run_scripts WHERE run_id = 'run' AND seq = 0", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, None, "an existing script has no invented retained result");
+        let pending_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_rc_run_scripts_pending_projection'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_index, 1, "the pending-projection index must follow the column upgrade");
     }
 
     /// The same regression as

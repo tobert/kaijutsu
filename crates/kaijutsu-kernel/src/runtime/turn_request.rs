@@ -113,12 +113,10 @@ pub(crate) fn queue_startup(
                         dispatcher = host.broker().kj_dispatcher() => dispatcher
                             .ok_or("submit lifecycle requires a registered kj dispatcher")?,
                     };
-                    if let Err(error) = crate::rc::run(&dispatcher, crate::rc::RcInvocation {
+                    crate::rc::run(&dispatcher, crate::rc::RcInvocation {
                         vars: info.vars(),
                         ..crate::rc::RcInvocation::new(crate::rc::VERB_SUBMIT, &admission, &cancel)
-                    }, &caller).await {
-                        tracing::warn!(context = %request.context_id, "rc submit lifecycle: {error}");
-                    }
+                    }, &caller).await.map_err(|error| format!("rc submit lifecycle: {error}"))?;
                 }
                 let tool_ctx = match tool_ctx {
                     Some(context) => context,
@@ -250,5 +248,51 @@ mod tests {
         }
         assert!(!dispatcher.kernel().turn_in_flight(context));
         dispatcher.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_rc_admission_fault_prevents_provider_startup() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::Arc;
+
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+        dispatcher.kernel().broker().set_kj_dispatcher(&dispatcher).await;
+        let kernel = dispatcher.kernel().clone();
+        let principal = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("submit-rc-fault"), None, principal);
+        let blocks = dispatcher.block_store();
+        blocks.create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let input = blocks.insert_block_as(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "submitted", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(principal)).unwrap();
+        let admission = {
+            let db = kernel.kernel_db().lock();
+            crate::runtime::admission::ContextAdmission::acquire(&db, context).unwrap()
+        };
+        let lease = kernel.turns().begin(context);
+        let caller = crate::kj::KjCaller {
+            principal_id: principal, actor_id: principal, reviewer_id: None, context_id: Some(context),
+            session_id: SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+            cancel: lease.interrupt().cancel.child_token(),
+        };
+        kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+        let result = queue_startup(&kernel, StartupRequest {
+            admission, lease,
+            request: TurnRequest { context_id: context, after_block_id: input, content: String::new(),
+                principal_id: principal, model: None, continuation_epoch: None, score: None },
+            origin: TurnOrigin::Interactive, tool_ctx: None, session: caller.session_id,
+            submit: Some((crate::rc::SubmitInfo { input_block: input, edge_block: None,
+                edge_shown: None, log_tail: None, turn_live: false }, caller)),
+        }, None).unwrap().await.unwrap();
+        kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        let error = result.expect_err("submit rc admission fault must stop startup");
+        assert!(error.contains("rc submit lifecycle"), "{error}");
+        assert!(!kernel.turn_in_flight(context), "failed submit lifecycle must release its turn lease");
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 }

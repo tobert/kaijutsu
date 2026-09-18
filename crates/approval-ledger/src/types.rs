@@ -777,12 +777,13 @@ pub struct RcRunRow {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub outcome: Option<RcOutcome>,
+    /// The outcome requested by settlement before every begun script has
+    /// retained its result and projection.
+    pub intended_outcome: Option<RcOutcome>,
     /// How many scripts this run intended to execute, set once its script
     /// list was loaded. NULL for a run that predates this field, or that
-    /// failed before its script list was ever loaded. Compare against the
-    /// number of recorded `rc_run_scripts` rows to tell a run cancelled
-    /// part-way from a run where a script actually failed — see
-    /// `schema.rs`'s `rc_runs` table comment.
+    /// failed before recording its script list. Fewer begun script rows
+    /// mean the lifecycle stopped before attempting the complete set.
     pub script_count: Option<i64>,
 }
 
@@ -795,6 +796,12 @@ pub struct RcRunScriptRow {
     pub exit_code: Option<i64>,
     pub started_at: i64,
     pub finished_at: Option<i64>,
+    /// Opaque execution record retained before its output is projected.
+    pub result_json: Option<String>,
+    /// When the retained result was projected into the context log.
+    pub projected_at: Option<i64>,
+    /// The context-log block created for this script's output, when any.
+    pub output_block_id: Option<String>,
 }
 
 #[cfg(test)]

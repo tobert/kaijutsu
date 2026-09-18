@@ -103,6 +103,21 @@ pub(crate) struct ShellResultFields {
     pub ephemeral: Option<bool>,
 }
 
+/// One new block whose document projection and related database record commit
+/// together. Lifecycle settlement uses this after retaining execution output:
+/// a failed journal write leaves both the block and its projection marker
+/// absent, so restart can retry projection without repeating execution.
+pub(crate) struct RecordedBlockInsert<'a> {
+    pub role: Role,
+    pub kind: BlockKind,
+    pub content: String,
+    pub status: Status,
+    pub content_type: ContentType,
+    pub author: PrincipalId,
+    pub ansi: Option<(Vec<kaijutsu_types::StyleSpan>, &'a [u8])>,
+    pub shell: Option<ShellResultFields>,
+}
+
 /// Text captured for shell submission, tied to one draft revision. This is
 /// process-local: it is neither a persisted receipt nor a wire credential.
 pub struct DraftSubmission {
@@ -1275,6 +1290,76 @@ impl BlockStore {
             });
 
             Ok((ops, events, block_id))
+        })
+    }
+
+    /// Append a complete block projection and its related kernel record in one
+    /// journal transaction. ANSI provenance is part of the same acceptance;
+    /// no published block can name original bytes that failed to commit.
+    pub(crate) fn append_block_recorded(
+        &self,
+        context_id: ContextId,
+        insert: RecordedBlockInsert<'_>,
+        record: impl FnOnce(&KernelDb, &BlockId) -> crate::kernel_db::KernelDbResult<()>,
+    ) -> BlockStoreResult<BlockId> {
+        if self.journaling_db()?.is_none() {
+            return Err(BlockStoreError::NoDatabaseConfigured);
+        }
+        let mut entry = self.documents.get_mut(&context_id)
+            .ok_or(BlockStoreError::DocumentNotFound(context_id))?;
+        if entry.poisoned {
+            return Err(BlockStoreError::Validation(format!(
+                "document {context_id} failed acceptance; restart to recover durable state"
+            )));
+        }
+        let RecordedBlockInsert {
+            role, kind, content, status, content_type, author, ansi, shell,
+        } = insert;
+        self.accept_locked_recorded(context_id, &mut entry, None, |entry| {
+            let after_id = entry.doc.block_ids_ordered().last().copied();
+            entry.doc.set_principal_id(author);
+            let block_id = entry.doc.insert_block(
+                None, after_id.as_ref(), role, kind, content, status, content_type,
+            )?;
+            let (spans, tag) = match &ansi {
+                Some((spans, _)) => (spans.clone(), Some(kaijutsu_ansi::provenance_tag())),
+                None => (Vec::new(), None),
+            };
+            if ansi.is_some() {
+                entry.doc.set_style_spans(&block_id, spans, tag)?;
+            }
+            if let Some(fields) = &shell {
+                entry.doc.set_stderr(&block_id, fields.stderr.clone())?;
+                entry.doc.set_output(&block_id, fields.output.clone())?;
+                entry.doc.set_content_type(&block_id, fields.content_type)?;
+                entry.doc.set_exit_code(&block_id, fields.exit_code)?;
+                if let Some(ephemeral) = fields.ephemeral {
+                    entry.doc.set_ephemeral(&block_id, ephemeral)?;
+                }
+            }
+            entry.touch(author);
+            let snapshot = entry.doc.get_block_snapshot(&block_id)
+                .ok_or(BlockStoreError::BlockNotFoundAfterInsert)?;
+            let payload = SyncPayload::from_new_block(snapshot.clone());
+            let version = entry.version();
+            let events = vec![BlockFlow::Inserted {
+                context_id,
+                block: Arc::new(snapshot),
+                after_id,
+                version,
+                source: OpSource::Local,
+            }];
+            Ok((payload, events, block_id))
+        }, |db, block_id| {
+            if let Some((_, original)) = ansi {
+                db.insert_block_provenance(
+                    block_id,
+                    kaijutsu_ansi::TRANSFORM_NAME,
+                    kaijutsu_ansi::PARSER_VERSION,
+                    original,
+                )?;
+            }
+            record(db, block_id)
         })
     }
 

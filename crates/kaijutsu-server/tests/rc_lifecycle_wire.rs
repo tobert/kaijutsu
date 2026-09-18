@@ -115,3 +115,56 @@ fn accepted_nested_rc_survives_disconnect_and_archive() {
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
+
+#[test]
+fn client_reads_complete_rc_output_from_successful_and_failed_scripts() {
+    run_local(async {
+        let (addr, server) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let parent = create_context(&kernel, "rc-output-parent").await.unwrap();
+        let vfs = server.kernel.vfs();
+        for failed in [false, true] {
+            let label = if failed { "rc-output-failure" } else { "rc-output-success" };
+            let base = format!("/config/rc/{label}");
+            vfs.mkdir(Path::new(&base), 0o755).await.unwrap();
+            vfs.mkdir(Path::new(&format!("{base}/create")), 0o755).await.unwrap();
+            let stdout = format!("stdout-first-{}-stdout-last", "音".repeat(3000));
+            let stderr = format!("stderr-first-{}-stderr-last", "err".repeat(3000));
+            let ending = if failed { "false" } else { "true" };
+            let script = format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2; {ending}");
+            vfs.write_all(Path::new(&format!("{base}/create/S00-output.kai")), script.as_bytes()).await.unwrap();
+            let result = kernel.execute_kj(parent, &[
+                "context".into(), "create".into(), label.into(), "--type".into(), label.into(),
+            ]).await.unwrap();
+            assert_eq!(result.exit_code, 0, "ordinary script failure retains the context: {}", result.stderr);
+            let context = kernel.list_contexts().await.unwrap().into_iter()
+                .find(|row| row.label == label).expect("created context").id;
+            let blocks = kernel.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+            let kind = if failed { kaijutsu_types::BlockKind::Error } else { kaijutsu_types::BlockKind::Trace };
+            let capture = blocks.iter().find(|block| block.kind == kind).expect("rc output block over RPC");
+            assert!(capture.content.contains(&stdout), "client must receive complete stdout");
+            assert!(capture.content.contains(&stderr), "client must receive complete stderr");
+            let listed = kernel.execute_kj(parent, &[
+                "ledger".into(), "runs".into(), "--context".into(), label.into(),
+            ]).await.unwrap();
+            assert_eq!(listed.exit_code, 0, "{}", listed.stderr);
+            let runs = listed.data.expect("structured run listing");
+            let run_id = runs[0].as_str().expect("run id");
+            let shown = kernel.execute_kj(parent, &[
+                "ledger".into(), "runs".into(), run_id.into(),
+            ]).await.unwrap();
+            assert_eq!(shown.exit_code, 0, "{}", shown.stderr);
+            let detail = shown.data.expect("structured run detail");
+            assert_eq!(detail["outcome"], if failed { "failed" } else { "ok" });
+            let script = &detail["scripts"][0];
+            assert!(!script["projected_at"].is_null());
+            assert_eq!(script["output_block_id"], capture.id.to_key());
+            let returned: kaish_kernel::interpreter::ExecResult =
+                serde_json::from_value(script["result"]["Completed"]["result"].clone()).unwrap();
+            assert_eq!(returned.text_out(), stdout);
+            assert_eq!(returned.err, stderr);
+        }
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

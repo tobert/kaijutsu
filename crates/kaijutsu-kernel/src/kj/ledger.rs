@@ -412,9 +412,8 @@ enum LedgerCommand {
     },
     // A bare positional rather than a `--run` flag, to match `Show`'s shape:
     // the same list-vs-show split as the ask verbs, applied to the run log.
-    /// List rc lifecycle runs, most recent first, capped at `--limit`
-    /// (default 20) — the durable record of whether a context's rc
-    /// scripts actually ran.
+    /// List rc lifecycle runs, most recent first (default limit 20).
+    /// With a run id, show script results and pending settlement.
     Runs {
         /// Show this run's per-script detail instead of the run listing.
         /// Run ids come from `kj ledger runs`. Lists all runs when omitted.
@@ -1639,7 +1638,8 @@ impl KjDispatcher {
                 .unwrap_or_else(|| "(unparseable)".to_string());
             let outcome = match r.outcome {
                 Some(o) => o.to_string(),
-                None => "(running)".to_string(),
+                None => r.intended_outcome.map_or_else(|| "(running)".to_string(),
+                    |outcome| format!("settlement pending ({outcome})")),
             };
             lines.push(format!(
                 "  {:<38}  {:<12}  {:<20}  {:<8}  {:<13}  {}",
@@ -1655,11 +1655,8 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    /// `kj ledger runs <run-id>` — one run's metadata plus the per-script
-    /// rows the lifecycle recorded for it (if the run predates this
-    /// wiring, or every script-record write degraded per its own
-    /// `tracing::warn!`, the script list is legitimately empty — reported
-    /// as such, not confused with "no such run").
+    /// Show retained script results and distinguish pending settlement from
+    /// running execution. Older records can lack captured output.
     fn ledger_run_show(&self, run_id: &str) -> KjResult {
         let db = self.kernel_db.lock();
         let conn = db.conn_for_ledger();
@@ -1690,6 +1687,9 @@ impl KjDispatcher {
             ),
             format!("outcome:      {}", outcome.as_deref().unwrap_or("(none yet)")),
         ];
+        if run.outcome.is_none() && let Some(intended) = run.intended_outcome {
+            lines.push(format!("settlement pending: {intended}"));
+        }
         // `script_count` is NULL for a run that predates this field, or
         // that failed before its script list was ever loaded — omit the
         // line rather than print a count that was never recorded.
@@ -1712,20 +1712,41 @@ impl KjDispatcher {
                 ));
             }
         }
-        // The point of `script_count`: fewer recorded rows than intended
-        // means the run was cut short (dropped mid-lifecycle, `RunGuard`'s
-        // `Drop` backstop stamped it `failed`) — not that a script itself
-        // failed. Say so explicitly rather than leaving a reader to guess
-        // from a gap in `SEQ`.
+        // A begun record is written before execution; it can hold a refused
+        // or interrupted attempt. Fewer rows means later scripts never began.
         if let Some(expected) = run.script_count {
             let recorded = scripts.len() as i64;
             if recorded < expected {
                 lines.push(String::new());
                 lines.push(format!(
-                    "only {recorded} of {expected} scripts ran — the run stopped before the rest \
-                     started (cancelled or aborted, not a script failure)"
+                    "only {recorded} of {expected} scripts were attempted; the run stopped before \
+                     the rest began"
                 ));
             }
+        }
+
+        let mut script_data = Vec::with_capacity(scripts.len());
+        for script in &scripts {
+            let result = match script.result_json.as_deref().map(serde_json::from_str::<serde_json::Value>).transpose() {
+                Ok(value) => value,
+                Err(error) => return KjResult::Err(format!(
+                    "kj ledger runs: script {} in run {run_id} has an unreadable retained result: {error}", script.seq
+                )),
+            };
+            if script.result_json.is_some() && script.projected_at.is_none() {
+                lines.push(format!("script {}: output projection pending", script.seq));
+            }
+            script_data.push(serde_json::json!({
+                "seq": script.seq,
+                "path": script.path,
+                "body_sha256": script.body_sha256,
+                "exit_code": script.exit_code,
+                "started_at": script.started_at,
+                "finished_at": script.finished_at,
+                "result": result,
+                "projected_at": script.projected_at,
+                "output_block_id": script.output_block_id,
+            }));
         }
 
         let data = serde_json::json!({
@@ -1736,15 +1757,9 @@ impl KjDispatcher {
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "outcome": outcome,
+            "intended_outcome": run.intended_outcome.map(|outcome| outcome.to_string()),
             "script_count": run.script_count,
-            "scripts": scripts.iter().map(|s| serde_json::json!({
-                "seq": s.seq,
-                "path": s.path,
-                "body_sha256": s.body_sha256,
-                "exit_code": s.exit_code,
-                "started_at": s.started_at,
-                "finished_at": s.finished_at,
-            })).collect::<Vec<_>>(),
+            "scripts": script_data,
         });
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -3878,7 +3893,7 @@ mod tests {
         assert!(shown.is_ok(), "{shown:?}");
         // The count comes from the lifecycle itself, not from the test.
         assert!(shown.message().contains("script_count: 1"), "{}", shown.message());
-        assert!(!shown.message().contains("scripts ran"), "{}", shown.message());
+        assert!(!shown.message().contains("scripts were attempted"), "{}", shown.message());
         let obj = match &shown {
             KjResult::Ok { data: Some(v), .. } => v.clone(),
             other => panic!("{other:?}"),
@@ -3905,29 +3920,49 @@ mod tests {
             let conn = db.conn_for_ledger();
             let run_id = rc_runs::start_run(conn, ctx.as_bytes(), "ledgertest4", "create").unwrap();
             rc_runs::set_run_script_count(conn, &run_id, 3).unwrap();
-            let sha = rc_runs::insert_script_body(conn, "echo hi").unwrap();
-            rc_runs::record_run_script(
-                conn,
-                &run_id,
-                "/config/rc/ledgertest4/create/S00-hello.kai",
-                &sha,
-                Some(0),
-                1,
-                Some(2),
-            )
-            .unwrap();
-            rc_runs::finish_run(conn, &run_id, RcOutcome::Failed).unwrap();
+            let seq = rc_runs::begin_run_script(conn, &run_id,
+                "/config/rc/ledgertest4/create/S00-hello.kai", "echo hi", 1).unwrap();
+            rc_runs::retain_run_script_result(conn, &run_id, seq, "{}", Some(0), 2).unwrap();
+            rc_runs::mark_run_script_projected(conn, &run_id, seq, None, 3).unwrap();
+            rc_runs::finish_settled_run(conn, &run_id, RcOutcome::Failed).unwrap();
             run_id
         };
 
         let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &c).await;
         assert!(shown.is_ok(), "{shown:?}");
-        assert!(shown.message().contains("1 of 3 scripts ran"), "{}", shown.message());
+        assert!(shown.message().contains("1 of 3 scripts were attempted"), "{}", shown.message());
         let obj = match &shown {
             KjResult::Ok { data: Some(v), .. } => v.clone(),
             other => panic!("{other:?}"),
         };
         assert_eq!(obj["script_count"], serde_json::json!(3));
+    }
+
+    #[tokio::test]
+    async fn ledger_runs_show_exposes_retained_result_and_pending_settlement() {
+        use approval_ledger::{rc_runs, types::RcOutcome};
+        let d = test_dispatcher().await;
+        let execution = crate::rc::settlement::ScriptExecution::Completed {
+            result: kaish_kernel::interpreter::ExecResult::success("retained rc output"), cancelled: false,
+        };
+        let captured = serde_json::to_value(&execution).unwrap();
+        let run_id = {
+            let db = d.kernel_db.lock();
+            let conn = db.conn_for_ledger();
+            let run = rc_runs::start_run(conn, ContextId::new().as_bytes(), "detail", "create").unwrap();
+            rc_runs::set_run_script_count(conn, &run, 1).unwrap();
+            let seq = rc_runs::begin_run_script(conn, &run, "/config/rc/detail/create/S00-output.kai", "echo output", 1).unwrap();
+            rc_runs::retain_run_script_result(conn, &run, seq, &captured.to_string(), Some(0), 2).unwrap();
+            assert!(rc_runs::finish_settled_run(conn, &run, RcOutcome::Failed).is_err());
+            run
+        };
+        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &unjoined_caller()).await;
+        assert!(shown.is_ok(), "{shown:?}");
+        assert!(shown.message().contains("settlement pending"), "{}", shown.message());
+        let KjResult::Ok { data: Some(data), .. } = shown else { panic!("run detail must be structured"); };
+        assert_eq!(data["intended_outcome"], "failed");
+        assert_eq!(data["scripts"][0]["result"], captured);
+        assert!(data["scripts"][0]["projected_at"].is_null());
     }
 
     /// An unknown run id errors loudly — never a blank "show" that could

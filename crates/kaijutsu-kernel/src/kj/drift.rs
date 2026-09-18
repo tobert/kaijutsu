@@ -20,6 +20,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 enum DriftDeliveryOutcome {
     Complete,
     LifecycleCancelled(String),
+    LifecycleFault(String),
 }
 
 #[derive(Parser, Debug)]
@@ -251,17 +252,13 @@ impl KjDispatcher {
             caller,
         )
             .await;
-        if let Err(e) = &lifecycle {
-            tracing::warn!(
-                "rc drift lifecycle {} → {}: {e}",
-                source_ctx.short(),
-                target_ctx.short()
-            );
-        }
         if caller.cancel.is_cancelled() {
             return Ok(DriftDeliveryOutcome::LifecycleCancelled(
                 lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into()),
             ));
+        }
+        if let Err(error) = lifecycle {
+            return Ok(DriftDeliveryOutcome::LifecycleFault(error));
         }
 
         Ok(DriftDeliveryOutcome::Complete)
@@ -427,6 +424,9 @@ impl KjDispatcher {
                 Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => KjResult::Err(format!(
                     "kj drift push: delivered to {dst_query}, but its rc lifecycle was cancelled: {error}"
                 )),
+                Ok(DriftDeliveryOutcome::LifecycleFault(error)) => KjResult::Err(format!(
+                    "kj drift push: delivered to {dst_query}, but its rc lifecycle could not settle: {error}"
+                )),
                 Err(e) => stage_after_failure(e),
             };
         }
@@ -568,13 +568,15 @@ impl KjDispatcher {
             caller,
         )
             .await;
-        if let Err(e) = &lifecycle {
-            tracing::warn!("rc drift lifecycle (pull): {e}");
-        }
         if caller.cancel.is_cancelled() {
             let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
             return KjResult::Err(format!(
                 "kj drift pull: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+            ));
+        }
+        if let Err(error) = lifecycle {
+            return KjResult::Err(format!(
+                "kj drift pull: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
             ));
         }
 
@@ -701,13 +703,15 @@ impl KjDispatcher {
             caller,
         )
             .await;
-        if let Err(e) = &lifecycle {
-            tracing::warn!("rc drift lifecycle (merge): {e}");
-        }
         if caller.cancel.is_cancelled() {
             let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
             return KjResult::Err(format!(
                 "kj drift merge: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+            ));
+        }
+        if let Err(error) = lifecycle {
+            return KjResult::Err(format!(
+                "kj drift merge: delivery and edge were committed, but its rc lifecycle could not settle: {error}"
             ));
         }
 
@@ -761,6 +765,7 @@ impl KjDispatcher {
         let mut failed = Vec::new();
         let mut released = Vec::new();
         let mut lifecycle_cancelled = false;
+        let mut lifecycle_fault = None;
 
         let mut staged = staged.into_iter();
         while let Some(drift) = staged.next() {
@@ -862,7 +867,7 @@ impl KjDispatcher {
                         }
                     }
 
-                    if let Err(e) = crate::rc::run(
+                    let lifecycle = crate::rc::run(
                         self,
                         crate::rc::RcInvocation {
                             drift: Some(crate::rc::DriftInfo {
@@ -875,17 +880,15 @@ impl KjDispatcher {
                         },
                         caller,
                     )
-                        .await
-                    {
-                        tracing::warn!(
-                            "rc drift lifecycle (flush) {} → {}: {e}",
-                            source_ctx.short(),
-                            drift.target_ctx.short()
-                        );
-                    }
+                        .await;
                     if caller.cancel.is_cancelled() {
                         released.extend(staged);
                         lifecycle_cancelled = true;
+                        break;
+                    }
+                    if let Err(error) = lifecycle {
+                        released.extend(staged);
+                        lifecycle_fault = Some(error);
                         break;
                     }
                 }
@@ -915,6 +918,12 @@ impl KjDispatcher {
                 "kj drift flush: delivered {injected}/{count} drift(s), but an rc lifecycle \
                  was cancelled; {fail_count} failed item(s) were requeued and {release_count} \
                  unattempted item(s) were released without consuming a retry"
+            ));
+        }
+        if let Some(error) = lifecycle_fault {
+            return KjResult::Err(format!(
+                "kj drift flush: delivered {injected}/{count} drift(s), but an rc lifecycle could not settle: {error}; \
+                 {fail_count} failed item(s) were requeued and {release_count} unattempted item(s) were released without consuming a retry"
             ));
         }
 
@@ -1828,6 +1837,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rc_admission_fault_reports_committed_drift_without_staging_a_duplicate() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("rc-fault-drift-source"), None, principal);
+        let target = register_context(&d, Some("rc-fault-drift-target"), None, principal);
+        d.block_store().create_document(target, crate::DocumentKind::Conversation, None).unwrap();
+        let c = caller_with_context(source);
+        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+
+        let result = d.dispatch(
+            &[s("drift"), s("push"), s("rc-fault-drift-target"), s("delivered-once")], &c,
+        ).await;
+        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "rc admission fault must report the committed delivery");
+        assert!(result.message().contains("delivered to"), "{}", result.message());
+        let delivered = d.block_store().block_snapshots(target).unwrap().into_iter()
+            .filter(|block| block.kind == kaijutsu_types::BlockKind::Drift && block.content == "delivered-once")
+            .count();
+        assert_eq!(delivered, 1);
+        assert!(d.drift_router().read().queue().is_empty(), "committed delivery must not be restaged");
+    }
+
     /// An ambiguous label prefix must still report every candidate rather
     /// than silently picking one. This is the failure mode the crowded
     /// `cc-*` namespace produces in the field, so it is worth pinning.
@@ -2118,6 +2156,41 @@ mod tests {
         assert!(!result.is_ok(), "cancelled flush must report partial completion");
         assert!(result.message().contains("released without consuming a retry"), "{}", result.message());
 
+        let blocks = d.block_store().block_snapshots(dst).unwrap();
+        assert!(blocks.iter().any(|block| block.content == "first-delivery"));
+        assert!(!blocks.iter().any(|block| block.content == "unattempted-delivery"));
+        let router = d.drift_router().read();
+        assert_eq!(router.queue().len(), 1);
+        assert_eq!(router.queue()[0].content, "unattempted-delivery");
+        assert_eq!(router.queue()[0].retry_count, 0);
+        assert!(!router.queue()[0].in_flight);
+    }
+
+    #[tokio::test]
+    async fn rc_admission_fault_flush_releases_unattempted_remainder_without_retry() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("rc-fault-flush-source"), None, principal);
+        let dst = register_context(&d, Some("rc-fault-flush-target"), None, principal);
+        d.block_store().create_document(dst, crate::DocumentKind::Conversation, None).unwrap();
+        let caller = caller_with_context(src);
+        for content in ["first-delivery", "unattempted-delivery"] {
+            let staged = d.dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("rc-fault-flush-target"), s(content)], &caller,
+            ).await;
+            assert!(staged.is_ok(), "stage failed: {}", staged.message());
+        }
+        d.kernel_db().lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+        let result = d.dispatch(&[s("drift"), s("flush")], &caller).await;
+        d.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+
+        assert!(!result.is_ok(), "rc admission fault must stop flush after committed delivery");
+        assert!(result.message().contains("released without consuming a retry"), "{}", result.message());
         let blocks = d.block_store().block_snapshots(dst).unwrap();
         assert!(blocks.iter().any(|block| block.content == "first-delivery"));
         assert!(!blocks.iter().any(|block| block.content == "unattempted-delivery"));

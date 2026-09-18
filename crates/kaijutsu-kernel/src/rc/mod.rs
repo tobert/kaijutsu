@@ -9,7 +9,7 @@
 //!
 //! Scripts run after the context is committed. A script failure inserts a
 //! `BlockKind::Error` block into the new context with rc path, sort key,
-//! exit code, and last 4 KB of stderr/stdout. Subsequent scripts continue
+//! exit code, and captured stderr/stdout. Subsequent scripts continue
 //! to run — the new context is "alive but degraded," matching SysV
 //! init.d. No rollback. The error block is non-ephemeral so the LLM sees
 //! it on next hydrate.
@@ -38,6 +38,9 @@ use kaijutsu_types::{
 
 use crate::kj::{KjCaller, KjDispatcher};
 
+pub(crate) mod settlement;
+use settlement::ScriptExecution;
+
 mod script_path;
 pub use script_path::{RcPathParts, is_rc_script_filename, parse_rc_path};
 
@@ -62,7 +65,6 @@ impl RcAuthority {
 /// lifecycle run. Bodies are read through the VFS before execution starts.
 pub(crate) struct RcScript {
     pub path: String,
-    pub sort_key: String,
     pub content: String,
 }
 
@@ -121,9 +123,6 @@ impl SubmitInfo {
 /// produces an error block and is skipped — its lifecycle does NOT run.
 pub const MAX_RC_DEPTH: u8 = 4;
 
-/// Last N bytes of stdout/stderr captured into the failure block.
-const RC_FAILURE_OUTPUT_TAIL_BYTES: usize = 4096;
-
 pub const VERB_CREATE: &str = "create";
 pub const VERB_FORK: &str = "fork";
 pub const VERB_ATTACH: &str = "attach";
@@ -141,8 +140,8 @@ pub const VERB_TICK: &str = "tick";
 pub const VERB_ROTATE: &str = "rotate";
 /// The submit verb: fired by the server after a chat submit has promoted the
 /// player's draft to a durable user block. Scripts see the submit facts as
-/// `KJ_*` variables ([`SubmitInfo::vars`]). Runs awaited inline like `drift`,
-/// so anything a script writes is durable before `submitInput` returns.
+/// `KJ_*` variables ([`SubmitInfo::vars`]). Turn startup awaits script execution
+/// and settlement before starting provider work.
 pub const VERB_SUBMIT: &str = "submit";
 
 /// Canonical verbs shared by lifecycle dispatch and script path validation.
@@ -193,8 +192,8 @@ impl<'a> RcInvocation<'a> {
 
 /// Run a context type's scripts after the triggering state change is committed.
 /// Script failures are recorded and later scripts continue. Cancellation stops
-/// the lifecycle after active execution cleans up. Invalid verbs and context or
-/// discovery failures return an error to the caller.
+/// the lifecycle after active execution cleans up. Invalid verbs, unavailable
+/// context state, and discovery or settlement failures return an error.
 #[tracing::instrument(
     skip(dispatcher, invocation, caller),
     fields(verb = %invocation.verb, ctx = %invocation.admission.context().short(), rc_depth = caller.rc_depth),
@@ -209,6 +208,8 @@ pub async fn run(
     if !verb_is_wired(verb) {
         return Err(format!("rc lifecycle: unknown verb '{verb}'; expected {}", RC_VERBS.join(", ")));
     }
+
+    dispatcher.kernel().rc_settlements().retry_pending()?;
 
     // Lifecycle diagnostics belong to the context creator. Commands inside
     // scripts author their blocks as the invoking performer.
@@ -226,35 +227,42 @@ pub async fn run(
         }
     };
 
-    // Start the durable run record before discovery. RunGuard finishes it on
-    // every exit, including cancellation. Ledger errors are logged while the
-    // lifecycle continues; script execution is not conditional on bookkeeping.
     let run_id = {
         let db = dispatcher.kernel_db().lock();
-        match rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), &context_type, verb) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::warn!(
-                    "rc lifecycle: run log start_run failed (continuing unlogged): {e}"
-                );
-                None
-            }
-        }
+        rc_runs::start_run(db.conn_for_ledger(), new_id.as_bytes(), &context_type, verb)
+            .map_err(|error| format!("rc lifecycle {verb}: could not record admission: {error}"))?
     };
-    let mut run_guard = RunGuard::new(dispatcher, run_id);
+    let mut guard = RunGuard::new(dispatcher, run_id.clone());
+    let result = run_lifecycle(dispatcher, &invocation, caller, &context_type, owner, &run_id).await;
+    let outcome = result.as_ref().copied().unwrap_or(RcOutcome::Failed);
+    let settled = guard.finish(outcome);
+    match (result, settled) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(settlement)) => Err(format!("{error}; {settlement}")),
+    }
+}
 
+async fn run_lifecycle(
+    dispatcher: &KjDispatcher,
+    invocation: &RcInvocation<'_>,
+    caller: &KjCaller,
+    context_type: &str,
+    owner: PrincipalId,
+    run_id: &str,
+) -> Result<RcOutcome, String> {
+    let verb = invocation.verb;
+    let new_id = invocation.admission.context();
     if invocation.cancel.is_cancelled() {
-        run_guard.finish(RcOutcome::Failed);
         return Err(format!("rc lifecycle {verb} cancelled before script discovery"));
     }
 
     let scripts = match tokio::select! {
         biased;
         _ = invocation.cancel.cancelled() => {
-            run_guard.finish(RcOutcome::Failed);
             return Err(format!("rc lifecycle {verb} cancelled during script discovery"));
         }
-        scripts = load_scripts(dispatcher, &context_type, verb) => scripts,
+        scripts = load_scripts(dispatcher, context_type, verb) => scripts,
     } {
         Ok(s) => s,
         Err(e) => {
@@ -275,12 +283,10 @@ pub async fn run(
                         None,
                         e.clone(),
                         owner,
-                    );
-                    run_guard.finish(RcOutcome::Failed);
+                    )?;
                     return Err(e);
                 }
                 Err(document_error) => {
-                    run_guard.finish(RcOutcome::Failed);
                     return Err(format!(
                         "{e}; could not create the document for its diagnostic: {document_error}"
                     ));
@@ -289,21 +295,21 @@ pub async fn run(
         }
     };
 
-    // Recorded once, here: the set is snapshotted, so this is how many
-    // scripts the run intends to execute. Fewer script rows than this at
-    // read time means the run stopped early rather than that a script
-    // failed — the two are otherwise identical in the log, both landing
-    // as `Failed`.
-    run_guard.record_script_count(scripts.len());
+    // The count records the snapshotted source set before execution. Readers
+    // compare it with begun script rows to distinguish an early stop from a
+    // completed lifecycle whose scripts returned nonzero exits.
+    {
+        let db = dispatcher.kernel_db().lock();
+        rc_runs::set_run_script_count(db.conn_for_ledger(), run_id, scripts.len())
+            .map_err(|error| format!("rc lifecycle {verb}: could not record script count: {error}"))?;
+    }
 
     if invocation.cancel.is_cancelled() {
-        run_guard.finish(RcOutcome::Failed);
         return Err(format!("rc lifecycle {verb} cancelled after script discovery"));
     }
 
     if scripts.is_empty() {
-        run_guard.finish(RcOutcome::Ok);
-        return Ok(());
+        return Ok(RcOutcome::Ok);
     }
 
     // The BlockStore document for this context may not exist yet —
@@ -317,9 +323,7 @@ pub async fn run(
     {
         Ok(()) => {}
         Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
-        Err(e) => {
-            tracing::warn!("rc lifecycle: create_document failed: {e}");
-        }
+        Err(e) => return Err(format!("rc lifecycle: could not prepare the context document: {e}")),
     }
 
     if caller.rc_depth >= MAX_RC_DEPTH {
@@ -336,53 +340,49 @@ pub async fn run(
                 paths::rc_dir(&context_type, verb)
             ),
             owner,
-        );
+        )?;
         // The recursion guard already inserted a failure block and ran
         // NO scripts — that is a failed run, not a no-op.
-        run_guard.finish(RcOutcome::Failed);
-        return Ok(());
+        return Ok(RcOutcome::Failed);
     }
 
     let mut any_script_failed = false;
 
     for script in &scripts {
         if invocation.cancel.is_cancelled() {
-            run_guard.finish(RcOutcome::Failed);
             return Err(format!(
                 "rc lifecycle {verb} cancelled before {}",
                 script.path
             ));
         }
         let script_started_at = now_millis();
-        let result = run_kai_script(dispatcher, &invocation, &context_type, script, caller, owner).await;
-        if matches!(result, ScriptRunResult::Failed { .. } | ScriptRunResult::Cancelled) {
-            any_script_failed = true;
-        }
-        run_guard.record_script(script, script_started_at, &result);
-        if matches!(result, ScriptRunResult::Cancelled) {
-            run_guard.finish(RcOutcome::Failed);
+        let seq = {
+            let db = dispatcher.kernel_db().lock();
+            rc_runs::begin_run_script(db.conn_for_ledger(), run_id, &script.path, &script.content, script_started_at)
+                .map_err(|error| format!("rc lifecycle {verb}: could not record {} before execution: {error}", script.path))?
+        };
+        let result = run_kai_script(dispatcher, invocation, context_type, script, caller, owner).await;
+        let cancelled = result.cancelled();
+        any_script_failed |= result.failed();
+        dispatcher.kernel().rc_settlements().retain_and_project(run_id, seq, result)?;
+        if cancelled {
             return Err(format!("rc lifecycle {verb} cancelled while running {}", script.path));
         }
         if invocation.cancel.is_cancelled() {
-            run_guard.finish(RcOutcome::Failed);
             return Err(format!("rc lifecycle {verb} cancelled after {}", script.path));
         }
     }
 
-    // SysV init.d semantics: one script failing does not stop the rest
-    // (module docs), so the run's own outcome is "did anything fail
-    // across the whole phase", not "did the last script fail".
-    run_guard.finish(if any_script_failed { RcOutcome::Failed } else { RcOutcome::Ok });
-    Ok(())
+    // Ordinary script failures do not stop later scripts. Settlement faults do.
+    Ok(if any_script_failed { RcOutcome::Failed } else { RcOutcome::Ok })
 }
 
 /// Load the rc scripts for `(context_type, verb)` from the `/config/rc`
 /// file tree, ordered lexically by filename (which is exactly
 /// `(sort_key, name)` order). A missing directory means "no scripts for
 /// this verb" — the common case — and returns empty, not an error. A
-/// read failure on a present file *is* surfaced: per the
-/// crash-over-corruption stance an unreadable stance script is
-/// corruption, not an empty default.
+/// read failure on a present file returns an error; it cannot mean an empty
+/// lifecycle.
 async fn load_scripts(
     dispatcher: &KjDispatcher,
     context_type: &str,
@@ -440,26 +440,13 @@ async fn load_scripts(
         };
         let content = String::from_utf8(bytes)
             .map_err(|e| format!("rc lifecycle: read {path}: not valid UTF-8: {e}"))?;
-        let sort_key = name.split_once('-').expect("validated rc name").0.to_string();
         scripts.push(RcScript {
             path,
-            sort_key,
             content,
         });
     }
     Ok(scripts)
 }
-/// Whether one rc script's execution succeeded, for the run log
-/// (`RunGuard::record_script`) and for the whole run's own pass/fail outcome.
-/// `exit_code` is `None` when initialization or execution fails without one.
-enum ScriptRunResult {
-    Ok,
-    Failed { exit_code: Option<i32> },
-    /// The lifecycle stopped before execution or after interpreter cleanup.
-    /// Record the conventional interrupted exit code, then stop.
-    Cancelled,
-}
-
 async fn run_kai_script(
     dispatcher: &KjDispatcher,
     invocation: &RcInvocation<'_>,
@@ -467,7 +454,7 @@ async fn run_kai_script(
     script: &RcScript,
     caller: &KjCaller,
     principal: PrincipalId,
-) -> ScriptRunResult {
+) -> ScriptExecution {
     let new_id = invocation.admission.context();
     let parent_id = invocation.parent;
     let fork_kind = invocation.fork_kind;
@@ -477,11 +464,7 @@ async fn run_kai_script(
     let extra_vars = &invocation.vars;
 
     if invocation.cancel.is_cancelled() {
-        insert_rc_failure_block(
-            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
-            "rc lifecycle cancelled before contextual shell construction".into(), principal,
-        );
-        return ScriptRunResult::Cancelled;
+        return ScriptExecution::NotRun { message: "rc lifecycle cancelled before contextual shell construction".into(), cancelled: true };
     }
 
     // Each rc script runs in its own single-use context shell — a snapshot of
@@ -492,11 +475,7 @@ async fn run_kai_script(
     let kaish = match tokio::select! {
         biased;
         _ = invocation.cancel.cancelled() => {
-            insert_rc_failure_block(
-                dispatcher, new_id, &script.path, &script.sort_key, Some(130),
-                "rc lifecycle cancelled during contextual shell construction".into(), principal,
-            );
-            return ScriptRunResult::Cancelled;
+            return ScriptExecution::NotRun { message: "rc lifecycle cancelled during contextual shell construction".into(), cancelled: true };
         }
         kaish = EmbeddedKaish::for_context(
             dispatcher,
@@ -511,18 +490,7 @@ async fn run_kai_script(
         ) => kaish,
     } {
         Ok(k) => k,
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc lifecycle: kaish init failed: {e}"),
-                principal,
-            );
-            return ScriptRunResult::Failed { exit_code: None };
-        }
+        Err(e) => return ScriptExecution::NotRun { message: format!("rc lifecycle: kaish init failed: {e}"), cancelled: false },
     };
 
     let mut vars: HashMap<String, kaish_kernel::ast::Value> = HashMap::new();
@@ -600,11 +568,7 @@ async fn run_kai_script(
     kaish.set_positional(&script.path, Vec::new()).await;
 
     if invocation.cancel.is_cancelled() {
-        insert_rc_failure_block(
-            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
-            "rc lifecycle cancelled before script execution".into(), principal,
-        );
-        return ScriptRunResult::Cancelled;
+        return ScriptExecution::NotRun { message: "rc lifecycle cancelled before script execution".into(), cancelled: true };
     }
 
     // Apply the kernel's rc timeout independently to each script.
@@ -616,103 +580,14 @@ async fn run_kai_script(
     // Do not select cancellation against this future: kaish owns child cleanup
     // (TERM, grace, KILL) and must finish it before the lifecycle reports done.
     let execution = kaish.execute_with_options(&script.content, opts).await;
-    if invocation.cancel.is_cancelled() {
-        let diagnostic = match execution {
-            Ok(exec) => {
-                let stdout = exec.text_out();
-                let output = tail_output(&stdout, &exec.err);
-                if output.is_empty() {
-                    "rc lifecycle cancelled during script execution".into()
-                } else {
-                    format!("rc lifecycle cancelled during script execution\n{output}")
-                }
-            }
-            Err(e) => format!("rc lifecycle cancelled during script execution: {e}"),
-        };
-        insert_rc_failure_block(
-            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
-            diagnostic, principal,
-        );
-        return ScriptRunResult::Cancelled;
-    }
+    let cancelled = invocation.cancel.is_cancelled();
     match execution {
-        Ok(exec) if exec.code == 0 => {
-            // Capture stdout/stderr from a successful run into a Trace
-            // block. Hidden from the LLM (Trace skips hydrate) but kept
-            // in the conversation document for operator debugging and
-            // potential downstream UI surfaces. No block at all when the
-            // script was silent — avoids littering the doc with empties.
-            let stdout = exec.text_out();
-            if !stdout.is_empty() || !exec.err.is_empty() {
-                insert_rc_trace_block(
-                    dispatcher,
-                    new_id,
-                    &script.path,
-                    &script.sort_key,
-                    tail_output(&stdout, &exec.err),
-                    principal,
-                );
-            }
-            ScriptRunResult::Ok
-        }
-        Ok(exec) => {
-            let stdout = exec.text_out().into_owned();
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                Some(exec.code as i32),
-                tail_output(&stdout, &exec.err),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: Some(exec.code as i32) }
-        }
-        Err(e) => {
-            insert_rc_failure_block(
-                dispatcher,
-                new_id,
-                &script.path,
-                &script.sort_key,
-                None,
-                format!("rc kaish exec error: {e}"),
-                principal,
-            );
-            ScriptRunResult::Failed { exit_code: None }
-        }
+        Ok(result) => ScriptExecution::Completed { result, cancelled },
+        Err(error) => ScriptExecution::Fault { message: format!("rc kaish exec error: {error}"), cancelled },
     }
 }
 
-fn tail_output(stdout: &str, stderr: &str) -> String {
-    let mut combined = String::new();
-    if !stdout.is_empty() {
-        combined.push_str("--- stdout ---\n");
-        combined.push_str(stdout);
-        combined.push('\n');
-    }
-    if !stderr.is_empty() {
-        combined.push_str("--- stderr ---\n");
-        combined.push_str(stderr);
-    }
-    if combined.len() <= RC_FAILURE_OUTPUT_TAIL_BYTES {
-        return combined;
-    }
-    let cut = combined.len() - RC_FAILURE_OUTPUT_TAIL_BYTES;
-    let mut start = cut;
-    while start < combined.len() && !combined.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("[truncated]\n{}", &combined[start..])
-}
-
-/// Current time as Unix milliseconds, for the run log's per-script
-/// `started_at`/`finished_at`. `approval_ledger::time::now_millis` (what
-/// `rc_runs::finish_run` uses for the run row itself) is `pub(crate)` to
-/// that crate, so this is a small local twin rather than a cross-crate
-/// visibility change for one call site. Both timestamps are captured here
-/// in Rust, not left to `rc_run_scripts.started_at`'s SQL `DEFAULT` — that
-/// default only fires at INSERT time, which is after the script already
-/// ran, so relying on it would make `started_at` always >= `finished_at`.
+/// Capture script start time before execution rather than at result insertion.
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -720,101 +595,29 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Finish a run explicitly or mark it failed when execution drops the guard.
-/// `run_id` is absent when starting the ledger record failed.
+/// Finish only after script results are retained and projected. The kernel keeps
+/// ownership of failed settlement writes; dropping execution records abandonment.
 struct RunGuard<'a> {
     dispatcher: &'a KjDispatcher,
     run_id: Option<String>,
 }
 
 impl<'a> RunGuard<'a> {
-    fn new(dispatcher: &'a KjDispatcher, run_id: Option<String>) -> Self {
-        Self { dispatcher, run_id }
+    fn new(dispatcher: &'a KjDispatcher, run_id: String) -> Self {
+        Self { dispatcher, run_id: Some(run_id) }
     }
 
-    /// Record how many scripts this run intends to execute, best-effort for
-    /// the same reason [`RunGuard::record_script`] is: the run log rides
-    /// alongside the lifecycle and never gates it.
-    fn record_script_count(&self, count: usize) {
-        let Some(run_id) = self.run_id.as_deref() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = rc_runs::set_run_script_count(db.conn_for_ledger(), run_id, count) {
-            tracing::warn!("rc lifecycle: run log set_run_script_count failed for {run_id}: {e}");
-        }
-    }
-
-    /// Record one script's execution in the run log, best-effort. A failure
-    /// here degrades to a `tracing::warn!` for the same reason `start_run`'s
-    /// does: this is observability riding alongside the lifecycle, not
-    /// gating it, so a second database's hiccup must never cost a context
-    /// its rc scripts.
-    ///
-    /// `started_at` must be captured by the caller immediately before the
-    /// script ran — this method (and the INSERT it drives) only happens
-    /// *after* the script has already finished, so leaving `started_at` to
-    /// the SQL `DEFAULT` would stamp it at insert time and make it
-    /// impossible for `started_at` to precede `finished_at`.
-    fn record_script(&self, script: &RcScript, started_at: i64, result: &ScriptRunResult) {
-        let Some(run_id) = self.run_id.as_deref() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        let conn = db.conn_for_ledger();
-        let sha256 = match rc_runs::insert_script_body(conn, &script.content) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "rc lifecycle: run log insert_script_body failed for {}: {e}",
-                    script.path
-                );
-                return;
-            }
-        };
-        let exit_code = match result {
-            ScriptRunResult::Ok => Some(0i64),
-            ScriptRunResult::Failed { exit_code } => exit_code.map(i64::from),
-            ScriptRunResult::Cancelled => Some(130i64),
-        };
-        if let Err(e) = rc_runs::record_run_script(
-            conn,
-            run_id,
-            &script.path,
-            &sha256,
-            exit_code,
-            started_at,
-            Some(now_millis()),
-        ) {
-            tracing::warn!(
-                "rc lifecycle: run log record_run_script failed for {}: {e}",
-                script.path
-            );
-        }
-    }
-
-    /// Finish the run with `outcome`. Idempotent — the first call clears
-    /// `run_id`, so a later call (including the one from `Drop` on the
-    /// ordinary path) is a no-op rather than a second write against an
-    /// already-finished row (which `finish_run` refuses loudly; swallowing
-    /// that here would be exactly the silent-fallback CLAUDE.md warns
-    /// against, so this avoids it structurally instead).
-    fn finish(&mut self, outcome: RcOutcome) {
-        let Some(run_id) = self.run_id.take() else {
-            return;
-        };
-        let db = self.dispatcher.kernel_db().lock();
-        if let Err(e) = rc_runs::finish_run(db.conn_for_ledger(), &run_id, outcome) {
-            tracing::warn!("rc lifecycle: run log finish_run failed for {run_id}: {e}");
-        }
+    fn finish(&mut self, outcome: RcOutcome) -> Result<(), String> {
+        let Some(run_id) = self.run_id.take() else { return Ok(()); };
+        self.dispatcher.kernel().rc_settlements().finish_run(&run_id, outcome)
     }
 }
 
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        // Only reached if some exit path forgot to call `finish` explicitly —
-        // see the struct doc for why the backstop outcome is `Failed`.
-        self.finish(RcOutcome::Failed);
+        if let Err(error) = self.finish(RcOutcome::Abandoned) {
+            tracing::error!("rc lifecycle abandonment remains unsettled: {error}");
+        }
     }
 }
 
@@ -826,10 +629,9 @@ fn insert_rc_failure_block(
     exit_code: Option<i32>,
     detail: String,
     principal: PrincipalId,
-) {
-    // Hunk #1: emit a plain BlockKind::Error block with the diagnostic in
-    // content. Structured ErrorPayload requires a parent block, which the
-    // freshly-created context may not have. Tracked as a follow-up.
+) -> Result<(), String> {
+    // Pre-execution diagnostics have no parent command block. Keep them as
+    // plain Error blocks; executed-script results use retained settlement.
     let summary = match exit_code {
         Some(code) => format!(
             "rc {sort_key} exit {code}: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\nexit_code: {code}\n\n{detail}"
@@ -847,24 +649,10 @@ fn insert_rc_failure_block(
         principal,
         rc_path,
         "failure",
-    );
+    )
 }
 
-/// Insert one rc capture block, projecting ANSI out of it first.
-///
-/// The RC boot aesthetic (docs/ansi-and-beyond.md) means these are the blocks
-/// most likely to be *deliberately* colorful — an rc script printing `[ OK ]`
-/// in green is the feature, not an accident. So the whole assembled `summary`
-/// (header lines plus the script's captured output) is what gets projected and
-/// what gets stored as the original: span offsets address block content, and
-/// the header prefix is part of that content. Projecting the detail alone
-/// would leave every offset short by the header's length.
-///
-/// The spans arrive as a follow-up `set_style_spans` rather than riding the
-/// inserted snapshot. That is one extra journal op on a path that runs once
-/// per context creation, and it buys the ordering rule stated in
-/// [`crate::ansi_ingest`] — text first, spans second — without every insert
-/// helper in the kernel needing to grow a spans argument.
+/// Commit a pre-execution diagnostic and any ANSI provenance together.
 #[allow(clippy::too_many_arguments)]
 fn insert_rc_output_block(
     dispatcher: &KjDispatcher,
@@ -875,69 +663,18 @@ fn insert_rc_output_block(
     principal: PrincipalId,
     rc_path: &str,
     what: &str,
-) {
+) -> Result<(), String> {
     let projection = crate::ansi_ingest::project(summary.as_bytes());
-    let original = projection.as_ref().map(|_| summary.clone());
-    let content = match projection {
-        Some(ref p) => p.text.clone(),
-        None => summary,
-    };
-    let after = dispatcher.block_store().last_block_id(new_id);
-    match dispatcher.block_store().insert_block_as(
-        new_id,
-        None,
-        after.as_ref(),
-        Role::System,
-        kind,
-        content,
-        status,
-        ContentType::Plain,
-        Some(principal),
-    ) {
-        Ok(block_id) => {
-            if let (Some(p), Some(original)) = (projection, original) {
-                crate::ansi_ingest::record(
-                    dispatcher.block_store(),
-                    new_id,
-                    &block_id,
-                    p.spans,
-                    original.as_bytes(),
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                "rc lifecycle: could not insert {what} block for {rc_path}: {e}"
-            );
-        }
-    }
-}
-
-/// Insert a `BlockKind::Trace` block capturing the stdout/stderr of a
-/// successful rc `.kai` script. Hidden from the LLM (the hydrator skips
-/// `Trace` unconditionally) but available in the conversation document
-/// for operator inspection.
-fn insert_rc_trace_block(
-    dispatcher: &KjDispatcher,
-    new_id: ContextId,
-    rc_path: &str,
-    sort_key: &str,
-    detail: String,
-    principal: PrincipalId,
-) {
-    let summary = format!(
-        "rc {sort_key} trace: {rc_path}\nrc_path: {rc_path}\nsort_key: {sort_key}\n\n{detail}"
-    );
-    insert_rc_output_block(
-        dispatcher,
-        new_id,
-        BlockKind::Trace,
-        summary,
-        Status::Done,
-        principal,
-        rc_path,
-        "trace",
-    );
+    let content = projection.as_ref().map_or_else(|| summary.clone(), |value| value.text.clone());
+    let ansi = projection.as_ref().map(|value| (value.spans.clone(), summary.as_bytes()));
+    dispatcher.block_store().append_block_recorded(new_id,
+        crate::block_store::RecordedBlockInsert {
+            role: Role::System, kind, content, status, content_type: ContentType::Plain,
+            author: principal, ansi, shell: None,
+        }, |_, _| Ok(())
+    ).map(|_| ()).map_err(|error| format!(
+        "{summary}\nrc lifecycle: could not retain {what} diagnostic for {rc_path}: {error}"
+    ))
 }
 
 #[cfg(test)]

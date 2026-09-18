@@ -168,6 +168,8 @@ pub struct Kernel {
     ledger_flows: SharedLedgerFlowBus,
     /// Durable shell receipts and context-owned kaish jobs.
     shell_operations: Arc<crate::shell_operations::ShellOperationRegistry>,
+    /// Durable rc results and the live owners of post-execution write faults.
+    rc_settlements: crate::rc::settlement::RcSettlements,
     turn_state: crate::runtime::turn_state::TurnState,
     runtime_worker: OnceLock<Result<crate::runtime::worker::RuntimeWorker, String>>,
     approval_delivery: OnceLock<Result<(), String>>,
@@ -347,6 +349,10 @@ impl Kernel {
             vfs.clone(),
             db.clone(),
         ));
+        let rc_settlements = crate::rc::settlement::RcSettlements::new(
+            db.clone(),
+            blocks.clone(),
+        );
 
         let kernel = Self {
             id,
@@ -388,6 +394,7 @@ impl Kernel {
                 operations.recover_result_reviews().expect("recover interrupted result reviews");
                 Arc::new(operations)
             },
+            rc_settlements,
             turn_state: crate::runtime::turn_state::TurnState::default(),
             runtime_worker: OnceLock::new(),
             approval_delivery: OnceLock::new(),
@@ -395,6 +402,7 @@ impl Kernel {
             cc_inbox: OnceLock::new(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
+        kernel.rc_settlements.recover().expect("recover rc lifecycle settlements");
         crate::runtime::approval_resume::recover_unpublished_pairs(&kernel).expect("retire unpublished approval invocations");
         crate::runtime::command::recover_unfinished(&kernel).expect("settle interrupted shell operations");
         crate::runtime::completion_notice::recover(&kernel).expect("recover execution completion notifications");
@@ -403,6 +411,10 @@ impl Kernel {
 
     /// Conversation ownership and interrupts shared by all model entry paths.
     pub fn turns(&self) -> &crate::runtime::turn_state::TurnState { &self.turn_state }
+
+    pub(crate) fn rc_settlements(&self) -> &crate::rc::settlement::RcSettlements {
+        &self.rc_settlements
+    }
 
     /// Admit a task to the shared executor. Shutdown cancels its token and
     /// joins the task; each owner must finish its settlement before returning.
@@ -443,9 +455,12 @@ impl Kernel {
             None => Ok(()),
         };
         let retried = crate::runtime::command::retry_retained_outcomes(self, usize::MAX);
+        let rc_retried = self.rc_settlements.retry_pending();
         let mut failures = self.shell_operations().retention_failures();
+        failures.extend(self.rc_settlements.unresolved_failures());
         if let Err(error) = joined { failures.push(error); }
         if let Err(error) = retried { failures.push(error); }
+        if let Err(error) = rc_retried { failures.push(error); }
         if failures.is_empty() { Ok(()) }
         else { Err(format!("kernel shutdown has unresolved work: {}", failures.join("; "))) }
     }

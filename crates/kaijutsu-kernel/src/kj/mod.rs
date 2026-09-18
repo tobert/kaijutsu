@@ -1196,22 +1196,16 @@ mod distillation_tests {
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
-    use crate::block_store::{shared_block_store, shared_block_store_with_db};
+    use crate::block_store::shared_block_store_with_db;
     use crate::drift::shared_drift_router;
     use crate::kernel_db::KernelDb;
     use kaijutsu_types::paths::{CLIENT_ROOT, CONFIG_ROOT, MIDI_ROOT, MIDI_RUN_ROOT, RC_ROOT};
 
-    /// Create a KjDispatcher with in-memory state for testing.
+    /// Create a KjDispatcher with a temporary database and journaled blocks.
     ///
     /// Must be called from an async context (e.g., `#[tokio::test]`).
     pub async fn test_dispatcher() -> KjDispatcher {
         test_dispatcher_with_timeouts(kaijutsu_types::TimeoutPolicy::default()).await
-    }
-
-    /// Create a test dispatcher whose temporary rc bindings allow host subprocesses.
-    #[allow(dead_code)] // Explicit opt-in for a test that reaches an rc lifecycle.
-    pub async fn test_dispatcher_with_host_exec() -> KjDispatcher {
-        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), false, true).await
     }
 
     /// Variant of `test_dispatcher` that installs a custom `TimeoutPolicy`
@@ -1220,16 +1214,16 @@ pub(crate) mod test_helpers {
     pub async fn test_dispatcher_with_timeouts(
         policy: kaijutsu_types::TimeoutPolicy,
     ) -> KjDispatcher {
-        test_dispatcher_with_storage(policy, false, false).await
+        test_dispatcher_configured(policy).await
     }
 
     /// Exercise receipt/journal transactions against the same database.
     pub async fn test_dispatcher_persistent() -> KjDispatcher {
-        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), true, false).await
+        test_dispatcher().await
     }
 
-    async fn test_dispatcher_with_storage(
-        policy: kaijutsu_types::TimeoutPolicy, persistent: bool, host_exec: bool,
+    async fn test_dispatcher_configured(
+        policy: kaijutsu_types::TimeoutPolicy,
     ) -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
@@ -1250,12 +1244,8 @@ pub(crate) mod test_helpers {
             })
             .unwrap();
         }
-        let blocks = if persistent {
-            let workspace = kernel_db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
-            shared_block_store_with_db(kernel_db.clone(), workspace, PrincipalId::system())
-        } else {
-            shared_block_store(PrincipalId::system())
-        };
+        let workspace = kernel_db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let blocks = shared_block_store_with_db(kernel_db.clone(), workspace, PrincipalId::system());
         // One throwaway root holds BOTH the kernel data_dir and the seeded
         // /config/rc tree, so the kernel's cleanup guard removes them together when
         // the dispatcher (and its kernel) drops — no leaked `/tmp` dirs across
@@ -1266,14 +1256,14 @@ pub(crate) mod test_helpers {
         let rc_tmp = root.join("rc");
         std::fs::create_dir_all(&kernel_data).expect("create kernel data dir");
         std::fs::create_dir_all(&rc_tmp).expect("create rc test dir");
-        seed_test_rc(&rc_tmp, host_exec);
+        seed_test_rc(&rc_tmp, false);
         let kernel = Arc::new(
             Kernel::new("test", &kernel_data, blocks.clone(), kernel_db.clone())
                 .await
                 .with_timeouts(policy)
                 .with_temp_cleanup(root.clone()),
         );
-        // Rc tests use host files; receipt tests also journal their block store.
+        // Rc uses real host files; every accepted block mutation is journaled.
         kernel
             .mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_tmp))
             .await;
@@ -1298,12 +1288,9 @@ pub(crate) mod test_helpers {
     /// `kj config` / `kj midi` / lifecycle tests that must exercise the real
     /// mount end-to-end, not just the backend-agnostic kj layer.
     ///
-    /// It uses a **DB-backed block store** (needed once a test loads a path
-    /// through the file-doc cache, which populates the `documents` table).
-    /// That is faithful to production but currently deadlocks the `kj::fork`
-    /// tests under a shared in-memory DB handle — a latent lock-ordering
-    /// issue tracked separately — so it is deliberately *not* the global
-    /// `test_dispatcher`; only rc-scoped tests (which never fork) use it.
+    /// Like `test_dispatcher`, this journals accepted block mutations in the
+    /// kernel database. Its additional mounts exercise the production config
+    /// namespace; host execution remains denied unless explicitly enabled.
     pub async fn test_dispatcher_rc() -> KjDispatcher {
         test_dispatcher_rc_configured(false).await
     }

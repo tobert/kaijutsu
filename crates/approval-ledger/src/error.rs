@@ -148,6 +148,38 @@ pub enum LedgerError {
     #[error("rc run {0} already has a recorded script_count")]
     RunScriptCountAlreadySet(String),
 
+    #[error("rc run {0} has no recorded script_count")]
+    RunScriptCountUnset(String),
+
+    #[error("rc run {run_id} cannot begin another script: script_count is {script_count}")]
+    RunScriptCountReached { run_id: String, script_count: i64 },
+
+    #[error("rc run {0} has started settlement and cannot begin another script")]
+    RunSettlementStarted(String),
+
+    /// No script with this sequence exists in the named rc run.
+    #[error("rc run {run_id} has no script at sequence {seq}")]
+    RunScriptNotFound { run_id: String, seq: i64 },
+
+    /// A retained script result is immutable once recorded.
+    #[error("rc run {run_id} script {seq} already has a different retained result")]
+    RunScriptResultConflict { run_id: String, seq: i64 },
+
+    /// A script projection is immutable once recorded.
+    #[error("rc run {run_id} script {seq} already has a different output block")]
+    RunScriptProjectionConflict { run_id: String, seq: i64 },
+
+    #[error("rc run {run_id} script {seq} has no retained result")]
+    RunScriptResultNotRetained { run_id: String, seq: i64 },
+
+    #[error("rc run {run_id} already intends outcome `{recorded}`, not `{requested}`")]
+    RunIntendedOutcomeConflict { run_id: String, recorded: String, requested: String },
+
+    /// A run cannot finish while a script that began lacks a retained result
+    /// or output projection, or when an ok run did not begin every script.
+    #[error("rc run {0} is not settled")]
+    RunNotSettled(String),
+
     /// `redeem_ask` was asked to redeem a request that carries no answer —
     /// it is still `pending`/`claimed`, or it ended `expired`/`abandoned`
     /// without anyone deciding. A distinct variant from the plain
