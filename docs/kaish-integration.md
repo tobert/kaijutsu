@@ -327,6 +327,10 @@ These are source observations, not promises that all paths behave alike.
   unknown side effects. State-publication and result-hook panics retain captured
   execution; completed statement output drains before streams close. The worker
   stops admission after a task failure and returns an error from shutdown.
+  Task factories also run inside their spawned task, so construction panics
+  reach that failure path instead of unwinding the supervisor. Accepted sibling
+  commands and queued shutdown work keep their settlement owners. Construction
+  remains on the kaish thread and may produce a non-`Send` future.
 - Live reporting/retry of persistence failures remains open. Abrupt task
   destruction before capture still needs a durable terminal outcome; cooperative worker shutdown settles execution, paused hooks,
   and review with matching job/receipt results and closed streams.

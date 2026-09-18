@@ -379,6 +379,56 @@ mod tests {
         paused_preparation(false, true, false).await;
     }
 
+    #[tokio::test]
+    async fn worker_factory_panic_settles_sibling_commands() {
+        for pre_call in [true, false] {
+            let (dispatcher, identity) = fixture().await;
+            let kernel = dispatcher.kernel();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut hooks = kernel.broker().hooks().write().await;
+            let table = if pre_call { &mut hooks.pre_call } else { &mut hooks.post_call };
+            table.entries.push(HookEntry {
+                id: HookId("factory-panic-sibling".into()), match_instance: None, match_tool: None,
+                match_context: Some(identity.context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::Invoke(HookBody::Builtin { name: "factory-panic-sibling".into(),
+                    hook: Arc::new(PausedHook { entered: entered.clone(), release, panic: false }) }),
+            });
+            drop(hooks);
+            let local = tokio::task::LocalSet::new();
+            let owner = kernel.clone();
+            local.spawn_local(async move { submit(&owner, identity, ShellSource::Code("echo captured-sibling".into()), true).await });
+            local.run_until(tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())).await.unwrap();
+            drop(local);
+            kernel.spawn_runtime_task(|_| -> std::future::Ready<()> { panic!("work factory panic sentinel"); }).unwrap();
+            let operation = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let operations = kernel.shell_operations().list_for_context(identity.context).unwrap();
+                    assert_eq!(operations.len(), 1);
+                    if operations[0].completed_at.is_some() { break operations.into_iter().next().unwrap(); }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }).await.expect("factory failure must cancel and join the admitted sibling without host shutdown");
+            let outcome = kernel.shell_operations().outcome(&operation.receipt.operation_id, identity.context).unwrap().unwrap();
+            if pre_call { assert!(matches!(outcome.execution, CommandExecution::NotRun)); }
+            else {
+                let CommandExecution::Completed(raw) = &outcome.execution else { panic!("lost sibling capture") };
+                assert_eq!(raw.text_out(), "captured-sibling\n");
+                let jobs = kernel.context_job_manager(identity.context);
+                let job = jobs.list().await.into_iter().next().unwrap();
+                assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), jobs.wait(job.id)).await.unwrap().unwrap(), outcome.exec_result());
+                let streams = jobs.streams(job.id).await.unwrap();
+                assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
+            }
+            for id in [operation.receipt.command_block_id, operation.receipt.output_block_id] {
+                assert_eq!(kernel.blocks().get_block_snapshot(identity.context, &id).unwrap().unwrap().status, Status::Error);
+            }
+            assert!(kernel.spawn_runtime_task(|_| async {}).is_err());
+            let failure = kernel.shutdown_runtime_worker().await.unwrap_err();
+            assert!(failure.contains("work factory panic sentinel"), "{failure}");
+        }
+    }
+
     async fn paused_preparation(shutdown: bool, panic: bool, edit: bool) {
         let (dispatcher, identity) = fixture().await;
         let kernel = dispatcher.kernel().clone();

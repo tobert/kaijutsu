@@ -263,10 +263,10 @@ answer, and model refusal notifications consume it atomically with their block.
 Claimed approvals now retain completion ownership through notification failures;
 source is never replayed to recover a message. Continue the live terminal-result
 audit for abrupt worker destruction and remaining job/controller lifetimes.
-Include submission factories: both worker receive/drain loops evaluate
-`work(stop)` before spawning its future. A synchronous factory panic appears
-able to unwind the supervisor; add a regression to check settlement of sibling
-commands before changing that boundary. Session refusals settle before a separate redemption; a retry can re-emit the same pair's
+Task construction now runs inside its worker task; a factory panic follows the
+same cancellation/drain path as a future panic. Regression coverage checks
+sibling command settlement before/after capture and queued shutdown cleanup.
+Session refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
 settling them. Periodic scans now drain larger backlogs; the four-item cap still
 counts delivery, not provider requests. Separate delivery throughput from

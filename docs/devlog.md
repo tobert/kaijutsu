@@ -2341,6 +2341,23 @@ ownership; none established an additional defect. The private review archive
 records that disposition. Abrupt worker destruction and the full caller
 inventory remain open.
 
+The worker lifetime audit reproduced a second panic boundary: evaluating a
+submitted factory before `spawn_local` unwound the supervisor and stranded an
+admitted sibling command. Factory evaluation now occurs inside the task, so
+Tokio reports the panic through the existing JoinSet failure path. The worker
+stops admission, cancels siblings, drains accepted work and reports the failure
+from shutdown. No new executor or recovery mechanism was needed.
+
+Regression coverage checks actual interactive commands paused before and after
+capture: the first settles NotRun, the second keeps captured execution, both
+pairs settle, and jobs complete with closed streams. A separate deterministic
+shutdown test queues a failing factory and a later non-Send future, then checks
+that construction stays on the worker thread and queued cleanup still finishes.
+Validation passed 3,199 kernel tests (6 ignored), 51 SSH/RPC tests and workspace
+all-targets checking. DeepSeek found no regression. Its claimed infinite
+retention retry was contradicted by the finite one-pass snapshot; admission
+pressure during prolonged faults remains tracked separately.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

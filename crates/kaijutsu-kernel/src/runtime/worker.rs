@@ -75,7 +75,9 @@ impl RuntimeWorker {
     pub(crate) fn submit<F, W>(&self, work: W) -> Result<(), String>
     where F: Future<Output = ()> + 'static, W: FnOnce(CancellationToken) -> F + Send + 'static {
         if self.shutdown.is_cancelled() { return Err("runtime worker is shut down".into()); }
-        self.sender.send(Box::new(move |stop| Box::pin(work(stop))))
+        // Construct the future inside its task so a factory panic reaches the
+        // JoinSet failure path and cannot unwind the supervisor or its siblings.
+        self.sender.send(Box::new(move |stop| Box::pin(async move { work(stop).await })))
             .map_err(|_| "runtime worker stopped before accepting work".into())
     }
 
@@ -107,6 +109,36 @@ mod tests {
         }).await.expect("task failure must stop new admission without waiting for host shutdown");
         let result = kernel.shutdown_runtime_worker().await;
         assert!(result.is_err(), "worker must not report a clean shutdown after a task panic");
+    }
+
+    #[tokio::test]
+    async fn a_factory_panic_during_shutdown_still_drains_accepted_work() {
+        let kernel = crate::Kernel::new_ephemeral("factory-panic-drain").await;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        kernel.spawn_runtime_task(move |_| async move {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+        }).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), ready).await.unwrap().unwrap();
+        kernel.spawn_runtime_task(|_| -> std::future::Ready<()> { panic!("queued factory panic sentinel"); }).unwrap();
+        let (finished, settled) = tokio::sync::oneshot::channel();
+        let caller = std::thread::current().id();
+        kernel.spawn_runtime_task(move |stop| {
+            assert_ne!(std::thread::current().id(), caller, "construction stays on the kaish thread");
+            let local = std::rc::Rc::new("settled");
+            async move {
+                assert!(stop.is_cancelled(), "queued work must receive the stopped token");
+                tokio::task::yield_now().await;
+                finished.send(*local).unwrap();
+            }
+        }).unwrap();
+        kernel.stop_runtime_worker();
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), kernel.shutdown_runtime_worker()).await.unwrap();
+        assert_eq!(settled.await.expect("factory failure must not discard queued settlement"), "settled");
+        assert!(result.unwrap_err().contains("queued factory panic sentinel"));
+        assert!(kernel.spawn_runtime_task(|_| async {}).is_err());
     }
 
     #[tokio::test]
