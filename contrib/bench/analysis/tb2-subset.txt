@@ -1,0 +1,29 @@
+# Terminal-Bench 2.0 subset for a cheap-model (DeepSeek flash), single-workstation,
+# podman run. See tb2-subset.md for the full table, selection criteria, and the
+# harbor run command line.
+#
+# Dataset: terminal-bench@2.0
+# Pinned commit: 69671fbaac6d67a7ef0dfec016cc38a64ef7a77c
+# (https://github.com/laude-institute/terminal-bench-2.git, cloned at
+# /home/atobey/src/bench-work/harbor/repos/tb2; matches the registry's
+# terminal-bench@2.0 entry, verified against its 89 task.toml files)
+fix-git
+cobol-modernization
+overfull-hbox
+fix-code-vulnerability
+configure-git-webserver
+sparql-university
+model-extraction-relu-logits
+dna-assembly
+sqlite-with-gcov
+openssl-selfsigned-cert
+query-optimize
+regex-log
+db-wal-recovery
+extract-elf
+largest-eigenval
+constraints-scheduling
+chess-best-move
+headless-terminal
+modernize-scientific-stack
+raman-fitting
