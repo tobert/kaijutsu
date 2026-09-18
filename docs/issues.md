@@ -2838,3 +2838,24 @@ broad facade/exec grants (`assets/defaults/rc/director/create/S10-binding.kai`)
 are worth revisiting once `kj` itself can reach what a shell used to be
 for. "We'll do a cap redesign sweep soon so it's a good time to
 experiment" — treat `Editor` as provisional until that sweep.
+
+## Shell settlement follow-ups
+
+- **Spill masks a later failure.** `seq 1 5000; false` reports exit 0 with
+  `did_spill`: kaish's `accumulate_result` keeps the first statement's
+  `original_code` and `runtime/command_result.rs:191` reads
+  `original_code.unwrap_or(code)`. `docs/shell-envelope.md` says the real exit
+  judges a capped result. Decide whether kaish or the glue changes. The ignored
+  test `spilled_statement_does_not_mask_a_later_failure` in
+  `mcp/servers/shell.rs` becomes the regression.
+- **`timeout` builtin under embedded kaish** fails with "no dispatcher available
+  (Kernel must be created via into_arc())".
+- **No timeout knob on the server kernel**, so the wire timeout test proxies
+  with `exit 124`; a real one needs an injectable `TimeoutPolicy`.
+- **`kaish_kernel::ExecuteOptions` built outside the shared owner:**
+  `streaming.rs:49` and `structured.rs:112` pass a default into
+  `command::run_without_blocks`; `rc/mod.rs`, `mcp/broker.rs` and
+  `runtime/editor_read.rs` build options themselves.
+- **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);
+  the mailbox notice block for a paused PostCall; wire-level interactive cancel
+  (no wire cancel exists for durable interactive commands).
