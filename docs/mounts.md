@@ -9,6 +9,55 @@
 > kaish-side rework making `/dev` writable enough for `> /dev/null` under
 > our read-only root is still open, tracked as "Later slices" below.
 
+## What a kernel mounts today
+
+`create_shared_kernel` (`crates/kaijutsu-server/src/rpc.rs`) builds the whole
+namespace and then calls `freeze_mounts()`. After that call the set is fixed:
+the `mount` RPC refuses, and nothing a client says can widen it. The perimeter
+is decided at boot, from the server's configuration.
+
+| Path | Backend | Access |
+|---|---|---|
+| `/` | host root | read-only |
+| `/dev` | host `/dev`, opaque to sweeps | read-only |
+| `$HOME/src` | host directory | read-write |
+| `/tmp` | host directory | read-write |
+| `/config/<tree>` | the declared host directory (`docs/config-namespace.md`) | read-write |
+| `/run/*`, `/v/cas`, `/r` | kernel-owned | as each backend says |
+
+`--rw-mount <DIR>` adds a host directory to that set, read-write, at the same
+path inside the kernel: host `/app` is kernel `/app`. It is repeatable and
+position-independent, and it is how a model gets write access to a workspace
+outside `$HOME/src` and `/tmp`. `kaijutsu-solo-acp --mount <DIR>` is the same
+seam (`SshServerConfig::rw_mounts`), and that binary also mounts the directory
+it was launched in unless told not to (`docs/solo-acp.md`).
+
+Each directory is checked before the freeze (`ssh::validate_rw_mounts`), and
+one that fails refuses the boot, naming itself and the reason. It must be
+absolute, exist, and be a directory; it may not be `/`, which would replace
+the read-only root, and it may not be at or under `/config`, `/run`, `/v`,
+`/r`, or `/dev`, which the kernel serves itself. The check is
+component-correct: `/configuration` is an ordinary directory, not `/config`.
+
+The check reads the path as written. It does not canonicalize, and the host
+follows symlinks and `..` when the mount is used, so what a directory
+resolves to is the operator's to know: `--rw-mount /home/u/link` where `link`
+points at `/` does make the host root writable under that name. The reverse
+is worth knowing too: a mount that contains a configuration tree's host
+directory makes those files reachable read-write at a second kernel path,
+while `/config/*` keeps winning for its own path by longest prefix. Both
+follow from "reach, not a sandbox", and from the flag being something an
+operator types.
+
+Resolution is longest-prefix (`MountTable::owner_of`), so a read-write `/app`
+wins over the read-only `/` for everything beneath it, and a nested pair
+behaves the way it reads: with both `/app` and `/app/sub` mounted, `/app/sub/x`
+goes to `/app/sub`.
+
+A mount is reach, not a sandbox — the same doctrine the rest of this document
+rests on. It decides what a model can see and resolve, not what a spawned
+child process can do.
+
 ## The inversion
 
 Today the kernel mounts the **whole host** read-only (`kernel.mount("/",

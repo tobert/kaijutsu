@@ -118,6 +118,12 @@ pub struct SshServerConfig {
     pub config_mounts: crate::config_mounts::ConfigMounts,
     /// Data directory override. None = use XDG default (~/.local/share/kaijutsu/kernel).
     pub data_dir: Option<PathBuf>,
+    /// Extra host directories mounted read-write, each at the same path in
+    /// the kernel namespace: host `/app` is kernel `/app`. These join the
+    /// fixed mounts (`docs/mounts.md`) and are checked by
+    /// [`validate_rw_mounts`] at boot. Empty by default — a kernel decides
+    /// its own perimeter, and widening it is something an operator asks for.
+    pub rw_mounts: Vec<PathBuf>,
     /// Maximum number of concurrent SSH connections. Default: 100.
     pub max_connections: usize,
     /// RAII guard for an `ephemeral()` test dir: removes the dir when the config
@@ -129,6 +135,83 @@ pub struct SshServerConfig {
     /// The private key bound to the `ephemeral()` root character. `None` for
     /// production configs.
     root_key: Option<std::sync::Arc<russh::keys::PrivateKey>>,
+}
+
+/// Kernel paths an extra read-write mount may never take over.
+///
+/// `/config`, `/run`, `/r`, and `/dev` come from `kaijutsu_types::paths` and
+/// this file's fixed mounts; `/v` has no single constant because kaish and
+/// kaijutsu share the namespace (`kaijutsu_types::paths`, "Reserved names"),
+/// so the parent is named here and covers every `/v/*` mount beneath it.
+const RESERVED_MOUNT_ROOTS: &[&str] = &[
+    kaijutsu_types::paths::CONFIG_NAMESPACE_ROOT,
+    kaijutsu_types::paths::RUN_ROOT,
+    kaijutsu_types::paths::R_ROOT,
+    "/v",
+    "/dev",
+];
+
+/// Whether `path` is `root` or a path-component child of it. `/configuration`
+/// is not under `/config`.
+fn is_or_under(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// Check the extra read-write host directories and return them ready to
+/// mount, with trailing slashes trimmed and repeats collapsed.
+///
+/// Each is mounted at the same path in the kernel namespace, so the rules are
+/// about that path as much as the directory: it must be absolute, exist, and
+/// be a directory, and it may not be `/` or a reserved root. Every refusal
+/// names the path and the reason and fails the boot. A mount that quietly did
+/// nothing would surface much later as a model's write failing, with nothing
+/// to point at.
+pub fn validate_rw_mounts(dirs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut checked: Vec<PathBuf> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let given = dir.to_string_lossy().into_owned();
+        if !given.starts_with('/') {
+            return Err(format!(
+                "read-write mount '{given}' is not absolute; it names a host directory \
+                 and the kernel path it is mounted at"
+            ));
+        }
+        let trimmed = given.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(
+                "read-write mount '/' would replace the read-only root the whole namespace \
+                 rests on; name the directory you want to write to"
+                    .to_string(),
+            );
+        }
+        if let Some(reserved) = RESERVED_MOUNT_ROOTS
+            .iter()
+            .find(|root| is_or_under(trimmed, root))
+        {
+            return Err(format!(
+                "read-write mount '{trimmed}' is at or under '{reserved}', a reserved kernel \
+                 root; mount a directory of your own instead"
+            ));
+        }
+
+        let path = PathBuf::from(trimmed);
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(format!("read-write mount '{trimmed}' is not a directory"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("read-write mount '{trimmed}' does not exist"));
+            }
+            Err(e) => {
+                return Err(format!("read-write mount '{trimmed}' is unreadable: {e}"));
+            }
+        }
+        if !checked.contains(&path) {
+            checked.push(path);
+        }
+    }
+    Ok(checked)
 }
 
 /// Removes its directory on drop. A tiny owned guard so `ephemeral()` test
@@ -288,6 +371,7 @@ impl SshServerConfig {
             config_dir: Some(path.clone()),
             config_mounts,
             data_dir: Some(path.clone()),
+            rw_mounts: Vec::new(),
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
             root_key: Some(std::sync::Arc::new(root_key)),
@@ -326,6 +410,7 @@ impl SshServerConfig {
                 crate::config_mounts::ConfigMounts::default_root(),
             ),
             data_dir: None,   // Use XDG default
+            rw_mounts: Vec::new(),
             max_connections: 100,
             _cleanup: None,
             root_key: None,
@@ -409,10 +494,18 @@ impl SshServer {
     /// `SharedKernel` back through `kernel_tx` right after it is built —
     /// before the server starts accepting connections.
     ///
-    /// Test-only hook for inspecting the kernel behind a connected client or
-    /// exercising native broker tools. `ledger_events_wire.rs` also uses it
-    /// to publish `LedgerFlow::Changed` on the kernel bus and check the
-    /// `subscribeLedgerEvents` bridge independently of approval decisions.
+    /// For a caller that hosts the kernel rather than merely connecting to
+    /// it. A process that must settle the kernel at exit the way
+    /// `spawn_signal_shutdown` does for a signal — cancel, await the runtime
+    /// worker, checkpoint — needs the handle to do it (`kaijutsu-solo-acp`
+    /// closes on client disconnect, where no signal arrives). Tests use it to
+    /// inspect the kernel behind a connected client or exercise native broker
+    /// tools; `ledger_events_wire.rs` also publishes `LedgerFlow::Changed` on
+    /// the kernel bus to check the `subscribeLedgerEvents` bridge
+    /// independently of approval decisions.
+    ///
+    /// Not a way to reach past the wire. A client speaks RPC; this hands a
+    /// handle to whoever started the kernel in their own process.
     #[doc(hidden)]
     pub async fn run_on_listener_with_kernel_sink(
         &self,
@@ -492,6 +585,7 @@ impl SshServer {
             self.config.config_dir.as_deref(),
             &self.config.config_mounts,
             self.config.data_dir.as_deref(),
+            &self.config.rw_mounts,
         )
         .await
         .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
@@ -1238,7 +1332,7 @@ mod tests {
                 }).unwrap();
                 drop(db);
                 let shared = crate::rpc::create_shared_kernel(None,
-                    &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir)).await.unwrap();
+                    &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir), &[]).await.unwrap();
                 let context = shared.kernel_db.lock().get_character(principal).unwrap().unwrap().root_ctx.unwrap();
                 let mut binding = ContextToolBinding::new();
                 binding.grant(Capability::Facade("shell".into()));
@@ -1393,5 +1487,92 @@ mod tests {
         assert!(!should_warn_idle(RPC_IDLE_WARN_THRESHOLD - Duration::from_secs(1)));
         assert!(should_warn_idle(RPC_IDLE_WARN_THRESHOLD));
         assert!(should_warn_idle(RPC_IDLE_WARN_THRESHOLD + Duration::from_secs(1)));
+    }
+
+    /// The error a refused mount produces, or the panic message if it was
+    /// accepted.
+    fn rw_refusal(dir: &str) -> String {
+        match validate_rw_mounts(&[PathBuf::from(dir)]) {
+            Err(e) => e,
+            Ok(_) => panic!("{dir} must not be accepted as a read-write mount"),
+        }
+    }
+
+    #[test]
+    fn a_read_write_mount_must_be_an_absolute_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            validate_rw_mounts(&[dir.path().to_path_buf()]).unwrap(),
+            vec![dir.path().to_path_buf()],
+            "an existing absolute directory is what this flag is for"
+        );
+
+        let relative = rw_refusal("work/project");
+        assert!(relative.contains("absolute"), "{relative}");
+        assert!(relative.contains("work/project"), "{relative}");
+
+        let missing = dir.path().join("not-here");
+        let error = validate_rw_mounts(std::slice::from_ref(&missing))
+            .expect_err("a missing path is refused");
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let error = validate_rw_mounts(&[file]).expect_err("a file is refused");
+        assert!(error.contains("not a directory"), "{error}");
+    }
+
+    #[test]
+    fn a_read_write_mount_may_not_take_over_a_reserved_root() {
+        // `/` read-write would undo the read-only root the whole namespace
+        // rests on.
+        let root = rw_refusal("/");
+        assert!(root.contains("read-only root"), "{root}");
+
+        for reserved in [
+            "/config",
+            "/config/rc",
+            "/config/kernel/deeper",
+            "/run",
+            "/run/midi",
+            "/v",
+            "/v/cas",
+            "/r",
+            "/dev",
+        ] {
+            let error = rw_refusal(reserved);
+            assert!(
+                error.contains(reserved) && error.contains("reserved"),
+                "{reserved}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_root_is_matched_at_component_boundaries() {
+        // `/configuration` merely starts with `/config`; it is an ordinary
+        // directory and must be mountable.
+        let dir = tempfile::tempdir().unwrap();
+        let lookalike = dir.path().join("runner");
+        std::fs::create_dir(&lookalike).unwrap();
+        assert!(validate_rw_mounts(&[lookalike]).is_ok());
+
+        let error = rw_refusal("/configuration");
+        assert!(
+            error.contains("does not exist"),
+            "a lookalike is judged as an ordinary path, not a reserved one: {error}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_is_trimmed_and_repeats_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_slash = PathBuf::from(format!("{}/", dir.path().display()));
+        assert_eq!(
+            validate_rw_mounts(&[with_slash.clone(), dir.path().to_path_buf()]).unwrap(),
+            vec![dir.path().to_path_buf()],
+            "the same directory named twice is mounted once"
+        );
     }
 }

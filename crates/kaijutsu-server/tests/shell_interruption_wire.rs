@@ -18,7 +18,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
         let marker = config.data_dir.as_ref().unwrap().join("must-not-run");
         let (context, command, output, orphan_call, orphan_result) = {
             let shared = kaijutsu_server::rpc::create_shared_kernel(
-                config.config_dir.as_deref(), &config.config_mounts, config.data_dir.as_deref(),
+                config.config_dir.as_deref(), &config.config_mounts, config.data_dir.as_deref(), &[],
             ).await.unwrap();
             let amy = shared.kernel_db.lock().get_character_by_name("amy").unwrap().unwrap().principal_id;
             let context = shared.kernel_db.lock().get_character(amy).unwrap().unwrap().root_ctx.unwrap();

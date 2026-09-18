@@ -52,6 +52,7 @@ transport = "carrier_pigeon"
         Some(config_dir.path()),
         &kaijutsu_server::config_mounts::ConfigMounts::new(config_dir.path().join("config")),
         Some(data_dir.path()),
+        &[],
     )
     .await
     .expect("a bad mcp.toml entry must not fail kernel boot");

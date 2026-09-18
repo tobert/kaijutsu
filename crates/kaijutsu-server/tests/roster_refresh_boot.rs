@@ -36,6 +36,7 @@ async fn boot_refreshes_the_roster_without_a_reader() {
         None,
         &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),
         Some(tmp.path()),
+        &[],
     )
         .await
         .expect("create_shared_kernel should succeed on an empty data dir");
@@ -74,6 +75,7 @@ async fn dropping_the_shared_kernel_cancels_the_refresh_loop() {
         None,
         &kaijutsu_server::config_mounts::ConfigMounts::new(tmp.path().join("config")),
         Some(tmp.path()),
+        &[],
     )
         .await
         .expect("create_shared_kernel should succeed on an empty data dir");

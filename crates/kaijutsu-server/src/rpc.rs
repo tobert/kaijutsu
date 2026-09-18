@@ -1417,6 +1417,10 @@ pub async fn create_shared_kernel(
     // meaning on one parameter is how a test writes into a real home.
     config_mounts: &crate::config_mounts::ConfigMounts,
     data_dir: Option<&Path>,
+    // Extra host directories to mount read-write, each at the same path in
+    // the kernel namespace (`docs/mounts.md`). Empty for a kernel that keeps
+    // the fixed perimeter below.
+    rw_mounts: &[std::path::PathBuf],
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
     // Per-subscription lossless queue depth (KAIJUTSU_FLOW_QUEUE_DEPTH). The
@@ -1643,6 +1647,17 @@ pub async fn create_shared_kernel(
     // backdrop and any indexer skip it, never crawling a client's disk.
     let share_fs = kaijutsu_kernel::vfs::ShareFs::new(kernel.share_registry().clone());
     kernel.mount(paths::R_ROOT, share_fs).await;
+
+    // The operator's own read-write directories, each at the same path in the
+    // kernel namespace: host /app is kernel /app. Longest-prefix routing puts
+    // each ahead of the read-only `/`, which is what makes a workspace outside
+    // $HOME/src writable. Checked first, and a bad one fails the boot: a mount
+    // the perimeter cannot honor must not look like it worked
+    // (`docs/mounts.md`).
+    for dir in crate::ssh::validate_rw_mounts(rw_mounts).map_err(capnp::Error::failed)? {
+        log::info!("Read-write mount at {}", dir.display());
+        kernel.mount(&dir, LocalBackend::new(&dir)).await;
+    }
 
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
@@ -10609,6 +10624,7 @@ mod semantic_search_tests {
             let shared = create_shared_kernel(None,
                 &crate::config_mounts::ConfigMounts::new(dir.path().join("config")),
                 Some(dir.path()),
+                &[],
             ).await.unwrap();
             let connection = Rc::new(RefCell::new(ConnectionState::new(
                 PrincipalId::system(), shared.session_contexts.clone(),

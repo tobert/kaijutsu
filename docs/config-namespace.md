@@ -82,6 +82,12 @@ than one that came up and died.
 There is no bootstrap cycle: the root comes from a flag or the default, and the
 file inside it only ever names its own children.
 
+`--mount` moves a configuration tree that already exists; it never invents a
+name, and `/config/rc=<dir>` is the only shape it takes. To make an ordinary
+working directory writable — a project, a task workspace — the flag is
+`--rw-mount <dir>`, which mounts a host directory at its own path outside
+`/config` entirely. See `docs/mounts.md`.
+
 **When nothing is declared, nothing looks special.** Every root is a
 subdirectory of one host directory, and the registry is invisible. It earns its
 keep only when a root diverges — which is the point of "don't make rooting on a

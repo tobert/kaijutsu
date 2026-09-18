@@ -79,6 +79,10 @@ OPTIONS:
     --mount <TREE>=<DIR>          Point one tree elsewhere, e.g.
                                   --mount /config/rc=./assets/defaults/rc.
                                   Beats <config-root>/mounts.toml.
+    --rw-mount <DIR>              Mount a host directory read-write at the
+                                  same path in the kernel, so file tools may
+                                  write there. Repeatable. This is a
+                                  workspace, not a /config tree.
     --port <PORT>                 SSH port (default: {port})
     --as <NAME>                   add-key: the character to bind the key to.
     --rebind                      add-key: move an already-bound key instead
@@ -198,12 +202,14 @@ async fn async_main() -> ExitCode {
     }
 }
 
-/// The `--config-root` / `--mount` half of the command line: where every
-/// `/config` tree comes from (`docs/config-namespace.md`).
+/// The path half of the command line: where every `/config` tree comes from
+/// (`--config-root` / `--mount`, `docs/config-namespace.md`) and which host
+/// directories the kernel mounts read-write (`--rw-mount`, `docs/mounts.md`).
 #[derive(Debug, Default)]
 struct ServerPaths {
     root: Option<PathBuf>,
     mounts: Vec<String>,
+    rw_mounts: Vec<PathBuf>,
 }
 
 impl ServerPaths {
@@ -228,6 +234,11 @@ impl ServerPaths {
                     me.mounts.push(v.clone());
                     i += 2;
                 }
+                "--rw-mount" => {
+                    let v = args.get(i + 1).ok_or("--rw-mount needs a directory")?;
+                    me.rw_mounts.push(PathBuf::from(v));
+                    i += 2;
+                }
                 other => {
                     out.push(other.to_string());
                     i += 1;
@@ -250,7 +261,8 @@ impl ServerPaths {
     }
 }
 
-async fn run_server(port: u16, paths: ServerPaths) -> ExitCode {
+async fn run_server(port: u16, mut paths: ServerPaths) -> ExitCode {
+    let rw_mounts = std::mem::take(&mut paths.rw_mounts);
     // Resolve the config mounts BEFORE announcing a start. A bad declaration
     // is a refusal to boot, and saying "Starting..." first would report a
     // server that came up and died rather than one that never began.
@@ -265,6 +277,7 @@ async fn run_server(port: u16, paths: ServerPaths) -> ExitCode {
     tracing::info!("Starting kaijutsu server on SSH port {}...", port);
     let mut config = SshServerConfig::production(port);
     config.config_mounts = mounts;
+    config.rw_mounts = rw_mounts;
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {

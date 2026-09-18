@@ -23,7 +23,7 @@ async fn boot_uses_discovered_dimensions_and_no_builtin_model_files() {
         timeout_ms: 2000, max_in_flight: 2, max_context_bytes: 2048 }).unwrap();
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path())).await.unwrap();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
     let index = shared.semantic_index.as_ref().expect("service discovery must initialize the index");
     assert_eq!(index.embedder().model_name(), "boot-test");
     assert_eq!(index.embedder().dimensions(), 1024);
@@ -41,7 +41,7 @@ async fn unavailable_service_leaves_index_unavailable() {
         timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path())).await.unwrap();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
     assert!(shared.semantic_index.is_none(), "must not substitute another embedding model");
 }
 
