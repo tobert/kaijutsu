@@ -71,6 +71,19 @@ being a positive integer before the command is built, so a typo is a refusal
 here rather than a refusal from the binary after the container is already
 up. Both are recorded in `kaijutsu-provenance.json`'s `model` object.
 
+`KAIJUTSU_ACP_RC_OVERLAY` (`--ak rc_overlay=`) names a local rc overlay
+directory (see `contrib/bench/rc-variants/*/README.md` for the shape, e.g.
+`coder-driven`). `install()` uploads it into the container under
+`/installed-agent/kaijutsu/rc-overlay/` (`environment.upload_dir`, the same
+call `AcpAgent.install()` uses for the agent's own source) and passes
+`--rc-overlay /installed-agent/kaijutsu/rc-overlay` to the binary, which
+applies it after the kernel seeds `/config/rc` and before any context can be
+created. Left unset, the seeded rc tree is unchanged. `kaijutsu-provenance.json`'s
+`rc_overlay` object records the local host path and a sha256 over the
+directory's sorted relative paths and file bytes, so a job's provenance ties
+a run to the exact variant that produced it even though the variant's own
+files never leave the host in the trial's output.
+
 Requirements: bash >= 4.4 (the wrapper expands possibly-empty arrays under
 `set -u`) and Python >= 3.12 (Harbor's own floor — `requires-python = ">=3.12"`;
 the adapter imports Harbor and runs in its interpreter).

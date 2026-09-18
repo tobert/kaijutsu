@@ -731,6 +731,139 @@ fn a_named_gate_policy_lands_in_this_kernels_config() {
     assert!(state.is_dir(), "a named state directory survives the exit");
 }
 
+/// A minimal rc overlay: `coder/create/S00-stance.kai` reads its companion
+/// Markdown the same way `contrib/bench/rc-variants/coder-driven` does, and
+/// the companion carries `marker` as its whole body. The shipped
+/// `coder/create/S00-stance.kai` is already a regular file (not a symlink),
+/// so this overlay exercises the plain-replace path; the symlink-unlink path
+/// is covered in `state::tests`.
+fn write_marker_overlay(dir: &Path, marker: &str) {
+    let coder_dir = dir.join("coder").join("create");
+    std::fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
+    std::fs::write(dir.join("README.md"), "test fixture, not applied\n")
+        .expect("write the overlay README");
+    std::fs::write(
+        coder_dir.join("S00-stance.kai"),
+        "set -e\nkj block create --role system --kind text --content-type text/markdown < \"$(dirname \"$0\")/$(basename \"$0\" .kai).md\"\n",
+    )
+    .expect("write the overlay stance script");
+    std::fs::write(coder_dir.join("S00-stance.md"), format!("{marker}\n"))
+        .expect("write the overlay stance companion");
+}
+
+/// The overlay's marker reaches the coder context's durable system
+/// instructions. Observable: reopen the state dir's `kernel.db` after the
+/// binary exits (stdin EOF checkpoints it) and read the context's blocks
+/// back through the same `BlockStore::load_from_db` + `block_snapshots` path
+/// the kernel itself uses — the ACP `sessionId` IS the context id's hex form
+/// (`kaijutsu_acp::rank::session_id_of`), so no extra lookup is needed to
+/// find which context to read.
+#[test]
+fn an_rc_overlay_marker_reaches_the_contexts_system_instructions() {
+    let state = scratch_dir("rc-overlay-state").join("state");
+    let overlay = scratch_dir("rc-overlay-variant");
+    let marker = "MARKER-rc-overlay-test-3f9c7a21-unique-instruction-sentence";
+    write_marker_overlay(&overlay, marker);
+
+    let mut agent = Agent::spawn_mock_with(
+        "chat",
+        &[
+            "--state-dir",
+            state.to_str().expect("utf-8 state path"),
+            "--rc-overlay",
+            overlay.to_str().expect("utf-8 overlay path"),
+        ],
+    );
+    agent.initialize();
+    let cwd = scratch_dir("rc-overlay-cwd");
+    // `session/new` runs the create lifecycle synchronously, so the
+    // instructions are already durable blocks once this returns; no prompt
+    // is needed.
+    let session = agent.new_session(&cwd);
+
+    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
+
+    let context_id = kaijutsu_types::ContextId::parse(&session)
+        .unwrap_or_else(|e| panic!("session id {session:?} is not a context id: {e}"));
+    let db = Arc::new(parking_lot::Mutex::new(
+        kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+            .expect("reopen the kernel db the binary just closed"),
+    ));
+    let blocks = kaijutsu_kernel::block_store::shared_block_store_with_db(
+        db,
+        kaijutsu_types::WorkspaceId::new(),
+        kaijutsu_types::PrincipalId::system(),
+    );
+    blocks.load_from_db().expect("load documents from the reopened db");
+    let snapshots = blocks
+        .block_snapshots(context_id)
+        .unwrap_or_else(|e| panic!("read blocks for context {context_id}: {e}"));
+
+    let marker_block = snapshots
+        .iter()
+        .find(|b| b.content.contains(marker))
+        .unwrap_or_else(|| {
+            let bodies: Vec<&str> = snapshots.iter().map(|b| b.content.as_str()).collect();
+            panic!("no block carried the overlay marker {marker:?}; saw {bodies:?}")
+        });
+    assert_eq!(
+        marker_block.role,
+        kaijutsu_types::Role::System,
+        "the overlay's stance script authors a system block, same as the shipped one"
+    );
+}
+
+#[test]
+fn an_unusable_rc_overlay_refuses_the_boot() {
+    let missing = scratch_dir("rc-overlay-refusals").join("missing");
+    let plain_file = scratch_dir("rc-overlay-refusals").join("a-file");
+    std::fs::write(&plain_file, "not a directory\n").expect("write a plain file");
+    let readme_only = scratch_dir("rc-overlay-refusals").join("readme-only");
+    std::fs::create_dir_all(&readme_only).expect("create the readme-only overlay");
+    std::fs::write(readme_only.join("README.md"), "docs only\n").expect("write the readme");
+    let typo = scratch_dir("rc-overlay-refusals").join("typo");
+    std::fs::create_dir_all(typo.join("coderr").join("create")).expect("create the typo'd dir");
+    std::fs::write(typo.join("coderr").join("create").join("S00-base.kai"), "# typo\n")
+        .expect("write the typo'd file");
+
+    let cases: [(&str, &std::path::Path); 4] = [
+        ("does not exist", &missing),
+        ("is not a directory", &plain_file),
+        ("nothing to apply", &readme_only),
+        ("no seeded directory", &typo),
+    ];
+    for (reason, overlay) in cases {
+        let output = Command::new(BIN)
+            .arg("--backend-kind")
+            .arg("mock")
+            .arg("--model")
+            .arg("solo-mock")
+            .arg("--rc-overlay")
+            .arg(overlay)
+            .env("TMPDIR", scratch_dir("tmp"))
+            .output()
+            .unwrap_or_else(|e| panic!("run --rc-overlay {}: {e}", overlay.display()));
+        assert!(
+            !output.status.success(),
+            "--rc-overlay {} must refuse the boot, got {:?}",
+            overlay.display(),
+            output.status
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "stdout stays empty on a refusal: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(reason),
+            "--rc-overlay {} must say why ({reason}):\n{stderr}",
+            overlay.display()
+        );
+    }
+}
+
 /// The line the binary prints once the ACP bridge is up. Every exit test
 /// waits for it, so a signal always lands on a fully-started process.
 const SERVING: &str = "serving ACP v1 on stdio";

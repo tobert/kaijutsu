@@ -149,6 +149,18 @@ struct Cli {
     #[arg(long, value_name = "N")]
     max_tokens: Option<NonZeroU64>,
 
+    /// An rc variant to install over the seeded `/config/rc` tree, for A/B
+    /// instruction sets. The directory mirrors the rc tree's layout and holds
+    /// only the files that differ; every regular file under it (a top-level
+    /// `README.md` is skipped) replaces the file at the same relative path.
+    /// Applied after the kernel seeds `/config/rc` and before any context can
+    /// be created, so it reaches every session this process serves. Refused,
+    /// before anything is replaced, if the directory is missing, empty,
+    /// contains a symlink or another non-regular file, or names a file whose
+    /// seeded parent directory does not exist.
+    #[arg(long, value_name = "DIR")]
+    rc_overlay: Option<PathBuf>,
+
     /// Fail the kernel once it is serving. Drives the recovery path in
     /// tests; hidden, and absent from a build without `test-mock`.
     #[cfg(feature = "test-mock")]
@@ -317,6 +329,11 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(gate) = &cli.gate_config {
         state::install_gate_config(&solo, gate)?;
         tracing::info!(source = %gate.display(), "installed the gate policy");
+    }
+
+    if let Some(overlay) = &cli.rc_overlay {
+        state::install_rc_overlay(&solo, overlay)?;
+        tracing::info!(source = %overlay.display(), "installed the rc overlay");
     }
 
     let shared_kernel = running.kernel().clone();

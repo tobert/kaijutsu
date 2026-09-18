@@ -45,6 +45,7 @@ BACKEND_ENV = "KAIJUTSU_ACP_BACKEND"
 RUST_LOG_ENV = "KAIJUTSU_ACP_RUST_LOG"
 CONSENT_ENV = "KAIJUTSU_ACP_CONSENT"
 MAX_TOKENS_ENV = "KAIJUTSU_ACP_MAX_TOKENS"
+RC_OVERLAY_ENV = "KAIJUTSU_ACP_RC_OVERLAY"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -118,6 +119,27 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _dir_content_hash(root: Path) -> str:
+    """sha256 over `root`'s sorted relative paths and file bytes.
+
+    A stable fingerprint of what gets uploaded: independent of mtimes,
+    ownership, and directory-listing order. Only regular files count -- a
+    symlink is skipped here the same way kaijutsu-solo-acp itself refuses
+    one when applying the overlay (`docs/solo-acp.md`, `--rc-overlay`), so
+    this hash can never silently follow one to content outside the tree.
+    """
+    digest = hashlib.sha256()
+    files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+    for path in files:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -205,6 +227,16 @@ class KaijutsuSoloOptions(AcpOptions):
             "factory ceiling)."
         ),
     )
+    rc_overlay: str | None = Field(
+        default=None,
+        description=(
+            "Host path to a local rc overlay directory (see "
+            "contrib/bench/rc-variants/*/README.md), uploaded into the "
+            "container and passed to --rc-overlay. Default: "
+            f"${RC_OVERLAY_ENV}, else left off the command line entirely, "
+            "which keeps the seeded rc tree unchanged."
+        ),
+    )
 
 
 class KaijutsuSoloAcp(AcpAgent):
@@ -216,6 +248,7 @@ class KaijutsuSoloAcp(AcpAgent):
     REMOTE_DIR = PurePosixPath("/installed-agent/kaijutsu")
     REMOTE_BINARY = REMOTE_DIR / "kaijutsu-solo-acp"
     REMOTE_GATE = REMOTE_DIR / "gate.toml"
+    REMOTE_RC_OVERLAY = REMOTE_DIR / "rc-overlay"
 
     PROVENANCE_FILENAME = "kaijutsu-provenance.json"
 
@@ -229,6 +262,7 @@ class KaijutsuSoloAcp(AcpAgent):
         rust_log: str | None = None,
         consent: str | None = None,
         max_tokens: int | str | None = None,
+        rc_overlay: str | None = None,
         **kwargs: Any,
     ):
         self._local_binary = self._require_file(
@@ -321,6 +355,21 @@ class KaijutsuSoloAcp(AcpAgent):
                     f"max_tokens must be greater than zero, got {self._max_tokens}."
                 )
 
+        # Left unset, the seeded rc tree is untouched -- this module changes
+        # no default of its own here either.
+        rc_overlay_value = rc_overlay if rc_overlay is not None else os.environ.get(RC_OVERLAY_ENV)
+        if rc_overlay_value is None:
+            self._rc_overlay: Path | None = None
+            self._rc_overlay_hash: str | None = None
+        else:
+            self._rc_overlay = self._require_dir(
+                rc_overlay_value,
+                what="rc overlay directory",
+                option="rc_overlay",
+                env_var=RC_OVERLAY_ENV,
+            )
+            self._rc_overlay_hash = _dir_content_hash(self._rc_overlay)
+
         # A reused container must not silently continue the previous kernel's
         # contexts and transcript, so each constructed agent gets its own state
         # directory. The steps of one multi-step trial share it, which is the
@@ -344,6 +393,7 @@ class KaijutsuSoloAcp(AcpAgent):
             rust_log=self._rust_log,
             consent=self._consent,
             max_tokens=self._max_tokens,
+            rc_overlay=str(self._rc_overlay) if self._rc_overlay is not None else None,
             **kwargs,
         )
 
@@ -386,6 +436,15 @@ class KaijutsuSoloAcp(AcpAgent):
             raise FileNotFoundError(f"{what} is not a file: {path}")
         return path
 
+    @staticmethod
+    def _require_dir(value: str, *, what: str, option: str, env_var: str) -> Path:
+        path = Path(value).expanduser().resolve()
+        if not path.is_dir():
+            raise NotADirectoryError(
+                f"{what} is not a directory: {path} (--ak {option}=<dir> or ${env_var})"
+            )
+        return path
+
     def _entry_version(self) -> str:
         """A version that names the thing that actually ran."""
         if self._git_head:
@@ -407,6 +466,8 @@ class KaijutsuSoloAcp(AcpAgent):
             args += ["--consent", self._consent]
         if self._max_tokens is not None:
             args += ["--max-tokens", str(self._max_tokens)]
+        if self._rc_overlay is not None:
+            args += ["--rc-overlay", self.REMOTE_RC_OVERLAY.as_posix()]
         return args + self._solo_args
 
     def _registry_entry_payload(self) -> dict[str, Any]:
@@ -492,6 +553,15 @@ class KaijutsuSoloAcp(AcpAgent):
                 if self._local_gate is not None
                 else {"installed": False, "reason": f"gate_config_path={GATE_NONE}"}
             ),
+            "rc_overlay": (
+                {
+                    "host_path": str(self._rc_overlay),
+                    "content_hash": self._rc_overlay_hash,
+                    "remote_path": self.REMOTE_RC_OVERLAY.as_posix(),
+                }
+                if self._rc_overlay is not None
+                else {"installed": False}
+            ),
             "worktree": {
                 "path": str(self._worktree),
                 "head": self._git_head,
@@ -554,6 +624,12 @@ class KaijutsuSoloAcp(AcpAgent):
                 target_path=self.REMOTE_GATE.as_posix(),
             )
             chmod += f" && chmod 0644 {shlex.quote(self.REMOTE_GATE.as_posix())}"
+        if self._rc_overlay is not None:
+            await environment.upload_dir(
+                source_dir=self._rc_overlay,
+                target_dir=self.REMOTE_RC_OVERLAY.as_posix(),
+            )
+            chmod += f" && chmod -R a+rX {shlex.quote(self.REMOTE_RC_OVERLAY.as_posix())}"
         # The agent user must be able to read and run both, and to write state.
         # Inside a disposable task container that is deliberately permissive.
         chmod += f" && chmod -R a+rwX {remote_state}"

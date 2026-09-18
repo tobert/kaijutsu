@@ -75,6 +75,7 @@ file the backend row names. It never belongs in this file.
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
 | `--consent <collaborative\|autonomous>` | The consent mode every session this kernel serves runs in. It sets the per-turn agentic tool-loop cap: 50 iterations in collaborative, 100 in autonomous. Collaborative pauses with a message asking for a follow-up prompt; autonomous pauses with a plain warning. Nothing else reads this mode today. Default: the kernel's own default, collaborative — plain use is unchanged. |
 | `--max-tokens <N>` | The output token ceiling written into this kernel's model defaults. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the factory ceiling, 16384. |
+| `--rc-overlay <dir>` | An rc variant to install over the seeded `/config/rc` tree, for A/B instruction sets (`contrib/bench/rc-variants/*/README.md`). The directory mirrors the rc tree's layout and holds only the files that differ; every regular file under it (a top-level `README.md` is skipped) replaces the file at the same relative path, unlinked first so a seeded symlink into `lib/` is replaced rather than written through. Refuses, before anything is replaced, if the directory is missing or empty, contains a symlink or another non-regular file, or names a file whose seeded parent directory does not exist. Idempotent: re-applying the same overlay against a persistent `--state-dir` is safe. |
 
 Zero flags works when exactly one of `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
 or `OPENAI_API_KEY` is set. Zero keys, or several, is a refusal naming what to
@@ -166,12 +167,18 @@ Each step fails loudly, with what it was doing:
    exactly as a fresh install does, and refuses to start on a mount it cannot
    honor.
 9. Install `--gate-config`, if given.
-10. Apply `--consent`, if given, to the running kernel — before the ACP
+10. Apply `--rc-overlay`, if given, to the seeded `/config/rc` tree. This
+    must run after step 8 seeds it and before any context can be created —
+    rc scripts are read fresh from disk at every lifecycle run
+    (`kaijutsu_kernel::rc::mod::load_scripts`), not cached at boot, so
+    landing here, before the ACP bridge connects, is early enough for every
+    session this process serves.
+11. Apply `--consent`, if given, to the running kernel — before the ACP
     bridge connects, so it is in place for every session this process
     serves. The per-turn iteration cap a turn reads is kernel-wide, not a
     per-context setting, so this is the one place a solo kernel's consent
     mode is set.
-11. Connect the ACP bridge over the loopback wire and serve stdio.
+12. Connect the ACP bridge over the loopback wire and serve stdio.
 
 On stdin EOF the kernel settles accepted work and checkpoints its database
 before a temporary state directory is removed. If the kernel stops, fails, or

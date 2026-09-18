@@ -303,6 +303,119 @@ pub fn install_gate_config(state: &SoloState, source: &Path) -> Result<()> {
     fs::write(&target, body).with_context(|| format!("write {}", target.display()))
 }
 
+/// Apply an rc overlay onto the seeded `/config/rc` tree: every regular file
+/// under `overlay`, except a top-level `README.md`, replaces the file at the
+/// same relative path under this kernel's rc tree.
+///
+/// The kernel seeds `/config/rc` on the way up (`kernel::start`), and rc
+/// scripts are read fresh from disk at every lifecycle run rather than
+/// cached at boot (`kaijutsu_kernel::rc::load_scripts`), so this needs to
+/// land only before the first context of an overlaid type is created — the
+/// caller runs it after `kernel::start` and before the ACP bridge serves.
+///
+/// The destination is unlinked before the copy, never written through: a
+/// reseed writes some rc entries (`coder/create/S00-base.kai` and the like)
+/// as symlinks into `lib/`, and copying over a symlink would edit the shared
+/// base every other context type reads.
+///
+/// Refuses, before replacing anything, when: `overlay` is missing or not a
+/// directory; it holds no file to apply; an entry anywhere under it is a
+/// symlink or another non-regular file (this also catches a symlinked
+/// directory that would otherwise let a walk escape the rc tree, since a
+/// symlink is refused before it is ever followed); or a file's destination
+/// parent directory does not already exist in the seeded tree — a typo'd
+/// type or verb name must refuse rather than create a new one.
+pub fn install_rc_overlay(state: &SoloState, overlay: &Path) -> Result<()> {
+    if !overlay.exists() {
+        anyhow::bail!("--rc-overlay {} does not exist", overlay.display());
+    }
+    if !overlay.is_dir() {
+        anyhow::bail!("--rc-overlay {} is not a directory", overlay.display());
+    }
+
+    let mut relative_files = Vec::new();
+    collect_overlay_files(overlay, overlay, &mut relative_files)?;
+    if relative_files.is_empty() {
+        anyhow::bail!(
+            "--rc-overlay {} has nothing to apply (only a top-level README.md, or no files \
+             at all)",
+            overlay.display()
+        );
+    }
+
+    let rc_root = state.config_root().join("rc");
+    for relative in &relative_files {
+        let src = overlay.join(relative);
+        let dest = rc_root.join(relative);
+        if !dest.starts_with(&rc_root) {
+            anyhow::bail!(
+                "--rc-overlay entry {} would land outside the rc tree",
+                relative.display()
+            );
+        }
+        let parent = dest.parent().with_context(|| {
+            format!("--rc-overlay entry {} has no parent path", relative.display())
+        })?;
+        if !parent.is_dir() {
+            anyhow::bail!(
+                "--rc-overlay entry {} has no seeded directory at {} — check the type and \
+                 verb names",
+                relative.display(),
+                parent.display(),
+            );
+        }
+
+        match fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("remove {}", dest.display()));
+            }
+        }
+        fs::copy(&src, &dest)
+            .with_context(|| format!("copy {} to {}", src.display(), dest.display()))?;
+        eprintln!("kaijutsu-solo-acp: rc overlay: {} replaced", relative.display());
+    }
+    Ok(())
+}
+
+/// Recursively collect `dir`'s regular files, relative to `root`, refusing a
+/// symlink or any other non-regular entry anywhere under it. A top-level
+/// `README.md` (directly inside `root`) is skipped; a nested one is not.
+fn collect_overlay_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read an entry of {}", dir.display()))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .expect("walked from root, so every path is under it")
+            .to_path_buf();
+        if dir == root && relative == Path::new("README.md") {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?;
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "--rc-overlay entry {} is a symlink; only regular files are allowed",
+                relative.display()
+            );
+        } else if file_type.is_dir() {
+            collect_overlay_files(root, &path, out)?;
+        } else if file_type.is_file() {
+            out.push(relative);
+        } else {
+            anyhow::bail!(
+                "--rc-overlay entry {} is neither a regular file nor a directory",
+                relative.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +527,228 @@ mod tests {
             "a second run must keep the identity the kernel already trusts"
         );
         assert!(path.with_extension("pub").is_file());
+    }
+
+    // ---- rc overlay -------------------------------------------------------
+
+    /// A minimal stand-in for what a real reseed leaves under `<state>/config/
+    /// rc`: `coder/create/S00-base.kai` linked to a shared script under
+    /// `lib/`, and one real (non-linked) `coder/create/S00-stance.kai`.
+    /// Returns the state and the path of the shared `lib` script, so a test
+    /// can prove it was not written through.
+    fn seeded_rc_tree() -> (tempfile::TempDir, SoloState, PathBuf) {
+        let (parent, state) = named_state();
+        let rc = state.config_root().join("rc");
+        let lib_dir = rc.join("lib").join("create");
+        let coder_dir = rc.join("coder").join("create");
+        fs::create_dir_all(&lib_dir).expect("create the lib dir");
+        fs::create_dir_all(&coder_dir).expect("create the coder dir");
+
+        let lib_script = lib_dir.join("S00-base.kai");
+        fs::write(&lib_script, "# shared base script\n").expect("write the shared base");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&lib_script, coder_dir.join("S00-base.kai"))
+            .expect("link coder/create/S00-base.kai to the shared base");
+
+        fs::write(coder_dir.join("S00-stance.kai"), "# shipped stance\n")
+            .expect("write the shipped stance");
+
+        (parent, state, lib_script)
+    }
+
+    /// An overlay directory under the test's own scratch parent (never
+    /// `/tmp`), holding a top-level `README.md` (must be skipped) plus
+    /// `coder/create/S00-base.kai` and a brand-new `coder/create/S00-base.md`
+    /// companion.
+    fn write_overlay(dir: &Path) {
+        let coder_dir = dir.join("coder").join("create");
+        fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
+        fs::write(dir.join("README.md"), "not applied\n").expect("write the overlay README");
+        fs::write(coder_dir.join("S00-base.kai"), "# overlay base script\n")
+            .expect("write the overlay base script");
+        fs::write(coder_dir.join("S00-base.md"), "overlay marker prose\n")
+            .expect("write the overlay base companion");
+    }
+
+    #[test]
+    fn an_overlay_replaces_a_symlink_without_writing_through_it() {
+        let (_seed_parent, state, lib_script) = seeded_rc_tree();
+        let lib_before = fs::read(&lib_script).expect("read the shared base before");
+
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        write_overlay(&overlay);
+
+        install_rc_overlay(&state, &overlay).expect("apply the overlay");
+
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        assert!(
+            !fs::symlink_metadata(&dest).expect("stat the destination").file_type().is_symlink(),
+            "the destination must be a plain file, not the seeded symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(&dest).expect("read the replaced file"),
+            "# overlay base script\n"
+        );
+
+        let lib_after = fs::read(&lib_script).expect("read the shared base after");
+        assert_eq!(
+            lib_before, lib_after,
+            "unlinking the symlink first must leave the shared lib script untouched"
+        );
+
+        let companion = state
+            .config_root()
+            .join("rc")
+            .join("coder")
+            .join("create")
+            .join("S00-base.md");
+        assert_eq!(
+            fs::read_to_string(&companion).expect("read the new companion"),
+            "overlay marker prose\n",
+            "a file absent from the seeded tree is still written, given its parent dir exists"
+        );
+
+        let readme = state.config_root().join("rc").join("README.md");
+        assert!(!readme.exists(), "a top-level README.md must never be applied");
+    }
+
+    #[test]
+    fn reapplying_the_same_overlay_is_idempotent() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        write_overlay(&overlay);
+
+        install_rc_overlay(&state, &overlay).expect("first apply");
+        install_rc_overlay(&state, &overlay).expect("second apply must succeed the same way");
+
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        assert_eq!(
+            fs::read_to_string(&dest).expect("read the replaced file"),
+            "# overlay base script\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_overlay_directory_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let missing = tempfile::tempdir().expect("parent").path().join("nowhere");
+        let error = install_rc_overlay(&state, &missing).expect_err("a missing dir must refuse");
+        assert!(error.to_string().contains(&missing.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn a_plain_file_as_the_overlay_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let file_parent = tempfile::tempdir().expect("parent");
+        let file = file_parent.path().join("not-a-dir");
+        fs::write(&file, "nope\n").expect("write a plain file");
+        let error = install_rc_overlay(&state, &file).expect_err("a file must refuse");
+        assert!(error.to_string().contains("not a directory"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_overlay_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("empty");
+        fs::create_dir_all(&overlay).expect("create the empty overlay");
+        let error = install_rc_overlay(&state, &overlay).expect_err("an empty dir must refuse");
+        assert!(error.to_string().contains("nothing to apply"), "{error}");
+    }
+
+    #[test]
+    fn an_overlay_with_only_a_readme_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("readme-only");
+        fs::create_dir_all(&overlay).expect("create the overlay");
+        fs::write(overlay.join("README.md"), "just docs\n").expect("write the readme");
+        let error = install_rc_overlay(&state, &overlay).expect_err("README-only must refuse");
+        assert!(error.to_string().contains("nothing to apply"), "{error}");
+    }
+
+    #[test]
+    fn a_symlink_inside_the_overlay_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        let coder_dir = overlay.join("coder").join("create");
+        fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
+        let outside = overlay_parent.path().join("outside.kai");
+        fs::write(&outside, "# not from the overlay\n").expect("write a file outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, coder_dir.join("S00-base.kai"))
+            .expect("symlink into the overlay");
+
+        let error = install_rc_overlay(&state, &overlay).expect_err("a symlink must refuse");
+        assert!(error.to_string().contains("symlink"), "{error}");
+
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        assert!(
+            fs::symlink_metadata(&dest).expect("stat the destination").file_type().is_symlink(),
+            "a refused overlay must not have replaced anything"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_directory_inside_the_overlay_refuses_before_it_is_followed() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        fs::create_dir_all(&overlay).expect("create the overlay");
+
+        let escape_target = overlay_parent.path().join("escape");
+        fs::create_dir_all(escape_target.join("create")).expect("create an escape target");
+        fs::write(escape_target.join("create").join("S00-base.kai"), "# escaped\n")
+            .expect("write a file the walk must never reach");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&escape_target, overlay.join("coder"))
+            .expect("symlink a whole type directory out of the overlay");
+
+        let error = install_rc_overlay(&state, &overlay)
+            .expect_err("a symlinked directory must refuse, not be followed");
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_file_inside_the_overlay_refuses() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        let coder_dir = overlay.join("coder").join("create");
+        fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
+
+        let fifo = coder_dir.join("S00-base.kai");
+        let c_path = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("cstring");
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; it creates a
+        // FIFO at a path this test owns and touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let error = install_rc_overlay(&state, &overlay)
+            .expect_err("a FIFO is neither a file nor a directory and must refuse");
+        assert!(error.to_string().contains("neither a regular file nor a directory"), "{error}");
+    }
+
+    #[test]
+    fn a_typo_d_type_name_refuses_rather_than_creating_one() {
+        let (_seed_parent, state, _lib_script) = seeded_rc_tree();
+        let overlay_parent = tempfile::tempdir().expect("overlay parent");
+        let overlay = overlay_parent.path().join("variant");
+        let typo_dir = overlay.join("coderr").join("create");
+        fs::create_dir_all(&typo_dir).expect("create the overlay's typo'd dir");
+        fs::write(typo_dir.join("S00-base.kai"), "# typo'd type\n").expect("write the file");
+
+        let error = install_rc_overlay(&state, &overlay)
+            .expect_err("a directory absent from the seeded tree must refuse");
+        assert!(error.to_string().contains("no seeded directory"), "{error}");
+
+        let typo_in_seeded_tree = state.config_root().join("rc").join("coderr");
+        assert!(!typo_in_seeded_tree.exists(), "a typo must never create a new type directory");
     }
 }
