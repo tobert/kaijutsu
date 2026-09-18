@@ -76,7 +76,97 @@ fn shutdown_settles_streaming_execution_paused_in_post_call() {
             panic!("streaming output closed without an exit");
         })
             .await.expect("joined shutdown must leave a completed streaming output");
-        assert_ne!(exit, 0);
+        assert_eq!(exit, 1, "cancelling result review reports the hook refusal, not the captured echo exit 0 or kaish cancellation 130");
+    });
+}
+
+#[test]
+fn interactive_exit_124_settles_consistently_in_receipt_blocks_and_job() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kj.join_context(context, "interactive-timeout").await.unwrap();
+        let submission = kj.shell_submit("exit 124", context, true).await.unwrap();
+        let operation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let operation = kernel.kernel.shell_operations().get(&submission.operation_id, context).unwrap().unwrap();
+                if operation.completed_at.is_some() { break operation; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("the command must settle");
+        let envelope = operation.envelope.unwrap();
+        assert_eq!(envelope.exit_code, Some(124), "{envelope:?}");
+        assert!(envelope.is_error());
+        for block in [&operation.receipt.command_block_id, &operation.receipt.output_block_id] {
+            assert_eq!(kernel.kernel.blocks().get_block_snapshot(context, block).unwrap().unwrap().status, Status::Error);
+        }
+        let jobs = kernel.kernel.context_job_manager(context);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == operation.receipt.job_id).unwrap();
+        assert_eq!(jobs.wait(job.id).await.unwrap().code, 124);
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+#[test]
+fn a_human_shell_command_is_performed_by_the_connected_human_not_the_context_performer() {
+    run_local(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = kaijutsu_server::SshServerConfig::ephemeral(addr.port());
+        register_root_key(addr, config.root_key());
+        let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
+        let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_local(async move {
+            kaijutsu_server::SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
+        });
+        let kernel = kernel_rx.await.unwrap();
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "requester-performer").await.unwrap();
+        let requester = kernel.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
+        let (performer, reviewer) = (kaijutsu_types::PrincipalId::new(), kaijutsu_types::PrincipalId::new());
+        {
+            let db = kernel.kernel_db.lock();
+            for (principal_id, name) in [(performer, "distinct-performer"), (reviewer, "distinct-reviewer")] {
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                    principal_id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+        }
+        let set = kj.execute_kj_quiet(context, &[
+            "context".into(), "set".into(), context.to_hex(), "--as".into(), "distinct-performer".into(),
+            "--reviewer".into(), "distinct-reviewer".into(),
+        ]).await.unwrap();
+        assert_eq!(set.exit_code, 0, "{}", set.stderr);
+        assert_eq!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().played_by, Some(performer));
+        assert_ne!(requester, performer);
+        kj.join_context(context, "requester-performer").await.unwrap();
+        let submission = kj.shell_submit("echo who-ran-this", context, false).await.unwrap();
+        let operation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let operation = kernel.kernel.shell_operations().get(&submission.operation_id, context).unwrap().unwrap();
+                if operation.completed_at.is_some() { break operation; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("the command must settle");
+        assert_eq!(operation.envelope.as_ref().unwrap().stdout, "who-ran-this\n");
+        let (receipt_requester, receipt_performer): (Vec<u8>, Vec<u8>) = rusqlite::Connection::open(&db_path).unwrap().query_row(
+            "SELECT principal_id, actor_id FROM shell_operations WHERE operation_id=?1",
+            [&submission.operation_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(receipt_requester, requester.as_bytes().to_vec(), "receipt requester");
+        assert_eq!(receipt_performer, requester.as_bytes().to_vec(),
+            "a direct human command is performed by the connected human (docs/approval-identity.md, \"Three identities\")");
+        assert_ne!(receipt_performer, performer.as_bytes().to_vec(), "the context's performer does not run a human's command");
+        let blocks = kernel.documents.block_snapshots(context).unwrap();
+        let command = blocks.iter().find(|block| block.id == operation.receipt.command_block_id).unwrap();
+        let output = blocks.iter().find(|block| block.id == operation.receipt.output_block_id).unwrap();
+        assert_eq!(command.id.principal_id, requester, "the authored command block carries the connected human");
+        assert_ne!(output.id.principal_id, performer, "the output block is not authored by the context's performer");
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
 

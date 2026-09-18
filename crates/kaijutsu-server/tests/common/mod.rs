@@ -43,7 +43,8 @@ fn root_keys() -> &'static Mutex<HashMap<SocketAddr, Arc<PrivateKey>>> {
 /// Record `key` as the way to authenticate against the server bound at
 /// `addr`. Call once per `start_server*` helper, before the config (and its
 /// key) moves into the spawned server task.
-fn register_root_key(addr: SocketAddr, key: Arc<PrivateKey>) {
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn register_root_key(addr: SocketAddr, key: Arc<PrivateKey>) {
     root_keys().lock().unwrap().insert(addr, key);
 }
 

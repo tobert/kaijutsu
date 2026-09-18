@@ -752,7 +752,7 @@ fn test_interrupt_cancels_execution() {
         )
         .await
         .expect("timed out waiting for interrupted exit code");
-        assert_ne!(exit_code, 0, "interrupted command should exit non-zero");
+        assert_eq!(exit_code, 130, "an interrupted command reports kaish's cancellation code");
 
         // Verify the kernel is not broken — next execute should work.
         let exec_id2 = kernel.execute("echo ok").await.unwrap();

@@ -754,6 +754,82 @@ mod fill_tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_request_timeout_settles_as_exit_124_with_the_job_stderr_note() {
+        let policy = kaijutsu_types::TimeoutPolicy {
+            kaish_request_timeout: std::time::Duration::from_millis(150),
+            ..Default::default()
+        };
+        let kernel = Arc::new(Kernel::new_ephemeral("request-timeout").await.with_timeouts(policy));
+        let ctx = ContextId::new();
+        let documents = kernel.blocks();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, "sleep 30", None).unwrap();
+        let kaish = EmbeddedKaish::new("request-timeout", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), run_into_blocks(&kaish, "sleep 30", &receipt,
+            &kernel, &call, CommandRunOptions { job_output: CommandJobOutput::LiveExecution, ..Default::default() }))
+            .await.expect("the request timeout must end a 30 second sleep").unwrap();
+        assert_eq!(outcome.envelope().exit_code, Some(124));
+        assert!(outcome.envelope().is_error());
+        let state = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+        assert!(state.completed_at.is_some());
+        for block in [&command, &output] { assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Error); }
+        let jobs = kernel.context_job_manager(ctx);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+        assert_eq!(jobs.wait(job.id).await.unwrap().code, 124);
+        let streams = jobs.streams(job.id).await.unwrap();
+        assert!(String::from_utf8(streams.stderr.read().await).unwrap().contains("background job timed out\n"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_command_settles_as_exit_130_in_every_record() {
+        let kernel = Arc::new(Kernel::new_ephemeral("cancel-contract").await);
+        let ctx = ContextId::new();
+        let documents = kernel.blocks();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = documents.insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
+        let code = "echo started; sleep 30; echo never";
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(), command, output, code, None).unwrap();
+        let kaish = EmbeddedKaish::new("cancel-contract", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run = run_into_blocks(&kaish, code, &receipt, &kernel, &call,
+            CommandRunOptions { cancel: Some(cancel.clone()), job_output: CommandJobOutput::LiveExecution, ..Default::default() });
+        let interrupt = async {
+            let jobs = kernel.context_job_manager(ctx);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(job) = jobs.list().await.into_iter().next() {
+                        if jobs.read_stdout(job.id).await.is_some_and(|out| !out.is_empty()) { break; }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("the command starts before it is cancelled");
+            cancel.cancel();
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(run, interrupt) })
+            .await.expect("cancellation must end a 30 second sleep");
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.envelope().exit_code, Some(130));
+        assert!(outcome.envelope().is_error());
+        assert!(!outcome.envelope().stdout.contains("never"));
+        let state = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+        assert!(state.completed_at.is_some());
+        assert_eq!(state.envelope.as_ref().unwrap().exit_code, Some(130), "the durable receipt agrees with the live outcome");
+        for block in [&command, &output] { assert_eq!(documents.get_block_snapshot(ctx, block).unwrap().unwrap().status, Status::Error); }
+        let jobs = kernel.context_job_manager(ctx);
+        let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+        assert_eq!(jobs.wait(job.id).await.unwrap().code, 130);
+        let streams = jobs.streams(job.id).await.unwrap();
+        assert!(String::from_utf8(streams.stderr.read().await).unwrap().contains("background job cancelled\n"));
+    }
+
     struct PausedHook {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -771,6 +847,80 @@ mod fill_tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_paused_post_call_hook_exposes_no_terminal_until_released() {
+        use crate::flows::BlockFlow;
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(parking_lot::Mutex::new(crate::KernelDb::open(dir.path().join("kernel.db")).unwrap()));
+        let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+        let flows = Arc::new(crate::flows::FlowBus::new(64));
+        let blocks = Arc::new(crate::block_store::BlockStore::with_db_and_flows(db.clone(), workspace, PrincipalId::system(), flows.clone()));
+        let kernel = Arc::new(Kernel::with_flows(kaijutsu_types::KernelId::new(), "paused-terminal", flows, dir.path(), blocks, db).await);
+        let documents = kernel.blocks().clone();
+        let ctx = ContextId::new();
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let source = "echo captured";
+        let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: true, context: ctx, principal: PrincipalId::system(), actor: PrincipalId::system(), source,
+            tool: "shell", input: serde_json::json!({"code": source}), kind: kaijutsu_types::ToolKind::Shell,
+            role: kaijutsu_types::Role::User, excluded: false, status: Status::Running, ask: None,
+        }).unwrap();
+        let pair = [receipt.command_block_id, receipt.output_block_id];
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("pause".into()), match_instance: None, match_tool: None, match_context: Some(ctx),
+            match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Invoke(HookBody::Builtin { name: "pause".into(),
+                hook: Arc::new(PausedHook { entered: entered.clone(), release: release.clone() }) }),
+        });
+        let kaish = EmbeddedKaish::new("paused-terminal", documents.clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(ctx);
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
+        let mut events = kernel.block_flows().subscribe("block.*");
+        let terminal_events = |events: &mut crate::flows::Subscription<BlockFlow>| {
+            let mut count = 0;
+            while let Some(message) = events.try_recv() {
+                if let BlockFlow::StatusChanged { block_id, status, .. } = message.payload {
+                    if pair.contains(&block_id) && matches!(status, Status::Done | Status::Error) { count += 1; }
+                }
+            }
+            count
+        };
+        let notice = || crate::runtime::completion_notice::summary(&kernel.kernel_db().lock(),
+            &crate::runtime::completion_notice::Source::Shell(receipt.operation_id.clone())).unwrap().unwrap();
+        let run = run_into_blocks(&kaish, source, &receipt, &kernel, &call, CommandRunOptions::default());
+        let observe = async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
+            let state = kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap();
+            let jobs = kernel.context_job_manager(ctx);
+            let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+            assert!(state.completed_at.is_none(), "the receipt must not complete while PostCall is paused");
+            assert!(kernel.shell_operations().outcome(&receipt.operation_id, ctx).unwrap().is_none(), "no final outcome is retained yet");
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(200), jobs.wait(job.id)).await.is_err(),
+                "jobs.wait must not resolve before the final outcome");
+            assert_eq!(notice()["status"], "pending", "no completion notice may be ready");
+            assert_eq!(terminal_events(&mut events), 0, "no terminal block status may be published");
+            for block in &pair {
+                assert!(!documents.get_block_snapshot(ctx, block).unwrap().unwrap().status.is_terminal());
+            }
+            release.notify_one();
+            job
+        };
+        let (settled, job) = tokio::join!(run, observe);
+        settled.unwrap();
+        let jobs = kernel.context_job_manager(ctx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), jobs.wait(job.id)).await
+            .expect("jobs.wait resolves once the outcome is final").unwrap();
+        assert_eq!(result.code, 0);
+        assert!(kernel.shell_operations().get(&receipt.operation_id, ctx).unwrap().unwrap().completed_at.is_some());
+        assert_eq!(terminal_events(&mut events), 2, "exactly one terminal event per block");
+        assert_eq!(terminal_events(&mut events), 0);
+        let notice = notice();
+        assert_eq!(notice["status"], "ready", "the completion notice is ready exactly once: {notice}");
     }
 
     #[tokio::test]
