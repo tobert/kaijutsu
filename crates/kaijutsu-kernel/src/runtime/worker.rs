@@ -8,6 +8,29 @@ use tokio_util::sync::CancellationToken;
 
 type Work = Box<dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = ()>>> + Send>;
 
+enum SupervisorEvent {
+    Stop,
+    Completed(Result<(), tokio::task::JoinError>),
+    Work(Option<Work>),
+}
+
+// Reap completed tasks before admitting more queued work so a busy producer
+// cannot postpone failure detection and retain finished tasks indefinitely.
+async fn next_supervisor_event(
+    stopped: &CancellationToken,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Work>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> SupervisorEvent {
+    tokio::select! {
+        biased;
+        _ = stopped.cancelled() => SupervisorEvent::Stop,
+        result = tasks.join_next(), if !tasks.is_empty() => {
+            SupervisorEvent::Completed(result.expect("a nonempty JoinSet has a next task"))
+        }
+        work = receiver.recv() => SupervisorEvent::Work(work),
+    }
+}
+
 pub(crate) struct RuntimeWorker {
     sender: tokio::sync::mpsc::UnboundedSender<Work>,
     shutdown: CancellationToken,
@@ -33,14 +56,13 @@ impl RuntimeWorker {
                 let mut tasks = tokio::task::JoinSet::new();
                 let mut failures = Vec::new();
                 loop {
-                    tokio::select! {
-                        biased;
-                        _ = stopped.cancelled() => break,
-                        work = receiver.recv() => match work {
+                    match next_supervisor_event(&stopped, &mut receiver, &mut tasks).await {
+                        SupervisorEvent::Stop => break,
+                        SupervisorEvent::Work(work) => match work {
                             Some(work) => { tasks.spawn_local(work(stopped.child_token())); }
                             None => break,
                         },
-                        Some(result) = tasks.join_next() => {
+                        SupervisorEvent::Completed(result) => {
                             if let Err(error) = result {
                                 tracing::error!("runtime task failed: {error}");
                                 failures.push(error.to_string());
@@ -97,6 +119,26 @@ impl Drop for RuntimeWorker {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_ready_task_failure_preempts_the_ready_admission_queue() {
+        let stopped = tokio_util::sync::CancellationToken::new();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<super::Work>();
+        sender.send(Box::new(|_| Box::pin(async {}))).unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let (finished, ready) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let _ = finished.send(());
+            panic!("ready supervisor failure sentinel");
+        });
+        ready.await.unwrap();
+        tokio::task::yield_now().await;
+
+        match super::next_supervisor_event(&stopped, &mut receiver, &mut tasks).await {
+            super::SupervisorEvent::Completed(Err(error)) => assert!(error.is_panic()),
+            _ => panic!("a ready admission queue must not starve a ready task failure"),
+        }
+    }
+
     #[tokio::test]
     async fn a_panicked_task_makes_worker_shutdown_fail() {
         let kernel = crate::Kernel::new_ephemeral("panic-worker").await;
