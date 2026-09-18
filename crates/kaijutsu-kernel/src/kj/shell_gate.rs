@@ -1,5 +1,5 @@
 //! Builds a [`crate::kj::gate::GateSpec`] for the `shell_write` gate
-//! (`docs/gate-and-shell-split.md`, "Slice 4") from a submission's kaish
+//! (`docs/gate-and-shell-split.md`) from a submission's kaish
 //! source text.
 //!
 //! ## What this covers, and what it structurally cannot
@@ -97,8 +97,7 @@ impl std::fmt::Display for ShellGateBuildError {
 /// `shell_write` there is no separate "target" the way `kj cc send` has a
 /// session name to resolve; what the caller typed IS the whole statement,
 /// so the label that scopes confirmation to what was typed (the property
-/// kept from the deleted latch, `docs/gate-and-shell-split.md`) is the
-/// source text.
+/// described in `docs/gate-and-shell-split.md`) is the source text.
 #[cfg(test)]
 pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateBuildError> {
     build_shell_gate_spec_with_stdin(source, None)
@@ -248,20 +247,13 @@ mod tests {
     /// `source_index` carries `PlannedStatement::index` verbatim rather
     /// than re-enumerating the filtered list.
     ///
-    /// **kaish 0.16 reversed what that index means.** It used to number
-    /// statements before the empty ones were dropped, so a leading comment
-    /// shifted the first real statement to 1 and this test asserted exactly
-    /// that. 0.16 defines `index` as "the statement's position in the
-    /// returned list" (`ast/plan.rs`) and ships its own
-    /// `a_leading_comment_does_not_shift_the_indexes` pinning 0.
-    ///
-    /// So the old landmine is gone upstream, and with it this test's power
-    /// to tell carrying-the-index apart from re-enumerating: under the new
-    /// contract the two answers agree by construction. Kept anyway, pinning
-    /// the contract we consume — if kaish reintroduces a gap between the
-    /// published index and the positional one, this is where it surfaces,
-    /// and the module must still READ `PlannedStatement::index` rather than
-    /// count the filtered list.
+    /// kaish defines `index` as "the statement's position in the returned
+    /// list" (`ast/plan.rs`), so a leading comment does not shift it and
+    /// carrying the index agrees with re-enumerating by construction. This
+    /// pins the contract we consume: if kaish reintroduces a gap between the
+    /// published index and the positional one, this is where it surfaces, and
+    /// the module must still READ `PlannedStatement::index` rather than count
+    /// the filtered list.
     #[test]
     fn source_index_follows_kaish_published_index_across_a_leading_comment() {
         let source = "# a comment\nls\nrm -rf foo\n";
@@ -275,7 +267,7 @@ mod tests {
     }
 
     /// Two gaps deep, same contract: consecutive comments and blank lines do
-    /// not push the first real statement off 0 under kaish 0.16.
+    /// not push the first real statement off 0.
     #[test]
     fn multiple_leading_gaps_do_not_shift_the_published_index() {
         let source = "\n# one\n# two\nrm -rf foo\n";
@@ -298,8 +290,7 @@ mod tests {
         assert!(!rendered.contains("NOTE:"), "a literal heredoc needs no caveat: {rendered}");
     }
 
-    /// The replacement for the spec's old heredoc-REFUSAL test: a
-    /// `literal: false` heredoc is rendered and gated normally, but the
+    /// A `literal: false` heredoc is rendered and gated normally, but the
     /// prompt must not present the unexpanded text as final — it must name
     /// the variables that will be substituted.
     #[test]

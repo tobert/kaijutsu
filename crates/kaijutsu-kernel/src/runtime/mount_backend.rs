@@ -316,12 +316,10 @@ impl KernelBackend for MountBackend {
             Err(_) => {
                 self.raw_write(path, content, mode).await?;
                 // Best-effort: the disk write already landed, so a refusal
-                // here (an open editor session pins this path's entry, C —
-                // docs/audits/2026-08-20-editor-fileio.md) must not fail the
-                // whole write. It leaves a stale text shadow behind a live
-                // pinned session, which is loud (not silently swallowed) and
-                // strictly no worse than the old behavior of dropping the
-                // pinned entry out from under that session outright.
+                // here (an open editor session pins this path's entry) must
+                // not fail the whole write. It leaves a stale text shadow
+                // behind a live pinned session and logs the refusal; a pinned
+                // entry is never dropped out from under its session.
                 if let Err(e) = self.file_cache.invalidate(&key) {
                     tracing::warn!("mount_backend write (binary): {e}");
                 }
@@ -356,8 +354,7 @@ impl KernelBackend for MountBackend {
         // Write-through: external tools (cargo, git) read the real filesystem.
         // If the flush fails, roll the edit back out of the cache so a later
         // read can't serve content that never reached disk — crash, don't
-        // corrupt. A pinned entry (an open editor session, C —
-        // docs/audits/2026-08-20-editor-fileio.md) refuses the rollback
+        // corrupt. A pinned entry (an open editor session) refuses the rollback
         // instead: the flush failure is still reported below, but a live
         // session's buffer is never evicted to satisfy this write's cleanup.
         if let Err(e) = self.file_cache.flush_one(&key).await {
@@ -454,10 +451,9 @@ impl KernelBackend for MountBackend {
         // Compute the WHOLE batch against an in-memory String first — no
         // storage call happens until every op (including every `expected` CAS
         // precondition) has validated, and every offset lands on a UTF-8 char
-        // boundary. See `compute_patch_op`'s doc: a partial-batch commit here
-        // was `3cb3ed4f`'s bug (op N's CAS failure must not leave ops 1..N-1
-        // durably applied), and a mid-char byte offset used to panic instead
-        // of erroring — `check_byte_boundary` closes that.
+        // boundary. See `compute_patch_op`'s doc: op N's CAS failure must not
+        // leave ops 1..N-1 durably applied, and a mid-char byte offset is an
+        // error (`check_byte_boundary`), never a panic.
         let mut text = original.clone();
         for op in ops {
             text = compute_patch_op(op, &text)?;
@@ -677,12 +673,8 @@ impl MountBackend {
 // PatchOp helpers
 // =============================================================================
 //
-// Moved here from `kaish_backend.rs` (2026-08-20, see
-// `docs/audits/2026-08-20-kaish-glue.md` B2/B3): this is the ONE hardened
-// `PatchOp` implementation now, living with the live path (`MountBackend`,
-// the backend kaish actually scripts against). `KaijutsuBackend::patch` — the
-// twin these replaced there — was unreachable through any mount and is now
-// stubbed to `InvalidOperation`.
+// The one `PatchOp` implementation, owned by `MountBackend` (the backend kaish
+// scripts against). `KaijutsuBackend::patch` refuses with `InvalidOperation`.
 
 /// Ensure a wire BYTE offset lands on a UTF-8 char boundary in `content`.
 ///
@@ -1172,7 +1164,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Now the read-only backend over the SAME (writable) mount table.
+        // The read-only backend over the SAME (writable) mount table.
         let ro = MountBackend::new_read_only(mount_table, docs, file_cache, PrincipalId::system());
         assert!(ro.read_only(), "read_only() must report the mode");
 
@@ -1219,10 +1211,9 @@ mod tests {
     }
 
     /// Regression: a Backend error during `append`'s pre-read must NOT wipe the
-    /// file by appending `suffix` onto "" and overwriting. The old code used
-    /// `read_content(...).unwrap_or_default()`, which mapped a real backend
-    /// failure to an empty string — effectively truncating the file to just the
-    /// appended suffix.
+    /// file by appending `suffix` onto "" and overwriting. Mapping a real backend
+    /// failure to an empty string with `read_content(...).unwrap_or_default()`
+    /// would truncate the file to just the appended suffix.
     ///
     /// This test MUST FAIL on code that uses `unwrap_or_default()` on the read
     /// (or any variant that silently falls back to empty on a Backend error).
@@ -1281,7 +1272,7 @@ mod tests {
         );
 
         // The underlying VFS file must still contain the original content.
-        // On old code this would contain only " suffix" (the file was wiped).
+        // A wiping append would leave only " suffix".
         let raw = backend
             .mount_table
             .read_all(Path::new("/tmp/nowipe.txt"))
@@ -1295,9 +1286,9 @@ mod tests {
     }
 
     /// Regression: a Backend error during `read` must return `Err`, NOT fall
-    /// through to serve stale on-disk bytes. The old code used a blanket `if
-    /// let Ok(text) = read_content(...)` which silently served disk content when
-    /// the block store was broken — silent data corruption.
+    /// through to serve stale on-disk bytes. A blanket `if let Ok(text) =
+    /// read_content(...)` would silently serve disk content when the block
+    /// store was broken.
     ///
     /// This test MUST FAIL on code that uses `if let Ok(text) = read_content`
     /// (or any pattern that falls through on ALL errors, not just NotCached).
@@ -1337,8 +1328,8 @@ mod tests {
             .delete_document(ctx_id)
             .expect("setup: delete_document must succeed");
 
-        // On old code: Backend error → falls through → serves "doc-content"
-        // from disk (stale, wrong). On new code: must return Err.
+        // A Backend error must return Err, never fall through to the stale
+        // "doc-content" on disk.
         let result = backend.read(Path::new("/tmp/stale.txt"), None).await;
         assert!(
             result.is_err(),
@@ -1348,9 +1339,8 @@ mod tests {
 
     // ── compute_patch_op × multibyte content (byte-vs-char offset regression) ──
     //
-    // Moved from `kaish_backend.rs` (2026-08-20) along with the hardened
-    // `compute_patch_op`/`check_byte_boundary` it pins — this file's `patch()`
-    // is the only live caller now. `compute_patch_op` is pure (no storage),
+    // This file's `patch()` is the only caller of `compute_patch_op` and
+    // `check_byte_boundary`. `compute_patch_op` is pure (no storage),
     // so these call it directly; the batch-atomicity property below can only
     // be observed through `backend.patch()`.
 
@@ -1473,10 +1463,8 @@ mod tests {
     //
     // `patch()` computes every op in a batch against an in-memory `String`
     // via `compute_patch_op` (pure, no storage) and commits once, only after
-    // the whole batch has succeeded — the property `3cb3ed4f` fixed on the
-    // old `KaijutsuBackend::patch` (a CAS failure on op N must not leave ops
-    // 1..N-1 durably applied) and that this file now provides for the live
-    // path.
+    // the whole batch has succeeded: a CAS failure on op N must not leave ops
+    // 1..N-1 durably applied.
 
     #[tokio::test]
     async fn patch_batch_cas_failure_leaves_content_untouched() {

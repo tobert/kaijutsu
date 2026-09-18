@@ -775,9 +775,9 @@ mod tests {
     }
 
     /// Canary for kaish #367/#368. A command substitution in a NON-LAST
-    /// pipeline stage used to destroy that stage's entire output — silently,
-    /// at exit 0 — so `echo $(git rev-parse HEAD) | cut -c1-8` handed a model
-    /// an empty string it then reasoned on. Fixed in kaish 0.15.0.
+    /// pipeline stage must keep that stage's output; losing it silently at
+    /// exit 0 would hand a model an empty string from
+    /// `echo $(git rev-parse HEAD) | cut -c1-8`. Fixed in kaish 0.15.0.
     ///
     /// **If this test fails, the kaish dependency has gone backward.** Check
     /// the `kaish-*` versions in the workspace `Cargo.toml`: they must be
@@ -895,16 +895,13 @@ mod tests {
         assert_eq!(target.to_string_lossy(), "../../lib/create/binding.kai");
     }
 
-    /// `/v/cas` regression: kaish 0.11's `VirtualOverlayBackend` reserved
-    /// every `/v/*` path for its own
-    /// (always-empty here) overlay regardless of whether the embedder had a
-    /// real mount there, so `ls`/`cat /v/cas/...` through kaish silently saw
-    /// nothing even with a live `CasFs` mount on the kernel `MountTable` — SFTP
-    /// and `kj cas`, which bypass kaish's VFS, were unaffected, so the bug was
-    /// kaish-shell-only. kaish 0.12 made `is_virtual_path` purely mount-coverage
-    /// based, so an unclaimed `/v/*` path now falls through to the embedder's
-    /// backend. This pins the fix so a future kaish bump can't silently
-    /// reintroduce the shadow.
+    /// `/v/cas` regression: `is_virtual_path` is purely mount-coverage based,
+    /// so an unclaimed `/v/*` path falls through to the embedder's backend and
+    /// `ls`/`cat /v/cas/...` through kaish reach a live `CasFs` mount on the
+    /// kernel `MountTable`. A kaish that reserved every `/v/*` path for its own
+    /// always-empty overlay would silently show nothing (SFTP and `kj cas`
+    /// bypass kaish's VFS and would look fine). This pins the behavior so a
+    /// kaish bump can't reintroduce the shadow.
     #[tokio::test]
     async fn kaish_ls_and_cat_reach_the_real_cas_mount_at_v_cas() {
         use kaijutsu_cas::{ContentStore, FileStore};
@@ -996,30 +993,20 @@ mod tests {
             "a successful substitution must keep its value; got: {ok}"
         );
 
-        // **FIXED — this canary fired 2026-08-17 and is now flipped.** It used
-        // to assert `[]`, pinning kaish's long-standing divergence: a bare
-        // assignment returned success unconditionally, so `||` never saw the
-        // substitution's failure and declined to fire. The test carried
-        // instructions for exactly this moment and they were followed.
-        //
-        // The fix arrived when kaijutsu linked against the kaish lead's
-        // integration worktree (`integration/kaijutsu-preview`, rev
-        // `21642871…`). Verified against the POSIX reference semantics this
-        // project probed in bash and recorded — a bare assignment takes the
-        // status of the LAST command substitution performed, or 0 if none:
+        // A bare assignment takes the status of the LAST command substitution
+        // performed, or 0 if none (POSIX, verified in bash), so `||` after a
+        // failed substitution fires:
         //
         //   false; x=5              rc=0   not stale; no substitution ran
         //   x="$(false)$(true)"     rc=0   \ last wins — decisively NOT
         //   x="$(true)$(false)"     rc=1   / "any failed"
         //   x=$(false) true         rc=0   has a command NAME, so it's that
         //
-        // All four match. The two middle rows are the ones that are easy to
-        // get wrong from memory, so they are the ones worth having checked.
+        // The two middle rows are the easy ones to get wrong.
         //
-        // **If this ever asserts `[]` again, the dependency moved BACKWARD** —
-        // most likely someone reverted the `path` dep to a crates.io `"0.14"`
-        // before 0.15 was actually released. That is a real regression signal,
-        // not a test to relax.
+        // **If this ever asserts `[]`, the kaish dependency moved BACKWARD**
+        // (a bare assignment returned success unconditionally). That is a
+        // regression signal, not a test to relax.
         let fixed = run(
             r#"v="$(cat /definitely/not/here)" || v="READ-FAIL"; echo "[$v]""#,
         )
@@ -1031,7 +1018,7 @@ mod tests {
              version predating the fix. Got: {fixed}"
         );
 
-        // Quiet-hours arithmetic on the UNPADDED hour the script now asks
+        // Quiet-hours arithmetic on the UNPADDED hour the script asks
         // for (`date '+%-H'`). Pins the 8/9 would-be-octal boundary.
         let hours = run(
             r#"for h in "3" "8" "14" "22"; do q=0; if [[ "$h" -ge 22 ]] || [[ "$h" -lt 6 ]]; then q=1; fi; echo "$h=$q"; done"#,

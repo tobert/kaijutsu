@@ -38,9 +38,7 @@ use crate::kj::KjCaller;
 /// own failure family: a fault that reads as a policy decision teaches a
 /// caller the wrong lesson (*that action is refused*) about a control that
 /// was simply absent. Both paths map them to `RefusalKind::Denied` and
-/// `RefusalKind::GateUnavailable` — the `shell_write` gate included, which
-/// used to render every outcome as one error because it had no hook id to
-/// name and the refusal shapes required one.
+/// `RefusalKind::GateUnavailable` — the `shell_write` gate included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GateVerdict {
     /// An assigned reviewer or a rule decided yes.
@@ -343,7 +341,7 @@ async fn build_ask(
                 // schema's NOT NULL `approval_plan_commands` row without
                 // claiming a command-level breakdown this gate doesn't
                 // build. Threading kaish's real `PlannedCommand` tree
-                // through here is future work, not required for Slice 4.
+                // through here is future work.
                 commands: vec![NewPlanCommand {
                     name: spec.tool.clone(),
                     args: vec![NewPlannedValue::Plain(s.rendered.clone())],
@@ -1633,10 +1631,10 @@ mod tests {
 
     /// An escalated ask is announced while it is still answerable.
     ///
-    /// Before this existed, an escalated ask was a row in a SQLite table
-    /// nothing pointed at — answerable and undiscoverable at once. The
-    /// announcement now has to happen before `run_gate` returns, because
-    /// there is no longer a wait during which it could arrive late.
+    /// An escalated ask is a row in a SQLite table; unannounced it would be
+    /// answerable and undiscoverable at once. The announcement happens before
+    /// `run_gate` returns because the gate never waits, so nothing could
+    /// deliver it later.
     #[tokio::test]
     async fn an_escalated_ask_is_announced_before_the_gate_returns() {
         let d = gate_dispatcher().await;
@@ -2300,8 +2298,7 @@ mod tests {
 
     /// The whole point: an escalating shell ask records the value each free
     /// variable held in `context_env` at ask time, and the human-facing
-    /// description carries a NOTE naming it (Amy's ruling, 2026-09-02,
-    /// `docs/gate-shape-b.md`) — so a human approving the ask and the
+    /// description carries a NOTE naming it (`docs/gate-shape-b.md`) — so a human approving the ask and the
     /// execution that later runs it never see different values.
     ///
     /// Falsified by making `build_ask` pass `env: vec![]` unconditionally
@@ -2396,11 +2393,11 @@ mod tests {
             .auto_reason
     }
 
-    /// The mismatch the evaluator closes: a program broker PreCall waved
-    /// through without a hook still escalated inside `run_gate`, so a read
-    /// through the MCP `shell_write` tool asked a human. The builtin layer
-    /// now auto-allows it here too, with the durable row every
-    /// auto-decision leaves, and the row names the layer and key.
+    /// Broker PreCall and `run_gate` share one evaluator: a read program the
+    /// broker waves through without a hook must also auto-allow inside
+    /// `run_gate`, not ask a human. The builtin layer auto-allows it with the
+    /// durable row every auto-decision leaves, and the row names the layer and
+    /// key.
     ///
     /// Falsified by dropping the builtin layer from `gate_policy::evaluate`
     /// (the verdict comes back `Pending`).
@@ -2498,7 +2495,7 @@ mod tests {
         );
     }
 
-    // ── The config layers (gate policy slice 2) ─────────────────────
+    // ── The config layers ───────────────────────────────────────────
 
     fn gate_config(text: &str) -> crate::kj::gate_policy::GateConfigLoad {
         Ok(crate::kj::gate_policy::GateConfig::parse(text).expect("test config parses"))

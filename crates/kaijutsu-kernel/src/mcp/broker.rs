@@ -1,16 +1,16 @@
 //! `Broker` — the one tool-call pipeline (§4.2, D-02).
 //!
-//! Phase 2 responsibilities (in addition to §4.2 call_tool):
+//! Responsibilities beyond §4.2 `call_tool`:
 //! - Subscribes to per-server `ServerNotification` streams and synthesizes
 //!   per-tool `ToolsChanged` diffs on `register`/`unregister` (D-35).
 //! - Coalesces Log/PromptsChanged bursts via `NotificationCoalescer` (§5.3,
 //!   D-39) and emits a single summary block on window close.
 //! - Routes every emitted notification into `BlockKind::Notification` blocks
 //!   in contexts whose binding allows the emitting instance.
-//!
-//! Out of scope for Phase 2: hook evaluation (tables exist but empty),
-//! ResourceUpdated → `BlockKind::Resource` (Phase 3), elicitation live
-//! handling (§9, D-25), tool search / late injection (Phase 5).
+//! - Evaluates hooks at PreCall, PostCall, OnError, OnNotification, and
+//!   ListTools, enforcing or in dry run (`PhaseMode`).
+//! - Persists per-context `ContextToolBinding`s and tracks resource
+//!   subscriptions, re-reading a resource into a context on `ResourceUpdated`.
 
 use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use crate::runtime::embedded_kaish::EmbeddedKaish;
@@ -165,19 +165,19 @@ pub struct Broker {
     /// Last-seen tool list per instance, used to diff ToolsChanged into
     /// per-tool ToolAdded/ToolRemoved emissions (D-35).
     tool_snapshots: Mutex<HashMap<InstanceId, Vec<KernelTool>>>,
-    /// Phase 3 (D-44): live resource subscriptions tied to `ContextToolBinding`.
+    /// (D-44) Live resource subscriptions tied to `ContextToolBinding`.
     /// `clear_binding` / `unregister` walk this table and call
     /// `server.unsubscribe` on each matching entry.
     subscriptions: Mutex<HashMap<ContextId, HashSet<(InstanceId, String)>>>,
-    /// Phase 3 (D-43): parent block id for each subscribed resource. Used
+    /// (D-43) Parent block id for each subscribed resource. Used
     /// when `ResourceUpdated` fires: the re-read emits a child resource
     /// block threaded under the initial read.
     resource_parents: Mutex<HashMap<(ContextId, InstanceId, String), BlockId>>,
-    /// Phase 4 (D-50): named builtin hook registry. Admin RPC looks up hook
+    /// (D-50) Named builtin hook registry. Admin RPC looks up hook
     /// bodies by name so the wire never carries `Arc<dyn Hook>`. Frozen
     /// after construction.
     builtin_hooks: BuiltinHookRegistry,
-    /// Phase 5 (D-54): kernel DB handle used to persist `ContextToolBinding`
+    /// (D-54) Kernel DB handle used to persist `ContextToolBinding`
     /// across kernel restart. Set via `set_db` at kernel bootstrap (same
     /// D-37 setter pattern as `documents`). `None` → persistence is a
     /// no-op, which keeps `Broker::new()` workable for tests.
@@ -745,7 +745,7 @@ impl Broker {
         });
         self.pump_handles.lock().await.insert(id.clone(), handle);
 
-        // Phase 5 (D-55): publish a kernel-level ToolsChanged so
+        // (D-55) Publish a kernel-level ToolsChanged so
         // `builtin.bindings`'s bridge task can turn this into a
         // `ResourceUpdated { uri: "kj://kernel/tools" }` and subscribers
         // to the kernel-wide tools resource see the new instance.
@@ -756,7 +756,7 @@ impl Broker {
     }
 
     /// Walk `subscriptions` and call `server.unsubscribe` on every entry
-    /// that points at `instance` (Phase 3 M3). Tolerates errors — the server
+    /// that points at `instance`. Tolerates errors — the server
     /// may already be down. Also drops matching rows from `resource_parents`.
     async fn teardown_subscriptions_for_instance(
         self: &Arc<Self>,
@@ -884,7 +884,7 @@ impl Broker {
             };
             self.emit_for_bindings(id, payload).await;
         }
-        // Phase 5 (D-55): same kernel-level signal as `register_inner` —
+        // (D-55) Same kernel-level signal as `register_inner` —
         // `kj://kernel/tools` subscribers get notified via the bindings
         // server's bridge task.
         let _ = self
@@ -959,9 +959,9 @@ impl Broker {
     /// Replace a context's binding wholesale. Sticky resolutions on the
     /// incoming binding are preserved as-is; the broker does not recompute.
     ///
-    /// Phase 5 (D-54): persists to `KernelDb` if a handle is installed.
+    /// (D-54) Persists to `KernelDb` if a handle is installed.
     ///
-    /// Phase 5 (D-35 reuse): computes the `(instance, tool_name)` diff
+    /// (D-35 reuse) Computes the `(instance, tool_name)` diff
     /// against the previous binding and fires per-tool `ToolAdded` /
     /// `ToolRemoved` notifications into this specific context so the LLM
     /// sees the change on the next turn without new notification kinds.
@@ -1368,13 +1368,10 @@ impl Broker {
     ///
     /// Dropping only the in-memory entry does not reset anything: `binding()`
     /// re-hydrates from the kernel DB on a cache miss, so the very next read
-    /// resurrects the row this call was meant to remove — and `kj binding
-    /// reset` reported "now denies all" while the loadout came straight back.
-    /// Both readers agreed, and both were wrong, which is why no divergence
-    /// test would have caught it.
+    /// would resurrect the row this call is meant to remove.
     ///
     /// A failed delete is the caller's error, as in [`Self::persist_binding`]:
-    /// the row would outlive the reset and the next read would show the old
+    /// the row would outlive the reset and the next read would show the prior
     /// loadout, so the reset must not report success.
     async fn forget_persisted_binding(&self, context_id: &ContextId) -> McpResult<()> {
         let db = match self.db.read().await.clone() {
@@ -1392,7 +1389,7 @@ impl Broker {
     }
 
     /// Read a context's binding, hydrating from the kernel DB on cache miss.
-    /// Phase 5 (D-54): first-touch loads from persistent storage so
+    /// (D-54) First-touch loads from persistent storage so
     /// curation survives kernel restart. Callers that fall back to "bind
     /// all registered" on `None` will observe the persisted binding here.
     /// Returns `None` if no row exists in DB (never-bound context) or the
@@ -1530,7 +1527,7 @@ impl Broker {
             );
         }
 
-        // Phase 5 (D-56): apply `ListTools` hook filter before resolution
+        // (D-56) Apply `ListTools` hook filter before resolution
         // so denied tools never enter `name_map` — they become uncallable
         // via `call_tool` in the same stroke, because `binding.resolve`
         // has no entry for them. Matches on raw (instance, tool_name) per
@@ -1582,7 +1579,7 @@ impl Broker {
         Ok(out)
     }
 
-    /// The one tool-call pipeline. Phase 4 wires hook evaluation at three
+    /// The one tool-call pipeline. Hook evaluation runs at three
     /// pinch points: `PreCall` before the server call, `PostCall` on success,
     /// `OnError` on failure. ShortCircuit in any phase bypasses the server
     /// (or converts an error to a success in OnError). Deny terminates with
@@ -2204,7 +2201,7 @@ impl Broker {
                     }
                     HookBody::KaishPath(path) => {
                         // Read fresh from the VFS every fire — no cache, no
-                        // snapshot (`docs/rc-on-disk.md`, "slice 5"). An
+                        // snapshot (`docs/rc-on-disk.md`). An
                         // unreadable path is a `Deny`, not an escalation;
                         // see `unreadable_hook_body_reason`.
                         let body_read = tokio::select! {
@@ -2921,9 +2918,8 @@ impl Broker {
     }
 
     /// Read a `HookBody::KaishPath` body fresh from the VFS. Deliberately
-    /// uncached: every call re-reads `path`, which is the entire point of
-    /// slice 5 (`docs/rc-on-disk.md`) — an edit to the file reaches the
-    /// running hook with no reinstall. Reached the same way
+    /// uncached: every call re-reads `path` (`docs/rc-on-disk.md`), so an
+    /// edit to the file reaches the running hook with no reinstall. Reached the same way
     /// `run_kaish_hook` reaches its `KjDispatcher`: upgrade the stashed
     /// `Weak`, then `dispatcher.kernel().vfs()`.
     async fn read_kaish_hook_body(&self, path: &str) -> Result<String, String> {
@@ -3177,7 +3173,7 @@ impl Broker {
         }
     }
 
-    // ── Resource dispatch (Phase 3 M3) ─────────────────────────────────
+    // ── Resource dispatch ─────────────────────────────────
 
     /// Resolve a live instance by id, returning `InstanceNotFound` otherwise.
     async fn resolve_instance(
@@ -3453,7 +3449,7 @@ impl Broker {
     }
 
     /// Emit a notification block into every bound context that allows this
-    /// instance. Walks bindings (no reverse index in Phase 2 — simple scale).
+    /// instance. Walks bindings (no reverse index; the table stays small).
     /// No-op when `documents` is unset (broker constructed without bootstrap).
     async fn emit_for_bindings(
         self: &Arc<Self>,
@@ -3485,7 +3481,7 @@ impl Broker {
 
     /// Emit a notification block into a single specific context, regardless
     /// of whether that context's binding currently allows the instance.
-    /// Phase 5: used for binding-mutation diff emissions where the mutation
+    /// Used for binding-mutation diff emissions where the mutation
     /// itself is the trigger, not ongoing binding membership. Still runs
     /// `OnNotification` hooks for consistency with `emit_for_bindings`.
     async fn emit_for_context(
@@ -3506,8 +3502,8 @@ impl Broker {
 
     /// Shared per-context emission body used by both `emit_for_bindings` and
     /// `emit_for_context`. Evaluates `OnNotification` hooks then writes the
-    /// block. Silent on hook errors (emits anyway, per prior Phase 4
-    /// behavior) so transient hook failures don't swallow notifications.
+    /// block. Silent on hook errors (emits anyway)
+    /// so transient hook failures don't swallow notifications.
     async fn emit_into_context(
         self: &Arc<Self>,
         ctx: ContextId,
@@ -3577,7 +3573,7 @@ impl Broker {
     }
 
     /// Schedule a window-flush timer for `ResourceUpdated` on `(instance, uri)`
-    /// (Phase 3 M3, D-43). When the window elapses, the broker re-reads the
+    /// (D-43). When the window elapses, the broker re-reads the
     /// URI once and emits a child `BlockKind::Resource` block per subscribed
     /// context. `Broker::coalescer::flush` is called for bookkeeping (clears
     /// the window); the coalesced count is unused because the re-read result
@@ -3819,8 +3815,8 @@ fn error_to_hook_json(e: &McpError) -> String {
             // over `RefusalKind`, which is what makes a new kind a compile
             // error here rather than a silently mistagged log line.
             //
-            // The tags keep their old spelling so a consumer reading these
-            // journal entries still sees the same three-way split.
+            // The tags are a stable three-way split for consumers reading
+            // these journal entries.
             let kind = match r.kind {
                 RefusalKind::Denied => "Denied",
                 RefusalKind::Pending => "GatePending",
@@ -4006,8 +4002,8 @@ fn emit_deny_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
 /// Tracing attribution for a `GateUnavailable` result — an `Ask` hook that
 /// never reached a verdict. Kept as its own event name (`hook.gate_unavailable`,
 /// not `hook.deny`) so a trace consumer can tell a broken control apart from
-/// an actual "no" without parsing `reason` prose (Amy, 2026-08-17,
-/// `docs/gate-and-shell-split.md`).
+/// an actual "no" without parsing `reason` prose
+/// (`docs/gate-and-shell-split.md`).
 fn emit_gate_unavailable_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
     tracing::info!(
         hook_id = %format!("hook:{hook_id}"),
@@ -4118,8 +4114,8 @@ async fn pump_loop(
                 total,
                 message,
             }) => {
-                // Surfacing this as a log is the whole point for now: a long
-                // kaibo consult used to be indistinguishable from a hung one.
+                // Surfacing this as a log keeps a long kaibo consult
+                // distinguishable from a hung one.
                 // Deliberately NOT routed through the coalescer — progress is
                 // already rate-limited by the sender, and collapsing it would
                 // destroy exactly the liveness signal we came for.
@@ -8309,8 +8305,7 @@ mod tests {
         assert!(err.is_refusal(RefusalKind::Denied), "expected Denied, got {err:?}");
     }
 
-    /// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "Exit 3 =
-    /// escalate to an ask"): a `HookBody::Kaish` body that exits 3 does not
+    /// (`docs/gate-and-shell-split.md`, "Exit 3 = escalate to an ask"): a `HookBody::Kaish` body that exits 3 does not
     /// deny outright — it escalates through the same ledger ask round trip
     /// `HookAction::Ask` uses, with the body's stderr tail as the ask's
     /// description. The first call returns `GatePending` immediately
@@ -8406,15 +8401,15 @@ mod tests {
         );
     }
 
-    // ── HookBody::KaishPath (docs/rc-on-disk.md, "slice 5") ──────────
+    // ── HookBody::KaishPath (docs/rc-on-disk.md) ─────────────────────
     //
     // A path is read fresh from the VFS at every fire — no cache, no
-    // snapshot. The three tests below are the slice's whole point:
+    // snapshot. The three tests below pin that:
     // (1) an edit to the file reaches the running hook with no reinstall;
-    // (2) an unreadable path denies, naming the path (Amy's ruling,
-    // 2026-08-28); (3) the persisted row never carries a snapshotted body.
+    // (2) an unreadable path denies, naming the path;
+    // (3) the persisted row never carries a snapshotted body.
 
-    /// The point of the whole slice: a `HookBody::KaishPath` hook fires,
+    /// A `HookBody::KaishPath` hook fires,
     /// the file is edited on disk, and the very next fire picks up the new
     /// behavior — no `hook_add`, no reinstall, no new `HookEntry`.
     #[tokio::test]
@@ -8473,8 +8468,7 @@ mod tests {
         );
     }
 
-    /// Amy's ruling, 2026-08-28 (`docs/rc-on-disk.md`, "slice 5"): a
-    /// `HookBody::KaishPath` whose file cannot be read is a `Deny` — the
+    /// (`docs/rc-on-disk.md`): a `HookBody::KaishPath` whose file cannot be read is a `Deny` — the
     /// opposite of `HookBody::Kaish`'s fault handling, which escalates
     /// instead (see `unreadable_hook_body_reason`). Calls `evaluate_phase`
     /// directly so the deny reason is observable to assert it names the
@@ -9256,12 +9250,11 @@ mod tests {
     const SHELL_GUARD_SEED: &str =
         include_str!("../../../../assets/defaults/rc/lib/create/S45-shell-guard.kai");
 
-    /// The `sh -c` guard (`docs/gate-and-shell-split.md` item 4, Amy
-    /// 2026-08-20): denies any `shell_write` command that routes through
-    /// `sh`/`bash`/`zsh`/`dash` `-c` (optionally via `exec`) at a statement
+    /// The `sh -c` guard (`docs/gate-and-shell-split.md` item 4): denies any
+    /// `shell_write` command that routes through `sh`/`bash`/`zsh`/`dash` `-c`
+    /// (optionally via `exec`) at a statement
     /// boundary or the start of the command, and lets everything else
-    /// through — including the three benign shapes that tripped an earlier,
-    /// looser regex on our own probe this morning (per the ruling text):
+    /// through — including three benign shapes a looser regex would block:
     /// `grep 'sh -c' file`, `echo "bash -c"`, and a commit message
     /// containing the substring `sh -c`.
     ///
@@ -9277,7 +9270,7 @@ mod tests {
     async fn shell_guard_denies_sh_dash_c_and_allows_benign_shapes() {
         let (broker, kernel, kj) = wired_kaish_broker("shell-guard-falsify").await;
 
-        // `HookBody::KaishPath` (docs/rc-on-disk.md, "slice 5") reads the
+        // `HookBody::KaishPath` (docs/rc-on-disk.md) reads the
         // guard's body fresh from `/config/rc` at every fire, so this test
         // needs a real seeded rc tree mounted — the same seed the create
         // lifecycle installs from.
@@ -9356,8 +9349,8 @@ mod tests {
             );
         }
 
-        // Falsified against Amy's own morning incident: the Claude Code
-        // regex hook blocked this exact data-position false positive.
+        // Data-position occurrences of `sh -c` must not be blocked (a regex
+        // hook matching the substring anywhere would):
         let benign = [
             "grep 'sh -c' file",
             "echo \"bash -c\"",
@@ -10237,7 +10230,7 @@ mod tests {
     /// broker from upgrading to `None` mid-test.
     /// Wire a broker for hook tests: documents, kernel, and a `kj` dispatcher.
     /// The dispatcher is returned (not just set) because the broker holds a
-    /// `Weak` to it — kaish hooks now materialize their shell through the
+    /// `Weak` to it — kaish hooks materialize their shell through the
     /// dispatcher, so it must outlive the call. Drop it and the hook can't
     /// upgrade the weak ref.
     async fn wired_kaish_broker(
@@ -10837,11 +10830,10 @@ mod tests {
         }
     }
 
-    // ── D-57 / Slice 4.7: HookAction::Ask melted into the ledger ────────
-    // (`docs/gate-and-shell-split.md`, "The shared seam"). These tests
-    // replace the old `ScriptedAsker` double — there is nothing left to
-    // script; `run_permission_ask` now calls `kj::gate::run_gate` for
-    // real, so these tests wire a real `KjDispatcher` (mirroring
+    // ── D-57: HookAction::Ask goes through the ledger ────────────────────
+    // (`docs/gate-and-shell-split.md`, "The shared seam"). There is no
+    // scripted asker double; `run_permission_ask` calls `kj::gate::run_gate`
+    // for real, so these tests wire a real `KjDispatcher` (mirroring
     // `wired_kaish_broker` above) and answer/inspect the durable ledger
     // row directly, the same way `mcp/servers/shell.rs`'s gate tests do.
 

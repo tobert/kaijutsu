@@ -315,7 +315,7 @@ async fn run_lifecycle(
     // The BlockStore document for this context may not exist yet —
     // context_create commits the KernelDb document but doesn't seed
     // the in-memory BlockStore (LLM stream / RPC handler creates it
-    // lazily on first block). rc scripts insert blocks now, so we
+    // lazily on first block). rc scripts insert blocks, so we
     // must ensure the BlockStore doc exists.
     match dispatcher
         .block_store()

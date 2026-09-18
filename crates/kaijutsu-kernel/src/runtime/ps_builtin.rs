@@ -3,9 +3,8 @@
 //! kaish ships a `ps` that enumerates host processes. Inside a kaijutsu
 //! shell that is the wrong answer to the right question: a seat asking
 //! "what is running?" means the kernel's own landscape, not every process
-//! on the machine (Amy, 2026-08-24: *"drop the kaish ps in favor of system
-//! ps when ps is needed for that, which generally kaijutsu agents don't
-//! need to and shouldn't see"*).
+//! on the machine, which kaijutsu agents generally do not need and should not
+//! see.
 //!
 //! **This tool never renders the table.** `kj system ps` is the one door,
 //! because it is the one that carries the capability check. If `ps` also

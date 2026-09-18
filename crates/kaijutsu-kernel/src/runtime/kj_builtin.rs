@@ -291,10 +291,9 @@ impl Tool for KjBuiltin {
     fn schema(&self) -> ToolSchema {
         // Reflected from the composed clap `Command` tree — the single source of
         // truth for both routing (`dispatch`) and schema. See
-        // docs/monday-clap-upgrades.md §2.1/§2.4. This replaces the hand-written
-        // flat `.param(...)` union that `11160e5` last reconciled; the `-t`
-        // collision (cache `--target` vs context `--tree`) now resolves because
-        // each lives on its own leaf.
+        // docs/monday-clap-upgrades.md §2.1/§2.4. Each leaf carries its own
+        // params, so the `-t` collision (cache `--target` vs context `--tree`)
+        // resolves per leaf.
         let mut schema = kaish_kernel::tools::schema_tree_from_clap(
             &crate::kj::kj_command(),
             "kj",
@@ -323,31 +322,22 @@ impl Tool for KjBuiltin {
             ],
         );
 
-        // `owns_output` stays at its default `false` (deliberately NOT calling
-        // `with_owned_output()` anymore): kaish 0.13 formats `--json` uniformly
-        // for every tool via `finalize_output`/`apply_output_format`, reading
-        // `.data`/`.output`/`.latch` straight off the `ExecResult` kj already
-        // returns from `execute()` below. kj no longer builds its own envelope
-        // (the old `render_json_envelope` is gone). `owns_output && result.ok()`
-        // is exactly the case `finalize_output` uses to SKIP formatting, so
-        // setting it would silently turn off JSON rendering on every
-        // successful `kj` command — the opposite of what we want (uniform
-        // success + failure formatting, kaish-owned).
+        // `owns_output` stays `false`: kaish formats `--json` uniformly for every
+        // tool via `finalize_output`/`apply_output_format`, reading
+        // `.data`/`.output` straight off the `ExecResult` kj returns from
+        // `execute()` below. `owns_output && result.ok()` is exactly the case
+        // `finalize_output` uses to SKIP formatting, so setting it would turn
+        // off JSON rendering on every successful `kj` command.
         //
-        // The one behavior `owns_output` used to buy for free: routing
-        // `--help`/`-h` through kj's OWN clap parser (leaf help) instead of
-        // kaish's generic whole-tool help router (`wants_help` in kernel.rs is
-        // gated on `!schema.owns_output`) — `kj context create --help` must
-        // render `create`'s leaf help, not the generic schema-derived listing
-        // (tobert/kaish#51). `params_from_clap` can't express "this tool claims
-        // help" (it hard-skips a "help"-id arg at every level of the tree, the
-        // same treatment as "json"), so it's reclaimed directly here: a
-        // root-level "help" param (aliased "h") makes `wants_help`'s
-        // `schema_claims("help")`/`schema_claims("-h")` checks true
-        // unconditionally — independent of `owns_output` — mirroring how
-        // `ToolSchema::mark_owned_output` used to synthesize a "json" param.
-        // Guarded by `owns_output_routes_leaf_help_through_kaish` (renamed
-        // from the with-owned-output era; still asserts the same behavior).
+        // With `owns_output` false, kaish's generic whole-tool help router
+        // (`wants_help` in kernel.rs) would intercept `--help`/`-h`, but
+        // `kj context create --help` must render `create`'s leaf help from kj's
+        // OWN clap parser (tobert/kaish#51). `params_from_clap` cannot express
+        // "this tool claims help" (it skips a "help"-id arg at every level, as
+        // it does "json"), so a root-level "help" param (aliased "h") is added
+        // directly: it makes `wants_help`'s `schema_claims("help")`/
+        // `schema_claims("-h")` checks true independent of `owns_output`.
+        // Guarded by `owns_output_routes_leaf_help_through_kaish`.
         schema.params.push(
             ParamSchema::new("help", "bool")
                 .with_aliases(vec!["h".to_string()])
@@ -355,7 +345,7 @@ impl Tool for KjBuiltin {
         );
         // `$(kj …)` binds `.data`, not the rendered table.
         //
-        // kaish 0.16 stopped inferring this: a tool that prints text AND
+        // kaish does not infer this: a tool that prints text AND
         // attaches data has to say which one a command substitution means,
         // because both readings are defensible (`jq` means the data, `cut`
         // means the text). kj means the data — `kj context list` renders a
@@ -416,9 +406,8 @@ impl Tool for KjBuiltin {
             }
         }
 
-        // Extract the bare --confirm flag before dispatch. kaish 0.14 deleted
-        // the confirmation latch and with it the nonce store this used to
-        // round-trip through, so presence of the flag IS the confirmation.
+        // Extract the bare --confirm flag before dispatch. Presence of the flag
+        // IS the confirmation; no nonce store or cross-call state exists.
         let confirmed = crate::kj::parse::has_flag(&argv, &["--confirm"]);
         crate::kj::parse::strip_flag(&mut argv, &["--confirm"]);
 
@@ -639,17 +628,13 @@ fn is_gated_verb(argv: &[String]) -> bool {
 
 // ── kj's confirmation gate, carried on kaish baggage ──────────────────────
 //
-// kaish 0.13 gave an embedder a typed control-plane field for this
-// (`ExecResult.latch` / `ExecContext::latch_result`); 0.14 deleted the latch
-// outright. kj's OWN gate — the one that holds `kj context archive`,
-// `kj context archive`, `kj context retag`, `kj doc delete`, `kj preset
-// remove` and `kj workspace remove` at exit 2 until `--confirm` — is
-// kaijutsu policy, not kaish's, so it survives the removal. What it lost is
-// the substrate: it now rides `ExecResult::baggage`, the opaque key-value
-// channel kaish carries and does not interpret (kaish-types
-// `ExecResult::baggage`), which propagates up a statement exactly the way
-// `.data` does. Producer and consumers are all kaijutsu, so the keys below
-// are the whole protocol.
+// kj's OWN gate holds `kj context archive`, `kj context retag`,
+// `kj doc delete`, `kj preset remove` and `kj workspace remove` at exit 2
+// until `--confirm`. It is kaijutsu policy, not kaish's, and rides
+// `ExecResult::baggage`, the opaque key-value channel kaish carries and does
+// not interpret (kaish-types `ExecResult::baggage`), which propagates up a
+// statement the way `.data` does. Producer and consumers are all kaijutsu, so
+// the keys below are the whole protocol.
 
 /// Baggage key: the canonical command that latched (e.g. `kj context archive`).
 pub const LATCH_COMMAND_KEY: &str = "kj.latch.command";
@@ -1144,7 +1129,7 @@ mod tests {
     /// `kj context list --json` (flag AFTER the subcommand) must emit valid
     /// JSON, not error with "unexpected argument" — `--json` binds at the leaf
     /// even though no leaf declares it (kaish's undeclared-flag-defaults-to-bool
-    /// fallback). kaish 0.13 owns `--json` rendering: on success with `.data`
+    /// fallback). kaish owns `--json` rendering: on success with `.data`
     /// set and no `.output`, `apply_output_format` serializes `.data` DIRECTLY
     /// (no `{ok,...}` wrapper) — `kj context list`'s `.data` is the array of
     /// context handles, so stdout is exactly that array.
@@ -1213,8 +1198,7 @@ mod tests {
 
     /// An error under `--json` still produces parseable JSON — kaish's
     /// `{"error", "code"}` object (`apply_output_format`'s no-output-and-failed
-    /// branch), not kj's retired `{ok:false, message}` envelope — with the exit
-    /// code preserved.
+    /// branch), with the exit code preserved.
     #[tokio::test]
     async fn json_flag_renders_errors_as_envelope() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -1247,10 +1231,10 @@ mod tests {
             parsed["error"].as_str().is_some_and(|m| !m.is_empty()),
             "kaish's error envelope must carry a nonempty `error` message: {parsed}"
         );
-        // No leftover from the retired kj-owned shape.
+        // Not a kj-owned `{ok,message}` shape.
         assert!(
             parsed.get("ok").is_none() && parsed.get("message").is_none(),
-            "must not resemble the retired {{ok,message}} envelope: {parsed}"
+            "must not resemble an {{ok,message}} envelope: {parsed}"
         );
     }
 
@@ -1310,12 +1294,11 @@ mod tests {
         }
     }
 
-    /// The headline win of per-leaf schemas (the flat-schema retirement): `-t`
-    /// means different things on different leaves and BOTH bind correctly.
+    /// Per-leaf schemas: `-t` means different things on different leaves and
+    /// BOTH bind correctly.
     /// `kj cache add -t <target>` takes a value (the cache target); `kj context
-    /// list -t` is a bool (tree view). The old flat schema could bind `-t` to
-    /// exactly one meaning (`target`), so `kj context list -t` was the casualty.
-    /// This is the acceptance gate for the reflected schema.
+    /// list -t` is a bool (tree view). This is the acceptance gate for the
+    /// reflected schema.
     #[tokio::test]
     async fn dash_t_disambiguates_per_leaf() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -1348,9 +1331,8 @@ mod tests {
             "`-t tools` must bind target=tools, got: {bps:?}"
         );
 
-        // `-t` binds as a BOOL on `context list` (tree view). Under the old flat
-        // schema `-t` was the value flag `target`, so this form mis-bound; now it
-        // resolves to `--tree` on its own leaf.
+        // `-t` binds as a BOOL on `context list` (tree view): it resolves to
+        // `--tree` on its own leaf.
         let list = kaish
             .execute_with_options("kj context list -t", ExecuteOptions::default())
             .await
@@ -1846,12 +1828,8 @@ mod tests {
 
     /// The confirmation gate round-trips across a *fresh* `EmbeddedKaish` for
     /// the same context — the real path a follow-up MCP `execute` takes, since
-    /// kaish is materialized per call. Under kaish 0.13 this was a nonce
-    /// durability regression (the store had to live per-context on the kernel
-    /// or `--confirm` hit a brand-new empty table and reported "invalid
-    /// nonce"). kaish 0.14 deleted the nonce store, so the gate is now a bare
-    /// flag with no cross-call state to lose — this holds the observable
-    /// behavior that regression was about: unconfirmed refuses, confirmed runs.
+    /// kaish is materialized per call. The gate is a bare flag with no
+    /// cross-call state: unconfirmed refuses, confirmed runs.
     #[tokio::test]
     async fn confirmation_gate_round_trips_across_a_fresh_shell() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -2058,7 +2036,7 @@ mod tests {
     /// approval ledger — today `kj cc send` without `--dry-run` — and nothing
     /// else. Freezing the script clock for an ungated verb would hide a real
     /// wedge from the watchdog; missing a gated one lets kaish kill the wait
-    /// before the gate's deadline (Gate slice 1a, finding #1).
+    /// before the gate's deadline.
     #[test]
     fn is_gated_verb_classifies_approval_gated_verbs() {
         let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -2185,22 +2163,12 @@ mod tests {
     /// the kaish bridge: `kj <group> <leaf> --help` must render the *leaf's*
     /// clap help, not the generic whole-tool help.
     ///
-    /// History: kaish's `dispatch_command` used to intercept `--help` (render
-    /// the whole-tool help, skip the tool) unless the tool's **root** schema
-    /// claimed the `help` flag. kj re-parses its argv with clap and wants
-    /// `--help` at the leaf, so it originally carried a synthetic root `help`
-    /// param solely to flip `schema_claims("help")` true; kaish 0.11
-    /// (tobert/kaish#51) made that redundant by gating `wants_help` on
-    /// `!schema.owns_output` instead, so `with_owned_output()` alone routed
-    /// `--help` through. The kaish 0.13 `--json` migration retired
-    /// `with_owned_output()` (kj no longer builds its own `--json` envelope —
-    /// see `schema()`'s `owns_output` note; `owns_output` now needs to stay
-    /// `false` so kaish's uniform `--json` formatting applies on success too),
-    /// which resurrected the original problem: `owns_output=false` alone would
-    /// let the outer router intercept every `kj … --help`. `schema()` closes
-    /// the gap the same way the pre-0.11 code did — a manually-pushed root
-    /// `help`/`h` param — so this test's *assertions* are unchanged from the
-    /// with-owned-output era; only *how* `schema_claims` gets satisfied moved.
+    /// kaish's `dispatch_command` intercepts `--help` (renders the whole-tool
+    /// help, skips the tool) unless the tool's **root** schema claims the
+    /// `help` flag. kj re-parses its argv with clap and wants `--help` at the
+    /// leaf, and `owns_output` must stay `false` for uniform `--json`
+    /// formatting (see `schema()`), so `schema()` pushes a root `help`/`h`
+    /// param to satisfy `schema_claims("help")`.
     #[tokio::test]
     async fn owns_output_routes_leaf_help_through_kaish() {
         let dispatcher = Arc::new(test_dispatcher().await);
@@ -2230,16 +2198,14 @@ mod tests {
         );
     }
 
-    /// Bug 1 (2026-07-04): `kj fork --include <range>` through the kaish bridge.
+    /// `kj fork --include <range>` through the kaish bridge.
     /// `--include` reflects as a repeatable clap flag (`Vec<String>` →
     /// `ArgAction::Append`), so kaish hands the builtin its value as a
-    /// `Value::Json(Array(...))` (one element per occurrence). Before the fix,
-    /// `KjBuiltin::execute`'s argv reconstruction had no arm for that and
-    /// Debug-formatted the whole array into one token
-    /// (`Json(Array [String("0:1")])`), which the range parser then rejected as
-    /// a bad endpoint — so every documented range form failed live even though
-    /// the parser and the direct dispatcher path were both fine. This drives the
-    /// forms end-to-end through kaish, including a repeated `--include` (two
+    /// `Value::Json(Array(...))` (one element per occurrence).
+    /// `KjBuiltin::execute`'s argv reconstruction must expand that array into
+    /// one argv token per element; Debug-formatting it into one token
+    /// (`Json(Array [String("0:1")])`) makes the range parser reject a bad
+    /// endpoint. This drives the forms end-to-end through kaish, including a repeated `--include` (two
     /// occurrences → the array path is guaranteed).
     #[tokio::test]
     async fn fork_include_ranges_survive_kaish_bridge() {
@@ -2297,9 +2263,7 @@ mod tests {
         }
     }
 
-    /// A latched `kj … --json` result must still surface the gate. kaish 0.13
-    /// had its own `latch_envelope` in `apply_output_format`; 0.14 deleted the
-    /// latch, so under `--json` a refusal renders as kaish's ordinary error
+    /// A latched `kj … --json` result must still surface the gate. Under `--json` a refusal renders as kaish's ordinary error
     /// envelope (`{"error", "code": 2}`) and the structured gate rides
     /// `ExecResult::baggage` — which is what the MCP shell layer and the RPC
     /// `execute_kj` path read. This drives a real latched command end-to-end
@@ -2338,10 +2302,10 @@ mod tests {
                 .is_some_and(|e| e.contains("--confirm") && e.contains("doomed")),
             "the error must be the ready-to-run confirmation: {body}"
         );
-        // Not the retired kj-owned {ok,message} shape.
+        // Not a kj-owned {ok,message} shape.
         assert!(
             body.get("ok").is_none(),
-            "must not resemble the retired envelope: {body}"
+            "must not resemble an {{ok,message}} envelope: {body}"
         );
 
         // The structured gate survives so the MCP shell layer

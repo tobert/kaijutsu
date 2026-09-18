@@ -375,17 +375,12 @@ impl KernelBackend for KaijutsuBackend {
         }
     }
 
-    // `append` and `patch` are unreachable through any live caller: `/v/docs`
-    // (`docs_filesystem.rs`) mounts this backend as a `Filesystem`, whose
-    // trait has no append/patch methods, and `MountBackend` (the mount kaish
-    // actually scripts against) never forwards to `docs_tools` for file ops —
-    // only `call_tool`/`list_tools`/`get_tool`/`mounts` (`mount_backend.rs`).
-    // Refused structurally, the same way the symlink methods below already
-    // are, rather than kept alive with no caller and no coverage. The
-    // hardened byte-domain patch logic these used to run
-    // (`compute_patch_op`/`check_byte_boundary`) moved to `mount_backend.rs`,
-    // which *is* the live path — see `docs/audits/2026-08-20-kaish-glue.md`
-    // B2/B3.
+    // `append` and `patch` have no live caller: `/v/docs` (`docs_filesystem.rs`)
+    // mounts this backend as a `Filesystem`, whose trait has no append/patch
+    // methods, and `MountBackend` (the mount kaish scripts against) forwards only
+    // `call_tool`/`list_tools`/`get_tool`/`mounts` to `docs_tools`. They refuse
+    // structurally, like the symlink methods below. `MountBackend` owns the
+    // byte-domain patch logic (`compute_patch_op`, `check_byte_boundary`).
     async fn append(&self, _path: &Path, _content: &[u8]) -> BackendResult<()> {
         Err(BackendError::InvalidOperation(
             "append not supported on conversation blocks (/docs); unreachable through any live mount".into(),
@@ -711,15 +706,8 @@ impl KernelBackend for KaijutsuBackend {
 // Helper Functions
 // =============================================================================
 //
-// The byte-domain `PatchOp` helpers (`compute_patch_op`, `check_byte_boundary`,
-// `line_to_byte_offset`, `line_range`) and the read-range windower
-// (`apply_read_range`) used to live here, backing this file's own
-// `append`/`patch`/ranged-`read` — all now stubbed above as unreachable (see
-// their doc comments). The hardened patch helpers moved to
-// `mount_backend.rs`, which *is* the live path kaish scripts patch through;
-// `apply_read_range` had no live equivalent to move to (`MountBackend`
-// already had its own working `apply_range`) and was deleted outright. See
-// `docs/audits/2026-08-20-kaish-glue.md` B2/B3/B5.
+// Byte-domain patching and ranged reads live in `mount_backend.rs`
+// (`compute_patch_op`, `apply_range`); this backend serves neither.
 
 /// Convert kaish ToolArgs to JSON for passing to execution engines.
 fn tool_args_to_json(args: &ToolArgs) -> JsonValue {
@@ -1108,9 +1096,8 @@ mod tests {
         assert!(!blocks.contains(absent));
     }
 
-    /// `append`/`patch` are unreachable through any live mount (see the doc
-    /// comment on both methods) — pins that they refuse rather than silently
-    /// no-op or panic now that their storage-backed bodies are gone.
+    /// `append`/`patch` have no live caller (see the comment above both
+    /// methods); pins that they refuse rather than silently no-op or panic.
     #[tokio::test]
     async fn append_and_patch_are_stubbed_unreachable() {
         let ctx_id = ContextId::new();

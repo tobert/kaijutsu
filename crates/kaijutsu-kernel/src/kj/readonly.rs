@@ -2,15 +2,12 @@
 //!
 //! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores every
 //! `shell_write` clause through a classifier that over-escalates on ordinary
-//! reads. Measured against the live v10 scorer, 2026-09-01: `kj block read
-//! <id>` lands `situation-normal` 0.791 and `kj rc show <path>` 0.675, and
-//! anything but `informative` escalates — so a verb named `read` asked a
-//! human for permission to read. The escalation is not uniform, which is why
-//! a declared class beats tuning: `kj block list` (`informative` 0.897) and
-//! `kj context list` (0.960) sail through, so neighbouring reads on the same
-//! noun disagree. This module is Amy's fix: every `kj` verb declares its own
-//! effect (`kj/effect.rs`), and a call whose effect
-//! is [`Effect::Read`] skips the classifier entirely (`KJ_TOOL_PLAN`'s
+//! reads. The escalation is not uniform: `kj block read <id>` scored
+//! `situation-normal` while `kj block list` scored `informative`, and anything
+//! but `informative` escalates, so a verb named `read` asked a human for
+//! permission to read. A declared class beats tuning: every `kj` verb declares
+//! its own effect (`kj/effect.rs`), and a call whose effect is
+//! [`Effect::Read`] skips the classifier entirely (`KJ_TOOL_PLAN`'s
 //! `kj_readonly` field, wired in `mcp/broker.rs`).
 //!
 //! [`is_read_only_kj`] takes one [`PlannedCommand`] — kaish's own plan
@@ -53,8 +50,8 @@
 //! command itself is. This module refuses one in condition 2, for every
 //! command it accepts.
 //!
-//! The hook's other two exemptions (`--help`, `kj ledger`) once had the same
-//! hole and no longer do: they gate on a `has_redirect` field the hook reads
+//! The hook's other two exemptions (`--help`, `kj ledger`) gate on a
+//! `has_redirect` field the hook reads
 //! from `KJ_TOOL_PLAN`'s `commands[].redirects`, which is kaish's structured
 //! field rather than a scan of clause text. One narrower case stays open by
 //! choice — the hook's fallback item, used only when `KJ_TOOL_PLAN` is
