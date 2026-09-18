@@ -1,0 +1,31 @@
+# One Harbor job running kaijutsu-solo-acp on hello-world.
+#
+#   source /home/atobey/src/bench-work/harbor/env.sh
+#   export PYTHONPATH=/home/atobey/src/wt/kaijutsu-bench/contrib/bench/harbor
+#   export DEEPSEEK_API_KEY="$(< ~/.deepseek-key)"
+#   harbor run -c job.yaml -y
+#
+# `run-harbor.sh` does all of that and checks the job directory for the key
+# afterwards. Prefer it.
+job_name: kj-hello-world
+jobs_dir: /home/atobey/src/bench-work/harbor/jobs
+n_attempts: 1
+n_concurrent_trials: 1
+agent_timeout_multiplier: 5.0
+environment:
+  type: podman
+  delete: true
+agents:
+  - import_path: kaijutsu_solo_agent:KaijutsuSoloAcp
+    env:
+      # A template, not a literal: Harbor resolves it from the host
+      # environment at run time and persists the template unchanged.
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+    kwargs:
+      binary_path: /home/atobey/src/bench-work/dist/out/kaijutsu-solo-acp
+      gate_config_path: /home/atobey/src/wt/kaijutsu-bench/contrib/bench/gate-sandbox.toml
+      # backend_kind, solo_model and rust_log are omitted on purpose:
+      # kaijutsu_solo_agent.py owns those defaults (DEFAULT_BACKEND_KIND,
+      # DEFAULT_MODEL, DEFAULT_RUST_LOG). Set them here only to override.
+tasks:
+  - path: /home/atobey/src/harbor/examples/tasks/hello-world

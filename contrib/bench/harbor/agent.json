@@ -1,0 +1,18 @@
+{
+  "id": "kaijutsu-solo-acp",
+  "name": "kaijutsu",
+  "version": "unpinned",
+  "description": "kaijutsu with its own kernel, over ACP v1",
+  "distribution": {
+    "local": {
+      "cmd": "/installed-agent/kaijutsu/kaijutsu-solo-acp",
+      "args": [
+        "--backend-kind", "deepseek",
+        "--model", "deepseek-v4-flash",
+        "--state-dir", "/installed-agent/kaijutsu/state",
+        "--gate-config", "/installed-agent/kaijutsu/gate.toml"
+      ],
+      "env": { "RUST_LOG": "info" }
+    }
+  }
+}
