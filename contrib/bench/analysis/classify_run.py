@@ -78,6 +78,23 @@ GATE_WAIT_MARKERS = (
 TIMEOUT_MARKER = "timed out after"
 ITERATION_CAP_MARKER = "Paused after"
 
+# The driven-worker verdict line (contrib/bench/rc-variants/coder-driven,
+# "The verdict line"): one line, alone, ending the worker's final message.
+# The leading class absorbs an indent, a quote marker, or backticks a model
+# wraps the line in; the dash alternation accepts a literal "-"/"--" as well
+# as an em dash. Group 1 is the verdict, group 2 the reason (or None).
+VERDICT_RE = re.compile(
+    r"^[ \t>*`]*RESULT:[ \t]+(done|blocked|gave up)"
+    r"(?:[ \t]*(?:—|-{1,2})[ \t]*(\S.*?))?[ \t`]*$",
+    re.MULTILINE,
+)
+
+# Kaijutsu's two shell-executing tools, by their ACP `title` (not `kind`,
+# which Harbor collapses to a broad category like "execute"/"edit" —
+# `ToolCallState.resolved_name` mirrors that collapse, so identifying these
+# two specifically means reading `title` directly).
+SHELL_TOOL_TITLES = frozenset({"shell", "shell_write"})
+
 ASK_ID_RE = re.compile(
     r"ask ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
@@ -235,18 +252,33 @@ def find_epoch_ms_timestamps(obj: Any, keys: frozenset[str]) -> list[int]:
 class ToolCallState:
     """One tool call's accumulated state across its tool_call/tool_call_update events.
 
-    `kind`/`title` are captured only from the event that first creates this
-    state (mirroring Harbor's own `_convert_events_to_trajectory`, which
-    resolves a tool's name once, at creation, from `_resolve_tool_name`).
-    A later update that omits `kind`/`title` does not overwrite them.
+    `kind`/`title`/`raw_input` are captured only from the event that first
+    creates this state (mirroring Harbor's own
+    `_convert_events_to_trajectory`, which resolves a tool's name once, at
+    creation, from `_resolve_tool_name`). A later update that omits them
+    does not overwrite what creation captured — matches the observed shape
+    of real ACP event data, where `rawInput` rides only the `tool_call`
+    event, never a `tool_call_update`.
     """
 
-    __slots__ = ("tool_call_id", "kind", "title", "status", "first_index", "last_index", "texts")
+    __slots__ = (
+        "tool_call_id",
+        "kind",
+        "title",
+        "raw_input",
+        "status",
+        "first_index",
+        "last_index",
+        "texts",
+    )
 
-    def __init__(self, tool_call_id: str, index: int, kind: Any, title: Any) -> None:
+    def __init__(
+        self, tool_call_id: str, index: int, kind: Any, title: Any, raw_input: Any = None
+    ) -> None:
         self.tool_call_id = tool_call_id
         self.kind = kind if isinstance(kind, str) else None
         self.title = title if isinstance(title, str) else None
+        self.raw_input = raw_input if isinstance(raw_input, dict) else None
         self.status: str | None = None
         self.first_index = index
         self.last_index = index
@@ -262,6 +294,64 @@ class ToolCallState:
         if self.title and self.title.strip():
             return self.title.strip().splitlines()[0]
         return "tool"
+
+
+def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallState]) -> dict[str, Any]:
+    """Shell/shell_write call counts an A/B compares: total calls, how many
+    passed `foreground: true`, and how many literal "kj wait" invocations
+    appear in their command text.
+
+    All three read `rawInput` off each call's `ToolCallState` (captured only
+    at the `tool_call` event that creates it — see that class's docstring).
+    `foreground` rides `rawInput` only when the model set it to `true`;
+    absent means the tool's own default, `false`, not an unknown. A real
+    absence of shell calls is a genuine 0, not null. Null-with-a-reason is
+    reserved for when the count truly cannot be read: no shell/shell_write
+    call carried any `rawInput` at all.
+    """
+    shell_ids = [tid for tid in tool_order if tool_states[tid].title in SHELL_TOOL_TITLES]
+    total = len(shell_ids)
+    if total == 0:
+        return {
+            "shell_tool_calls_total": 0,
+            "shell_tool_calls_foreground_true": 0,
+            "shell_tool_calls_kj_wait_invocations": 0,
+            "shell_tool_calls_raw_input_reason": None,
+        }
+
+    with_raw_input = [tid for tid in shell_ids if tool_states[tid].raw_input is not None]
+    if not with_raw_input:
+        reason = f"none of {total} shell/shell_write tool_call event(s) carried rawInput"
+        return {
+            "shell_tool_calls_total": total,
+            "shell_tool_calls_foreground_true": None,
+            "shell_tool_calls_kj_wait_invocations": None,
+            "shell_tool_calls_raw_input_reason": reason,
+        }
+
+    foreground_true = sum(
+        1 for tid in with_raw_input if tool_states[tid].raw_input.get("foreground") is True
+    )
+    kj_wait_invocations = sum(
+        tool_states[tid].raw_input.get("command", "").count("kj wait")
+        for tid in with_raw_input
+        if isinstance(tool_states[tid].raw_input.get("command"), str)
+    )
+    missing = total - len(with_raw_input)
+    reason = (
+        None
+        if missing == 0
+        else (
+            f"{missing} of {total} shell/shell_write tool_call event(s) carried no "
+            f"rawInput; counted over the remaining {len(with_raw_input)}"
+        )
+    )
+    return {
+        "shell_tool_calls_total": total,
+        "shell_tool_calls_foreground_true": foreground_true,
+        "shell_tool_calls_kj_wait_invocations": kj_wait_invocations,
+        "shell_tool_calls_raw_input_reason": reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +435,9 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
 
             state = tool_states.get(tool_call_id)
             if state is None:
-                state = ToolCallState(tool_call_id, index, update.get("kind"), update.get("title"))
+                state = ToolCallState(
+                    tool_call_id, index, update.get("kind"), update.get("title"), update.get("rawInput")
+                )
                 tool_states[tool_call_id] = state
                 tool_order.append(tool_call_id)
             state.last_index = index
@@ -409,6 +501,16 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
         trailing_message = message_text_all
         final_message_source = "all_message_chunks"
     final_message = trailing_message[-FINAL_MESSAGE_LIMIT:]
+
+    # --- driven-worker verdict line -------------------------------------
+    # Searched over the UNTRUNCATED trailing_message, not final_message: a
+    # verdict line beyond FINAL_MESSAGE_LIMIT chars from the end must still
+    # be found. Last match wins — a report above the real verdict can quote
+    # the form as an example.
+    verdict_matches = list(VERDICT_RE.finditer(trailing_message))
+    verdict_match = verdict_matches[-1] if verdict_matches else None
+    verdict = verdict_match.group(1) if verdict_match else None
+    verdict_reason = verdict_match.group(2) if verdict_match and verdict_match.group(2) else None
 
     # --- gate-wait / asks_orphaned -----------------------------------
     requested_ask_ids = {p["ask_id"] for p in permission_events if p["ask_id"]}
@@ -525,7 +627,10 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
         "final_message": final_message,
         "final_message_source": final_message_source,
         "final_message_truncated": len(trailing_message) > FINAL_MESSAGE_LIMIT,
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
     }
+    result.update(shell_command_stats(tool_order, tool_states))
 
     if isinstance(summary, dict):
         summary_reported = summary.get("permissions_requested")
@@ -772,6 +877,16 @@ def format_text(report: dict[str, Any]) -> str:
         f"unawaited_async_operations: {report['unawaited_async_operations']}",
         f"tool_timeouts: {report['tool_timeouts']}",
         f"spilled_or_truncated_matches: {report['spilled_or_truncated_matches']}",
+        f"verdict: {report['verdict']} {report['verdict_reason'] or ''}".rstrip(),
+        f"shell_tool_calls_total: {report['shell_tool_calls_total']} "
+        f"(foreground_true={report['shell_tool_calls_foreground_true']}, "
+        f"kj_wait_invocations={report['shell_tool_calls_kj_wait_invocations']}"
+        + (
+            f", {report['shell_tool_calls_raw_input_reason']}"
+            if report["shell_tool_calls_raw_input_reason"]
+            else ""
+        )
+        + ")",
     ]
     if "duration_seconds" in report:
         lines.append(

@@ -22,6 +22,18 @@ had data. When `acp.txt` exists but no log line matches the trial's
 session, tokens and `llm_inferences` are null with `tokens_absent_reason`
 set to why — never reported as zero.
 
+An ACP trial also carries the driven-worker verdict line, if one exists
+(classify_run's `verdict`/`verdict_reason`, from
+`contrib/bench/rc-variants/coder-driven`'s `RESULT: done|blocked|gave up`
+convention), and three shell-command counts the A/B compares:
+`shell_tool_calls_total`, `shell_tool_calls_foreground_true`, and
+`shell_tool_calls_kj_wait_invocations` (literal "kj wait" occurrences in
+shell/shell_write command text). All null with
+`shell_tool_calls_raw_input_reason` set when no shell/shell_write call
+carried the `rawInput` these are read from — never reported as zero when
+the data cannot support the count; a genuine absence of shell calls is a
+real 0.
+
 Usage:
     summarize_job.py JOB_DIR [--format markdown|jsonl]
 
@@ -49,6 +61,18 @@ Totals:
                           failing oracle/nop/mini-swe-agent trial counts
                           here as well, since neither condition names ACP
                           specifically.
+    verdict_present       trials whose final message carried a verdict line.
+    verdict_done_and_solved
+                          verdict == "done" and Harbor's reward >= 1.0: the
+                          worker's self-report and the verifier agree.
+    verdict_done_but_failed
+                          verdict == "done" but reward < 1.0 or absent
+                          (errored before the verifier ran): the worker
+                          claimed done when it was not.
+    verdict_not_done_but_solved
+                          verdict is "blocked", "gave up", or absent, but
+                          reward >= 1.0: the worker under-reported, or never
+                          reached the line that would have reported at all.
 """
 
 from __future__ import annotations
@@ -205,6 +229,12 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
             else None
         ),
         "tokens_absent_reason": None,
+        "verdict": None,
+        "verdict_reason": None,
+        "shell_tool_calls_total": None,
+        "shell_tool_calls_foreground_true": None,
+        "shell_tool_calls_kj_wait_invocations": None,
+        "shell_tool_calls_raw_input_reason": None,
     }
 
     acp = acp_analysis_for_trial(trial_dir)
@@ -213,6 +243,12 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
         row["tool_calls_total"] = acp["tool_calls_total"]
         row["permission_requests"] = acp["permission_requests"]
         row["asks_orphaned"] = acp["asks_orphaned"]
+        row["verdict"] = acp["verdict"]
+        row["verdict_reason"] = acp["verdict_reason"]
+        row["shell_tool_calls_total"] = acp["shell_tool_calls_total"]
+        row["shell_tool_calls_foreground_true"] = acp["shell_tool_calls_foreground_true"]
+        row["shell_tool_calls_kj_wait_invocations"] = acp["shell_tool_calls_kj_wait_invocations"]
+        row["shell_tool_calls_raw_input_reason"] = acp["shell_tool_calls_raw_input_reason"]
 
     kernel_tokens = acp_kernel_log_tokens(trial_dir)
     if kernel_tokens is not None:
@@ -258,6 +294,23 @@ def compute_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
     stall_count = sum(1 for r in rows if r["stalled"])
     turns_ended_early = sum(1 for r in rows if r["ended_early"])
 
+    # The driven-worker verdict line vs. Harbor's own reward: how often the
+    # worker's self-report and the verifier agree. "solved" here always
+    # means reward >= 1.0, read fresh per row (not the `solved` list above,
+    # which is scoped to rewarded trials only and would silently exclude an
+    # errored trial that still emitted a verdict).
+    verdict_present = sum(1 for r in rows if r["verdict"] is not None)
+    verdict_done_rows = [r for r in rows if r["verdict"] == "done"]
+    verdict_done_and_solved = sum(
+        1 for r in verdict_done_rows if r["reward"] is not None and r["reward"] >= 1.0
+    )
+    verdict_done_but_failed = len(verdict_done_rows) - verdict_done_and_solved
+    verdict_not_done_but_solved = sum(
+        1
+        for r in rows
+        if r["verdict"] != "done" and r["reward"] is not None and r["reward"] >= 1.0
+    )
+
     return {
         "kind": "totals",
         "n_trials": n_trials,
@@ -270,6 +323,10 @@ def compute_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ask_count": ask_count,
         "stall_count": stall_count,
         "turns_ended_early": turns_ended_early,
+        "verdict_present": verdict_present,
+        "verdict_done_and_solved": verdict_done_and_solved,
+        "verdict_done_but_failed": verdict_done_but_failed,
+        "verdict_not_done_but_solved": verdict_not_done_but_solved,
     }
 
 
@@ -280,7 +337,11 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "agent_name",
         "reward",
         "turn_end_class",
+        "verdict",
         "tool_calls_total",
+        "shell_tool_calls_total",
+        "shell_tool_calls_foreground_true",
+        "shell_tool_calls_kj_wait_invocations",
         "permission_requests",
         "asks_orphaned",
         "tokens_in",
@@ -310,6 +371,10 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "ask_count",
         "stall_count",
         "turns_ended_early",
+        "verdict_present",
+        "verdict_done_and_solved",
+        "verdict_done_but_failed",
+        "verdict_not_done_but_solved",
     ):
         lines.append(f"- **{key}**: {totals[key]}")
     return "\n".join(lines)

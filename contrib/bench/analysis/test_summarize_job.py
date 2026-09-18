@@ -61,21 +61,36 @@ def write_acp_kernel_log(trial_dir: Path, lines: str) -> None:
     (agent_dir / "acp.txt").write_text(lines)
 
 
-def write_acp_logs(trial_dir: Path, *, session_id: str = "s" * 32) -> None:
+def write_acp_logs(
+    trial_dir: Path,
+    *,
+    session_id: str = "s" * 32,
+    final_message: str = "Done.",
+    t1_raw_input: dict | None = None,
+    t2_raw_input: dict | None = None,
+) -> None:
     agent_dir = trial_dir / "agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
+    t1_update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "t1",
+        "kind": "edit",
+        "title": "shell_write",
+    }
+    if t1_raw_input is not None:
+        t1_update["rawInput"] = t1_raw_input
+    t2_update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "t2",
+        "kind": "execute",
+        "title": "shell",
+    }
+    if t2_raw_input is not None:
+        t2_update["rawInput"] = t2_raw_input
     events = [
         {
             "event_type": "session_update",
-            "payload": {
-                "session_id": session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "t1",
-                    "kind": "edit",
-                    "title": "shell_write",
-                },
-            },
+            "payload": {"session_id": session_id, "update": t1_update},
         },
         {
             "event_type": "session_update",
@@ -91,15 +106,7 @@ def write_acp_logs(trial_dir: Path, *, session_id: str = "s" * 32) -> None:
         },
         {
             "event_type": "session_update",
-            "payload": {
-                "session_id": session_id,
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "t2",
-                    "kind": "execute",
-                    "title": "shell",
-                },
-            },
+            "payload": {"session_id": session_id, "update": t2_update},
         },
         {
             "event_type": "session_update",
@@ -119,7 +126,7 @@ def write_acp_logs(trial_dir: Path, *, session_id: str = "s" * 32) -> None:
                 "session_id": session_id,
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "Done."},
+                    "content": {"type": "text", "text": final_message},
                 },
             },
         },
@@ -220,6 +227,104 @@ class TestSyntheticJob(unittest.TestCase):
             lines = [json.loads(line) for line in proc.stdout.strip().splitlines()]
             self.assertEqual(lines[0]["kind"], "trial")
             self.assertEqual(lines[-1]["kind"], "totals")
+
+
+class TestVerdictAndShellStats(unittest.TestCase):
+    def test_row_carries_verdict_and_shell_stats_from_classify_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__verdict"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "acp", "version": "0.1.0", "model_info": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(
+                trial_dir,
+                final_message="Fixed and verified.\nRESULT: done",
+                t1_raw_input={"command": "sed -i s/x/y/ file.py"},
+                t2_raw_input={"command": "kj wait --operation abc; pytest", "foreground": True},
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["verdict"], "done")
+            self.assertIsNone(row["verdict_reason"])
+            self.assertEqual(row["shell_tool_calls_total"], 2)
+            self.assertEqual(row["shell_tool_calls_foreground_true"], 1)
+            self.assertEqual(row["shell_tool_calls_kj_wait_invocations"], 1)
+            self.assertIsNone(row["shell_tool_calls_raw_input_reason"])
+
+    def test_non_acp_trial_leaves_verdict_and_shell_stats_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            write_trial_result(job_dir / "hello-world__novacp")
+            row = sj.summarize_trial(job_dir / "hello-world__novacp")
+            self.assertIsNone(row["verdict"])
+            self.assertIsNone(row["shell_tool_calls_total"])
+
+    def test_verdict_totals_agree_done_and_solved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "t__agree"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "acp", "version": "0.1.0", "model_info": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(trial_dir, final_message="Done.\nRESULT: done")
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["verdict_present"], 1)
+            self.assertEqual(totals["verdict_done_and_solved"], 1)
+            self.assertEqual(totals["verdict_done_but_failed"], 0)
+            self.assertEqual(totals["verdict_not_done_but_solved"], 0)
+
+    def test_verdict_totals_done_but_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "t__wrong"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "acp", "version": "0.1.0", "model_info": None},
+                verifier_result={"rewards": {"reward": 0.0}},
+            )
+            write_acp_logs(trial_dir, final_message="I fixed it.\nRESULT: done")
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["verdict_done_and_solved"], 0)
+            self.assertEqual(totals["verdict_done_but_failed"], 1)
+            self.assertEqual(totals["verdict_not_done_but_solved"], 0)
+
+    def test_verdict_totals_not_done_but_solved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "t__undersold"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "acp", "version": "0.1.0", "model_info": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(trial_dir, final_message="Ran out of ideas.\nRESULT: gave up — stuck")
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["verdict_present"], 1)
+            self.assertEqual(totals["verdict_done_and_solved"], 0)
+            self.assertEqual(totals["verdict_done_but_failed"], 0)
+            self.assertEqual(totals["verdict_not_done_but_solved"], 1)
+
+    def test_verdict_totals_absent_verdict_counts_toward_not_done_but_solved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "t__noverdict"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "acp", "version": "0.1.0", "model_info": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(trial_dir, final_message="Done, no verdict line here.")
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["verdict_present"], 0)
+            self.assertEqual(totals["verdict_not_done_but_solved"], 1)
 
 
 def dashed(session_id: str) -> str:

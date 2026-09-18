@@ -49,12 +49,20 @@ def thought_chunk(text: str) -> dict:
     )
 
 
-def tool_call(tool_call_id: str, *, kind: str | None = None, title: str | None = None) -> dict:
+def tool_call(
+    tool_call_id: str,
+    *,
+    kind: str | None = None,
+    title: str | None = None,
+    raw_input: dict | None = None,
+) -> dict:
     update = {"sessionUpdate": "tool_call", "toolCallId": tool_call_id}
     if kind is not None:
         update["kind"] = kind
     if title is not None:
         update["title"] = title
+    if raw_input is not None:
+        update["rawInput"] = raw_input
     return session_update(update)
 
 
@@ -449,6 +457,184 @@ class TestKernelLogParsing(unittest.TestCase):
             log_path.write_text("garbage LLM stream completed: nonsense\n")
             with self.assertRaises(SystemExit):
                 cr.parse_kernel_log(log_path, None)
+
+
+class TestVerdictRegex(unittest.TestCase):
+    """`cr.VERDICT_RE` directly, per contrib/bench/rc-variants/coder-driven's
+    "The verdict line"."""
+
+    def test_plain_form_matches(self):
+        m = cr.VERDICT_RE.search("did the work\nRESULT: done")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "done")
+        self.assertIsNone(m.group(2))
+
+    def test_em_dash_reason_matches(self):
+        m = cr.VERDICT_RE.search("RESULT: blocked — need write access")
+        self.assertEqual(m.group(1), "blocked")
+        self.assertEqual(m.group(2), "need write access")
+
+    def test_double_dash_reason_matches(self):
+        m = cr.VERDICT_RE.search("RESULT: gave up -- no network in sandbox")
+        self.assertEqual(m.group(1), "gave up")
+        self.assertEqual(m.group(2), "no network in sandbox")
+
+    def test_single_dash_reason_matches(self):
+        m = cr.VERDICT_RE.search("RESULT: blocked - waiting on review")
+        self.assertEqual(m.group(1), "blocked")
+        self.assertEqual(m.group(2), "waiting on review")
+
+    def test_indented_form_matches(self):
+        self.assertIsNotNone(cr.VERDICT_RE.search("summary\n    RESULT: done"))
+
+    def test_quoted_form_matches(self):
+        self.assertIsNotNone(cr.VERDICT_RE.search("> RESULT: done"))
+
+    def test_backtick_wrapped_form_matches(self):
+        m = cr.VERDICT_RE.search("`RESULT: done`")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "done")
+
+    def test_inline_mid_sentence_mention_is_not_a_match(self):
+        self.assertIsNone(cr.VERDICT_RE.search("I saw RESULT: done in the log earlier"))
+
+    def test_last_match_wins(self):
+        text = (
+            "Example form:\n> RESULT: blocked — placeholder\n\n"
+            "Actual report follows.\nRESULT: done"
+        )
+        matches = list(cr.VERDICT_RE.finditer(text))
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(matches[-1].group(1), "done")
+        self.assertIsNone(matches[-1].group(2))
+
+    def test_absent_is_no_match(self):
+        self.assertIsNone(cr.VERDICT_RE.search("did the work and stopped"))
+
+
+class TestVerdictInAnalyzeRun(unittest.TestCase):
+    def test_verdict_extracted_from_final_message(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell"),
+            tool_call_update("t1", status="completed", text="ok"),
+            message_chunk("Did the work.\nRESULT: done"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "done")
+        self.assertIsNone(report["verdict_reason"])
+
+    def test_verdict_with_reason_extracted(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell"),
+            tool_call_update("t1", status="completed", text="ok"),
+            message_chunk("Tried everything.\nRESULT: blocked — need credentials"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "blocked")
+        self.assertEqual(report["verdict_reason"], "need credentials")
+
+    def test_absent_verdict_is_null(self):
+        events = [message_chunk("just some text, no verdict line")]
+        report = cr.analyze_run(events, base_summary())
+        self.assertIsNone(report["verdict"])
+        self.assertIsNone(report["verdict_reason"])
+
+    def test_verdict_searched_in_untruncated_text(self):
+        # The real verdict line sits well before the final FINAL_MESSAGE_LIMIT
+        # characters of the trailing message, so final_message (truncated)
+        # must not contain it -- proving the search reads trailing_message,
+        # not the already-truncated final_message.
+        padding = "x" * (cr.FINAL_MESSAGE_LIMIT + 500)
+        events = [message_chunk(f"RESULT: done\n{padding}")]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "done")
+        self.assertNotIn("RESULT:", report["final_message"])
+
+    def test_last_match_wins_in_a_real_message(self):
+        events = [
+            message_chunk(
+                "The format is:\n> RESULT: blocked — placeholder example\n\n"
+                "Everything is done.\nRESULT: done"
+            )
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "done")
+        self.assertIsNone(report["verdict_reason"])
+
+
+class TestShellCommandStats(unittest.TestCase):
+    def test_counts_shell_and_shell_write_only(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell"),
+            tool_call_update("t1", status="completed", text="ok"),
+            tool_call("t2", kind="edit", title="shell_write"),
+            tool_call_update("t2", status="completed", text="ok"),
+            tool_call("t3", kind="edit", title="write"),
+            tool_call_update("t3", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_total"], 2)
+
+    def test_foreground_true_and_kj_wait_counted_from_raw_input(self):
+        events = [
+            tool_call(
+                "t1", kind="execute", title="shell",
+                raw_input={"command": "ls -la", "foreground": True},
+            ),
+            tool_call_update("t1", status="completed", text="ok"),
+            tool_call(
+                "t2", kind="edit", title="shell_write",
+                raw_input={"command": "kj wait --operation x; kj wait --operation y"},
+            ),
+            tool_call_update("t2", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_total"], 2)
+        self.assertEqual(report["shell_tool_calls_foreground_true"], 1)
+        self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 2)
+        self.assertIsNone(report["shell_tool_calls_raw_input_reason"])
+
+    def test_absent_foreground_is_not_counted_as_true(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell", raw_input={"command": "ls"}),
+            tool_call_update("t1", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_foreground_true"], 0)
+
+    def test_no_shell_calls_is_a_real_zero_not_null(self):
+        events = [message_chunk("nothing ran")]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_total"], 0)
+        self.assertEqual(report["shell_tool_calls_foreground_true"], 0)
+        self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 0)
+        self.assertIsNone(report["shell_tool_calls_raw_input_reason"])
+
+    def test_missing_raw_input_on_every_shell_call_reports_null_with_reason(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell"),
+            tool_call_update("t1", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_total"], 1)
+        self.assertIsNone(report["shell_tool_calls_foreground_true"])
+        self.assertIsNone(report["shell_tool_calls_kj_wait_invocations"])
+        self.assertIsNotNone(report["shell_tool_calls_raw_input_reason"])
+
+    def test_partial_raw_input_counts_over_available_and_notes_the_gap(self):
+        events = [
+            tool_call(
+                "t1", kind="execute", title="shell",
+                raw_input={"command": "kj wait --operation x"},
+            ),
+            tool_call_update("t1", status="completed", text="ok"),
+            tool_call("t2", kind="edit", title="shell_write"),
+            tool_call_update("t2", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_total"], 2)
+        self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 1)
+        self.assertIn("1 of 2", report["shell_tool_calls_raw_input_reason"])
 
 
 class TestRealData(unittest.TestCase):

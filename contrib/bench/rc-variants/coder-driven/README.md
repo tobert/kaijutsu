@@ -95,7 +95,9 @@ leading class absorbs an indent, a quote marker, or backticks a model wraps the
 line in, and the dash alternation accepts `-` and `--` for the em dash. No
 match means the turn ended without a verdict, which is itself the measurement.
 
-`contrib/bench/analysis/classify_run.py` does not read this yet.
+`contrib/bench/analysis/classify_run.py` reads this: `verdict` and
+`verdict_reason` in its report, `verdict`-derived totals in
+`summarize_job.py` (`contrib/bench/analysis/README.md`).
 
 ## Confounds to name in any result
 

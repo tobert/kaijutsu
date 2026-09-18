@@ -30,6 +30,21 @@ own log), not the `acp.txt` name Harbor's `AcpAgent._OUTPUT_FILENAME`
 uses inside a real `harbor run` trial. This tool does not read either
 one; only `acp-events.jsonl` and `acp-summary.json` are required.
 
+The report also carries the driven-worker A/B fields, both independent of
+`turn_end_class`:
+
+- `verdict` / `verdict_reason`: the last `RESULT: done|blocked|gave up`
+  line in the run's final message (`contrib/bench/rc-variants/coder-driven`,
+  "The verdict line"; `VERDICT_RE`), searched over the untruncated text —
+  a verdict beyond `final_message`'s 2000-character tail is still found.
+  Null when no worker in this run used the convention.
+- `shell_tool_calls_total`, `shell_tool_calls_foreground_true`,
+  `shell_tool_calls_kj_wait_invocations`: counted from the `shell` and
+  `shell_write` tool calls' `rawInput` (present on the `tool_call` event
+  that creates each call, never on a later `tool_call_update`).
+  `shell_tool_calls_raw_input_reason` explains a null count — a real
+  absence of shell calls is reported as `0`, never as a null.
+
 ## `summarize_job.py`
 
 Reads one Harbor job directory (one subdirectory per trial, each holding
@@ -50,6 +65,16 @@ tokens came from (`"kernel_log"`, `"agent_result"`, or null). When
 `acp.txt` exists but no log line matches the session, tokens and
 `llm_inferences` are null with `tokens_absent_reason` explaining why —
 never reported as zero.
+
+Each ACP row also carries `verdict`, `verdict_reason`,
+`shell_tool_calls_total`, `shell_tool_calls_foreground_true`, and
+`shell_tool_calls_kj_wait_invocations` from `classify_run`'s analysis (see
+above); a non-ACP row leaves them null. Totals add `verdict_present` and
+three agreement counts against Harbor's own `reward >= 1.0`:
+`verdict_done_and_solved`, `verdict_done_but_failed` (the worker claimed
+done but the verifier disagreed, or the trial errored before it ran), and
+`verdict_not_done_but_solved` (blocked/gave up/no verdict, but the
+verifier passed it anyway).
 
 ```bash
 python3 summarize_job.py /home/atobey/src/bench-work/harbor/jobs/hello-world-oracle
