@@ -208,12 +208,17 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
 /// - The model rows start from the kernel's own factory floor, so a solo
 ///   kernel's providers, context windows, and tunables are the ones every
 ///   other kernel ships.
+/// - `max_tokens`, when given, overrides the factory output-token ceiling
+///   (`kaijutsu_kernel::seed_backends::FACTORY_MAX_TOKENS`) in the written
+///   defaults row. Left `None`, the factory ceiling from
+///   `ensure_factory_backends` stands.
 pub fn prepare_rows(
     state: &SoloState,
     root_character: &str,
     performer: &str,
     key: &PrivateKey,
     choice: &ModelChoice,
+    max_tokens: Option<i64>,
 ) -> Result<()> {
     let mut db = KernelDb::open(state.kernel_db_path())
         .with_context(|| format!("open {}", state.kernel_db_path().display()))?;
@@ -259,6 +264,9 @@ pub fn prepare_rows(
         .context("the factory floor wrote no model defaults")?;
     defaults.default_backend = choice.backend.clone();
     defaults.default_model = choice.model.clone();
+    if let Some(max_tokens) = max_tokens {
+        defaults.max_tokens = Some(max_tokens);
+    }
     db.set_llm_defaults(&defaults)
         .context("point the model defaults at the chosen provider")?;
 
@@ -331,6 +339,67 @@ mod tests {
         }
         let elsewhere = std::env::temp_dir().join("kaijutsu-solo-somewhere");
         refuse_operator_state_dir(&elsewhere).expect("an ordinary directory is fine");
+    }
+
+    /// A choice that reuses the `deepseek` factory backend row, so
+    /// `prepare_rows` needs to write nothing but the defaults and the
+    /// performer character.
+    fn factory_choice() -> ModelChoice {
+        ModelChoice {
+            backend: "deepseek".to_string(),
+            kind: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            base_url: None,
+            api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
+            key_optional: false,
+            write_backend_row: false,
+        }
+    }
+
+    /// A named state directory rather than `SoloState::prepare(None)`: a
+    /// temporary one registers itself in the process-wide `TEMP_STATE`
+    /// singleton (`remove_temp_state`), which only one directory per test
+    /// binary can own. Two temporary states in the same run would race to
+    /// register and `clean_up` could remove a sibling test's directory
+    /// instead of its own. A named directory sidesteps that registry and
+    /// tempfile's own `TempDir` drop cleans it up here.
+    fn named_state() -> (tempfile::TempDir, SoloState) {
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("solo");
+        let state = SoloState::prepare(Some(root)).expect("prepare named state");
+        (parent, state)
+    }
+
+    #[test]
+    fn a_max_tokens_override_lands_in_the_defaults_row() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), Some(4096))
+            .expect("prepare rows with an override");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let defaults = db
+            .get_llm_defaults()
+            .expect("read the model defaults")
+            .expect("prepare_rows wrote a defaults row");
+        assert_eq!(defaults.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn without_an_override_the_factory_ceiling_stands() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), None)
+            .expect("prepare rows with no override");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let defaults = db
+            .get_llm_defaults()
+            .expect("read the model defaults")
+            .expect("prepare_rows wrote a defaults row");
+        // `seed_backends::FACTORY_MAX_TOKENS` is private to that module; this
+        // is docs/solo-acp.md's documented default, kept in sync by hand.
+        assert_eq!(defaults.max_tokens, Some(16384));
     }
 
     #[test]

@@ -61,6 +61,16 @@ Environment variables with defaults: `KAIJUTSU_ACP_BINARY`, `KAIJUTSU_ACP_GATE`,
 same things per run; `harbor agent schema kaijutsu_solo_agent:KaijutsuSoloAcp`
 prints them. `job.yaml` is the same job as a config file, for `harbor run -c`.
 
+`KAIJUTSU_ACP_CONSENT` (`--ak consent=`) and `KAIJUTSU_ACP_MAX_TOKENS`
+(`--ak max_tokens=`) pass `--consent <collaborative|autonomous>` and
+`--max-tokens <N>` through to the binary. Neither has a default here: left
+unset, the flag is left off the command line entirely, so the binary's own
+default stands — collaborative consent, the factory output-token ceiling.
+`consent` is checked against the two known values and `max_tokens` against
+being a positive integer before the command is built, so a typo is a refusal
+here rather than a refusal from the binary after the container is already
+up. Both are recorded in `kaijutsu-provenance.json`'s `model` object.
+
 Requirements: bash >= 4.4 (the wrapper expands possibly-empty arrays under
 `set -u`) and Python >= 3.12 (Harbor's own floor — `requires-python = ">=3.12"`;
 the adapter imports Harbor and runs in its interpreter).

@@ -57,6 +57,55 @@ fn mock_scripts(case: &str) -> PathBuf {
         .join(case)
 }
 
+/// Spawn the binary against a scripted model in a caller-built script
+/// directory, rather than one of the fixtures under `tests/mock_scripts/`.
+/// The `--consent` probes below generate their script at test time — 50-odd
+/// turns is too much to keep as a checked-in fixture.
+fn spawn_solo_mock_with_scripts(script_dir: &Path, extra: &[&str]) -> Agent {
+    let mut command = Command::new(BIN);
+    command
+        .arg("--backend-kind")
+        .arg("mock")
+        .arg("--model")
+        .arg("solo-mock")
+        .args(extra)
+        .env("KJ_MOCK_SCRIPT_DIR", script_dir)
+        .env("TMPDIR", scratch_dir("tmp"))
+        .env("RUST_LOG", "info");
+    Agent::spawn(command)
+}
+
+/// Write a 51-turn `solo-mock` script into `dir`: 50 tool-use turns, then one
+/// that ends the turn normally. The collaborative iteration cap (50) halts
+/// before the 51st turn is ever read; the autonomous cap (100) does not, so
+/// whether the 51st turn's text was reached is the observable that tells the
+/// two modes apart (`docs/solo-acp.md`, "Flags", `--consent`).
+fn write_consent_probe_script(dir: &Path) {
+    let mut turns: Vec<Value> = (0..50)
+        .map(|i| {
+            json!([
+                {"ToolUse": {
+                    "id": format!("consent-probe-{i}"),
+                    "name": "write",
+                    "input": {"path": "consent-probe.txt", "content": "probing\n"},
+                }},
+                {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}},
+            ])
+        })
+        .collect();
+    turns.push(json!([
+        "TextStart",
+        {"TextDelta": "reached turn 51"},
+        "TextEnd",
+        {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}},
+    ]));
+    std::fs::write(
+        dir.join("solo-mock.json"),
+        serde_json::to_string(&Value::Array(turns)).expect("serialize the scripted turns"),
+    )
+    .expect("write the scripted turns");
+}
+
 /// A running `kaijutsu-solo-acp`, with its stdout and stderr drained by
 /// reader threads so neither pipe can fill and deadlock the child.
 struct Agent {
@@ -867,6 +916,116 @@ fn proc_environ_is_unreadable_to_same_uid_readers() {
             );
         }
     }
+}
+
+#[test]
+fn default_consent_halts_at_fifty_iterations_with_the_collaborative_message() {
+    let cwd = scratch_dir("consent-collab-cwd");
+    let scripts = scratch_dir("consent-collab-scripts");
+    write_consent_probe_script(&scripts);
+
+    let mut agent = spawn_solo_mock_with_scripts(&scripts, &[]);
+    agent.initialize();
+    let session = agent.new_session(&cwd);
+    let response = agent.prompt(&session, "go");
+
+    assert_eq!(
+        response.get("stopReason").and_then(Value::as_str),
+        Some("max_turn_requests"),
+        "the default (collaborative) cap of 50 must fire: {response}\n\
+         --- stderr ---\n{}",
+        agent.stderr()
+    );
+    assert!(
+        agent
+            .agent_text()
+            .contains("Paused after 50 agentic iteration(s) (consent: collaborative)"),
+        "the collaborative halt message names the cap; saw {:?}",
+        agent.agent_text()
+    );
+    assert!(
+        !agent.agent_text().contains("reached turn 51"),
+        "the 51st scripted turn must never be read: {:?}",
+        agent.agent_text()
+    );
+}
+
+#[test]
+fn consent_autonomous_raises_the_cap_past_fifty_iterations() {
+    let cwd = scratch_dir("consent-auto-cwd");
+    let scripts = scratch_dir("consent-auto-scripts");
+    write_consent_probe_script(&scripts);
+
+    let mut agent = spawn_solo_mock_with_scripts(&scripts, &["--consent", "autonomous"]);
+    agent.initialize();
+    let session = agent.new_session(&cwd);
+    let response = agent.prompt(&session, "go");
+
+    assert_eq!(
+        response.get("stopReason").and_then(Value::as_str),
+        Some("end_turn"),
+        "autonomous's cap of 100 must not fire at 51 iterations: {response}\n\
+         --- stderr ---\n{}",
+        agent.stderr()
+    );
+    assert!(
+        agent.agent_text().contains("reached turn 51"),
+        "the 51st scripted turn's text must have been reached; saw {:?}",
+        agent.agent_text()
+    );
+}
+
+/// `--max-tokens` writes into `llm_defaults.max_tokens`
+/// (`kaijutsu_kernel::kernel_db::LlmDefaultsRow`), a plain DB row rather than
+/// something the ACP wire reports — so this reads it back through the
+/// library the kernel itself uses, from a state directory the binary was
+/// told to keep.
+#[test]
+fn max_tokens_overrides_the_written_defaults_row() {
+    let state = scratch_dir("max-tokens-state").join("state");
+    let mut agent = Agent::spawn_mock_with(
+        "chat",
+        &["--state-dir", state.to_str().expect("utf-8 state path"), "--max-tokens", "4096"],
+    );
+    agent.initialize();
+
+    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0));
+
+    let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+        .expect("reopen the kernel db the binary just closed");
+    let defaults = db
+        .get_llm_defaults()
+        .expect("read the model defaults")
+        .expect("the binary wrote a defaults row");
+    assert_eq!(
+        defaults.max_tokens,
+        Some(4096),
+        "--max-tokens 4096 must land in the written defaults row"
+    );
+}
+
+/// Without the flag, the factory ceiling from `seed_backends` stands — the
+/// same default `docs/solo-acp.md` documents.
+#[test]
+fn without_max_tokens_the_factory_ceiling_stands_in_the_written_defaults_row() {
+    let state = scratch_dir("max-tokens-default-state").join("state");
+    let mut agent = Agent::spawn_mock_with(
+        "chat",
+        &["--state-dir", state.to_str().expect("utf-8 state path")],
+    );
+    agent.initialize();
+
+    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0));
+
+    let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+        .expect("reopen the kernel db the binary just closed");
+    let defaults = db
+        .get_llm_defaults()
+        .expect("read the model defaults")
+        .expect("the binary wrote a defaults row");
+    assert_eq!(defaults.max_tokens, Some(16384), "the factory ceiling stands unless asked");
 }
 
 #[test]

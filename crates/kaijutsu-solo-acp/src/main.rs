@@ -21,6 +21,7 @@ mod kernel;
 mod provider;
 mod state;
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -33,6 +34,8 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kaijutsu_acp::bridge::KernelBridge;
 use kaijutsu_acp::{AcpBridge, serve_stdio};
 use kaijutsu_client::{KeySource, SshConfig};
+use kaijutsu_server::SharedKernel;
+use kaijutsu_types::ConsentMode;
 
 use provider::{BackendKind, ModelFlags, RealHost};
 use state::SoloState;
@@ -44,6 +47,26 @@ const ROOT_CHARACTER: &str = "solo";
 
 /// Seconds to wait for the bridge's own connection to the kernel.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The `--consent` spelling, converted to `kaijutsu_types::ConsentMode`
+/// after parsing. A local value-enum rather than the kernel's own type,
+/// which parses from a bare `FromStr` string instead of taking part in
+/// clap's `ValueEnum` machinery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
+enum ConsentFlag {
+    Collaborative,
+    Autonomous,
+}
+
+impl From<ConsentFlag> for ConsentMode {
+    fn from(flag: ConsentFlag) -> Self {
+        match flag {
+            ConsentFlag::Collaborative => Self::Collaborative,
+            ConsentFlag::Autonomous => Self::Autonomous,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "kaijutsu-solo-acp")]
@@ -107,6 +130,24 @@ struct Cli {
     /// copied verbatim into this kernel's `/config/kernel/gate.toml`.
     #[arg(long, value_name = "FILE")]
     gate_config: Option<PathBuf>,
+
+    /// Consent mode every session this kernel serves runs in. It sets the
+    /// per-turn agentic tool-loop cap this kernel enforces before pausing a
+    /// turn: 50 iterations in collaborative, 100 in autonomous. Collaborative
+    /// pauses with a message asking for a follow-up prompt to continue;
+    /// autonomous pauses with a plain warning. Nothing else reads this mode
+    /// today. Default: the kernel's own default, collaborative, so plain use
+    /// is unchanged.
+    #[arg(long, value_enum)]
+    consent: Option<ConsentFlag>,
+
+    /// Output token ceiling for every turn, written into this kernel's model
+    /// defaults. Must be greater than zero — zero and negative values are
+    /// refused. A value the provider rejects as above its own per-model
+    /// ceiling is refused by the provider, not by this flag. Default: the
+    /// factory ceiling, 16384.
+    #[arg(long, value_name = "N")]
+    max_tokens: Option<NonZeroU64>,
 
     /// Fail the kernel once it is serving. Drives the recovery path in
     /// tests; hidden, and absent from a build without `test-mock`.
@@ -243,7 +284,8 @@ fn run(cli: Cli) -> Result<()> {
     eprintln!("kaijutsu-solo-acp: solo state directory: {}", solo.root().display());
 
     let key = state::ensure_client_key(&solo.client_key_path())?;
-    state::prepare_rows(&solo, ROOT_CHARACTER, &cli.character, &key, &choice)?;
+    let max_tokens = cli.max_tokens.map(|n| n.get() as i64);
+    state::prepare_rows(&solo, ROOT_CHARACTER, &cli.character, &key, &choice, max_tokens)?;
 
     let mut config = kernel::solo_server_config(&solo);
     config.rw_mounts = cli.mount.clone();
@@ -277,9 +319,16 @@ fn run(cli: Cli) -> Result<()> {
         tracing::info!(source = %gate.display(), "installed the gate policy");
     }
 
-    let served = serve(&cli, running.addr().port(), solo.client_key_path(), || {
-        running.arm_fault()
-    });
+    let shared_kernel = running.kernel().clone();
+    let consent = cli.consent.map(ConsentMode::from);
+    let served = serve(
+        &cli,
+        running.addr().port(),
+        solo.client_key_path(),
+        shared_kernel,
+        consent,
+        || running.arm_fault(),
+    );
 
     // Settle the kernel before the state disappears, so a named state
     // directory is left consistent and a temporary one is removed only
@@ -294,7 +343,21 @@ fn run(cli: Cli) -> Result<()> {
 
 /// Connect the ACP bridge to our own kernel and serve until the client goes
 /// away.
-fn serve(cli: &Cli, port: u16, key_path: PathBuf, serving: impl Fn()) -> Result<()> {
+///
+/// `consent`, when given, is applied to the running kernel before the bridge
+/// connects: the iteration cap a turn reads
+/// (`kaijutsu_kernel::runtime::llm_stream`) comes from the kernel-wide
+/// setting `Kernel::consent_mode`, not from a per-context row, so setting it
+/// here — once, before any session exists — is what makes every session this
+/// process serves run in the chosen mode.
+fn serve(
+    cli: &Cli,
+    port: u16,
+    key_path: PathBuf,
+    shared_kernel: SharedKernel,
+    consent: Option<ConsentMode>,
+    serving: impl Fn(),
+) -> Result<()> {
     let config = SshConfig {
         host: "127.0.0.1".to_string(),
         port,
@@ -321,6 +384,10 @@ fn serve(cli: &Cli, port: u16, key_path: PathBuf, serving: impl Fn()) -> Result<
     runtime.block_on(async move {
         let result = local
             .run_until(async move {
+                if let Some(mode) = consent {
+                    shared_kernel.kernel.set_consent_mode(mode).await;
+                    tracing::info!(%mode, "consent mode set");
+                }
                 let kernel = KernelBridge::connect(
                     config,
                     context_type,
@@ -343,4 +410,67 @@ fn serve(cli: &Cli, port: u16, key_path: PathBuf, serving: impl Fn()) -> Result<
         drop(local);
         result
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec!["kaijutsu-solo-acp"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn consent_is_absent_by_default() {
+        let cli = parse(&[]).expect("no flags parses");
+        assert_eq!(cli.consent, None, "solo must not force a mode when nobody asked");
+    }
+
+    #[test]
+    fn consent_collaborative_and_autonomous_both_parse() {
+        let cli = parse(&["--consent", "collaborative"]).expect("collaborative parses");
+        assert_eq!(cli.consent, Some(ConsentFlag::Collaborative));
+        assert_eq!(ConsentMode::from(cli.consent.unwrap()), ConsentMode::Collaborative);
+
+        let cli = parse(&["--consent", "autonomous"]).expect("autonomous parses");
+        assert_eq!(cli.consent, Some(ConsentFlag::Autonomous));
+        assert_eq!(ConsentMode::from(cli.consent.unwrap()), ConsentMode::Autonomous);
+    }
+
+    #[test]
+    fn an_unknown_consent_value_is_refused() {
+        let error = parse(&["--consent", "eager"]).expect_err("an unknown mode must refuse");
+        let message = error.to_string();
+        assert!(message.contains("collaborative") && message.contains("autonomous"), "{message}");
+    }
+
+    #[test]
+    fn max_tokens_is_absent_by_default() {
+        let cli = parse(&[]).expect("no flags parses");
+        assert_eq!(cli.max_tokens, None, "the factory ceiling must stand unless asked");
+    }
+
+    #[test]
+    fn a_positive_max_tokens_parses() {
+        let cli = parse(&["--max-tokens", "4096"]).expect("a positive value parses");
+        assert_eq!(cli.max_tokens.map(NonZeroU64::get), Some(4096));
+    }
+
+    #[test]
+    fn zero_max_tokens_is_refused() {
+        let error = parse(&["--max-tokens", "0"]).expect_err("zero must refuse");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_negative_max_tokens_is_refused() {
+        parse(&["--max-tokens", "-1"]).expect_err("negative must refuse");
+    }
+
+    #[test]
+    fn a_non_numeric_max_tokens_is_refused() {
+        parse(&["--max-tokens", "lots"]).expect_err("non-numeric must refuse");
+    }
 }

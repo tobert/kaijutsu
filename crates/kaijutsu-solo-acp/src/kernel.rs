@@ -53,6 +53,10 @@ pub enum Fault {
 /// A kernel running on its own thread.
 pub struct SoloKernel {
     addr: SocketAddr,
+    /// The handle the caller uses to reach into the running kernel before
+    /// the ACP bridge starts serving — setting the kernel-wide consent mode
+    /// is the one thing that needs this today.
+    kernel: SharedKernel,
     /// Set when an injected fault may fire. Armed by the caller at the
     /// moment it starts serving, so a test's fault lands on a live session
     /// rather than racing the bridge's connect.
@@ -67,6 +71,12 @@ pub struct SoloKernel {
 impl SoloKernel {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The running kernel, for the caller to configure before it serves the
+    /// ACP bridge.
+    pub fn kernel(&self) -> &SharedKernel {
+        &self.kernel
     }
 
     /// Let an injected fault fire from here on. A no-op without one.
@@ -119,7 +129,7 @@ pub fn start(
     log_target: Option<PathBuf>,
     fault: Fault,
 ) -> Result<SoloKernel> {
-    let (ready_tx, ready_rx) = channel::<Result<SocketAddr, String>>();
+    let (ready_tx, ready_rx) = channel::<Result<(SocketAddr, SharedKernel), String>>();
     let (stopped_tx, stopped_rx) = channel::<()>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stopping = Arc::new(AtomicBool::new(false));
@@ -195,8 +205,9 @@ pub fn start(
         .context("spawn the kernel thread")?;
 
     match ready_rx.recv_timeout(READY_TIMEOUT) {
-        Ok(Ok(addr)) => Ok(SoloKernel {
+        Ok(Ok((addr, kernel))) => Ok(SoloKernel {
             addr,
+            kernel,
             fault_armed,
             stop: Some(stop_tx),
             stopped: stopped_rx,
@@ -224,7 +235,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// Bind, boot, serve, and — on a stop signal — settle.
 async fn run_kernel(
     config: SshServerConfig,
-    ready_tx: std::sync::mpsc::Sender<Result<SocketAddr, String>>,
+    ready_tx: std::sync::mpsc::Sender<Result<(SocketAddr, SharedKernel), String>>,
     served: Arc<AtomicBool>,
     stop_rx: tokio::sync::oneshot::Receiver<()>,
     fault: Fault,
@@ -235,16 +246,16 @@ async fn run_kernel(
         .with_context(|| format!("bind {}", config.bind_addr))?;
     let addr = listener.local_addr().context("read the bound address")?;
 
-    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
+    let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel::<SharedKernel>();
     let live: Arc<Mutex<Option<SharedKernel>>> = Arc::new(Mutex::new(None));
     let live_for_task = Arc::clone(&live);
     tokio::spawn(async move {
         // Only success is reported here. A kernel that was never built
         // leaves this quiet, and the thread sends the reason it failed.
         if let Ok(kernel) = kernel_rx.await {
-            *live_for_task.lock() = Some(kernel);
+            *live_for_task.lock() = Some(kernel.clone());
             served.store(true, Ordering::SeqCst);
-            let _ = ready_tx.send(Ok(addr));
+            let _ = ready_tx.send(Ok((addr, kernel)));
         }
     });
 

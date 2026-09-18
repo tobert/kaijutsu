@@ -73,6 +73,8 @@ file the backend row names. It never belongs in this file.
 | `--mount <dir>` | Mount a host directory read-write at the same path inside the kernel, so the model's file tools may write there. Repeatable. |
 | `--no-cwd-mount` | Do not mount the directory the agent was launched in. |
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
+| `--consent <collaborative\|autonomous>` | The consent mode every session this kernel serves runs in. It sets the per-turn agentic tool-loop cap: 50 iterations in collaborative, 100 in autonomous. Collaborative pauses with a message asking for a follow-up prompt; autonomous pauses with a plain warning. Nothing else reads this mode today. Default: the kernel's own default, collaborative — plain use is unchanged. |
+| `--max-tokens <N>` | The output token ceiling written into this kernel's model defaults. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the factory ceiling, 16384. |
 
 Zero flags works when exactly one of `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
 or `OPENAI_API_KEY` is set. Zero keys, or several, is a refusal naming what to
@@ -151,7 +153,8 @@ Each step fails loudly, with what it was doing:
 5. Seed the factory backends, then point the model defaults at the chosen
    provider and model. The factory row is left alone unless `--base-url` or
    `--api-key-env` says something different, which is what keeps a provider's
-   key file working.
+   key file working. `--max-tokens` overrides the factory output-token
+   ceiling in this same defaults row; left out, the factory ceiling stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews
    and `solo-coder` performs.
@@ -163,7 +166,12 @@ Each step fails loudly, with what it was doing:
    exactly as a fresh install does, and refuses to start on a mount it cannot
    honor.
 9. Install `--gate-config`, if given.
-10. Connect the ACP bridge over the loopback wire and serve stdio.
+10. Apply `--consent`, if given, to the running kernel — before the ACP
+    bridge connects, so it is in place for every session this process
+    serves. The per-turn iteration cap a turn reads is kernel-wide, not a
+    per-context setting, so this is the one place a solo kernel's consent
+    mode is set.
+11. Connect the ACP bridge over the loopback wire and serve stdio.
 
 On stdin EOF the kernel settles accepted work and checkpoints its database
 before a temporary state directory is removed. If the kernel stops, fails, or

@@ -510,11 +510,20 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   16384 with effort max, so reasoning spends the same budget). Return an
   error tool result that says the call was cut off and how large it was, and
   continue the turn; surface the provider's finish reason when it is `length`.
+  `kaijutsu-solo-acp --max-tokens <N>` (2026-09-18, `docs/solo-acp.md`) lets a
+  benchmark operator raise the ceiling as a workaround; the truncation failure
+  mode itself, and every other caller of the factory default, are unchanged.
 - **The iteration cap assumes a human is present.** `sqlite-with-gcov` stopped
   at "Paused after 50 agentic iteration(s) (consent: collaborative). Send a
   follow-up to continue". A driven worker has nobody to send one. The cap and
   consent mode want a per-context or per-type setting that a driver can choose;
-  today consent is kernel-wide.
+  today consent is kernel-wide. `kaijutsu-solo-acp --consent autonomous`
+  (2026-09-18, `docs/solo-acp.md`) lets a solo kernel's own operator choose the
+  wider cap at boot, through the same kernel-wide setting
+  (`Kernel::set_consent_mode`) — the per-context row `kj context set --consent`
+  writes still is not what `runtime/llm_stream.rs` reads (see its own
+  "Consent setting ownership" TODO there), so this remains open for anyone
+  who needs it per-context or mid-run.
 - **Boot spends about 1.8 s probing an unreachable embedding host**
   (`kaijutsu-server/src/rpc.rs`, "Embedding service unavailable"; the endpoint
   comes from `seed_backends.rs`). In a sandbox that is most of the boot. Give
@@ -530,6 +539,20 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   its dumpable flag, which stops a same-uid reader but not root. A provider key
   that reaches the kernel by environment is readable there; use a run-scoped
   key in a disposable container.
+
+## `SoloState::prepare(None)` shares one temp-directory registry per test binary (2026-09-18)
+
+`crates/kaijutsu-solo-acp/src/state.rs`'s `TEMP_STATE` is a process-wide
+`OnceLock<PathBuf>`, by design: one solo process only ever makes one
+temporary state directory, and `atexit` needs a single path to remove. Two
+`SoloState::prepare(None)` calls in the same *test binary*, though, share
+that one slot — only the first registers, and any of them calling
+`clean_up()`/`remove_temp_state()` removes whichever directory won that
+race, not necessarily its own. Found while adding `state::tests`; worked
+around there by giving the new tests a named `SoloState` (`named_state()`
+helper) instead of a temporary one, which sidesteps the registry entirely.
+Existing `state::tests` still uses `prepare(None)` once; a second test ever
+doing the same would need the same treatment.
 
 Smaller, from the same work:
 
