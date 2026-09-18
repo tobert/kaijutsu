@@ -75,6 +75,20 @@ pub enum StreamEvent {
         input: serde_json::Value,
     },
 
+    /// A tool call whose arguments did not parse as JSON, most often because
+    /// the response stopped at the output ceiling part-way through them.
+    ///
+    /// The call is real and the model believes it made it, so the runtime
+    /// records it and answers it with an error tool result instead of failing
+    /// the turn. `arguments` is the raw text as it arrived; `error` is the
+    /// parser's message, which names the position it stopped at.
+    ToolUseInvalid {
+        id: String,
+        name: String,
+        arguments: String,
+        error: String,
+    },
+
     /// A tool request that must be answered before the provider can continue
     /// this stream.
     ///

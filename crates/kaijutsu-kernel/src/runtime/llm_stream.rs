@@ -56,7 +56,8 @@ fn validate_content_event(open: Option<OpenContent>, event: &StreamEvent) -> Res
         StreamEvent::ThinkingDelta(_) | StreamEvent::ThinkingEnd { .. } => matches!(open, Some(OpenContent::Thinking(_))),
         StreamEvent::TextDelta(_) | StreamEvent::TextEnd => matches!(open, Some(OpenContent::Text(_))),
         StreamEvent::ThinkingStart | StreamEvent::TextStart | StreamEvent::ToolUse { .. }
-            | StreamEvent::InlineToolUse { .. } | StreamEvent::Done { .. } => open.is_none(),
+            | StreamEvent::ToolUseInvalid { .. } | StreamEvent::InlineToolUse { .. }
+            | StreamEvent::Done { .. } => open.is_none(),
         StreamEvent::ToolResult { .. } => return Err(StreamFailure::Protocol("provider emitted ToolResult; only the runtime authors tool results".into())),
         StreamEvent::Error(_) => true,
     };
@@ -65,7 +66,8 @@ fn validate_content_event(open: Option<OpenContent>, event: &StreamEvent) -> Res
         StreamEvent::ThinkingStart => "ThinkingStart", StreamEvent::ThinkingDelta(_) => "ThinkingDelta",
         StreamEvent::ThinkingEnd { .. } => "ThinkingEnd", StreamEvent::TextStart => "TextStart",
         StreamEvent::TextDelta(_) => "TextDelta", StreamEvent::TextEnd => "TextEnd",
-        StreamEvent::ToolUse { .. } => "ToolUse", StreamEvent::InlineToolUse { .. } => "InlineToolUse",
+        StreamEvent::ToolUse { .. } => "ToolUse", StreamEvent::ToolUseInvalid { .. } => "ToolUseInvalid",
+        StreamEvent::InlineToolUse { .. } => "InlineToolUse",
         StreamEvent::ToolResult { .. } => "ToolResult", StreamEvent::Done { .. } => "Done", StreamEvent::Error(_) => "Error",
     };
     let state = match open { Some(OpenContent::Thinking(_)) => "an open thinking block",
@@ -672,6 +674,237 @@ fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
     match mode {
         ConsentMode::Collaborative => COLLABORATIVE_MAX_ITERATIONS,
         ConsentMode::Autonomous => AUTONOMOUS_MAX_ITERATIONS,
+    }
+}
+
+/// How many times one turn answers an output-ceiling stop with a notice and
+/// another inference. Counted over the whole turn, not per run of consecutive
+/// stops. The turn then ends with the provider's own `max_tokens` reason.
+///
+/// Small on purpose: a model that spends the whole ceiling on reasoning tends
+/// to do it again, and each continuation costs another ceiling of output
+/// tokens. Each continuation also spends an agentic iteration, so the
+/// iteration cap still bounds the turn.
+const MAX_OUTPUT_CEILING_CONTINUATIONS: u32 = 3;
+
+/// What the turn knows at an output-ceiling stop, for [`CeilingStop::continues`].
+#[derive(Clone, Copy, Debug)]
+struct CeilingStop {
+    /// The provider stopped this inference at the output ceiling.
+    ceiling: bool,
+    /// Continuations this turn has already spent.
+    continuations_spent: u32,
+    /// A beat is waiting on this turn's output.
+    timed_delivery: bool,
+    /// Another pass fits under the agentic-loop iteration cap.
+    iterations_left: bool,
+    cancelled: bool,
+    stopping_after_turn: bool,
+}
+
+impl CeilingStop {
+    /// Whether the turn takes another inference.
+    ///
+    /// It continues only when the ceiling is what stopped it, the turn has
+    /// continuations left, no beat is waiting on it, another pass fits under
+    /// the iteration cap, and no interrupt is pending. Every other ending is
+    /// somebody else's to report, and the caller writes no notice for an
+    /// inference that will not run — a durable notice for a response that no
+    /// longer exists would instruct the next turn instead.
+    fn continues(self) -> bool {
+        self.ceiling
+            && self.continuations_spent < MAX_OUTPUT_CEILING_CONTINUATIONS
+            && !self.timed_delivery
+            && self.iterations_left
+            && !self.cancelled
+            && !self.stopping_after_turn
+    }
+}
+
+/// Reasoning entries a provider may receive back: those carrying a continuity
+/// signature. This is the hydrator's rule (`llm/hydrate.rs`), applied to the
+/// live loop so one turn serializes the same way live and rehydrated. An
+/// unsigned block is dropped — Anthropic refuses one echoed back without its
+/// signature, and the next hydration would not replay it either.
+fn replayable_reasoning(
+    reasoning: Vec<(String, Option<String>)>,
+) -> Vec<(String, Option<String>)> {
+    reasoning
+        .into_iter()
+        .filter(|(text, signature)| signature.is_some() && !text.is_empty())
+        .collect()
+}
+
+/// The assistant message replayed for an output-ceiling continuation, or
+/// `None` when the truncated response cannot stand as one.
+///
+/// A replayed assistant message needs text. Reasoning alone is not an
+/// assistant turn — the API requires accompanying text or a tool call, and
+/// `llm/hydrate.rs` (`flush_assistant`) drops that shape, which is the common
+/// truncation: the whole ceiling goes to reasoning before any text arrives.
+/// The notice then follows the previous message instead. The shape matches
+/// `flush_assistant` too: plain text when no reasoning survives, blocks
+/// otherwise.
+fn ceiling_continuation_assistant(
+    reasoning: Vec<(String, Option<String>)>,
+    text: &str,
+) -> Option<LlmMessage> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let reasoning = replayable_reasoning(reasoning);
+    Some(if reasoning.is_empty() {
+        LlmMessage::assistant(text)
+    } else {
+        LlmMessage::with_reasoning_text_and_tool_uses(
+            reasoning,
+            Some(text.to_string()),
+            Vec::new(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod ceiling_decision_tests {
+    use super::*;
+
+    /// A ceiling stop with everything clear continues.
+    fn clear() -> CeilingStop {
+        CeilingStop {
+            ceiling: true,
+            continuations_spent: 0,
+            timed_delivery: false,
+            iterations_left: true,
+            cancelled: false,
+            stopping_after_turn: false,
+        }
+    }
+
+    #[test]
+    fn a_clear_ceiling_stop_continues() {
+        assert!(clear().continues());
+    }
+
+    #[test]
+    fn an_ordinary_ending_does_not_continue() {
+        assert!(!CeilingStop { ceiling: false, ..clear() }.continues());
+    }
+
+    #[test]
+    fn the_budget_is_spent_at_the_bound() {
+        assert!(
+            CeilingStop {
+                continuations_spent: MAX_OUTPUT_CEILING_CONTINUATIONS - 1,
+                ..clear()
+            }
+            .continues()
+        );
+        assert!(
+            !CeilingStop {
+                continuations_spent: MAX_OUTPUT_CEILING_CONTINUATIONS,
+                ..clear()
+            }
+            .continues()
+        );
+    }
+
+    /// A beat waiting on this turn gets the truncated output now, not a better
+    /// one late: extra inferences would put slow work on the beat path.
+    #[test]
+    fn a_turn_a_beat_waits_on_does_not_continue() {
+        assert!(!CeilingStop { timed_delivery: true, ..clear() }.continues());
+    }
+
+    /// The next pass would halt at the iteration cap, so the notice would
+    /// describe an inference that never ran.
+    #[test]
+    fn the_iteration_cap_stops_the_continuation() {
+        assert!(!CeilingStop { iterations_left: false, ..clear() }.continues());
+    }
+
+    #[test]
+    fn a_pending_interrupt_stops_the_continuation() {
+        assert!(!CeilingStop { cancelled: true, ..clear() }.continues());
+        assert!(!CeilingStop { stopping_after_turn: true, ..clear() }.continues());
+    }
+}
+
+#[cfg(test)]
+mod continuation_replay_tests {
+    use super::*;
+    use crate::llm::{ContentBlock, MessageContent};
+
+    fn signed(text: &str) -> (String, Option<String>) {
+        (text.to_string(), Some("signed".to_string()))
+    }
+
+    fn blocks(message: &LlmMessage) -> Vec<&ContentBlock> {
+        match &message.content {
+            MessageContent::Blocks(blocks) => blocks.iter().collect(),
+            MessageContent::Text(_) => Vec::new(),
+        }
+    }
+
+    /// Text alone replays as the model wrote it.
+    #[test]
+    fn text_only_replays_as_an_assistant_message() {
+        let message = ceiling_continuation_assistant(Vec::new(), "half a plan")
+            .expect("text can stand as an assistant message");
+        assert_eq!(message.as_text(), Some("half a plan"));
+    }
+
+    /// Signed reasoning rides with the text it belongs to.
+    #[test]
+    fn signed_reasoning_rides_with_text() {
+        let message = ceiling_continuation_assistant(vec![signed("thinking")], "half a plan")
+            .expect("text can stand as an assistant message");
+        let blocks = blocks(&message);
+        assert!(
+            matches!(blocks.first(), Some(ContentBlock::Reasoning { text, .. }) if text == "thinking"),
+            "{blocks:?}"
+        );
+        assert!(
+            matches!(blocks.get(1), Some(ContentBlock::Text { text }) if text == "half a plan"),
+            "{blocks:?}"
+        );
+    }
+
+    /// The benchmark's own shape: the ceiling went entirely to reasoning. A
+    /// lone Reasoning block is not an assistant turn — the API requires
+    /// accompanying text or a tool call, and `llm/hydrate.rs`
+    /// (`flush_assistant`) drops the same shape, so replaying it would send
+    /// the provider something the next hydration could never reproduce.
+    #[test]
+    fn reasoning_without_text_replays_nothing() {
+        assert!(ceiling_continuation_assistant(vec![signed("thinking")], "").is_none());
+    }
+
+    /// Unsigned reasoning is dropped, so it cannot carry an otherwise empty
+    /// message either.
+    #[test]
+    fn unsigned_reasoning_without_text_replays_nothing() {
+        assert!(ceiling_continuation_assistant(vec![("thinking".into(), None)], "").is_none());
+    }
+
+    /// Nothing arrived before the ceiling: no message at all. An assistant
+    /// message with empty content is refused by the providers.
+    #[test]
+    fn an_empty_response_replays_nothing() {
+        assert!(ceiling_continuation_assistant(Vec::new(), "").is_none());
+    }
+
+    /// A signed but empty thinking block is skipped by the message builder
+    /// (`llm/mod.rs`), so guarding on the pre-build list would produce an
+    /// assistant message with no content blocks at all.
+    #[test]
+    fn signed_but_empty_reasoning_replays_nothing() {
+        assert!(ceiling_continuation_assistant(vec![signed("")], "").is_none());
+    }
+
+    /// Whitespace is not text: it cannot carry a message either.
+    #[test]
+    fn whitespace_only_text_replays_nothing() {
+        assert!(ceiling_continuation_assistant(vec![signed("thinking")], "  \n").is_none());
     }
 }
 
@@ -1755,6 +1988,9 @@ async fn run_llm_stream(
     let consent = kernel.consent_mode().await;
     let max_iterations = iteration_cap_for_consent(consent);
     let mut iteration: u32 = 0;
+    // Output-ceiling continuations spent by this turn, against
+    // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
+    let mut ceiling_continuations: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
 
@@ -1973,6 +2209,11 @@ async fn run_llm_stream(
         let mut open_content: Option<OpenContent> = None;
         // Each pending invocation already has a durable call block.
         let mut tool_calls: Vec<(String, String, serde_json::Value, kaijutsu_types::BlockId)> = vec![];
+        // Calls whose arguments did not parse: `(id, name, recorded input,
+        // the error result already written)`. They dispatch nothing; they ride
+        // the same assistant/tool-result pairing so the model reads its own
+        // call and the answer to it.
+        let mut invalid_tool_calls: Vec<(String, String, serde_json::Value, String)> = vec![];
         // Collect text output for conversation history
         let mut assistant_text = String::new();
         // Collect thinking output for in-call continuity (A3), one
@@ -1985,6 +2226,10 @@ async fn run_llm_stream(
         // hydrator reconstructs from block history, so live and rehydrated turns
         // serialize identically.
         let mut assistant_reasoning: Vec<(String, Option<String>)> = Vec::new();
+        // The provider stopped this inference at the output ceiling. Set by
+        // the terminal `Done`; read at the bottom of the loop, where the turn
+        // either continues with a notice or ends as `MaxTokens`.
+        let mut output_ceiling_hit = false;
 
         tracing::debug!("Entering stream event loop");
         let mut cancel_deadline = None;
@@ -2139,6 +2384,43 @@ async fn run_llm_stream(
                     turn_lease.track_block(call);
                     last_block_id = call;
                     tool_calls.push((id, name, input, call));
+                }
+
+                StreamEvent::ToolUseInvalid { id, name, arguments, error } => {
+                    // The model made this call and waits on it. Record it with
+                    // the arguments as they arrived and answer it with an error
+                    // result: failing the turn tells the model nothing, and it
+                    // ends the work with the call still unanswered.
+                    let detail = format!(
+                        "This call did not run: its arguments were not valid JSON. They stop \
+                         after {} bytes ({error}), most likely cut off at the output limit. \
+                         Make the call again in smaller pieces — write a large file in several \
+                         appends rather than one call.",
+                        arguments.len(),
+                    );
+                    tracing::warn!(
+                        %context_id, tool = %name, call = %id, bytes = arguments.len(), %error,
+                        "Tool call arguments did not parse; answering the model with an error result"
+                    );
+                    // The raw text rides as one JSON field: the wire needs a
+                    // valid object on both the call and its result, and this
+                    // keeps what the model wrote where it can read it back.
+                    let input = serde_json::json!({ "truncated_arguments": arguments });
+                    let call = documents.insert_tool_call_as(context_id, None, Some(&last_block_id),
+                        &name, input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal),
+                        Some(id.clone()), None)?;
+                    turn_lease.track_block(call);
+                    let answer = documents.insert_tool_result_as(context_id, &call, Some(&call),
+                        "", Status::Running, None, Some(TypesToolKind::Builtin),
+                        Some(PrincipalId::system()), Some(id.clone()))?;
+                    turn_lease.track_block(answer);
+                    // Settle the pair rather than writing the result alone:
+                    // the call block reaches a final status the same way every
+                    // other dispatched call does.
+                    documents.settle_tool_result_as(context_id, &call, &answer, &detail,
+                        Status::Error, true, PrincipalId::system(), None, None)?;
+                    last_block_id = answer;
+                    invalid_tool_calls.push((id, name, input, detail));
                 }
 
                 StreamEvent::InlineToolUse { id, name, input } => {
@@ -2372,6 +2654,7 @@ async fn run_llm_stream(
                         Some("max_tokens") | Some("length") => TurnStopReason::MaxTokens,
                         _ => TurnStopReason::EndTurn,
                     };
+                    output_ceiling_hit = stop_reason_out == TurnStopReason::MaxTokens;
                     tracing::info!(
                         "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
                         stop_reason,
@@ -2423,7 +2706,95 @@ async fn run_llm_stream(
         // agent uses the presence of tool calls as the continuation signal (see
         // rig-core streaming.rs did_call_tool pattern). This is reliable because
         // the API only emits ToolCall content blocks when stop_reason is "tool_use".
-        if tool_calls.is_empty() {
+        // A call whose arguments did not parse counts here: it dispatches
+        // nothing, but its error result is the model's turn back, and it is
+        // the one message about a response the output limit cut off.
+        if tool_calls.is_empty() && invalid_tool_calls.is_empty() {
+            // The output ceiling cut this inference off before the model
+            // reached a tool call, so the turn has nothing to act on and
+            // nobody to ask — a driven worker has no human to say "continue".
+            // Tell the model what happened and take another inference, up to
+            // `MAX_OUTPUT_CEILING_CONTINUATIONS` times per turn. Past that the
+            // turn ends with the provider's own `max_tokens` reason.
+            //
+            // Decide the whole continuation before writing anything durable: a
+            // notice the model never receives still hydrates into the next
+            // turn as an instruction about a response that no longer exists.
+            // The conditions are the ones the top of this loop applies to the
+            // next pass, plus the two that belong to a ceiling stop: the
+            // continuation budget, and a turn a beat is waiting on, which ends
+            // at its first ceiling stop rather than spending inferences the
+            // caller did not budget for (`docs/tracks.md`).
+            let stop = CeilingStop {
+                ceiling: output_ceiling_hit,
+                continuations_spent: ceiling_continuations,
+                timed_delivery: turn_lease.owes_timed_delivery(),
+                iterations_left: iteration < max_iterations,
+                cancelled: interrupt.cancel.is_cancelled(),
+                stopping_after_turn: interrupt
+                    .stop_after_turn
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            };
+            if stop.continues() {
+                ceiling_continuations += 1;
+                // Replay what arrived so the model can continue from it.
+                if let Some(assistant) = ceiling_continuation_assistant(
+                    std::mem::take(&mut assistant_reasoning),
+                    &assistant_text,
+                ) {
+                    messages.push(assistant);
+                }
+                let notice = format!(
+                    "Your last response stopped at the output limit of {} tokens before you \
+                     finished, and no tool call in it was complete. Continue from where you \
+                     stopped. Keep your reasoning brief and act with a tool call.",
+                    build_opts.max_tokens,
+                );
+                tracing::warn!(
+                    %context_id,
+                    continuation = ceiling_continuations,
+                    limit = MAX_OUTPUT_CEILING_CONTINUATIONS,
+                    "Inference stopped at the output ceiling; continuing the turn with a notice"
+                );
+                // A `(System, Notification)` block is the durable, visible
+                // carrier the model reads as a user message, live and on the
+                // next hydration alike (`llm/hydrate.rs`).
+                //
+                // A write fault fails the turn, like every other block this
+                // stream authors for the model (`?` on the provider content
+                // writes above): the notice and the message pushed below are
+                // one fact, and continuing with only the wire copy would send
+                // an instruction no later hydration can reproduce.
+                let notice_block = documents.insert_block_as(
+                    context_id,
+                    None,
+                    Some(&last_block_id),
+                    Role::System,
+                    BlockKind::Notification,
+                    &notice,
+                    Status::Done,
+                    ContentType::Plain,
+                    Some(PrincipalId::system()),
+                )?;
+                last_block_id = notice_block;
+                messages.push(LlmMessage::user(notice));
+                continue 'agentic;
+            }
+            if output_ceiling_hit {
+                // The turn ends here. Report why it did not continue, and let
+                // a requested interrupt name the ending it caused — the same
+                // reason the top of the loop would have published.
+                if stop.cancelled {
+                    stop_reason_out = TurnStopReason::Cancelled { immediate: true };
+                } else if stop.stopping_after_turn {
+                    stop_reason_out = TurnStopReason::Cancelled { immediate: false };
+                }
+                tracing::warn!(
+                    %context_id,
+                    decision = ?stop,
+                    "Output ceiling reached and the turn does not continue"
+                );
+            }
             // Add final assistant message to history before saving
             if !assistant_text.is_empty() {
                 messages.push(LlmMessage::assistant(&assistant_text));
@@ -2435,7 +2806,9 @@ async fn run_llm_stream(
         // Execute tools concurrently — the kernel sequences concurrent block inserts
         tracing::debug!("Executing {} tool calls concurrently", tool_calls.len());
 
-        // Build assistant tool uses (for conversation history)
+        // Build assistant tool uses (for conversation history). A call whose
+        // arguments did not parse is one of them: the provider sent it, so the
+        // assistant turn carries it and the reply below answers it.
         let assistant_tool_uses: Vec<ContentBlock> = tool_calls
             .iter()
             .map(|(id, name, input, _)| ContentBlock::ToolUse {
@@ -2443,6 +2816,11 @@ async fn run_llm_stream(
                 name: name.clone(),
                 input: input.clone(),
             })
+            .chain(invalid_tool_calls.iter().map(|(id, name, input, _)| ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            }))
             .collect();
 
         // Signal cancellation on the first persistence fault, but join every
@@ -2475,6 +2853,15 @@ async fn run_llm_stream(
             tool_results.push(content);
             last_block_id = anchor;
         }
+        // The error results for calls that never dispatched, in the same order
+        // as their tool uses above.
+        for (tool_use_id, _, _, detail) in std::mem::take(&mut invalid_tool_calls) {
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id,
+                content: detail,
+                is_error: true,
+            });
+        }
 
         // Add assistant message with tool uses to conversation. Preserve
         // accumulated thinking (A3), one Reasoning block per thinking block, so
@@ -2482,8 +2869,9 @@ async fn run_llm_stream(
         // this `process_llm_stream` invocation. Each signature comes from the
         // provider via `StreamEvent::ThinkingEnd.signature` — load-bearing for
         // Anthropic when extended thinking is enabled and tool_use is in the
-        // same turn (the builder skips any empty-text entries).
-        let reasoning = std::mem::take(&mut assistant_reasoning);
+        // same turn. `replayable_reasoning` applies the one rule both paths
+        // out of this loop share, the hydrator's: signed entries only.
+        let reasoning = replayable_reasoning(std::mem::take(&mut assistant_reasoning));
         let text = (!assistant_text.is_empty()).then(|| std::mem::take(&mut assistant_text));
         messages.push(LlmMessage::with_reasoning_text_and_tool_uses(
             reasoning,
@@ -3185,36 +3573,143 @@ mod publish_tests {
             .await;
     }
 
-    /// A truncated response carries `MaxTokens`, taken from the provider's own
-    /// terminal stop reason. Without it, a turn cut off at the output ceiling is
-    /// indistinguishable from one the model chose to end — the frontend renders
-    /// a half-sentence as a finished answer.
+    /// One truncated inference in the middle of a turn, exactly as the
+    /// benchmark recorded it: reasoning spent the whole output ceiling, the
+    /// provider stopped with `length`, and nothing had run yet. The turn must
+    /// carry on — a driven worker has nobody to say "continue" — and the model
+    /// must be told why its own output stops mid-thought.
     #[tokio::test]
-    async fn token_ceiling_truncation_reports_max_tokens() {
+    async fn output_ceiling_continues_the_turn_with_a_notice() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("ceiling-continue").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+                let truncated = vec![
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("length".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    },
+                ];
+                let tool = vec![
+                    crate::llm::StreamEvent::ToolUse {
+                        id: "call_after_notice".into(),
+                        name: "nonexistent_tool".into(),
+                        input: serde_json::json!({}),
+                    },
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: Some(20),
+                        output_tokens: Some(5),
+                        extra: None,
+                    },
+                ];
+                let finish = vec![
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("EFGA|".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        input_tokens: Some(30),
+                        output_tokens: Some(5),
+                        extra: None,
+                    },
+                ];
+
+                let (documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Interactive,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused")
+                            .with_scripted_stream(vec![truncated, tool, finish]),
+                    ),
+                    |_| {},
+                )
+                .await;
+
+                let msg = completed.try_recv().expect("the turn completes once");
+                match msg.payload {
+                    TurnFlow::Completed {
+                        context_id, reason, ..
+                    } => {
+                        assert_eq!(context_id, ctx);
+                        assert_eq!(
+                            reason,
+                            TurnStopReason::EndTurn,
+                            "the turn ended where the model ended it, not at the ceiling"
+                        );
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                let notices: Vec<_> = blocks
+                    .iter()
+                    .filter(|b| b.kind == BlockKind::Notification)
+                    .collect();
+                assert_eq!(notices.len(), 1, "one ceiling stop, one notice");
+                assert_eq!(notices[0].role, Role::System, "a kernel fact, not model text");
+                assert!(
+                    notices[0]
+                        .content
+                        .contains("stopped at the output limit of 1024 tokens"),
+                    "{}",
+                    notices[0].content
+                );
+                assert!(
+                    notices[0].content.contains("Continue from where you stopped"),
+                    "{}",
+                    notices[0].content
+                );
+                assert!(
+                    blocks.iter().any(|b| b.content.contains("EFGA|")),
+                    "the continuation's output is in the context"
+                );
+            })
+            .await;
+    }
+
+    /// The continuation budget is bounded. A model that spends every ceiling on
+    /// reasoning would otherwise burn `max_tokens` per inference until the
+    /// iteration cap, so the turn gives up after
+    /// `MAX_OUTPUT_CEILING_CONTINUATIONS` notices and reports the provider's own
+    /// reason — a turn cut off at the output ceiling must not read as one the
+    /// model chose to end.
+    #[tokio::test]
+    async fn repeated_output_ceilings_end_the_turn_with_max_tokens() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let kernel = Arc::new(Kernel::new_ephemeral("max-tokens").await);
                 let mut completed = kernel.turn_flows().subscribe("turn.completed");
 
-                let events = vec![
-                    crate::llm::StreamEvent::TextStart,
-                    crate::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
-                    crate::llm::StreamEvent::TextEnd,
-                    crate::llm::StreamEvent::Done {
-                        stop_reason: Some("max_tokens".into()),
-                        input_tokens: Some(10),
-                        output_tokens: Some(1024),
-                        extra: None,
-                    },
-                ];
+                let truncated = || {
+                    vec![
+                        crate::llm::StreamEvent::TextStart,
+                        crate::llm::StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
+                        crate::llm::StreamEvent::TextEnd,
+                        crate::llm::StreamEvent::Done {
+                            stop_reason: Some("max_tokens".into()),
+                            input_tokens: Some(10),
+                            output_tokens: Some(1024),
+                            extra: None,
+                        },
+                    ]
+                };
+                let script: Vec<_> = (0..MAX_OUTPUT_CEILING_CONTINUATIONS + 1)
+                    .map(|_| truncated())
+                    .collect();
 
-                let (_documents, ctx, _player) = drive_turn_with(
+                let (documents, ctx, _player) = drive_turn_with(
                     TurnOrigin::Interactive,
                     kernel.clone(),
-                    Provider::Mock(
-                        MockClient::new("unused").with_scripted_stream(vec![events]),
-                    ),
+                    Provider::Mock(MockClient::new("unused").with_scripted_stream(script)),
                     |_| {},
                 )
                 .await;
@@ -3229,6 +3724,373 @@ mod publish_tests {
                     }
                     other => panic!("expected Completed, got {other:?}"),
                 }
+
+                let notices = documents
+                    .block_snapshots(ctx)
+                    .unwrap()
+                    .iter()
+                    .filter(|b| b.kind == BlockKind::Notification)
+                    .count();
+                assert_eq!(
+                    notices, 3,
+                    "three notices, then the fourth ceiling stop ends the turn"
+                );
+            })
+            .await;
+    }
+
+    /// A pending soft interrupt ends the turn at a ceiling stop, and leaves no
+    /// notice behind: a durable "continue from where you stopped" for an
+    /// inference that never ran would instruct the *next* turn instead. The
+    /// script holds one inference, so a continuation would also panic the mock.
+    #[tokio::test(start_paused = true)]
+    async fn an_interrupt_at_a_ceiling_stop_leaves_no_notice() {
+        use std::time::Duration;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("ceiling-interrupt").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                let events = vec![
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("half a plan".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("length".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    },
+                ];
+                let provider = Provider::Mock(
+                    MockClient::new("unused")
+                        .with_scripted_stream(vec![events])
+                        .with_event_delay(Duration::from_millis(10)),
+                );
+                let (documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Interactive,
+                    kernel.clone(),
+                    provider,
+                    |interrupt| {
+                        // Land the request while the first inference streams,
+                        // after the loop's own soft-interrupt check has passed.
+                        let interrupt = interrupt.clone();
+                        tokio::task::spawn_local(async move {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            interrupt.soft();
+                        });
+                    },
+                )
+                .await;
+
+                match completed.try_recv().expect("the turn completes").payload {
+                    TurnFlow::Completed { reason, .. } => assert_eq!(
+                        reason,
+                        TurnStopReason::Cancelled { immediate: false },
+                        "the interrupt names the ending it caused"
+                    ),
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+                assert!(
+                    !documents
+                        .block_snapshots(ctx)
+                        .unwrap()
+                        .iter()
+                        .any(|b| b.kind == BlockKind::Notification),
+                    "no notice for an inference that never ran"
+                );
+            })
+            .await;
+    }
+
+    /// What the provider is handed on the continuation, for each shape a
+    /// truncated response can take. A lone Reasoning block is not an assistant
+    /// turn and neither is an empty one; the hydrator drops both
+    /// (`llm/hydrate.rs`, `flush_assistant`), so sending either live would put
+    /// a message on the wire that no later hydration could reproduce — and
+    /// reasoning-only is the shape the benchmark actually produced.
+    #[tokio::test]
+    async fn the_continuation_request_carries_no_reasoning_only_or_empty_assistant() {
+        use crate::llm::{MessageContent, Role as LlmRole};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let thinking = || {
+                    vec![
+                        crate::llm::StreamEvent::ThinkingStart,
+                        crate::llm::StreamEvent::ThinkingDelta("long reasoning".into()),
+                        crate::llm::StreamEvent::ThinkingEnd {
+                            signature: Some("signed".into()),
+                        },
+                    ]
+                };
+                let text = || {
+                    vec![
+                        crate::llm::StreamEvent::TextStart,
+                        crate::llm::StreamEvent::TextDelta("half a plan".into()),
+                        crate::llm::StreamEvent::TextEnd,
+                    ]
+                };
+                let cases: Vec<(&str, Vec<crate::llm::StreamEvent>, bool)> = vec![
+                    ("text only", text(), true),
+                    ("text and signed reasoning", [thinking(), text()].concat(), true),
+                    ("signed reasoning only", thinking(), false),
+                    ("nothing at all", Vec::new(), false),
+                ];
+
+                for (shape, prefix, expect_assistant) in cases {
+                    let kernel = Arc::new(Kernel::new_ephemeral("continuation-shape").await);
+                    let mut truncated = prefix;
+                    truncated.push(crate::llm::StreamEvent::Done {
+                        stop_reason: Some("length".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    });
+                    let finish = vec![
+                        crate::llm::StreamEvent::TextStart,
+                        crate::llm::StreamEvent::TextDelta("finished".into()),
+                        crate::llm::StreamEvent::TextEnd,
+                        crate::llm::StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(20),
+                            output_tokens: Some(5),
+                            extra: None,
+                        },
+                    ];
+                    let (mock, sent) = MockClient::new("unused")
+                        .with_scripted_stream(vec![truncated, finish])
+                        .recording_sent_messages();
+                    let (documents, ctx, _player) = drive_turn_with(
+                        TurnOrigin::Interactive,
+                        kernel.clone(),
+                        Provider::Mock(mock),
+                        |_| {},
+                    )
+                    .await;
+
+                    let sent = sent.lock();
+                    assert_eq!(sent.len(), 2, "{shape}: the turn continued once");
+                    let request = &sent[1];
+                    for (index, message) in request.iter().enumerate() {
+                        if message.role != LlmRole::Assistant {
+                            continue;
+                        }
+                        match &message.content {
+                            MessageContent::Text(text) => {
+                                assert!(!text.trim().is_empty(), "{shape}: empty assistant text")
+                            }
+                            MessageContent::Blocks(blocks) => {
+                                assert!(
+                                    !blocks.is_empty(),
+                                    "{shape}: assistant message {index} has no content"
+                                );
+                                assert!(
+                                    blocks.iter().any(|block| !matches!(
+                                        block,
+                                        crate::llm::ContentBlock::Reasoning { .. }
+                                    )),
+                                    "{shape}: assistant message {index} is reasoning only"
+                                );
+                                assert!(
+                                    !blocks.iter().any(|block| matches!(
+                                        block,
+                                        crate::llm::ContentBlock::Text { text } if text.trim().is_empty()
+                                    )),
+                                    "{shape}: assistant message {index} carries empty text"
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        request.iter().any(|m| m.role == LlmRole::Assistant),
+                        expect_assistant,
+                        "{shape}: assistant replay"
+                    );
+                    let last = request.last().expect("the notice is the last message");
+                    assert_eq!(last.role, LlmRole::User);
+                    assert!(
+                        last.as_text()
+                            .unwrap_or_default()
+                            .contains("stopped at the output limit"),
+                        "{shape}: {last:?}"
+                    );
+
+                    // Live and rehydrated must serialize the same way: the
+                    // next turn rebuilds this conversation from the block log.
+                    let blocks = documents.block_snapshots(ctx).unwrap();
+                    let rehydrated = crate::llm::hydrate_from_blocks(&blocks);
+                    let live = serde_json::to_value(request).unwrap();
+                    let replayed =
+                        serde_json::to_value(&rehydrated[..request.len()]).unwrap();
+                    assert_eq!(live, replayed, "{shape}: live and rehydrated differ");
+                }
+            })
+            .await;
+    }
+
+    /// The raw arguments the benchmark recorded: a `write` call whose JSON was
+    /// cut off mid-string. The turn must not fail — the model only learns its
+    /// call was cut off if it gets a tool result saying so.
+    const TRUNCATED_ARGUMENTS: &str = "{\"path\": \"/app/solve.py\", \"content\": \"import re";
+
+    fn truncated_write_call() -> crate::llm::StreamEvent {
+        crate::llm::StreamEvent::ToolUseInvalid {
+            id: "call_truncated".into(),
+            name: "write".into(),
+            arguments: TRUNCATED_ARGUMENTS.into(),
+            error: "EOF while parsing a string at line 1 column 7174".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_arguments_answer_the_model_and_keep_the_turn() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("truncated-arguments").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                let mut failed = kernel.turn_flows().subscribe("turn.failed");
+
+                let cut_off = vec![
+                    truncated_write_call(),
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("tool_use".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    },
+                ];
+                let retry = vec![
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("writing it in pieces".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        input_tokens: Some(20),
+                        output_tokens: Some(5),
+                        extra: None,
+                    },
+                ];
+
+                let (documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Interactive,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![cut_off, retry]),
+                    ),
+                    |_| {},
+                )
+                .await;
+
+                assert!(failed.try_recv().is_none(), "a cut-off call is not a failed turn");
+                match completed.try_recv().expect("the turn completes").payload {
+                    TurnFlow::Completed { reason, .. } => {
+                        assert_eq!(reason, TurnStopReason::EndTurn)
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                let call = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolCall)
+                    .expect("the call the model made is recorded");
+                assert_eq!(call.tool_name.as_deref(), Some("write"));
+                assert_eq!(
+                    call.status,
+                    Status::Error,
+                    "the call block settles like any other answered call"
+                );
+                assert!(
+                    call.tool_input.as_deref().unwrap_or_default().contains("import re"),
+                    "the raw arguments are preserved: {:?}",
+                    call.tool_input
+                );
+                let result = blocks
+                    .iter()
+                    .find(|b| b.kind == BlockKind::ToolResult)
+                    .expect("the call is answered");
+                assert!(result.is_error, "the model must see this as an error");
+                assert!(
+                    result.content.contains("not valid JSON")
+                        && result.content.contains("47 bytes")
+                        && result.content.contains("line 1 column 7174"),
+                    "{}",
+                    result.content
+                );
+                assert!(
+                    result.content.contains("smaller pieces"),
+                    "the result says what to do next: {}",
+                    result.content
+                );
+                assert!(
+                    blocks.iter().any(|b| b.content.contains("writing it in pieces")),
+                    "the loop went on to another inference"
+                );
+            })
+            .await;
+    }
+
+    /// A cut-off call and a `length` stop are one event, not two. The tool
+    /// result already says the output limit ended the call, so the ceiling
+    /// notice must not repeat it.
+    #[tokio::test]
+    async fn a_cut_off_call_with_a_length_stop_sends_one_message() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("one-message").await);
+                let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+                let cut_off = vec![
+                    truncated_write_call(),
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("length".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    },
+                ];
+                let retry = vec![
+                    crate::llm::StreamEvent::TextStart,
+                    crate::llm::StreamEvent::TextDelta("writing it in pieces".into()),
+                    crate::llm::StreamEvent::TextEnd,
+                    crate::llm::StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        input_tokens: Some(20),
+                        output_tokens: Some(5),
+                        extra: None,
+                    },
+                ];
+
+                let (documents, ctx, _player) = drive_turn_with(
+                    TurnOrigin::Interactive,
+                    kernel.clone(),
+                    Provider::Mock(
+                        MockClient::new("unused").with_scripted_stream(vec![cut_off, retry]),
+                    ),
+                    |_| {},
+                )
+                .await;
+
+                match completed.try_recv().expect("the turn completes").payload {
+                    TurnFlow::Completed { reason, .. } => {
+                        assert_eq!(reason, TurnStopReason::EndTurn)
+                    }
+                    other => panic!("expected Completed, got {other:?}"),
+                }
+
+                let blocks = documents.block_snapshots(ctx).unwrap();
+                assert!(
+                    !blocks.iter().any(|b| b.kind == BlockKind::Notification),
+                    "the tool result is the one message about the cut-off"
+                );
+                assert_eq!(
+                    blocks.iter().filter(|b| b.kind == BlockKind::ToolResult).count(),
+                    1,
+                    "one call, one answer"
+                );
             })
             .await;
     }
@@ -5599,6 +6461,55 @@ mod lifetime_tests {
             drop(tl);
             kernel.shutdown_runtime_worker().await.unwrap();
         }
+    }
+
+    /// A turn a beat is waiting on does not continue at the output ceiling. It
+    /// ends with `MaxTokens`, as it did before continuations existed: extra
+    /// inferences would put slow work on the beat path, and the resolver
+    /// validates one block as a whole tune, so a continuation's block is a
+    /// tail fragment either way (`docs/tracks.md`, `docs/hyoushigi.md`). The
+    /// script holds one inference, so a continuation panics the mock.
+    #[tokio::test]
+    async fn a_timed_turn_ends_at_its_first_output_ceiling() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Fallback, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        let truncated = vec![
+            StreamEvent::TextStart,
+            StreamEvent::TextDelta("X:1\nK:C\nCD".into()),
+            StreamEvent::TextEnd,
+            StreamEvent::Done {
+                stop_reason: Some("length".into()),
+                input_tokens: Some(10),
+                output_tokens: Some(1024),
+                extra: None,
+            },
+        ];
+        let (kernel, context, after, call) = fixture(Some(
+            MockClient::new("unused").with_scripted_stream(vec![truncated]),
+        ))
+        .await;
+        let track = TrackId::new("timed-ceiling").unwrap();
+        let _timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let TurnAdmission::Accepted { .. } = kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent {
+                track, start: Tick::new(10), fallback: Fallback::Skip,
+            }),
+        }).unwrap() else { panic!("score admission must be accepted") };
+
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv())
+            .await.unwrap().unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed {
+            reason: TurnStopReason::MaxTokens, .. }), "{:?}", event.payload);
+        assert!(
+            !kernel.blocks().block_snapshots(context).unwrap().iter()
+                .any(|block| block.kind == BlockKind::Notification),
+            "a beat's turn is not continued, so it gets no notice"
+        );
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

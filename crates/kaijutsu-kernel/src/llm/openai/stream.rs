@@ -216,8 +216,10 @@ impl StateMachine {
     }
 
     /// Drain accumulated tool calls into atomic [`StreamEvent::ToolUse`]
-    /// events (index order). A missing name or unparseable arguments
-    /// surfaces a loud [`StreamEvent::Error`] rather than a bogus call.
+    /// events (index order). A missing name surfaces a loud
+    /// [`StreamEvent::Error`] rather than a bogus call; arguments that do not
+    /// parse surface as [`StreamEvent::ToolUseInvalid`], which the runtime
+    /// answers with an error tool result.
     fn flush_tool_calls(&mut self, out: &mut Vec<StreamEvent>) {
         let drained = std::mem::take(&mut self.tool_calls);
         for (index, accum) in drained {
@@ -237,9 +239,12 @@ impl StateMachine {
                 match serde_json::from_str(&accum.arguments) {
                     Ok(v) => v,
                     Err(e) => {
-                        out.push(StreamEvent::Error(format!(
-                            "tool_call input JSON parse failed for {name} ({id}): {e}",
-                        )));
+                        out.push(StreamEvent::ToolUseInvalid {
+                            id,
+                            name,
+                            arguments: accum.arguments,
+                            error: e.to_string(),
+                        });
                         continue;
                     }
                 }
@@ -444,8 +449,11 @@ data: [DONE]
         }
     }
 
+    /// Arguments that do not parse keep the call: the runtime answers it with
+    /// an error tool result and the turn goes on. A `StreamEvent::Error` here
+    /// would fail the whole turn and tell the model nothing.
     #[tokio::test]
-    async fn malformed_tool_arguments_surface_error() {
+    async fn malformed_tool_arguments_surface_the_call_and_its_raw_text() {
         let payload = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":\"f\",\"arguments\":\"{not json\"}}]},\"finish_reason\":null}]}
 
@@ -455,14 +463,25 @@ data: [DONE]
 
 ";
         let events = run(payload).await;
-        let err = events
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "a cut-off call is not a stream error: {events:?}"
+        );
+        let invalid = events
             .iter()
-            .find(|e| matches!(e, StreamEvent::Error(_)))
-            .expect("must surface parse error");
-        match err {
-            StreamEvent::Error(s) => {
-                assert!(s.contains("tool_call input JSON parse failed"));
-                assert!(s.contains("call_x"));
+            .find(|e| matches!(e, StreamEvent::ToolUseInvalid { .. }))
+            .expect("must surface the call that did not parse");
+        match invalid {
+            StreamEvent::ToolUseInvalid {
+                id,
+                name,
+                arguments,
+                error,
+            } => {
+                assert_eq!(id, "call_x");
+                assert_eq!(name, "f");
+                assert_eq!(arguments, "{not json");
+                assert!(!error.is_empty(), "the parser's message rides along");
             }
             _ => unreachable!(),
         }

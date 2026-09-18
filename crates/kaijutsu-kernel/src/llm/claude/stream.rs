@@ -234,10 +234,16 @@ impl StateMachine {
                 } else {
                     match serde_json::from_str(&partial_input) {
                         Ok(v) => v,
+                        // The call is real and the model waits on it, so it
+                        // keeps its identity: the runtime answers it with an
+                        // error tool result instead of failing the turn.
                         Err(e) => {
-                            return vec![StreamEvent::Error(format!(
-                                "tool_use input JSON parse failed for {name} ({id}): {e}",
-                            ))];
+                            return vec![StreamEvent::ToolUseInvalid {
+                                id,
+                                name,
+                                arguments: partial_input,
+                                error: e.to_string(),
+                            }];
                         }
                     }
                 };
@@ -511,10 +517,12 @@ data: {\"type\":\"content_block_delta\",\"index\":99,\"delta\":{\"type\":\"text_
     }
 
     #[tokio::test]
-    async fn malformed_tool_input_partials_surface_parse_error() {
-        // Anthropic streaming an invalid JSON fragment chain is a bug
-        // (or wire-shape shift). The state machine must surface it
-        // rather than emitting a bogus ToolUse with garbage input.
+    async fn malformed_tool_input_partials_surface_the_call_and_its_raw_text() {
+        // An invalid JSON fragment chain means the call cannot run, most
+        // often because the response stopped at the output ceiling part-way
+        // through the arguments. The state machine keeps the call's identity
+        // and its raw text rather than emitting a bogus ToolUse with garbage
+        // input; the runtime answers it with an error tool result.
         let payload = "\
 event: content_block_start
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_X\",\"name\":\"f\",\"input\":{}}}
@@ -528,11 +536,18 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
 ";
         let events = run(payload).await;
         match &events[0] {
-            StreamEvent::Error(s) => {
-                assert!(s.contains("tool_use input JSON parse failed"));
-                assert!(s.contains("toolu_X"));
+            StreamEvent::ToolUseInvalid {
+                id,
+                name,
+                arguments,
+                error,
+            } => {
+                assert_eq!(id, "toolu_X");
+                assert_eq!(name, "f");
+                assert_eq!(arguments, "{not valid");
+                assert!(!error.is_empty(), "the parser's message rides along");
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected ToolUseInvalid, got {other:?}"),
         }
     }
 }

@@ -70,6 +70,48 @@ This is a conversation projection and a send-time check. Writers can still
 interleave blocks in the durable context. Insert-time tool-pair atomicity
 remains the separate follow-up described below.
 
+## When an inference stops at the output ceiling
+
+A turn does not end because one inference did. When the provider stops with
+`max_tokens` or `length` and the model completed no tool call, the loop writes
+a `(System, Notification)` block saying the response stopped at the output
+limit of N tokens and to continue from there, sends it as the next user
+message — the same shape hydration would produce for that block — and takes
+another inference. A driven worker has nobody to say "continue".
+
+The turn does **not** continue when any of these holds, and then it ends as it
+did before continuations existed:
+
+- the inference completed a tool call, or made one whose arguments did not
+  parse — the loop already carries on with the result, and the model already
+  has its turn back;
+- the turn has spent `MAX_OUTPUT_CEILING_CONTINUATIONS` continuations
+  (`crates/kaijutsu-kernel/src/runtime/llm_stream.rs`, `CeilingStop`), so it
+  ends with `TurnStopReason::MaxTokens`, the provider's own reason;
+- a beat waits on the turn's output (a score delivery), because extra
+  inferences would put slow work on the beat path and the resolver validates
+  one block as a whole tune — see `docs/tracks.md`;
+- an interrupt is pending, which names the ending it caused;
+- another pass would halt at the agentic-loop iteration cap. Each continuation
+  spends an iteration, so that cap still bounds the turn.
+
+The decision comes before any durable write: a notice for an inference that
+never runs would survive as an instruction to the *next* turn.
+
+The replayed assistant message follows the hydrator's rules
+(`llm/hydrate.rs`, `flush_assistant`), so one turn serializes the same way
+live and rehydrated. Reasoning rides only with its continuity signature. A
+truncated response is replayed only when it has text: reasoning alone is not
+an assistant turn, and it is the common truncation — the whole ceiling goes to
+reasoning before any text arrives. The notice then follows the previous
+message, and the wire merges consecutive user messages.
+
+A tool call whose arguments do not parse as JSON is recorded with its raw
+text and answered with an error tool result naming the byte count and the
+parser's position. The loop continues on that result; the turn does not fail,
+and the ceiling notice is not added on top of it — one message about one
+truncation.
+
 ## Before the session change
 
 `process_llm_stream` in `crates/kaijutsu-server/src/llm_stream.rs` called
