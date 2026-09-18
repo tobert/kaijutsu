@@ -30,12 +30,17 @@ impl Kernel {
     /// presence never determines execution. The lease covers startup and queuing
     /// as well as inference, so an immediate `kj wait` sees accepted work.
     pub fn request_turn(self: &Arc<Self>, request: TurnRequest) -> Result<TurnAdmission, String> {
-        let mut lease = match request.continuation_epoch {
-            Some(_) => match self.turns().begin_if_idle(request.context_id) {
-                Some(lease) => lease,
-                None => return Ok(TurnAdmission::AlreadyActive),
-            },
-            None => self.turns().begin(request.context_id),
+        let (admission, mut lease) = {
+            let db = self.kernel_db().lock();
+            let admission = super::admission::ContextAdmission::acquire(&db, request.context_id)?;
+            let lease = match request.continuation_epoch {
+                Some(_) => match self.turns().begin_if_idle(request.context_id) {
+                    Some(lease) => lease,
+                    None => return Ok(TurnAdmission::AlreadyActive),
+                },
+                None => self.turns().begin(request.context_id),
+            };
+            (admission, lease)
         };
         let turn_id = lease.id();
         let score = request.score.as_ref().map(|intent|
@@ -61,7 +66,7 @@ impl Kernel {
                     };
                     spawn_admitted_turn(&kernel, accepted.context_id, accepted.model.as_deref(),
                         &accepted.after_block_id, tool_ctx, accepted.principal_id,
-                        TurnOrigin::Autonomous, accepted.continuation_epoch, Some(lease)).await
+                        TurnOrigin::Autonomous, accepted.continuation_epoch, Some(lease), admission).await
                 }).catch_unwind();
                 tokio::pin!(startup);
                 tokio::select! {
@@ -120,6 +125,30 @@ fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, error
 mod tests {
     use super::*;
     use crate::kj::test_helpers::{register_context, test_dispatcher};
+
+    #[tokio::test]
+    async fn archived_context_refuses_headless_admission_without_publishing_work() {
+        let dispatcher = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("archived-turn"), None, principal);
+        let blocks = dispatcher.block_store();
+        blocks.create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let anchor = blocks.insert_block_as(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "seed", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(principal)).unwrap();
+        dispatcher.kernel_db().lock().archive_context(context).unwrap();
+        let mut requested = dispatcher.kernel().turn_flows().subscribe("turn.requested");
+        let result = dispatcher.kernel().request_turn(TurnRequest {
+            score: None, context_id: context, after_block_id: anchor,
+            content: String::new(), principal_id: principal, model: None, continuation_epoch: None,
+        });
+        dispatcher.kernel().shutdown_runtime_worker().await.unwrap();
+        let error = result.expect_err("archived context must not admit a headless turn");
+        assert!(error.contains("archived"), "{error}");
+        assert!(!dispatcher.kernel().turn_in_flight(context));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), requested.recv()).await.is_err());
+        assert_eq!(blocks.block_snapshots(context).unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn unreadable_cwd_fails_before_headless_model_startup() {

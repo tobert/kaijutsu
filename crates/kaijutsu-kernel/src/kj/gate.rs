@@ -27,7 +27,7 @@ use approval_ledger::types::{
 use kaijutsu_types::{AskRef, AskStatus, ContextId, PrincipalId};
 
 use crate::flows::SharedLedgerFlowBus;
-use crate::kernel_db::KernelDb;
+use crate::kernel_db::{KernelDb, KernelDbError, KernelDbResult};
 use crate::kj::env_snapshot::{self, AskEnvEntry};
 use crate::kj::KjCaller;
 
@@ -448,6 +448,15 @@ pub(crate) async fn run_gate(
     run_gate_recorded(kernel, caller, spec, ledger_flows, config, &|_, _| Ok(())).await
 }
 
+/// Verify the addressed context in the transaction that makes an approval
+/// durable. `build_ask` awaits after the early guard, so that guard alone
+/// cannot order archive against ask creation or redemption.
+fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> KernelDbResult<()> {
+    crate::runtime::admission::ContextAdmission::acquire(db, context_id)
+        .map(|_| ())
+        .map_err(KernelDbError::Validation)
+}
+
 /// Record caller state in the ask transaction, before any ledger notification.
 #[tracing::instrument(
     name = "approval.gate",
@@ -473,7 +482,7 @@ pub(crate) async fn run_gate_recorded(
     if let Some(context) = caller.context_id {
         approval_span.record("context.id", context.to_string());
     }
-    // An archived context is inert — it runs nothing. This is the second of
+    // An archived context does not admit new gate work. This is the second of
     // two checks; `kj ledger` refuses to ANSWER an archived context's ask,
     // and this one refuses to act on an answer, because a context can be
     // archived in the gap between the two. Neither check covers the other.
@@ -481,18 +490,30 @@ pub(crate) async fn run_gate_recorded(
     // `Unavailable`, not `Denied`: nobody decided anything here. The
     // distinction is the one this whole lane exists to keep.
     if let Some(context_id) = caller.context_id {
-        let archived = {
+        let context = {
             let db = db.lock();
             db.get_context(context_id)
-                .ok()
-                .flatten()
-                .is_some_and(|c| c.is_archived())
         };
-        if archived {
-            return GateOutcome::unavailable_without_row(format!(
-                "context {} is archived — archived contexts are retained work and run nothing; nothing was run and no ask was recorded",
-                context_id.short()
-            ));
+        match context {
+            Ok(Some(row)) if row.is_archived() => {
+                return GateOutcome::unavailable_without_row(format!(
+                    "context {} is archived — archived contexts retain accepted work but do not authorize new work; nothing was run and no ask was recorded",
+                    context_id.short()
+                ));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return GateOutcome::unavailable_without_row(format!(
+                    "context {} was not found — the approval gate cannot authorize work without its target; nothing was run and no ask was recorded",
+                    context_id.short()
+                ));
+            }
+            Err(error) => {
+                return GateOutcome::unavailable_without_row(format!(
+                    "approval gate could not read context {}: {error} (fail-closed — nothing was run and no ask was recorded)",
+                    context_id.short()
+                ));
+            }
         }
     }
 
@@ -572,7 +593,7 @@ pub(crate) async fn run_gate_recorded(
     if matches!(verdict, AskVerdict::Escalate) && spec.origin != Origin::HookResult {
         let answered = {
             let db = db.lock();
-            (|| -> crate::kernel_db::KernelDbResult<_> {
+            let redeem = |db: &KernelDb| -> KernelDbResult<_> {
                 let found = approval_ledger::ask::find_redeemable(
                     db.conn_for_ledger(), &digest_refs, &spec.authorized_label,
                     Some(context.as_slice()), Some(principal.as_slice()), caller.actor_id.as_bytes(),
@@ -584,7 +605,16 @@ pub(crate) async fn run_gate_recorded(
                     && (row.exec_source.is_some() || !db.approval_pair_ready(&request_id)?);
                 if held { return Ok(Some((request_id, status, row, true))); }
                 Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false)))
-            })()
+            };
+            match caller.context_id {
+                Some(context_id) => {
+                    match require_live_context_for_gate(&db, context_id) {
+                        Ok(()) => redeem(&db),
+                        Err(error) => Err(error),
+                    }
+                }
+                None => redeem(&db),
+            }
         };
         match answered {
             Ok(Some((request_id, _, _, true))) => {
@@ -655,6 +685,11 @@ pub(crate) async fn run_gate_recorded(
             Some(context) => context,
             None => return GateOutcome::unavailable_without_row("approval gate could not resolve reviewer: approval asks require a context".into()),
         };
+        if let Err(error) = require_live_context_for_gate(&db, context) {
+            return GateOutcome::unavailable_without_row(format!(
+                "approval gate could not admit context {context}: {error} (fail-closed — nothing was run and no ask was recorded)"
+            ));
+        }
         // A self-confirmation names the actor as its own reviewer: the row
         // is raised, and only that actor may answer it
         // (`docs/approval-identity.md`).
@@ -1878,8 +1913,8 @@ mod tests {
             .unwrap();
     }
 
-    /// An archived context runs nothing, so its gate refuses before any ask
-    /// is recorded. `Unavailable`, not `Denied` — nobody decided this, and
+    /// An archived context cannot authorize new gate work, so its gate
+    /// refuses before any ask is recorded. `Unavailable`, not `Denied` — nobody decided this, and
     /// the two teach opposite lessons.
     ///
     /// Falsified by deleting the archived guard at the top of `run_gate`:
@@ -1916,6 +1951,57 @@ mod tests {
             "the reason must name why: {}",
             outcome.reason
         );
+    }
+
+    /// A context read fault is not evidence that the context is live. The
+    /// gate must refuse before it asks a reviewer to authorize work whose
+    /// target it could not inspect.
+    #[tokio::test]
+    async fn an_unreadable_context_refuses_without_recording_an_ask() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+        let d = gate_dispatcher().await;
+        let context = register_context(&d, Some("unreadable-gate"), None, kaijutsu_types::PrincipalId::new());
+        let caller = caller_with_context(context);
+        d.kernel_db.lock().conn_for_ledger().authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+            AuthAction::Read { table_name: "contexts", .. } => Authorization::Deny,
+            _ => Authorization::Allow,
+        })).unwrap();
+
+        let outcome = run_gate(
+            d.kernel(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+
+        d.kernel_db.lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable, "an unreadable context must fail closed: {}", outcome.reason);
+        assert!(outcome.ask.is_none(), "no reviewer may authorize an unreadable context");
+        assert!(outcome.reason.contains("could not read"), "{}", outcome.reason);
+    }
+
+    /// A caller with an addressed context must not create an ask for an
+    /// absent context. Global operations keep their `None` context unchanged.
+    #[tokio::test]
+    async fn a_missing_context_refuses_without_recording_an_ask() {
+        let d = gate_dispatcher().await;
+        let caller = caller_with_context(kaijutsu_types::ContextId::new());
+
+        let outcome = run_gate(
+            d.kernel(),
+            &caller,
+            cc_spec("kaijutsu-chan"),
+            d.kernel.ledger_flows(),
+            &crate::kj::gate_policy::no_config(),
+        )
+        .await;
+
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable, "a missing context must fail closed: {}", outcome.reason);
+        assert!(outcome.ask.is_none(), "no reviewer may authorize a missing context");
+        assert!(outcome.reason.contains("not found"), "{}", outcome.reason);
     }
 
     /// Archiving a context abandons the asks it left open. They are

@@ -496,6 +496,7 @@ fn timed_drives_keep_admission_targets_through_the_client() {
         // Run the shipped tick body through rc, with the same captured transport
         // variables the scheduler supplies. Nothing is reseeded on the host.
         server.kernel_db.lock().update_context_type(context, "musician").unwrap();
+        let admission = server.kernel.admit_context(context).unwrap();
         let admitted_at = timeline.lock().playhead();
         let session = server.kernel.turns().conversations().get_or_create(context);
         let held = session.lock().await;
@@ -505,7 +506,7 @@ fn timed_drives_keep_admission_targets_through_the_client() {
             ("KJ_PHRASE".into(), "1".into()), ("KJ_HEARD".into(), "[]".into()),
         ]);
         kaijutsu_kernel::rc::run(&server.kj_dispatcher, kaijutsu_kernel::rc::RcInvocation {
-            vars, ..kaijutsu_kernel::rc::RcInvocation::new("tick", context)
+            vars, ..kaijutsu_kernel::rc::RcInvocation::new("tick", &admission)
         }, &kaijutsu_kernel::KjCaller {
             principal_id: performer, actor_id: performer, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,

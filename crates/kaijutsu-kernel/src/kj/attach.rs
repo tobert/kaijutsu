@@ -55,19 +55,24 @@ impl KjDispatcher {
         // loadout to authorize against) without adding any real authority — the
         // attach scripts assign/exercise capability themselves.
         let ctx_ref = parse_context_ref(&parsed.ctx);
-        let target_id = {
+        let (target_id, admission) = {
             let db = self.kernel_db().lock();
-            match resolve_context_ref(&ctx_ref, caller, &db) {
+            let target_id = match resolve_context_ref(&ctx_ref, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj attach: {e}")),
-            }
+            };
+            let admission = match crate::runtime::admission::ContextAdmission::acquire(&db, target_id) {
+                Ok(admission) => admission,
+                Err(e) => return KjResult::Err(format!("kj attach: {e}")),
+            };
+            (target_id, admission)
         };
 
         // Run lifecycle policy before asking the caller to switch. Accepted
         // script effects remain in the target if applying the switch later fails.
         if let Err(e) = crate::rc::run(
             self,
-            crate::rc::RcInvocation::new("attach", target_id),
+            crate::rc::RcInvocation::new("attach", &admission),
             caller,
         )
             .await
@@ -182,6 +187,23 @@ mod tests {
             contents.iter().any(|c| c.contains("attach-marker")),
             "attach script must land its content; got: {contents:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn attach_refuses_an_archived_target_before_running_lifecycle() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("archived-target"), None, principal);
+        set_context_type(&d, target, "archived-target");
+        install_attach_script(&d, "archived-target",
+            r#"kj block create --role system --kind text --content 'must-not-run'"#, "kai").await;
+        d.kernel_db().lock().archive_context(target).unwrap();
+
+        let result = d.dispatch(&[s("attach"), s(&target.to_string())], &unjoined_caller()).await;
+
+        assert!(matches!(result, KjResult::Err(ref error) if error.contains("archived")), "{result:?}");
+        assert!(!block_contents(&d, target).iter().any(|content| content == "must-not-run"));
     }
 
     /// `.kai` script for attach sees `KJ_VERB=attach` and `KJ_CONTEXT`

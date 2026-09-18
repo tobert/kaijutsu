@@ -2396,7 +2396,37 @@ failed first on context removal and document deletion, then passed with the
 retention policy. Actual SSH/RPC clients verify archive/restore and a command
 finishing after archive with its captured output and durable receipt retained.
 
-Archive admission still needs a consistent contract across execution paths.
+Archive admission now has a shared request proof. The database lock orders
+acceptance against archive; accepted preparation keeps its proof, so a later
+archive cannot remove its settlement destination. Rc borrows the proof from its
+lifecycle trigger. Interpreter construction and block publication remain usable
+by accepted work. Capabilities, command hooks and approval keep their own checks.
+
+Tests first showed archived shell calls returning handles and archived prompts
+and chat drafts changing the transcript before refusal. Admission now precedes
+those mutations. Paused worker tests cover accepted interactive, structured,
+quiet, streaming and editor requests across archive. MCP read-only and writable
+shells refuse before receipts; headless turns refuse before publishing work.
+Archive state and unresolved-ask cleanup now share a transaction or nested
+savepoint. Injected sweep failures roll both back even when an outer caller
+catches the error, and an already archived row can retry cleanup. Gate and
+archive label reads fail explicitly instead of treating a read fault as absence.
+The gate repeats the canonical state check under its final database guard.
+A regression pauses input capture after the early check and archives the
+context; without the final check it creates a pending ask, and with it no ask
+is recorded. Redemption uses the same check before spending an answer.
+
+The proof does not own an asynchronous task. Interactive model preparation
+still needs to move under the existing worker before its first await; the
+caller-lifetime audit remains part of the execution migration.
+
+Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
+passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
+the source (72,000 input / 907 output tokens), with no confirmed defect. Its
+proposed RC recheck would reject a lifecycle already accepted before archive;
+the race test preserves that lifecycle instead. Review and disposition are in
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/admission-*`.
+
 Index eligibility is separate: `kj search --all` skips archived contexts, while
 the semantic watcher sees terminal blocks without context-state filtering.
 Recorded Amy's suggested don't-index policy, including existing vectors and

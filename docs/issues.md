@@ -277,14 +277,18 @@ Kaibo review and disposition:
 
 Contexts retain their history: `kj context remove` and its alias are deleted,
 and document deletion refuses registered contexts. Archive leaves accepted
-commands able to settle against their original blocks and receipts. Audit
-archive admission consistently across turns, preparations, pending asks, rc
-and jobs; existing archived-state checks are uneven, so archive is not yet a
-universal admission fence. Do not discard accepted outcomes or add a
-cancel-and-delete sequence. The archive handler also suppresses label-read
-errors, and an ask-sweep failure after the state update is logged but not
-retried by an already-archived call. Include explicit read failures and sweep
-recovery in that audit.
+commands able to settle against their original blocks and receipts. Runtime
+entry points now carry context admission through preparation, and rc borrows
+the triggering request's proof. Archive and unresolved-ask cleanup are atomic,
+including nested transactions and retries; read failures are explicit.
+Interactive prompt preparation remains caller-owned until the stream is
+queued, and its turn lease starts late. Move that preparation into the existing
+worker and test dropped RPC waits and shutdown before provider selection.
+Admission proof alone does not supply task ownership or observable liveness.
+Generic `executeTool` RPC still dispatches non-shell tools without context
+admission and keeps their preparation on the caller. Audit it alongside prompt
+ownership; shell tools now admit at their own runtime entry point. Preserve
+accepted nested tool execution rather than gating every broker dispatch anew.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while
@@ -1023,8 +1027,9 @@ registers an archived row as archived, so the re-join no longer collides
 with the live holder of the label (`register_with_state`, `drift.rs`). What
 remains open is whether `joinContext` on an archived context should redirect
 the client to the live holder of its label, or refuse so the MCP re-registers
-a fresh context; today it succeeds and the session works inside an archived
-context, which `ContextRow::is_archived` documents as inert.
+a fresh context. Joining still permits history inspection; new shell and model
+requests now refuse archive at admission. Choose reconnect behavior without
+silently retargeting requests intended for a retained context.
 
 ## An ask's `exec_source` shows `none` for a positional the executor ran correctly (2026-09-09)
 

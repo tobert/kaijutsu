@@ -13,6 +13,7 @@
 //! filesystem, and builtin modules implement kaish interfaces. Rc orchestration
 //! remains a distinct owner; see `docs/kaish-integration.md`.
 
+pub mod admission;
 pub mod turn_request;
 pub mod approval_resume;
 pub(crate) mod completion_notice;

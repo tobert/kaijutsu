@@ -29,6 +29,7 @@ pub(crate) fn create_operation(
 }
 
 pub(crate) struct ToolCommand {
+    pub admission: super::admission::ContextAdmission,
     pub kernel: Arc<crate::Kernel>,
     pub broker: Arc<Broker>,
     pub kaish: EmbeddedKaish,
@@ -42,6 +43,7 @@ pub(crate) struct ToolCommand {
 
 impl ToolCommand {
     pub(crate) async fn execute(self, cancel: CancellationToken) -> McpResult<KernelToolResult> {
+        debug_assert_eq!(self.admission.context(), self.call.context_id);
         let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
         let receipt = if self.foreground { None } else {
             Some(create_operation(&self.kernel, &self.call, &self.code, None).map_err(McpError::Protocol)?)
@@ -58,6 +60,7 @@ impl ToolCommand {
         let hook_depth = crate::mcp::broker::current_hook_depth();
         let host = self.kernel.clone();
         let started = host.spawn_runtime_task(move |shutdown| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+                let _admission = self.admission;
                 let stop_command = task_cancel.clone();
                 let run = CommandRunOptions { stdin: self.stdin,
                     context_switch: CommandContextSwitch::Pinned,

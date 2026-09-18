@@ -1378,8 +1378,9 @@ impl KjDispatcher {
         // Resolve the performer before validating its model assignment. The
         // final insertion repeats the liveness and reviewer checks under its
         // transaction because either can change while that async validation runs.
-        // The requester remains the author of creation and rc output.
-        {
+        // The requester remains the context creator; rc output belongs to the
+        // invoking performer.
+        let admission = {
             let played_by = {
                 let db = self.kernel_db().lock();
                 match character {
@@ -1457,7 +1458,8 @@ impl KjDispatcher {
             if let Err(e) = insert_new_context_checked(&db, &row, parent_id) {
                 return KjResult::Err(format!("kj context create: {e}"));
             }
-        }
+            crate::runtime::admission::ContextAdmission::for_inserted(&row)
+        };
 
         // Register in DriftRouter
         {
@@ -1487,7 +1489,7 @@ impl KjDispatcher {
             self,
             crate::rc::RcInvocation {
                 parent: parent_id,
-                ..crate::rc::RcInvocation::new("create", new_id)
+                ..crate::rc::RcInvocation::new("create", &admission)
             },
             caller,
         )
@@ -1553,13 +1555,13 @@ impl KjDispatcher {
     /// not as a cheerful success: the binding step is still broken and the
     /// operator needs to know that before they try to use the context.
     async fn context_rebind(&self, target_arg: Option<&str>, caller: &KjCaller) -> KjResult {
-        let row = {
+        let (row, admission) = {
             let db = self.kernel_db().lock();
             let target_id = match super::refs::resolve_context_arg(target_arg, caller, &db) {
                 Ok(id) => id,
                 Err(e) => return KjResult::Err(format!("kj context rebind: {e}")),
             };
-            match db.get_context(target_id) {
+            let row = match db.get_context(target_id) {
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return KjResult::Err(format!(
@@ -1568,7 +1570,12 @@ impl KjDispatcher {
                     ));
                 }
                 Err(e) => return KjResult::Err(format!("kj context rebind: {e}")),
-            }
+            };
+            let admission = match crate::runtime::admission::ContextAdmission::acquire(&db, target_id) {
+                Ok(admission) => admission,
+                Err(e) => return KjResult::Err(format!("kj context rebind: {e}")),
+            };
+            (row, admission)
         };
         let target_id = row.context_id;
 
@@ -1605,7 +1612,7 @@ impl KjDispatcher {
             self,
             crate::rc::RcInvocation {
                 parent: row.forked_from,
-                ..crate::rc::RcInvocation::new("create", target_id)
+                ..crate::rc::RcInvocation::new("create", &admission)
             },
             caller,
         )
@@ -2111,12 +2118,21 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj context archive: {e}")),
                 };
-            let label = db
-                .get_context(target_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.label)
-                .unwrap_or_else(|| target_id.short());
+            let label = match db.get_context(target_id) {
+                Ok(Some(row)) => row.label.unwrap_or_else(|| target_id.short()),
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj context archive: context {} not found",
+                        target_id.short()
+                    ));
+                }
+                Err(error) => {
+                    return KjResult::Err(format!(
+                        "kj context archive: could not read context {}: {error}",
+                        target_id.short()
+                    ));
+                }
+            };
             (target_id, label)
         };
 
@@ -2198,7 +2214,7 @@ impl KjDispatcher {
             paused_at: None,
             ..predecessor.clone()
         };
-        {
+        let admission = {
             let db = self.kernel_db().lock();
             let inserted = db.in_transaction(|db| {
                 insert_new_context_rows(db, &successor, parent)?;
@@ -2216,7 +2232,8 @@ impl KjDispatcher {
             if let Err(e) = inserted {
                 return KjResult::Err(format!("kj context rotate: {e}"));
             }
-        }
+            crate::runtime::admission::ContextAdmission::for_inserted(&successor)
+        };
         {
             let mut drift = self.drift_router().write();
             if let Err(e) = drift.register(successor_id, None, parent, caller.principal_id) {
@@ -2229,7 +2246,7 @@ impl KjDispatcher {
 
         if let Err(e) = crate::rc::run(
             self,
-            crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", successor_id) },
+            crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", &admission) },
             caller,
         )
         .await

@@ -1080,9 +1080,10 @@ mod tests {
             rc_depth: 0,
             privileged: false,
         };
+        let admission = d.kernel().admit_context(ctx).expect("admit create lifecycle");
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("create", ctx),
+            crate::rc::RcInvocation::new("create", &admission),
             &caller,
         )
             .await

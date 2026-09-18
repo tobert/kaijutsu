@@ -3425,6 +3425,7 @@ impl kernel::Server for KernelImpl {
         Promise::from_future(
             async move {
                 log::debug!("prompt future started for context_id={}", context_id);
+                let admission = kernel.kernel.admit_context(context_id).map_err(capnp::Error::failed)?;
 
                 // Resolve cwd from the context's durable L1 state.
                 let tool_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
@@ -3497,7 +3498,7 @@ impl kernel::Server for KernelImpl {
                 // this turn finish.
                 spawn_llm_for_prompt(
                     &kernel.kernel,
-                    context_id,
+                    admission,
                     model.as_deref(),
                     &user_block_id,
                     tool_ctx,
@@ -5807,6 +5808,7 @@ impl kernel::Server for KernelImpl {
                         }
                     }
                 } else {
+                    let admission = kernel.kernel.admit_context(context_id).map_err(capnp::Error::failed)?;
                     // Chat prompt — the draft IS the user message. Submitting is
                     // a status transition on the block they typed into, so the
                     // text is never in flight between two homes. Refuses an empty
@@ -5844,7 +5846,7 @@ impl kernel::Server for KernelImpl {
                         &kernel.kj_dispatcher,
                         kaijutsu_kernel::rc::RcInvocation {
                             vars: submit_info.vars(),
-                            ..kaijutsu_kernel::rc::RcInvocation::new(kaijutsu_kernel::rc::VERB_SUBMIT, context_id)
+                            ..kaijutsu_kernel::rc::RcInvocation::new(kaijutsu_kernel::rc::VERB_SUBMIT, &admission)
                         },
                         &rc_caller,
                     )
@@ -5885,7 +5887,7 @@ impl kernel::Server for KernelImpl {
                     // frontend is waiting on.
                     spawn_llm_for_prompt(
                         &kernel.kernel,
-                        context_id,
+                        admission,
                         None,
                         &user_block_id,
                         tool_ctx,

@@ -44,8 +44,8 @@ pub async fn execute_kj(
     let argv = argv.to_vec();
     let span = tracing::Span::current();
     let hook_depth = crate::mcp::broker::current_hook_depth();
-    kernel.spawn_runtime_task(move |stop| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
-        let result = run_kj(&owner, identity, &argv, quiet, notices, stop).await;
+    kernel.spawn_context_task(identity.context, move |admission, stop| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
+        let result = run_kj(&owner, admission, identity, &argv, quiet, notices, stop).await;
         if let Err(Err(error)) = reply.send(result) {
             tracing::error!(context = %identity.context,
                 "structured command settlement failed after its caller departed: {error}");
@@ -58,11 +58,12 @@ pub async fn execute_kj(
 }
 
 async fn run_kj(
-    kernel: &Arc<Kernel>, identity: ShellIdentity, argv: &[String], quiet: bool,
+    kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission, identity: ShellIdentity, argv: &[String], quiet: bool,
     notices: tokio::sync::mpsc::UnboundedSender<Refusal>, stop: CancellationToken,
 ) -> Result<Result<ExecutedKj, Refusal>, String> {
     if stop.is_cancelled() { return Err("kernel runtime shut down before structured execution".into()); }
-    let context = identity.context;
+    let context = admission.context();
+    debug_assert_eq!(context, identity.context);
     if kernel.kernel_db().lock().get_context(context).map_err(|e| e.to_string())?.is_none() {
         return Err("context not found".into());
     }

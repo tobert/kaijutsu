@@ -2,6 +2,10 @@
     use crate::kj::test_helpers::*;
     use kaijutsu_types::{ContextId, PrincipalId};
 
+    fn admit(d: &KjDispatcher, context: ContextId) -> crate::runtime::admission::ContextAdmission {
+        d.kernel().admit_context(context).expect("admit rc lifecycle")
+    }
+
     #[tokio::test]
     async fn rc_snapshots_programs_but_reads_companion_data_at_execution() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -16,7 +20,8 @@
             kj block create --role system --kind text --content-type text/markdown < /config/rc/snapshot/create/S10-author.md
         "#).await;
         install_rc_script_file(&d, "/config/rc/snapshot/create/S10-author.md", "old data").await;
-        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        let admission = admit(&d, ctx);
+        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
         assert_eq!(instructions.len(), 1);
@@ -84,7 +89,8 @@
             std::path::Path::new("/config/rc/mddata/create/S10-missing.md"),
             std::path::Path::new("missing-target.md"),
         ).await.unwrap();
-        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        let admission = admit(&d, ctx);
+        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
         assert!(d.block_store().block_snapshots(ctx).unwrap().is_empty());
         let run = find_run_for_context(&d, ctx, "create").unwrap();
         assert_eq!(run.script_count, Some(0));
@@ -120,7 +126,8 @@
             } else {
                 install_rc_script_file(&d, path, program).await;
             }
-            crate::rc::run(&d, RcInvocation::new("create", ctx), &caller).await.unwrap();
+            let admission = admit(&d, ctx);
+            crate::rc::run(&d, RcInvocation::new("create", &admission), &caller).await.unwrap();
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             let instructions: Vec<_> = blocks.iter()
                 .filter(|b| b.role == Role::System && b.kind == BlockKind::Text).collect();
@@ -151,7 +158,8 @@
                 d.kernel().vfs().write_all(std::path::Path::new(&format!("{path}.txt")),
                     &[b'a', 0xff, b'\n']).await.unwrap();
             }
-            crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+            let admission = admit(&d, ctx);
+            crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             assert!(!blocks.iter().any(|b| b.kind == BlockKind::Text));
             assert!(blocks.iter().any(|b| b.kind == BlockKind::Error), "input failure must be visible");
@@ -171,7 +179,8 @@
             kj block create --role system --kind text < "$0.txt"
         "#).await;
         install_rc_script_file(&d, "/config/rc/precedence/create/S00-instructions.kai.txt", "").await;
-        crate::rc::run(&d, RcInvocation::new("create", ctx), &caller_with_context(ctx)).await.unwrap();
+        let admission = admit(&d, ctx);
+        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
         assert_eq!(instructions.len(), 2);
@@ -184,9 +193,11 @@
     async fn unknown_lifecycle_verb_is_an_error() {
         let d = test_dispatcher().await;
         let caller = unjoined_caller();
+        let context = register_context(&d, Some("unknown-verb"), None, caller.principal_id);
+        let admission = admit(&d, context);
         let result = crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("cretae", ContextId::new()),
+            crate::rc::RcInvocation::new("cretae", &admission),
             &caller,
         ).await;
         assert!(result.is_err(), "an unknown lifecycle verb must not succeed without running");
@@ -560,11 +571,12 @@
         ]
         .into_iter()
         .collect();
+        let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
             crate::rc::RcInvocation {
                 vars: vars.clone(),
-                ..crate::rc::RcInvocation::new("tick", new_id)
+                ..crate::rc::RcInvocation::new("tick", &admission)
             },
             &caller,
         )
@@ -600,9 +612,10 @@
         let new_id = lookup_context_id(&d, "ctx-novars");
 
         // The plain lifecycle (no extra vars) leaves the heartbeat unset.
+        let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", new_id),
+            crate::rc::RcInvocation::new("tick", &admission),
             &caller,
         )
             .await
@@ -644,9 +657,10 @@
             "fixture must use two distinct principals or the assertion is vacuous"
         );
 
+        let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", new_id),
+            crate::rc::RcInvocation::new("tick", &admission),
             &visitor,
         )
             .await
@@ -751,9 +765,10 @@
         let visitor = unjoined_caller();
         assert_ne!(owner.principal_id, visitor.principal_id);
 
+        let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", new_id),
+            crate::rc::RcInvocation::new("tick", &admission),
             &visitor,
         )
             .await
@@ -821,12 +836,13 @@
             .unwrap();
 
         let caller = caller_with_context(child);
+        let admission = admit(&d, child);
         crate::rc::run(
             &d,
             crate::rc::RcInvocation {
                 parent: Some(parent),
                 fork_kind: Some(fork_kind),
-                ..crate::rc::RcInvocation::new("fork", child)
+                ..crate::rc::RcInvocation::new("fork", &admission)
             },
             &caller,
         )
@@ -1252,9 +1268,10 @@
         set_context_type(&d, target, "test");
 
         let caller = caller_with_context(target);
+        let admission = admit(&d, target);
         let res = crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("attach", target),
+            crate::rc::RcInvocation::new("attach", &admission),
             &caller,
         )
             .await;
@@ -1265,6 +1282,33 @@
             contents.iter().any(|c| c.contains("attach-banner-content")),
             "attach script must author its instruction; got: {contents:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn admitted_lifecycle_finishes_its_snapshot_after_archive() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let target = register_context(&d, Some("admitted-then-archived"), None, principal);
+        set_context_type(&d, target, "archive-race");
+        for (order, marker) in [("S00", "first"), ("S10", "second")] {
+            install_rc_script_file(&d,
+                &format!("/config/rc/archive-race/tick/{order}-marker.kai"),
+                &format!("kj block create --role system --kind text --content '{marker}'"),
+            ).await;
+        }
+        let admission = admit(&d, target);
+        d.kernel_db().lock().archive_context(target).unwrap();
+
+        crate::rc::run(&d, RcInvocation::new("tick", &admission), &caller_with_context(target))
+            .await.expect("accepted lifecycle survives later archive");
+
+        let contents = block_contents_in(&d, target);
+        assert!(contents.iter().any(|content| content == "first"), "{contents:?}");
+        assert!(contents.iter().any(|content| content == "second"), "{contents:?}");
+        let run = find_run_for_context(&d, target, "tick").expect("durable lifecycle run");
+        assert_eq!(run.script_count, Some(2));
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
     }
 
     #[tokio::test]
@@ -1338,6 +1382,7 @@ esac
         let src = register_context(&d, Some("src"), None, principal);
 
         let caller = caller_with_context(dst);
+        let admission = admit(&d, dst);
         let res = crate::rc::run(
             &d,
             crate::rc::RcInvocation {
@@ -1347,7 +1392,7 @@ esac
                     target_ctx: dst,
                     source_model: Some("claude-opus-4-7".into()),
                 }),
-                ..crate::rc::RcInvocation::new("drift", dst)
+                ..crate::rc::RcInvocation::new("drift", &admission)
             },
             &caller,
         )
@@ -1384,6 +1429,7 @@ esac
         let child = register_context(&d, Some("child"), Some(parent), principal);
 
         let caller = caller_with_context(child);
+        let admission = admit(&d, parent);
         let res = crate::rc::run(
             &d,
             crate::rc::RcInvocation {
@@ -1393,7 +1439,7 @@ esac
                     target_ctx: parent,
                     source_model: None,
                 }),
-                ..crate::rc::RcInvocation::new("drift", parent)
+                ..crate::rc::RcInvocation::new("drift", &admission)
             },
             &caller,
         )

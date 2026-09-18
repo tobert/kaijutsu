@@ -24,8 +24,8 @@ pub(crate) async fn read_shell(
     let kernel = dispatcher.kernel().clone();
     let depth = crate::mcp::broker::current_hook_depth();
     let span = tracing::Span::current();
-    kernel.spawn_runtime_task(move |shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
-        let run = execute(&dispatcher, identity, &code, cancel.clone());
+    kernel.spawn_context_task(identity.context, move |admission, shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
+        let run = execute(&dispatcher, admission, identity, &code, cancel.clone());
         tokio::pin!(run);
         let result = tokio::select! {
             biased;
@@ -38,8 +38,9 @@ pub(crate) async fn read_shell(
 }
 
 async fn execute(
-    dispatcher: &KjDispatcher, identity: ShellIdentity, code: &str, cancel: CancellationToken,
+    dispatcher: &KjDispatcher, admission: super::admission::ContextAdmission, identity: ShellIdentity, code: &str, cancel: CancellationToken,
 ) -> Result<String, String> {
+    debug_assert_eq!(admission.context(), identity.context);
     let kaish = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err("editor shell read cancelled before execution".into()),

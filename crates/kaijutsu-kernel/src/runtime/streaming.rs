@@ -32,9 +32,9 @@ pub async fn execute(
     let cancel = cancel.child_token();
     let depth = crate::mcp::broker::current_hook_depth();
     let span = tracing::Span::current();
-    kernel.spawn_runtime_task(move |shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
+    kernel.spawn_context_task(identity.context, move |admission, shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
         let run = async {
-            let (kaish, call, replacement) = match prepare(&owner, identity, &code, &cancel).await {
+            let (kaish, call, replacement) = match prepare(&owner, admission, identity, &code, &cancel).await {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(refusal)) => { let _ = ready.send(Ok(Err(refusal))); return; }
                 Err(error) => { let _ = ready.send(Err(error)); return; }
@@ -71,8 +71,9 @@ pub async fn execute(
 type Prepared = (EmbeddedKaish, crate::mcp::CallContext, Option<CommandOutcome>);
 
 async fn prepare(
-    kernel: &Arc<Kernel>, identity: ShellIdentity, code: &str, cancel: &CancellationToken,
+    kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission, identity: ShellIdentity, code: &str, cancel: &CancellationToken,
 ) -> Result<Result<Prepared, Refusal>, String> {
+    debug_assert_eq!(admission.context(), identity.context);
     let kaish = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err("streaming command cancelled before execution".into()),

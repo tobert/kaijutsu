@@ -330,6 +330,13 @@ async fn act_on_executable_answer(
         let claim = if matches!(answer.status, crate::ApprovalStatus::Allowed) {
             match db.get_context(context_id) {
                 Ok(Some(row)) if context_row_is_live(&row) => {
+                    let admission = match super::admission::ContextAdmission::acquire(&db, context_id) {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            tracing::error!(ask = %answer.request_id, %error, "could not admit approved execution; retaining the answer");
+                            return ExecAction::Deferred;
+                        }
+                    };
                     let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
                         && row.played_by != Some(ask.actor);
                     let claim = db.in_transaction(|db| {
@@ -340,7 +347,7 @@ async fn act_on_executable_answer(
                             &super::completion_notice::Source::Approval(answer.request_id.clone()), suppression)?;
                         Ok(true)
                     });
-                    Some((claim, performer_changed))
+                    Some((claim, performer_changed, admission))
                 }
                 Ok(_) => {
                     tracing::info!("gate-resume: {context_id} is no longer live; leaving ask {} unclaimed", answer.request_id);
@@ -378,7 +385,8 @@ async fn act_on_executable_answer(
         return ExecAction::Settled;
     }
 
-    let (claim, performer_changed) = claim.expect("allowed answers attempt a claim");
+    let (claim, performer_changed, admission) = claim.expect("allowed answers attempt a claim");
+    debug_assert_eq!(admission.context(), context_id);
     match claim {
         Ok(true) => {}
         Ok(false) => {

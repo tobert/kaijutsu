@@ -192,6 +192,7 @@ impl KjDispatcher {
         edge_metadata: String,
         caller: &KjCaller,
     ) -> Result<(), String> {
+        let admission = self.kernel().admit_context(target_ctx)?;
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
         // belongs to an outsider, so it carries the SENDER — the performer,
@@ -240,7 +241,7 @@ impl KjDispatcher {
                     target_ctx,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, target_ctx)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
             },
             caller,
         )
@@ -502,6 +503,10 @@ impl KjDispatcher {
             let router = self.drift_router().read();
             router.get(source_id).and_then(|h| h.model.clone())
         };
+        let admission = match self.kernel().admit_context(context_id) {
+            Ok(admission) => admission,
+            Err(error) => return KjResult::Err(format!("kj drift pull: {error}")),
+        };
         let after = self.block_store().last_block_id(context_id);
 
         // `pull` is a send the caller performs on their own behalf: they asked
@@ -545,7 +550,7 @@ impl KjDispatcher {
                     target_ctx: context_id,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, context_id)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
             },
             caller,
         )
@@ -626,6 +631,10 @@ impl KjDispatcher {
             let router = self.drift_router().read();
             router.get(context_id).and_then(|h| h.model.clone())
         };
+        let admission = match self.kernel().admit_context(target_id) {
+            Ok(admission) => admission,
+            Err(error) => return KjResult::Err(format!("kj drift merge: {error}")),
+        };
         let after = self.block_store().last_block_id(target_id);
         // `merge` sends the child's distillation up to the parent — the
         // performer is the sender, and the block lands in a context they may
@@ -668,7 +677,7 @@ impl KjDispatcher {
                     target_ctx: target_id,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, target_id)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
             },
             caller,
         )
@@ -758,6 +767,15 @@ impl KjDispatcher {
                 failed.push(drift);
                 continue;
             }
+            let admission = match self.kernel().admit_context(drift.target_ctx) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    tracing::warn!(target = %drift.target_ctx.short(),
+                        "drift flush: {error}, requeuing");
+                    failed.push(drift);
+                    continue;
+                }
+            };
             let after = self.block_store().last_block_id(drift.target_ctx);
             // The author is whoever STAGED this item, not whoever is running
             // flush — see `StagedDrift::staged_by`.
@@ -814,7 +832,7 @@ impl KjDispatcher {
                                 target_ctx: drift.target_ctx,
                                 source_model: drift.source_model.clone(),
                             }),
-                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, drift.target_ctx)
+                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
                         },
                         caller,
                     )

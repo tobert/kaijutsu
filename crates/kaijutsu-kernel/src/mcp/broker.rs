@@ -4573,10 +4573,44 @@ fn shrink_json_to_budget(value: &mut serde_json::Value, budget: usize) -> bool {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn archive_during_gate_input_capture_leaves_no_pending_ask() {
+        use crate::kj::gate::{GateSpec, GateVerdict, GatedStatement, run_gate};
+        use approval_ledger::types::{Origin, VarBinding};
+        let dispatcher = crate::kj::test_helpers::test_dispatcher_persistent().await;
+        let context = crate::kj::test_helpers::register_rooted_context(&dispatcher,
+            Some("gate-archive-race"), kaijutsu_types::PrincipalId::new());
+        let caller = crate::kj::test_helpers::caller_with_context(context);
+        let kernel = dispatcher.kernel();
+        let held = kernel.broker().bindings.write().await;
+        let config = crate::kj::gate_policy::no_config();
+        let gate = run_gate(kernel, &caller, GateSpec {
+            publishes_pair: false, origin: Origin::KjVerb,
+            instance: "builtin.kj".into(), tool: "cc.send".into(), hook_id: None,
+            description: "gate archive race".into(), authorized_label: "gate-race".into(),
+            statements: vec![GatedStatement {
+                rendered: "kj cc send ${TARGET} ${MESSAGE}".into(), statement_kind: "kj_verb".into(),
+                vars: vec![("MESSAGE".into(), VarBinding::Free)], source_index: None,
+            }],
+            exec_source: None, exec_stdin: None, planned: Vec::new(),
+        }, kernel.ledger_flows(), &config);
+        tokio::pin!(gate);
+        assert!(futures::poll!(&mut gate).is_pending(), "capture waits after the first context check");
+        kernel.kernel_db().lock().archive_context(context).unwrap();
+        drop(held);
+        let outcome = gate.await;
+        assert_eq!(outcome.verdict, GateVerdict::Unavailable, "{}", outcome.reason);
+        assert!(outcome.reason.contains("archived"), "{}", outcome.reason);
+        assert!(outcome.ask.is_none());
+        assert_eq!(kernel.kernel_db().lock().conn_for_ledger().query_row(
+            "SELECT count(*) FROM approvals", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn dropped_tool_after_admission_cancels_and_settles_its_operation() {
         use crate::runtime::{embedded_kaish::EmbeddedKaish, tool_command::ToolCommand};
-        let kernel = Arc::new(crate::Kernel::new_ephemeral("dropped-admitted-tool").await);
-        let context = ContextId::new();
+        let dispatcher = crate::kj::test_helpers::test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel().clone();
+        let context = crate::kj::test_helpers::register_context(&dispatcher, Some("dropped-admitted-tool"), None, PrincipalId::system());
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, held) = std::sync::mpsc::channel();
@@ -4588,6 +4622,7 @@ mod tests {
         let kaish = EmbeddedKaish::new("dropped-admitted-tool", kernel.blocks().clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(context);
         let call = ToolCommand {
+            admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: kernel.broker().clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
@@ -4620,8 +4655,9 @@ mod tests {
     #[tokio::test]
     async fn dropped_tool_policy_wait_leaves_no_unowned_operation() {
         use crate::runtime::{embedded_kaish::EmbeddedKaish, tool_command::ToolCommand};
-        let kernel = Arc::new(crate::Kernel::new_ephemeral("cancelled-tool-admission").await);
-        let context = ContextId::new();
+        let dispatcher = crate::kj::test_helpers::test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel().clone();
+        let context = crate::kj::test_helpers::register_context(&dispatcher, Some("cancelled-tool-admission"), None, PrincipalId::system());
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let broker = kernel.broker().clone();
         let held = broker.policies.write().await;
@@ -4629,6 +4665,7 @@ mod tests {
         kaish.set_context_id(context);
         let mut events = kernel.block_flows().subscribe("block.*");
         let call = ToolCommand {
+            admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: broker.clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),

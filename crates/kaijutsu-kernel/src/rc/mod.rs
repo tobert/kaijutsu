@@ -23,6 +23,7 @@
 //!
 
 use crate::runtime::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
+use crate::runtime::admission::ContextAdmission;
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
 use crate::runtime::synthesis::NoopBlockSource;
@@ -161,7 +162,8 @@ fn verb_is_wired(verb: &str) -> bool {
 /// Facts captured for one lifecycle run. Extra variables are scoped to this run.
 pub struct RcInvocation<'a> {
     pub verb: &'a str,
-    pub context: ContextId,
+    /// Proof that the lifecycle trigger was accepted while the context was live.
+    pub admission: &'a ContextAdmission,
     pub parent: Option<ContextId>,
     pub fork_kind: Option<ForkKind>,
     pub drift: Option<DriftInfo>,
@@ -169,8 +171,8 @@ pub struct RcInvocation<'a> {
 }
 
 impl<'a> RcInvocation<'a> {
-    pub fn new(verb: &'a str, context: ContextId) -> Self {
-        Self { verb, context, parent: None, fork_kind: None, drift: None, vars: HashMap::new() }
+    pub fn new(verb: &'a str, admission: &'a ContextAdmission) -> Self {
+        Self { verb, admission, parent: None, fork_kind: None, drift: None, vars: HashMap::new() }
     }
 }
 
@@ -179,7 +181,7 @@ impl<'a> RcInvocation<'a> {
 /// context or discovery failures return an error to the caller.
 #[tracing::instrument(
     skip(dispatcher, invocation, caller),
-    fields(verb = %invocation.verb, ctx = %invocation.context.short(), rc_depth = caller.rc_depth),
+    fields(verb = %invocation.verb, ctx = %invocation.admission.context().short(), rc_depth = caller.rc_depth),
 )]
 pub async fn run(
     dispatcher: &KjDispatcher,
@@ -187,7 +189,7 @@ pub async fn run(
     caller: &KjCaller,
 ) -> Result<(), String> {
     let verb = invocation.verb;
-    let new_id = invocation.context;
+    let new_id = invocation.admission.context();
     if !verb_is_wired(verb) {
         return Err(format!("rc lifecycle: unknown verb '{verb}'; expected {}", RC_VERBS.join(", ")));
     }
@@ -417,7 +419,7 @@ async fn run_kai_script(
 ) -> ScriptRunResult {
     use kaijutsu_types::SessionId;
 
-    let new_id = invocation.context;
+    let new_id = invocation.admission.context();
     let parent_id = invocation.parent;
     let fork_kind = invocation.fork_kind;
     let drift_info = invocation.drift.as_ref();

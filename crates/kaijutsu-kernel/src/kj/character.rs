@@ -209,7 +209,7 @@ impl KjDispatcher {
     /// played by it, with no parent. `requester` becomes `created_by`.
     async fn ensure_root_context(&self, character: PrincipalId, requester: PrincipalId) -> Result<ContextId, String> {
         let new_id = ContextId::new();
-        let name = {
+        let (name, admission) = {
             let db = self.kernel_db().lock();
             let sheet = db
                 .get_character(character)
@@ -257,7 +257,8 @@ impl KjDispatcher {
                 db.set_character_root_ctx(character, Some(new_id))
             })
             .map_err(|e| format!("could not create the root context '{}': {e}", sheet.name))?;
-            sheet.name
+            let admission = crate::runtime::admission::ContextAdmission::for_inserted(&row);
+            (sheet.name, admission)
         };
 
         self.drift_router()
@@ -277,7 +278,7 @@ impl KjDispatcher {
         };
         crate::rc::run(
             self,
-            crate::rc::RcInvocation::new("create", new_id),
+            crate::rc::RcInvocation::new("create", &admission),
             &rc_caller,
         )
             .await

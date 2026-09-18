@@ -565,7 +565,7 @@ impl KjDispatcher {
         let child_tail = self.block_store().last_block_id(new_id);
 
         // Write-through: KernelDb then DriftRouter
-        {
+        let admission = {
             let mut db = self.kernel_db().lock();
 
             // Inherit workspace + cast from source — a fork is the same
@@ -705,7 +705,8 @@ impl KjDispatcher {
                 }
                 Err(e) => return KjResult::Err(format!("kj fork: {e}")),
             }
-        }
+            crate::runtime::admission::ContextAdmission::for_inserted(&row)
+        };
 
         // Register in DriftRouter (inherits parent's model)
         {
@@ -808,7 +809,7 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(fork_kind),
-                ..crate::rc::RcInvocation::new("fork", new_id)
+                ..crate::rc::RcInvocation::new("fork", &admission)
             },
             caller,
         )
@@ -940,7 +941,7 @@ impl KjDispatcher {
         }
 
         // Write-through: KernelDb then DriftRouter
-        {
+        let admission = {
             let mut db = self.kernel_db().lock();
 
             let source_ws = source_row.workspace_id;
@@ -1012,7 +1013,8 @@ impl KjDispatcher {
                     "kj fork --compact: failed to insert structural edge: {e}"
                 ));
             }
-        }
+            crate::runtime::admission::ContextAdmission::for_inserted(&row)
+        };
 
         {
             let mut drift = self.drift_router().write();
@@ -1079,7 +1081,7 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(ForkKind::Compact),
-                ..crate::rc::RcInvocation::new("fork", new_id)
+                ..crate::rc::RcInvocation::new("fork", &admission)
             },
             caller,
         )
@@ -1172,8 +1174,9 @@ impl KjDispatcher {
         let new_root_id = id_map[&template_root_id];
 
         // Create new contexts (BFS order — template_nodes is already ordered by depth)
-        {
+        let admission = {
             let mut db = self.kernel_db().lock();
+            let mut root_admission = None;
 
             for (row, _depth) in &template_nodes {
                 let new_id = id_map[&row.context_id];
@@ -1231,6 +1234,11 @@ impl KjDispatcher {
                 if let Err(e) = db.insert_forked_context(&new_row, default_ws, row.context_id) {
                     return KjResult::Err(format!("kj fork --as: failed to create context: {e}"));
                 }
+                if is_root {
+                    root_admission = Some(
+                        crate::runtime::admission::ContextAdmission::for_inserted(&new_row),
+                    );
+                }
             }
 
             // Insert structural edges mirroring the template
@@ -1278,7 +1286,13 @@ impl KjDispatcher {
             if let Err(e) = db.insert_edge(&root_edge) {
                 return KjResult::Err(format!("kj fork --as: failed to insert root edge: {e}"));
             }
-        }
+            match root_admission {
+                Some(admission) => admission,
+                None => return KjResult::Err(
+                    "kj fork --as: template root was absent from its subtree snapshot".into(),
+                ),
+            }
+        };
 
         // Document acceptance acquires the document before the database.
         for (row, _depth) in &template_nodes {
@@ -1354,7 +1368,7 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(ForkKind::Subtree),
-                ..crate::rc::RcInvocation::new("fork", new_root_id)
+                ..crate::rc::RcInvocation::new("fork", &admission)
             },
             caller,
         )

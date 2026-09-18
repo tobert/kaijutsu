@@ -2036,6 +2036,13 @@ impl BeatScheduler {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return;
         };
+        let admission = match self.kernel.admit_context(ctx) {
+            Ok(admission) => admission,
+            Err(error) => {
+                log::warn!("beat: {verb} lifecycle was not admitted for context {ctx}: {error}");
+                return;
+            }
+        };
         let vars = self.transport_env(ctx);
         tokio::task::spawn_local(async move {
             let caller = KjCaller {
@@ -2052,7 +2059,7 @@ impl BeatScheduler {
                 &dispatcher,
                 kaijutsu_kernel::rc::RcInvocation {
                     vars: vars.clone(),
-                    ..kaijutsu_kernel::rc::RcInvocation::new(verb, ctx)
+                    ..kaijutsu_kernel::rc::RcInvocation::new(verb, &admission)
                 },
                 &caller,
             )
@@ -4038,6 +4045,87 @@ mod tests {
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
         (kernel, documents, db, ctx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn archived_context_does_not_fire_tick_lifecycle() {
+        tokio::task::LocalSet::new().run_until(async {
+            use kaijutsu_kernel::kernel_db::ContextRow;
+            use kaijutsu_kernel::vfs::{MemoryBackend, VfsOps};
+            use kaijutsu_kernel::KjDispatcher;
+            use kaijutsu_types::{ConsentMode, ContextState};
+            use std::path::Path;
+
+            let kernel = Arc::new(Kernel::new_ephemeral("archived-tick").await);
+            let db = kernel.kernel_db().clone();
+            let documents = kernel.blocks().clone();
+            let principal = PrincipalId::new();
+            let ctx = ContextId::new();
+            {
+                let db = db.lock();
+                let workspace = db.get_or_create_default_workspace(principal).unwrap();
+                db.insert_context_with_document(
+                    &ContextRow {
+                        context_id: ctx,
+                        label: Some("archived-tick".to_string()),
+                        provider: None,
+                        model: None,
+                        system_prompt: None,
+                        consent_mode: ConsentMode::default(),
+                        context_state: ContextState::Live,
+                        context_type: "musician".to_string(),
+                        created_at: 0,
+                        created_by: principal,
+                        forked_from: None,
+                        fork_kind: None,
+                        archived_at: None,
+                        workspace_id: None,
+                        preset_id: None,
+                        concluded_at: None,
+                        last_activity_at: None,
+                        promoted_at: None,
+                        demoted_at: None,
+                        paused_at: None,
+                        cast_id: None,
+                        origin_host: None,
+                        played_by: None,
+                        reviewer_id: None,
+                        director_id: None,
+                    },
+                    workspace,
+                )
+                .unwrap();
+            }
+            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            db.lock().archive_context(ctx).unwrap();
+            let rc = MemoryBackend::new();
+            rc.mkdir(Path::new("/musician"), 0o755).await.unwrap();
+            rc.mkdir(Path::new("/musician/tick"), 0o755).await.unwrap();
+            rc.write_all(
+                Path::new("/musician/tick/S00-marker.kai"),
+                b"kj block create --role system --kind text --content tick-must-not-run",
+            )
+            .await
+            .unwrap();
+            kernel.mount("/config/rc", rc).await;
+            let dispatcher = Arc::new(KjDispatcher::new(
+                kernel.drift().clone(),
+                documents.clone(),
+                db.clone(),
+                kernel.clone(),
+            ));
+            dispatcher.set_self_arc();
+            let scheduler = BeatScheduler::new(kernel, documents.clone()).with_dispatcher(dispatcher);
+
+            scheduler.fire_tick(ctx);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            let blocks = documents.block_snapshots(ctx).unwrap();
+            assert!(
+                blocks.iter().all(|block| block.content != "tick-must-not-run"),
+                "an archived tick must not run its lifecycle: {blocks:?}"
+            );
+        }).await;
     }
 
     /// Attach + tempo + rotate write the live clock through to the `tracks` row and

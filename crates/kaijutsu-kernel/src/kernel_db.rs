@@ -21,7 +21,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult, params};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use kaijutsu_types::{
     BackendId, BlockId, CastId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
@@ -4267,11 +4267,30 @@ impl KernelDb {
 
     /// Archive a context while retaining its history. Returns true if it was
     /// active. Clears ring placement and abandons unresolved asks without
-    /// deleting their records. Decided asks retain their answers.
-    ///
-    /// The ask sweep runs after the state change. Its failure is logged;
-    /// the context remains archived. This method does not stop running work.
+    /// deleting their records. Decided asks retain their answers. State and
+    /// sweep commit together; an already archived row retries unresolved ask
+    /// cleanup. This method does not stop running work.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.archive_context_writes(id));
+        }
+        self.conn.execute_batch("SAVEPOINT archive_context")?;
+        let result = self.archive_context_writes(id);
+        match result {
+            Ok(archived) => {
+                self.conn.execute_batch("RELEASE SAVEPOINT archive_context")?;
+                Ok(archived)
+            }
+            Err(error) => {
+                self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT archive_context; RELEASE SAVEPOINT archive_context",
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    fn archive_context_writes(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
             "UPDATE contexts
@@ -4280,24 +4299,13 @@ impl KernelDb {
              WHERE context_id = ?2 AND archived_at IS NULL",
             params![now, blob_param(id.as_bytes())],
         )?;
-        if updated > 0 {
-            match approval_ledger::decide::abandon_unresolved_for_archived_context(
-                &self.conn,
-                id.as_bytes(),
-                "the context that raised this was archived; this ask cannot authorize further work",
-            ) {
-                Ok(0) => {}
-                Ok(swept) => {
-                    info!(context = %id.short(), swept, "archived context: swept unresolved asks");
-                }
-                Err(e) => {
-                    error!(
-                        context = %id.short(),
-                        error = %e,
-                        "archived context: could not sweep its unresolved asks"
-                    );
-                }
-            }
+        let swept = approval_ledger::decide::abandon_unresolved_for_archived_context(
+            &self.conn,
+            id.as_bytes(),
+            "the context that raised this was archived; this ask cannot authorize further work",
+        )?;
+        if swept > 0 {
+            info!(context = %id.short(), swept, "archived context: swept unresolved asks");
         }
         Ok(updated > 0)
     }
@@ -9683,6 +9691,102 @@ mod tests {
         let all = db.list_all_contexts().unwrap();
         assert_eq!(all.len(), 1);
         assert!(all[0].archived_at.is_some());
+    }
+
+    fn pending_ask_for_context(db: &KernelDb, context: ContextId) -> String {
+        let principal = PrincipalId::new();
+        db.create_approval_ask(&approval_ledger::types::NewAsk {
+            context_id: context.as_bytes().to_vec(),
+            actor_id: principal.as_bytes().to_vec(),
+            reviewer_id: PrincipalId::new().as_bytes().to_vec(),
+            principal_id: principal.as_bytes().to_vec(),
+            origin: approval_ledger::types::Origin::KjVerb,
+            instance: None,
+            tool: None,
+            hook_id: None,
+            description: "archive sweep test".into(),
+            statements: vec![],
+            authorized_label: None,
+            rc_run_id: None,
+            expires_at: None,
+            options: vec![],
+            signals: vec![],
+            cwd: None,
+            exec_source: None,
+            exec_stdin: None,
+            continuation_epoch: None,
+            env: vec![],
+        }, false).unwrap()
+    }
+
+    fn approval_status(db: &KernelDb, request: &str) -> approval_ledger::types::ApprovalStatus {
+        db.get_approval(request).unwrap().expect("ask exists").status
+    }
+
+    #[test]
+    fn archive_context_rolls_back_when_its_ask_sweep_fails() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("archive-sweep-rollback"));
+        let context = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+        let request = pending_ask_for_context(&db, context);
+        db.conn.execute_batch(
+            "CREATE TRIGGER reject_archive_ask_sweep BEFORE UPDATE OF status ON approvals
+             WHEN NEW.status = 'abandoned'
+             BEGIN SELECT RAISE(ABORT, 'injected archive ask sweep failure'); END;",
+        ).unwrap();
+
+        let error = db.archive_context(context).expect_err("the failed sweep must roll back archive");
+        assert!(error.to_string().contains("injected archive ask sweep failure"), "{error}");
+        let loaded = db.get_context(context).unwrap().unwrap();
+        assert!(!loaded.is_archived(), "state change must roll back with its failed sweep");
+        assert_eq!(approval_status(&db, &request), approval_ledger::types::ApprovalStatus::Pending);
+
+        db.conn.execute("DROP TRIGGER reject_archive_ask_sweep", []).unwrap();
+        assert!(db.archive_context(context).unwrap(), "retry archives after the sweep fault clears");
+        assert_eq!(approval_status(&db, &request), approval_ledger::types::ApprovalStatus::Abandoned);
+    }
+
+    #[test]
+    fn archive_context_rolls_back_inside_a_committed_outer_transaction() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("archive-sweep-nested-rollback"));
+        let context = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+        let request = pending_ask_for_context(&db, context);
+        db.conn.execute_batch(
+            "CREATE TRIGGER reject_nested_archive_ask_sweep BEFORE UPDATE OF status ON approvals
+             WHEN NEW.status = 'abandoned'
+             BEGIN SELECT RAISE(ABORT, 'injected nested archive ask sweep failure'); END;",
+        ).unwrap();
+
+        db.in_transaction(|db| {
+            assert!(db.archive_context(context).is_err(), "the nested archive must report its failed sweep");
+            Ok(())
+        }).unwrap();
+
+        let loaded = db.get_context(context).unwrap().unwrap();
+        assert!(!loaded.is_archived(), "the caught archive error must not leak its state change into the outer commit");
+        assert_eq!(approval_status(&db, &request), approval_ledger::types::ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn archive_context_retries_the_sweep_for_an_already_archived_context() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("archive-sweep-heal"));
+        let context = row.context_id;
+        insert_context_with_doc(&db, &row, ws_id);
+        let request = pending_ask_for_context(&db, context);
+        db.conn.execute(
+            "UPDATE contexts SET archived_at = ?1, context_state = 'archived' WHERE context_id = ?2",
+            params![now_millis(), blob_param(context.as_bytes())],
+        ).unwrap();
+
+        assert!(!db.archive_context(context).unwrap(), "the historical state transition was already applied");
+        assert_eq!(approval_status(&db, &request), approval_ledger::types::ApprovalStatus::Abandoned);
     }
 
     #[test]

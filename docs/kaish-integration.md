@@ -39,8 +39,11 @@ Contexts are retained. `kj context archive <id> --confirm` removes a context
 from the active set while preserving lineage, blocks, execution receipts and
 approval history. `kj context promote <id>` restores it. There is no context
 removal command, and document deletion refuses documents owned by contexts.
-Already accepted commands retain their settlement destination across archive;
-consistent archive admission remains in the runtime audit. Index eligibility
+Already accepted commands retain their settlement destination across archive.
+The migrated execution entry points order admission against archive under the kernel database lock:
+archive first refuses new work before user input, drafts, receipts or lifecycle
+scripts change; admission first lets that request prepare and settle. Command
+hooks, approval and cancellation still apply. Index eligibility
 is separate pending policy; see `docs/issues.md`, "Context retention and index
 eligibility".
 
@@ -48,6 +51,21 @@ eligibility".
 
 These are source observations, not promises that all paths behave alike.
 
+- `runtime/admission.rs::ContextAdmission` records an accepted context request.
+  Interactive, structured, quiet, streaming, editor, MCP shell and model entry
+  points obtain it before preparation. Prompt and chat submission obtain it
+  before authoring input or promoting a draft. Rc borrows the triggering
+  request's proof; lifecycle scripts do not recheck archive between scripts.
+  Approval resume retains admission with its claim. Interpreter construction
+  and result publication stay available to accepted requests after archive.
+  Missing or unreadable context state refuses new admission explicitly.
+  Archive and unresolved-ask cleanup commit atomically, including nested
+  rotation transactions; retry also cleans asks on an already archived row.
+  Gate ask creation and redemption repeat the canonical context check under
+  their database guard, so archive during input capture cannot leave a new ask.
+  Interactive model preparation still needs the caller-lifetime audit below.
+  Generic non-shell `executeTool` RPC admission and task ownership remain open;
+  shell tools enforce this contract at their runtime entry point.
 - `src/lib.rs::spawn_kaish_thread` reserves the 16 MiB stack for dedicated
   threads that can enter kaish. The server's Tokio runtime also reserves it.
   The helper sets thread name and stack; it does not construct a shell or own

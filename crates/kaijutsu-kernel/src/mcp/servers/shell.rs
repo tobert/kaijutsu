@@ -239,6 +239,8 @@ impl McpServerLike for ShellServer {
                 reason: "kj dispatcher not wired (Broker::set_kj_dispatcher)".to_string(),
             })?;
 
+        let admission = dispatcher.kernel().admit_context(ctx.context_id).map_err(McpError::Protocol)?;
+
         // Writable submissions pass the source-program gate. Read-only shells
         // enforce their policy structurally and do not need execution approval.
         // An approved writable submission carries the directory it authorized.
@@ -341,6 +343,7 @@ impl McpServerLike for ShellServer {
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
         crate::runtime::tool_command::ToolCommand {
+            admission,
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
             code: parsed.command, stdin: parsed.stdin, foreground: parsed.foreground, read_only: self.read_only,
         }.execute(cancel).await
@@ -1646,6 +1649,32 @@ mod tests {
         assert!(d.kernel().shell_operations().cancel(&id, context).await.unwrap());
         wait_for_operation(&d, context, &id).await;
         assert_eq!(progress.expect("running jobs expose completed statement output"), b"first\n");
+    }
+
+    #[tokio::test]
+    async fn archived_context_refuses_both_shell_tools_without_receipts() {
+        for read_only in [true, false] {
+            for foreground in [true, false] {
+                let (broker, d) = wired().await;
+                let principal = PrincipalId::new();
+                let context = crate::kj::test_helpers::register_rooted_context(&d, Some("archived-tool"), principal);
+                d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+                let mut binding = ContextToolBinding::new();
+                binding.grant(Capability::Facade(if read_only { "shell" } else { "shell_write" }.into()));
+                broker.set_binding(context, binding).await.unwrap();
+                d.kernel_db().lock().archive_context(context).unwrap();
+                let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
+                    .with_actor(principal, Some(PrincipalId::new()));
+                let mut params = if read_only { call("echo must-not-run") } else { call_write("echo must-not-run") };
+                params.arguments["foreground"] = serde_json::json!(foreground);
+                let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
+                d.kernel().shutdown_runtime_worker().await.unwrap();
+                let error = result.expect_err("archived context cannot start a new shell tool");
+                assert!(error.to_string().contains("archived"), "{error}");
+                assert!(d.kernel().shell_operations().list_for_context(context).unwrap().is_empty());
+                assert!(d.block_store().block_snapshots(context).unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test]

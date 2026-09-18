@@ -37,8 +37,8 @@ pub async fn submit(
     let trace_id = kernel.drift().read().trace_id_for_context(identity.context).unwrap_or([0u8; 16]);
     let span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute");
     let depth = crate::mcp::broker::current_hook_depth();
-    kernel.spawn_runtime_task(move |stop| crate::mcp::broker::inherit_hook_depth(depth, async move {
-        match prepare(&owner, identity, source, user_initiated, &stop).await {
+    kernel.spawn_context_task(identity.context, move |admission, stop| crate::mcp::broker::inherit_hook_depth(depth, async move {
+        match prepare(&owner, admission, identity, source, user_initiated, &stop).await {
             Err(error) => {
                 if let Err(Err(error)) = reply.send(Err(error)) {
                     tracing::error!("interactive admission failed after its caller departed: {error}");
@@ -67,10 +67,12 @@ pub async fn submit(
 type PreparedExecution = (EmbeddedKaish, crate::mcp::CallContext, crate::shell_operations::ShellOperationReceipt, String);
 
 async fn prepare(
-    kernel: &Arc<Kernel>, identity: ShellIdentity, source: ShellSource, user_initiated: bool,
+    kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission,
+    identity: ShellIdentity, source: ShellSource, user_initiated: bool,
     stop: &CancellationToken,
 ) -> Result<(ShellSubmission, Option<PreparedExecution>), String> {
-    let context = identity.context;
+    let context = admission.context();
+    debug_assert_eq!(context, identity.context);
     let code = match &source {
         ShellSource::Code(code) => code.clone(),
         ShellSource::Draft(draft) => {
@@ -285,7 +287,7 @@ mod tests {
                     "CREATE TRIGGER reject_session_link BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'injected session link fault'); END;"
                 ).unwrap();
             }
-            let result = prepare(kernel, identity, ShellSource::Code("echo never-run".into()), true, &CancellationToken::new()).await;
+            let result = prepare(kernel, kernel.admit_context(identity.context).unwrap(), identity, ShellSource::Code("echo never-run".into()), true, &CancellationToken::new()).await;
             let db = kernel.kernel_db().clone();
             let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
             let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
