@@ -141,6 +141,50 @@ def write_acp_logs(
     (agent_dir / "acp-summary.json").write_text(json.dumps(summary))
 
 
+def write_acp_events_no_summary(trial_dir: Path, *, session_id: str | None) -> None:
+    """acp-events.jsonl only, no acp-summary.json: a trial Harbor killed (or
+    one still running) before the ACP runner wrote its summary."""
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    def wrap(update: dict) -> dict:
+        payload = {"update": update}
+        if session_id is not None:
+            payload["session_id"] = session_id
+        return {"event_type": "session_update", "payload": payload}
+
+    events = [
+        wrap({"sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "execute", "title": "shell"}),
+        wrap({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "in_progress"}),
+    ]
+    (agent_dir / "acp-events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+def write_acp_error_summary(trial_dir: Path, *, session_id: str, error: dict) -> None:
+    """acp-events.jsonl plus an acp-summary.json carrying an "error": the
+    shape a provider_failure/setup_failure (NonZeroAgentExitCodeError) trial
+    leaves behind."""
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "event_type": "session_update",
+            "payload": {
+                "session_id": session_id,
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "execute", "title": "shell"},
+            },
+        },
+    ]
+    (agent_dir / "acp-events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    summary = {
+        "instruction": "do the thing",
+        "session": {"sessionId": session_id},
+        "error": error,
+        "permissions_requested": 0,
+    }
+    (agent_dir / "acp-summary.json").write_text(json.dumps(summary))
+
+
 class TestSyntheticJob(unittest.TestCase):
     def test_non_acp_trial_reports_na_class_and_totals(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -406,17 +450,226 @@ class TestAcpKernelLogTokens(unittest.TestCase):
             self.assertEqual(row["tokens_source"], "agent_result")
             self.assertIsNone(row["tokens_absent_reason"])
 
-    def test_acp_txt_without_summary_json_raises(self):
+    def test_acp_txt_without_summary_or_events_degrades_via_kernel_log_single_context(self):
+        # A trial's acp-summary.json can be missing (killed before the ACP
+        # runner wrote it) while acp.txt still exists -- this is normal, not
+        # corrupt, and must never abort the whole job summary (previously
+        # this raised SystemExit; see docs/issues.md-adjacent commit history
+        # for the defect this replaces).
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = Path(tmp)
             trial_dir = job_dir / "fix-git__eee"
-            write_trial_result(trial_dir)
+            write_trial_result(trial_dir, verifier_result={"rewards": {"reward": 0.0}})
             write_acp_kernel_log(
                 trial_dir,
                 KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="end_turn", tin=1, tout=1),
             )
-            with self.assertRaises(SystemExit):
-                sj.summarize_trial(trial_dir)
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["tokens_in"], 1)
+            self.assertEqual(row["tokens_out"], 1)
+            self.assertEqual(row["tokens_source"], "kernel_log_single_context")
+            self.assertIsNone(row["tokens_absent_reason"])
+
+
+class TestDegradedTrials(unittest.TestCase):
+    """The four states a Harbor job can leave a trial in that must degrade,
+    not abort the job: a timed-out trial (events+log, no summary), a trial
+    still in progress (no result.json), a non-zero-exit trial (summary
+    carries an error), and an unresolvable multi-session kernel log."""
+
+    SESSION_ID = "01a0b4eae5567b7180dfd2d5d59e40d5"
+
+    def test_timed_out_trial_classifies_agent_timeout_via_events_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "chess-best-move__timeout"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "kaijutsu-solo-acp", "version": "0.1.0", "model_info": None},
+                agent_result={
+                    "n_input_tokens": None,
+                    "n_cache_tokens": None,
+                    "n_output_tokens": None,
+                    "cost_usd": None,
+                },
+                verifier_result={"rewards": {"reward": 0.0}},
+                exception_info={
+                    "exception_type": "AgentTimeoutError",
+                    "exception_message": "Agent execution timed out after 900.0 seconds",
+                    "occurred_at": "2026-09-18T18:06:09.778593Z",
+                },
+            )
+            write_acp_events_no_summary(trial_dir, session_id=self.SESSION_ID)
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="tool_calls", tin=40, tout=4)
+                + KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="tool_calls", tin=60, tout=6),
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["turn_end_class"], "agent_timeout")
+            self.assertEqual(row["tokens_in"], 100)
+            self.assertEqual(row["tokens_out"], 10)
+            self.assertEqual(row["llm_inferences"], 2)
+            self.assertEqual(row["tokens_source"], "kernel_log_events_session")
+            self.assertIsNone(row["tokens_absent_reason"])
+            self.assertEqual(row["timeout_last_tool_call_name"], "execute")
+            self.assertEqual(row["timeout_last_tool_call_status"], "in_progress")
+            self.assertTrue(row["ended_early"])
+
+    def test_timed_out_trial_counted_in_agent_timeouts_and_turns_ended_early(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "largest-eigenval__timeout"
+            write_trial_result(
+                trial_dir,
+                verifier_result={"rewards": {"reward": 0.0}},
+                exception_info={"exception_type": "AgentTimeoutError", "exception_message": "timed out"},
+            )
+            write_acp_events_no_summary(trial_dir, session_id=self.SESSION_ID)
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="tool_calls", tin=1, tout=1),
+            )
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["agent_timeouts"], 1)
+            self.assertEqual(totals["turns_ended_early"], 1)
+
+    def test_in_progress_trial_reported_and_excluded_from_totals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            running_dir = job_dir / "sqlite-with-gcov__running"
+            running_dir.mkdir(parents=True)
+            (running_dir / "agent").mkdir()
+            # No result.json: this trial is still executing.
+            write_trial_result(job_dir / "hello-world__done", verifier_result={"rewards": {"reward": 1.0}})
+
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+
+            statuses = {r["trial_name"]: r["trial_status"] for r in rows}
+            self.assertEqual(statuses["sqlite-with-gcov__running"], "in_progress")
+            self.assertEqual(statuses["hello-world__done"], "completed")
+            self.assertEqual(totals["n_trials"], 2)
+            self.assertEqual(totals["n_in_progress"], 1)
+            self.assertEqual(totals["n_with_reward"], 1)
+            self.assertEqual(totals["pass_rate"], 1.0)
+
+    def test_non_zero_exit_trial_reports_failure_detail_from_summary_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "db-wal-recovery__err"
+            write_trial_result(
+                trial_dir,
+                verifier_result={"rewards": {"reward": 0.0}},
+                exception_info={
+                    "exception_type": "NonZeroAgentExitCodeError",
+                    "exception_message": "Command failed (exit 1)",
+                },
+            )
+            write_acp_error_summary(
+                trial_dir,
+                session_id=self.SESSION_ID,
+                error={"type": "ConnectionError", "message": "Connection closed"},
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["turn_end_class"], "provider_failure")
+            self.assertEqual(row["failure_detail"], "Connection closed")
+            self.assertTrue(row["ended_early"])
+
+    def test_non_zero_exit_trial_recovers_detail_from_acp_txt_when_internal_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "cobol-modernization__err"
+            write_trial_result(
+                trial_dir,
+                verifier_result={"rewards": {"reward": 1.0}},
+                exception_info={
+                    "exception_type": "NonZeroAgentExitCodeError",
+                    "exception_message": "Command failed (exit 1)",
+                },
+            )
+            write_acp_error_summary(
+                trial_dir,
+                session_id=self.SESSION_ID,
+                error={"type": "RequestError", "message": "Internal error"},
+            )
+            write_acp_kernel_log(
+                trial_dir,
+                f"2026-09-18T18:18:11Z ERROR llm.turn{{context.id={dashed(self.SESSION_ID)}}}: "
+                "kaijutsu_kernel::runtime::llm_stream: LLM stream error: SSE transport: "
+                "Transport error: error decoding response body\n",
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["turn_end_class"], "provider_failure")
+            self.assertEqual(
+                row["failure_detail"],
+                "SSE transport: Transport error: error decoding response body",
+            )
+            # reward 1.0 here (Harbor's own timing edge case, like the real
+            # cobol-modernization trial) so turns_ended_early must not count
+            # this row even though the turn itself failed.
+            self.assertFalse(row["ended_early"])
+
+    def test_turn_failures_totals_and_ended_early_gated_by_reward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "db-wal-recovery__err2"
+            write_trial_result(
+                trial_dir,
+                verifier_result={"rewards": {"reward": 0.0}},
+                exception_info={"exception_type": "NonZeroAgentExitCodeError", "exception_message": "boom"},
+            )
+            write_acp_error_summary(
+                trial_dir, session_id=self.SESSION_ID, error={"type": "ConnectionError", "message": "closed"}
+            )
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["turn_failures"], 1)
+            self.assertEqual(totals["turns_ended_early"], 1)
+
+    def test_ambiguous_kernel_log_context_ids_reports_absent_with_ids_seen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__ambiguous"
+            write_trial_result(trial_dir, verifier_result={"rewards": {"reward": 0.0}})
+            # Only acp.txt: no acp-events.jsonl, no acp-summary.json, and two
+            # distinct context ids with nothing to disambiguate between them.
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed("a" * 32), stop="end_turn", tin=1, tout=1)
+                + KERNEL_LOG_TEMPLATE.format(ctx=dashed("b" * 32), stop="end_turn", tin=2, tout=2),
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertIsNone(row["tokens_in"])
+            self.assertIsNone(row["tokens_source"])
+            self.assertIsNotNone(row["tokens_absent_reason"])
+            self.assertIn("2 distinct context ids", row["tokens_absent_reason"])
+
+    def test_median_duration_seconds_solved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            write_trial_result(
+                job_dir / "t__1",
+                verifier_result={"rewards": {"reward": 1.0}},
+                started_at="2026-09-18T14:00:00Z",
+                finished_at="2026-09-18T14:01:00Z",  # 60s
+            )
+            write_trial_result(
+                job_dir / "t__2",
+                verifier_result={"rewards": {"reward": 1.0}},
+                started_at="2026-09-18T14:00:00Z",
+                finished_at="2026-09-18T14:03:00Z",  # 180s
+            )
+            write_trial_result(
+                job_dir / "t__3",
+                verifier_result={"rewards": {"reward": 0.0}},
+                started_at="2026-09-18T14:00:00Z",
+                finished_at="2026-09-18T14:20:00Z",  # 1200s, but unsolved -- excluded
+            )
+            rows = [sj.summarize_trial(d) for d in sj.find_trial_dirs(job_dir)]
+            totals = sj.compute_totals(rows)
+            self.assertEqual(totals["median_duration_seconds_solved"], 120.0)
 
 
 class TestRealOracleJobs(unittest.TestCase):

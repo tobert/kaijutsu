@@ -212,6 +212,96 @@ class TestStopReasonClasses(unittest.TestCase):
         self.assertEqual(cls, "provider_failure")
         self.assertTrue(evidence["session_established"])
 
+    def test_no_summary_and_no_trial_result_stays_unclassified(self):
+        # No acp-summary.json, and nothing telling us why -- must not guess.
+        cls, evidence = cr.classify_turn_end(
+            summary=None,
+            tools_by_recency=[],
+            tool_states={},
+            message_text="",
+            thought_text="",
+            unawaited_async_operations=[],
+            spilled_last_two=[],
+            last_edit_id=None,
+            successful_execution_after_edit=False,
+        )
+        self.assertEqual(cls, "unclassified_stop_reason")
+        self.assertEqual(evidence["reason"], "no acp-summary.json data available")
+
+    def test_no_summary_with_non_timeout_exception_stays_unclassified(self):
+        # A trial_result is available but names a different exception --
+        # only AgentTimeoutError earns the agent_timeout class.
+        cls, _ = cr.classify_turn_end(
+            summary=None,
+            tools_by_recency=[],
+            tool_states={},
+            message_text="",
+            thought_text="",
+            unawaited_async_operations=[],
+            spilled_last_two=[],
+            last_edit_id=None,
+            successful_execution_after_edit=False,
+            trial_result={"exception_info": {"exception_type": "RuntimeError"}},
+        )
+        self.assertEqual(cls, "unclassified_stop_reason")
+
+    def test_no_summary_with_agent_timeout_exception_classifies_and_reports_evidence(self):
+        tool_states = {
+            "t1": cr.ToolCallState("t1", 0, kind="execute", title="shell"),
+        }
+        tool_states["t1"].status = "in_progress"
+        cls, evidence = cr.classify_turn_end(
+            summary=None,
+            tools_by_recency=["t1"],
+            tool_states=tool_states,
+            message_text="",
+            thought_text="",
+            unawaited_async_operations=[],
+            spilled_last_two=[],
+            last_edit_id=None,
+            successful_execution_after_edit=False,
+            trial_result={
+                "exception_info": {
+                    "exception_type": "AgentTimeoutError",
+                    "exception_message": "Agent execution timed out after 900.0 seconds",
+                    "occurred_at": "2026-09-18T18:06:09.778593Z",
+                }
+            },
+            inference_count=7,
+        )
+        self.assertEqual(cls, "agent_timeout")
+        self.assertEqual(evidence["last_tool_call_name"], "execute")
+        self.assertEqual(evidence["last_tool_call_status"], "in_progress")
+        self.assertEqual(evidence["inferences_so_far"], 7)
+        # No event timestamps supplied in this synthetic call, so the
+        # seconds-since figure is honestly unavailable, not guessed.
+        self.assertIsNone(evidence["seconds_since_last_event"])
+        self.assertEqual(evidence["seconds_since_last_event_source"], "unavailable")
+
+    def test_agent_timeout_seconds_since_last_event_computed_when_timestamps_present(self):
+        cls, evidence = cr.classify_turn_end(
+            summary=None,
+            tools_by_recency=[],
+            tool_states={},
+            message_text="",
+            thought_text="",
+            unawaited_async_operations=[],
+            spilled_last_two=[],
+            last_edit_id=None,
+            successful_execution_after_edit=False,
+            trial_result={
+                "exception_info": {
+                    "exception_type": "AgentTimeoutError",
+                    "occurred_at": "2026-09-18T18:06:40.000000Z",
+                }
+            },
+            latest_event_epoch_ms=1789754770000.0,  # 2026-09-18T18:06:10Z
+            latest_event_epoch_ms_source="operation_receipt_timestamps",
+        )
+        self.assertEqual(cls, "agent_timeout")
+        self.assertAlmostEqual(evidence["seconds_since_last_event"], 30.0, places=3)
+        self.assertEqual(evidence["seconds_since_last_event_source"], "operation_receipt_timestamps")
+
 
 class TestEndTurnFamily(unittest.TestCase):
     def test_yielded_on_ask(self):
@@ -635,6 +725,160 @@ class TestShellCommandStats(unittest.TestCase):
         self.assertEqual(report["shell_tool_calls_total"], 2)
         self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 1)
         self.assertIn("1 of 2", report["shell_tool_calls_raw_input_reason"])
+
+
+class TestAgentTimeoutInAnalyzeRun(unittest.TestCase):
+    """analyze_run's summary=None + trial_result path end to end, not just
+    classify_turn_end's slice of it -- proves the last-tool-call lookup and
+    the top-level timeout_* fields actually reach the report."""
+
+    def test_timed_out_run_reports_agent_timeout_and_last_tool_call(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell", raw_input={"command": "pytest -x"}),
+            tool_call_update("t1", status="in_progress"),
+        ]
+        trial_result = {
+            "exception_info": {
+                "exception_type": "AgentTimeoutError",
+                "exception_message": "Agent execution timed out after 900.0 seconds",
+                "occurred_at": "2026-09-18T18:06:09.778593Z",
+            }
+        }
+        report = cr.analyze_run(events, None, trial_result=trial_result)
+        self.assertEqual(report["turn_end_class"], "agent_timeout")
+        self.assertEqual(report["timeout_last_tool_call_name"], "execute")
+        self.assertEqual(report["timeout_last_tool_call_status"], "in_progress")
+        # No timestamped events in this fixture: honestly unavailable.
+        self.assertIsNone(report["timeout_seconds_since_last_event"])
+        self.assertEqual(report["timeout_seconds_since_last_event_source"], "unavailable")
+
+    def test_non_timeout_fields_are_null_for_a_normal_run(self):
+        events = [message_chunk("all done")]
+        report = cr.analyze_run(events, base_summary())
+        self.assertNotEqual(report["turn_end_class"], "agent_timeout")
+        self.assertIsNone(report["timeout_last_tool_call_name"])
+        self.assertIsNone(report["timeout_last_tool_call_status"])
+        self.assertIsNone(report["timeout_seconds_since_last_event"])
+
+
+class TestFailureDetail(unittest.TestCase):
+    def test_none_when_summary_has_no_error(self):
+        self.assertIsNone(cr.failure_detail_for(base_summary(), None))
+        self.assertIsNone(cr.failure_detail_for(None, None))
+
+    def test_message_used_directly_when_not_generic(self):
+        summary = {"error": {"type": "ConnectionError", "message": "Connection closed"}}
+        self.assertEqual(cr.failure_detail_for(summary, None), "Connection closed")
+
+    def test_truncated_to_300_chars(self):
+        summary = {"error": {"type": "RequestError", "message": "x" * 400}}
+        detail = cr.failure_detail_for(summary, None)
+        self.assertEqual(len(detail), 300)
+
+    def test_internal_error_falls_back_to_acp_txt_llm_stream_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            acp_log = Path(tmp) / "acp.txt"
+            acp_log.write_text(
+                "2026-09-18T18:18:11Z ERROR llm.turn{context.id=01a0b5b3-10c3-7060-b41f-0676da1bf43c}: "
+                "kaijutsu_kernel::runtime::llm_stream: LLM stream error: SSE transport: "
+                "Transport error: error decoding response body\n"
+            )
+            summary = {"error": {"type": "RequestError", "message": "Internal error"}}
+            detail = cr.failure_detail_for(summary, acp_log)
+            self.assertEqual(detail, "SSE transport: Transport error: error decoding response body")
+
+    def test_internal_error_without_matching_acp_txt_line_keeps_generic_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            acp_log = Path(tmp) / "acp.txt"
+            acp_log.write_text("nothing relevant here\n")
+            summary = {"error": {"type": "RequestError", "message": "Internal error"}}
+            self.assertEqual(cr.failure_detail_for(summary, acp_log), "Internal error")
+
+    def test_missing_acp_log_path_keeps_generic_message(self):
+        summary = {"error": {"type": "RequestError", "message": "Internal error"}}
+        self.assertEqual(cr.failure_detail_for(summary, None), "Internal error")
+
+
+class TestSessionResolution(unittest.TestCase):
+    SESSION_ID = "01a0b4eae5567b7180dfd2d5d59e40d5"
+
+    def test_session_ids_in_events_collects_distinct_normalized_ids(self):
+        events = [
+            {"event_type": "session_update", "payload": {"session_id": self.SESSION_ID, "update": {}}},
+            {"event_type": "session_update", "payload": {"session_id": self.SESSION_ID, "update": {}}},
+            {"event_type": "on_connect", "payload": {}},
+        ]
+        self.assertEqual(cr.session_ids_in_events(events), [self.SESSION_ID])
+
+    def test_session_ids_in_events_empty_when_none_carry_one(self):
+        events = [{"event_type": "session_update", "payload": {"update": {}}}]
+        self.assertEqual(cr.session_ids_in_events(events), [])
+
+    def test_context_ids_in_kernel_log_collects_distinct_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text(
+                TestKernelLogParsing.LOG_TEMPLATE.format(
+                    ctx="01a0b4ea-e556-7b71-80df-d2d5d59e40d5", stop="tool_calls", tin=1, tout=1
+                )
+            )
+            self.assertEqual(cr.context_ids_in_kernel_log(log_path), [self.SESSION_ID])
+
+    def test_resolve_prefers_summary_over_events_and_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text("no matching lines\n")
+            summary = {"session": {"sessionId": self.SESSION_ID}}
+            session_id, source, ids_seen = cr.resolve_session_id(summary, None, log_path)
+            self.assertEqual(session_id, self.SESSION_ID)
+            self.assertEqual(source, "acp_summary")
+            self.assertEqual(ids_seen, [self.SESSION_ID])
+
+    def test_resolve_falls_back_to_single_session_id_in_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text("no matching lines\n")
+            events = [{"event_type": "session_update", "payload": {"session_id": self.SESSION_ID, "update": {}}}]
+            session_id, source, _ = cr.resolve_session_id(None, events, log_path)
+            self.assertEqual(session_id, self.SESSION_ID)
+            self.assertEqual(source, "acp_events")
+
+    def test_resolve_falls_back_to_single_context_id_in_kernel_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text(
+                TestKernelLogParsing.LOG_TEMPLATE.format(
+                    ctx="01a0b4ea-e556-7b71-80df-d2d5d59e40d5", stop="end_turn", tin=1, tout=1
+                )
+            )
+            session_id, source, _ = cr.resolve_session_id(None, None, log_path)
+            self.assertEqual(session_id, self.SESSION_ID)
+            self.assertEqual(source, "kernel_log_single_context")
+
+    def test_resolve_reports_ambiguous_ids_when_several_distinct_context_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text(
+                TestKernelLogParsing.LOG_TEMPLATE.format(
+                    ctx="01a0b4ea-e556-7b71-80df-d2d5d59e40d5", stop="end_turn", tin=1, tout=1
+                )
+                + TestKernelLogParsing.LOG_TEMPLATE.format(
+                    ctx="01a0b4ed-374f-70a1-b442-1afe1bf2eff7", stop="end_turn", tin=2, tout=2
+                )
+            )
+            session_id, source, ids_seen = cr.resolve_session_id(None, None, log_path)
+            self.assertIsNone(session_id)
+            self.assertIsNone(source)
+            self.assertEqual(len(ids_seen), 2)
+
+    def test_resolve_no_lines_at_all_reports_empty_ids_seen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "acp.txt"
+            log_path.write_text("nothing here\n")
+            session_id, source, ids_seen = cr.resolve_session_id(None, None, log_path)
+            self.assertIsNone(session_id)
+            self.assertIsNone(source)
+            self.assertEqual(ids_seen, [])
 
 
 class TestRealData(unittest.TestCase):
