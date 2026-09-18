@@ -93,9 +93,30 @@ for img in "docker.io/library/debian:bookworm-slim" "docker.io/library/ubuntu:24
         sh -c 'for b in "$@"; do "/dist/${b}" --help >"/tmp/${b}.out" 2>&1; echo "${b} exit=$?"; head -2 "/tmp/${b}.out"; done' sh "${BINS[@]}"
 done
 
+# Stamp the build's source revision beside the binaries. A run's provenance
+# records the worktree HEAD at run time, which can move after a build; this
+# file is what ties a binary's sha256 to the commit it was compiled from.
+BUILD_INFO="${OUT_DIR}/BUILD_INFO.json"
+{
+    printf '{\n  "commit": "%s",\n' "$(git -C "${WORKTREE}" rev-parse HEAD)"
+    if [[ -n "$(git -C "${WORKTREE}" status --porcelain --untracked-files=no)" ]]; then
+        printf '  "dirty": true,\n'
+    else
+        printf '  "dirty": false,\n'
+    fi
+    printf '  "built_at": "%s",\n  "sha256": {\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    last="${BINS[-1]}"
+    for b in "${BINS[@]}"; do
+        sep=","; [[ "${b}" == "${last}" ]] && sep=""
+        printf '    "%s": "%s"%s\n' "${b}" "$(sha256sum "${OUT_DIR}/${b}" | cut -d' ' -f1)" "${sep}"
+    done
+    printf '  }\n}\n'
+} > "${BUILD_INFO}"
+cat "${BUILD_INFO}"
+
 echo "==> [5/5] packaging"
 TARBALL="${PKG_DIR}/kaijutsu-agent-linux-x86_64.tar.gz"
-tar -C "${OUT_DIR}" -czf "${TARBALL}" "${BINS[@]}"
+tar -C "${OUT_DIR}" -czf "${TARBALL}" "${BINS[@]}" "BUILD_INFO.json"
 sha256sum "${TARBALL}"
 ls -lh "${TARBALL}"
 

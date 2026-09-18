@@ -1,5 +1,9 @@
 # Bench: an ACP client driving a throwaway kaijutsu kernel
 
+`docs/benchmarks.md` is the rerun recipe end to end — setup, static build,
+suites under Harbor, results, and the recorded baselines. This file is the
+host loop.
+
 These scripts stand up a disposable kaijutsu kernel, point Harbor's standalone
 ACP runner at it through `kaijutsu-acp`, and run one task unattended. Nothing
 here touches the operator's kernel: the run gets its own XDG trees, its own

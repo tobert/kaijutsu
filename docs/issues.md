@@ -557,6 +557,20 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   its dumpable flag, which stops a same-uid reader but not root. A provider key
   that reaches the kernel by environment is readable there; use a run-scoped
   key in a disposable container.
+- **`--consent` on a context is accepted and does nothing.** `kj context
+  create --consent` and `kj context set --consent` both write
+  `ContextRow.consent_mode` through the shared `ContextConfigArgs`
+  (`kj/context.rs:38-40`, flattened into `Create` at `:125` and `Set` at
+  `:156`; the write is `db.update_settings` at `:551`). The turn loop never
+  reads that row: `runtime/llm_stream.rs:1755` takes
+  `kernel.consent_mode().await`, the kernel-wide value, under a TODO at
+  `:1751-1754` that names the split and points here. So a per-context consent
+  mode is stored, reported back by `kj context info` (`:1011`), and ignored by
+  the iteration cap it appears to set. `kaijutsu-solo-acp --consent` is the
+  available workaround and sets the kernel-wide value
+  (`Kernel::set_consent_mode`, `kernel.rs:1904`), which is why the benchmark
+  arms carry a consent mode at all. Decide per-context resolution or retire
+  the field; see "Consent setting ownership" above for the constraints.
 
 ## `SoloState::prepare(None)` shares one temp-directory registry per test binary (2026-09-18)
 

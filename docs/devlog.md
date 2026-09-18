@@ -2795,3 +2795,105 @@ director allowed to cast its children with `set --as`, an ask on create would
 have put more friction on a create than on the create-then-set path it equals.
 Amy chose parity instead: `create --as` needs Operator and a live character
 caller, like `set --as`.
+
+## The benchmark that measured the harness (September 18)
+
+Amy had been running a coder context for local work and noticed something:
+*"it seems to stop more readily than other agents, we might need to try some
+coder contexts and see how they do and see what we need to tune."* The
+question was not how kaijutsu scores. *"We are* **not** *chasing high benchmark
+numbers, mostly using it to set our own personal bests and really using it to
+see what we need to do make kaijutsu make sense to others."* A benchmark was
+the cheapest way to make a turn's behavior observable with no person in the
+room, because the absence of the person is the condition being measured. The
+rerun recipe is `docs/benchmarks.md`.
+
+**One door, not one per benchmark.** Terminal-Bench's own runner is gone;
+Terminal-Bench, SWE-bench, aider-polyglot and about a hundred more now run
+through Harbor. Harbor speaks ACP to an agent it launches inside the task
+container, and kaijutsu already had an ACP bridge. So the integration is one
+seam — ACP — against one meta-harness, and every dataset Harbor adapts comes
+along with it. The literature pushed the same way: harness spread rivals model
+spread, and two harnesses at nearly equal pass rates can differ 40x in tokens
+per solved task. That is the number this work actually watches, and it is why a
+control arm on the same model matters more than a score.
+
+**A binary, not a mode.** Harbor launches one command in a container that has
+never heard of kaijutsu. Amy: *"maybe a new binary that combines acp and kernel
+into an all-in-one with all the startup stuff?"* — named `kaijutsu-solo-acp`
+*"so it's obvious what it is"*. A flag on `kaijutsu-acp` would have put a
+kernel's whole startup — state directory, keys, root identity, config trees,
+model defaults, a performer distinct from its reviewer — behind a conditional
+in a bridge whose job is to be a bridge. The separate crate also keeps the wire
+real: the kernel listens on loopback and the bridge dials it over SSH and Cap'n
+Proto, so nothing works here that would not work against a shared kernel. Amy
+read it as product work too — *"some of these bootstrap things can be built
+into kaijutsu that might be handy for any new user"* — and the throwaway-kernel
+script has been shrinking as each step landed in the binary.
+
+**The gate got a tier, not a longer list.** A benchmark container needs no
+human in the loop, and an allow list cannot say that: an allow covers a command
+key, never its arguments, so `python3 build.py > log 2>&1` and
+`cargo test | tee out` drop back to the gate no matter how long the list grows.
+`uncovered = "allow"` decides the leftovers instead. It keeps every precedence
+above it — explicit `ask` and `deny` keys, learned ledger rules, and the
+structural veto all still fire; the tier is decided last, and a section's own
+setting beats `[global]`. It is absent from the shipped file and belongs only
+where the kernel is disposable, because it also removes every PreCall hook.
+
+**The workspace is a mount, not a permission.** A model writes where the kernel
+mounts a directory read-write, and the set was hardcoded to `$HOME/src` and
+`/tmp`. `--rw-mount` made it a boot decision an operator declares, and
+`kaijutsu-solo-acp --mount` is the same seam; solo additionally mounts the
+directory it was launched in, which is exactly what an ACP client means when it
+starts an agent in a project. The mount table still freezes at boot, so the
+perimeter stays a launch decision and no verb widens it.
+
+**What the first runs said.** Four findings, in the order they cost tokens.
+An approved command's output never reaches the model: the ACP client sees the
+real output land on the same tool call, while the model gets only a notice that
+the action ran. In a pair of runs on the same task, the run where every command
+asked spent 35 inferences and 1.09M input tokens against 9 and 173K for the run
+where those commands were allowed — about twenty of the extra calls were the
+model hunting for a result it had already produced. A turn can end before its
+ask is offered: an ask was raised, the turn ended 70 ms later, and the round
+trip to a decision measures around 337 ms, so the ask stayed pending, the
+command never ran, and the client saw no permission request at all. A truncated
+tool call fails the whole turn: on `regex-log` the model's `write` arrived with
+its JSON cut off mid-string, the stream raised a parse error, and the client
+saw "Internal error" — the model never learned its own call had been cut. And
+the iteration cap assumes a human: `sqlite-with-gcov` stopped at "Paused after
+50 agentic iteration(s) (consent: collaborative). Send a follow-up to
+continue", which a driven worker cannot do for itself. `--consent autonomous`
+and `--max-tokens` are the operator's workarounds; the failure modes are open
+in `docs/issues.md`.
+
+**Two settings that quietly did nothing.** The gate's config loader accepted
+any `[context_type.<name>]` section without checking the name against the rc
+tree, and the shipped `gate.toml` was carrying a `[context_type.explorer]`
+section that had been inert since that type was renamed to toolie. Validating
+section names found it. The second is still open: `kj context create --consent`
+and `kj context set --consent` write `ContextRow.consent_mode`, and the turn
+loop reads only the kernel-wide value — `runtime/llm_stream.rs` carries a TODO
+saying exactly that. The flag is accepted and changes nothing. Both have the
+same shape: a setting with a writer and no reader is worse than a missing one,
+because it answers the question you were about to ask about it.
+
+**Process, three lessons.** Kaibo reviews earned their place four times in one
+day: the throwaway-kernel scripts were writing a fresh host key into the
+operator's real `~/.ssh/known_hosts` at every boot and failing the next run on
+a reused port; the solo binary leaked its temporary state directory when the
+kernel died under a live client; the key scan reported "clean" for a `grep`
+that had errored rather than found nothing; and the gate's unvalidated section
+names turned up the dead `explorer` section. Second: a full
+`cargo check --workspace --tests` after each rebase, not a plain
+`cargo build --workspace`, which skips test targets — that is what caught a new
+`create_shared_kernel` call site a sibling session had added. Third: check that
+a test can go red. Mutating a lane's new classifier tests showed the red
+evidence was muddled, and the mutations that do fail are now named in the
+commit that introduced them.
+
+Credits: Claude Fable 5.1 led, Claude Opus and Claude Sonnet built the lanes,
+and kaibo's DeepSeek V4 Flash cast reviewed every slice. Model spend for the
+day's runs was about $0.15 on `deepseek-v4-flash`, roughly $0.02 per
+Terminal-Bench task.
