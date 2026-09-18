@@ -2283,6 +2283,27 @@ checks refusal, absent ask, preserved raw execution, and one source execution.
 Cancellation/panic recovery read failures, abandonment failure, and prolonged
 storage-fault admission pressure remain in the inventory.
 
+Interrupted commands now keep one outcome before attempting storage. A dropped
+review could retain its refusal after a failed write, while outer cancellation
+read SQLite, found no result, and constructed a different refusal without the
+ask ID. The immutable retry owner correctly rejected that second result. Read
+failure in the same recovery lookup could instead bypass command settlement
+and job completion altogether.
+
+The command owner now carries its admitted receipt and caches its first
+interrupted outcome. Drop, cancellation and panic recovery reuse that exact
+result without database reads. Normal settlement uses the same owner; captured
+attempts no longer return a storage-read error before settlement. Removed the
+receipt-free terminal lookup API that existed only for this recovery path.
+Fault injection covers failed writes and refused reads with and without a
+transcript pair, plus cancellation/panic before an ask. Jobs complete while
+retention reports its storage fault, and retry settles once without source replay.
+Failed ask abandonment remains a separate disposition audit. Validation passed
+3,194 kernel tests (6 ignored) and 32 SSH gate tests, including shutdown refusal
+and retry under interrupted-review retention faults. DeepSeek found no concrete
+regression in the cached receipt, interruption result, or lock ordering.
+Workspace all-targets checking also passed.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

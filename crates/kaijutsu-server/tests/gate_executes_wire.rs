@@ -1467,7 +1467,7 @@ fn sequential_result_reviews_keep_the_same_hook_snapshot() {
 #[test]
 fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
     run_local(async {
-        for quiet in [false, true] {
+        for (quiet, storage_fault) in [(false, false), (true, false), (false, true), (true, true)] {
             let s = seats().await;
             s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
                 id: HookId("structured-shutdown-review".into()), match_instance: None,
@@ -1482,8 +1482,21 @@ fn shutdown_settles_quiet_and_authored_structured_result_reviews() {
             let kaijutsu_client::RpcError::Refused(refusal) = error else { panic!("expected pending review: {error}") };
             assert_eq!(refusal.kind, kaijutsu_types::RefusalKind::Pending);
             let ask = refusal.ask.unwrap().request_id;
-            tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
-                .await.expect("shutdown must settle retained structured review").unwrap();
+            let conn = rusqlite::Connection::open(&s.db_path).unwrap();
+            if storage_fault {
+                conn.execute_batch(if quiet {
+                    "CREATE TRIGGER fail_interrupt BEFORE UPDATE OF final_json ON shell_result_reviews BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
+                } else {
+                    "CREATE TRIGGER fail_interrupt BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
+                }).unwrap();
+            }
+            let shutdown = tokio::time::timeout(std::time::Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
+                .await.expect("shutdown must finish interrupted execution");
+            if storage_fault {
+                assert!(shutdown.unwrap_err().contains("interrupted retention fault"));
+                conn.execute_batch("DROP TRIGGER fail_interrupt").unwrap();
+                s.kernel.kernel.shutdown_runtime_worker().await.unwrap();
+            } else { shutdown.unwrap(); }
             assert_eq!(s.kernel.kernel_db.lock().get_approval(&ask).unwrap().unwrap().status, kaijutsu_kernel::ApprovalStatus::Abandoned);
             let review = s.kernel.kernel.shell_operations().result_review_for_ask(&ask, s.worker).unwrap().unwrap();
             assert_eq!(review.operation_id.is_none(), quiet);

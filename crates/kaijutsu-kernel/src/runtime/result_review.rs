@@ -11,6 +11,8 @@ pub(super) struct CommandResultReview {
     pub call: crate::mcp::CallContext,
     pub pair: Option<(BlockId, BlockId)>,
     pub captured: CommandOutcome,
+    operation: Option<crate::shell_operations::ShellOperationState>,
+    interrupted: parking_lot::Mutex<Option<CommandOutcome>>,
     pub cancel: tokio_util::sync::CancellationToken,
     pub notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
 }
@@ -41,12 +43,9 @@ impl ReviewGuard<'_> {
 impl Drop for ReviewGuard<'_> {
     fn drop(&mut self) {
         if !self.armed { return; }
+        let outcome = self.owner.interrupt(
+            "Result review was interrupted; captured execution was not repeated.", Some(&self.ask.request_id));
         if let Err(error) = self.abandon() { tracing::error!("could not abandon interrupted result review: {error}"); }
-        let mut outcome = self.owner.captured.clone();
-        outcome.hook = Some(CommandHookEffect::Refused {
-            reason: "Result review was interrupted; captured execution was not repeated.".into(),
-            refusal: None, waiting: false, ask_id: Some(self.ask.request_id.clone()),
-        });
         if let Err(error) = self.owner.settle(&outcome)
         {
             tracing::error!("could not settle interrupted result review: {error}");
@@ -58,16 +57,15 @@ impl Drop for ReviewGuard<'_> {
 impl crate::mcp::broker::ResultReview for CommandResultReview {
     fn record_ask(&self, conn: &rusqlite::Connection, request: &str) -> crate::kernel_db::KernelDbResult<()> {
         use crate::kernel_db::KernelDbError;
-        use rusqlite::OptionalExtension;
-        let operation: Option<String> = match self.pair {
-            Some((command, output)) => Some(conn.query_row(
-                "SELECT operation_id FROM shell_operations WHERE context_id=?1 AND command_block_id=?2 AND output_block_id=?3",
-                rusqlite::params![self.call.context_id.as_bytes(), command.to_key(), output.to_key()], |row| row.get(0),
-            ).optional()?.ok_or_else(|| KernelDbError::Validation("result review pair has no durable operation receipt".into()))?),
-            None => None,
+        let operation = match (self.pair, &self.operation) {
+            (Some((command, output)), Some(operation))
+                if operation.receipt.context_id == self.call.context_id
+                    && operation.receipt.command_block_id == command && operation.receipt.output_block_id == output => Some(operation.receipt.operation_id.as_str()),
+            (None, None) => None,
+            _ => return Err(KernelDbError::Validation("result review pair has no matching admission receipt".into())),
         };
         crate::shell_operations::ShellOperationRegistry::checkpoint_result_review_in(
-            conn, &self.review_id, operation.as_deref(), &self.call, &self.waiting_outcome(request))
+            conn, &self.review_id, operation, &self.call, &self.waiting_outcome(request))
     }
 
     async fn wait_for_review(&self, ask: &AskRef) -> McpResult<()> {
@@ -82,36 +80,35 @@ impl crate::mcp::broker::ResultReview for CommandResultReview {
 impl CommandResultReview {
     pub(super) fn new(
         kernel: Arc<crate::Kernel>, call: crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
+        operation: Option<crate::shell_operations::ShellOperationState>,
         captured: CommandOutcome, cancel: tokio_util::sync::CancellationToken,
         notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
     ) -> Self {
-        Self { kernel, review_id: uuid::Uuid::now_v7().to_string(), call, pair, captured, cancel, notices }
+        Self { kernel, review_id: uuid::Uuid::now_v7().to_string(), call, pair, captured, operation,
+            interrupted: parking_lot::Mutex::new(None), cancel, notices }
     }
 
     pub(super) fn settle(&self, outcome: &CommandOutcome) -> Result<(), String> {
         match self.pair {
-            Some((command, output)) => super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, outcome, None),
+            Some((command, output)) => super::command::settle_known_outcome(&self.kernel, self.call.context_id, &command, &output, outcome, None, self.operation.as_ref()),
             None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome),
         }
     }
 
-    /// A dropped review wait may already have retained its terminal result.
-    /// Preserve that exact record when the surrounding command is interrupted.
-    pub(super) fn interrupted_outcome(&self, reason: &str) -> Result<CommandOutcome, String> {
-        let settled = match self.pair {
-            Some((_, output)) => match self.kernel.shell_operations().get_by_output(&output, self.call.context_id)? {
-                Some(operation) => self.kernel.shell_operations().outcome(&operation.receipt.operation_id, self.call.context_id)?,
-                None => None,
-            },
-            None => self.kernel.shell_operations().settled_result_review(&self.review_id, self.call.context_id)?,
-        };
-        if let Some(outcome) = settled { return Ok(outcome); }
-        let mut outcome = self.captured.clone();
-        outcome.hook = Some(CommandHookEffect::Refused {
-            reason: reason.into(),
-            refusal: None, waiting: false, ask_id: None,
-        });
-        Ok(outcome)
+    /// Cancellation and unwinding share the first interrupted outcome, even
+    /// before storage accepts it. Recovery never needs a successful DB read.
+    pub(super) fn interrupted_outcome(&self, reason: &str) -> CommandOutcome {
+        self.interrupt(reason, None)
+    }
+
+    fn interrupt(&self, reason: &str, ask: Option<&str>) -> CommandOutcome {
+        self.interrupted.lock().get_or_insert_with(|| {
+            let mut outcome = self.captured.clone();
+            outcome.hook = Some(CommandHookEffect::Refused {
+                reason: reason.into(), refusal: None, waiting: false, ask_id: ask.map(str::to_owned),
+            });
+            outcome
+        }).clone()
     }
 
     fn waiting_outcome(&self, request: &str) -> CommandOutcome {
@@ -126,10 +123,7 @@ impl CommandResultReview {
     async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
         use approval_ledger::types::ApprovalStatus;
         let waiting = self.waiting_outcome(&ask.request_id);
-        if let Some((command, output)) = self.pair {
-            super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, &waiting, None)
-                .map_err(McpError::Protocol)?;
-        }
+        if self.pair.is_some() { self.settle(&waiting).map_err(McpError::Protocol)?; }
         if let Some(notices) = &self.notices {
             let refusal = McpError::gate_pending(None, Some(ask.clone()),
                 "Captured execution awaits result review; approval continues processing without running source again.".into())
@@ -209,11 +203,61 @@ mod tests {
             }).unwrap();
         let ask = crate::kj::gate::ask_ref(request_id, approval_ledger::types::ApprovalStatus::Pending);
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
-        let review = CommandResultReview::new(kernel, call, pair,
+        let admitted = operation.as_ref().map(|id| kernel.shell_operations().get(id, context).unwrap().unwrap());
+        let review = CommandResultReview::new(kernel, call, pair, admitted,
             CommandOutcome::new(CommandExecution::Completed(
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
             tokio_util::sync::CancellationToken::new(), None);
         (review, ask, operation)
+    }
+
+    #[tokio::test]
+    async fn interrupted_review_keeps_one_outcome_through_storage_faults() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for authored in [true, false] {
+            for read_fault in [false, true] {
+                let (review, ask, operation) = fixture(authored).await;
+                review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
+                let mut wait = Box::pin(review.wait_for_review(&ask));
+                std::future::poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                }).await;
+                {
+                    let db = review.kernel.kernel_db().lock();
+                    if read_fault {
+                        db.conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                            AuthAction::Read { table_name: "shell_operations" | "shell_result_reviews", .. } => Authorization::Deny,
+                            _ => Authorization::Allow,
+                        })).unwrap();
+                    } else {
+                        db.conn_for_ledger().execute_batch(if authored {
+                            "CREATE TRIGGER fail_interrupt BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
+                        } else {
+                            "CREATE TRIGGER fail_interrupt BEFORE UPDATE OF final_json ON shell_result_reviews BEGIN SELECT RAISE(ABORT, 'interrupted retention fault'); END;"
+                        }).unwrap();
+                    }
+                }
+                drop(wait);
+                let pending = review.kernel.shell_operations().pending_retention(10).unwrap();
+                assert_eq!(pending.len(), 1, "dropped review must retain its result even when receipt reads fail");
+                let interrupted = review.interrupted_outcome("outer cancellation");
+                assert_eq!(serde_json::to_value(&interrupted).unwrap(), serde_json::to_value(&pending[0].1).unwrap(),
+                    "cancellation must keep the exact interrupted result already owned by retention");
+                {
+                    let db = review.kernel.kernel_db().lock();
+                    db.conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+                    if !read_fault { db.conn_for_ledger().execute_batch("DROP TRIGGER fail_interrupt").unwrap(); }
+                }
+                review.settle(&interrupted).unwrap();
+                super::super::command::retry_retained_outcomes(&review.kernel, 10).unwrap();
+                assert!(review.kernel.shell_operations().retention_failures().is_empty());
+                let saved = review.kernel.shell_operations().result_review_for_ask(&ask.request_id, review.call.context_id).unwrap().unwrap();
+                assert_eq!(saved.operation_id, operation);
+                assert_eq!(serde_json::to_value(saved.settled.unwrap()).unwrap(), serde_json::to_value(interrupted).unwrap());
+                review.kernel.shutdown_runtime_worker().await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

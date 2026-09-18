@@ -411,14 +411,6 @@ impl ShellOperationRegistry {
         tx.commit().map_err(Into::into)
     }
 
-    pub(crate) fn settled_result_review(&self, review: &str, context: ContextId) -> OperationResult<Option<CommandOutcome>> {
-        let json: Option<Option<String>> = self.db.lock().conn_for_ledger().query_row(
-            "SELECT final_json FROM shell_result_reviews WHERE review_id=?1 AND context_id=?2",
-            rusqlite::params![review, context.as_bytes()], |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
-        json.flatten().map(|json| serde_json::from_str(&json).map_err(|e| e.to_string())).transpose()
-    }
-
     pub fn result_review_for_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ResultReviewState>> {
         let row: Option<(String, Option<String>, String, Option<String>)> = self.db.lock().conn_for_ledger().query_row(
             "SELECT r.review_id,r.operation_id,r.outcome_json,r.final_json FROM shell_result_reviews r

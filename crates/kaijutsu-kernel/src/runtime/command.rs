@@ -97,7 +97,7 @@ pub fn settle_outcome(
     settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref())
 }
 
-fn settle_known_outcome(
+pub(super) fn settle_known_outcome(
     kernel: &Kernel, context_id: ContextId, command_block_id: &BlockId, output_block_id: &BlockId,
     outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>, operation: Option<&crate::shell_operations::ShellOperationState>,
 ) -> Result<(), String> {
@@ -332,9 +332,9 @@ pub async fn run_into_blocks(
     if let Some(ready) = run.job_ready.take() { let _ = ready.send(()); }
     let job_output = run.job_output;
     let attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
-        Some((*command_block_id, *output_block_id)), options, run, streams).await?;
+        Some((*command_block_id, *output_block_id)), operation, options, run, streams).await;
     let outcome = &attempt.outcome;
-    let settled = settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, None, operation.as_ref());
+    let settled = attempt.review.settle(outcome);
     if let Some((manager, job, sender)) = tracked_job {
         let result = outcome.exec_result();
         let streams_result = match job_output {
@@ -360,7 +360,7 @@ pub async fn run_without_blocks(
     if let Some(stdin) = run.stdin.take() { options = options.with_stdin(stdin); }
     if let Some(cancel) = run.cancel.clone() { options.cancel_token = Some(cancel); }
     let attempt = capture_and_review(kaish, code, kernel, call_ctx.context_id, call_ctx,
-        None, options, run, None).await?;
+        None, None, options, run, None).await;
     let settled = attempt.review.settle(&attempt.outcome);
     attempt.finish(settled)
 }
@@ -388,9 +388,10 @@ impl CommandAttempt {
 async fn capture_and_review(
     kaish: &EmbeddedKaish, code: &str, kernel: &Arc<Kernel>, context: ContextId,
     call: &crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
+    operation: Option<crate::shell_operations::ShellOperationState>,
     options: kaish_kernel::ExecuteOptions, run: CommandRunOptions<'_>,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
-) -> Result<CommandAttempt, String> {
+) -> CommandAttempt {
     let started = std::time::Instant::now();
     let cancel = options.cancel_token.clone().unwrap_or_default();
     let mut captured_outcome = None;
@@ -412,26 +413,19 @@ async fn capture_and_review(
         }
     };
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call.clone(),
-        pair, outcome.clone(), cancel, run.review_notices);
+        pair, operation, outcome.clone(), cancel, run.review_notices);
     if panic.is_none() {
         match std::panic::AssertUnwindSafe(Box::pin(finish_result_hooks(&mut outcome, code, kernel, call, run.hooks, &review)))
             .catch_unwind().await {
-            Ok(Ok(true)) => outcome.elapsed_ms = started.elapsed().as_millis() as u64,
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => return Err(error),
+            Ok(true) => outcome.elapsed_ms = started.elapsed().as_millis() as u64,
+            Ok(false) => {}
             Err(payload) => {
-                outcome = match review.interrupted_outcome("Result processing panicked; captured execution was not repeated.") {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        tracing::error!("could not recover result after hook panic: {error}");
-                        std::panic::resume_unwind(payload);
-                    }
-                };
+                outcome = review.interrupted_outcome("Result processing panicked; captured execution was not repeated.");
                 panic = Some(payload);
             }
         }
     }
-    Ok(CommandAttempt { outcome, review, panic })
+    CommandAttempt { outcome, review, panic }
 }
 
 async fn capture_command(
@@ -527,7 +521,7 @@ async fn finish_result_hooks(
     outcome: &mut CommandOutcome, code: &str, kernel: &Kernel,
     call: &crate::mcp::CallContext, invocation: Option<CommandHooks<'_>>,
     review: &super::result_review::CommandResultReview,
-) -> Result<bool, String> {
+) -> bool {
     if review.cancel.is_cancelled() && match &outcome.execution {
         CommandExecution::NotRun => true,
         CommandExecution::Completed(result) => result.original_code.unwrap_or(result.code) == 130,
@@ -535,15 +529,15 @@ async fn finish_result_hooks(
     } {
         // Cancellation already settled execution. Do not invent a hook refusal
         // or start result hooks after their owner has stopped.
-        return Ok(true);
+        return true;
     }
     let completed = tokio::select! {
         biased;
         _ = review.cancel.cancelled() => false,
         _ = Box::pin(apply_result_hooks(outcome, code, kernel, call, invocation, Some(review))) => true,
     };
-    if !completed { *outcome = review.interrupted_outcome("Result processing was cancelled; captured execution was not repeated.")?; }
-    Ok(completed)
+    if !completed { *outcome = review.interrupted_outcome("Result processing was cancelled; captured execution was not repeated."); }
+    completed
 }
 
 async fn apply_result_hooks(
@@ -837,6 +831,77 @@ mod fill_tests {
         let dir = tempfile::tempdir().unwrap();
         let recovered = Kernel::new("retention-recovered", dir.path(), blocks, db).await;
         assert_eq!(recovered.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().envelope.unwrap().stdout, "retained");
+    }
+
+    struct InterruptWithReadFault {
+        kernel: std::sync::Weak<Kernel>,
+        cancel: tokio_util::sync::CancellationToken,
+        panic: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::Hook for InterruptWithReadFault {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+            use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Read { table_name: "shell_operations" | "shell_result_reviews", .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })).unwrap();
+            if self.panic { panic!("interrupted storage sentinel"); }
+            self.cancel.cancel();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_capture_reaches_retention_and_jobs_without_database_reads() {
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId};
+        use rusqlite::hooks::{AuthContext, Authorization};
+        for panic in [false, true] {
+            let kernel = Arc::new(Kernel::new_ephemeral("interrupted-storage").await);
+            let context = ContextId::new();
+            let documents = kernel.blocks();
+            documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let command = documents.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+            let output = documents.insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+            let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(), command, output,
+                "counted-capture", None).unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let kaish = EmbeddedKaish::with_identity("interrupted-storage", documents.clone(), kernel.clone(), None,
+                crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                    reviewer: None, context, session: kaijutsu_types::SessionId::new() },
+                crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+                super::super::embedded_kaish::OutputProfile::Internal, move |_, _, tools| { tools.register(CountedCapture(count)); }).unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+                id: HookId("interrupt-storage".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::Invoke(HookBody::Builtin { name: "interrupt-storage".into(), hook: Arc::new(InterruptWithReadFault {
+                    kernel: Arc::downgrade(&kernel), cancel: cancel.clone(), panic,
+                }) }),
+            });
+            let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
+            let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "counted-capture", context, &command, &output, &kernel, &call,
+                CommandRunOptions { cancel: Some(cancel), ..Default::default() })).catch_unwind().await;
+            if panic { assert_eq!(result.unwrap_err().downcast_ref::<&str>().copied(), Some("interrupted storage sentinel")); }
+            else { assert!(result.unwrap().is_err(), "settlement must report the injected storage fault"); }
+            let pending = kernel.shell_operations().pending_retention(10).unwrap();
+            assert_eq!(pending.len(), 1, "interruption must hand captured execution to retention before returning");
+            let outcome = &pending[0].1;
+            let CommandExecution::Completed(raw) = &outcome.execution else { panic!("lost interrupted capture") };
+            assert_eq!(raw.text_out(), "captured exactly once");
+            let jobs = kernel.context_job_manager(context);
+            let job = jobs.list().await.into_iter().next().unwrap();
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), jobs.wait(job.id)).await.unwrap().unwrap(), outcome.exec_result());
+            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            retry_retained_outcomes(&kernel, 10).unwrap();
+            assert_eq!(serde_json::to_value(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(outcome).unwrap());
+            assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
     }
 
     #[tokio::test]
