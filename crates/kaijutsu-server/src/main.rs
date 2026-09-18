@@ -185,7 +185,7 @@ async fn async_main() -> ExitCode {
         "list-keys" => cmd_list_keys(),
         "list-characters" => cmd_list_characters(),
         "migrate-keyring" => cmd_migrate_keyring(),
-        "rc" => cmd_rc(&args[2..]),
+        "rc" => cmd_rc(&args[2..], server_paths),
         arg => {
             // Try parsing as port number for backwards compatibility
             if let Ok(port) = arg.parse::<u16>() {
@@ -281,7 +281,7 @@ async fn run_server(port: u16, paths: ServerPaths) -> ExitCode {
 /// capability, and nothing to approve. That is the point — it is what you run
 /// before starting the kernel, and it cannot be blocked by the kernel it is
 /// about to configure.
-fn cmd_rc(args: &[String]) -> ExitCode {
+fn cmd_rc(args: &[String], server_paths: ServerPaths) -> ExitCode {
     let Some(sub) = args.first().map(String::as_str) else {
         eprintln!("Usage: kaijutsu-server rc reseed [--force] [--dir <path>]");
         return ExitCode::FAILURE;
@@ -312,7 +312,18 @@ fn cmd_rc(args: &[String]) -> ExitCode {
         }
     }
 
-    let root = dir.unwrap_or_else(kaijutsu_server::ssh::default_rc_dir);
+    // Without `--dir`, reseed the rc tree the server itself would mount from
+    // `--config-root`/`--mount` (`docs/config-namespace.md`).
+    let root = match dir {
+        Some(dir) => dir,
+        None => match server_paths.into_mounts() {
+            Ok(mounts) => mounts.host_dir(kaijutsu_types::paths::RC_ROOT),
+            Err(e) => {
+                eprintln!("config mounts: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     match kaijutsu_kernel::seed_scripts::reseed_rc_files(&root, force) {
         Ok(r) => {
             println!(
