@@ -2171,6 +2171,37 @@ DeepSeek found no actionable defect. Its reachability questions were checked:
 acceptance delegates to the journal transaction, persistent stores refuse a
 missing database, and the fork child has no context registration at this step.
 
+Completion delivery had a different owner gap: an allowed ask was already spent
+when its in-memory notification text reached the writer. A failed write removed
+it from the ledger's retry scan. Async shell delivery had no marker at all; the
+first regression appended two notices when delivery was retried.
+
+Execution notifications now reserve ownership with the claim or async admission.
+The shared record stores the source key, prepared message, delivered block and
+suppression reason; identity stays on the existing approval or receipt. Shell
+settlement prepares its message with the terminal receipt. Approval delivery
+retains a live copy if message persistence fails. Notice insertion and its marker
+commit in one journal acceptance. Startup recovers pending messages after result
+recovery, disables old provider wakes, and never replays source. Sessions retain
+an explicit disposition that their caller reads the command pair directly.
+
+The existing worker scans each second as well as on ledger events, processing
+up to four deliveries per scan. Larger backlogs now drain without another answer.
+`kj wait --operation` reports notification states; `kj ledger show` distinguishes
+completion delivery from the reviewer's decision. Reassignment and retirement
+retain suppression reasons. Tests cover reservation/claim rollback, message and
+publication retry, missing-pair restart, journal/marker/compaction faults, preserved
+full output, and restart without provider wake. The SSH client reads the recovered
+notice and its disposition. Durable delivery and provider admission remain
+separate: the general continuation-versus-reassignment race stays in issues.
+
+DeepSeek reviewed design and implementation. We rejected moving claim and final
+notice into one transaction across execution: a spent claim must never be restored
+to retry delivery. The implementation review's suggested startup race is absent
+before worker admission; terminal/suppressed summaries are intentional audit data,
+and corrupt ownership refuses startup. Its reassignment concern prompted a check
+of continuation admission, where the existing epoch does not bind the performer.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

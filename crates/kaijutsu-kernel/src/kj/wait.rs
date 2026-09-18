@@ -75,6 +75,7 @@ impl TailFilter {
 )]
 pub(crate) struct WaitArgs {
     /// Wait for this shell operation to finish, including any approval wait.
+    /// Reports completion-notification status when one was reserved.
     #[arg(long, conflicts_with_all = ["ask", "job", "since"])]
     operation: Option<String>,
     /// Wait for this ask's decision. Approval may start work that is still running.
@@ -358,7 +359,13 @@ impl KjDispatcher {
                     Ok(None) => return KjResult::Err(format!("kj wait: operation {id} not found in context {context_id}")),
                     Err(e) => return KjResult::Err(format!("kj wait: {e}")),
                 };
-                ("operation", id.clone(), state.completed_at.is_some(), serde_json::json!(state))
+                let mut value = serde_json::json!(state);
+                let notifications = match crate::runtime::completion_notice::operation_summaries(&self.kernel_db().lock(), id) {
+                    Ok(notices) => notices,
+                    Err(error) => return KjResult::Err(format!("kj wait: could not read completion notifications: {error}")),
+                };
+                value["notifications"] = serde_json::json!(notifications);
+                ("operation", id.clone(), state.completed_at.is_some(), value)
             } else {
                 let id = kaish_kernel::scheduler::JobId(args.job.expect("one work selector"));
                 let manager = self.kernel().context_job_manager(context_id);

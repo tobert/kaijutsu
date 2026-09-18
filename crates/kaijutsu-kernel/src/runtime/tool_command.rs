@@ -17,6 +17,7 @@ pub(crate) fn create_operation(
     kernel: &crate::Kernel, call: &CallContext, source: &str, ask: Option<&str>,
 ) -> Result<ShellOperationReceipt, String> {
     let receipt = kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: ask.is_none(),
         context: call.context_id, principal: call.principal_id, actor: call.actor_id,
         source, tool: "shell", input: serde_json::json!({"command": source}),
         kind: kaijutsu_types::ToolKind::Shell, role: Role::Tool, excluded: true,
@@ -83,8 +84,8 @@ impl ToolCommand {
                 };
                 if let Some(receipt) = &completion_receipt {
                     match &outcome {
-                        Ok(_) => if let Err(error) = self.kernel.notify_async_shell_completion(
-                            &receipt.operation_id, context, self.call.principal_id, self.call.actor_id).await {
+                        Ok(_) => if let Err(error) = super::completion_notice::deliver(&self.kernel,
+                            &super::completion_notice::Source::Shell(receipt.operation_id.clone()), &shutdown).await {
                             tracing::error!("shell completion notification failed: {error}");
                         },
                         Err(error) => tracing::error!("shell operation {} settlement failed: {error}", receipt.operation_id),
@@ -150,12 +151,16 @@ mod setup_tests {
 
     #[tokio::test]
     async fn operation_registration_failure_publishes_no_partial_pair() {
+        for table in ["shell_operations", "execution_notifications"] { failed_operation_registration(table).await; }
+    }
+
+    async fn failed_operation_registration(table: &str) {
         let (_dir, kernel, context) = fixture().await;
         let mut events = kernel.block_flows().subscribe("block.*");
-        kernel.kernel_db().lock().conn_for_ledger().execute_batch(
-            "CREATE TRIGGER reject_operation BEFORE INSERT ON shell_operations
+        kernel.kernel_db().lock().conn_for_ledger().execute_batch(&format!(
+            "CREATE TRIGGER reject_operation BEFORE INSERT ON {table}
              BEGIN SELECT RAISE(FAIL, 'injected operation registration fault'); END;"
-        ).unwrap();
+        )).unwrap();
         let call = CallContext::new(PrincipalId::new(), context, kaijutsu_types::SessionId::new(), kernel.id());
         let error = create_operation(&kernel, &call, "echo never-run", None).unwrap_err();
         assert!(error.contains("injected operation registration fault"), "{error}");

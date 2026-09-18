@@ -15,6 +15,7 @@
 
 pub mod turn_request;
 pub mod approval_resume;
+pub(crate) mod completion_notice;
 pub mod turn_state;
 pub mod interrupt;
 pub mod llm_stream;

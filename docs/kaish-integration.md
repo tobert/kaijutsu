@@ -131,7 +131,7 @@ These are source observations, not promises that all paths behave alike.
   records the requester. A claimed ask starts Running, while a pending ask
   starts Waiting. Setup failure reports that the approval is spent and nothing
   ran. Retained outcomes recover without executing the approved source again;
-  notification recovery after redemption remains open.
+  completion delivery retains its own durable owner after redemption.
   Linking an executable ask to an existing model pair now adopts that pair into
   the same receipt registry. Model Waiting content, statuses, ask link and
   receipt commit together. A non-executable ask only links its pair. Links
@@ -153,7 +153,20 @@ These are source observations, not promises that all paths behave alike.
   writers in one acceptance per context. Statuses, appended stderr and one
   explanation commit together; stored output and provenance survive. Forks use
   the same operation on copied open blocks. Either caller propagates failure.
-  Abrupt live failure and notification delivery remain in the ownership audit.
+  Abrupt live failure and continuation admission remain in the ownership audit.
+- `runtime/completion_notice.rs` owns execution-completion delivery. An allowed
+  approval reserves a notification with its claim; an asynchronous shell reserves
+  one with its pair and receipt. Source rows retain identity and continuation
+  epoch. A small shared record retains the prepared message, delivered block or
+  explicit suppression reason. Block insertion and the delivery marker share a
+  journal acceptance. Retrying delivery never authorizes execution.
+  Startup resolves interrupted notification owners after command recovery and
+  disables automatic provider wakes for those notices. The existing delivery
+  worker drains ready notices and new answers in scans of up to four, also
+  polling each second so lost events and larger backlogs do not strand work.
+  `kj wait --operation` reports notification disposition; `kj ledger show`
+  includes an approval's completion delivery. Provider admission remains separate
+  from durable delivery and still requires the original continuation window.
 - `runtime/interactive.rs` admits shell submissions, constructs the addressed
   context's shell, authors the pair/receipt, and applies PreCall on the kernel
   worker. Accepted work survives RPC teardown. Runtime consumes the captured
@@ -247,7 +260,7 @@ These are source observations, not promises that all paths behave alike.
   fails before mutation. Denied/cancelled pair settlement must succeed before
   consuming an answer. Model refusal notifications and redemption commit together;
   repeated notification delivery creates no second block. Session refusal linkage
-  and already-claimed approval ownership transfer remain open.
+  remains in the ownership audit; approved completion delivery has a separate durable owner.
 - Timed `kj drive --track <name> --score-at <tick>` pairs a turn lease with
   timeline-owned preparation before model work starts. Rc chooses the target
   and fallback; runtime validates complete performer-authored ABC and retains
@@ -317,8 +330,8 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Streaming execute RPC | kernel `runtime/streaming.rs`, `runtime/command.rs`; server RPC adapter | Kernel-owned preparation/execution/settlement; connection-owned IDs, admission slot, history, cancellation and callbacks; hooks, review, physical exit, context switches, disconnect and joined shutdown |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
-| Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; abrupt live failure and approved notification delivery remain open |
-| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; abrupt drop and durable notification recovery remain in the settlement audit |
+| Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
+| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; abrupt drop and job/receipt agreement remain in the settlement audit |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |

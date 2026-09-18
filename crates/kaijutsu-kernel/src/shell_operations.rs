@@ -31,6 +31,8 @@ pub struct ShellOperationReceipt {
 
 /// The command pair and durable owner accepted before execution or waiting.
 pub(crate) struct ShellOperationStart<'a> {
+    /// Reserve a model completion notice with this receipt's admission.
+    pub notify: bool,
     pub context: ContextId,
     /// The requester is recorded on the receipt; the performer authors the command.
     pub principal: PrincipalId,
@@ -71,6 +73,10 @@ impl ShellOperationStart<'_> {
     pub(crate) fn record(&self, db: &KernelDb, receipt: &ShellOperationReceipt) -> crate::kernel_db::KernelDbResult<()> {
         let epoch = db.continuation_epoch(self.context)?;
         insert_operation(db, receipt, self.principal, self.actor, self.source, epoch)?;
+        if self.notify {
+            crate::runtime::completion_notice::reserve(db,
+                &crate::runtime::completion_notice::Source::Shell(receipt.operation_id.clone()), None)?;
+        }
         if let Some((ask, owner)) = self.ask {
             db.link_ask_blocks(ask, &receipt.command_block_id, &receipt.output_block_id, owner)?;
             if self.status == kaijutsu_types::Status::Waiting { db.release_approval_pair(ask)?; }
@@ -558,6 +564,11 @@ impl ShellOperationRegistry {
             ).map_err(|e| e.to_string())?;
             if prepared { return Err(format!("shell operation {id} has a retained outcome; refusing to replace it")); }
         }
+        let source = crate::runtime::completion_notice::Source::Shell(id.into());
+        if crate::runtime::completion_notice::read(db, &source).map_err(|e| e.to_string())?.is_some() {
+            crate::runtime::completion_notice::prepare(db, &source,
+                &crate::runtime::completion_notice::shell_message(id, &envelope)).map_err(|e| e.to_string())?;
+        }
         if let Some(tx) = tx { tx.commit().map_err(|e| e.to_string())?; }
         Ok(changed == 1)
     }
@@ -705,6 +716,29 @@ fn require_changed(changed: usize, id: &str) -> OperationResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn async_completion_notification_is_repeatable_without_duplicate_blocks() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        let dispatcher = test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel();
+        let actor = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("completion-once"), None, actor);
+        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
+        let receipt = crate::runtime::tool_command::create_operation(kernel, &call, "echo captured", None).unwrap();
+        let outcome = CommandOutcome::new(crate::runtime::command_outcome::CommandExecution::Completed(
+            kaish_kernel::interpreter::ExecResult::success("captured")), 1);
+        crate::runtime::command::settle_outcome(kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome, None).unwrap();
+        for _ in 0..2 {
+            crate::runtime::completion_notice::deliver(kernel, &crate::runtime::completion_notice::Source::Shell(receipt.operation_id.clone()),
+                &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        }
+        let notices: Vec<_> = kernel.blocks().block_snapshots(context).unwrap().into_iter()
+            .filter(|block| block.content.starts_with("Shell operation ")).collect();
+        assert_eq!(notices.len(), 1, "retrying delivery must not append another completion");
+    }
+
     use super::*;
 
     fn register(registry: &ShellOperationRegistry, context: ContextId) -> ShellOperationReceipt {
@@ -835,46 +869,5 @@ mod tests {
         let state = registry.get(&receipt.operation_id, context).unwrap().unwrap();
         assert!(state.completed_at.is_none());
         assert!(state.envelope.is_none());
-    }
-}
-
-impl crate::Kernel {
-    /// Notify once after the execution owner has settled its durable receipt.
-    pub(crate) async fn notify_async_shell_completion(
-        self: &Arc<Self>, id: &str, context: ContextId, principal: PrincipalId, actor: PrincipalId,
-    ) -> OperationResult<()> {
-        let state = self.shell_operations().get(id, context)?
-            .ok_or_else(|| format!("shell operation {id} is missing"))?;
-        if state.completed_at.is_none() { return Err("shell notification requires a completed receipt".into()); }
-        let envelope = state.envelope.as_ref().ok_or("completed shell receipt has no result")?;
-        let row = self.kernel_db().lock().get_context(context).map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("shell operation context {context} is missing"))?;
-        if row.is_archived() || row.played_by != Some(actor) { return Ok(()); }
-        let message = format!(
-            "Shell operation {id} completed with status {} and exit code {:?}. Output block: {}.\n{}",
-            envelope.status.as_str(), envelope.exit_code, state.receipt.output_block_id.to_key(),
-            envelope.readable_output(),
-        );
-        let after = self.blocks().last_block_id(context);
-        let notification = self.blocks().insert_block_as(
-            context, None, after.as_ref(), kaijutsu_types::Role::User,
-            kaijutsu_types::BlockKind::Text, message.clone(), kaijutsu_types::Status::Done,
-            kaijutsu_types::ContentType::Plain, Some(PrincipalId::system()),
-        ).map_err(|e| e.to_string())?;
-        let Some(epoch) = state.continuation_epoch else { return Ok(()); };
-        let window = self.gate_resume_window().await?;
-        let window_ms = i64::try_from(window.as_millis()).map_err(|e| e.to_string())?;
-        if !self.turn_in_flight(context)
-            && self.kernel_db().lock().automatic_resume_allowed(
-                context, epoch, kaijutsu_types::now_millis() as i64, window_ms,
-            ).map_err(|e| e.to_string())?
-        {
-            self.request_turn(crate::runtime::turn_request::TurnRequest {
-                score: None,
-                context_id: context, after_block_id: notification, content: message,
-                principal_id: principal, model: None, continuation_epoch: Some(epoch),
-            })?;
-        }
-        Ok(())
     }
 }

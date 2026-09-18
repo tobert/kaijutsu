@@ -93,6 +93,7 @@ async fn prepare(
     let documents = kernel.blocks();
     if documents.get(context).is_none() { return Err(format!("context {context} is not materialized")); }
     let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
         context, principal: identity.requester, actor: identity.performer, source: &code,
         tool: "shell", input: serde_json::json!({"code": code}), kind: ToolKind::Shell,
         role: if user_initiated { Role::User } else { Role::Model }, excluded: user_initiated, status: kaijutsu_types::Status::Running, ask: None,

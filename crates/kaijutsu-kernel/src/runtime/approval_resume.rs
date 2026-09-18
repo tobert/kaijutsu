@@ -326,7 +326,15 @@ async fn act_on_executable_answer(
                 Ok(Some(row)) if context_row_is_live(&row) => {
                     let performer_changed = linked.is_some_and(|(_, _, owner)| owner == crate::PairOwner::Turn)
                         && row.played_by != Some(ask.actor);
-                    Some((db.redeem_ask(&answer.request_id), performer_changed))
+                    let claim = db.in_transaction(|db| {
+                        if !db.redeem_ask(&answer.request_id)? { return Ok(false); }
+                        let suppression = linked.filter(|(_, _, owner)| *owner == crate::PairOwner::Session)
+                            .map(|_| "session observes the command result directly");
+                        super::completion_notice::reserve(db,
+                            &super::completion_notice::Source::Approval(answer.request_id.clone()), suppression)?;
+                        Ok(true)
+                    });
+                    Some((claim, performer_changed))
                 }
                 Ok(_) => {
                     tracing::info!("gate-resume: {context_id} is no longer live; leaving ask {} unclaimed", answer.request_id);
@@ -393,7 +401,7 @@ async fn act_on_executable_answer(
             }
         }
         tracing::error!("gate-resume: ask {}: {reason}", answer.request_id);
-        return ExecAction::Settled;
+        return ExecAction::Tell(reason);
     }
 
     let mut preparation = ApprovalPreparation {
@@ -457,6 +465,7 @@ async fn act_on_executable_answer(
             (command_block_id, output_block_id, matches!(owner, crate::PairOwner::Turn))
         }
         None => match kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
             context: context_id, principal: principal_id, actor: ask.actor, source,
             tool: "shell", input: serde_json::json!({"code": source}), kind: TypesToolKind::Shell,
             role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running,
@@ -543,7 +552,7 @@ async fn act_on_executable_answer(
 
 /// No caller survives a kernel restart to finish an unpublished handoff.
 /// Retain the reviewer's decision, but retire its invocation without execution.
-/// Run after captured-result recovery and before generic receipt abandonment.
+/// Run after captured-result recovery and before settling other interruptions.
 pub(crate) fn recover_unpublished_pairs(kernel: &Kernel) -> Result<usize, String> {
     let held = kernel.kernel_db().lock().unpublished_approval_pairs().map_err(|error| error.to_string())?;
     let reason = "Kernel restarted before the caller published its Waiting result. Source did not run.";
@@ -585,22 +594,44 @@ async fn run_delivery(
     mut woken: std::collections::HashSet<String>,
     stop: tokio_util::sync::CancellationToken,
 ) {
-    // Bound provider spending from one event. Unhandled answers remain in the
-    // ledger for a later event; each scan reads authoritative state again.
-    const WAKE_CAP_PER_EVENT: usize = 4;
+    // Bound delivery work per scan. Periodic scans recover lost bus events
+    // and drain ready notices without needing another reviewer decision.
+    const DELIVERY_CAP_PER_SCAN: usize = 4;
+    let mut pending_messages = std::collections::HashMap::new();
+    let mut retry = tokio::time::interval(std::time::Duration::from_secs(1));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
             _ = stop.cancelled() => return,
+            _ = retry.tick() => {},
             event = sub.recv() => if event.is_none() { return; },
         }
         let Some(owner) = owner.upgrade() else { return; };
         let kernel = &owner;
+        let retained: Vec<_> = pending_messages.keys().take(DELIVERY_CAP_PER_SCAN).cloned().collect();
+        for source in retained {
+            let message: &String = &pending_messages[&source];
+            match super::completion_notice::prepare(&kernel.kernel_db().lock(), &source, message) {
+                Ok(()) => { pending_messages.remove(&source); }
+                Err(error) => tracing::error!(%error, "completion message persistence failed; retaining its live copy"),
+            }
+        }
+        let ready = match super::completion_notice::sources(&kernel.kernel_db().lock(), true, DELIVERY_CAP_PER_SCAN) {
+            Ok(ready) => ready,
+            Err(error) => { tracing::error!(%error, "could not read completion notifications"); continue; }
+        };
+        let mut delivered_this_scan = ready.len();
+        for source in ready {
+            if stop.is_cancelled() { return; }
+            if let Err(error) = super::completion_notice::deliver(kernel, &source, &stop).await {
+                tracing::error!(?source, %error, "completion delivery failed; retaining its owner");
+            }
+        }
         // The event carries only a generation; the ledger is the
         // authority, so re-read it rather than trusting the number.
         // `ledger.changed` is on the timing lane (lossy by design):
-        // dropping events is safe here because any later one
-        // re-reads everything still outstanding.
+        // periodic scans also re-read outstanding work if no later event arrives.
         let answers = {
             let db = kernel.kernel_db().lock();
             match db.undelivered_answers() {
@@ -612,16 +643,14 @@ async fn run_delivery(
             }
         };
 
-        let mut woken_this_event = 0usize;
         for answer in answers {
             if stop.is_cancelled() { return; }
             if woken.contains(&answer.request_id) {
                 continue;
             }
-            if woken_this_event >= WAKE_CAP_PER_EVENT {
+            if delivered_this_scan >= DELIVERY_CAP_PER_SCAN {
                 tracing::warn!(
-                    "gate-resume: stopped at {WAKE_CAP_PER_EVENT} wakes for one ledger \
-                     change; the rest wait for the next one"
+                    "gate-resume: stopped at {DELIVERY_CAP_PER_SCAN} deliveries for one scan; the rest wait for the next scan"
                 );
                 break;
             }
@@ -760,10 +789,24 @@ async fn run_delivery(
                     {
                         ExecAction::Settled => {
                             woken.insert(answer.request_id.clone());
-                            woken_this_event += 1;
+                            delivered_this_scan += 1;
                             continue;
                         }
                         ExecAction::Deferred => continue,
+                        ExecAction::Tell(text) if answer.status == crate::ApprovalStatus::Allowed => {
+                            let source = super::completion_notice::Source::Approval(answer.request_id.clone());
+                            if let Err(error) = super::completion_notice::prepare(&kernel.kernel_db().lock(), &source, &text) {
+                                tracing::error!(%error, "approved completion could not be retained; recovery owns the pending notice");
+                                pending_messages.insert(source, text);
+                                continue;
+                            }
+                            if let Err(error) = super::completion_notice::deliver(kernel, &source, &stop).await {
+                                tracing::error!(%error, "approved completion delivery failed; retaining its owner");
+                            }
+                            woken.insert(answer.request_id.clone());
+                            delivered_this_scan += 1;
+                            continue;
+                        }
                         ExecAction::Tell(text) => Some(text),
                         ExecAction::FallThrough => None,
                     }
@@ -825,7 +868,7 @@ async fn run_delivery(
             // to request.
             if turn_in_flight {
                 woken.insert(answer.request_id.clone());
-                woken_this_event += 1;
+                delivered_this_scan += 1;
                 tracing::info!(
                     "gate-resume: left a seed for {context_id}'s in-flight turn, ask {}",
                     answer.request_id
@@ -835,7 +878,7 @@ async fn run_delivery(
 
             let Some(continuation_epoch) = row.continuation_epoch else {
                 woken.insert(answer.request_id.clone());
-                woken_this_event += 1;
+                delivered_this_scan += 1;
                 tracing::info!(
                     "gate-resume: delivered {} to {context_id} without automatic continuation; the ask predates continuation epochs",
                     answer.request_id
@@ -846,7 +889,7 @@ async fn run_delivery(
                 Ok(window) => window,
                 Err(error) => {
                     woken.insert(answer.request_id.clone());
-                    woken_this_event += 1;
+                    delivered_this_scan += 1;
                     tracing::error!(
                         "gate-resume: delivered {} but could not read continuation policy: {error}",
                         answer.request_id
@@ -858,7 +901,7 @@ async fn run_delivery(
                 Ok(window_ms) => window_ms,
                 Err(_) => {
                     woken.insert(answer.request_id.clone());
-                    woken_this_event += 1;
+                    delivered_this_scan += 1;
                     tracing::error!(
                         "gate-resume: delivered {} but continuation window is too large",
                         answer.request_id
@@ -885,7 +928,7 @@ async fn run_delivery(
             };
             if !automatic_resume_allowed {
                 woken.insert(answer.request_id.clone());
-                woken_this_event += 1;
+                delivered_this_scan += 1;
                 tracing::info!(
                     "gate-resume: delivered {} to {context_id}; its continuation window is closed",
                     answer.request_id
@@ -896,7 +939,7 @@ async fn run_delivery(
             // The durable seed delivered this answer. Turn admission cannot
             // undo that fact or authorize another copy on a later ledger event.
             woken.insert(answer.request_id.clone());
-            woken_this_event += 1;
+            delivered_this_scan += 1;
             if let Err(error) = kernel.request_turn(super::turn_request::TurnRequest {
                 score: None,
                 context_id, after_block_id: seed_block, content: seed,
@@ -921,10 +964,122 @@ mod lifetime_tests {
 
     fn test_pair(kernel: &Arc<Kernel>, context: ContextId, actor: PrincipalId, source: &str) -> (BlockId, BlockId) {
         let receipt = kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
             context, principal: actor, actor, source, tool: "shell", input: serde_json::json!({"code": source}),
             kind: TypesToolKind::Shell, role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running, ask: None,
         }).unwrap();
         (receipt.command_block_id, receipt.output_block_id)
+    }
+
+    #[tokio::test]
+    async fn claimed_completion_retains_delivery_without_replaying_source() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{ask::{create_ask, redeemed_at}, decide::{decide, DecideInput}, types::{NewAsk, Origin}};
+        use super::super::completion_notice::{self, Source};
+        for mode in ["live-retry", "live-message-retry", "restart-before-pair"] {
+            let dispatcher = Arc::new(test_dispatcher_persistent().await);
+            dispatcher.set_self_arc();
+            let kernel = dispatcher.kernel();
+            if mode.starts_with("live-") { kernel.broker().set_kj_dispatcher(&dispatcher).await; }
+            let dir = tempfile::tempdir().unwrap();
+            kernel.mount("/notice-probe", crate::vfs::LocalBackend::new(dir.path())).await;
+            let source = "echo once >> /notice-probe/count; cat /notice-probe/count";
+            let actor = PrincipalId::new();
+            let reviewer = PrincipalId::new();
+            let context = register_context(&dispatcher, Some("claimed-notice"), None, actor);
+            kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+            kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+            let db = kernel.kernel_db().clone();
+            let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: "durable completion".into(), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            decide(db.lock().conn_for_ledger(), &request, DecideInput { allow: true, ..Default::default() }).unwrap();
+            let answer = db.lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, denial: "not denied".into() };
+            let key = Source::Approval(request.clone());
+            let stop = tokio_util::sync::CancellationToken::new();
+            db.lock().conn_for_ledger().execute_batch("CREATE TRIGGER reject_notice_owner BEFORE INSERT ON execution_notifications
+                BEGIN SELECT RAISE(ABORT, 'injected notification reservation fault'); END;").unwrap();
+            assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred));
+            assert!(redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_none(), "reservation failure must roll back the execution claim");
+            assert!(completion_notice::read(&db.lock(), &key).unwrap().is_none());
+            assert!(!dir.path().join("count").exists());
+            db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_notice_owner").unwrap();
+            if mode == "live-message-retry" {
+                db.lock().conn_for_ledger().execute_batch(
+                    "CREATE TABLE notification_fault_probe(attempts INTEGER); INSERT INTO notification_fault_probe VALUES(0);
+                     CREATE TRIGGER reject_notice_message BEFORE UPDATE OF message ON execution_notifications
+                     BEGIN UPDATE notification_fault_probe SET attempts=attempts+1;
+                     SELECT RAISE(FAIL, 'injected notification message fault'); END;"
+                ).unwrap();
+                let owner = Arc::downgrade(kernel);
+                let sub = kernel.ledger_flows().subscribe("ledger.changed");
+                kernel.spawn_runtime_task(move |stop| run_delivery(owner, sub, Default::default(), stop)).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let attempts: i64 = db.lock().conn_for_ledger().query_row("SELECT attempts FROM notification_fault_probe", [], |row| row.get(0)).unwrap();
+                        if attempts > 0 { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.expect("driver reached the injected message fault");
+                assert!(completion_notice::read(&db.lock(), &key).unwrap().unwrap().message.is_none());
+                assert!(redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_some());
+                db.lock().conn_for_ledger().execute_batch("DROP TRIGGER reject_notice_message").unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while completion_notice::read(&db.lock(), &key).unwrap().unwrap().block.is_none() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.expect("driver retries the retained message without another event");
+                assert_eq!(std::fs::read_to_string(dir.path().join("count")).unwrap(), "once\n");
+                kernel.shutdown_runtime_worker().await.unwrap();
+                continue;
+            }
+            let action = act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+            assert!(redeemed_at(db.lock().conn_for_ledger(), &request).unwrap().is_some());
+            assert!(completion_notice::read(&db.lock(), &key).unwrap().unwrap().message.is_none());
+            if mode == "live-retry" {
+                let ExecAction::Tell(message) = action else { panic!("completed action must retain a model notice") };
+                completion_notice::prepare(&db.lock(), &key, &message).unwrap();
+                kernel.blocks().arm_accept_fault(1);
+                assert!(completion_notice::deliver(kernel, &key, &stop).await.is_err());
+                assert!(completion_notice::read(&db.lock(), &key).unwrap().unwrap().block.is_none());
+                kernel.start_approval_delivery().unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while completion_notice::read(&db.lock(), &key).unwrap().unwrap().block.is_none() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.expect("periodic delivery does not need another ledger event");
+                assert_eq!(std::fs::read_to_string(dir.path().join("count")).unwrap(), "once\n");
+                assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Settled));
+                let notice = completion_notice::read(&db.lock(), &key).unwrap().unwrap();
+                let blocks = kernel.blocks().block_snapshots(context).unwrap();
+                assert_eq!(blocks.iter().filter(|b| Some(&b.content) == notice.message.as_ref()).count(), 1);
+                let shown = dispatcher.dispatch(&["ledger".into(), "show".into(), request.clone()],
+                    &crate::kj::test_helpers::caller_with_context(context)).await;
+                assert!(shown.message().contains("completion: delivered"), "{}", shown.message());
+                let crate::kj::KjResult::Ok { data: Some(data), .. } = shown else { panic!("completion disposition must be inspectable") };
+                assert_eq!(data["status"], "allowed");
+                assert_eq!(data["completion_notification"]["block_id"], notice.block.unwrap().to_key());
+                kernel.shutdown_runtime_worker().await.unwrap();
+            } else {
+                assert!(matches!(action, ExecAction::Tell(_)));
+                assert!(kernel.shell_operations().get_by_ask(&request, context).unwrap().is_none());
+                let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+                let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+                let recovered = Arc::new(Kernel::new("notice-recovered", dir.path(), blocks, db.clone()).await);
+                completion_notice::deliver(&recovered, &key, &stop).await.unwrap();
+                let notice = completion_notice::read(&db.lock(), &key).unwrap().unwrap();
+                assert!(notice.message.as_deref().unwrap().contains("outcome is unavailable"));
+                assert!(notice.block.is_some());
+                assert!(!notice.resume_allowed);
+                assert!(!dir.path().join("count").exists(), "recovery cannot use the spent claim to run source");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1147,7 +1302,8 @@ mod lifetime_tests {
                 kernel.kernel_db().lock().update_context_review(context, Some(PrincipalId::new()), Some(reviewer)).unwrap();
             }
             let action = act_on_executable_answer(kernel, context, actor, &answer, &scanned, "reviewer", &tokio_util::sync::CancellationToken::new()).await;
-            assert!(matches!(action, ExecAction::Settled), "a fresh link determines session delivery or performer rejection");
+            assert!(if changed_performer { matches!(action, ExecAction::Tell(_)) } else { matches!(action, ExecAction::Settled) },
+                "a fresh link determines session delivery or performer rejection");
             let blocks = kernel.blocks().block_snapshots(context).unwrap();
             assert_eq!(blocks.len(), 2, "the original pair must remain the only pair");
             let result = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();

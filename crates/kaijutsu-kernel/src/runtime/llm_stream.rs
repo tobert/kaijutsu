@@ -1252,6 +1252,7 @@ fn pending_shell_operation_receipt(
     let command_source = arguments.get("command").and_then(serde_json::Value::as_str)
         .ok_or_else(|| "pending shell call has no command".to_string())?;
     let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
         context: context_id, principal: tool_ctx.principal_id, actor: tool_ctx.actor_id,
         source: command_source, tool: "shell", input: serde_json::json!({"command": command_source}),
         kind: kaijutsu_types::ToolKind::Shell, role: Role::Model, excluded: true, status: Status::Waiting,

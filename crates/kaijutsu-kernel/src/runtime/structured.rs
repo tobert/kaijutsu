@@ -81,6 +81,7 @@ async fn run_kj(
     for arg in argv { code.push(' '); code.push_str(&kaish_quote(arg)); }
     let pair = if quiet { None } else {
         let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+            notify: false,
             context, principal: identity.requester, actor: identity.performer, source: &code,
             tool: "kj", input: serde_json::json!({"argv": argv}), kind: ToolKind::Builtin,
             role: Role::User, excluded: false, status: kaijutsu_types::Status::Running, ask: None,

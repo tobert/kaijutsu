@@ -186,8 +186,8 @@ terminal publication. Initial outcome-retention failures still need live
 reporting/retry: background interactive callers log the error and approval
 resumes report it to the model. Also reconcile the runner's synthetic job failure
 on projection error with a receipt that may already have committed its outcome.
-Unmigrated interrupted operations still complete their receipts without repairing
-their blocks; extend recovery as those callers move.
+Registered interrupted operations now settle their original blocks and receipts
+together. Receiptless writers use the atomic per-context orphan sweep.
 
 Interactive/approved result reviews now checkpoint execution and continue the
 same hook snapshot after approval. Their non-executable `hook_result` asks stay
@@ -197,9 +197,10 @@ this owner too, as do quiet, streaming, and MCP shell calls. Non-shell MCP
 calls still lack a retained result-review owner: result-phase Ask/escalation
 returns GateUnavailable before minting an ask.
 
-The shell tool's async completion notification now reads its settled receipt.
-Make notification delivery recoverable and idempotent across failure/restart;
-it currently occurs once in the live execution owner after settlement. Kernel
+Async shell and claimed-approval completion delivery now reserve durable owners
+at admission/claim. Notification blocks and delivery markers commit together;
+startup reconstructs interrupted notices without replaying source or provider
+wakes. Periodic scans drain pending delivery without another ledger event. Kernel
 worker shutdown now cancels and drains accepted work through settlement, including
 paused hooks and retained review. Execution/state/hook panics settle before
 resuming the original unwind, preserving captured output and completed statement
@@ -235,14 +236,15 @@ lock. Read faults leave answers untouched; repeated delivery cannot overwrite
 completed output after reassignment. A rejected continuation admission cannot
 repeat an already written seed. Denied/cancelled pair failures now retain the
 answer, and model refusal notifications consume it atomically with their block.
-Continue the audit for already-claimed approved actions: a failed result or
-notification write can still lose its retry owner after redemption. Session
+Claimed approvals now retain completion ownership through notification failures;
+source is never replayed to recover a message. Continue the live terminal-result
+audit for abrupt caller destruction and initial outcome-retention faults. Session
 refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
-settling them. The per-event cap counts delivery, not provider requests;
-large bursts can wait indefinitely for another ledger event. Separate queue
-draining from model-spend admission in the resource audit. Review changed-
-performer settlement's lack of a seed against already running conversations.
+settling them. Periodic scans now drain larger backlogs; the four-item cap still
+counts delivery, not provider requests. Separate delivery throughput from
+model-spend admission in the resource audit. Changed-performer completions retain
+a suppressed disposition; audit already running conversations separately.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
@@ -550,6 +552,13 @@ message that knew where the player was looking"). Left:
 
 ## Async completion recovery follow-ups
 
+- Completion publication rechecks performer and context state under its database
+  guard. Automatic turn admission is later and carries a continuation epoch,
+  but no expected performer. `update_context_review_assignment` currently leaves
+  that epoch open. A reassignment after the wake check can therefore race turn
+  startup; invalidate the old continuation or bind admission to its performer,
+  with a delayed-start regression. A validly published notice remains context
+  history if the performer changes afterward.
 - Completion during a model's final inference can reach the durable mailbox
   after that request was sent. The current automatic wake check skips an
   in-flight turn. Reconcile unread completion notifications when the turn
@@ -1451,7 +1460,8 @@ stored stderr and retains other output; startup refuses approval or block
 recovery failures. Historical error receipts
 already completed by the old receipt-only sweep are not rewritten by the new
 unfinished-operation recovery. Finish that ownership and compatibility audit.
-Claimed execution still needs durable notification retry. See docs/gate-resume.md,
+Claimed execution now has durable notification retry. Continue the live-failure
+and continuation-admission audit in docs/gate-resume.md,
 "Still open".
 
 ## Asks vs forms — decision open (2026-08-22)

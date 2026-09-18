@@ -39,6 +39,7 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
                 context.as_bytes().to_vec(), amy.as_bytes().to_vec(), command.to_key(), output.to_key(),
                 format!("echo unexpected > '{}'", marker.display()),
             ]).unwrap();
+            conn.execute("INSERT INTO execution_notifications(kind,source_id) VALUES('shell','interrupted')", []).unwrap();
             shared.kernel.shutdown_runtime_worker().await.unwrap();
             (context, command, output, orphan_call, orphan_result)
         };
@@ -60,6 +61,11 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
                 }
             }
         }).await.expect("client connects");
+        for argv in [vec!["wait", "--help"], vec!["ledger", "show", "--help"]] {
+            let help = actor.execute_kj_quiet(context, argv.into_iter().map(str::to_owned).collect()).await.unwrap();
+            assert_eq!(help.exit_code, 0);
+            println!("{}", help.stdout);
+        }
         for id in [command, output, orphan_call, orphan_result] {
             assert_eq!(actor.get_block(context, id).await.unwrap().unwrap().status, Status::Error);
         }
@@ -89,6 +95,21 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
             assert_eq!(envelope["data"], serde_json::json!({"observed": 1}));
             assert!(envelope["error"].as_str().unwrap().contains("restarted"));
         }
+        let notice = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let result = actor.execute_kj_quiet(context, vec!["wait".into(), "--operation".into(), "interrupted".into(), "--timeout".into(), "0".into()]).await.unwrap();
+                let data = result.data.unwrap();
+                let notice = &data["state"]["notifications"][0];
+                if notice["status"] == "delivered" { break notice.clone(); }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("recovered completion is delivered without a new ledger event");
+        assert_eq!(notice["resume_allowed"], false);
+        let id = kaijutsu_types::BlockId::from_key(notice["block_id"].as_str().unwrap()).unwrap();
+        let delivered = actor.get_block(context, id).await.unwrap().unwrap();
+        assert!(delivered.content.contains("observed stdout"));
+        assert!(delivered.content.contains("observed stderr"));
+        assert!(delivered.content.contains("restarted"));
         assert!(!marker.exists(), "startup must not execute interrupted source");
         drop(actor);
         kernel.kernel.shutdown_runtime_worker().await.unwrap();

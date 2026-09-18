@@ -556,6 +556,21 @@ CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
     abandoned_reason TEXT
 );
 
+-- Completion delivery is independent of the single-use execution claim.
+CREATE TABLE IF NOT EXISTS execution_notifications (
+    kind TEXT NOT NULL CHECK (kind IN ('approval', 'shell')),
+    source_id TEXT NOT NULL,
+    message TEXT,
+    block_id TEXT,
+    suppressed_reason TEXT,
+    resume_allowed INTEGER NOT NULL DEFAULT 1 CHECK (resume_allowed IN (0, 1)),
+    PRIMARY KEY (kind, source_id),
+    CHECK (block_id IS NULL OR (message IS NOT NULL AND suppressed_reason IS NULL))
+);
+CREATE INDEX IF NOT EXISTS execution_notifications_pending
+    ON execution_notifications(kind, source_id)
+    WHERE block_id IS NULL AND suppressed_reason IS NULL;
+
 -- ── Quiesce (singleton; the row's absence means running) ────────
 -- A row here means the kernel is quiesced: it accepts writes but starts no
 -- turns. Blocks, ledger answers and config edits still land — a write is

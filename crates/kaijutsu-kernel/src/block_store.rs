@@ -1314,6 +1314,45 @@ impl BlockStore {
         }).map(Some)
     }
 
+    /// Publish a reserved completion and its delivery marker in one acceptance.
+    pub(crate) fn insert_completion_notice(
+        &self, context: ContextId, source: &crate::runtime::completion_notice::Source,
+    ) -> BlockStoreResult<Option<(BlockId, crate::runtime::completion_notice::Notice, String)>> {
+        use crate::runtime::completion_notice;
+        let db = self.journaling_db()?.ok_or(BlockStoreError::NoDatabaseConfigured)?;
+        let mut entry = self.get_mut(context).ok_or(BlockStoreError::DocumentNotFound(context))?;
+        let db = db.lock();
+        let notice = completion_notice::read(&db, source).map_err(|e| BlockStoreError::Db(e.to_string()))?
+            .ok_or_else(|| BlockStoreError::Validation("completion has no reserved owner".into()))?;
+        if notice.context != context { return Err(BlockStoreError::Validation("completion crossed its owning context".into())); }
+        if notice.block.is_some() || notice.suppressed.is_some() { return Ok(None); }
+        let message = notice.message.clone().ok_or_else(|| BlockStoreError::Validation("completion message is not ready".into()))?;
+        let suppression = completion_notice::recipient_disposition(&db, &notice).map_err(|e| BlockStoreError::Db(e.to_string()))?;
+        if let Some(reason) = suppression {
+            completion_notice::suppress(&db, source, reason).map_err(|e| BlockStoreError::Db(e.to_string()))?;
+            return Ok(None);
+        }
+        self.accept_locked_recorded(context, &mut entry, Some(db), |entry| {
+            let author = PrincipalId::system();
+            let after = entry.doc.block_ids_ordered().last().copied();
+            entry.doc.set_principal_id(author);
+            let id = entry.doc.insert_block(None, after.as_ref(), Role::User, BlockKind::Text,
+                &message, Status::Done, ContentType::Plain)?;
+            entry.touch(author);
+            let snapshot = entry.doc.get_block_snapshot(&id).expect("inserted completion exists");
+            let events = vec![BlockFlow::Inserted { context_id: context, block: Arc::new(snapshot.clone()),
+                after_id: after, version: entry.version(), source: OpSource::Local }];
+            Ok((SyncPayload::from_new_block(snapshot), events, id))
+        }, |db, id| {
+            let changed = db.conn_for_ledger().execute(
+                "UPDATE execution_notifications SET block_id=?3 WHERE kind=?1 AND source_id=?2 AND block_id IS NULL AND suppressed_reason IS NULL",
+                rusqlite::params![source.kind(), source.id(), id.to_key()],
+            )?;
+            if changed != 1 { return Err(KernelDbError::Validation("completion delivery lost its reserved owner".into())); }
+            Ok(())
+        }).map(|id| Some((id, notice, message)))
+    }
+
     /// Insert a tool call block into a document.
     pub fn insert_tool_call(
         &self,

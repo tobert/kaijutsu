@@ -434,7 +434,9 @@ is redeemable.*
 `Kernel::start_approval_delivery` installs one `ledger.changed` subscription and
 snapshots the outstanding backlog before returning. It refuses unreadable
 startup state. `runtime/approval_resume.rs` re-reads uncollected answers on each
-event, handles only Live contexts, and caps wakes at four per event.
+event and each second, handles only Live contexts, and limits delivery work to
+four items per scan. Ready completion notices share that budget; it is not a
+provider-request budget.
 
 Allowed executable asks are claimed before execution, then fill their existing
 command/output pair or author one. Admission reads current pair linkage and
@@ -475,7 +477,20 @@ startup closes receiptless Running/Waiting blocks: statuses, appended stderr
 and one explanation per context commit together, preserving recorded output.
 A failed write rolls back retirement, and startup fails visibly so
 recovery can retry. An abrupt live failure without a terminal result still holds
-its ask until restart. Durable notification delivery remains open.
+its ask until restart.
+
+Allowed execution reserves completion delivery in the claim transaction. The
+claim stays spent if notification persistence fails. Asynchronous shell admission
+reserves the same kind of delivery record with its receipt. A prepared message
+and its delivered block are distinct from execution; the block and delivery
+marker commit together. Periodic scans retry notices without another ledger
+answer and cannot execute source. Startup recovers pending messages from settled
+receipts, or reports an unavailable outcome when no pair was recorded. Recovered
+notices never replay automatic provider wakes. Archived or reassigned recipients
+retain an explicit suppression reason. `kj ledger show` exposes
+`completion_notification`; `kj wait --operation` exposes `state.notifications`.
+Both report pending, ready, delivered, or suppressed, with a block or reason when
+available. These dispositions do not claim that another model request ran.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation

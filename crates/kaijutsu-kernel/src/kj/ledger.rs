@@ -320,8 +320,9 @@ enum LedgerCommand {
         signals: bool,
     },
     /// Show one pending or decided ask, its statement, identities, decision,
-    /// execution inputs, and publication abandonment. Result reviews include captured execution and
-    /// the settled result, even when the command authored no transcript pair.
+    /// execution inputs, publication abandonment, and completion delivery.
+    /// Result reviews include captured execution and the settled result, even
+    /// when the command authored no transcript pair.
     Show {
         /// The ask to show. Request ids come from `kj ledger list`.
         request_id: String,
@@ -778,6 +779,11 @@ impl KjDispatcher {
             Ok(reason) => reason,
             Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
         };
+        let completion_notification = match crate::runtime::completion_notice::summary(&db,
+            &crate::runtime::completion_notice::Source::Approval(request_id.into())) {
+            Ok(notice) => notice,
+            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+        };
         // The free-variable values an approval runs with, recorded on the
         // ask at raise time (`docs/gate-shape-b.md`, "The ask carries its
         // free variables") — always loaded, not gated on `--signals`, since
@@ -883,6 +889,12 @@ impl KjDispatcher {
         if let Some(reason) = &publication_abandoned {
             lines.push(format!("publication: abandoned — {reason}"));
         }
+        if let Some(notice) = &completion_notification {
+            let status = notice["status"].as_str().expect("notification summary supplies its status");
+            lines.push(format!("completion: {status}"));
+            if let Some(block) = notice["block_id"].as_str() { lines.push(format!("notice:     {block}")); }
+            if let Some(reason) = notice["reason"].as_str() { lines.push(format!("delivery:   {reason}")); }
+        }
         // Only a decided ask can be spent, so `redeemed: no` on a pending
         // one would state a fact about a question nobody has answered.
         if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied) {
@@ -935,6 +947,7 @@ impl KjDispatcher {
             "remember_scope": row.remember_scope,
             "redeemed_at": redeemed_at,
             "publication_abandoned": publication_abandoned,
+            "completion_notification": completion_notification,
             "status": row.status.to_string(),
             "origin": row.origin.to_string(),
             "instance": row.instance,

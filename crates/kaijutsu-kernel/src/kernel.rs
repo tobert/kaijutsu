@@ -397,6 +397,7 @@ impl Kernel {
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
         crate::runtime::approval_resume::recover_unpublished_pairs(&kernel).expect("retire unpublished approval invocations");
         crate::runtime::command::recover_unfinished(&kernel).expect("settle interrupted shell operations");
+        crate::runtime::completion_notice::recover(&kernel).expect("recover execution completion notifications");
         kernel
     }
 
