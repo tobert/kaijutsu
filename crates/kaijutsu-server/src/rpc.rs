@@ -4062,10 +4062,9 @@ impl kernel::Server for KernelImpl {
                     session_id,
                     kernel.id,
                 ).with_actor(principal_id, context_reviewer(&kernel, context_id).await);
-                let report = kernel
-                    .kernel
-                    .broker()
-                    .shell_pre_call_hooks_dry_run(&command, &call_ctx)
+                let report = kaijutsu_kernel::runtime::dry_run::inspect_shell(
+                    &kernel.kernel, call_ctx, command,
+                )
                     .await
                     .map_err(|e| {
                         capnp::Error::failed(format!("dry-run hook evaluation failed: {e}"))

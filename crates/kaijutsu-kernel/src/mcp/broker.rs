@@ -118,8 +118,8 @@ fn enter_hook_depth() -> McpResult<HookDepthGuard> {
     if next > max_hook_depth() {
         return Err(McpError::HookRecursionLimit { depth: next });
     }
-    // Enforcing evaluation and retained workers install the scope. Dry-run
-    // callers may lack one and never authorize execution.
+    // Public enforcing and dry-run evaluators install the scope before an
+    // Invoke body can re-enter the broker.
     let _ = HOOK_DEPTH.try_with(|d| d.set(next));
     Ok(HookDepthGuard)
 }
@@ -127,6 +127,20 @@ fn enter_hook_depth() -> McpResult<HookDepthGuard> {
 /// Flush-timer key. `uri` is `Some(...)` for `NotifKind::ResourceUpdated`
 /// (per-URI coalescing, D-40); `None` for Log / PromptsChanged.
 type FlushKey = (InstanceId, NotifKind, Option<String>);
+
+#[derive(Clone)]
+enum NotificationBlock {
+    Notification {
+        parent: Option<BlockId>,
+        payload: NotificationPayload,
+        summary: String,
+    },
+    Resource {
+        parent: BlockId,
+        payload: ResourcePayload,
+        summary: String,
+    },
+}
 
 pub struct Broker {
     instances: RwLock<HashMap<InstanceId, Arc<dyn McpServerLike>>>,
@@ -234,17 +248,10 @@ enum PermissionAskOutcome {
     Unavailable { reason: String, ask: Option<AskRef> },
 }
 
-/// What `run_kaish_hook` decided from one `HookBody::Kaish` run. Amy's
-/// ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "Exit 3 = escalate
-/// to an ask; a hook-body fault escalates by default"): exit 0 continues,
-/// exit 3 escalates to the same ledger ask round trip `HookAction::Ask`
-/// uses, any other non-zero exit denies as before, and — the part that
-/// changes today's behavior — a fault running the body at all (exec error,
-/// timeout, `Broker::set_kj_dispatcher` never wired) ALSO escalates rather
-/// than denying. A DB/runtime fault must never be indistinguishable from a
-/// human's "no": denying on a fault teaches the model the wrong lesson
-/// (the action was refused on the merits) when nobody actually rendered a
-/// verdict.
+/// What `run_kaish_hook` decided from one `HookBody::Kaish` run. Exit 0
+/// continues; exit 3, timeout 124, and runtime faults escalate through the
+/// same ledger ask as `HookAction::Ask`. Other nonzero exits deny. Owner
+/// cancellation is returned separately after cleanup.
 enum KaishHookOutcome {
     /// Exit 0. The phase continues.
     Continue,
@@ -291,7 +298,8 @@ fn sanitize_control_chars(text: &str) -> String {
 /// is control-char-sanitized before it reaches any of the three outcomes —
 /// see [`sanitize_control_chars`].
 fn classify_kaish_hook_exit(code: i64, stderr: &str, fallback: &str) -> KaishHookOutcome {
-    let stderr_tail: String = stderr.chars().take(512).collect();
+    let char_count = stderr.chars().count();
+    let stderr_tail: String = stderr.chars().skip(char_count.saturating_sub(512)).collect();
     let tail = sanitize_control_chars(stderr_tail.trim());
     let tail = tail.as_str();
     match code {
@@ -311,7 +319,8 @@ fn classify_kaish_hook_exit(code: i64, stderr: &str, fallback: &str) -> KaishHoo
 }
 
 /// Why a `HookBody::KaishPath` body's read failure denies, rather than
-/// escalating. This is the one place that decision lives. `HookBody::Kaish` follows a different rule instead — documented on
+/// escalating. This is the one place that decision lives.
+/// `HookBody::Kaish` follows a different rule instead, documented on
 /// `HookActionWire::Kaish`: a fault running an inline body escalates rather
 /// than denies, because a runtime/DB fault is never a verdict — and
 /// reconciling the two is a one-line change here. See `docs/rc-on-disk.md`.
@@ -960,7 +969,7 @@ impl Broker {
     /// `unbind → rebind` of the same instance is a no-op emission
     /// (identical pairs, empty set difference).
     pub async fn set_binding(
-        &self,
+        self: &Arc<Self>,
         context_id: ContextId,
         binding: ContextToolBinding,
     ) -> McpResult<()> {
@@ -1094,7 +1103,7 @@ impl Broker {
 
     /// Add an instance to a context's binding (idempotent). Triggers the
     /// same diff + persistence + notification pipeline as `set_binding`.
-    pub async fn bind(&self, context_id: ContextId, instance: InstanceId) -> McpResult<()> {
+    pub async fn bind(self: &Arc<Self>, context_id: ContextId, instance: InstanceId) -> McpResult<()> {
         let mut binding = self
             .binding(&context_id)
             .await
@@ -1106,7 +1115,7 @@ impl Broker {
     /// Remove an instance from a context's binding (idempotent if absent).
     /// Also evicts `name_map` entries pointing at the dropped instance so
     /// follow-up calls surface the removed-tool error cleanly.
-    pub async fn unbind(&self, context_id: ContextId, instance: &InstanceId) -> McpResult<()> {
+    pub async fn unbind(self: &Arc<Self>, context_id: ContextId, instance: &InstanceId) -> McpResult<()> {
         let mut binding = self
             .binding(&context_id)
             .await
@@ -1149,7 +1158,7 @@ impl Broker {
     /// — not one block per tool (D-35 coalesced). Tool names within a batch
     /// are sorted for stable summary lines across runs.
     async fn emit_binding_diff(
-        &self,
+        self: &Arc<Self>,
         context_id: ContextId,
         old_pairs: &HashSet<(InstanceId, String)>,
         new_pairs: &HashSet<(InstanceId, String)>,
@@ -1619,6 +1628,9 @@ impl Broker {
         ctx: &CallContext,
         cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
         if let Some(reviewer) = ctx.reviewer_id {
             tracing::Span::current().record("reviewer.id", tracing::field::display(reviewer));
         }
@@ -1683,7 +1695,7 @@ impl Broker {
 
         // PreCall — may short-circuit the call entirely, or deny it outright.
         match self
-            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None)
+            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None, &cancel)
             .await?
         {
             PhaseOutcome::Continue => {}
@@ -1698,6 +1710,7 @@ impl Broker {
                         &params,
                         ctx,
                         PhasePayload::Result(&result, None),
+                        &cancel,
                     )
                     .await?
                 {
@@ -1787,6 +1800,7 @@ impl Broker {
                         &call_params_for_hooks,
                         ctx,
                         PhasePayload::Result(&result, None),
+                        &cancel,
                     )
                     .await?
                 {
@@ -1809,14 +1823,15 @@ impl Broker {
                     }
                 }
             }
+            Ok(Err(McpError::Cancelled)) | Err(McpError::Cancelled) => Err(McpError::Cancelled),
             Ok(Err(e)) => {
                 if execution_owns_hooks { return Err(e); }
-                self.run_on_error_then_err(&call_params_for_hooks, ctx, e)
+                self.run_on_error_then_err(&call_params_for_hooks, ctx, e, &cancel)
                     .await
             }
             Err(timeout_err) => {
                 if execution_owns_hooks { return Err(timeout_err); }
-                self.run_on_error_then_err(&call_params_for_hooks, ctx, timeout_err)
+                self.run_on_error_then_err(&call_params_for_hooks, ctx, timeout_err, &cancel)
                     .await
             }
         }
@@ -1833,9 +1848,10 @@ impl Broker {
         params: &KernelCallParams,
         ctx: &CallContext,
         err: McpError,
+        cancel: &CancellationToken,
     ) -> McpResult<KernelToolResult> {
         match self
-            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(&err, None))
+            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(&err, None), cancel)
             .await
         {
             Ok(PhaseOutcome::Continue) => Err(err),
@@ -1855,6 +1871,7 @@ impl Broker {
                 emit_gate_pending_attribution(McpHookPhase::OnError, &hook_id, &reason);
                 Err(McpError::gate_pending(Some(hook_id), ask, reason))
             }
+            Err(McpError::Cancelled) => Err(McpError::Cancelled),
             Err(eval_err) => {
                 tracing::warn!(
                     error = ?eval_err,
@@ -1884,10 +1901,13 @@ impl Broker {
         params: &KernelCallParams,
         ctx: &CallContext,
         payload: PhasePayload<'_>,
+        cancel: &CancellationToken,
     ) -> McpResult<PhaseOutcome> {
         // Keep the scope wrapper from carrying the full recursive evaluator
         // on every enclosing rc/command future's stack.
-        let evaluation = Box::pin(self.evaluate_phase_with_mode(PhaseMode::Enforce, phase, params, ctx, payload));
+        let evaluation = Box::pin(self.evaluate_phase_with_mode(
+            PhaseMode::Enforce, phase, params, ctx, payload, cancel,
+        ));
         let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
             else { inherit_hook_depth(0, evaluation).await };
         match result? {
@@ -1918,7 +1938,11 @@ impl Broker {
         params: &KernelCallParams,
         ctx: &CallContext,
         payload: PhasePayload<'_>,
+        cancel: &CancellationToken,
     ) -> McpResult<PhaseEval> {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
         // The gate policy runs before any hook (`kj/gate_policy.rs`,
         // `docs/gate-policy-tuning.md`): a shell program it allows outright
         // — every statement a `kj ledger` call, read-only `kj`, or an
@@ -2004,6 +2028,9 @@ impl Broker {
             PhasePayload::None => None,
         };
         for (_idx, entry) in ordered {
+            if cancel.is_cancelled() {
+                return Err(McpError::Cancelled);
+            }
             match entry.action {
                 HookAction::Log(spec) => {
                     // LogSpec::level is a tracing::Level; dispatch via
@@ -2108,7 +2135,9 @@ impl Broker {
                             self.dry_run_ask(&entry.id, description, params, ctx).await,
                         ));
                     }
-                    match self.run_permission_ask(&entry.id, &spec, params, ctx, phase, &payload, review).await {
+                    match self.run_permission_ask(
+                        &entry.id, &spec, params, ctx, phase, &payload, review, cancel,
+                    ).await? {
                         PermissionAskOutcome::Proceed => {}
                         PermissionAskOutcome::Denied { reason, ask } => {
                             return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
@@ -2138,7 +2167,10 @@ impl Broker {
                         // D-29 / D-47: guard against runaway recursion when
                         // a hook body re-enters `broker.call_tool`.
                         let _depth_guard = enter_hook_depth()?;
-                        if let Err(e) = hook.invoke(params, ctx).await {
+                        if let Err(e) = hook.invoke(params, ctx, cancel).await {
+                            if matches!(e, McpError::Cancelled) || cancel.is_cancelled() {
+                                return Err(McpError::Cancelled);
+                            }
                             let reason = format!("hook body `{name}` returned error: {e}");
                             if mode == PhaseMode::DryRun {
                                 return Ok(PhaseEval::DryRun(
@@ -2151,17 +2183,21 @@ impl Broker {
                                 ask: None,
                             }));
                         }
+                        if cancel.is_cancelled() {
+                            return Err(McpError::Cancelled);
+                        }
                     }
                     HookBody::Kaish(script) => {
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
-                            .run_kaish_hook(mode, phase, &script, params, ctx, &payload)
-                            .await;
+                            .run_kaish_hook(mode, phase, &script, params, ctx, &payload, cancel)
+                            .await?;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
                                 mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
+                                cancel,
                             )
-                            .await
+                            .await?
                         {
                             return Ok(eval);
                         }
@@ -2171,7 +2207,12 @@ impl Broker {
                         // snapshot (`docs/rc-on-disk.md`, "slice 5"). An
                         // unreadable path is a `Deny`, not an escalation;
                         // see `unreadable_hook_body_reason`.
-                        let body = match self.read_kaish_hook_body(&path).await {
+                        let body_read = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(McpError::Cancelled),
+                            result = self.read_kaish_hook_body(&path) => result,
+                        };
+                        let body = match body_read {
                             Ok(body) => body,
                             Err(err) => {
                                 let reason = unreadable_hook_body_reason(&path, &err);
@@ -2187,15 +2228,19 @@ impl Broker {
                                 }));
                             }
                         };
+                        if cancel.is_cancelled() {
+                            return Err(McpError::Cancelled);
+                        }
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
-                            .run_kaish_hook(mode, phase, &body, params, ctx, &payload)
-                            .await;
+                            .run_kaish_hook(mode, phase, &body, params, ctx, &payload, cancel)
+                            .await?;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
                                 mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
+                                cancel,
                             )
-                            .await
+                            .await?
                         {
                             return Ok(eval);
                         }
@@ -2282,8 +2327,8 @@ impl Broker {
     ///
     /// `None` when there is no `KjDispatcher` to reach the ledger through,
     /// or when the ledger refused the write. Both are logged and neither is
-    /// fatal — a dry run that cannot record has still changed nothing, and
-    /// its caller must never be blocked by a bookkeeping failure.
+    /// fatal. The advisory record grants no authority, so its absence cannot
+    /// change the dry-run verdict or authorize later execution.
     async fn record_dry_run_ask(
         &self,
         hook_id: &HookId,
@@ -2336,14 +2381,20 @@ impl Broker {
         phase: McpHookPhase,
         payload: &PhasePayload<'_>,
         review: Option<&dyn ResultReview>,
-    ) -> Option<PhaseEval> {
-        if mode == PhaseMode::Enforce {
-            return self
-                .resolve_kaish_hook_outcome(hook_id, outcome, params, ctx, phase, payload, review)
-                .await
-                .map(PhaseEval::Enforced);
+        cancel: &CancellationToken,
+    ) -> McpResult<Option<PhaseEval>> {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
         }
-        match outcome {
+        if mode == PhaseMode::Enforce {
+            return Ok(self
+                .resolve_kaish_hook_outcome(
+                    hook_id, outcome, params, ctx, phase, payload, review, cancel,
+                )
+                .await?
+                .map(PhaseEval::Enforced));
+        }
+        Ok(match outcome {
             KaishHookOutcome::Continue => None,
             KaishHookOutcome::Deny(reason) => Some(PhaseEval::DryRun(
                 self.dry_run_deny(&hook_id, reason, params, ctx).await,
@@ -2351,7 +2402,7 @@ impl Broker {
             KaishHookOutcome::Escalate(description) => Some(PhaseEval::DryRun(
                 self.dry_run_ask(&hook_id, description, params, ctx).await,
             )),
-        }
+        })
     }
 
     /// Record a durable ask with the phase's authority. PreCall approval can
@@ -2367,7 +2418,11 @@ impl Broker {
         phase: McpHookPhase,
         payload: &PhasePayload<'_>,
         review: Option<&dyn ResultReview>,
-    ) -> PermissionAskOutcome {
+        cancel: &CancellationToken,
+    ) -> McpResult<PermissionAskOutcome> {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
         let description = spec
             .description
             .clone()
@@ -2383,11 +2438,11 @@ impl Broker {
                 "permission ask fired with no KjDispatcher wired (Broker::set_kj_dispatcher never \
                  called, or a bare Broker::new() in a test); refusing (fail-closed, gate unavailable)",
             );
-            return PermissionAskOutcome::Unavailable {
+            return Ok(PermissionAskOutcome::Unavailable {
                 reason: "permission ask: no kj dispatcher wired (fail-closed, gate unavailable)"
                     .into(),
                 ask: None,
-            };
+            });
         };
 
         let caller = crate::kj::KjCaller {
@@ -2399,15 +2454,14 @@ impl Broker {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
-            // Ledger attribution only; this caller does not execute commands or rc.
-            cancel: CancellationToken::new(),
+            cancel: cancel.child_token(),
         };
         let mut gate_spec = if matches!(phase, McpHookPhase::PostCall | McpHookPhase::OnError) {
             if review.is_none() {
-                return PermissionAskOutcome::Unavailable {
+                return Ok(PermissionAskOutcome::Unavailable {
                     reason: "Execution has finished, but this caller cannot retain a result review. Do not rerun source to answer this review.".into(),
                     ask: None,
-                };
+                });
             }
             let captured = match payload {
                 PhasePayload::Result(result, _) => result_to_hook_json(result),
@@ -2420,6 +2474,9 @@ impl Broker {
         };
         gate_spec.publishes_pair = ctx.publishes_pair && phase == McpHookPhase::PreCall;
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
         let outcome = crate::kj::gate::run_gate_recorded(
             dispatcher.kernel(),
             &caller,
@@ -2432,22 +2489,27 @@ impl Broker {
             },
         )
         .await;
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
 
         if outcome.verdict == crate::kj::gate::GateVerdict::Pending
             && let Some(review) = review
         {
             let Some(ask) = outcome.ask else {
-                return PermissionAskOutcome::Unavailable { reason: "result review has no ask".into(), ask: None };
+                return Ok(PermissionAskOutcome::Unavailable { reason: "result review has no ask".into(), ask: None });
             };
             return match review.wait_for_review(&ask).await {
-                Ok(()) => PermissionAskOutcome::Proceed,
+                Ok(()) if cancel.is_cancelled() => Err(McpError::Cancelled),
+                Ok(()) => Ok(PermissionAskOutcome::Proceed),
                 Err(error) => match error.as_refusal() {
-                    Some(refusal) => PermissionAskOutcome::Denied { reason: error.to_string(), ask: refusal.ask },
-                    None => PermissionAskOutcome::Unavailable { reason: error.to_string(), ask: Some(ask) },
+                    Some(refusal) => Ok(PermissionAskOutcome::Denied { reason: error.to_string(), ask: refusal.ask }),
+                    None if matches!(&error, McpError::Cancelled) || cancel.is_cancelled() => Err(McpError::Cancelled),
+                    None => Ok(PermissionAskOutcome::Unavailable { reason: error.to_string(), ask: Some(ask) }),
                 },
             };
         }
-        match outcome.verdict {
+        Ok(match outcome.verdict {
             crate::kj::gate::GateVerdict::Allowed => {
                 tracing::debug!(
                     target: "kaijutsu::hooks",
@@ -2516,14 +2578,13 @@ impl Broker {
                     ask: outcome.ask.clone(),
                 }
             }
-        }
+        })
     }
 
-    /// Run a `HookBody::Kaish` body. The script's `id` field is treated
-    /// as the inline kaish source (per the wart documented in
-    /// `hooks_builtin::build_hook_action`). Returns `Ok(())` on exit 0,
-    /// `Err(reason)` otherwise — the caller maps `Err` to
-    /// `PhaseOutcome::Deny` so kaish hooks cleanly veto a tool call.
+    /// Run a `HookBody::Kaish` source and classify its explicit verdict.
+    /// Exit zero continues. A nonzero exit denies unless the shell reports
+    /// an infrastructure fault that requires gate escalation. Owner
+    /// cancellation remains a distinct [`McpError::Cancelled`] result.
     ///
     /// The script always sees: `KJ_HOOK_PHASE`, `KJ_HOOK_INSTANCE`,
     /// `KJ_HOOK_TOOL`, `KJ_PRINCIPAL`, `KJ_CONTEXT`, `KJ_TOOL_ARGS`
@@ -2542,8 +2603,13 @@ impl Broker {
         params: &super::types::KernelCallParams,
         ctx: &CallContext,
         payload: &PhasePayload<'_>,
-    ) -> KaishHookOutcome {
+        cancel: &CancellationToken,
+    ) -> McpResult<KaishHookOutcome> {
         use std::collections::HashMap;
+
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
 
         // A hook body runs in a single-use context shell — a snapshot of the
         // calling context's durable state (env + cwd), with `kj` wired. This is
@@ -2560,34 +2626,42 @@ impl Broker {
         {
             Some(d) => d,
             None => {
-                // A fault, not a verdict (Amy's ruling, 2026-08-20): escalate
-                // rather than deny. `run_permission_ask` below performs the
-                // same `kj_dispatcher()` lookup and, finding nothing either,
-                // resolves this to `PermissionAskOutcome::Unavailable` →
-                // `McpError::gate_unavailable` — never `denied_by_hook`.
-                return KaishHookOutcome::Escalate(
+                // Missing execution infrastructure cannot become a hook
+                // verdict. Escalation reaches the gate, which reports the
+                // unavailable control instead of attributing a denial.
+                return Ok(KaishHookOutcome::Escalate(
                     "kaish hook requires Broker::set_kj_dispatcher; not wired".to_string(),
-                );
+                ));
             }
         };
-        let kaish = match EmbeddedKaish::for_context(
+        let prepare = EmbeddedKaish::for_context(
             &dispatcher,
             "hook",
             ShellIdentity {
                 requester: ctx.principal_id, performer: ctx.actor_id, reviewer: ctx.reviewer_id,
-                context: ctx.context_id, session: kaijutsu_types::SessionId::new(),
+                context: ctx.context_id, session: ctx.session_id,
             },
             ShellPolicy::Internal, ShellCwd::Context,
             None,
             Arc::new(crate::runtime::synthesis::NoopBlockSource),
-        )
-            .await
-        {
+        );
+        let prepared = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(McpError::Cancelled),
+            result = prepare => result,
+        };
+        let kaish = match prepared {
             Ok(k) => k,
             Err(e) => {
-                return KaishHookOutcome::Escalate(format!("kaish hook init failed: {e}"));
+                if cancel.is_cancelled() {
+                    return Err(McpError::Cancelled);
+                }
+                return Ok(KaishHookOutcome::Escalate(format!("kaish hook init failed: {e}")));
             }
         };
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
 
         let phase_str = match phase {
             McpHookPhase::PreCall => "pre_call",
@@ -2781,8 +2855,8 @@ impl Broker {
                             dispatcher.kernel(), ctx.context_id, params.tool == "shell", &statements,
                         ).await {
                             Ok(entries) => entries,
-                            Err(error) => return KaishHookOutcome::Escalate(format!(
-                                "could not capture shell plan inputs: {error}")),
+                            Err(error) => return Ok(KaishHookOutcome::Escalate(format!(
+                                "could not capture shell plan inputs: {error}"))),
                         };
                         if let Some(obj) = plan_value.as_object_mut() {
                             obj.insert(
@@ -2822,11 +2896,16 @@ impl Broker {
 
         let opts = kaish_kernel::ExecuteOptions::new()
             .with_vars(vars)
-            .with_timeout(kaish.timeouts().hook_body_timeout);
+            .with_timeout(kaish.timeouts().hook_body_timeout)
+            .with_cancel_token(cancel.clone());
         let fallback = format!("{}.{}", params.instance, params.tool);
         match kaish.execute_with_options(body, opts).await {
-            Ok(exec) => classify_kaish_hook_exit(exec.code, &exec.err, &fallback),
+            Ok(_) if cancel.is_cancelled() => Err(McpError::Cancelled),
+            Ok(exec) => Ok(classify_kaish_hook_exit(exec.code, &exec.err, &fallback)),
             Err(e) => {
+                if cancel.is_cancelled() {
+                    return Err(McpError::Cancelled);
+                }
                 tracing::warn!(
                     target: "kaijutsu::hooks",
                     instance = %params.instance,
@@ -2836,7 +2915,7 @@ impl Broker {
                     "kaish hook body faulted; escalating to an ask rather than denying — \
                      a runtime fault is not a verdict",
                 );
-                KaishHookOutcome::Escalate(format!("kaish hook exec error: {e}"))
+                Ok(KaishHookOutcome::Escalate(format!("kaish hook exec error: {e}")))
             }
         }
     }
@@ -2866,8 +2945,7 @@ impl Broker {
     /// to let `evaluate_phase` continue to the next hook entry. Shared by
     /// `HookBody::Kaish` and `HookBody::KaishPath` — the two differ only
     /// in where the body text came from; once it has run, the exit-code
-    /// handling (Amy's ruling, 2026-08-20, documented on
-    /// `KaishHookOutcome`) is identical.
+    /// handling documented on `KaishHookOutcome` is identical.
     async fn resolve_kaish_hook_outcome(
         &self,
         hook_id: HookId,
@@ -2877,8 +2955,12 @@ impl Broker {
         phase: McpHookPhase,
         payload: &PhasePayload<'_>,
         review: Option<&dyn ResultReview>,
-    ) -> Option<PhaseOutcome> {
-        match outcome {
+        cancel: &CancellationToken,
+    ) -> McpResult<Option<PhaseOutcome>> {
+        if cancel.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
+        Ok(match outcome {
             KaishHookOutcome::Continue => None,
             KaishHookOutcome::Deny(reason) => {
                 Some(PhaseOutcome::Deny { hook_id, reason, ask: None })
@@ -2887,7 +2969,9 @@ impl Broker {
                 let ask_spec = AskSpec {
                     description: Some(description),
                 };
-                match self.run_permission_ask(&hook_id, &ask_spec, params, ctx, phase, payload, review).await {
+                match self.run_permission_ask(
+                    &hook_id, &ask_spec, params, ctx, phase, payload, review, cancel,
+                ).await? {
                     PermissionAskOutcome::Proceed => None,
                     PermissionAskOutcome::Denied { reason, ask } => {
                         Some(PhaseOutcome::Deny { hook_id, reason, ask })
@@ -2900,22 +2984,17 @@ impl Broker {
                     }
                 }
             }
-        }
+        })
     }
 
     // ── Direct kaish exec paths take the hook path (docs/gate-and-shell-
     // split.md, "The three rpc.rs shell paths take the hook path") ──────
     //
-    // `crates/kaijutsu-server/src/rpc.rs`'s `execute`, `execute_shell_command`,
-    // and `execute_kj_command` run `EmbeddedKaish::execute_with_options`
-    // directly — never through `Broker::call_tool` — so no `PreCall`/
-    // `PostCall`/`OnError` hook ever sees a human typing at the shell. These
-    // three methods give `rpc.rs` the same PreCall/PostCall/OnError verdict
-    // a `shell_write` tool call gets, matched as `instance: builtin.shell_write,
-    // tool: shell_write, args: {command}` — the identity every
-    // `match_tool: "shell_write"` hook (the sh -c guard, a future lfm2d
-    // scorer) already expects, so one hook fires on both the tool-call path
-    // and the interactive-shell path with no special-casing on either side.
+    // Runtime shell owners call these methods around captured kaish execution
+    // because that execution does not enter `Broker::call_tool`. They receive
+    // the same PreCall/PostCall/OnError verdict as a `shell_write` tool call,
+    // matched as `instance: builtin.shell_write, tool: shell_write,
+    // args: {command}`.
     //
     // Deliberately NOT a full reroute through `call_tool`: these RPC paths
     // stream output, register a cancel token, and write directly to context
@@ -2949,10 +3028,11 @@ impl Broker {
         &self,
         command: &str,
         ctx: &CallContext,
+        cancel: &CancellationToken,
     ) -> ShellHookVerdict {
         let params = Self::shell_write_hook_params(command);
         match self
-            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None)
+            .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None, cancel)
             .await
         {
             Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
@@ -2994,18 +3074,20 @@ impl Broker {
         &self,
         command: &str,
         ctx: &CallContext,
+        cancel: &CancellationToken,
     ) -> McpResult<DryRunReport> {
         let params = Self::shell_write_hook_params(command);
-        match self
-            .evaluate_phase_with_mode(
-                PhaseMode::DryRun,
-                McpHookPhase::PreCall,
-                &params,
-                ctx,
-                PhasePayload::None,
-            )
-            .await?
-        {
+        let evaluation = Box::pin(self.evaluate_phase_with_mode(
+            PhaseMode::DryRun,
+            McpHookPhase::PreCall,
+            &params,
+            ctx,
+            PhasePayload::None,
+            cancel,
+        ));
+        let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
+            else { inherit_hook_depth(0, evaluation).await };
+        match result? {
             PhaseEval::DryRun(report) => Ok(report),
             // Unreachable by construction, and an error rather than a
             // fallback: a verdict reaching this path would mean the
@@ -3025,6 +3107,7 @@ impl Broker {
         ctx: &CallContext,
         result: &KernelToolResult,
         review: Option<&dyn ResultReview>,
+        cancel: &CancellationToken,
     ) -> ShellHookVerdict {
         match self
             .evaluate_phase(
@@ -3032,6 +3115,7 @@ impl Broker {
                 params,
                 ctx,
                 PhasePayload::Result(result, review),
+                cancel,
             )
             .await
         {
@@ -3064,9 +3148,12 @@ impl Broker {
         ctx: &CallContext,
         err: &McpError,
         review: Option<&dyn ResultReview>,
+        cancel: &CancellationToken,
     ) -> ShellHookVerdict {
         match self
-            .evaluate_phase(McpHookPhase::OnError, params, ctx, PhasePayload::Error(err, review))
+            .evaluate_phase(
+                McpHookPhase::OnError, params, ctx, PhasePayload::Error(err, review), cancel,
+            )
             .await
         {
             Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
@@ -3230,16 +3317,146 @@ impl Broker {
         Ok(())
     }
 
-    /// Accessor for the (empty in Phase 1) hook tables.
+    /// Access the live hook tables.
     pub fn hooks(&self) -> &RwLock<HookTables> {
         &self.hooks
+    }
+
+    /// Run notification hook evaluation and its block insertion as one
+    /// kernel-owned task. Pumps and flush timers are transport producers; a
+    /// dropped producer must not abandon accepted hook work or its emission.
+    async fn emit_notification_block(
+        self: &Arc<Self>,
+        params: KernelCallParams,
+        ctx: CallContext,
+        instance: InstanceId,
+        docs: SharedBlockStore,
+        block: NotificationBlock,
+    ) {
+        let matching_hooks = {
+            let hooks = self.hooks.read().await;
+            hooks.on_notification.entries.iter()
+                .filter(|entry| hook_matches(entry, &params, &ctx))
+                .count()
+        };
+        let Some(dispatcher) = self.kj_dispatcher().await else {
+            if matching_hooks == 0 {
+                Self::insert_notification_block(&ctx, &instance, &docs, block);
+                return;
+            }
+            tracing::error!(
+                context_id = %ctx.context_id,
+                instance = %instance,
+                matching_hooks,
+                "notification hooks have no kernel runtime owner; suppressing emission",
+            );
+            return;
+        };
+        let kernel = dispatcher.kernel().clone();
+        let broker = self.clone();
+        let depth = current_hook_depth();
+        let context_id = ctx.context_id;
+        let log_instance = instance.clone();
+        let (settled, complete) = tokio::sync::oneshot::channel();
+        let accepted = kernel.spawn_runtime_task(move |stop| async move {
+            inherit_hook_depth(depth, broker.emit_notification_block_inner(
+                &params, &ctx, &instance, &docs, block, &stop,
+            )).await;
+            let _ = settled.send(());
+        });
+        if let Err(reason) = accepted {
+            tracing::warn!(
+                context_id = %context_id,
+                instance = %log_instance,
+                %reason,
+                "notification emission was not accepted by the kernel runtime",
+            );
+            return;
+        }
+        let _ = complete.await;
+    }
+
+    async fn emit_notification_block_inner(
+        &self,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+        instance: &InstanceId,
+        docs: &SharedBlockStore,
+        block: NotificationBlock,
+        cancel: &CancellationToken,
+    ) {
+        match self.evaluate_phase(
+            McpHookPhase::OnNotification, params, ctx, PhasePayload::None, cancel,
+        ).await {
+            Ok(PhaseOutcome::Continue) => {}
+            Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
+                emit_short_circuit_attribution(McpHookPhase::OnNotification, &hook_id);
+                return;
+            }
+            Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
+                emit_deny_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
+            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
+                emit_gate_unavailable_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
+            Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
+                emit_gate_pending_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
+                return;
+            }
+            Err(McpError::Cancelled) => return,
+            Err(error) => {
+                tracing::warn!(
+                    context_id = %ctx.context_id,
+                    instance = %instance,
+                    ?error,
+                    "on_notification evaluation failed; emitting anyway",
+                );
+            }
+        }
+        Self::insert_notification_block(ctx, instance, docs, block);
+    }
+
+    fn insert_notification_block(
+        ctx: &CallContext,
+        instance: &InstanceId,
+        docs: &SharedBlockStore,
+        block: NotificationBlock,
+    ) {
+        let result = match block {
+            NotificationBlock::Notification { parent, payload, summary } => docs
+                .insert_notification_block_as(
+                    ctx.context_id,
+                    parent.as_ref(),
+                    &payload,
+                    summary,
+                    Some(kaijutsu_types::PrincipalId::system()),
+                ),
+            NotificationBlock::Resource { parent, payload, summary } => docs
+                .insert_resource_block_as(
+                    ctx.context_id,
+                    Some(&parent),
+                    &payload,
+                    summary,
+                    Some(kaijutsu_types::PrincipalId::system()),
+                ),
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                context_id = %ctx.context_id,
+                instance = %instance,
+                ?error,
+                "failed to emit notification block",
+            );
+        }
     }
 
     /// Emit a notification block into every bound context that allows this
     /// instance. Walks bindings (no reverse index in Phase 2 — simple scale).
     /// No-op when `documents` is unset (broker constructed without bootstrap).
     async fn emit_for_bindings(
-        &self,
+        self: &Arc<Self>,
         instance: &InstanceId,
         payload: NotificationPayload,
     ) {
@@ -3272,7 +3489,7 @@ impl Broker {
     /// itself is the trigger, not ongoing binding membership. Still runs
     /// `OnNotification` hooks for consistency with `emit_for_bindings`.
     async fn emit_for_context(
-        &self,
+        self: &Arc<Self>,
         context_id: ContextId,
         instance: &InstanceId,
         payload: NotificationPayload,
@@ -3283,14 +3500,7 @@ impl Broker {
         };
         let summary = payload.summary_line();
         let synth_params = build_notification_synth(instance, &payload);
-        self.emit_into_context(
-            context_id,
-            instance,
-            &payload,
-            &summary,
-            &synth_params,
-            &docs,
-        )
+        self.emit_into_context(context_id, instance, &payload, &summary, &synth_params, &docs)
         .await;
     }
 
@@ -3299,7 +3509,7 @@ impl Broker {
     /// block. Silent on hook errors (emits anyway, per prior Phase 4
     /// behavior) so transient hook failures don't swallow notifications.
     async fn emit_into_context(
-        &self,
+        self: &Arc<Self>,
         ctx: ContextId,
         instance: &InstanceId,
         payload: &NotificationPayload,
@@ -3307,56 +3517,17 @@ impl Broker {
         synth_params: &KernelCallParams,
         docs: &SharedBlockStore,
     ) {
-        let synth_ctx = CallContext::system_for_context(ctx);
-        match self
-            .evaluate_phase(
-                McpHookPhase::OnNotification,
-                synth_params,
-                &synth_ctx,
-                PhasePayload::None,
-            )
-            .await
-        {
-            Ok(PhaseOutcome::Continue) => {}
-            Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
-                emit_short_circuit_attribution(McpHookPhase::OnNotification, &hook_id);
-                return;
-            }
-            Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
-                emit_deny_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
-                return;
-            }
-            Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
-                emit_gate_unavailable_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
-                return;
-            }
-            Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
-                emit_gate_pending_attribution(McpHookPhase::OnNotification, &hook_id, &reason);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    context_id = %ctx,
-                    instance = %instance,
-                    error = ?e,
-                    "on_notification evaluation failed; emitting anyway",
-                );
-            }
-        }
-        if let Err(e) = docs.insert_notification_block_as(
-            ctx,
-            None,
-            payload,
-            summary.to_string(),
-            Some(kaijutsu_types::PrincipalId::system()),
-        ) {
-            tracing::warn!(
-                context_id = %ctx,
-                instance = %instance,
-                error = ?e,
-                "failed to emit notification block",
-            );
-        }
+        self.emit_notification_block(
+            synth_params.clone(),
+            CallContext::system_for_context(ctx),
+            instance.clone(),
+            docs.clone(),
+            NotificationBlock::Notification {
+                parent: None,
+                payload: payload.clone(),
+                summary: summary.to_string(),
+            },
+        ).await;
     }
 
     /// Schedule a `flush` timer for `(instance, kind, uri)` if none is
@@ -4080,76 +4251,16 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                 }),
             };
             for (ctx_id, parent_block) in targets {
-                let synth_ctx = CallContext::system_for_context(ctx_id);
-                match broker
-                    .evaluate_phase(
-                        McpHookPhase::OnNotification,
-                        &success_synth,
-                        &synth_ctx,
-                        PhasePayload::None,
-                    )
-                    .await
-                {
-                    Ok(PhaseOutcome::Continue) => {}
-                    Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
-                        emit_short_circuit_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
-                        emit_deny_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
-                        emit_gate_unavailable_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
-                        emit_gate_pending_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            context_id = %ctx_id,
-                            instance = %id,
-                            uri = %uri,
-                            error = ?e,
-                            "on_notification evaluation failed; emitting anyway",
-                        );
-                    }
-                }
                 let payload =
                     resource_payload_from_contents(id, uri, chunk, Some(parent_block));
                 let summary = payload.summary_line();
-                if let Err(e) = docs.insert_resource_block_as(
-                    ctx_id,
-                    Some(&parent_block),
-                    &payload,
-                    summary,
-                    Some(kaijutsu_types::PrincipalId::system()),
-                ) {
-                    tracing::warn!(
-                        context_id = %ctx_id,
-                        instance = %id,
-                        uri = %uri,
-                        error = ?e,
-                        "failed to emit child resource block",
-                    );
-                }
+                broker.emit_notification_block(
+                    success_synth.clone(),
+                    CallContext::system_for_context(ctx_id),
+                    id.clone(),
+                    docs.clone(),
+                    NotificationBlock::Resource { parent: parent_block, payload, summary },
+                ).await;
             }
         }
         Err(e) => {
@@ -4166,58 +4277,6 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                 }),
             };
             for (ctx_id, parent_block) in targets {
-                let synth_ctx = CallContext::system_for_context(ctx_id);
-                match broker
-                    .evaluate_phase(
-                        McpHookPhase::OnNotification,
-                        &fail_synth,
-                        &synth_ctx,
-                        PhasePayload::None,
-                    )
-                    .await
-                {
-                    Ok(PhaseOutcome::Continue) => {}
-                    Ok(PhaseOutcome::ShortCircuit { hook_id, .. }) => {
-                        emit_short_circuit_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::Deny { hook_id, reason, ask: _ }) => {
-                        emit_deny_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::GateUnavailable { hook_id, reason, ask: _ }) => {
-                        emit_gate_unavailable_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Ok(PhaseOutcome::GatePending { hook_id, reason, ask: _ }) => {
-                        emit_gate_pending_attribution(
-                            McpHookPhase::OnNotification,
-                            &hook_id,
-                            &reason,
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            context_id = %ctx_id,
-                            instance = %id,
-                            uri = %uri,
-                            error = ?err,
-                            "on_notification evaluation failed; emitting anyway",
-                        );
-                    }
-                }
                 let payload = NotificationPayload {
                     instance: id.as_str().to_string(),
                     kind: kaijutsu_types::NotificationKind::Log,
@@ -4227,21 +4286,17 @@ async fn handle_resource_flush(broker: &Arc<Broker>, id: &InstanceId, uri: &str)
                     detail: Some(detail.clone()),
                 };
                 let summary = payload.summary_line();
-                if let Err(ee) = docs.insert_notification_block_as(
-                    ctx_id,
-                    Some(&parent_block),
-                    &payload,
-                    summary,
-                    Some(kaijutsu_types::PrincipalId::system()),
-                ) {
-                    tracing::warn!(
-                        context_id = %ctx_id,
-                        instance = %id,
-                        uri = %uri,
-                        error = ?ee,
-                        "failed to emit fallback Log notification",
-                    );
-                }
+                broker.emit_notification_block(
+                    fail_synth.clone(),
+                    CallContext::system_for_context(ctx_id),
+                    id.clone(),
+                    docs.clone(),
+                    NotificationBlock::Notification {
+                        parent: Some(parent_block),
+                        payload,
+                        summary,
+                    },
+                ).await;
             }
         }
     }
@@ -5749,6 +5804,31 @@ mod tests {
         (broker, store, ctx)
     }
 
+    async fn wire_runtime_owner(
+        broker: &Arc<Broker>,
+        name: &str,
+    ) -> (Arc<crate::Kernel>, Arc<crate::kj::KjDispatcher>) {
+        use crate::drift::shared_drift_router;
+        use crate::kj::KjDispatcher;
+
+        let kernel = Arc::new(crate::Kernel::new_ephemeral(name).await);
+        let kernel_db = kernel
+            .blocks()
+            .db()
+            .expect("new_ephemeral wires a persistent KernelDb")
+            .clone();
+        let dispatcher = Arc::new(KjDispatcher::new(
+            shared_drift_router(),
+            kernel.blocks().clone(),
+            kernel_db,
+            kernel.clone(),
+        ));
+        dispatcher.set_self_arc();
+        broker.set_kernel(&kernel).await;
+        broker.set_kj_dispatcher(&dispatcher).await;
+        (kernel, dispatcher)
+    }
+
     async fn bind(broker: &Arc<Broker>, ctx: ContextId, instance: &str) {
         let binding = ContextToolBinding::with_instances(vec![InstanceId::new(instance)]);
         broker.set_binding(ctx, binding).await.unwrap();
@@ -7159,6 +7239,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 _ctx: &CallContext,
+                _cancel: &CancellationToken,
             ) -> McpResult<()> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -7214,6 +7295,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 _ctx: &CallContext,
+                _cancel: &CancellationToken,
             ) -> McpResult<()> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -7675,6 +7757,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 _ctx: &CallContext,
+                _cancel: &CancellationToken,
             ) -> McpResult<()> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -7682,6 +7765,8 @@ mod tests {
         }
 
         let (broker, _store, ctx) = wired_broker().await;
+        let (_kernel, _dispatcher) =
+            wire_runtime_owner(&broker, "notification-log-passthrough").await;
         bind(&broker, ctx, "svc").await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         let tx = server.sender();
@@ -7716,7 +7801,11 @@ mod tests {
             message: "hi".into(),
             tool: None,
         });
-        sleep(Duration::from_millis(150)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while n.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("OnNotification hook should finish");
         assert_eq!(
             n.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -7737,6 +7826,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 _ctx: &CallContext,
+                _cancel: &CancellationToken,
             ) -> McpResult<()> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -7778,6 +7868,8 @@ mod tests {
             .create_document(ctx, DocumentKind::File, Some("rust".into()))
             .unwrap();
         broker.set_documents(store.clone()).await;
+        let (_kernel, _dispatcher) =
+            wire_runtime_owner(&broker, "notification-coalesced-burst").await;
         bind(&broker, ctx, "chatty").await;
         let server = Arc::new(MockServer::new("chatty").with_tool("t"));
         let tx = server.sender();
@@ -7814,7 +7906,11 @@ mod tests {
                 tool: None,
             });
         }
-        sleep(Duration::from_millis(250)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while n.load(std::sync::atomic::Ordering::SeqCst) != 6 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("all coalesced OnNotification hooks should finish");
 
         let fires = n.load(std::sync::atomic::Ordering::SeqCst);
         // 5 pass-through Logs + 1 Coalesced summary = 6 emissions = 6 hook fires.
@@ -7824,11 +7920,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn notification_hook_cancellation_awaits_cleanup_and_suppresses_emission() {
+        struct CleaningHook {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            cleaned: Arc<std::sync::atomic::AtomicBool>,
+        }
+        #[async_trait]
+        impl Hook for CleaningHook {
+            async fn invoke(
+                &self,
+                _params: &KernelCallParams,
+                _ctx: &CallContext,
+                cancel: &CancellationToken,
+            ) -> McpResult<()> {
+                if let Some(entered) = self.entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                }
+                cancel.cancelled().await;
+                tokio::task::yield_now().await;
+                self.cleaned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(McpError::Cancelled)
+            }
+        }
+
+        let (broker, store, ctx) = wired_broker().await;
+        let (kernel, _dispatcher) =
+            wire_runtime_owner(&broker, "notification-cancel-cleanup").await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        broker
+            .hooks()
+            .write()
+            .await
+            .on_notification
+            .entries
+            .push(HookEntry {
+                id: hook_id("notification-cleanup"),
+                match_instance: None,
+                match_tool: None,
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Builtin {
+                    name: "test.notification_cleanup".into(),
+                    hook: Arc::new(CleaningHook {
+                        entered: std::sync::Mutex::new(Some(entered_tx)),
+                        cleaned: cleaned.clone(),
+                    }),
+                }),
+                priority: 0,
+                kaish_script_id: None,
+            });
+
+        let emission = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker.emit_for_context(
+                    ctx,
+                    &InstanceId::new("svc"),
+                    NotificationPayload {
+                        instance: "svc".into(),
+                        kind: kaijutsu_types::NotificationKind::Log,
+                        level: Some(kaijutsu_types::LogLevel::Info),
+                        tools: Vec::new(),
+                        count: None,
+                        detail: Some("held".into()),
+                    },
+                ).await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .expect("notification hook should enter before timeout")
+            .expect("notification hook should enter");
+        emission.abort();
+        let _ = emission.await;
+
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker())
+            .await
+            .expect("notification hook cleanup should finish before timeout")
+            .unwrap();
+        assert!(
+            cleaned.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown must await notification hook cleanup",
+        );
+        assert!(
+            notifications_in(&store, ctx).is_empty(),
+            "cancelled notification hooks must suppress their block",
+        );
+    }
+
     /// A `Deny` OnNotification hook skips the emission for that context —
     /// no Notification block lands.
     #[tokio::test]
     async fn on_notification_deny_skips_emission() {
         let (broker, store, ctx) = wired_broker().await;
+        let (_kernel, _dispatcher) =
+            wire_runtime_owner(&broker, "notification-deny").await;
         bind(&broker, ctx, "svc").await;
         let server = Arc::new(MockServer::new("svc").with_tool("t"));
         let tx = server.sender();
@@ -7885,10 +8074,11 @@ mod tests {
                 &self,
                 params: &KernelCallParams,
                 ctx: &CallContext,
+                cancel: &CancellationToken,
             ) -> McpResult<()> {
                 let broker = self.0.get().unwrap().upgrade().unwrap();
                 broker
-                    .call_tool(params.clone(), ctx, CancellationToken::new())
+                    .call_tool(params.clone(), ctx, cancel.child_token())
                     .await
                     .map(|_| ())
             }
@@ -7948,6 +8138,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 ctx: &CallContext,
+                cancel: &CancellationToken,
             ) -> McpResult<()> {
                 let broker = self.0.get().unwrap().upgrade().unwrap();
                 // Call the sibling tool on a different instance (so the hook
@@ -7960,7 +8151,7 @@ mod tests {
                             arguments: serde_json::json!({}),
                         },
                         ctx,
-                        CancellationToken::new(),
+                        cancel.child_token(),
                     )
                     .await
                     .map(|_| ())
@@ -8096,6 +8287,26 @@ mod tests {
             err.is_refusal(RefusalKind::Denied),
             "expected Denied, got {err:?}"
         );
+
+        // Exit 130 is only cancellation when the invocation's owner token
+        // fired. A hook may deliberately choose that numeric exit while its
+        // owner remains live; it is an ordinary nonzero veto.
+        broker.hooks().write().await.pre_call.entries.clear();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("kaish-explicit-130"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish("exit 130".into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+        let live = CancellationToken::new();
+        let err = broker.call_tool(params("svc", "t"), &CallContext::test(), live.clone())
+            .await.expect_err("an explicit exit 130 must veto the call");
+        assert!(!live.is_cancelled());
+        assert!(err.is_refusal(RefusalKind::Denied), "expected Denied, got {err:?}");
     }
 
     /// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "Exit 3 =
@@ -8287,7 +8498,10 @@ mod tests {
         let cc = CallContext::test();
         let call_params = params("svc", "t");
         let outcome = broker
-            .evaluate_phase(McpHookPhase::PreCall, &call_params, &cc, PhasePayload::None)
+            .evaluate_phase(
+                McpHookPhase::PreCall, &call_params, &cc, PhasePayload::None,
+                &CancellationToken::new(),
+            )
             .await
             .expect("evaluate_phase itself must not error");
         match outcome {
@@ -8449,6 +8663,130 @@ mod tests {
             panic!("exit 3 must escalate");
         };
         assert_eq!(description, stderr, "newlines must not be escaped or otherwise altered");
+    }
+
+    #[test]
+    fn kaish_hook_exit_keeps_the_stderr_suffix() {
+        use super::{classify_kaish_hook_exit, KaishHookOutcome};
+        let stderr = format!("discarded-prefix:{}:retained-suffix", "x".repeat(600));
+        let KaishHookOutcome::Escalate(description) = classify_kaish_hook_exit(3, &stderr, "i.t") else {
+            panic!("exit 3 must escalate");
+        };
+        assert!(description.ends_with("retained-suffix"), "the newest stderr must survive: {description:?}");
+        assert!(!description.contains("discarded-prefix"), "the tail must discard old stderr: {description:?}");
+        assert!(description.chars().count() <= 512);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_kaish_hook_awaits_cleanup_and_stops_the_call() {
+        let mut policy = kaijutsu_types::TimeoutPolicy::default();
+        policy.hook_body_timeout = Duration::from_millis(500);
+        let (broker, kj) = wired_hook_ask_broker("hook-owner-cancel", policy).await;
+        let kernel = kj.kernel().clone();
+        let ctx = approval_call_context(&kj, "hook-owner-cancel");
+        kernel.blocks().create_document(
+            ctx.context_id, crate::DocumentKind::Conversation, None,
+        ).unwrap();
+
+        let server_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = server_calls.clone();
+        let server = Arc::new(MockServer::new("svc").with_tool("t").on_call(move |_| {
+            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(KernelToolResult::text("server ran")) }
+        }));
+        broker.register_silently(server, InstancePolicy::default()).await.unwrap();
+        broker.hooks().write().await.pre_call.entries.extend([
+            HookEntry {
+                id: hook_id("cancelled-hook"),
+                match_instance: None,
+                match_tool: Some(GlobPattern("t".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Kaish(
+                    "kj block create --role system --kind text --content hook-entered; \
+                     while true; do sleep 0.01; done".into(),
+                )),
+                priority: 0,
+                kaish_script_id: None,
+            },
+            HookEntry {
+                id: hook_id("must-not-run-after-cancel"),
+                match_instance: None,
+                match_tool: Some(GlobPattern("t".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Kaish(
+                    "kj block create --role system --kind text --content later-hook-ran".into(),
+                )),
+                priority: 1,
+                kaish_script_id: None,
+            },
+        ]);
+
+        let cancel = CancellationToken::new();
+        let task = {
+            let broker = broker.clone();
+            let ctx = ctx.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { broker.call_tool(params("svc", "t"), &ctx, cancel).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if kernel.blocks().block_snapshots(ctx.context_id).unwrap_or_default().iter()
+                    .any(|block| block.content == "hook-entered")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("the hook must enter before cancellation");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(2), task).await
+            .expect("hook cancellation must await interpreter cleanup")
+            .expect("hook task must not panic")
+            .expect_err("owner cancellation must stop the call");
+        assert!(matches!(error, McpError::Cancelled), "expected Cancelled, got {error:?}");
+        let blocks = kernel.blocks().block_snapshots(ctx.context_id).unwrap();
+        assert!(!blocks.iter().any(|block| block.content == "later-hook-ran"));
+        assert_eq!(server_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_real_kaish_hook_timeout_finishes_as_a_gate_fault_without_running_the_server() {
+        let mut policy = kaijutsu_types::TimeoutPolicy::default();
+        policy.hook_body_timeout = Duration::from_millis(40);
+        let (broker, kj) = wired_hook_ask_broker("hook-real-timeout", policy).await;
+        let server_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = server_calls.clone();
+        let server = Arc::new(MockServer::new("svc").with_tool("t").on_call(move |_| {
+            observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(KernelToolResult::text("server ran")) }
+        }));
+        broker.register_silently(server, InstancePolicy::default()).await.unwrap();
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("timed-out-hook"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("t".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(
+                "while true; do sleep 0.01; done".into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            broker.call_tool(
+                params("svc", "t"),
+                &approval_call_context(&kj, "hook-real-timeout"),
+                CancellationToken::new(),
+            ),
+        ).await.expect("the hook timeout must bound real execution")
+            .expect_err("a hook timeout must fail closed through the gate");
+        assert!(error.is_refusal(RefusalKind::Pending), "expected pending gate fault, got {error:?}");
+        assert_eq!(server_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// `KJ_TOOL_PLAN` (`docs/gate-and-shell-split.md`): a shell hook body
@@ -8660,11 +8998,11 @@ mod tests {
         .await;
         let db = kj.kernel_db();
 
-        match broker.shell_pre_call_hooks("kj ledger allow 01a0-abc", &ctx).await {
+        match broker.shell_pre_call_hooks("kj ledger allow 01a0-abc", &ctx, &CancellationToken::new()).await {
             ShellHookVerdict::Proceed => {}
             other => panic!("the answer path must proceed without a hook, got {other:?}"),
         }
-        match broker.shell_pre_call_hooks("kj block list", &ctx).await {
+        match broker.shell_pre_call_hooks("kj block list", &ctx, &CancellationToken::new()).await {
             ShellHookVerdict::Proceed => {}
             other => panic!("a read-only kj call must proceed without a hook, got {other:?}"),
         }
@@ -8673,14 +9011,17 @@ mod tests {
             "an exempt program must not mint an ask"
         );
         let report = broker
-            .shell_pre_call_hooks_dry_run("kj ledger deny 01a0-abc", &ctx)
+            .shell_pre_call_hooks_dry_run("kj ledger deny 01a0-abc", &ctx, &CancellationToken::new())
             .await
             .expect("a dry run reports");
         assert_eq!(report.outcome, DryRunOutcome::WouldProceed);
         assert!(report.hook_id.is_none(), "no hook fired: {report:?}");
 
         match broker
-            .shell_pre_call_hooks("kj ledger allow 01a0-abc; dd if=/dev/zero of=/tmp/x", &ctx)
+            .shell_pre_call_hooks(
+                "kj ledger allow 01a0-abc; dd if=/dev/zero of=/tmp/x", &ctx,
+                &CancellationToken::new(),
+            )
             .await
         {
             ShellHookVerdict::Denied(_) => {}
@@ -8707,7 +9048,7 @@ mod tests {
         .await;
 
         let report = broker
-            .shell_pre_call_hooks_dry_run("git push --force", &ctx)
+            .shell_pre_call_hooks_dry_run("git push --force", &ctx, &CancellationToken::new())
             .await
             .expect("a dry run reports; it does not fail");
 
@@ -8757,7 +9098,7 @@ mod tests {
 
         let command = "dd if=/dev/zero of=/tmp/kj-dry-run-never";
         let report = broker
-            .shell_pre_call_hooks_dry_run(command, &ctx)
+            .shell_pre_call_hooks_dry_run(command, &ctx, &CancellationToken::new())
             .await
             .expect("a dry run reports; it does not fail");
         assert_eq!(report.outcome, DryRunOutcome::WouldAsk);
@@ -8771,7 +9112,7 @@ mod tests {
         );
 
         // The enforcing path, same hook, same command: a real gate opens.
-        match broker.shell_pre_call_hooks(command, &ctx).await {
+        match broker.shell_pre_call_hooks(command, &ctx, &CancellationToken::new()).await {
             ShellHookVerdict::Denied(_) => {}
             other => panic!("the enforcing path must refuse and ask, got {other:?}"),
         }
@@ -8813,7 +9154,7 @@ mod tests {
         .await;
 
         let report = broker
-            .shell_pre_call_hooks_dry_run("echo hello", &ctx)
+            .shell_pre_call_hooks_dry_run("echo hello", &ctx, &CancellationToken::new())
             .await
             .expect("a dry run reports; it does not fail");
         assert_eq!(
@@ -8823,7 +9164,7 @@ mod tests {
             report.reason
         );
 
-        match broker.shell_pre_call_hooks("echo hello", &ctx).await {
+        match broker.shell_pre_call_hooks("echo hello", &ctx, &CancellationToken::new()).await {
             ShellHookVerdict::Denied(err) => {
                 let text = err.to_string();
                 assert!(
@@ -8854,7 +9195,7 @@ mod tests {
         let command = format!("echo ran > {}", marker.display());
 
         let report = broker
-            .shell_pre_call_hooks_dry_run(&command, &ctx)
+            .shell_pre_call_hooks_dry_run(&command, &ctx, &CancellationToken::new())
             .await
             .expect("a dry run reports; it does not fail");
         assert_eq!(
@@ -9117,6 +9458,7 @@ mod tests {
                 &self,
                 _params: &KernelCallParams,
                 _ctx: &CallContext,
+                _cancel: &CancellationToken,
             ) -> McpResult<()> {
                 panic!("simulated hook body panic");
             }
@@ -9175,6 +9517,8 @@ mod tests {
     #[tokio::test]
     async fn on_notification_fires_for_resource_flush_success_path() {
         let (broker, store, ctx) = wired_broker().await;
+        let (_kernel, _dispatcher) =
+            wire_runtime_owner(&broker, "notification-resource-flush").await;
         bind(&broker, ctx, "res").await;
         let server = Arc::new(
             ResourceMock::new("res").with_text_resource("file:///a", "initial"),
@@ -10233,6 +10577,7 @@ mod tests {
                 &CallContext::test(),
                 &real_result,
                 None,
+                &CancellationToken::new(),
             )
             .await;
         assert!(
@@ -10264,7 +10609,10 @@ mod tests {
 
         let real_err = McpError::Protocol("unmistakable-real-failure".into());
         let verdict = broker
-            .result_error_hooks(&Broker::shell_write_hook_params("false"), &CallContext::test(), &real_err, None)
+            .result_error_hooks(
+                &Broker::shell_write_hook_params("false"), &CallContext::test(), &real_err,
+                None, &CancellationToken::new(),
+            )
             .await;
         assert!(
             matches!(verdict, ShellHookVerdict::Proceed),
@@ -10301,6 +10649,7 @@ mod tests {
                 &CallContext::test(),
                 &real_result,
                 None,
+                &CancellationToken::new(),
             )
             .await;
         match verdict {
@@ -10348,6 +10697,7 @@ mod tests {
                 &CallContext::test(),
                 &real_result,
                 None,
+                &CancellationToken::new(),
             )
             .await;
         match verdict {

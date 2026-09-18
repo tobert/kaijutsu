@@ -92,22 +92,15 @@ async fn run_kj(
     let mut call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
     call_ctx.publishes_pair = receipt.is_some();
-    let verdict = tokio::select! {
-        biased;
-        _ = stop.cancelled() => {
-            let reason = "kernel runtime shut down before structured execution";
-            settle_unrun(kernel, receipt.as_ref(), reason)?;
-            return Err(reason.into());
-        },
-        result = std::panic::AssertUnwindSafe(kernel.broker().shell_pre_call_hooks(&code, &call_ctx)).catch_unwind() => match result {
-            Ok(verdict) => verdict,
-            Err(panic) => {
-                if let Err(error) = settle_unrun(kernel, receipt.as_ref(), "Structured pre-call hook panicked; source was not run.") {
-                    tracing::error!("could not settle structured pre-call panic: {error}");
-                }
-                std::panic::resume_unwind(panic);
+    let verdict = match std::panic::AssertUnwindSafe(kernel.broker().shell_pre_call_hooks(&code, &call_ctx, &stop))
+        .catch_unwind().await {
+        Ok(verdict) => verdict,
+        Err(panic) => {
+            if let Err(error) = settle_unrun(kernel, receipt.as_ref(), "Structured pre-call hook panicked; source was not run.") {
+                tracing::error!("could not settle structured pre-call panic: {error}");
             }
-        },
+            std::panic::resume_unwind(panic);
+        }
     };
     let outcome = match verdict {
         crate::mcp::ShellHookVerdict::Proceed => match &receipt {
@@ -180,9 +173,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PausedHook {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.release.notified() => {}
+            }
             Ok(())
         }
     }
@@ -217,7 +214,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PanicHook {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, _cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             panic!("structured pre-call panic sentinel");
         }
     }

@@ -1,7 +1,6 @@
-//! `BuiltinHooksServer` — admin MCP surface for hook management (D-14,
-//! Phase 4 / §4.3).
+//! Hook and stored-script administration through the MCP broker.
 //!
-//! Four tools delegate to `Broker`'s hook tables:
+//! Hook tools delegate to `Broker`'s tables:
 //! - `hook_add { phase, match_*?, priority?, action, hook_id? }` — push an
 //!   entry onto the relevant `HookTable`. Returns the assigned id.
 //! - `hook_remove { hook_id }` — walk every phase table and drop entries
@@ -13,7 +12,7 @@
 //!
 //! Holds `Weak<Broker>` to avoid the Arc cycle (broker owns the instance
 //! Arc; the instance refers back via Weak and upgrades on each call).
-//! Registered silently at kernel bootstrap (D-38).
+//! Registered silently at kernel bootstrap.
 
 use std::sync::{Arc, Weak};
 
@@ -36,83 +35,49 @@ use super::super::types::{
 };
 use kaijutsu_types::{ContextId, PrincipalId};
 
-/// Wire representation of a hook action. The broker never serializes
-/// `Arc<dyn Hook>`; `BuiltinInvoke` carries a registry name (D-50) and the
-/// server resolves via `Broker::builtin_hooks()`.
+/// Action to take when a hook matches. Executable bodies share the invoking
+/// context and identity; list discovery supports only denial and logging.
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookActionWire {
     /// Resolve a named builtin hook body from the broker registry.
     BuiltinInvoke { name: String },
-    /// Inline kaish source body. Persisted in `hooks.action_kaish_body`.
-    /// Evaluated at fire time via `EmbeddedKaish::execute_with_vars`.
-    ///
-    /// The exit-code contract (Amy's ruling, 2026-08-20,
-    /// `docs/gate-and-shell-split.md`, "Exit 3 = escalate to an ask; a
-    /// hook-body fault escalates by default"):
-    /// - **Exit 0** → the phase continues.
-    /// - **Exit 3** → escalates to the SAME ledger ask round trip
-    ///   `HookAction::Ask` uses (`Broker::run_permission_ask`), with the
-    ///   body's stderr tail as the ask's description. kaish used exit 3
-    ///   for its own now-deleted confirmation latch, which is why it was
-    ///   picked here too.
-    /// - **Any other non-zero exit** → `PhaseOutcome::Deny`, unchanged.
-    /// - **A fault running the body at all** — an exec error, a timeout,
-    ///   or no `KjDispatcher` wired (`Broker::set_kj_dispatcher` never
-    ///   called) — ALSO escalates, exactly like exit 3, rather than
-    ///   denying. A runtime/DB fault is never a verdict: escalating routes
-    ///   it through the same ask machinery, which itself resolves to
-    ///   `McpError::gate_unavailable` (not `denied_by_hook`) when there is
-    ///   nowhere to run the gate — so a fault stays distinguishable from a
-    ///   real "no" all the way to the model, the same distinction Ruling 2
-    ///   makes for `HookAction::Ask`.
+    /// Run inline kaish source when this hook fires. Exit 0 continues; exit 3
+    /// asks for approval using the last 512 stderr characters. Exit 124 or a
+    /// runtime fault also asks for approval; other nonzero exits deny.
+    /// Owner cancellation stops evaluation and waits for cleanup without
+    /// creating a new ask. Control characters in diagnostics are escaped.
     Kaish { body: String },
-    /// Reference to a stored shared script in the `hook_scripts` table.
-    /// The body is resolved at hook_add time and SNAPSHOTTED into the
-    /// resulting `HookEntry` (`HookBody::Kaish(body)`); the originating
-    /// `script_id` is preserved on `HookEntry.kaish_script_id` as
-    /// provenance. Per
-    /// [[feedback_script_snapshot_on_instantiation]], updates to the
-    /// source script do NOT propagate to existing hooks — to pick up
-    /// new behavior, re-add the hook (which re-snapshots from the
-    /// current script).
+    /// Snapshot a stored script when adding the hook. Later edits to that
+    /// script do not change installed hooks; re-add the hook to take a new
+    /// snapshot. Execution follows the inline kaish exit contract.
     KaishScript { script_id: String },
-    /// A VFS path (e.g. `/config/rc/lib/create/S50-lfm2d.kai`) whose contents
-    /// are read fresh **at every fire**, never snapshotted. Persisted in
-    /// `hooks.action_kaish_path`, not `hooks.action_kaish_body`. Editing
-    /// the file at `path` reaches the running hook with no reinstall —
-    /// the opposite of `KaishScript`'s snapshot-at-install rule
-    /// (`docs/rc-on-disk.md`, "slice 5"). The path is not validated to
-    /// exist at install time; an unreadable path is a `Deny` at fire
-    /// time (`unreadable_hook_body_outcome` in `broker.rs`).
+    /// Read kaish source from this VFS path whenever the hook fires.
+    /// Editing the file affects later invocations. The path need not exist
+    /// when installing the hook; an unreadable path denies at invocation.
     KaishPath { path: String },
     /// Return a synthetic result in lieu of calling the server.
     ShortCircuit {
         result_text: String,
         is_error: Option<bool>,
     },
-    /// Terminate the phase with what `McpError::denied_by_hook` builds. The
-    /// `reason` is observable in tracing only.
+    /// Stop the phase and return this reason to the caller.
     Deny { reason: String },
-    /// Observability-only: emit a `tracing::event!` at the given level.
-    /// Does NOT write a block (D-48).
+    /// Emit a tracing event at this level without writing a block.
     Log {
         target: Option<String>,
         level: String,
     },
-    /// Block the phase on an approval-ledger ask (`docs/gate-and-shell-split.md`,
-    /// "The shared seam"). `description` overrides the auto-generated
-    /// `"{instance}.{tool}"` shown to whoever answers it. No `KjDispatcher`
-    /// wired, or no answer within the gate's timeout, both fail closed as
-    /// `McpError::gate_unavailable` — not `McpError::denied_by_hook`, which
-    /// is reserved for a real "no" — see `Broker::run_permission_ask`.
+    /// Ask for approval before continuing this phase. An omitted description
+    /// uses the instance and tool name. An unavailable approval service is
+    /// reported as a control failure; a rejected answer is reported as a denial.
     Ask { description: Option<String> },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HookAddParams {
-    /// `pre_call` | `post_call` | `on_error` | `on_notification`.
+    /// `pre_call`, `post_call`, `on_error`, `on_notification`, or `list_tools`.
     pub phase: String,
     pub match_instance: Option<String>,
     pub match_tool: Option<String>,
@@ -133,7 +98,7 @@ pub struct HookRemoveParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HookListParams {
-    /// Filter to a single phase; omit for all four.
+    /// Filter to a single phase; omit for all phases.
     pub phase: Option<String>,
 }
 
@@ -224,14 +189,8 @@ fn phase_to_str(phase: McpHookPhase) -> &'static str {
     }
 }
 
-/// Reject action shapes that have no coherent semantics in the given phase.
-///
-/// D-56: `ListTools` is a list-filter phase. `ShortCircuit` (what would it
-/// return in place of a list?) and `Invoke` (bodies can't rewrite lists)
-/// are rejected at add time so the caller sees the failure immediately
-/// rather than at first list-tools evaluation. `Kaish` is rejected
-/// unconditionally by `build_hook_action` anyway; called out here for
-/// completeness.
+/// List discovery supports logging and denial. It cannot execute a body,
+/// return a call result, or wait for an approval answer per tool.
 fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> McpResult<()> {
     if phase == McpHookPhase::ListTools {
         match action {
@@ -240,8 +199,6 @@ fn validate_action_for_phase(phase: McpHookPhase, action: &HookActionWire) -> Mc
             | HookActionWire::Kaish { .. }
             | HookActionWire::KaishScript { .. }
             | HookActionWire::KaishPath { .. }
-            // D-57: a list-filter can't block-wait for a permission
-            // answer per tool any more than it can invoke a body.
             | HookActionWire::Ask { .. } => return Err(McpError::Unsupported),
             HookActionWire::Deny { .. } | HookActionWire::Log { .. } => {}
         }
@@ -437,7 +394,7 @@ impl McpServerLike for BuiltinHooksServer {
                 name: "hook_add".to_string(),
                 description: Some(
                     "Register a hook entry on the named phase table (pre_call / \
-                     post_call / on_error / on_notification)."
+                     post_call / on_error / on_notification / list_tools)."
                         .to_string(),
                 ),
                 input_schema: add_val,
@@ -474,9 +431,8 @@ impl McpServerLike for BuiltinHooksServer {
                 instance: self.instance_id.clone(),
                 name: "hook_script_add".to_string(),
                 description: Some(
-                    "Create a shared kaish hook script. Hooks reference \
-                     it by `script_id` via `KaishScript` action; one \
-                     script body, many hooks."
+                    "Store kaish source for hooks to snapshot. Add a hook with \
+                     action type `kaish_script` and this `script_id`."
                         .to_string(),
                 ),
                 input_schema: script_add_val,
@@ -485,10 +441,9 @@ impl McpServerLike for BuiltinHooksServer {
                 instance: self.instance_id.clone(),
                 name: "hook_script_update".to_string(),
                 description: Some(
-                    "Replace the body of a shared script. Updates apply \
-                     to new hook_add calls and to existing entries on \
-                     next kernel hydrate; in-flight entries keep the \
-                     prior body."
+                    "Replace stored kaish source. Existing hooks keep their installed \
+                     snapshot, including after restart. Remove and re-add a hook \
+                     to use the updated source."
                         .to_string(),
                 ),
                 input_schema: script_update_val,

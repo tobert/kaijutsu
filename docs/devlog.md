@@ -2611,6 +2611,44 @@ bug came from the separate fault test and was fixed afterward. The packet,
 response, and disposition are archived under
 `~/exomemory/kaijutsu/reviews/2026-09-18-execution/rc-settlement-*`.
 
+Hook bodies now receive their execution owner's cancellation through builtin
+invocation, kaish execution, and approval waits. Command result processing
+awaits hook cleanup before terminal settlement and retains the command's
+captured output. Explicit exit 130 with a live owner still denies; owner
+cancellation stops processing without creating another ask. Actual timeout
+124 and internal output spill 3 preserve their escalation contract. The
+reported stderr tail now retains the final 512 characters, not the prefix.
+
+Advisory hooks moved from the RPC future to the existing joined runtime, with
+context admission. SSH regressions first showed an entered hook disappearing
+on confirmed disconnect and continuing after shutdown; both now pass. The
+proposed command still never runs. Notification hook evaluation and final block
+insertion share a runtime owner and inherit hook depth. A dropped notification
+producer cannot discard accepted work, and cancellation joins cleanup before
+suppressing its notification. These scenarios use kaish builtins with system
+execution denied. Adjacent runtime and server fixtures use cooperative hooks.
+
+Reading the actual tool schemas caught stale text promising stored-script
+updates would reach installed hooks after restart. The schema now describes
+the persistent installation snapshot and explicit remove/re-add procedure.
+The environment and gate-planning caller audits found their migration complete:
+one contextual input snapshot feeds construction and approval capture, typed
+restore validates every target, and policy consumes kaish plans through the
+shared clause renderer. Those inventory rows now say Migrated.
+
+Kaibo/DeepSeek Flash reviewed the source (67,807 input / 1,091 output tokens).
+Its only claimed defect misread the existing async factory wrapper; the worker
+factory-panic regression directly covers that scenario. No review finding
+required a code change. Local review caught and removed a draft notification
+snapshot race before the packet was sent. Review and disposition are in
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/hook-owner-*`.
+
+Validation passed: 3,284 kernel unit tests (6 ignored), 31 kernel integration
+tests, 482 server tests, and 156 MCP tests. The actual-client musical timeline
+scenario remains green alongside the new hook lifecycle cases. The emitted
+hook schemas were read from the compiled server. Workspace all-targets and
+diff checks passed.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

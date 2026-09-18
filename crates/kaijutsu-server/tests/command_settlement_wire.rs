@@ -185,10 +185,17 @@ fn archiving_preserves_an_accepted_commands_settlement_and_receipt() {
 
 #[async_trait::async_trait]
 impl Hook for PausedHook {
-    async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+    async fn invoke(
+        &self,
+        _: &KernelCallParams,
+        _: &CallContext,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> McpResult<()> {
         self.entered.notify_one();
-        self.release.notified().await;
-        Ok(())
+        tokio::select! {
+            _ = self.release.notified() => Ok(()),
+            _ = cancel.cancelled() => Err(kaijutsu_kernel::mcp::McpError::Cancelled),
+        }
     }
 }
 

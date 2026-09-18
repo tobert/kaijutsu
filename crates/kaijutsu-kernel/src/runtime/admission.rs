@@ -64,7 +64,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_shell_preparation_survives_archive_before_worker_entry() {
-        for path in ["interactive", "structured", "quiet", "streaming", "editor"] {
+        for path in ["interactive", "structured", "quiet", "streaming", "editor", "dry-run"] {
             let dispatcher = Arc::new(test_dispatcher_persistent().await);
             dispatcher.set_self_arc();
             let kernel = dispatcher.kernel();
@@ -101,6 +101,13 @@ mod tests {
                         .await.unwrap().unwrap().completed.await.unwrap().unwrap().envelope().stdout,
                     "editor" => crate::runtime::editor_read::read_shell(dispatcher.clone(), identity,
                         "echo admitted-before-archive".into()).await.unwrap(),
+                    "dry-run" => {
+                        let call = crate::mcp::CallContext::new(principal, context, identity.session, kernel.id());
+                        let report = crate::runtime::dry_run::inspect_shell(kernel, call,
+                            "echo admitted-before-archive".into()).await.unwrap();
+                        assert!(matches!(report.outcome, crate::mcp::DryRunOutcome::WouldProceed));
+                        "admitted-before-archive".into()
+                    }
                     _ => unreachable!(),
                 }
             };

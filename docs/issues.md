@@ -136,6 +136,9 @@ Kaibo's identity review found remaining adapter policy/provenance gaps:
   A persisted mutation audit record is separate follow-up work.
 - `img_block_from_path` uses host `std::fs::read`, bypassing the shared mount
   namespace. Route it through the existing file/CAS integration.
+- `runtime/docs_filesystem.rs::docs_path` claims to normalize parent
+  components but drops them: `a/../b` becomes `a/b`. Audit the adapter against
+  kaish VFS path normalization before changing this separate path contract.
 Review evidence and disposition are under
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
@@ -302,15 +305,7 @@ Inline rc now inherits its execution owner through `KjCaller`, and scheduled
 tick/rotate runs on the joined kernel runtime with the original admission proof.
 Cancellation preserves committed work and stops later unadmitted effects.
 Rc stops on run-record or projection faults and retains captured results for
-settlement retry without source replay. Hook execution still loses the caller's
-cancellation token between `Broker::call_tool`, `evaluate_phase`, and
-`run_kaish_hook`; the hook receives its timeout but no owner token. Result-hook
-cancellation drops the active future instead of joining cleanup, and
-`CommandResultReview::wait_inner` does not observe the token it stores.
-Propagate ownership through actual hook execution and test cancellation while
-a builtin wait is active. Add a real hook-timeout test alongside synthetic exit
-classification. The classifier also calls its diagnostic a stderr tail while
-taking the first 512 characters; preserve the documented suffix.
+settlement retry without source replay.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while

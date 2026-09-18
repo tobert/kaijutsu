@@ -1759,17 +1759,25 @@ mod tests {
 
     #[async_trait]
     impl crate::mcp::Hook for ShutdownHook {
-        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext, cancel: &tokio_util::sync::CancellationToken) -> McpResult<()> {
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.release.notified() => {}
+            }
             Ok(())
         }
     }
 
     #[async_trait]
     impl crate::mcp::Hook for AfterCallerDrop {
-        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
-            self.0.notified().await;
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext, cancel: &tokio_util::sync::CancellationToken) -> McpResult<()> {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.0.notified() => {}
+            }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             Ok(())
         }
@@ -1814,10 +1822,10 @@ mod tests {
 
     #[async_trait]
     impl crate::mcp::Hook for ReenterShell {
-        async fn invoke(&self, params: &KernelCallParams, ctx: &CallContext) -> McpResult<()> {
+        async fn invoke(&self, params: &KernelCallParams, ctx: &CallContext, cancel: &tokio_util::sync::CancellationToken) -> McpResult<()> {
             let count = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             if count >= 8 { return Err(McpError::Protocol("test stopped unbounded shell hook recursion".into())); }
-            let result = self.broker.upgrade().unwrap().call_tool(params.clone(), ctx, CancellationToken::new()).await?;
+            let result = self.broker.upgrade().unwrap().call_tool(params.clone(), ctx, cancel.child_token()).await?;
             if result.is_error { Err(McpError::Protocol("nested shell tool failed".into())) } else { Ok(()) }
         }
     }
@@ -1851,7 +1859,7 @@ mod tests {
 
     #[async_trait]
     impl crate::mcp::Hook for PanickingResultHook {
-        async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {
+        async fn invoke(&self, _: &KernelCallParams, _: &CallContext, _cancel: &tokio_util::sync::CancellationToken) -> McpResult<()> {
             panic!("post-review hook panic sentinel");
         }
     }

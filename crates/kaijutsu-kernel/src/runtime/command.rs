@@ -539,11 +539,10 @@ async fn finish_result_hooks(
         // or start result hooks after their owner has stopped.
         return true;
     }
-    let completed = tokio::select! {
-        biased;
-        _ = review.cancel.cancelled() => false,
-        _ = Box::pin(apply_result_hooks(outcome, code, kernel, call, invocation, Some(review))) => true,
-    };
+    // Active hook execution owns cleanup. Signal it through the shared token
+    // and await its return before retaining the terminal command outcome.
+    Box::pin(apply_result_hooks(outcome, code, kernel, call, invocation, review)).await;
+    let completed = !review.cancel.is_cancelled();
     if !completed { *outcome = review.interrupted_outcome("Result processing was cancelled; captured execution was not repeated."); }
     completed
 }
@@ -554,7 +553,7 @@ async fn apply_result_hooks(
     kernel: &Kernel,
     call_ctx: &crate::mcp::CallContext,
     invocation: Option<CommandHooks<'_>>,
-    review: Option<&dyn crate::mcp::broker::ResultReview>,
+    review: &super::result_review::CommandResultReview,
 ) {
     let direct = crate::mcp::Broker::shell_write_hook_params(code);
     let (broker, params) = invocation.as_ref().map_or((kernel.broker().as_ref(), &direct), |hook| (hook.broker, hook.params));
@@ -567,10 +566,10 @@ async fn apply_result_hooks(
                 }
                 result
             } else { exec_result_to_hook_tool_result(result) };
-            broker.result_post_call_hooks(params, call_ctx, &result, review).await
+            broker.result_post_call_hooks(params, call_ctx, &result, Some(review), &review.cancel).await
         }
         CommandExecution::Rejected(error) | CommandExecution::Fault(error) => broker.result_error_hooks(
-            params, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), review).await,
+            params, call_ctx, &crate::mcp::McpError::Protocol(error.clone()), Some(review), &review.cancel).await,
         CommandExecution::NotRun => unreachable!("a completed invocation has an execution outcome"),
     };
     outcome.apply_hook(verdict);
@@ -599,7 +598,7 @@ mod fill_tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PanicHook {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, _cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             panic!("hook panic sentinel");
         }
     }
@@ -763,9 +762,13 @@ mod fill_tests {
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PausedHook {
         async fn invoke(&self, _: &crate::mcp::KernelCallParams,
-            _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+            _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.release.notified() => {}
+            }
             Ok(())
         }
     }
@@ -820,6 +823,69 @@ mod fill_tests {
     }
 
     struct CountedCapture(Arc<std::sync::atomic::AtomicUsize>);
+
+    struct CleaningHook {
+        entered: Arc<tokio::sync::Notify>,
+        cleaned: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::Hook for CleaningHook {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams,
+            _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
+            self.entered.notify_one();
+            cancel.cancelled().await;
+            tokio::task::yield_now().await;
+            self.cleaned.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::mcp::McpError::Cancelled)
+        }
+    }
+
+    #[tokio::test]
+    async fn result_hook_cancellation_awaits_cleanup_before_terminal_settlement() {
+        use crate::mcp::{HookAction, HookBody, HookEntry, HookId};
+        let kernel = Arc::new(Kernel::new_ephemeral("result-cleanup").await);
+        let context = ContextId::new();
+        let blocks = kernel.blocks();
+        blocks.create_document(context, DocumentKind::Conversation, None).unwrap();
+        let command = blocks.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+        let output = blocks.insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+        let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(),
+            command, output, "counted-capture", None).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let kaish = EmbeddedKaish::with_identity("result-cleanup", blocks.clone(), kernel.clone(), None,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                reviewer: None, context, session: kaijutsu_types::SessionId::new() },
+            crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+            super::super::embedded_kaish::OutputProfile::Internal, move |_, _, tools| { tools.register(CountedCapture(count)); }).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("clean-before-finish".into()), match_instance: None, match_tool: None,
+            match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Invoke(HookBody::Builtin { name: "clean-before-finish".into(),
+                hook: Arc::new(CleaningHook { entered: entered.clone(), cleaned: cleaned.clone() }) }),
+        });
+        let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
+        let run = run_into_blocks(&kaish, "counted-capture", &receipt, &kernel, &call,
+            CommandRunOptions { cancel: Some(cancel.clone()), ..Default::default() });
+        let interrupt = async {
+            entered.notified().await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(run, interrupt)
+        }).await.expect("hook cleanup must finish under its execution owner");
+        result.unwrap();
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst), "terminal settlement must await hook cleanup");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let saved = kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap();
+        let CommandExecution::Completed(raw) = saved.execution else { panic!("lost captured execution") };
+        assert_eq!(raw.text_out(), "captured exactly once");
+        assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
+    }
 
     #[async_trait::async_trait]
     impl kaish_kernel::Tool for CountedCapture {
@@ -896,7 +962,7 @@ mod fill_tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for InterruptWithReadFault {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
             self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                 AuthAction::Read { table_name: "shell_operations" | "shell_result_reviews", .. } => Authorization::Deny,
@@ -904,7 +970,8 @@ mod fill_tests {
             })).unwrap();
             if self.panic { panic!("interrupted storage sentinel"); }
             self.cancel.cancel();
-            std::future::pending().await
+            cancel.cancelled().await;
+            Err(crate::mcp::McpError::Cancelled)
         }
     }
 

@@ -7,6 +7,7 @@
 //! `command` owns captured execution, result review, and block-pair settlement;
 //! `structured` owns addressed kj invocation; `interactive` owns shell submission;
 //! `editor_read` owns complete-text editor shell reads.
+//! `dry_run` owns advisory hook evaluation through disconnect and shutdown.
 //! `streaming` owns cancellable transport commands. `command_outcome` retains execution
 //! and hook results. `command_result` and `shell_state` supply shared projections
 //! and durable write-back.
@@ -26,6 +27,7 @@ pub mod llm_stream;
 mod turn_identity;
 pub mod command;
 pub mod structured;
+pub mod dry_run;
 pub mod interactive;
 pub mod streaming;
 pub(crate) mod editor_read;

@@ -85,11 +85,7 @@ async fn prepare(
     };
     let call = crate::mcp::CallContext::new(identity.requester, identity.context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
-    let verdict = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err("streaming command cancelled before execution".into()),
-        verdict = kernel.broker().shell_pre_call_hooks(code, &call) => verdict,
-    };
+    let verdict = kernel.broker().shell_pre_call_hooks(code, &call, &cancel).await;
     let replacement = match verdict {
         crate::mcp::ShellHookVerdict::Proceed => None,
         crate::mcp::ShellHookVerdict::Denied(error) => return match error.as_refusal() {
@@ -133,9 +129,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PausedHook {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.release.notified() => {}
+            }
             assert!(!self.panic, "streaming hook panic sentinel");
             Ok(())
         }

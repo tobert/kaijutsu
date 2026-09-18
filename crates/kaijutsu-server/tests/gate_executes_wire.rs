@@ -493,6 +493,134 @@ fn shutdown_settles_an_approved_command_before_returning() {
     });
 }
 
+/// A real shell-box submission must not outlive a pre-call Kaish hook when
+/// the runtime shuts down. The first marker makes the wait deterministic;
+/// `sleep` is Kaish's builtin, so this fixture keeps host execution denied.
+#[test]
+fn shutdown_joins_pre_call_kaish_hook_before_the_target_runs() {
+    run_local(async {
+        let s = seats().await;
+        s.kernel.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+            id: HookId("shutdown-pre-call-kaish".into()),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: Some(s.worker),
+            match_principal: None,
+            action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish(
+                "kj block create --role system --kind text --content hook-pre-entered\n\
+                 sleep 300\n\
+                 kj block create --role system --kind text --content hook-pre-late"
+                    .into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        s.worker_kj.join_context(s.worker, "shutdown-pre-call-kaish").await.unwrap();
+        let submitter = s.worker_kj.clone();
+        let context = s.worker;
+        let request = tokio::task::spawn_local(async move {
+            submitter.shell_execute(
+                "echo pre-call-target-must-not-run",
+                context,
+                true,
+            ).await
+        });
+        wait_for("the pre-call hook to enter", || {
+            s.worker_blocks().iter().any(|block| block.content == "hook-pre-entered")
+        }).await;
+
+        tokio::time::timeout(Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
+            .await
+            .expect("shutdown must cancel and join the entered pre-call hook")
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("the wire request must settle after joined hook cancellation")
+            .expect("the wire request task must not panic")
+            .expect_err("pre-call cancellation must reach the waiting shell submitter");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        let operation = s.kernel.kernel.shell_operations().list_for_context(s.worker).unwrap()
+            .into_iter().find(|operation| operation.source == "echo pre-call-target-must-not-run")
+            .expect("the retained pre-call shell operation");
+        let command_block_id = operation.receipt.command_block_id;
+        assert!(operation.completed_at.is_some(), "shutdown must settle the retained operation");
+        assert_eq!(s.block(&command_block_id).status, Status::Error,
+            "a cancelled pre-call hook must settle its command as an error");
+        assert_eq!(s.block(&operation.receipt.output_block_id).status, Status::Error,
+            "a cancelled pre-call hook must settle its output as an error");
+        let outcome = s.kernel.kernel.shell_operations().outcome(&operation.receipt.operation_id, s.worker)
+            .unwrap().expect("shutdown must retain the pre-call operation outcome");
+        assert!(matches!(outcome.execution,
+            kaijutsu_kernel::runtime::command_outcome::CommandExecution::NotRun),
+            "cancelling a pre-call hook must leave its target unexecuted");
+
+        let blocks = s.worker_blocks();
+        assert!(blocks.iter().any(|block| block.content == "hook-pre-entered"));
+        assert!(!blocks.iter().any(|block| block.content == "hook-pre-late"),
+            "cancellation must stop later hook statements");
+        s.close().await;
+    });
+}
+
+/// Once a command has produced its result, shutdown must retain that capture
+/// while cancelling and joining the result hook before its later effects run.
+#[test]
+fn shutdown_joins_result_hook_and_retains_captured_shell_output() {
+    run_local(async {
+        let s = seats().await;
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("shutdown-result-kaish".into()),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: Some(s.worker),
+            match_principal: None,
+            action: HookAction::Invoke(kaijutsu_kernel::mcp::HookBody::Kaish(
+                "kj block create --role system --kind text --content hook-result-entered\n\
+                 sleep 300\n\
+                 kj block create --role system --kind text --content hook-result-late"
+                    .into(),
+            )),
+            priority: 0,
+            kaish_script_id: None,
+        });
+
+        s.worker_kj.join_context(s.worker, "shutdown-result-kaish").await.unwrap();
+        let submitter = s.worker_kj.clone();
+        let context = s.worker;
+        let request = tokio::task::spawn_local(async move {
+            submitter.shell_execute("echo captured-before-result-hook", context, true).await
+        });
+        wait_for("the result hook to enter", || {
+            s.worker_blocks().iter().any(|block| block.content == "hook-result-entered")
+        }).await;
+
+        tokio::time::timeout(Duration::from_secs(3), s.kernel.kernel.shutdown_runtime_worker())
+            .await
+            .expect("shutdown must cancel and join the entered result hook")
+            .unwrap();
+        let command_block_id = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("the wire request must settle after joined hook cancellation")
+            .expect("the wire request task must not panic")
+            .expect("accepted shell submission must acknowledge its retained command block");
+
+        let operation = s.kernel.kernel.shell_operations().list_for_context(s.worker).unwrap()
+            .into_iter().find(|operation| operation.receipt.command_block_id == command_block_id)
+            .expect("the acknowledged result-hook shell operation");
+        let captured = s.kernel.kernel.shell_operations().outcome(&operation.receipt.operation_id, s.worker)
+            .unwrap().expect("shutdown must retain the captured execution");
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution
+            else { panic!("result-hook cancellation discarded the completed shell result") };
+        assert_eq!(raw.text_out(), "captured-before-result-hook\n");
+        let blocks = s.worker_blocks();
+        assert!(blocks.iter().any(|block| block.content == "hook-result-entered"));
+        assert!(!blocks.iter().any(|block| block.content == "hook-result-late"),
+            "cancellation must stop later result-hook statements");
+        s.close().await;
+    });
+}
+
 /// The headline. An allowed ask whose blocks are already waiting on it goes
 /// `Waiting` → `Done` with the command's stdout in the output block, the
 /// approval is spent exactly once, and a later ledger change does not run it
@@ -1340,7 +1468,8 @@ struct CountResultHook(Arc<std::sync::atomic::AtomicUsize>);
 #[async_trait::async_trait]
 impl kaijutsu_kernel::mcp::Hook for CountResultHook {
     async fn invoke(&self, _: &kaijutsu_kernel::mcp::KernelCallParams,
-        _: &kaijutsu_kernel::mcp::CallContext) -> kaijutsu_kernel::mcp::McpResult<()> {
+        _: &kaijutsu_kernel::mcp::CallContext,
+        _: &tokio_util::sync::CancellationToken) -> kaijutsu_kernel::mcp::McpResult<()> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }

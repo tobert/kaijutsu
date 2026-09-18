@@ -1626,6 +1626,13 @@ somewhere to resume *from* — `docs/gate-resume.md`.
 
 ## Dry-run mode
 
+Advisory evaluation is accepted through the kernel runtime. Hook bodies may
+write blocks or make other effects even though the proposed command never
+runs here. Accepted evaluation survives client disconnect; shutdown cancels
+and joins its hook cleanup. Archive refuses new advisory work and preserves
+already accepted work. The invoking requester, performer, reviewer, context,
+and session remain attached to the hook.
+
 `kj ledger list` stays empty and the command runs anyway. That is the whole
 contract. `shellDryRun @103` hands the kernel a command that is about to run
 somewhere else — a Claude Code `PreToolUse` hook, forwarded by
@@ -1666,8 +1673,8 @@ that status to a human. A would-proceed and a would-short-circuit record
 nothing at all: no gate was crossed, so there is no question to file. The
 report names the hook, the reason, and the row (`ShellDryRunReport`), and a
 recording failure is logged and reported as an absent `ask` rather than
-raised — a dry run that cannot write its row has still changed nothing, and
-the path must never be able to break the harness it observes. That last rule
+raised. A missing advisory record grants no authority, and the path must never
+be able to break the harness it observes. That last rule
 governs the client side too: kaijutsu-mcp's `tool.before` arm issues the call
 detached and replies immediately, and a kernel that is down, slow, or
 erroring changes nothing about the reply.

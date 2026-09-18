@@ -12,13 +12,28 @@
 mod common;
 use common::{create_context};
 
+use std::path::Path;
+use std::time::Duration;
+
 use common::{connect_client, run_local, start_server_with_kernel_handle};
 use kaijutsu_client::ShellDryRunOutcome;
 use kaijutsu_kernel::kernel_db::CharacterRow;
+use kaijutsu_kernel::vfs::VfsOps;
 use kaijutsu_kernel::ApprovalStatus;
-use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
+use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookBody, HookEntry, HookId};
 use kaijutsu_server::SharedKernel;
 use kaijutsu_types::{AskStatus, PrincipalId};
+
+async fn wait_for(label: &str, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {label}");
+}
 
 /// Push one PreCall hook matched on `shell_write` onto the live broker.
 async fn install_hook(kernel: &SharedKernel, id: &str, action: HookAction) {
@@ -179,5 +194,109 @@ fn no_matching_hook_reports_a_would_proceed_and_records_nothing() {
             kernel.kernel_db.lock().list_pending_asks().unwrap().is_empty(),
             "and nothing is waiting on anyone"
         );
+    });
+}
+
+/// Dry-run hook work is accepted by the kernel, so losing the client that
+/// asked for its advisory report cannot discard it. The VFS release is a
+/// deterministic hand-off; no host process is involved.
+#[test]
+fn dropped_dry_run_rpc_does_not_drop_an_accepted_kaish_hook() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "dry-run-disconnect-hook").await.unwrap();
+        kj.join_context(context, "dry-run-disconnect-hook").await.unwrap();
+        let session = *kernel.session_contexts.iter()
+            .find(|entry| *entry.value() == context)
+            .expect("the dry-run caller has a registered context session")
+            .key();
+        let release = Path::new("/config/rc/dry-run-disconnect-release");
+        install_hook(
+            &kernel,
+            "dry-run-disconnect-hook",
+            HookAction::Invoke(HookBody::Kaish(
+                "kj block create --role system --kind text --content dry-run-disconnect-entered\n\
+                 while test ! -e /config/rc/dry-run-disconnect-release; do sleep 0.01; done\n\
+                 kj block create --role system --kind text --content dry-run-disconnect-finished"
+                    .into(),
+            )),
+        ).await;
+
+        let requesting = kj.clone();
+        let request = tokio::task::spawn_local(async move {
+            requesting.shell_dry_run(context, "echo advisory-only").await
+        });
+        wait_for("the dry-run hook to enter", || {
+            kernel.documents.block_snapshots(context).unwrap().iter()
+                .any(|block| block.content == "dry-run-disconnect-entered")
+        }).await;
+        request.abort();
+        assert!(request.await.is_err(), "aborting the client RPC task must drop its handle");
+        drop(kj);
+        drop(client);
+        wait_for("the dry-run caller session to close", || {
+            !kernel.session_contexts.contains_key(&session)
+        }).await;
+        kernel.kernel.vfs().write_all(release, b"release").await.unwrap();
+        wait_for("the retained dry-run hook to finish", || {
+            kernel.documents.block_snapshots(context).unwrap().iter()
+                .any(|block| block.content == "dry-run-disconnect-finished")
+        }).await;
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
+/// Shutdown owns dry-run hook cleanup too: it must cancel the entered hook
+/// and join it before returning, so a release after shutdown cannot run its
+/// later source. The source body uses only Kaish builtins.
+#[test]
+fn shutdown_cancels_and_joins_an_entered_dry_run_kaish_hook() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "dry-run-shutdown-hook").await.unwrap();
+        kj.join_context(context, "dry-run-shutdown-hook").await.unwrap();
+        let release = Path::new("/config/rc/dry-run-shutdown-release");
+        install_hook(
+            &kernel,
+            "dry-run-shutdown-hook",
+            HookAction::Invoke(HookBody::Kaish(
+                "kj block create --role system --kind text --content dry-run-shutdown-entered\n\
+                 while test ! -e /config/rc/dry-run-shutdown-release; do sleep 0.01; done\n\
+                 kj block create --role system --kind text --content dry-run-shutdown-late"
+                    .into(),
+            )),
+        ).await;
+
+        let requesting = kj.clone();
+        let request = tokio::task::spawn_local(async move {
+            requesting.shell_dry_run(context, "echo advisory-only").await
+        });
+        wait_for("the shutdown dry-run hook to enter", || {
+            kernel.documents.block_snapshots(context).unwrap().iter()
+                .any(|block| block.content == "dry-run-shutdown-entered")
+        }).await;
+
+        tokio::time::timeout(Duration::from_secs(3), kernel.kernel.shutdown_runtime_worker())
+            .await
+            .expect("shutdown must join the dry-run hook")
+            .unwrap();
+        kernel.kernel.vfs().write_all(release, b"release").await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), request).await
+            .expect("the cancelled dry-run RPC task must settle")
+            .expect("the dry-run RPC task must not panic")
+            .expect_err("shutdown must report hook cancellation to the dry-run caller");
+        assert!(error.to_string().to_ascii_lowercase().contains("cancel"),
+            "dry-run shutdown must name cancellation, got {error}");
+        assert!(kernel.documents.block_snapshots(context).unwrap().iter()
+            .any(|block| block.content == "dry-run-shutdown-entered"));
+        assert!(!kernel.documents.block_snapshots(context).unwrap().iter()
+            .any(|block| block.content == "dry-run-shutdown-late"),
+            "a hook joined by shutdown must not resume after its release");
+        drop(kj);
+        drop(client);
     });
 }

@@ -1,5 +1,5 @@
 //! Retain execution through result review, with or without a transcript pair.
-//! The command owner cancels the wait; terminal retention closes unanswered asks.
+//! Owner cancellation settles the wait; terminal retention closes unanswered asks.
 
 use std::sync::Arc;
 use kaijutsu_types::{AskRef, BlockId, Status};
@@ -50,7 +50,18 @@ impl crate::mcp::broker::ResultReview for CommandResultReview {
 
     async fn wait_for_review(&self, ask: &AskRef) -> McpResult<()> {
         let mut guard = ReviewGuard { owner: self, ask, armed: true };
-        let result = self.wait_inner(ask).await;
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => {
+                let outcome = self.interrupt(
+                    "Result review was cancelled; captured execution was not repeated.", Some(&ask.request_id));
+                match self.settle(&outcome) {
+                    Ok(()) => Err(McpError::Cancelled),
+                    Err(error) => Err(McpError::Protocol(error)),
+                }
+            }
+            result = self.wait_inner(ask) => result,
+        };
         guard.armed = false;
         result
     }
@@ -188,6 +199,40 @@ mod tests {
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
             tokio_util::sync::CancellationToken::new(), None);
         (review, ask, id)
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_settles_a_review_without_dropping_its_wait() {
+        for authored in [true, false] {
+            for already_cancelled in [true, false] {
+                let (review, ask, operation) = fixture(authored).await;
+                review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
+                if already_cancelled { review.cancel.cancel(); }
+                let mut wait = Box::pin(review.wait_for_review(&ask));
+                if !already_cancelled {
+                    std::future::poll_fn(|cx| {
+                        assert!(wait.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    }).await;
+                    review.cancel.cancel();
+                }
+                let result = tokio::time::timeout(std::time::Duration::from_millis(250), &mut wait).await
+                    .expect("the retained wait must observe its cancellation owner");
+                assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
+                let saved = review.kernel.shell_operations().result_review_for_ask(&ask.request_id, review.call.context_id)
+                    .unwrap().unwrap().settled.expect("cancellation must retain the captured execution");
+                let CommandExecution::Completed(raw) = saved.execution else { panic!("captured execution was lost") };
+                assert_eq!(raw.text_out(), "already ran");
+                assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
+                    approval_ledger::types::ApprovalStatus::Abandoned);
+                if let Some(operation) = operation {
+                    let state = review.kernel.shell_operations().get(&operation, review.call.context_id).unwrap().unwrap();
+                    assert!(state.completed_at.is_some());
+                } else {
+                    assert!(review.kernel.blocks().block_snapshots(review.call.context_id).unwrap().is_empty());
+                }
+            }
+        }
     }
 
     #[tokio::test]

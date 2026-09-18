@@ -108,11 +108,7 @@ async fn prepare(
     // Capture and result-hook unwinds belong to command::run_into_blocks.
     let mut settlement_started = false;
     let preparation = std::panic::AssertUnwindSafe(async {
-        let verdict = tokio::select! {
-            biased;
-            _ = stop.cancelled() => return Err("kernel runtime shut down before interactive execution".to_string()),
-            verdict = kernel.broker().shell_pre_call_hooks(&code, &call_ctx) => verdict,
-        };
+        let verdict = kernel.broker().shell_pre_call_hooks(&code, &call_ctx, stop).await;
         let execute = matches!(verdict, crate::mcp::ShellHookVerdict::Proceed);
         if !execute {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
@@ -187,9 +183,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for PausedHook {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             self.entered.notify_one();
-            self.release.notified().await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(crate::mcp::McpError::Cancelled),
+                _ = self.release.notified() => {}
+            }
             assert!(!self.panic, "interactive pre-call panic sentinel");
             Ok(())
         }
@@ -202,7 +202,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::mcp::Hook for ReceiptReadFault {
-        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext, _cancel: &tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<()> {
             use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
             self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                 AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,

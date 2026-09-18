@@ -615,10 +615,13 @@ impl kaijutsu_kernel::mcp::Hook for PauseShellSubmit {
         &self,
         _params: &kaijutsu_kernel::mcp::KernelCallParams,
         _ctx: &kaijutsu_kernel::mcp::CallContext,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> kaijutsu_kernel::mcp::McpResult<()> {
         self.entered.notify_one();
-        self.resume.notified().await;
-        Ok(())
+        tokio::select! {
+            _ = self.resume.notified() => Ok(()),
+            _ = cancel.cancelled() => Err(kaijutsu_kernel::mcp::McpError::Cancelled),
+        }
     }
 }
 

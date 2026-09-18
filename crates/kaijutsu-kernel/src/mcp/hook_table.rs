@@ -1,53 +1,18 @@
-//! Hook tables — match-action hook engine (§4.3, D-07).
+//! Match-action hooks for tool calls, visible tool lists, and notifications.
 //!
-//! **Scope: MCP / tool-broker only.** Every [`McpHookPhase`] variant fires
-//! around the broker — `call_tool`, `list_visible_tools`, notifications. The
-//! per-model-turn seam (`BeforeModelTurn` / `AfterModelTurn`) is a
-//! **separate sibling surface** on the LLM turn loop, not a variant here;
-//! it shares the [`HookAction`] verdict vocabulary but lives outside this
-//! MCP-scoped enum.
+//! `PreCall`, `PostCall`, and `OnError` surround broker calls and contextual
+//! shell commands. `OnNotification` runs after coalescing, once per emitted
+//! block; synthetic tool names such as `__notification.log` select its kind.
+//! `ListTools` filters discovery and cannot execute bodies or wait for approval.
 //!
-//! Phase 4 wires evaluation at the four pinch points:
-//! - `PreCall` / `PostCall` / `OnError` — evaluated around
-//!   `Broker::call_tool` (`broker.rs`); see `evaluate_phase`.
-//! - `OnNotification` — evaluated **post-coalesce**, once per emitted block
-//!   in `emit_for_bindings` and `handle_resource_flush`. Raw
-//!   `ServerNotification` events from `pump_loop` are NOT hook-evaluated;
-//!   the hook sees what the LLM/UI sees. Notifications carry a synthetic
-//!   `tool = "__notification.<kind>"` so users can filter via
-//!   `match_tool: Some("__notification.log")` or similar. `__`-prefix is
-//!   the convention for synthetic tool names; no real instance should
-//!   advertise tools in that namespace.
+//! Denial reasons reach the caller. `Log` writes tracing events; an `Invoke`
+//! body can author blocks explicitly. Kaish bodies require contextual kernel
+//! wiring. Stored script bodies are snapshots; path bodies read at invocation.
 //!
-//! `HookAction::Deny(String)` carries a reason message, and the broker
-//! puts it on the refusal the model reads as well as in the journal. A
-//! refusal that names no reason is indistinguishable from a control that
-//! broke — see `docs/gate-and-shell-split.md`.
-//!
-//! `HookAction::Log(LogSpec)` emits a `tracing::event!`, NOT a
-//! Notification block (D-48). LLM-visible audit is achieved by an
-//! `Invoke` body that calls the block tools server explicitly.
-//!
-//! Hook bodies MUST NOT `tokio::spawn` child tasks that re-enter the
-//! broker. The reentrancy counter (D-29) lives in `tokio::task_local!`
-//! and a spawned task starts fresh — losing the depth guard opens a
-//! reentrancy path around the cap.
-//!
-//! `HookBody::Kaish(body)` ships 2026-05-02 (post-runtime-hoist).
-//! The body is inline kaish source; persisted in
-//! `hooks.action_kaish_body` (TEXT). Evaluation requires
-//! `Broker::set_kernel`; without that wired, kaish hooks return Deny.
-//! `ListTools` phase still rejects kaish at `hook_add` (no coherent
-//! list-filter semantics).
-//!
-//! `HookAction::Ask(AskSpec)` blocks the phase on an approval-ledger ask
-//! (`Broker::run_permission_ask` calling `kj::gate::run_gate` with
-//! `Origin::Hook`) — see `docs/gate-and-shell-split.md`, "The shared seam".
-//! Like `Kaish`, `ListTools` rejects `Ask` at `hook_add` (D-56): a
-//! list-filter can't block-wait per tool. A real "no" terminates as
-//! `McpError::denied_by_hook`; a gate with no `KjDispatcher` wired or
-//! nobody answering in time terminates as `McpError::gate_unavailable`
-//! instead — a broken control, not a verdict. Both still fail closed.
+//! Executable hooks inherit their owner's cancellation and finish cleanup
+//! before returning. Hook bodies must not spawn tasks that re-enter the broker
+//! without inheriting its task-local hook depth; doing so bypasses recursion
+//! limits. See `docs/gate-and-shell-split.md` for verdicts and approval waits.
 
 use std::sync::Arc;
 
@@ -58,8 +23,7 @@ use super::context::CallContext;
 use super::error::{HookId, McpResult};
 use super::types::{KernelCallParams, KernelToolResult};
 
-/// MCP/tool-broker hook phases. All variants fire around the broker; the
-/// model-turn seam is a separate surface (see the module header). Persisted
+/// Broker and contextual shell hook phases. Persisted
 /// as stable lower-snake strings (`pre_call`, …) via `hook_persist`, decoupled
 /// from these Rust names — renaming a variant needs a `phase_to_str` update,
 /// not a DB migration.
@@ -72,12 +36,11 @@ pub enum McpHookPhase {
     /// Filter the per-context tool list returned by
     /// `Broker::list_visible_tools`. `Deny` strips matching tools; `Log`
     /// observes and continues. `ShortCircuit` / `Invoke` have no coherent
-    /// list-filter semantics and are rejected at `hook_add` time (D-56).
+    /// list-filter semantics and are rejected at `hook_add` time.
     ListTools,
 }
 
-/// Opaque glob pattern. Phase 1 keeps it a plain string; actual matching is
-/// wired in Phase 4.
+/// Glob pattern matched by the broker against hook invocation metadata.
 #[derive(Clone, Debug)]
 pub struct GlobPattern(pub String);
 
@@ -198,12 +161,15 @@ pub struct HookTables {
     pub list_tools: HookTable,
 }
 
-/// Builtin hook body trait. Phase 4 wires evaluation.
+/// Builtin hook execution. The evaluator awaits cleanup after cancellation;
+/// implementations must observe the owner token while waiting, finish owned
+/// effects, and return `McpError::Cancelled` before starting further work.
 #[async_trait]
 pub trait Hook: Send + Sync + 'static {
     async fn invoke(
         &self,
         params: &KernelCallParams,
         ctx: &CallContext,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> McpResult<()>;
 }

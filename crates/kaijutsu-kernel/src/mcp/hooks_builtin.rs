@@ -1,17 +1,8 @@
-//! Builtin hook registry — named bodies that the admin wire addresses by
-//! string, not by `Arc<dyn Hook>` (D-50).
+//! Named builtin hook factories used by hook administration.
 //!
-//! `BuiltinHookRegistry` is frozen after construction; the admin server
-//! looks up a name and builds a fresh `Arc<dyn Hook>` per `hook_add` call.
-//! The registry never returns the same Arc twice — makes each hook entry
-//! independently droppable.
-//!
-//! Phase 4 seeds:
-//! - `tracing_audit` — emits one `tracing::trace!` event per invocation.
-//!   The positive control for exit criterion #1.
-//! - `no_op` — returns `Ok(())` unconditionally. Useful as a negative
-//!   control and for tests that want to exercise the Invoke path without
-//!   observing side effects.
+//! The registry is fixed after construction. Each lookup creates an independent
+//! body. `tracing_audit` emits one trace event; `no_op` observes cancellation
+//! without adding other effects.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,7 +71,9 @@ impl Hook for TracingAuditHook {
         &self,
         params: &KernelCallParams,
         ctx: &CallContext,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> McpResult<()> {
+        if cancel.is_cancelled() { return Err(super::error::McpError::Cancelled); }
         tracing::trace!(
             target: "kaijutsu::hooks::audit",
             instance = %params.instance,
@@ -105,7 +98,9 @@ impl Hook for NoOpHook {
         &self,
         _params: &KernelCallParams,
         _ctx: &CallContext,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> McpResult<()> {
+        if cancel.is_cancelled() { return Err(super::error::McpError::Cancelled); }
         Ok(())
     }
 }
@@ -149,14 +144,14 @@ mod tests {
     async fn registry_builds_tracing_audit() {
         let r = BuiltinHookRegistry::new();
         let h = r.build("tracing_audit").expect("tracing_audit must exist");
-        h.invoke(&test_params(), &test_ctx()).await.unwrap();
+        h.invoke(&test_params(), &test_ctx(), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     }
 
     #[tokio::test]
     async fn registry_builds_no_op() {
         let r = BuiltinHookRegistry::new();
         let h = r.build("no_op").expect("no_op must exist");
-        h.invoke(&test_params(), &test_ctx()).await.unwrap();
+        h.invoke(&test_params(), &test_ctx(), &tokio_util::sync::CancellationToken::new()).await.unwrap();
     }
 
     #[test]
@@ -212,7 +207,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         TracingAuditHook
-            .invoke(&test_params(), &test_ctx())
+            .invoke(&test_params(), &test_ctx(), &tokio_util::sync::CancellationToken::new())
             .await
             .unwrap();
 
