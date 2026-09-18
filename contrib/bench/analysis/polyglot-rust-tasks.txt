@@ -1,0 +1,45 @@
+# All 30 Rust exercises from Aider-AI/polyglot-benchmark, upstream commit
+# 7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f (2024-12-22), generated with:
+#
+#   cd /home/atobey/src/harbor/adapters/aider_polyglot
+#   UV_PROJECT_ENVIRONMENT=/home/atobey/src/bench-work/harbor/aider-polyglot-venv \
+#   UV_CACHE_DIR=/home/atobey/src/bench-work/harbor/.cache/uv \
+#     uv run --frozen -- aider_polyglot \
+#       --polyglot-root /home/atobey/src/bench-work/harbor/repos/polyglot-benchmark \
+#       --languages rust \
+#       --output-dir /home/atobey/src/bench-work/harbor/datasets/polyglot-rust
+#
+# One task name per line, the form --task-file expects (turned into repeated
+# -i/--include-task-name flags). Pass alongside
+#   --task-path /home/atobey/src/bench-work/harbor/datasets/polyglot-rust
+# to run-harbor.sh or run-control.sh. See polyglot-rust.md.
+polyglot_rust_accumulate
+polyglot_rust_acronym
+polyglot_rust_alphametics
+polyglot_rust_book-store
+polyglot_rust_bowling
+polyglot_rust_decimal
+polyglot_rust_dot-dsl
+polyglot_rust_doubly-linked-list
+polyglot_rust_fizzy
+polyglot_rust_forth
+polyglot_rust_gigasecond
+polyglot_rust_grade-school
+polyglot_rust_grep
+polyglot_rust_luhn-from
+polyglot_rust_macros
+polyglot_rust_nucleotide-codons
+polyglot_rust_ocr-numbers
+polyglot_rust_parallel-letter-frequency
+polyglot_rust_pig-latin
+polyglot_rust_poker
+polyglot_rust_react
+polyglot_rust_robot-name
+polyglot_rust_say
+polyglot_rust_scale-generator
+polyglot_rust_simple-cipher
+polyglot_rust_two-bucket
+polyglot_rust_variable-length-quantity
+polyglot_rust_word-count
+polyglot_rust_wordy
+polyglot_rust_xorcism
