@@ -298,16 +298,16 @@ the job/controller lifetime work; do not claim the receipt currently identifies
 that process group. Linux parent-death cleanup covers direct spawned children;
 arbitrary descendant trees after SIGKILL need their own evidence.
 
-Kaish backend discovery enumerates raw global broker names instead of the
-context's visible names. Qualified names for broker-broker collisions are
-therefore not reliably discoverable through shell commands. No shipped caller
-needs a generic collision override; `kaish_exec` retirement deliberately drops
-that escape hatch. Audit contextual discovery as part of the backend inventory;
-keep native model tool resolution intact.
-
-Submit rc receives its turn's cancellation token. Other lifecycle producers
-still create fresh tokens; audit propagation through nested `kj` lifecycle
-calls and their owning task before claiming cancellation across all re-entry.
+Submit rc receives its turn's cancellation token, but `KjBuiltin` does not
+carry that owner into `KjCaller`. Nested create/fork/drift/attach lifecycle runs
+therefore mint fresh tokens and can hold shutdown until their own timeout.
+Carry the execution owner explicitly; signal and join inline child cleanup.
+Do not drop the dispatch future or tie cancellation to archive/disconnect.
+Stop later, not-yet-admitted effects such as a fork's child turn or rotation
+commit after cancellation. Character-root caller derivation must preserve the
+session, recursion depth and owner too. Beat tick/rotate currently uses an
+untracked local task; move accepted lifecycle work under the existing joined
+runtime owner, preserving its admission proof.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while

@@ -68,6 +68,9 @@ These are source observations, not promises that all paths behave alike.
   execution uses `shell` and its retained operation receipt. `callMcpTool` is
   also retired; native broker tests call the cancellable kernel boundary, and
   client tests use retained execution.
+  Backend discovery and invocation share the broker's context-visible names,
+  bindings, and ListTools filters. Qualified collision names retain their schema
+  for positional arguments. Kaish builtins still take precedence.
 - MCP exposes `shell`, session/peer tools, and `list_kernel_tools`. Visible
   broker tools with unshadowed names accept ordinary kaish arguments. The
   backend preserves stdout, stderr, exit code and structured output, including
@@ -434,7 +437,7 @@ remove the obsolete API in the same change as its final caller.
 | Pending | Job/receipt readers and controllers | kernel `shell_operations.rs`, `kj/wait.rs`, `kj/context.rs`, runtime job builtins | In-memory jobs and durable receipts keep their distinct lifetimes |
 | Pending | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `ps_builtin`, synthesis | Use kaish's backend/tool interfaces directly where they implement those interfaces |
 | Pending | Gate planning and parsing | `kj/gate*`, `hook_gate`, `shell_gate`, `plan_clauses`, `readonly` | Kaish remains the syntax authority; preserve clause plans and approval semantics |
-| Pending | Tests and fixtures | kernel and server unit/integration tests | Production constructors for integration tests; direct engine construction only in tests of that lower-level contract |
+| Partial | Tests and fixtures | kernel and server unit/integration tests | SSH and kernel rc fixtures deny host execution by default; explicit subprocess cases opt in; real kernel/SSH and container cases cover resolution and lifecycle; remaining direct-engine fixtures need their contract audit |
 
 This inventory includes support code as well as execution calls. A search for
 `kaish_kernel::` will still find legitimate backend implementations, builtin

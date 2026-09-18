@@ -659,9 +659,9 @@ impl Kernel {
 
     /// Enumerate every tool currently registered on the broker, without
     /// binding filtering. Returns `(tool_name, instance, schema,
-    /// description)` quadruples. Used by admin/introspection paths (kaish
-    /// CLI, capnp `get_tool_schemas`) that want the global surface.
-    pub async fn list_all_registered_tools(
+    /// description)` quadruples. Dispatch uses this global list only to
+    /// distinguish an unknown name from a tool omitted by the loadout.
+    async fn list_all_registered_tools(
         &self,
     ) -> Vec<(String, crate::mcp::InstanceId, serde_json::Value, Option<String>)> {
         use crate::mcp::CallContext;

@@ -2510,6 +2510,27 @@ tokens). Source, review, and disposition are archived under
 `~/exomemory/kaijutsu/reviews/2026-09-18-execution/rpc58-*`. Wire/client deletion
 was verified locally through references and compilation.
 
+Shell discovery now uses the same context-visible broker names as invocation.
+The adapter passes the active session context and requester, performer, and
+reviewer through ListTools filtering. A qualified collision name retains its
+schema, so a positional argument is mapped to the tool's declared parameter.
+The remaining global enumeration is private and used only to distinguish an
+unknown command from a loadout refusal. Builtin precedence is unchanged.
+
+Regression tests first observed hidden tools leaking from other bindings and
+two raw `inspect` names where qualified names were required. They now pass,
+including a session context switch and performer-specific ListTools filtering.
+A real SSH retained-shell test reads a file through `builtin_file__read` with
+a positional path and no host-exec permission. Kaibo/DeepSeek Flash reported
+no confirmed defect (23,350 input / 1,400 output tokens); its final coverage
+paragraph reached the output cap. Source and disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/discovery-*`.
+Validation passed: 3,224 kernel tests (6 ignored), 66 server integration tests,
+154 MCP tests, and workspace all-targets checking.
+After integrating the concurrent benchmark and standalone ACP commits, the
+combined tree passed 3,247 kernel tests (6 ignored), the same 66 server and
+154 MCP tests, and workspace all-targets checking.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

@@ -2,14 +2,14 @@
 //!
 //! Delegates filesystem operations to the kaijutsu kernel's `MountTable`
 //! (which routes to `LocalBackend` for real files) and tool dispatch to
-//! the document backends.
+//! the context's MCP broker binding.
 //!
 //! # Architecture
 //!
 //! ```text
 //! MountBackend (implements kaish KernelBackend)
 //! ├── File ops → MountTable → LocalBackend → real filesystem
-//! └── Tool calls → docs_tools → ToolNotFound
+//! └── Tool discovery/calls → KaijutsuBackend → MCP broker
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ pub struct MountBackend {
     /// across both the kaish and MCP surfaces. Disk is the source of truth;
     /// the cache reconciles against it. See `docs/file-buffers.md`.
     file_cache: Arc<FileDocumentCache>,
-    /// document backend for document tool dispatch.
+    /// Adapter for context-visible broker tools.
     docs_tools: Arc<KaijutsuBackend>,
     /// When true, every mutating op is refused structurally with
     /// `PermissionDenied` *before* it can reach the shared mount table or the

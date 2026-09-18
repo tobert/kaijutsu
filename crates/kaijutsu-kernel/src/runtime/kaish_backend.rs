@@ -47,7 +47,7 @@ struct KaijutsuToolInfo {
 }
 
 impl KaijutsuToolInfo {
-    fn new(name: impl Into<String>, description: impl Into<String>, _category: &str) -> Self {
+    fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
@@ -102,6 +102,32 @@ impl KaijutsuBackend {
         }
     }
 
+    /// Resolve the tool surface for the shell's active context. Discovery and
+    /// invocation must use the same broker-visible names: a binding can hide a
+    /// registered tool, and a collision can qualify its visible name.
+    async fn visible_tools(&self) -> BackendResult<Vec<(String, crate::mcp::KernelTool)>> {
+        let context_id = self
+            .session_contexts
+            .current(&self.identity.session)
+            .ok_or_else(|| BackendError::Io("no active context joined".to_string()))?;
+        let call_context = crate::mcp::CallContext::new(
+            self.identity.requester,
+            context_id,
+            self.identity.session,
+            self.kernel.id(),
+        )
+        .with_actor(self.identity.performer, self.identity.reviewer);
+        let broker = self.kernel.broker();
+        broker
+            .binding_checked(&context_id)
+            .await
+            .map_err(|error| BackendError::Io(error.to_string()))?;
+        broker
+            .list_visible_tools(context_id, &call_context)
+            .await
+            .map_err(|error| BackendError::Io(error.to_string()))
+    }
+
     /// Resolve a VFS path to a ContextId and optional block ID.
     ///
     /// Path formats:
@@ -144,7 +170,7 @@ impl KaijutsuBackend {
 
     /// Convert kaijutsu ToolInfo to kaish ToolInfo format.
     ///
-    /// When a JSON Schema is provided (from the engine), converts its properties
+    /// When a JSON Schema is provided by the broker, converts its properties
     /// to kaish `ParamSchema` entries so that positional→named mapping works.
     fn convert_tool_info(
         info: &KaijutsuToolInfo,
@@ -681,30 +707,27 @@ impl KernelBackend for KaijutsuBackend {
     }
 
     async fn list_tools(&self) -> BackendResult<Vec<ToolInfo>> {
-        // Phase 1 M4: enumerate through the broker's registered servers.
-        let tools = self.kernel.list_all_registered_tools().await;
+        let tools = self.visible_tools().await?;
         let mut infos = Vec::with_capacity(tools.len());
-        for (name, _instance, schema, description) in tools {
+        for (name, tool) in tools {
             let info = KaijutsuToolInfo::new(
                 &name,
-                description.clone().unwrap_or_default(),
-                "mcp",
+                tool.description.unwrap_or_default(),
             );
-            infos.push(Self::convert_tool_info(&info, Some(schema)));
+            infos.push(Self::convert_tool_info(&info, Some(tool.input_schema)));
         }
         Ok(infos)
     }
 
     async fn get_tool(&self, name: &str) -> BackendResult<Option<ToolInfo>> {
-        let tools = self.kernel.list_all_registered_tools().await;
-        for (tool_name, _instance, schema, description) in tools {
+        let tools = self.visible_tools().await?;
+        for (tool_name, tool) in tools {
             if tool_name == name {
                 let info = KaijutsuToolInfo::new(
                     &tool_name,
-                    description.unwrap_or_default(),
-                    "mcp",
+                    tool.description.unwrap_or_default(),
                 );
-                return Ok(Some(Self::convert_tool_info(&info, Some(schema))));
+                return Ok(Some(Self::convert_tool_info(&info, Some(tool.input_schema))));
             }
         }
         Ok(None)
@@ -807,7 +830,9 @@ fn json_to_kaish_value(json: JsonValue) -> kaish_kernel::ast::Value {
 mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
+    use crate::mcp::{ContextToolBinding, GlobPattern, HookAction, HookEntry, HookId, InstanceId, InstancePolicy, KernelCallParams, KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
     use kaijutsu_types::{PrincipalId, SessionId};
+    use tokio::sync::broadcast;
 
     #[test]
     fn convert_exec_result_preserves_both_streams_exit_status_and_output() {
@@ -835,6 +860,149 @@ mod tests {
         assert_eq!(converted.code, 0);
         assert_eq!(converted.stdout, "normal output\n");
         assert_eq!(converted.stderr, "warning\n");
+    }
+
+    struct DiscoveryServer {
+        id: InstanceId,
+        tool: String,
+        notifications: broadcast::Sender<ServerNotification>,
+        list_contexts: Arc<std::sync::Mutex<Vec<crate::mcp::CallContext>>>,
+    }
+
+    impl DiscoveryServer {
+        fn new(instance: &str, tool: &str) -> Self {
+            let (notifications, _) = broadcast::channel(1);
+            Self { id: InstanceId::new(instance), tool: tool.into(), notifications,
+                list_contexts: Arc::new(std::sync::Mutex::new(Vec::new())) }
+        }
+
+        fn list_contexts(&self) -> Vec<crate::mcp::CallContext> { self.list_contexts.lock().unwrap().clone() }
+
+        fn clear_list_contexts(&self) { self.list_contexts.lock().unwrap().clear(); }
+    }
+
+    #[async_trait]
+    impl McpServerLike for DiscoveryServer {
+        fn instance_id(&self) -> &InstanceId { &self.id }
+
+        async fn list_tools(&self, context: &crate::mcp::CallContext) -> McpResult<Vec<KernelTool>> {
+            self.list_contexts.lock().unwrap().push(context.clone());
+            Ok(vec![KernelTool {
+                instance: self.id.clone(), name: self.tool.clone(), description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            }])
+        }
+
+        async fn call_tool(
+            &self, _: KernelCallParams, _: &crate::mcp::CallContext, _: tokio_util::sync::CancellationToken,
+        ) -> McpResult<KernelToolResult> {
+            Ok(KernelToolResult::text(self.id.as_str()))
+        }
+
+        fn notifications(&self) -> broadcast::Receiver<ServerNotification> { self.notifications.subscribe() }
+
+        async fn shutdown(&self) -> McpResult<()> { Ok(()) }
+    }
+
+    async fn discovery_backend_as(identity: ShellIdentity) -> (KaijutsuBackend, Arc<KaijutsuKernel>, SessionContextMap, SessionId) {
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("backend-discovery").await);
+        let context = identity.context;
+        let session = identity.session;
+        let contexts = crate::runtime::context_engine::session_context_map();
+        contexts.insert(session, context);
+        let backend = KaijutsuBackend::new(
+            shared_block_store(identity.requester), kernel.clone(), identity,
+            contexts.clone(),
+        );
+        (backend, kernel, contexts, session)
+    }
+
+    async fn discovery_backend(context: ContextId) -> (KaijutsuBackend, Arc<KaijutsuKernel>, SessionContextMap, SessionId) {
+        discovery_backend_as(ShellIdentity {
+            requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None,
+            context, session: SessionId::new(),
+        }).await
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_follows_the_active_context_binding() {
+        let first = ContextId::new();
+        let second = ContextId::new();
+        let (backend, kernel, contexts, session) = discovery_backend(first).await;
+        let alpha = Arc::new(DiscoveryServer::new("alpha", "alpha_tool"));
+        let beta = Arc::new(DiscoveryServer::new("beta", "beta_tool"));
+        kernel.broker().register_silently(alpha, InstancePolicy::default()).await.unwrap();
+        kernel.broker().register_silently(beta, InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(first, ContextToolBinding::with_instances(vec![InstanceId::new("alpha")])).await.unwrap();
+        kernel.broker().set_binding(second, ContextToolBinding::with_instances(vec![InstanceId::new("beta")])).await.unwrap();
+
+        let names: Vec<_> = backend.list_tools().await.unwrap().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["alpha_tool"]);
+        assert!(backend.get_tool("alpha_tool").await.unwrap().is_some());
+        assert!(backend.get_tool("beta_tool").await.unwrap().is_none());
+
+        contexts.insert(session, second);
+        let names: Vec<_> = backend.list_tools().await.unwrap().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["beta_tool"], "discovery must follow the same active session context as dispatch");
+        assert!(backend.get_tool("alpha_tool").await.unwrap().is_none());
+        assert!(backend.get_tool("beta_tool").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_uses_broker_qualified_collision_names() {
+        let context = ContextId::new();
+        let (backend, kernel, _, _) = discovery_backend(context).await;
+        let first = Arc::new(DiscoveryServer::new("one.tools", "inspect"));
+        let second = Arc::new(DiscoveryServer::new("two.tools", "inspect"));
+        kernel.broker().register_silently(first, InstancePolicy::default()).await.unwrap();
+        kernel.broker().register_silently(second, InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![
+            InstanceId::new("one.tools"), InstanceId::new("two.tools"),
+        ])).await.unwrap();
+
+        let mut names: Vec<_> = backend.list_tools().await.unwrap().into_iter().map(|tool| tool.name).collect();
+        names.sort();
+        assert_eq!(names, ["one_tools__inspect", "two_tools__inspect"]);
+        assert!(backend.get_tool("inspect").await.unwrap().is_none());
+        for name in names {
+            assert!(backend.get_tool(&name).await.unwrap().is_some(), "resolved tool must be discoverable: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_discovery_preserves_shell_identity_and_list_tools_filtering() {
+        let requester = PrincipalId::new();
+        let performer = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = ContextId::new();
+        let session = SessionId::new();
+        let (backend, kernel, _, _) = discovery_backend_as(ShellIdentity {
+            requester, performer, reviewer: Some(reviewer), context, session,
+        }).await;
+        let kept = Arc::new(DiscoveryServer::new("kept", "read"));
+        let hidden = Arc::new(DiscoveryServer::new("hidden", "write"));
+        kernel.broker().register_silently(kept.clone(), InstancePolicy::default()).await.unwrap();
+        kernel.broker().register_silently(hidden, InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![
+            InstanceId::new("kept"), InstanceId::new("hidden"),
+        ])).await.unwrap();
+        kernel.broker().hooks().write().await.list_tools.entries.push(HookEntry {
+            id: HookId("hide-writes-for-performer".into()),
+            match_instance: Some(GlobPattern("hidden".into())),
+            match_tool: Some(GlobPattern("write".into())),
+            match_context: Some(context), match_principal: Some(performer),
+            action: HookAction::Deny("fixture filter".into()), priority: 0, kaish_script_id: None,
+        });
+        kept.clear_list_contexts();
+
+        let names: Vec<_> = backend.list_tools().await.unwrap().into_iter().map(|tool| tool.name).collect();
+        assert_eq!(names, ["read"]);
+        assert!(backend.get_tool("write").await.unwrap().is_none());
+        let listed = kept.list_contexts();
+        assert!(!listed.is_empty(), "visible server must receive the shell discovery context");
+        assert!(listed.iter().all(|seen| seen.principal_id == requester
+            && seen.actor_id == performer && seen.reviewer_id == Some(reviewer)
+            && seen.context_id == context && seen.session_id == session));
     }
 
     #[tokio::test]
