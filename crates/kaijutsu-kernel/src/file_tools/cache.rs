@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, Role, Status};
+use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, PrincipalId, Role, Status};
 use parking_lot::{Mutex, RwLock};
 
 use crate::block_store::SharedBlockStore;
@@ -442,6 +442,7 @@ impl FileDocumentCache {
         // has no blocks" (`BlockStore::create_document_with_block`).
         let block_id = match self.block_store.create_document_with_block(
             ctx_id,
+            self.block_store.principal_id(),
             DocKind::File,
             language,
             Role::System,
@@ -578,10 +579,8 @@ impl FileDocumentCache {
     /// `dirty_file_buffers` row directly, the same row that arm reads to
     /// decide `swap_recovered: true` in the first place: a fresh cache (a
     /// cold start, or a second `FileDocumentCache` over the same store) has
-    /// never run that recovery, so without this fallback a cold-path caller
-    /// (`create_or_replace`'s `get_or_load_with_content` branch) would splice
-    /// straight into the swap's block with no check at all (kaibo review of
-    /// `d45e0484`/`4369bd77`/`f02f3688`, "BUG 2").
+    /// never run that recovery, so this fallback keeps a cold-path content
+    /// replacement from overwriting the recovered swap.
     fn is_unacknowledged_swap(&self, path: &str) -> Result<bool, String> {
         let ctx_id = file_context_id(path);
         if let Some(entry) = self.cache.read().get(&ctx_id) {
@@ -598,10 +597,9 @@ impl FileDocumentCache {
     /// Refuse with the same [`FlushError::UnacknowledgedSwap`] shape
     /// `flush_one` uses if `path` is an unacknowledged recovered swap — see
     /// [`is_unacknowledged_swap`](Self::is_unacknowledged_swap). `pub(crate)`
-    /// so a caller that mutates a file's content *without* going through
-    /// `create_or_replace` (the MCP `edit` tool's direct `block_store.edit_text`,
-    /// kaibo review "BUG 3") can run the identical check before its first
-    /// mutation instead of re-deriving it.
+    /// so a caller that mutates a file's content without going through
+    /// `create_or_replace` can run the identical check before its first
+    /// mutation.
     pub(crate) fn refuse_if_swap_recovered(&self, path: &str) -> Result<(), String> {
         if self.is_unacknowledged_swap(path)? {
             return Err(FlushError::UnacknowledgedSwap {
@@ -615,53 +613,28 @@ impl FileDocumentCache {
     /// Create or replace a file's content.
     ///
     /// Refuses on a recovered, unacknowledged swap (`docs/file-buffers.md`
-    /// rule 4) **before** touching the block — B3, `docs/audits/
-    /// 2026-08-20-editor-fileio.md`: this used to splice the new content in
-    /// first and only have `flush_one` refuse afterward, so the recovered
-    /// work was already destroyed by the time the caller saw the error. The
-    /// check runs unconditionally, warm cache or cold — a cold cache (no
-    /// entry at all, e.g. right after a restart) used to skip straight past
-    /// this and mutate the swap's block via `get_or_load_with_content`'s
-    /// `DocumentAlreadyExists` fallback with no check whatsoever (kaibo
-    /// review, "BUG 2"). The error carries the same
-    /// `FlushError::UnacknowledgedSwap` shape `flush_one` uses, so every
-    /// caller's error handling (already written against a flush failure)
-    /// needs no new arm.
+    /// rule 4) before touching the block. The check runs for warm and cold
+    /// caches. The error carries the same
+    /// `FlushError::UnacknowledgedSwap` shape `flush_one` uses.
     pub async fn create_or_replace(
         &self,
         path: &str,
         content: &str,
+        actor: PrincipalId,
     ) -> Result<(ContextId, BlockId), String> {
         let ctx_id = file_context_id(path);
         self.refuse_if_swap_recovered(path)?;
 
-        // If doc exists, replace its content with a full splice
+        // A replacement is one atomic whole-text edit under the input actor.
         {
             let cache = self.cache.read();
             if let Some(entry) = cache.get(&ctx_id) {
-                let old_content = self
-                    .block_store
-                    .block_snapshots(ctx_id)
-                    .ok()
-                    .and_then(|snaps| {
-                        snaps
-                            .iter()
-                            .find(|s| s.id == entry.block_id)
-                            .map(|s| s.content.clone())
-                    })
-                    .unwrap_or_default();
-
-                // `edit_text` indexes in CHARACTERS (block text positions),
-                // not bytes — delete the whole block by char count. Using
-                // `old_content.len()` (bytes) over-counts on multi-byte
-                // UTF-8 (e.g. 改善, em-dashes) and panics out-of-bounds.
                 self.block_store
-                    .edit_text(
+                    .replace_text_as(
                         ctx_id,
                         &entry.block_id,
-                        0,
                         content,
-                        old_content.chars().count(),
+                        Some(actor),
                     )
                     .map_err(|e| e.to_string())?;
 
@@ -669,8 +642,9 @@ impl FileDocumentCache {
             }
         }
 
-        // New file: create doc + block
-        self.get_or_load_with_content(path, content).await
+        // New file creation and its first block use the input actor. Hydration
+        // calls this helper with the cache store's loader principal instead.
+        self.get_or_load_with_content(path, content, actor).await
     }
 
     /// Drop a path's cached kernel document, if any. Used when a write bypasses
@@ -960,11 +934,16 @@ impl FileDocumentCache {
         &self.vfs
     }
 
-    /// Load a file with given content (for write-new-file case).
+    /// Load a file with given content for a write-new-file case.
+    ///
+    /// `actor` is the input writer for an authored write. Hydration calls use
+    /// the cache store's loader principal so a read does not borrow a later
+    /// caller's mutation identity.
     async fn get_or_load_with_content(
         &self,
         path: &str,
         content: &str,
+        actor: PrincipalId,
     ) -> Result<(ContextId, BlockId), String> {
         let ctx_id = file_context_id(path);
         let language = detect_language(path);
@@ -981,6 +960,7 @@ impl FileDocumentCache {
         // must propagate, matching try_get_or_load's classification.
         let block_id = match self.block_store.create_document_with_block(
             ctx_id,
+            actor,
             DocKind::File,
             language,
             Role::System,
@@ -992,8 +972,7 @@ impl FileDocumentCache {
             Ok(block_id) => block_id,
             Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {
                 // Doc already in the store (cold cache). Replace its block's
-                // content with the new bytes (char-indexed delete, like the
-                // cached-hit path).
+                // content atomically under this call's actor.
                 let snaps = self
                     .block_store
                     .block_snapshots(ctx_id)
@@ -1001,12 +980,11 @@ impl FileDocumentCache {
                 match snaps.first() {
                     Some(existing) => {
                         self.block_store
-                            .edit_text(
+                            .replace_text_as(
                                 ctx_id,
                                 &existing.id,
-                                0,
                                 content,
-                                existing.content.chars().count(),
+                                Some(actor),
                             )
                             .map_err(|e| e.to_string())?;
                         existing.id
@@ -1018,7 +996,7 @@ impl FileDocumentCache {
                     // to lose here.
                     None => self
                         .block_store
-                        .insert_block(
+                        .insert_block_as(
                             ctx_id,
                             None,
                             None,
@@ -1027,6 +1005,7 @@ impl FileDocumentCache {
                             content,
                             Status::Done,
                             ContentType::Plain,
+                            Some(actor),
                         )
                         .map_err(|e| {
                             format!("failed to insert first block for {}: {}", path, e)
@@ -1203,7 +1182,7 @@ mod tests {
         );
     }
 
-    use crate::block_store::shared_block_store;
+    use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::vfs::backends::MemoryBackend;
     use crate::vfs::VfsOps;
     use kaijutsu_types::PrincipalId;
@@ -1217,15 +1196,61 @@ mod tests {
     }
 
     /// Build a cache over a MemoryBackend mounted at /tmp, backed by a fresh
-    /// temporary KernelDb (see `tmp_db`) — the same durable path production
-    /// runs, so a swap survives `invalidate` the way it survives a real
-    /// restart.
+    /// temporary KernelDb for swap markers. Its block store is in-memory;
+    /// tests that need persisted document rows construct one explicitly.
     async fn tmp_cache() -> (Arc<MountTable>, FileDocumentCache) {
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = FileDocumentCache::new(blocks, vfs.clone(), tmp_db());
         (vfs, cache)
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_the_block_and_attributes_new_and_existing_writes() {
+        let creator = PrincipalId::new();
+        let db = tmp_db();
+        let workspace = db.lock().get_or_create_default_workspace(creator).unwrap();
+        let blocks = shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = FileDocumentCache::new(blocks, vfs, db);
+        let path = "/tmp/attributed.txt";
+        let editor = PrincipalId::new();
+
+        let (context_id, block_id) = cache
+            .create_or_replace(path, "first", creator)
+            .await
+            .expect("create file document");
+        assert_eq!(
+            cache.block_store().get(context_id).expect("new document").doc.principal_id(),
+            creator,
+            "a newly authored file has its writer as the live document principal"
+        );
+        assert_eq!(
+            cache.db.lock().get_document(context_id).unwrap().expect("document row").created_by,
+            creator,
+            "the durable row preserves the new file's creator"
+        );
+        assert_eq!(block_id.principal_id, creator, "the first block keeps its creator");
+
+        let (same_context, same_block) = cache
+            .create_or_replace(path, "second", editor)
+            .await
+            .expect("replace file document");
+        assert_eq!(same_context, context_id);
+        assert_eq!(same_block, block_id, "replacement must not recreate the file block");
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "second");
+        assert_eq!(
+            cache.block_store().get(context_id).expect("replaced document").doc.principal_id(),
+            editor,
+            "the current writer owns the live replacement"
+        );
+        assert_eq!(
+            cache.db.lock().get_document(context_id).unwrap().expect("document row").created_by,
+            creator,
+            "replacement keeps the original file creator"
+        );
     }
 
     #[tokio::test]
@@ -1305,7 +1330,7 @@ mod tests {
             .unwrap();
 
         cache
-            .create_or_replace(path, "written anyway")
+            .create_or_replace(path, "written anyway", PrincipalId::system())
             .await
             .expect("a contentless document must take a first block, not refuse");
         assert_eq!(
@@ -1324,14 +1349,14 @@ mod tests {
 
         // First write loads the doc into the cache (new-file path).
         let original = "改善 — the standard we accept …\nline two";
-        cache.create_or_replace("/tmp/s.md", original).await.unwrap();
+        cache.create_or_replace("/tmp/s.md", original, PrincipalId::system()).await.unwrap();
         assert_eq!(cache.try_read_content("/tmp/s.md").await.unwrap(), original);
 
         // Replace the now-cached doc with different multi-byte content of a
         // *shorter* char length — the byte-vs-char bug overran here.
         let replacement = "短い";
         cache
-            .create_or_replace("/tmp/s.md", replacement)
+            .create_or_replace("/tmp/s.md", replacement, PrincipalId::system())
             .await
             .expect("replace cached multi-byte doc must not panic");
         assert_eq!(
@@ -1348,14 +1373,14 @@ mod tests {
         // already exists". `invalidate` reproduces the cold cache.
         let (_vfs, cache) = tmp_cache().await;
 
-        cache.create_or_replace("/tmp/r.kai", "v1").await.unwrap();
+        cache.create_or_replace("/tmp/r.kai", "v1", PrincipalId::system()).await.unwrap();
         // Simulate restart: cache entry gone, store doc remains.
         cache.invalidate("/tmp/r.kai").unwrap();
 
         // Replace through the cold-cache path (with multi-byte, to also cover
         // the char-count delete in the fallback branch).
         cache
-            .create_or_replace("/tmp/r.kai", "改善 v2 …")
+            .create_or_replace("/tmp/r.kai", "改善 v2 …", PrincipalId::system())
             .await
             .expect("replace a store-resident doc after a cold cache");
         assert_eq!(cache.try_read_content("/tmp/r.kai").await.unwrap(), "改善 v2 …");
@@ -1420,7 +1445,7 @@ mod tests {
         };
 
         let err = cache
-            .create_or_replace(path, "new content")
+            .create_or_replace(path, "new content", PrincipalId::system())
             .await
             .expect_err("a diverged document must not be treated as a benign already-exists");
         assert_eq!(
@@ -1455,7 +1480,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/g.txt").await.unwrap(), "disk-v1");
 
         // Local uncommitted edit (dirty, not flushed).
-        cache.create_or_replace("/tmp/g.txt", "local-edit").await.unwrap();
+        cache.create_or_replace("/tmp/g.txt", "local-edit", PrincipalId::system()).await.unwrap();
         cache.mark_dirty("/tmp/g.txt").unwrap();
 
         // External writer also changes the file (bumps the backend generation).
@@ -1693,7 +1718,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/dirty.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/dirty.md", "local-edit")
+            .create_or_replace("/tmp/dirty.md", "local-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/dirty.md").unwrap();
@@ -1731,7 +1756,7 @@ mod tests {
 
         // Local uncommitted edit — dirty, never flushed to disk.
         cache
-            .create_or_replace("/tmp/swap.md", "unsaved-edit")
+            .create_or_replace("/tmp/swap.md", "unsaved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/swap.md").unwrap();
@@ -1797,7 +1822,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/flushed.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/flushed.md", "saved-edit")
+            .create_or_replace("/tmp/flushed.md", "saved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/flushed.md").unwrap();
@@ -1828,7 +1853,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/ack.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/ack.md", "unsaved-edit")
+            .create_or_replace("/tmp/ack.md", "unsaved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/ack.md").unwrap();
@@ -1881,7 +1906,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/swap2.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/swap2.md", "unsaved-edit")
+            .create_or_replace("/tmp/swap2.md", "unsaved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/swap2.md").unwrap();
@@ -1898,7 +1923,7 @@ mod tests {
         // instead of overwriting it — the same typed error `flush_one`
         // produces for this condition.
         let err = cache
-            .create_or_replace("/tmp/swap2.md", "clobbering-write")
+            .create_or_replace("/tmp/swap2.md", "clobbering-write", PrincipalId::system())
             .await
             .expect_err("create_or_replace must refuse a recovered unacknowledged swap");
         assert_eq!(
@@ -1965,7 +1990,7 @@ mod tests {
             "disk-v1"
         );
         cache1
-            .create_or_replace("/tmp/cold_swap.md", "unsaved-edit")
+            .create_or_replace("/tmp/cold_swap.md", "unsaved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache1.mark_dirty("/tmp/cold_swap.md").unwrap();
@@ -1980,7 +2005,7 @@ mod tests {
         // `cache2` before this — exactly the shape a fresh `write_file`/`kj
         // swap`-adjacent call would take against a just-restarted kernel.
         let err = cache2
-            .create_or_replace("/tmp/cold_swap.md", "clobbering-write")
+            .create_or_replace("/tmp/cold_swap.md", "clobbering-write", PrincipalId::system())
             .await
             .expect_err("a cold create_or_replace must refuse an unacknowledged swap");
         assert_eq!(
@@ -2024,7 +2049,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/w12.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/w12.md", "local-edit")
+            .create_or_replace("/tmp/w12.md", "local-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/w12.md").unwrap();
@@ -2069,7 +2094,7 @@ mod tests {
         assert_eq!(cache.try_read_content("/tmp/w12_ok.md").await.unwrap(), "disk-v1");
 
         cache
-            .create_or_replace("/tmp/w12_ok.md", "local-edit")
+            .create_or_replace("/tmp/w12_ok.md", "local-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/w12_ok.md").unwrap();
@@ -2111,7 +2136,7 @@ mod tests {
         );
 
         cache
-            .create_or_replace("/tmp/w12_swap.md", "unsaved-edit")
+            .create_or_replace("/tmp/w12_swap.md", "unsaved-edit", PrincipalId::system())
             .await
             .unwrap();
         cache.mark_dirty("/tmp/w12_swap.md").unwrap();

@@ -23,6 +23,7 @@ use kaish_kernel::vfs::{DirEntry, DirEntryKind};
 use kaish_kernel::{
     BackendError, BackendResult, KernelBackend, PatchOp, ReadRange, ToolInfo, ToolResult, WriteMode,
 };
+use kaijutsu_types::PrincipalId;
 
 use crate::file_tools::path::resolve_str;
 use crate::file_tools::{CacheReadError, FileDocumentCache};
@@ -50,9 +51,12 @@ pub struct MountBackend {
     file_cache: Arc<FileDocumentCache>,
     /// Adapter for context-visible broker tools.
     docs_tools: Arc<KaijutsuBackend>,
+    /// Performer whose contextual shell invoked this backend. File-cache
+    /// mutations retain that input actor rather than the cache hydrator.
+    actor: PrincipalId,
     /// When true, every mutating op is refused structurally with
     /// `PermissionDenied` *before* it can reach the shared mount table or the
-    /// document cache — the read-only invariant for the toolie's `read_only_shell`.
+    /// document cache — the invariant for `ShellPolicy::ReadOnly`.
     /// Reads (real files and kernel documents) still pass through. This gates the
     /// real-FS + `FileDocumentCache` surface; the kaish-VFS `/v/docs` mount
     /// is gated separately by wrapping it in
@@ -66,28 +70,32 @@ impl MountBackend {
         mount_table: Arc<MountTable>,
         docs_tools: Arc<KaijutsuBackend>,
         file_cache: Arc<FileDocumentCache>,
+        actor: PrincipalId,
     ) -> Self {
         Self {
             mount_table,
             file_cache,
             docs_tools,
+            actor,
             read_only: false,
         }
     }
 
     /// Create a read-only MountBackend: reads pass through, every mutation is
     /// refused at this boundary regardless of whether the underlying mount is
-    /// writable. Used to materialize the toolie's `read_only_shell` over the
+    /// writable. Used to materialize a read-only shell over the
     /// *shared* mount table without exposing a write path.
     pub fn new_read_only(
         mount_table: Arc<MountTable>,
         docs_tools: Arc<KaijutsuBackend>,
         file_cache: Arc<FileDocumentCache>,
+        actor: PrincipalId,
     ) -> Self {
         Self {
             mount_table,
             file_cache,
             docs_tools,
+            actor,
             read_only: true,
         }
     }
@@ -341,7 +349,7 @@ impl KernelBackend for MountBackend {
         }
 
         self.file_cache
-            .create_or_replace(&key, text)
+            .create_or_replace(&key, text, self.actor)
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
@@ -398,7 +406,7 @@ impl KernelBackend for MountBackend {
         };
         let combined = format!("{existing}{suffix}");
         self.file_cache
-            .create_or_replace(&key, &combined)
+            .create_or_replace(&key, &combined, self.actor)
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
@@ -457,7 +465,7 @@ impl KernelBackend for MountBackend {
 
         if writable {
             self.file_cache
-                .create_or_replace(&key, &text)
+                .create_or_replace(&key, &text, self.actor)
                 .await
                 .map_err(BackendError::Io)?;
             self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
@@ -880,6 +888,10 @@ mod tests {
 
     /// Create a test MountBackend with a MemoryBackend mounted at /tmp.
     async fn test_mount_backend() -> MountBackend {
+        test_mount_backend_as(PrincipalId::system()).await
+    }
+
+    async fn test_mount_backend_as(performer: PrincipalId) -> MountBackend {
         let blocks = shared_block_store(PrincipalId::system());
         let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-mount").await);
         let sid = kaijutsu_types::SessionId::new();
@@ -893,10 +905,10 @@ mod tests {
         let docs = Arc::new(KaijutsuBackend::new(
             blocks,
             kernel,
-            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer, reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
 
-        MountBackend::new(mount_table, docs, file_cache)
+        MountBackend::new(mount_table, docs, file_cache, performer)
     }
 
     #[tokio::test]
@@ -917,6 +929,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn writes_attribute_file_documents_to_the_contextual_performer() {
+        let performer = PrincipalId::new();
+        let backend = test_mount_backend_as(performer).await;
+        let path = Path::new("/tmp/attributed.txt");
+
+        backend
+            .write(path, b"performed", WriteMode::Overwrite)
+            .await
+            .expect("contextual shell write");
+
+        assert_eq!(
+            backend
+                .file_cache
+                .block_store()
+                .get(crate::file_tools::cache::file_context_id("/tmp/attributed.txt"))
+                .expect("file document")
+                .doc
+                .principal_id(),
+            performer,
+            "the shell performer owns its file mutation"
+        );
     }
 
     #[tokio::test]
@@ -1018,7 +1054,7 @@ mod tests {
             kernel,
             crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
-        let backend = MountBackend::new(mount_table, docs, file_cache.clone());
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone(), PrincipalId::system());
 
         // kaish surface writes a file...
         backend
@@ -1035,7 +1071,7 @@ mod tests {
         // An edit through the cache (the MCP `edit` path) is visible back
         // through a kaish read — including before any flush to disk.
         file_cache
-            .create_or_replace("/tmp/shared.rs", "fn main() { /* edited */ }")
+            .create_or_replace("/tmp/shared.rs", "fn main() { /* edited */ }", PrincipalId::system())
             .await
             .unwrap();
         let via_kaish = backend.read(Path::new("/tmp/shared.rs"), None).await.unwrap();
@@ -1082,7 +1118,7 @@ mod tests {
             kernel,
             crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
-        let backend = MountBackend::new(mount_table, docs, file_cache);
+        let backend = MountBackend::new(mount_table, docs, file_cache, PrincipalId::system());
 
         let file = dir.join("ro.txt");
 
@@ -1104,7 +1140,7 @@ mod tests {
     }
 
     /// `new_read_only` is the structural read-only *mode* (for the toolie's
-    /// `read_only_shell`): it refuses every mutation regardless of whether the
+    /// `ShellPolicy::ReadOnly`): it refuses every mutation regardless of whether the
     /// underlying mount is writable, while reads — including kernel-owned text —
     /// still pass through. This is the gate that lets the toolie inspect a
     /// live, *writable* project tree without a write path. Distinct from
@@ -1130,14 +1166,14 @@ mod tests {
         ));
 
         // Seed a file through a writable backend sharing the same cache/mount.
-        let writable = MountBackend::new(mount_table.clone(), docs.clone(), file_cache.clone());
+        let writable = MountBackend::new(mount_table.clone(), docs.clone(), file_cache.clone(), PrincipalId::system());
         writable
             .write(Path::new("/tmp/seed.txt"), b"seeded", WriteMode::Overwrite)
             .await
             .unwrap();
 
         // Now the read-only backend over the SAME (writable) mount table.
-        let ro = MountBackend::new_read_only(mount_table, docs, file_cache);
+        let ro = MountBackend::new_read_only(mount_table, docs, file_cache, PrincipalId::system());
         assert!(ro.read_only(), "read_only() must report the mode");
 
         // Reads pass through (kernel-owned text included).
@@ -1206,7 +1242,7 @@ mod tests {
             kernel,
             crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
-        let backend = MountBackend::new(mount_table, docs, file_cache.clone());
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone(), PrincipalId::system());
 
         // Write the initial file content through the backend.
         backend
@@ -1281,7 +1317,7 @@ mod tests {
             kernel,
             crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
         ));
-        let backend = MountBackend::new(mount_table.clone(), docs, file_cache.clone());
+        let backend = MountBackend::new(mount_table.clone(), docs, file_cache.clone(), PrincipalId::system());
 
         // Write the file through the backend so it's in the document cache AND on disk.
         backend

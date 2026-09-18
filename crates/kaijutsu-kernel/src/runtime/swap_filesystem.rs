@@ -380,7 +380,7 @@ mod tests {
     /// `dirty_file_buffers` row `list_dirty_file_buffers` reads).
     async fn dirty(file_cache: &FileDocumentCache, path: &str, unsaved_content: &str) {
         file_cache
-            .create_or_replace(path, unsaved_content)
+            .create_or_replace(path, unsaved_content, PrincipalId::system())
             .await
             .unwrap();
         file_cache.mark_dirty(path).unwrap();

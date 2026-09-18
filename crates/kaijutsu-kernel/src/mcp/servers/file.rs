@@ -239,7 +239,7 @@ impl McpServerLike for FileToolsServer {
                 {
                     denied
                 } else {
-                    self.write_file(path, p.content).await
+                    self.write_file(path, p.content, tool_ctx.actor_id).await
                 }
             }
             "glob" => {
@@ -507,23 +507,12 @@ impl FileToolsServer {
         }
     }
 
-    async fn write_file(&self, path: String, content: String) -> ExecResult {
+    async fn write_file(&self, path: String, content: String, actor: kaijutsu_types::PrincipalId) -> ExecResult {
         let vfs_path = std::path::Path::new(&path);
 
-        // Read-only / OS mounts never touch the document cache: let the VFS
-        // reject the write cleanly instead of poisoning the cache with an
-        // un-flushable edit. Mirrors the gate `MountBackend::raw_write`
-        // already applies on the kaish surface (`runtime/mount_backend.rs`).
-        // Without it, `create_or_replace` below lands the new content in the
-        // kernel block store *before* the flush is even attempted, and a
-        // failed flush is never undone: the cache entry's `dirty` flag has
-        // no path back to `false` on failure, and staleness detection keys
-        // off the VFS file's `generation` — which a failed write never
-        // advances — so every later `read` on this path would keep serving
-        // the phantom unwritten content forever, not the real (untouched)
-        // file. Live-verified before this fix: a write to a read-only mount
-        // failed with a clean error, but the very next read returned the
-        // tampered content while the on-disk file was still the original.
+        // Read-only mounts reject writes before the file cache changes.
+        // This shares MountBackend's rule: a failed physical write must not
+        // leave new text in a cache that still claims to mirror unchanged disk.
         if !self.vfs.is_writable(vfs_path).await {
             let existed = self.vfs.exists(vfs_path).await;
             return match self.vfs.write_all(vfs_path, content.as_bytes()).await {
@@ -538,7 +527,7 @@ impl FileToolsServer {
         }
 
         let existed = self.cache.exists(&path).await;
-        match self.cache.create_or_replace(&path, &content).await {
+        match self.cache.create_or_replace(&path, &content, actor).await {
             Ok(_) => {
                 if let Err(e) = self.cache.mark_dirty(&path) {
                     return ExecResult::failure(
@@ -564,7 +553,7 @@ impl FileToolsServer {
         }
     }
 
-    async fn apply_edit_plan(&self, p: EditParams, path: String, _tool_ctx: &ExecContext) -> ExecResult {
+    async fn apply_edit_plan(&self, p: EditParams, path: String, tool_ctx: &ExecContext) -> ExecResult {
         match (&p.anchor, &p.old_string) {
             (Some(_), Some(_)) => {
                 return ExecResult::failure(
@@ -649,7 +638,10 @@ impl FileToolsServer {
         let store = self.cache.block_store();
         for op in plan.ops.iter().rev() {
             if let Err(e) =
-                store.edit_text(ctx_id, &block_id, op.char_offset, &op.insert, op.char_delete)
+                store.edit_text_as(
+                    ctx_id, &block_id, op.char_offset, &op.insert, op.char_delete,
+                    Some(tool_ctx.actor_id),
+                )
             {
                 return ExecResult::failure(1, e.to_string());
             }
@@ -1118,7 +1110,7 @@ mod tests {
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        cache.create_or_replace(path, content).await.unwrap();
+        cache.create_or_replace(path, content, PrincipalId::system()).await.unwrap();
 
         let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
         let broker = Arc::new(Broker::new());
@@ -1160,6 +1152,38 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn edit_attributes_the_file_document_to_the_current_performer() {
+        let path = "/tmp/attribution.txt";
+        let (broker, cache) = broker_with_file(path, "before").await;
+        let performer = PrincipalId::new();
+        let ctx = default_ctx().with_actor(performer, None);
+
+        let result = call_with_ctx(
+            &broker,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "old_string": "before",
+                "new_string": "after",
+            }),
+            &ctx,
+        )
+        .await;
+
+        assert!(!result.is_error, "edit failed: {}", text_of(&result));
+        assert_eq!(
+            cache
+                .block_store()
+                .get(crate::file_tools::cache::file_context_id(path))
+                .expect("file document")
+                .doc
+                .principal_id(),
+            performer,
+            "the current performer, rather than the file hydrator, owns the live edit"
+        );
     }
 
     fn text_of(r: &KernelToolResult) -> String {
@@ -1484,7 +1508,7 @@ mod tests {
             ("/tmp/small.txt", "needle here\n"),
         ])
         .await;
-        cache.create_or_replace("/tmp/huge-cached.txt", &huge).await.unwrap();
+        cache.create_or_replace("/tmp/huge-cached.txt", &huge, PrincipalId::system()).await.unwrap();
 
         let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
 
@@ -1691,7 +1715,7 @@ mod tests {
 
         // Load, then dirty it with an unsaved edit.
         assert_eq!(cache.try_read_content(path).await.unwrap(), "disk-v1");
-        cache.create_or_replace(path, "unsaved-edit").await.unwrap();
+        cache.create_or_replace(path, "unsaved-edit", PrincipalId::system()).await.unwrap();
         cache.mark_dirty(path).unwrap();
         // No flush — this is the unsaved edit. Drop the in-memory entry
         // (simulating a restart) while the document and the durable

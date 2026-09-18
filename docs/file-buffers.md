@@ -8,6 +8,13 @@ Canonical for the file tools (`file_tools/cache.rs`), the tool surface they
 expose, and the editor's relationship to both. The editor's own design is
 `docs/vi.md`; this doc owns what sits underneath it.
 
+File writes and edits carry the invoking performer. A newly authored file
+uses that performer for its first block and document creator; replacing an
+existing buffer preserves its original block author and records the current
+performer in live mutation state. Hydration from disk uses the loader's
+principal. Hydration does not turn the player who later reads a file into its
+author. Durable per-edit provenance remains separate follow-up work.
+
 ## The incident this doc exists for
 
 On 2026-08-18 a context edited `docs/issues.md` and wrote back content from

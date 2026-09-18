@@ -577,7 +577,8 @@ impl BlockStore {
         }
     }
 
-    /// Create a document and its first block as ONE durable write.
+    /// Create a document and first block under `principal_id` atomically.
+    /// Hydration uses its loader principal; authored content uses its input actor.
     ///
     /// `create_document` then `insert_block` commit in two transactions: the
     /// documents row lands first, the op second. A failure between them — or
@@ -595,6 +596,7 @@ impl BlockStore {
     pub fn create_document_with_block(
         &self,
         context_id: ContextId,
+        principal_id: PrincipalId,
         kind: DocKind,
         language: Option<String>,
         role: Role,
@@ -612,7 +614,6 @@ impl BlockStore {
         match self.documents.entry(context_id) {
             Entry::Occupied(_) => return Err(BlockStoreError::DocumentAlreadyExists(context_id)),
             Entry::Vacant(vacant) => {
-                let principal_id = self.principal_id();
                 let mut entry = DocumentEntry::new(context_id, kind, language.clone(), principal_id);
                 entry.doc.set_principal_id(principal_id);
                 let block_id = entry.doc.insert_block(
@@ -7143,6 +7144,7 @@ mod tests {
         let block_id = store
             .create_document_with_block(
                 ctx,
+                PrincipalId::system(),
                 DocumentKind::File,
                 None,
                 Role::System,
@@ -7207,6 +7209,7 @@ mod tests {
         store
             .create_document_with_block(
                 ctx,
+                PrincipalId::system(),
                 DocumentKind::File,
                 Some("rust".to_string()),
                 Role::System,
@@ -7233,6 +7236,7 @@ mod tests {
         let make = |content: &str| {
             store.create_document_with_block(
                 ctx,
+                PrincipalId::system(),
                 DocumentKind::File,
                 None,
                 Role::System,
@@ -7266,6 +7270,7 @@ mod tests {
         store
             .create_document_with_block(
                 ctx,
+                PrincipalId::system(),
                 DocumentKind::File,
                 None,
                 Role::System,
@@ -7354,6 +7359,7 @@ mod tests {
         let err = store
             .create_document_with_block(
                 ctx,
+                PrincipalId::system(),
                 DocumentKind::File,
                 None,
                 Role::System,

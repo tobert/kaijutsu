@@ -356,6 +356,7 @@ fn file_spec<'a>(old: &'a Resolved, new: &'a Resolved) -> Result<FileSpec<'a>, S
 mod tests {
     use super::*;
     use crate::kj::test_helpers::{test_caller, test_dispatcher};
+    use kaijutsu_types::PrincipalId;
     use std::sync::Arc;
 
     fn args(argv: &[&str]) -> DiffArgs {
@@ -577,7 +578,7 @@ mod tests {
         // Never written to disk; created directly as a kernel document.
         let cache = dispatcher.kernel().file_cache().clone();
         cache
-            .create_or_replace("/mnt/diff/new.txt", "fresh\n")
+            .create_or_replace("/mnt/diff/new.txt", "fresh\n", PrincipalId::system())
             .await
             .expect("create the document");
 

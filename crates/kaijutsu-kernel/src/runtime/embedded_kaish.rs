@@ -298,12 +298,14 @@ impl EmbeddedKaish {
                 mount_table,
                 docs_backend.clone(),
                 file_cache,
+                identity.performer,
             ))
         } else {
             Arc::new(MountBackend::new(
                 mount_table,
                 docs_backend.clone(),
                 file_cache,
+                identity.performer,
             ))
         };
 

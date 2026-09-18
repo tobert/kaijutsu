@@ -199,6 +199,7 @@ mod tests {
     use crate::kj::{KjDispatcher, KjResult};
     use crate::vfs::backends::MemoryBackend;
     use crate::vfs::VfsOps;
+    use kaijutsu_types::PrincipalId;
 
     /// Every test here needs a plain-file VFS mount, which `test_dispatcher`
     /// doesn't provide by default (only `/config/rc` is mounted).
@@ -232,7 +233,7 @@ mod tests {
     /// `file_tools::cache`'s and `swap_filesystem`'s own tests).
     async fn dirty_then_go_cold(d: &KjDispatcher, path: &str, unsaved_content: &str) {
         let cache = d.kernel().file_cache();
-        cache.create_or_replace(path, unsaved_content).await.unwrap();
+        cache.create_or_replace(path, unsaved_content, PrincipalId::system()).await.unwrap();
         cache.mark_dirty(path).unwrap();
         cache.invalidate(path).unwrap();
     }
