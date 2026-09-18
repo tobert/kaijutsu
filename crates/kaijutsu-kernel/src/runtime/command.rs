@@ -1,6 +1,6 @@
 //! Execute contextual commands and settle their results through shared hooks.
 //!
-//! Callers choose an existing transcript pair or no transcript output. A
+//! Callers retain an admitted receipt or choose no transcript output. A
 //! transport may supply a context-switch callback and review notices.
 
 use std::sync::Arc;
@@ -81,11 +81,13 @@ impl Default for CommandRunOptions<'_> {
     }
 }
 
-/// Retain the outcome, then commit its complete block projection and receipt
-/// together. A pre-call ask supplies its pair owner so linkage joins that
-/// acceptance; result-review asks already have an owner. Failed projections
-/// retain their recovery marker; startup finishes them without execution.
-pub fn settle_outcome(
+/// Discover an existing pair's receipt for recovery and settle its outcome.
+/// Active invocations keep their admission receipt and use `settle_operation`.
+/// Retention precedes the atomic block projection and receipt update.
+/// A pre-call ask supplies its pair owner so linkage joins that acceptance;
+/// result-review asks already have an owner. Failed projections retain their
+/// recovery marker; startup finishes them without execution.
+pub(crate) fn settle_outcome(
     kernel: &Kernel,
     context_id: ContextId,
     command_block_id: &BlockId,
@@ -94,14 +96,23 @@ pub fn settle_outcome(
     ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
     let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
-    settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref())
+    settle_known_outcome(kernel, context_id, command_block_id, output_block_id, outcome, ask_owner, operation.as_ref().map(|state| &state.receipt))
 }
 
-pub(super) fn settle_known_outcome(
-    kernel: &Kernel, context_id: ContextId, command_block_id: &BlockId, output_block_id: &BlockId,
-    outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>, operation: Option<&crate::shell_operations::ShellOperationState>,
+/// Settle a command using the receipt retained from admission, without a lookup.
+pub(crate) fn settle_operation(
+    kernel: &Kernel, receipt: &crate::shell_operations::ShellOperationReceipt,
+    outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>,
 ) -> Result<(), String> {
-    if operation.is_some_and(|operation| operation.receipt.command_block_id != *command_block_id) {
+    settle_known_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id,
+        outcome, ask_owner, Some(receipt))
+}
+
+fn settle_known_outcome(
+    kernel: &Kernel, context_id: ContextId, command_block_id: &BlockId, output_block_id: &BlockId,
+    outcome: &CommandOutcome, ask_owner: Option<crate::PairOwner>, operation: Option<&crate::shell_operations::ShellOperationReceipt>,
+) -> Result<(), String> {
+    if operation.is_some_and(|operation| operation.command_block_id != *command_block_id) {
         return Err("shell operation command block does not match its receipt".into());
     }
     let status = outcome.block_status();
@@ -115,7 +126,7 @@ pub(super) fn settle_known_outcome(
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
-        if kernel.shell_operations().prepare_settlement(&operation.receipt.operation_id, outcome)? {
+        if kernel.shell_operations().prepare_settlement(&operation.operation_id, outcome)? {
             crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
         }
     }
@@ -146,7 +157,7 @@ pub(super) fn settle_known_outcome(
                 db.link_ask_blocks(ask, command_block_id, output_block_id, owner)?;
             }
             if let Some(operation) = &operation {
-                let id = &operation.receipt.operation_id;
+                let id = &operation.operation_id;
                 let result = if status == Status::Waiting {
                     crate::shell_operations::ShellOperationRegistry::mark_waiting_in(db, id, envelope.ask_id.as_deref().expect("validated waiting ask"))
                 } else {
@@ -163,7 +174,7 @@ pub(super) fn settle_known_outcome(
     if let Some(operation) = &operation
         && status != Status::Waiting
     {
-        kernel.shell_operations().finish_projection(&operation.receipt.operation_id)?;
+        kernel.shell_operations().finish_projection(&operation.operation_id)?;
     }
     if ask_owner.is_some() && envelope.ask_id.is_some() {
         crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
@@ -179,7 +190,7 @@ pub(crate) fn retry_retained_outcomes(kernel: &Kernel, limit: usize) -> Result<(
         let result = match &key {
             RetentionKey::Operation(id) => registry.operation_for_retention(id).and_then(|operation| {
                 let receipt = operation.receipt;
-                settle_outcome(kernel, receipt.context_id, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)
+                settle_operation(kernel, &receipt, &outcome, None)
             }),
             RetentionKey::Review(id) => registry.finish_result_review(id, &outcome).map(|changed| {
                 if changed { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
@@ -213,7 +224,7 @@ pub(crate) fn recover_settlements(kernel: &Kernel) -> Result<usize, String> {
             }
             kernel.shell_operations().finish_projection(&receipt.operation_id)?;
         } else {
-            settle_outcome(kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)?;
+            settle_operation(kernel, receipt, &outcome, None)?;
         }
     }
     Ok(pending.len())
@@ -282,72 +293,65 @@ async fn context_switched(
     }
 }
 
-/// Run `code` in `kaish` and fill the already-authored `command_block_id` /
-/// `output_block_id` pair with what it produced.
+/// Run `code` in `kaish` and fill the admitted receipt's authored pair.
 ///
-/// The pair must already exist. Hooks and durable shell state settle before
-/// projections publish completion. A persistence failure is returned explicitly.
-#[allow(clippy::too_many_arguments)]
+/// Keep the receipt from admission through settlement without reloading it.
+/// Hooks and durable shell state settle before projections publish completion.
+/// A persistence failure is returned explicitly.
 pub async fn run_into_blocks(
     kaish: &EmbeddedKaish,
     code: &str,
-    context_id: ContextId,
-    command_block_id: &BlockId,
-    output_block_id: &BlockId,
+    receipt: &crate::shell_operations::ShellOperationReceipt,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
     mut run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
     // Let other accepted work make progress before entering the interpreter.
     tokio::task::yield_now().await;
-
+    let context = receipt.context_id;
     let mut options = kaish_kernel::ExecuteOptions::default();
     options.cancel_token = run.cancel.clone();
-    if let Some(stdin) = run.stdin.take() {
-        options = options.with_stdin(stdin);
-    }
-    let operation = kernel.shell_operations().get_by_output(output_block_id, context_id)?;
-    let tracked_job = match &operation {
-        Some(operation) => {
-            let manager = kernel.context_job_manager(context_id);
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            let job = manager.register(code.to_owned(), receiver).await;
-            let cancel = run.cancel.clone().unwrap_or_default();
-            manager.set_cancel_token(job, cancel.clone()).await;
-            options.cancel_token = Some(cancel);
-            if let Err(error) = kernel.shell_operations().attach_job(&operation.receipt.operation_id, job, manager.clone()) {
-                let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
-                outcome.settlement_error = Some(error);
-                let failure = outcome.exec_result();
-                let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, &outcome, None);
-                manager.finalize_streams(job, &failure).await;
-                let _ = sender.send(failure);
-                return settled.map(|()| outcome);
-            }
-            Some((manager, job, sender))
+    if let Some(stdin) = run.stdin.take() { options = options.with_stdin(stdin); }
+    let manager = kernel.context_job_manager(context);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let job = manager.register(code.to_owned(), receiver).await;
+    let cancel = run.cancel.clone().unwrap_or_default();
+    manager.set_cancel_token(job, cancel.clone()).await;
+    options.cancel_token = Some(cancel);
+    let prepared = async {
+        kernel.shell_operations().attach_job(&receipt.operation_id, job, manager.clone())?;
+        if call_ctx.context_id != context {
+            return Err("command invocation context does not match its admission receipt".to_string());
         }
-        None => None,
+        if matches!(run.job_output, CommandJobOutput::LiveExecution) {
+            Ok(Some(manager.streams(job).await.ok_or("tracked command lost its output streams")?))
+        } else { Ok(None) }
+    }.await;
+    let streams = match prepared {
+        Ok(streams) => streams,
+        Err(error) => {
+            let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
+            outcome.settlement_error = Some(error);
+            let failure = outcome.exec_result();
+            let settled = settle_operation(kernel, receipt, &outcome, None);
+            manager.finalize_streams(job, &failure).await;
+            let _ = sender.send(failure);
+            return settled.map(|()| outcome);
+        }
     };
-
-    let streams = if matches!(run.job_output, CommandJobOutput::LiveExecution) {
-        let (manager, job, _) = tracked_job.as_ref().ok_or("live command output requires a tracked job")?;
-        Some(manager.streams(*job).await.ok_or("tracked command lost its output streams")?)
-    } else { None };
     if let Some(ready) = run.job_ready.take() { let _ = ready.send(()); }
     let job_output = run.job_output;
-    let attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
-        Some((*command_block_id, *output_block_id)), operation, options, run, streams).await;
+    let attempt = capture_and_review(kaish, code, kernel, context, call_ctx,
+        Some(receipt.clone()), options, run, streams).await;
     let outcome = &attempt.outcome;
     let settled = attempt.review.settle(outcome);
-    if let Some((manager, job, sender)) = tracked_job {
-        let result = outcome.exec_result();
-        let streams_result = match job_output {
-            CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
-            CommandJobOutput::Settled => result.clone(),
-        };
-        manager.finalize_streams(job, &streams_result).await;
-        let _ = sender.send(result);
-    }
+    let result = outcome.exec_result();
+    let streams_result = match job_output {
+        CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
+        CommandJobOutput::Settled => result.clone(),
+    };
+    manager.finalize_streams(job, &streams_result).await;
+    let _ = sender.send(result);
     attempt.finish(settled)
 }
 
@@ -364,7 +368,7 @@ pub async fn run_without_blocks(
     if let Some(stdin) = run.stdin.take() { options = options.with_stdin(stdin); }
     if let Some(cancel) = run.cancel.clone() { options.cancel_token = Some(cancel); }
     let attempt = capture_and_review(kaish, code, kernel, call_ctx.context_id, call_ctx,
-        None, None, options, run, None).await;
+        None, options, run, None).await;
     let settled = attempt.review.settle(&attempt.outcome);
     attempt.finish(settled)
 }
@@ -391,8 +395,8 @@ impl CommandAttempt {
 #[allow(clippy::too_many_arguments)]
 async fn capture_and_review(
     kaish: &EmbeddedKaish, code: &str, kernel: &Arc<Kernel>, context: ContextId,
-    call: &crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
-    operation: Option<crate::shell_operations::ShellOperationState>,
+    call: &crate::mcp::CallContext,
+    receipt: Option<crate::shell_operations::ShellOperationReceipt>,
     options: kaish_kernel::ExecuteOptions, run: CommandRunOptions<'_>,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
 ) -> CommandAttempt {
@@ -417,7 +421,7 @@ async fn capture_and_review(
         }
     };
     let review = super::result_review::CommandResultReview::new(kernel.clone(), call.clone(),
-        pair, operation, outcome.clone(), cancel, run.review_notices);
+        receipt, outcome.clone(), cancel, run.review_notices);
     if panic.is_none() {
         match std::panic::AssertUnwindSafe(Box::pin(finish_result_hooks(&mut outcome, code, kernel, call, run.hooks, &review)))
             .catch_unwind().await {
@@ -626,7 +630,7 @@ mod fill_tests {
                 });
             }
             let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
-            let panic = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, code, ctx, &command, &output,
+            let panic = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, code, &receipt,
                 &kernel, &call, CommandRunOptions { job_output: CommandJobOutput::LiveExecution, ..Default::default() }))
                 .catch_unwind().await.expect_err("settlement must not swallow the panic");
             assert_eq!(panic.downcast_ref::<&str>().copied(), Some(if during_hook { "hook panic sentinel" } else { "execution panic sentinel" }));
@@ -669,7 +673,7 @@ mod fill_tests {
                 panic!("state publication panic sentinel");
             })
         };
-        let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "echo captured", ctx, &command, &output,
+        let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "echo captured", &receipt,
             &kernel, &call, CommandRunOptions { context_switch: CommandContextSwitch::Publish(Some(&publish)), ..Default::default() }))
             .catch_unwind().await;
         assert!(result.is_err());
@@ -700,10 +704,55 @@ mod fill_tests {
         let output = kernel.blocks().insert_tool_result(ctx, &command, Some(&command), "", false, None, None).unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let outcome = run_into_blocks(&kaish, "echo should-not-run", ctx, &command, &output,
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            command, output, "echo should-not-run", None).unwrap();
+        let outcome = run_into_blocks(&kaish, "echo should-not-run", &receipt,
             &kernel, &call, CommandRunOptions { cancel: Some(cancel), ..Default::default() }).await.unwrap();
-        assert!(matches!(outcome.execution, CommandExecution::NotRun), "a pair without a receipt must still honor cancellation");
+        assert!(matches!(outcome.execution, CommandExecution::NotRun), "an admitted command must still honor cancellation");
         assert_eq!(kernel.blocks().get_block_snapshot(ctx, &output).unwrap().unwrap().status, Status::Error);
+    }
+
+    #[tokio::test]
+    async fn execution_setup_faults_settle_admission_and_job_without_running_source() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for fault in ["context", "attachment"] {
+            let kernel = Arc::new(Kernel::new_ephemeral("execution-setup-fault").await);
+            let context = ContextId::new();
+            let documents = kernel.blocks();
+            documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let source = "export SHOULD_NOT_RUN=yes";
+            let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
+                notify: false, context, principal: PrincipalId::system(), actor: PrincipalId::system(), source,
+                tool: "shell", input: serde_json::json!({"code": source}), kind: kaijutsu_types::ToolKind::Shell,
+                role: kaijutsu_types::Role::User, excluded: false, status: Status::Running, ask: None,
+            }).unwrap();
+            let kaish = EmbeddedKaish::new("execution-setup-fault", documents.clone(), kernel.clone(), None).unwrap();
+            kaish.set_context_id(context);
+            let call = crate::mcp::CallContext::new(PrincipalId::system(),
+                if fault == "context" { ContextId::new() } else { context }, kaijutsu_types::SessionId::new(), kernel.id());
+            if fault == "attachment" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "CREATE TRIGGER fail_job_attachment BEFORE UPDATE OF job_id ON shell_operations BEGIN SELECT RAISE(ABORT, 'injected job attachment fault'); END;"
+                ).unwrap();
+            }
+            kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })).unwrap();
+            let outcome = run_into_blocks(&kaish, source, &receipt, &kernel, &call, CommandRunOptions::default()).await.unwrap();
+            assert!(matches!(outcome.execution, CommandExecution::NotRun));
+            assert!(outcome.settlement_error.as_deref().unwrap().contains(
+                if fault == "context" { "context does not match" } else { "injected job attachment fault" }));
+            assert!(kaish.get_var("SHOULD_NOT_RUN").await.is_none());
+            let jobs = kernel.context_job_manager(context);
+            let job = jobs.list().await.into_iter().next().unwrap();
+            assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), jobs.wait(job.id)).await.unwrap().unwrap(), outcome.exec_result());
+            let streams = jobs.streams(job.id).await.unwrap();
+            assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
+            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
+            assert_eq!(documents.get_block_snapshot(context, &receipt.output_block_id).unwrap().unwrap().status, Status::Error);
+        }
     }
 
     struct PausedHook {
@@ -731,6 +780,8 @@ mod fill_tests {
             documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
             let command = documents.insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None).unwrap();
             let output = documents.insert_tool_result(ctx, &command, Some(&command), "waiting", false, None, None).unwrap();
+            let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+                command, output, code, None).unwrap();
             for block in [&command, &output] { documents.set_status(ctx, block, Status::Running).unwrap(); }
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Notify::new());
@@ -750,7 +801,7 @@ mod fill_tests {
             kaish.set_context_id(ctx);
             let call_ctx = crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
-            let run = run_into_blocks(&kaish, code, ctx, &command, &output,
+            let run = run_into_blocks(&kaish, code, &receipt,
                 &kernel, &call_ctx, CommandRunOptions::default());
             let observe = async {
                 tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()).await.unwrap();
@@ -886,7 +937,7 @@ mod fill_tests {
                 }) }),
             });
             let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
-            let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "counted-capture", context, &command, &output, &kernel, &call,
+            let result = std::panic::AssertUnwindSafe(run_into_blocks(&kaish, "counted-capture", &receipt, &kernel, &call,
                 CommandRunOptions { cancel: Some(cancel), ..Default::default() })).catch_unwind().await;
             if panic { assert_eq!(result.unwrap_err().downcast_ref::<&str>().copied(), Some("interrupted storage sentinel")); }
             else { assert!(result.unwrap().is_err(), "settlement must report the injected storage fault"); }
@@ -929,7 +980,7 @@ mod fill_tests {
             "CREATE TRIGGER fail_retention BEFORE INSERT ON shell_operation_outcomes BEGIN SELECT RAISE(ABORT, 'injected retention fault'); END;"
         ).unwrap();
         let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
-        assert!(run_into_blocks(&kaish, "counted-capture", context, &command, &output, &kernel, &call,
+        assert!(run_into_blocks(&kaish, "counted-capture", &receipt, &kernel, &call,
             CommandRunOptions::default()).await.unwrap_err().contains("injected retention fault"));
         assert!(kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().is_none());
         kernel.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_retention").unwrap();
@@ -969,7 +1020,7 @@ mod fill_tests {
                 crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
                 super::super::embedded_kaish::OutputProfile::Internal, |_, _, _| {}).unwrap();
             let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
-            let error = run_into_blocks(&kaish, &code, context, &command, &output, &kernel, &call,
+            let error = run_into_blocks(&kaish, &code, &receipt, &kernel, &call,
                 CommandRunOptions::default()).await.unwrap_err();
             assert!(error.contains("injected projection failure"), "{error}");
             let outcome = kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap();
@@ -1018,7 +1069,7 @@ mod fill_tests {
         });
         let kaish = EmbeddedKaish::new("replacement-projections", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ctx);
-        run_into_blocks(&kaish, "echo warning >&2; false", ctx, &command, &output,
+        run_into_blocks(&kaish, "echo warning >&2; false", &receipt,
             &kernel,
             &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
         let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
@@ -1060,7 +1111,7 @@ mod fill_tests {
                 command, output, &code, None).unwrap();
             let kaish = EmbeddedKaish::new("real-exit", documents.clone(), kernel.clone(), None).unwrap();
             kaish.set_context_id(ctx);
-            run_into_blocks(&kaish, &code, ctx, &command, &output,
+            run_into_blocks(&kaish, &code, &receipt,
                 &kernel,
                 &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
             let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
@@ -1384,7 +1435,7 @@ mod fill_tests {
             command, output, "echo '", None).unwrap();
         let kaish = EmbeddedKaish::new("rejected-command", documents.clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(ctx);
-        run_into_blocks(&kaish, "echo '", ctx, &command, &output, &kernel,
+        run_into_blocks(&kaish, "echo '", &receipt, &kernel,
             &crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id()), CommandRunOptions::default()).await.unwrap();
         let block = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
         assert_eq!(block.status, Status::Error);
@@ -1418,6 +1469,8 @@ mod fill_tests {
             .insert_tool_result(ctx, &call, Some(&call), placeholder, true, None, None)
             .unwrap();
         documents.set_status(ctx, &result, Status::Waiting).unwrap();
+        let receipt = kernel.shell_operations().register(ctx, PrincipalId::system(), PrincipalId::system(),
+            call, result, "echo replaced", None).unwrap();
 
         let kaish = EmbeddedKaish::new("fill-waiting", documents.clone(), kernel.clone(), None)
             .expect("EmbeddedKaish::new failed");
@@ -1425,9 +1478,7 @@ mod fill_tests {
         run_into_blocks(
             &kaish,
             "echo replaced",
-            ctx,
-            &call,
-            &result,
+            &receipt,
             &kernel,
             &crate::mcp::CallContext::new(
                 PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id(),

@@ -2324,6 +2324,23 @@ write transaction, and an abandonment-loop concern contradicted by the wait's
 terminal return. The review disposition records both checks. Workspace
 all-targets checking also passed.
 
+Admission receipts now stay with interactive, structured, tool and approval
+execution through preparation, refusal, capture and settlement. The regression
+first left an admitted interactive pair Running when a pre-call hook refused
+receipt-source reads. Passing the receipt removes that lookup and the runner's
+optional unregistered-pair branch. Result review derives its pair from the same
+receipt; recovery alone discovers an owner when no live invocation remains.
+Linked approvals resolve their receipt before claiming the answer, under the
+same DB guard as context validation and redemption. Read failure leaves the
+answer available for retry. Execution setup faults retain NotRun, finalize
+job streams and deliver the job result without entering the interpreter.
+Validation passed 3,197 kernel tests (6 ignored), 42 real SSH/RPC tests, and
+workspace all-targets checking. DeepSeek's follow-up concerns were checked
+against kaish's job retention, handoff retirement and immutable terminal retry
+ownership; none established an additional defect. The private review archive
+records that disposition. Abrupt worker destruction and the full caller
+inventory remain open.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

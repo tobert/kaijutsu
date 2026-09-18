@@ -192,8 +192,11 @@ interrupted outcome in memory. Settlement uses the admitted receipt, so read
 faults cannot prevent handing capture to retention or completing the job.
 Terminal retention now closes linked pending/claimed result asks atomically;
 ask-update or audit-event failure retains the same result for retry. Existing
-decisions stay intact, and successful retry announces closure. Receipt lookup
-during preparation/refusal settlement still needs explicit disposition. Job results now preserve the captured outcome
+decisions stay intact, and successful retry announces closure. Interactive,
+structured, tool and approval callers now retain admission receipts through
+preparation/refusal and execution entry. Linked approval receipt reads precede
+claiming the answer under the same DB guard; read faults defer the claim.
+Job results now preserve the captured outcome
 when projection fails; they agree with retained and committed receipts. The
 persistence error remains separate, and an unfinished operation still needs
 projection recovery even when its job has finished.
@@ -259,8 +262,11 @@ repeat an already written seed. Denied/cancelled pair failures now retain the
 answer, and model refusal notifications consume it atomically with their block.
 Claimed approvals now retain completion ownership through notification failures;
 source is never replayed to recover a message. Continue the live terminal-result
-audit for abrupt worker destruction and preparation/refusal lookup disposition. Session
-refusals settle before a separate redemption; a retry can re-emit the same pair's
+audit for abrupt worker destruction and remaining job/controller lifetimes.
+Include submission factories: both worker receive/drain loops evaluate
+`work(stop)` before spawning its future. A synchronous factory panic appears
+able to unwind the supervisor; add a regression to check settlement of sibling
+commands before changing that boundary. Session refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
 settling them. Periodic scans now drain larger backlogs; the four-item cap still
 counts delivery, not provider requests. Separate delivery throughput from

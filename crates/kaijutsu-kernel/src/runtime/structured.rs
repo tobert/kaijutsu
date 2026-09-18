@@ -79,29 +79,29 @@ async fn run_kj(
     if documents.get(context).is_none() { return Err(format!("context {context} is not materialized")); }
     let mut code = String::from("kj");
     for arg in argv { code.push(' '); code.push_str(&kaish_quote(arg)); }
-    let pair = if quiet { None } else {
+    let receipt = if quiet { None } else {
         let receipt = documents.start_shell_operation(crate::shell_operations::ShellOperationStart {
             notify: false,
             context, principal: identity.requester, actor: identity.performer, source: &code,
             tool: "kj", input: serde_json::json!({"argv": argv}), kind: ToolKind::Builtin,
             role: Role::User, excluded: false, status: kaijutsu_types::Status::Running, ask: None,
         }).map_err(|error| error.to_string())?;
-        Some((receipt.command_block_id, receipt.output_block_id))
+        Some(receipt)
     };
     let mut call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
         .with_actor(identity.performer, identity.reviewer);
-    call_ctx.publishes_pair = pair.is_some();
+    call_ctx.publishes_pair = receipt.is_some();
     let verdict = tokio::select! {
         biased;
         _ = stop.cancelled() => {
             let reason = "kernel runtime shut down before structured execution";
-            settle_unrun(kernel, context, pair, reason)?;
+            settle_unrun(kernel, receipt.as_ref(), reason)?;
             return Err(reason.into());
         },
         result = std::panic::AssertUnwindSafe(kernel.broker().shell_pre_call_hooks(&code, &call_ctx)).catch_unwind() => match result {
             Ok(verdict) => verdict,
             Err(panic) => {
-                if let Err(error) = settle_unrun(kernel, context, pair, "Structured pre-call hook panicked; source was not run.") {
+                if let Err(error) = settle_unrun(kernel, receipt.as_ref(), "Structured pre-call hook panicked; source was not run.") {
                     tracing::error!("could not settle structured pre-call panic: {error}");
                 }
                 std::panic::resume_unwind(panic);
@@ -109,8 +109,8 @@ async fn run_kj(
         },
     };
     let outcome = match verdict {
-        crate::mcp::ShellHookVerdict::Proceed => match pair {
-            Some((command, output)) => command::run_into_blocks(&kaish, &code, context, &command, &output,
+        crate::mcp::ShellHookVerdict::Proceed => match &receipt {
+            Some(receipt) => command::run_into_blocks(&kaish, &code, receipt,
                 kernel, &call_ctx, CommandRunOptions { stdin: None,
                     context_switch: CommandContextSwitch::Pinned, review_notices: Some(notices),
                     cancel: Some(stop), ..Default::default() }).await?,
@@ -122,8 +122,8 @@ async fn run_kj(
         verdict => {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
             outcome.apply_hook(verdict);
-            if let Some((command, output)) = pair {
-                command::settle_outcome(kernel, context, &command, &output, &outcome, Some(crate::PairOwner::Session))?;
+            if let Some(receipt) = &receipt {
+                command::settle_operation(kernel, receipt, &outcome, Some(crate::PairOwner::Session))?;
             }
             outcome
         }
@@ -136,20 +136,19 @@ async fn run_kj(
     let stdout = crate::ansi_ingest::project(&raw).map_or_else(|| result.text_out().into_owned(), |p| p.text);
     Ok(Ok(ExecutedKj {
         exit_code: result.code.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-        stdout, stderr: result.err.clone(), command_block_id: pair.map(|(command, _)| command),
+        stdout, stderr: result.err.clone(), command_block_id: receipt.map(|receipt| receipt.command_block_id),
         latch: super::kj_builtin::latch_from_result(&result),
         data: outcome.output_data().and_then(|output| output.rich_json),
     }))
 }
 
 fn settle_unrun(
-    kernel: &Kernel, context: kaijutsu_types::ContextId,
-    pair: Option<(BlockId, BlockId)>, reason: &str,
+    kernel: &Kernel, receipt: Option<&crate::shell_operations::ShellOperationReceipt>, reason: &str,
 ) -> Result<(), String> {
-    if let Some((command, output)) = pair {
+    if let Some(receipt) = receipt {
         let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
         outcome.settlement_error = Some(reason.into());
-        command::settle_outcome(kernel, context, &command, &output, &outcome, None)?;
+        command::settle_operation(kernel, receipt, &outcome, None)?;
     }
     Ok(())
 }

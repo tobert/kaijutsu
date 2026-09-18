@@ -166,23 +166,19 @@ async fn seed_ask_env(
 /// the shape a refused `shellExecute` already uses, so a human reading the
 /// conversation sees why nothing ran in the place the command would have
 /// printed.
-fn settle_pair_error(
+fn settle_operation_error(
     kernel: &Arc<Kernel>,
-    context_id: ContextId,
-    command_block_id: &BlockId,
-    output_block_id: &BlockId,
+    receipt: &crate::shell_operations::ShellOperationReceipt,
     reason: String,
 ) -> Result<(), String> {
     let mut outcome = crate::runtime::command_outcome::CommandOutcome::new(
         crate::runtime::command_outcome::CommandExecution::NotRun, 0);
     outcome.settlement_error = Some(reason);
-    crate::runtime::command::settle_outcome(
-        kernel, context_id, command_block_id, output_block_id, &outcome, None,
-    )?;
+    crate::runtime::command::settle_operation(kernel, receipt, &outcome, None)?;
     // The pair may already be cached from an earlier turn as `Waiting`;
     // this settles it in place, so the next turn must hydrate cold to see
     // it (see `crate::runtime::turn_state::ConversationCache::evict`).
-    kernel.turns().conversations().evict(context_id);
+    kernel.turns().conversations().evict(receipt.context_id);
     Ok(())
 }
 
@@ -239,7 +235,7 @@ struct ApprovalPreparation<'a> {
     kernel: &'a Arc<Kernel>,
     context: ContextId,
     actor: PrincipalId,
-    pair: Option<(BlockId, BlockId)>,
+    receipt: Option<crate::shell_operations::ShellOperationReceipt>,
     armed: bool,
 }
 
@@ -247,8 +243,8 @@ impl Drop for ApprovalPreparation<'_> {
     fn drop(&mut self) {
         if !self.armed || !std::thread::panicking() { return; }
         let reason = "Approved action preparation panicked; nothing was run. The approval is spent.";
-        if let Some((command, output)) = self.pair {
-            if let Err(error) = settle_pair_error(self.kernel, self.context, &command, &output, reason.into()) {
+        if let Some(receipt) = &self.receipt {
+            if let Err(error) = settle_operation_error(self.kernel, receipt, reason.into()) {
                 tracing::error!(%error, "could not persist approved preparation panic");
             }
         } else {
@@ -297,7 +293,7 @@ async fn act_on_executable_answer(
     let source = ask.source.as_str();
     // Linkage may have completed since the delivery scan. Read it with context
     // state and claim under one guard; never spend an answer using a stale pair.
-    let (linked, claim) = {
+    let (linked, receipt, claim) = {
         let db = kernel.kernel_db().lock();
         match db.approval_pair_ready(&answer.request_id) {
             Ok(true) => {}
@@ -320,6 +316,16 @@ async fn act_on_executable_answer(
                 tracing::error!(ask = %answer.request_id, %error, "invalid approval linkage; retaining the answer");
                 return ExecAction::Deferred;
             }
+        };
+        let receipt = match linked {
+            Some((command, output, _)) => match crate::shell_operations::ShellOperationRegistry::receipt_for_pair_in(&db, context_id, &command, &output) {
+                Ok(Some(receipt)) => Some(receipt),
+                result => {
+                    tracing::error!(ask = %answer.request_id, ?result, "could not read approval execution owner; retaining the answer");
+                    return ExecAction::Deferred;
+                }
+            },
+            None => None,
         };
         let claim = if matches!(answer.status, crate::ApprovalStatus::Allowed) {
             match db.get_context(context_id) {
@@ -346,17 +352,17 @@ async fn act_on_executable_answer(
                 }
             }
         } else { None };
-        (linked, claim)
+        (linked, receipt, claim)
     };
 
     // A denial runs nothing. A connected session sees its settled pair
     // directly. A model turn does not: its cached mailbox cannot observe an
     // in-place edit, so it also receives an explicit no-run seed.
     if !matches!(answer.status, crate::ApprovalStatus::Allowed) {
-        let Some((command_block_id, output_block_id, owner)) = linked else {
+        let Some((_, output_block_id, owner)) = linked else {
             return ExecAction::FallThrough;
         };
-        if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id, ask.denial.clone()) {
+        if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), ask.denial.clone()) {
             tracing::error!(ask = %answer.request_id, %error, "refusal settlement failed; retaining the answer");
             return ExecAction::Deferred;
         }
@@ -395,8 +401,8 @@ async fn act_on_executable_answer(
 
     if performer_changed {
         let reason = "The context's performer changed after this ask was raised; nothing was run.".to_string();
-        if let Some((command, output, _)) = linked {
-            if let Err(error) = settle_pair_error(kernel, context_id, &command, &output, reason.clone()) {
+        if let Some((_, output, _)) = linked {
+            if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"), reason.clone()) {
                 return ExecAction::Tell(format!("{reason} Its result could not be persisted: {error}. Inspect block {}.", output.to_key()));
             }
         }
@@ -406,7 +412,7 @@ async fn act_on_executable_answer(
 
     let mut preparation = ApprovalPreparation {
         kernel, context: context_id, actor: ask.actor,
-        pair: linked.map(|(command, output, _)| (command, output)), armed: true,
+        receipt: receipt.clone(), armed: true,
     };
 
     // A synthetic session: the seat that raised this ask is gone (its turn
@@ -437,8 +443,8 @@ async fn act_on_executable_answer(
                  approval is spent and nothing ran",
                 answer.request_id
             );
-            if let Some((command_block_id, output_block_id, _owner)) = linked {
-                if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id,
+            if let Some((_, output_block_id, _owner)) = linked {
+                if let Err(error) = settle_operation_error(kernel, receipt.as_ref().expect("linked ask has a receipt"),
                     format!("approved, but no shell could be built to run it: {e}")) {
                     return ExecAction::Tell(format!("The approved action did not run because no shell could be built: {e}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
                 }
@@ -460,10 +466,8 @@ async fn act_on_executable_answer(
     // (`PairOwner::Turn`). A connected session's linked pair
     // (`PairOwner::Session`) watches its own blocks, so a fill tells
     // nobody.
-    let (command_block_id, output_block_id, tell) = match linked {
-        Some((command_block_id, output_block_id, owner)) => {
-            (command_block_id, output_block_id, matches!(owner, crate::PairOwner::Turn))
-        }
+    let (receipt, tell) = match receipt {
+        Some(receipt) => (receipt, matches!(linked, Some((_, _, crate::PairOwner::Turn)))),
         None => match kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
             notify: false,
             context: context_id, principal: principal_id, actor: ask.actor, source,
@@ -471,7 +475,7 @@ async fn act_on_executable_answer(
             role: kaijutsu_types::Role::Model, excluded: false, status: Status::Running,
             ask: Some((&answer.request_id, crate::PairOwner::Turn)),
         }) {
-            Ok(receipt) => (receipt.command_block_id, receipt.output_block_id, true),
+            Ok(receipt) => (receipt, true),
             Err(e) => {
                 tracing::error!(
                     "gate-resume: could not author blocks for ask {} ({e}); the approval \
@@ -485,13 +489,14 @@ async fn act_on_executable_answer(
             }
         },
     };
-    preparation.pair = Some((command_block_id, output_block_id));
+    let output_block_id = receipt.output_block_id;
+    preparation.receipt = Some(receipt.clone());
 
     // Restore captured inputs before execution. Cancellation after redemption
     // spends the approval but settles its pair without running the source.
     if let Err(why) = prepare_while_running(stop, seed_ask_env(&kaish, &answer.request_id, kernel)).await {
         let reason = format!("approved, but not run: {why}");
-        if let Err(error) = settle_pair_error(kernel, context_id, &command_block_id, &output_block_id, reason.clone()) {
+        if let Err(error) = settle_operation_error(kernel, &receipt, reason.clone()) {
             return ExecAction::Tell(format!("{reason}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
         }
         return if tell {
@@ -516,9 +521,7 @@ async fn act_on_executable_answer(
     if let Err(error) = crate::runtime::command::run_into_blocks(
         &kaish,
         source,
-        context_id,
-        &command_block_id,
-        &output_block_id,
+        &receipt,
         kernel,
         &crate::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id())
             .with_actor(ask.actor, Some(ask.reviewer)),
@@ -1532,10 +1535,14 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
-    async fn unreadable_context_preserves_approval_and_pair_for_retry() {
+    async fn unreadable_preparation_preserves_approval_and_pair_for_retry() {
         use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
         use approval_ledger::{ask::create_ask, decide::{decide, Answerer, DecideInput}, types::{NewAsk, Origin}};
-        for owner in [Some(crate::PairOwner::Turn), Some(crate::PairOwner::Session), None] {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        for (fault, owner) in [
+            ("context", Some(crate::PairOwner::Turn)), ("context", Some(crate::PairOwner::Session)), ("context", None),
+            ("receipt", Some(crate::PairOwner::Turn)), ("receipt", Some(crate::PairOwner::Session)),
+        ] {
             let dispatcher = Arc::new(test_dispatcher_persistent().await);
             dispatcher.set_self_arc();
             let kernel = dispatcher.kernel().clone();
@@ -1572,12 +1579,19 @@ mod lifetime_tests {
             let ask = ExecutableAsk { source: "echo approved-once".into(), stdin: None, cwd: None,
                 actor, reviewer, denial: "not denied".into() };
             let before = kernel.blocks().block_snapshots(context).unwrap();
-            kernel.kernel_db().lock().conn_for_ledger().execute_batch(
-                "ALTER TABLE contexts RENAME TO unavailable_contexts"
-            ).unwrap();
+            if fault == "context" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "ALTER TABLE contexts RENAME TO unavailable_contexts"
+                ).unwrap();
+            } else {
+                kernel.kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                    AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
+                    _ => Authorization::Allow,
+                })).unwrap();
+            }
             let stop = tokio_util::sync::CancellationToken::new();
             let action = act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
-            assert!(matches!(action, ExecAction::Deferred), "{owner:?}: an unreadable context is not reassignment or archive");
+            assert!(matches!(action, ExecAction::Deferred), "{owner:?}/{fault}: a read failure must defer the claim");
             let after = kernel.blocks().block_snapshots(context).unwrap();
             assert_eq!(after.len(), before.len());
             for (before, after) in before.iter().zip(after.iter()) {
@@ -1587,9 +1601,15 @@ mod lifetime_tests {
             }
             assert!(kernel.kernel_db().lock().undelivered_answers().unwrap().iter()
                 .any(|a| a.request_id == answer.request_id), "read failure must not consume approval");
-            kernel.kernel_db().lock().conn_for_ledger().execute_batch(
-                "ALTER TABLE unavailable_contexts RENAME TO contexts"
-            ).unwrap();
+            assert!(approval_ledger::ask::redeemed_at(kernel.kernel_db().lock().conn_for_ledger(), &answer.request_id).unwrap().is_none(),
+                "{owner:?}/{fault}: preparation must retain a redeemable answer");
+            if fault == "context" {
+                kernel.kernel_db().lock().conn_for_ledger().execute_batch(
+                    "ALTER TABLE unavailable_contexts RENAME TO contexts"
+                ).unwrap();
+            } else {
+                kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            }
             let retried = act_on_executable_answer(&kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
             assert!(matches!(retried, ExecAction::Tell(_) | ExecAction::Settled));
             let completed = kernel.blocks().block_snapshots(context).unwrap();
@@ -1699,12 +1719,13 @@ mod lifetime_tests {
         let actor = PrincipalId::new();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let owned = test_pair(&kernel, context, actor, "echo approved");
+        let receipt = kernel.shell_operations().get_by_output(&owned.1, context).unwrap().unwrap().receipt;
         let other = test_pair(&kernel, context, actor, "echo unrelated");
         let snapshot = |id: &BlockId| kernel.blocks().get_block_snapshot(context, id).unwrap().unwrap();
         let before = snapshot(&other.1);
         let panic = std::panic::AssertUnwindSafe(async {
             let _preparation = ApprovalPreparation {
-                kernel: &kernel, context, actor, pair: Some(owned), armed: true,
+                kernel: &kernel, context, actor, receipt: Some(receipt), armed: true,
             };
             tokio::task::yield_now().await;
             panic!("preparation panic sentinel");
@@ -1726,7 +1747,7 @@ mod lifetime_tests {
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _preparation = ApprovalPreparation {
-                kernel: &kernel, context, actor, pair: None, armed: true,
+                kernel: &kernel, context, actor, receipt: None, armed: true,
             };
             panic!("unlinked preparation panic");
         })).is_err());
@@ -1744,10 +1765,11 @@ mod lifetime_tests {
         let actor = PrincipalId::new();
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         let pair = test_pair(&kernel, context, actor, "echo captured");
+        let receipt = kernel.shell_operations().get_by_output(&pair.1, context).unwrap().unwrap().receipt;
         kernel.blocks().set_status(context, &pair.1, Status::Done).unwrap();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut preparation = ApprovalPreparation {
-                kernel: &kernel, context, actor, pair: Some(pair), armed: true,
+                kernel: &kernel, context, actor, receipt: Some(receipt), armed: true,
             };
             preparation.armed = false;
             panic!("command capture owns this panic");

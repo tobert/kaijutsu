@@ -10,9 +10,8 @@ pub(super) struct CommandResultReview {
     pub kernel: Arc<crate::Kernel>,
     pub review_id: String,
     pub call: crate::mcp::CallContext,
-    pub pair: Option<(BlockId, BlockId)>,
     pub captured: CommandOutcome,
-    operation: Option<crate::shell_operations::ShellOperationState>,
+    receipt: Option<crate::shell_operations::ShellOperationReceipt>,
     interrupted: parking_lot::Mutex<Option<CommandOutcome>>,
     pub cancel: tokio_util::sync::CancellationToken,
     pub notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
@@ -40,12 +39,10 @@ impl Drop for ReviewGuard<'_> {
 impl crate::mcp::broker::ResultReview for CommandResultReview {
     fn record_ask(&self, conn: &rusqlite::Connection, request: &str) -> crate::kernel_db::KernelDbResult<()> {
         use crate::kernel_db::KernelDbError;
-        let operation = match (self.pair, &self.operation) {
-            (Some((command, output)), Some(operation))
-                if operation.receipt.context_id == self.call.context_id
-                    && operation.receipt.command_block_id == command && operation.receipt.output_block_id == output => Some(operation.receipt.operation_id.as_str()),
-            (None, None) => None,
-            _ => return Err(KernelDbError::Validation("result review pair has no matching admission receipt".into())),
+        let operation = match &self.receipt {
+            Some(receipt) if receipt.context_id == self.call.context_id => Some(receipt.operation_id.as_str()),
+            None => None,
+            _ => return Err(KernelDbError::Validation("result review context does not match its admission receipt".into())),
         };
         crate::shell_operations::ShellOperationRegistry::checkpoint_result_review_in(
             conn, &self.review_id, operation, &self.call, &self.waiting_outcome(request))
@@ -61,22 +58,26 @@ impl crate::mcp::broker::ResultReview for CommandResultReview {
 
 impl CommandResultReview {
     pub(super) fn new(
-        kernel: Arc<crate::Kernel>, call: crate::mcp::CallContext, pair: Option<(BlockId, BlockId)>,
-        operation: Option<crate::shell_operations::ShellOperationState>,
+        kernel: Arc<crate::Kernel>, call: crate::mcp::CallContext,
+        receipt: Option<crate::shell_operations::ShellOperationReceipt>,
         captured: CommandOutcome, cancel: tokio_util::sync::CancellationToken,
         notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
     ) -> Self {
-        Self { kernel, review_id: uuid::Uuid::now_v7().to_string(), call, pair, captured, operation,
+        Self { kernel, review_id: uuid::Uuid::now_v7().to_string(), call, captured, receipt,
             interrupted: parking_lot::Mutex::new(None), cancel, notices }
     }
 
     pub(super) fn settle(&self, outcome: &CommandOutcome) -> Result<(), String> {
-        match self.pair {
-            Some((command, output)) => super::command::settle_known_outcome(&self.kernel, self.call.context_id, &command, &output, outcome, None, self.operation.as_ref()),
+        match &self.receipt {
+            Some(receipt) => super::command::settle_operation(&self.kernel, receipt, outcome, None),
             None => self.kernel.shell_operations().finish_result_review(&self.review_id, outcome).map(|changed| {
                 if changed { crate::kj::gate::announce_ledger_change(self.kernel.kernel_db(), self.kernel.ledger_flows()); }
             }),
         }
+    }
+
+    fn pair(&self) -> Option<(BlockId, BlockId)> {
+        self.receipt.as_ref().map(|receipt| (receipt.command_block_id, receipt.output_block_id))
     }
 
     /// Cancellation and unwinding share the first interrupted outcome, even
@@ -107,7 +108,7 @@ impl CommandResultReview {
     async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
         use approval_ledger::types::ApprovalStatus;
         let waiting = self.waiting_outcome(&ask.request_id);
-        if self.pair.is_some() { self.settle(&waiting).map_err(McpError::Protocol)?; }
+        if self.receipt.is_some() { self.settle(&waiting).map_err(McpError::Protocol)?; }
         if let Some(notices) = &self.notices {
             let refusal = McpError::gate_pending(None, Some(ask.clone()),
                 "Captured execution awaits result review; approval continues processing without running source again.".into())
@@ -129,7 +130,7 @@ impl CommandResultReview {
                     return Err(McpError::Protocol("result review answer was already consumed".into()));
                 }
                 if row.status == ApprovalStatus::Allowed {
-                    if let Some((command, output)) = self.pair {
+                    if let Some((command, output)) = self.pair() {
                         for block in [output, command] {
                             self.kernel.blocks().set_status(self.call.context_id, &block, Status::Running)
                                 .map_err(|e| McpError::Protocol(e.to_string()))?;
@@ -163,12 +164,12 @@ mod tests {
         let blocks = kernel.blocks();
         blocks.create_document(context, crate::block_store::DocumentKind::Conversation, None).unwrap();
         let actor = PrincipalId::system();
-        let (pair, operation) = if authored {
+        let operation = if authored {
             let command = blocks.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
             let output = blocks.insert_tool_result(context, &command, Some(&command), "waiting", false, None, None).unwrap();
             let operation = kernel.shell_operations().register(context, actor, actor, command, output, "never-rerun", None).unwrap();
-            (Some((command, output)), Some(operation.operation_id))
-        } else { (None, None) };
+            Some(operation)
+        } else { None };
         let request_id = approval_ledger::ask::create_ask(kernel.kernel_db().lock().conn_for_ledger(),
             &approval_ledger::types::NewAsk {
                 context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
@@ -181,12 +182,12 @@ mod tests {
             }).unwrap();
         let ask = crate::kj::gate::ask_ref(request_id, approval_ledger::types::ApprovalStatus::Pending);
         let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
-        let admitted = operation.as_ref().map(|id| kernel.shell_operations().get(id, context).unwrap().unwrap());
-        let review = CommandResultReview::new(kernel, call, pair, admitted,
+        let id = operation.as_ref().map(|receipt| receipt.operation_id.clone());
+        let review = CommandResultReview::new(kernel, call, operation,
             CommandOutcome::new(CommandExecution::Completed(
                 kaish_kernel::interpreter::ExecResult::success("already ran")), 1),
             tokio_util::sync::CancellationToken::new(), None);
-        (review, ask, operation)
+        (review, ask, id)
     }
 
     #[tokio::test]
@@ -325,14 +326,14 @@ mod tests {
         assert_eq!(raw.text_out(), "already ran");
         assert_eq!(review.kernel.kernel_db().lock().get_approval(&ask.request_id).unwrap().unwrap().status,
             approval_ledger::types::ApprovalStatus::Abandoned);
-        assert_eq!(review.kernel.blocks().get_block_snapshot(review.call.context_id, &review.pair.unwrap().1).unwrap().unwrap().status, Status::Error);
+        assert_eq!(review.kernel.blocks().get_block_snapshot(review.call.context_id, &review.pair().unwrap().1).unwrap().unwrap().status, Status::Error);
     }
 
     #[tokio::test]
     async fn original_execution_ask_keeps_its_receipt_after_result_review() {
         let (review, ask, operation) = fixture(true).await;
         let operation = operation.unwrap();
-        let (command, output) = review.pair.unwrap();
+        let (command, output) = review.pair().unwrap();
         let context = review.call.context_id;
         let original = {
             let db = review.kernel.kernel_db().lock();
@@ -485,7 +486,7 @@ mod tests {
             assert_eq!(raw.text_out(), "already ran");
             assert!(outcome.settlement_error.as_deref().unwrap().contains("restarted during result review"));
             assert_eq!(outcome.block_status(), Status::Error);
-            if let Some((_, output)) = review.pair {
+            if let Some((_, output)) = review.pair() {
                 assert_eq!(recovered.blocks().get_block_snapshot(review.call.context_id, &output).unwrap().unwrap().status, Status::Error);
                 assert_eq!(recovered.shell_operations().get_by_ask(&ask.request_id, review.call.context_id).unwrap().unwrap().receipt.operation_id,
                     operation.unwrap());

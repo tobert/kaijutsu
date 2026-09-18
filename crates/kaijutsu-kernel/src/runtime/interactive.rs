@@ -45,14 +45,12 @@ pub async fn submit(
                 }
             }
             Ok((submission, execution)) => {
-                let command = submission.command_block_id;
                 let _ = reply.send(Ok(submission));
-                if let Some((kaish, call_ctx, output, code)) = execution {
+                if let Some((kaish, call_ctx, receipt, code)) = execution {
                     let record = |context| -> futures::future::LocalBoxFuture<'_, ()> {
                         Box::pin(command::send_context_switch(context, &switches, &stop))
                     };
-                    if let Err(error) = command::run_into_blocks(&kaish, &code, identity.context,
-                        &command, &output, &owner, &call_ctx,
+                    if let Err(error) = command::run_into_blocks(&kaish, &code, &receipt, &owner, &call_ctx,
                         CommandRunOptions { cancel: Some(stop.clone()),
                             context_switch: CommandContextSwitch::Publish(Some(&record)), ..Default::default() }).await
                     {
@@ -66,7 +64,7 @@ pub async fn submit(
     Ok((submission, receiver))
 }
 
-type PreparedExecution = (EmbeddedKaish, crate::mcp::CallContext, BlockId, String);
+type PreparedExecution = (EmbeddedKaish, crate::mcp::CallContext, crate::shell_operations::ShellOperationReceipt, String);
 
 async fn prepare(
     kernel: &Arc<Kernel>, identity: ShellIdentity, source: ShellSource, user_initiated: bool,
@@ -99,7 +97,6 @@ async fn prepare(
         role: if user_initiated { Role::User } else { Role::Model }, excluded: user_initiated, status: kaijutsu_types::Status::Running, ask: None,
     }).map_err(|error| error.to_string())?;
     let command = receipt.command_block_id;
-    let output = receipt.output_block_id;
     let mut submission = ShellSubmission { command_block_id: command,
         operation_id: receipt.operation_id.to_string(), refusal: None };
     let mut call_ctx = crate::mcp::CallContext::new(identity.requester, context, identity.session, kernel.id())
@@ -119,7 +116,7 @@ async fn prepare(
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
             outcome.apply_hook(verdict);
             settlement_started = true;
-            command::settle_outcome(kernel, context, &command, &output, &outcome, Some(crate::PairOwner::Session))?;
+            command::settle_operation(kernel, &receipt, &outcome, Some(crate::PairOwner::Session))?;
             if let Some(refusal) = outcome.refusal() {
                 submission.refusal = Some(refusal.clone());
             } else if let Some(CommandHookEffect::Refused { reason, .. }) = &outcome.hook {
@@ -146,7 +143,7 @@ async fn prepare(
             if !settlement_started {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(reason.into());
-                if let Err(error) = command::settle_outcome(kernel, context, &command, &output, &outcome, None) {
+                if let Err(error) = command::settle_operation(kernel, &receipt, &outcome, None) {
                     tracing::error!("could not settle interactive preparation failure: {error}");
                 }
             }
@@ -157,7 +154,7 @@ async fn prepare(
             }
         }
     };
-    Ok((submission, execute.then_some((kaish, call_ctx, output, code))))
+    Ok((submission, execute.then_some((kaish, call_ctx, receipt, code))))
 }
 
 #[cfg(test)]
@@ -193,6 +190,76 @@ mod tests {
             self.release.notified().await;
             assert!(!self.panic, "interactive pre-call panic sentinel");
             Ok(())
+        }
+    }
+
+    struct ReceiptReadFault {
+        kernel: std::sync::Weak<Kernel>,
+        action: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::Hook for ReceiptReadFault {
+        async fn invoke(&self, _: &crate::mcp::KernelCallParams, _: &crate::mcp::CallContext) -> crate::mcp::McpResult<()> {
+            use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+            self.kernel.upgrade().unwrap().kernel_db().lock().conn_for_ledger().authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                AuthAction::Read { table_name: "shell_operations", column_name: "source", .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            })).unwrap();
+            match self.action {
+                "panic" => panic!("preparation receipt fault sentinel"),
+                "refuse" => Err(crate::mcp::McpError::Protocol("preparation refusal sentinel".into())),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_receipt_survives_preparation_and_execution_entry_read_faults() {
+        use rusqlite::hooks::{AuthContext, Authorization};
+        for (structured, action) in [false, true].into_iter().flat_map(|structured|
+            ["refuse", "panic", "execute"].into_iter().map(move |action| (structured, action))) {
+            let (dispatcher, identity) = fixture().await;
+            let kernel = dispatcher.kernel();
+            kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+                id: HookId("receipt-read-fault".into()), match_instance: None, match_tool: None,
+                match_context: Some(identity.context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::Invoke(HookBody::Builtin { name: "receipt-read-fault".into(),
+                    hook: Arc::new(ReceiptReadFault { kernel: Arc::downgrade(kernel), action }) }),
+            });
+            if structured {
+                let argv = ["block", "create", "--role", "user", "--kind", "text", "--content", "receipt-probe"]
+                    .into_iter().map(str::to_owned).collect::<Vec<_>>();
+                let result = super::super::structured::execute_kj(kernel, identity, &argv, false).await;
+                if action == "execute" { assert_eq!(result.unwrap().unwrap().exit_code, 0); }
+                else { assert!(matches!(result, Err(_) | Ok(Err(_))), "preparation must report its failure"); }
+            } else {
+                let submitted = submit(kernel, identity, ShellSource::Code("echo captured".into()), true).await;
+                if action == "execute" {
+                    let id = submitted.unwrap().0.operation_id;
+                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        while kernel.shell_operations().outcome(&id, identity.context).unwrap().is_none() {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }).await.expect("execution must finish without reconstructing its receipt");
+                }
+            }
+            // Drain accepted work while the receipt-source read remains unavailable.
+            let shutdown = kernel.shutdown_runtime_worker().await;
+            kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
+            if action == "panic" { assert!(shutdown.is_err()); } else { shutdown.unwrap(); }
+            let operations = kernel.shell_operations().list_for_context(identity.context).unwrap();
+            assert_eq!(operations.len(), 1);
+            if structured {
+                let blocks = kernel.blocks().block_snapshots(identity.context).unwrap();
+                assert_eq!(blocks.iter().filter(|block| block.content == "receipt-probe").count(), usize::from(action == "execute"));
+            }
+            let operation = &operations[0];
+            assert!(operation.completed_at.is_some(), "{structured}/{action}: admission must keep its receipt through settlement");
+            let outcome = kernel.shell_operations().outcome(&operation.receipt.operation_id, identity.context).unwrap().unwrap();
+            if action == "execute" {
+                assert!(matches!(outcome.execution, CommandExecution::Completed(_)), "entry read fault must not lose accepted execution");
+            } else { assert!(matches!(outcome.execution, CommandExecution::NotRun)); }
         }
     }
 

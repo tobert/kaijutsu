@@ -639,6 +639,23 @@ impl ShellOperationRegistry {
         self.lookup("operation_id", id, context)
     }
 
+    /// Read an existing pair's owner before claiming its approval. The caller
+    /// holds the same database guard through receipt validation and the claim.
+    pub(crate) fn receipt_for_pair_in(
+        db: &KernelDb, context: ContextId, command: &BlockId, output: &BlockId,
+    ) -> KernelDbResult<Option<ShellOperationReceipt>> {
+        let state = db.conn_for_ledger().query_row(
+            &format!("{SELECT_STATE} WHERE output_block_id=?1 AND context_id=?2"),
+            rusqlite::params![output.to_key(), context.as_bytes()], decode_state,
+        ).optional()?;
+        state.map(|state| {
+            if state.receipt.command_block_id != *command {
+                return Err(KernelDbError::Validation("approval pair does not match its admission receipt".into()));
+            }
+            Ok(state.receipt)
+        }).transpose()
+    }
+
     pub fn get_by_output(&self, output: &BlockId, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
         self.lookup("output_block_id", &output.to_key(), context)
     }

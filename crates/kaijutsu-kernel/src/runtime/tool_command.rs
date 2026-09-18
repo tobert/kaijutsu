@@ -51,7 +51,6 @@ impl ToolCommand {
         let (notices, mut reviews) = tokio::sync::mpsc::unbounded_channel();
         let completion_receipt = receipt.clone();
         let failure_kernel = self.kernel.clone();
-        let context = self.call.context_id;
         let foreground = self.foreground;
         let task_cancel = if foreground { cancel.child_token() } else { CancellationToken::new() };
         let cancel_guard = task_cancel.clone().drop_guard();
@@ -68,8 +67,7 @@ impl ToolCommand {
                     cancel: Some(task_cancel), job_ready: Some(ready_tx), review_notices: Some(notices),
                 };
                 let execute = async { match &completion_receipt {
-                    Some(receipt) => command::run_into_blocks(&self.kaish, &self.code, context,
-                        &receipt.command_block_id, &receipt.output_block_id, &self.kernel, &self.call, run).await,
+                    Some(receipt) => command::run_into_blocks(&self.kaish, &self.code, receipt, &self.kernel, &self.call, run).await,
                     None => command::run_without_blocks(&self.kaish, &self.code, &self.kernel, &self.call,
                         kaish_kernel::ExecuteOptions::default(), run).await,
                 } };
@@ -97,7 +95,7 @@ impl ToolCommand {
             if let Some(receipt) = &receipt {
                 let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
                 outcome.settlement_error = Some(format!("runtime worker could not start: {error}"));
-                command::settle_outcome(&failure_kernel, context, &receipt.command_block_id, &receipt.output_block_id, &outcome, None)
+                command::settle_operation(&failure_kernel, receipt, &outcome, None)
                     .map_err(McpError::Protocol)?;
             }
             return Err(McpError::Protocol(format!("runtime worker could not start: {error}")));
