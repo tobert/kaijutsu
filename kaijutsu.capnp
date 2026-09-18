@@ -1524,19 +1524,6 @@ struct ToolInfo {
   description @1 :Text;
 }
 
-struct ToolCall {
-  tool @0 :Text;         # Tool name (e.g., "cell.edit")
-  params @1 :Text;       # JSON parameters
-  requestId @2 :Text;    # For correlation
-}
-
-struct ToolResult {
-  requestId @0 :Text;
-  success @1 :Bool;
-  output @2 :Text;       # JSON result
-  error @3 :Text;        # Error if !success
-}
-
 struct ToolSchema {
   name @0 :Text;
   description @1 :Text;
@@ -1980,7 +1967,8 @@ interface Kernel {
   # Tool execution
   # ==========================================================================
 
-  executeTool @18 (call :ToolCall, trace :TraceContext) -> (result :ToolResult);
+  # Tool execution enters through shellExecute and retains an operation receipt.
+  retired18 @18 ();
 
   getToolSchemas @19 (trace :TraceContext) -> (schemas :List(ToolSchema));
 

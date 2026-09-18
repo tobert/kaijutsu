@@ -57,7 +57,7 @@ Connection count is capped (default 100).
 
 `KernelImpl` methods group by domain: lifecycle (`get_info`, `ping`), shell exec
 (`execute`, `interrupt`, `complete`, `subscribe_output`), VFS, tools
-(`execute_tool`, `get_tool_schemas`), **blocks** (`subscribe_context`,
+(`get_tool_schemas`, `call_mcp_tool`), **blocks** (`subscribe_context`,
 `subscribe_blocks[_filtered]`, `get_blocks`, `move_block`, `set_block_excluded`,
 `cherry_pick_block`), **LLM** (`prompt`, `configure_llm`, `drift_queue`/
 `drift_cancel`), **context ops** (`create_context`/`join_context`/

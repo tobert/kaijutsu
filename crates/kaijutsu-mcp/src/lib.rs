@@ -1029,13 +1029,8 @@ impl KaijutsuMcp {
         }
     }
 
-    /// Shared polling loop for shell command completion.
-    ///
-    /// `shell()` dispatches a command via `shell_execute`, then waits for the
-    /// ToolResult child block to reach Done/Error status. Returns the
-    /// completed ToolResult block snapshot (or a synthetic one describing
-    /// timeout/event-stream errors); the caller serializes the JSON
-    /// envelope.
+    /// Read the command's completed output from the kernel. Wait timeouts
+    /// leave the accepted operation running; callers can use its receipt later.
     async fn execute_and_poll_shell(
         &self,
         remote: &RemoteState,
@@ -1047,19 +1042,9 @@ impl KaijutsuMcp {
     ) -> ShellCompletion {
         let start = std::time::Instant::now();
 
-        // Completion check — the finished ToolResult child of our command
-        // block, read from the SERVER. This used to scan the local
-        // `SyncedDocument`; the mirror is fed only by the event feed, and the
-        // stall fallback below exists precisely because that feed can die, so
-        // it was a cache that could silently disagree with the authority it
-        // was standing in for. Slice 4 of docs/crdt-position-2026-08.md.
-        //
-        // The filter cannot express `is_shell()` — `BlockFilter` has no
-        // `tool_kind` field — so that stays a client-side check. Which is
-        // also why there is deliberately NO `limit: 1`: the server would cap
-        // before our filter ran and could hand back a non-shell ToolResult
-        // while hiding the real one. A command block has a handful of
-        // children; take them all and pick here.
+        // Read terminal children from the kernel. Filter shell results locally:
+        // BlockFilter has no tool_kind field, so a limit could hide our result
+        // behind another tool's child.
         let query_terminal = || async {
             let filter = kaijutsu_types::BlockFilter {
                 kinds: vec![kaijutsu_types::BlockKind::ToolResult],
@@ -1079,66 +1064,13 @@ impl KaijutsuMcp {
             }
         };
 
-        // Wait for the ToolResult to reach a terminal status, then return
-        // that same snapshot directly. There used to be a second read here
-        // (a "Phase 2") that re-fetched the block via `get_context_sync` and
-        // decoded it into a throwaway `SyncedDocument`, on the theory that a
-        // locally-applied terminal `status` did not guarantee content/exit_code
-        // had replicated, since the three ride independently-reorderable
-        // FlowBus topics (`BlockTextOps` / `BlockMetadataChanged` /
-        // `BlockStatusChanged`). That reasoning was about a *local mirror* fed
-        // by that event stream — this function has not read a mirror since
-        // `query_terminal` below moved to `query_blocks`, an authoritative
-        // server query. `query_blocks`/`get_context_sync` both read the exact
-        // same server-side `entry.doc` (`kaijutsu-kernel/src/block_store.rs`)
-        // — one returns already-decoded `BlockSnapshot`s, the other serializes
-        // the same document's oplog for a client to decode back into an
-        // identical `BlockSnapshot` — so a second read cannot see anything
-        // this one doesn't. And the server's shell-completion writer
-        // (`execute_shell_command`, `kaijutsu-server/src/rpc.rs`) writes
-        // content, then stderr/output_data/content_type, then exit_code,
-        // and only *then* flips status to Done/Error — each write is its own
-        // fully-synchronous BlockStore mutation (acquire the per-context
-        // lock, mutate, release, journal) with no `.await` between them and
-        // no other writer of this block, so the moment any reader observes a
-        // terminal status the preceding writes are already committed and
-        // visible. That is a real ordering guarantee from strict sequential
-        // locking on the same store entry — unrelated to the FlowBus, whose
-        // topic reordering only affects event *notification*, never what a
-        // direct store read sees. So the snapshot below is already complete;
-        // re-reading it a second way would decode the same bytes twice.
-        //
-        // **Polling is the guarantee; the event feed only makes it fast.**
-        // Before this shape, the event feed was the mechanism and an
-        // authoritative catch-up was the emergency: the loop scanned a local
-        // mirror on every wake and only pulled from the server once a stall
-        // window convinced it that delivery had died. So the common path
-        // trusted a cache that the uncommon path existed to correct — and the
-        // cache was fed by exactly the feed whose death we were trying to
-        // detect.
-        //
-        // Now every check is an authoritative query and `change` is a
-        // *hint*: it can pull the next poll earlier, never later, and never
-        // makes one more often than `MIN_POLL_INTERVAL`. A dead feed is no
-        // longer an exceptional case to detect and recover from — it just
-        // means nothing arrives early and we fall back to the floor cadence.
-        // Nothing to detect means nothing to get wrong.
-        //
-        // Two bugs die with the old shape. The stall backoff was defeated by
-        // the doc task bumping `change` after its own fallback resync, so the
-        // loop read its own recovery as "delivery is alive" and reset the
-        // ladder; there is no ladder to defeat now.
-        // And `ResyncReason::StallFallback` sat outside `do_coalesced_resync`'s
-        // staleness argument because it was the one trigger not caused by the
-        // ordered event stream — this path no longer resyncs at all.
+        // Terminal status and complete output commit together. Return the same
+        // authoritative snapshot; events only bring the next poll forward.
+        // A lost event feed leaves the bounded polling cadence intact.
         const MIN_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(250);
         const MAX_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
 
-        // Subscribe BEFORE the first query: the watch records its version, so
-        // a bump landing between the query and the wait is still observed. The
-        // ordering matters more than it used to — the query is now the thing
-        // that can miss, and this is what stops a lost wakeup turning into a
-        // full `timeout_secs` stall.
+        // Subscribe before querying so an intervening version change wakes us.
         let mut change_rx = remote.change.subscribe();
         let mut poll_interval = MIN_POLL_INTERVAL;
 
@@ -1688,71 +1620,8 @@ impl Default for KaijutsuMcp {
 
 #[tool_router]
 impl KaijutsuMcp {
-    // ========================================================================
-    // Removed in MCP slim-down — see docs/kj-cleanup.md + docs/kj-cleanup-parity.md
-    //
-    // The following 16 tools previously duplicated kernel-side functionality
-    // that now lives in `kj` (clap_derive). Agents drive them through
-    // `shell "kj …"`:
-    //
-    //   doc_create | doc_list | doc_delete | doc_tree     → kj doc
-    //   block_create | block_read | block_append | block_edit |
-    //   block_list | block_status | block_exclude |
-    //   block_inspect | block_history | block_diff        → kj block
-    //   kernel_search                                      → kj search
-    //   stage_commit                                       → kj stage commit
-    //
-    // The narrow MCP surface that remains: shell as the rich entry point,
-    // register_session/whoami/invoke_peer for peer-and-session
-    // concerns, list_kernel_tools/kaish_exec as the escape hatches,
-    // {read,write,edit,submit}_input for the shared scratchpad.
-    // ========================================================================
-
-    // ========================================================================
-    // Kaish Execution (via ActorHandle → broker dispatch)
-    // ========================================================================
-
     #[tool(
-        description = "Execute a kernel tool by exact name. Use list_kernel_tools to discover available tool names and their input schemas. Common tools: glob, grep, kernel_search. Requires --connect.",
-        annotations(open_world_hint = true)
-    )]
-    #[tracing::instrument(skip(self, req), name = "mcp.kaish_exec")]
-    async fn kaish_exec(&self, Parameters(req): Parameters<KaishExecRequest>) -> CallToolResult {
-        let actor = match self.actor() {
-            Some(a) => a,
-            None => {
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "Error: kaish_exec requires --connect to kaijutsu-server",
-                )]);
-            }
-        };
-
-        match actor.execute_tool(&req.tool, &req.params).await {
-            Ok(result) if result.success => {
-                CallToolResult::success(vec![ContentBlock::text(result.output)])
-            }
-            Ok(result) => {
-                // `error` is the failure reason (kaish's stderr, or the
-                // dispatch error when the tool never ran); `output` is
-                // whatever stdout the tool produced before failing. Lead
-                // with the reason and keep both when both are present —
-                // dropping either loses information a model needs to
-                // recover.
-                let reason = if result.error.is_empty() {
-                    result.output
-                } else if result.output.is_empty() {
-                    result.error
-                } else {
-                    format!("{}\n{}", result.error, result.output)
-                };
-                CallToolResult::error(vec![ContentBlock::text(format!("Tool error: {reason}"))])
-            }
-            Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e}"))]),
-        }
-    }
-
-    #[tool(
-        description = "List all kernel tools with their names, descriptions, categories, and input schemas. Use this to discover exact tool names for kaish_exec. Requires --connect.",
+        description = "List broker tools visible to your context, with names, descriptions, categories, and input schemas. Shell commands resolve kaish builtins before broker tools. Requires --connect.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     #[tracing::instrument(skip(self), name = "mcp.list_kernel_tools")]
@@ -1808,7 +1677,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell, kaish_exec). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,

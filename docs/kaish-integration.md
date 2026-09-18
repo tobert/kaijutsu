@@ -64,8 +64,16 @@ These are source observations, not promises that all paths behave alike.
   Gate ask creation and redemption repeat the canonical context check under
   their database guard, so archive during input capture cannot leave a new ask.
   Interactive model preparation shares the headless startup owner below.
-  Generic non-shell `executeTool` RPC admission and task ownership remain open;
-  shell tools enforce this contract at their runtime entry point.
+  The duplicate `executeTool` RPC and MCP `kaish_exec` are retired. MCP command
+  execution uses `shell` and its retained operation receipt. The remaining
+  `callMcpTool` RPC has only test consumers; its migration or retirement is open.
+- MCP exposes `shell`, session/peer tools, and `list_kernel_tools`. Visible
+  broker tools with unshadowed names accept ordinary kaish arguments. The
+  backend preserves stdout, stderr, exit code and structured output, including
+  an error body on stdout. There is no generic exact-name override: kaish
+  builtins win collisions such as `read`, `write`, `glob` and `grep`. Native
+  model tool calls still use broker name resolution. No `kj mcp call` command
+  is added; `kj mcp` continues to administer external servers.
 - `src/lib.rs::spawn_kaish_thread` reserves the 16 MiB stack for dedicated
   threads that can enter kaish. The server's Tokio runtime also reserves it.
   The helper sets thread name and stack; it does not construct a shell or own
@@ -406,10 +414,12 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Interactive shell submission | kernel `runtime/interactive.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, draft revision consumption, addressed identity/context, command/output pair, hooks, write-back, acknowledged context switches, disconnect survival, and joined shutdown |
 | Migrated | Streaming execute RPC | kernel `runtime/streaming.rs`, `runtime/command.rs`; server RPC adapter | Kernel-owned preparation/execution/settlement; connection-owned IDs, admission slot, history, cancellation and callbacks; hooks, review, physical exit, context switches, disconnect and joined shutdown |
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
+| Retired | Generic `executeTool` and MCP `kaish_exec` | Reserved wire ordinal 18; MCP uses retained `shell` | Unshadowed broker calls preserve both streams and structured output; no exact-name override |
+| Pending | Generic `callMcpTool` | Server RPC, client/actor, test and isotest consumers | Migrate tests to retained client execution or broker fixtures, then retire the caller-owned wire path |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
-| Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
+| Partial | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; submit cancellation signals and joins kaish; nested lifecycle cancellation propagation remains open |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
 | Partial | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |

@@ -1,37 +1,10 @@
 //! MCP request and response types.
 //!
-//! Slim surface after the MCP cleanup (see docs/kj-cleanup.md):
-//! - shell for context-bound command execution
-//! - kaish_exec as the escape hatch into kernel tools
-//! - register_session, invoke_peer for peer/session concerns
-//!
-//! The block_*, doc_*, kernel_search, and stage_commit request types
-//! were removed when their corresponding tools moved to `kj`.
+//! Shell commands run in the current kernel context. Session and peer tools
+//! manage connections and exchanges between players.
 
 use rmcp::schemars;
 use serde::Deserialize;
-
-// ============================================================================
-// Kaish Execution Types
-// ============================================================================
-
-/// Execute a tool through the kernel's tool registry (git, drift, etc.).
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct KaishExecRequest {
-    /// Exact tool name to execute (use list_kernel_tools to discover names)
-    #[schemars(
-        description = "Exact tool name (use list_kernel_tools to discover available names, e.g., 'drift_ls', 'glob', 'grep')"
-    )]
-    pub tool: String,
-    /// JSON parameters for the tool
-    #[schemars(description = "JSON parameters for the tool (tool-specific)")]
-    #[serde(default = "default_empty_params")]
-    pub params: String,
-}
-
-fn default_empty_params() -> String {
-    "{}".to_string()
-}
 
 /// Execute a kaish command in the caller's kernel context. The shell is
 /// context-bound — `.` references the current context in kj commands, durable

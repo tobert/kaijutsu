@@ -72,13 +72,10 @@ out-of-band-change notification companion described in "Hydration" below.
      InProgress, `"done"` = Done ∪ Cancelled, or an exact status name).
    - Registered in `Kernel::register_builtin_mcp_servers` under
      `InstancePolicy::for_kernel`, same as every other builtin. No
-     `kaijutsu-mcp` (the external stdio server) changes were needed to
-     reach Claude Code / other MCP-attached models: an earlier MCP
-     slim-down (see the `#[tool_router] impl KaijutsuMcp` doc comment in
-     `crates/kaijutsu-mcp/src/lib.rs`) already replaced per-tool wrappers
-     there with generic `kaish_exec`/`list_kernel_tools` escape hatches
-     gated by the calling context's broker-level capability grant. The
-     `mcp`/`coder`/`director` rc loadouts
+     `kaijutsu-mcp` (the external stdio server) changes are needed: `shell`
+     dispatches task commands through the calling context's broker binding and
+     retains their operation results. `list_kernel_tools` exposes their input
+     schemas. The `mcp`/`coder`/`director` rc loadouts
      (`assets/defaults/rc/lib/create/S10-binding.kai`)
      grant `*` (`Capability::AllInstances`), so `builtin.tasks` is visible
      the moment it's registered — the "curate the external subset"

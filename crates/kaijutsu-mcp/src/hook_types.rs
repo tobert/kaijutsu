@@ -185,7 +185,6 @@ pub const KAIJUTSU_MCP_TOOLS: &[&str] = &[
     "doc_delete",
     "doc_list",
     "doc_tree",
-    "kaish_exec",
     "shell",
     "kernel_search",
     "list_kernel_tools",

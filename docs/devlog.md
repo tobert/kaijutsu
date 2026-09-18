@@ -2448,6 +2448,33 @@ successful return occupy one poll. Existing cancellation and panic tests check
 that no second terminal event appears. Review/disposition are archived under
 `~/exomemory/kaijutsu/reviews/2026-09-18-execution/prompt-owner-*`.
 
+The generic tool audit found one production consumer of `executeTool`: the
+external MCP server's `kaish_exec` wrapper. Amy challenged the proposed exact
+JSON replacement: "what would kj mcp call do? maybe we should remove it?"
+We removed the escape hatch instead. MCP commands enter through the existing
+retained shell path; no `kj mcp call` was added. The wire ordinal stays reserved
+as `retired18`, and its client methods, actor command, wire types and decoder
+are deleted. This deliberately removes exact-name overrides for names shadowed
+by kaish builtins; native model broker calls remain available. `callMcpTool`
+has only test/isotest callers and remains the next retirement boundary.
+
+An adjacent backend defect dropped stdout on failure and stderr on success.
+The adapter now carries both streams, exit status and structured output through
+kaish's canonical conversion. Its regression failed before the fix. A real
+MCP tools/list and tools/call test over the SSH-backed server proves ordinary
+broker invocation retains a failed JSON body and literal arguments, exposes an
+operation receipt, and no longer advertises `kaish_exec`. Its retirement
+assertion failed before deletion. Stale polling comments now state the atomic
+settlement and authoritative-read contract.
+
+Validation: 7 backend tests, 338 client/MCP/presentation unit tests, and all 7
+MCP shell integration tests passed; workspace all-targets checking and diff
+checking passed. Kaibo/DeepSeek Flash found no confirmed defect in the scoped
+source review (24,498 input / 1,306 output tokens). Wire deletion was checked
+locally through references and workspace compilation; it was outside the review
+packet. Packet, result and disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/tool-retirement-*`.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

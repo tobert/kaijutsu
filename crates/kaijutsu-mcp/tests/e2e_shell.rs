@@ -405,3 +405,49 @@ fn shell_sequential_commands() {
         }
     });
 }
+
+/// Exercise the published MCP tool schema and JSON request decoder over a real
+/// MCP connection, with execution and result recovery crossing SSH to the kernel.
+#[test]
+fn published_shell_retains_broker_output() {
+    use rmcp::{ServiceExt, model::{CallToolRequestParams, ClientInfo}};
+
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        let registration = register_with_retry(&mcp, "broker-shell").await;
+        assert_eq!(registration["success"], true, "{registration}");
+        let (server_io, client_io) = tokio::io::duplex(16384);
+        let server = tokio::task::spawn_local(async move {
+            mcp.serve(server_io).await.unwrap().waiting().await.unwrap();
+        });
+        let client = ClientInfo::default().serve(client_io).await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        let shell = tools.iter().find(|tool| tool.name == "shell").expect("published shell");
+        assert!(shell.input_schema["properties"].get("command").is_some());
+        assert!(shell.output_schema.as_ref().unwrap()["properties"].get("operation_id").is_some());
+
+        // Broker tools without a builtin or host-command collision use normal
+        // kaish arguments. A failed tool's JSON body must survive on stdout.
+        for suffix in ["", "; false"] {
+            let command = format!("echo 'literal $HOME 雪'{}", suffix);
+            let quoted = command.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+            let result = client.call_tool(CallToolRequestParams::new("shell").with_arguments(
+                serde_json::json!({
+                    "command": format!("shell --command \"{quoted}\" --foreground"),
+                    "foreground": true, "timeout_secs": 30,
+                }).as_object().unwrap().clone(),
+            )).await.unwrap();
+            let envelope = result.structured_content.expect("shell envelope");
+            assert!(envelope["operation_id"].is_string(), "{envelope}");
+            assert_eq!(envelope["exit_code"], if suffix.is_empty() { 0 } else { 1 }, "{envelope}");
+            let inner: serde_json::Value = serde_json::from_str(envelope["stdout"].as_str().unwrap())
+                .unwrap_or_else(|error| panic!("missing complete tool body: {error}: {envelope}"));
+            assert_eq!(inner["stdout"], "literal $HOME 雪\n", "{inner}");
+        }
+        assert!(!tools.iter().any(|tool| tool.name == "kaish_exec"),
+            "MCP commands must use the retained shell path");
+        client.cancel().await.unwrap();
+        server.await.unwrap();
+    });
+}

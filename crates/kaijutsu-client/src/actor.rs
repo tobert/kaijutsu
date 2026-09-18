@@ -86,7 +86,7 @@ const CONTEXT_FEED_QUEUE: usize = 256;
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
     KernelInfo, LlmConfigInfo, McpResource, McpToolResult, PeerInfo, ShellValue, SimilarContext,
-    StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, VersionSnapshot,
+    StagedDriftInfo, SubmitResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
     BlockEventsForwarder, ConnectionStatus, EditorEventsForwarder, LedgerEventsForwarder,
@@ -171,7 +171,7 @@ pub enum CallError {
 
     /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
     /// (`dispatch!`), or a per-call override for the few dispatched through
-    /// `dispatch_deadline!` instead (today: `ExecuteTool`, `CallMcpTool`
+    /// `dispatch_deadline!` instead (today: `CallMcpTool`
     /// and `ExecuteKj`, at `kaijutsu_types::timeout::gate::CLIENT_CALL`,
     /// because each can reach a gate holding for a human answer). The carried
     /// `Duration` is always the deadline that actually fired, so the
@@ -648,11 +648,6 @@ enum RpcCommand {
     },
 
     // ── Tool Execution ───────────────────────────────────────────────────
-    ExecuteTool {
-        tool: String,
-        params: String,
-        reply: oneshot::Sender<Result<ToolResult, CallError>>,
-    },
     GetToolSchemas {
         reply: oneshot::Sender<Result<Vec<ToolSchema>, CallError>>,
     },
@@ -857,7 +852,6 @@ impl RpcCommand {
             Self::VfsReadAll { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorInsert { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ExecuteTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1847,16 +1841,6 @@ impl ActorHandle {
     }
 
     // ── Tool Execution ───────────────────────────────────────────────────
-
-    #[tracing::instrument(skip(self, params))]
-    pub async fn execute_tool(&self, tool: &str, params: &str) -> Result<ToolResult, CallError> {
-        self.send(|reply| RpcCommand::ExecuteTool {
-            tool: tool.into(),
-            params: params.into(),
-            reply,
-        })
-        .await
-    }
 
     #[tracing::instrument(skip(self))]
     pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, CallError> {
@@ -3826,21 +3810,8 @@ async fn dispatch_kernel_command(
         RpcCommand::SetContextCwd { context_id, path, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.set_context_cwd(context_id, &path));
         }
-        // `executeKj` runs the verb SYNCHRONOUSLY on the server
-        // (`execute_kj_command` returns exit code and output, unlike
-        // `shellExecute`, which spawns and hands back a block id), and some
-        // `kj` verbs block on the approval gate — `kj cc send` today, plus
-        // the six `Latch` producers Slice 5 migrates. So this reaches the
-        // gate exactly the way `ExecuteTool` does, and needs the same
-        // deadline. It is also the path ACP drives `kj` through.
-        //
-        // Applied to the whole verb surface rather than just the gated
-        // ones: the client cannot tell a gated argv from an ungated one
-        // without duplicating `is_gated_verb` here, and a second copy of
-        // that policy would drift from the kernel's. A gated verb no
-        // longer waits on a human at all (`docs/gate-resume.md`), so this
-        // deadline now bounds an ordinary short call; it stays generous
-        // until the ladder comes out with that design's slice 4.
+        // Structured commands use the gate-aware deadline. The server owns
+        // accepted execution; a client timeout only stops this wait.
         RpcCommand::ExecuteKj { context_id, argv, reply } => {
             dispatch_deadline!(
                 kernel, reply, close_tx, k,
@@ -3954,28 +3925,6 @@ async fn dispatch_kernel_command(
         }
 
         // ── Tool Execution ──
-        //
-        // `ExecuteTool` and `CallMcpTool` both route (server-side, through
-        // `dispatch_tool_via_broker` → `Broker::call_tool`) to whichever
-        // instance the resolved tool name lands on — including
-        // `builtin.shell_write`, the only BROKER instance that reaches
-        // `kj::gate::run_gate` (`ExecuteKj` below reaches the same gate by
-        // the other route, through kaish) (verified by reading
-        // `kaijutsu-server::rpc::{execute_tool, call_mcp_tool}`). Both need
-        // the gate ladder's client-side deadline instead of the generic
-        // `RPC_CALL_TIMEOUT`, or the client gives up on an answerable gate
-        // ask long before the gate itself would. `GetToolSchemas` and
-        // `ListMcpResources` never dispatch a tool call, so they stay on
-        // `dispatch!`.
-        RpcCommand::ExecuteTool {
-            tool, params, reply,
-        } => {
-            dispatch_deadline!(
-                kernel, reply, close_tx, k,
-                kaijutsu_types::timeout::gate::CLIENT_CALL,
-                k.execute_tool(&tool, &params)
-            );
-        }
         RpcCommand::GetToolSchemas { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_tool_schemas());
         }

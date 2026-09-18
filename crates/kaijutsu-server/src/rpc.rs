@@ -2598,84 +2598,6 @@ impl kernel::Server for KernelImpl {
 
     // Tool execution
 
-    fn execute_tool(
-        self: Rc<Self>,
-        params: kernel::ExecuteToolParams,
-        mut results: kernel::ExecuteToolResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let trace_span = extract_rpc_trace(p.get_trace(), "execute_tool");
-        let call = pry!(p.get_call());
-        let tool_name = pry!(pry!(call.get_tool()).to_str()).to_owned();
-        let tool_params = pry!(pry!(call.get_params()).to_str()).to_owned();
-        let request_id = pry!(pry!(call.get_request_id()).to_str()).to_owned();
-
-        let kernel = self.kernel.clone();
-        let kernel_arc = kernel.kernel.clone();
-        let _kernel_id = kernel.id;
-
-        // Extract identity and resolve cwd from the context's durable L1 state.
-        let (principal_id, context_id, session_id) = {
-            let conn = self.connection.borrow();
-            (
-                conn.principal,
-                pry!(conn.require_context()),
-                conn.session_id,
-            )
-        };
-        trace_span.record("principal.id", principal_id.to_string());
-        let cwd = pry!(context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed));
-
-        Promise::from_future(
-            async move {
-                let mut result = results.get().init_result();
-                result.set_request_id(&request_id);
-                let reviewer = context_reviewer(&kernel, context_id).await;
-
-                let tool_ctx = match cwd {
-                    Some(cwd) => kaijutsu_kernel::ExecContext::new(
-                        principal_id,
-                        context_id,
-                        cwd,
-                        session_id,
-                        kernel_arc.id(),
-                    ),
-                    None => kaijutsu_kernel::ExecContext::new_without_cwd(
-                        principal_id,
-                        context_id,
-                        session_id,
-                        kernel_arc.id(),
-                    ),
-                }.with_actor(principal_id, reviewer);
-
-                // Phase 5 D-54: tool filter retired. Visibility is now
-                // enforced by the broker's `ContextToolBinding` +
-                // `McpHookPhase::ListTools` inside `list_visible_tools` and
-                // `dispatch_tool_via_broker`.
-
-                // Dispatch through the Phase 1 broker (M4).
-                match kernel_arc
-                    .dispatch_tool_via_broker(&tool_name, &tool_params, &tool_ctx)
-                    .await
-                {
-                    Ok(exec_result) => {
-                        result.set_success(exec_result.success);
-                        result.set_output(&exec_result.stdout);
-                        if !exec_result.stderr.is_empty() {
-                            result.set_error(&exec_result.stderr);
-                        }
-                    }
-                    Err(e) => {
-                        result.set_success(false);
-                        result.set_error(e.to_string());
-                    }
-                }
-                Ok(())
-            }
-            .instrument(trace_span),
-        )
-    }
-
     fn get_tool_schemas(
         self: Rc<Self>,
         params: kernel::GetToolSchemasParams,
@@ -3861,16 +3783,8 @@ impl kernel::Server for KernelImpl {
                     return Ok(());
                 }
             };
-            // `ExecResult::failure` puts its message in `stderr` and leaves
-            // `stdout` empty (`execution.rs`) — a bare `exec.stdout` here
-            // silently dropped every failure's message on this wire method,
-            // which every RPC-only client (this isotest suite included)
-            // reaches through `call_mcp_tool` with no other way to recover
-            // the text. `execute_tool` (below) and the LLM tool-call path
-            // (`llm_stream.rs::map_tool_dispatch_result`) already fall back
-            // to `stderr` on failure; this brings `call_mcp_tool` in line
-            // with that established convention instead of being the one
-            // silent exception.
+            // This legacy reply has one content field. Preserve a failure's
+            // diagnostic when present; retained shell results carry both streams.
             let mut out = results.get().init_outcome().init_ok();
             let content = if exec.success || exec.stderr.is_empty() {
                 &exec.stdout

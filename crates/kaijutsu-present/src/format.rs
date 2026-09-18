@@ -1358,7 +1358,7 @@ mod tests {
             call_id,
             None,
             ToolKind::Shell,
-            "kaish_exec",
+            "shell",
             serde_json::json!({"code": "false"}),
             Role::Model,
             None,
@@ -1394,7 +1394,7 @@ mod tests {
 
         let text = format_single_block(&error_block, None, &lookup);
         let mut lines = text.lines();
-        assert_eq!(lines.next().unwrap(), "tool error \u{2190} kaish_exec (#0)");
+        assert_eq!(lines.next().unwrap(), "tool error \u{2190} shell (#0)");
         assert_eq!(lines.next().unwrap(), "tool error: boom");
         assert_eq!(lines.next().unwrap(), "line1");
         assert_eq!(lines.next().unwrap(), "line2");
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "tool error \u{2190} kaish_exec (#0)",
+                "tool error \u{2190} shell (#0)",
                 "tool error: boom",
                 "l1",
                 "l2",

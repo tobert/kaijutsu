@@ -614,19 +614,8 @@ fn test_call_mcp_tool_requires_joined_context() {
     });
 }
 
-/// Regression: `Kernel::dispatch_tool_via_broker`'s `ExecResult::failure`
-/// puts its message in `stderr` and leaves `stdout` empty
-/// (`kaijutsu-kernel/src/execution.rs`). The `call_mcp_tool` RPC handler
-/// used to build the wire response from `exec.stdout` alone, so EVERY
-/// failed `call_mcp_tool` call returned `is_error=true` with completely
-/// empty content — silently dropping the reason on the one MCP entry point
-/// with no separate error field to fall back to (`execute_tool` sets a
-/// dedicated `error` field; the LLM tool-call path already reads `stderr`).
-/// `write` on the root character's own root context is a reliable,
-/// always-available failure: that context has no durable cwd until `kj
-/// context set --cwd` runs, so every file tool refuses up front
-/// (`refuse_missing_cwd`). The context's label is the root character's name
-/// (`SshServerConfig::EPHEMERAL_ROOT`, "tester" for an ephemeral server).
+/// A failed broker call must carry its diagnostic over the legacy one-field
+/// reply. The root context has no durable cwd, so file tools refuse the write.
 #[test]
 fn test_call_mcp_tool_failure_message_reaches_the_wire() {
     run_local(async {

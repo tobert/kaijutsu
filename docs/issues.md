@@ -285,14 +285,21 @@ Interactive prompt preparation now shares the headless startup owner and owns
 its turn lease before submit rc or provider selection. Disconnect preserves
 accepted preparation; shutdown signals and joins rc cleanup before completing
 the cancelled turn. Admission proof and task ownership remain distinct.
-Generic `executeTool` RPC still dispatches non-shell tools without context
-admission and keeps their preparation on the caller. Audit it alongside prompt
-callers; shell tools now admit at their own runtime entry point. Preserve
-accepted nested tool execution rather than gating every broker dispatch anew.
-It also lacks durable result retention after disconnect, and resolves its
-reviewer for the configured performer while assigning the invoking principal
-as actor. Inspect actual callers before choosing retention or retiring the
-generic RPC; see `~/exomemory/kaijutsu/tool-rpc-ownership-design.md`.
+The duplicate `executeTool` RPC and MCP `kaish_exec` are retired; the published
+MCP shell retains ordinary broker command output. `callMcpTool` has only test
+and isotest consumers, but still dispatches non-shell tools without context
+admission, task ownership or durable output. Its reviewer is resolved for the
+configured performer while its actor is the invoking principal. Migrate those
+tests to retained client execution or lower-level broker fixtures, then retire
+the RPC. Preserve accepted nested calls rather than gating every broker entry.
+
+Kaish backend discovery enumerates raw global broker names instead of the
+context's visible names. Qualified names for broker-broker collisions are
+therefore not reliably discoverable through shell commands. No shipped caller
+needs a generic collision override; `kaish_exec` retirement deliberately drops
+that escape hatch. Audit contextual discovery as part of the backend inventory;
+keep native model tool resolution intact.
+
 Submit rc receives its turn's cancellation token. Other lifecycle producers
 still create fresh tokens; audit propagation through nested `kj` lifecycle
 calls and their owning task before claiming cancellation across all re-entry.

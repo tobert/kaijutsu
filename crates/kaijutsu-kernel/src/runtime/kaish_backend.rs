@@ -208,11 +208,14 @@ impl KaijutsuBackend {
 
     /// Convert ExecResult to ToolResult.
     fn convert_exec_result(result: ExecResult) -> ToolResult {
-        if result.success {
-            ToolResult::success(result.stdout)
-        } else {
-            ToolResult::failure(result.exit_code, result.stderr)
-        }
+        let ExecResult { stdout, stderr, exit_code, output, .. } = result;
+        let mut kaish_result = kaish_kernel::interpreter::ExecResult::from_output(
+            i64::from(exit_code),
+            stdout,
+            stderr,
+        );
+        kaish_result.set_output(output);
+        ToolResult::from(kaish_result)
     }
 }
 
@@ -805,6 +808,34 @@ mod tests {
     use super::*;
     use crate::block_store::shared_block_store;
     use kaijutsu_types::{PrincipalId, SessionId};
+
+    #[test]
+    fn convert_exec_result_preserves_both_streams_exit_status_and_output() {
+        let output = kaijutsu_types::OutputData::text("structured error body");
+        let converted = KaijutsuBackend::convert_exec_result(ExecResult {
+            stdout: "{\"error\":\"structured error body\"}".into(),
+            stderr: "diagnostic\n".into(),
+            exit_code: 17,
+            success: false,
+            output: Some(output.clone()),
+        });
+
+        assert_eq!(converted.code, 17);
+        assert_eq!(converted.stdout, "{\"error\":\"structured error body\"}");
+        assert_eq!(converted.stderr, "diagnostic\n");
+        assert_eq!(converted.output, Some(output));
+
+        let converted = KaijutsuBackend::convert_exec_result(ExecResult {
+            stdout: "normal output\n".into(),
+            stderr: "warning\n".into(),
+            exit_code: 0,
+            success: true,
+            output: None,
+        });
+        assert_eq!(converted.code, 0);
+        assert_eq!(converted.stdout, "normal output\n");
+        assert_eq!(converted.stderr, "warning\n");
+    }
 
     #[tokio::test]
     async fn test_path_resolution() {

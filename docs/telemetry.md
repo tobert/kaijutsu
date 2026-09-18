@@ -35,13 +35,13 @@ Standard OTel env vars are respected:
 
 ### Example full trace hierarchy
 
-A tool call from kaijutsu-app produces a connected distributed trace:
+A shell submission produces a connected distributed trace:
 
 ```
-actor.execute_tool (kaijutsu-app)
-  └── rpc_client.execute_tool (kaijutsu-client, injects traceparent)
-        └── rpc{method="execute_tool"} (kaijutsu-server, extracts traceparent)
-              └── engine.git (kaijutsu-kernel)
+shell_submit (ActorHandle, kaijutsu-client)
+  └── rpc_client.shell_submit (injects traceparent)
+        └── rpc{method="shell_execute"} (kaijutsu-server, extracts traceparent)
+              └── kernel-owned command execution
 ```
 
 W3C Trace Context (`traceparent`/`tracestate`) propagates in-band through
@@ -106,7 +106,7 @@ Sync methods use `span.entered()` guards.
 
 | Category | Methods |
 |----------|---------|
-| Execution | `execute`, `execute_tool`, `shell_execute`, `prompt` |
+| Execution | `execute`, `shell_execute`, `prompt` |
 | Context | `create_context`, `join_context`, `list_contexts`, `get_context_id` |
 | Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
 | Document / history | `push_ops`, `get_context_history`, `compact_context` |
@@ -133,7 +133,7 @@ with `name = "rpc_client.{method}"`. Large args (`code`, `ops`, `content`) are s
 ### Actor (40 methods)
 
 All `ActorHandle` methods in `actor.rs` have `#[tracing::instrument(skip(self))]`.
-Span names auto-derive from the method name (e.g., `ActorHandle::execute_tool`).
+Span names auto-derive from the method name (e.g., `ActorHandle::shell_submit`).
 
 ### Execution Engines (20 spans)
 
@@ -177,19 +177,14 @@ All `ExecutionEngine::execute()` implementations:
 | `DriftMergeEngine` | `drift.merge` | Merge fork back to parent |
 | `DriftLsEngine` | `engine.drift_ls` | List available contexts |
 
-### MCP Tools (6 tools)
+### MCP Tools (5 tools)
 
-The MCP slim-down cut 16 doc/block/drift-detail tools that duplicated
-kernel-side functionality now reached through `kj` (via `shell`/`context_shell`)
-— see the removal note at the top of `impl KaijutsuMcp` in
-`kaijutsu-mcp/src/lib.rs`. The compose-input tools (`read_input`/`write_input`/
-`edit_input`/`submit_input`) were removed 2026-09-15: the draft is the
-player's alone (`docs/issues.md`, "The compose draft is the player's alone").
-All 6 remaining `#[tool(...)]` methods have `#[tracing::instrument]`:
+Commands enter through `shell`, which retains an operation receipt. The other
+MCP tools inspect available tools or manage sessions and peers. Each method
+carries a tracing span.
 
 | Tool | Span |
 |------|------|
-| `kaish_exec` | `mcp.kaish_exec` |
 | `list_kernel_tools` | `mcp.list_kernel_tools` |
 | `shell` | `mcp.shell` |
 | `register_session` | `mcp.register_session` |

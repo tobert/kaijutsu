@@ -32,7 +32,7 @@ pub use rpc::{
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellDryRunOutcome, ShellDryRunReport, ShellSubmission, ShellValue, SimilarContext,
-    SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolResult, ToolSchema, TrackInfo,
+    SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolSchema, TrackInfo,
     VersionSnapshot, VfsActivityEntry, VfsFileType,
 };
 pub use context_feed::{

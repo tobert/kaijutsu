@@ -1491,30 +1491,6 @@ impl KernelHandle {
     // MCP Tool operations
     // =========================================================================
 
-    /// Execute a tool via the kernel's tool registry.
-    ///
-    /// This is the general-purpose tool execution path (executeTool @16).
-    /// Tools include git, drift, and any registered execution engines.
-    #[tracing::instrument(skip(self, params), name = "rpc_client.execute_tool")]
-    pub async fn execute_tool(&self, tool: &str, params: &str) -> Result<ToolResult, RpcError> {
-        let mut request = self.kernel.execute_tool_request();
-        {
-            let mut call = request.get().init_call();
-            call.set_tool(tool);
-            call.set_params(params);
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        let result = response.get()?.get_result()?;
-
-        parse_tool_result(result)
-    }
-
     /// Get schemas for all registered kernel tools.
     #[tracing::instrument(skip(self), name = "rpc_client.get_tool_schemas")]
     pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, RpcError> {
@@ -4603,33 +4579,7 @@ pub(crate) fn parse_editor_state(
     })
 }
 
-/// Result from a kernel tool execution (executeTool @16).
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub request_id: String,
-    pub success: bool,
-    pub output: String,
-    /// The failure reason (kaijutsu.capnp `ToolResult.error`). Empty when
-    /// `success` is true, or when a failure produced no separate reason
-    /// (rare — most failures set this even when `output` is also empty).
-    pub error: String,
-}
-
-/// Parse a capnp `ToolResult` reader into the client struct (executeTool
-/// @16). Split out so a unit test can decode a hand-built message without a
-/// live RPC round trip — see `parse_tool_result_carries_error_reason`.
-pub(crate) fn parse_tool_result(
-    r: crate::kaijutsu_capnp::tool_result::Reader<'_>,
-) -> Result<ToolResult, RpcError> {
-    Ok(ToolResult {
-        request_id: r.get_request_id()?.to_string()?,
-        success: r.get_success(),
-        output: r.get_output()?.to_string()?,
-        error: r.get_error()?.to_string()?,
-    })
-}
-
-/// Schema for a kernel tool (getToolSchemas @11).
+/// Schema for a broker tool visible to the current context.
 #[derive(Debug, Clone)]
 pub struct ToolSchema {
     pub name: String,
@@ -4883,35 +4833,6 @@ mod tests {
         assert_eq!(
             read_shell_value(reader).unwrap(),
             ShellValue::String("/v/cas/deadbeef".into())
-        );
-    }
-
-    /// `execute_tool`'s decode used to read only `request_id`/`success`/
-    /// `output` off the wire and silently drop `error` — a failed kaish
-    /// command (e.g. kaish's `redirect: read-only filesystem`, which lands
-    /// in `error` with `output` empty) never reached the caller, so
-    /// kaijutsu-mcp's `kaish_exec` reported the bare string "Tool error: ".
-    /// Locks in that the failure reason survives `parse_tool_result`.
-    #[test]
-    fn parse_tool_result_carries_error_reason() {
-        let mut message = MessageBuilder::new_default();
-        {
-            let mut builder = message.init_root::<crate::kaijutsu_capnp::tool_result::Builder>();
-            builder.set_request_id("req-1");
-            builder.set_success(false);
-            builder.set_output("");
-            builder.set_error("redirect: read-only filesystem");
-        }
-        let reader = message
-            .get_root_as_reader::<crate::kaijutsu_capnp::tool_result::Reader>()
-            .unwrap();
-        let result = parse_tool_result(reader).expect("parse_tool_result");
-
-        assert!(!result.success);
-        assert_eq!(result.output, "");
-        assert_eq!(
-            result.error, "redirect: read-only filesystem",
-            "the failure reason must survive the capnp round trip"
         );
     }
 
