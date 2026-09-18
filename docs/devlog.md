@@ -2528,8 +2528,8 @@ paragraph reached the output cap. Source and disposition are archived under
 Validation passed: 3,224 kernel tests (6 ignored), 66 server integration tests,
 154 MCP tests, and workspace all-targets checking.
 After integrating the concurrent benchmark and standalone ACP commits, the
-combined tree passed 3,247 kernel tests (6 ignored), the same 66 server and
-154 MCP tests, and workspace all-targets checking.
+combined tree passed 3,247 kernel tests (6 ignored), 66 server tests and
+156 MCP tests, and workspace all-targets checking.
 
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
