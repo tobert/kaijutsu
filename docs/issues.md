@@ -498,6 +498,39 @@ more readily than other agents". Open, most costly first:
   page within it; `grep` stops at 200 matches without saying how many remain
   (`mcp/servers/file.rs`).
 
+From the first Terminal-Bench 2.0 runs in containers (jobs under
+`~/src/bench-work/harbor/jobs/kj-calib-1`):
+
+- **A truncated tool call fails the whole turn.** On `regex-log` the model's
+  `write` call arrived with its JSON arguments cut off ("EOF while parsing a
+  string at line 1 column 7174"), `runtime/llm_stream.rs` raised "LLM stream
+  error: tool_call input JSON parse failed", the turn failed, and the ACP
+  client saw only "Internal error". The model never learned its call was cut
+  off. Likely cause, not confirmed: the output ceiling (factory `max_tokens`
+  16384 with effort max, so reasoning spends the same budget). Return an
+  error tool result that says the call was cut off and how large it was, and
+  continue the turn; surface the provider's finish reason when it is `length`.
+- **The iteration cap assumes a human is present.** `sqlite-with-gcov` stopped
+  at "Paused after 50 agentic iteration(s) (consent: collaborative). Send a
+  follow-up to continue". A driven worker has nobody to send one. The cap and
+  consent mode want a per-context or per-type setting that a driver can choose;
+  today consent is kernel-wide.
+- **Boot spends about 1.8 s probing an unreachable embedding host**
+  (`kaijutsu-server/src/rpc.rs`, "Embedding service unavailable"; the endpoint
+  comes from `seed_backends.rs`). In a sandbox that is most of the boot. Give
+  the probe a short connect timeout or let a caller skip the semantic index.
+- **`read_shell_operation` cannot tell a dropped operation from an invented
+  id** (`mcp/servers/shell_operations.rs`, "no shell operation <id> in this
+  context"). Two such failures in one run; the model recovered.
+- **`kaijutsu_client::subscriptions` logs "Event channel closed, dropping
+  BlockInserted event"** about fifteen times per run over ACP.
+- **A process the model spawns can read the kernel's environment through
+  `/proc/<pid>/environ`** when it runs as root, which is usual in task
+  containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
+  its dumpable flag, which stops a same-uid reader but not root. A provider key
+  that reaches the kernel by environment is readable there; use a run-scoped
+  key in a disposable container.
+
 Smaller, from the same work:
 
 - `kaijutsu-mcp` and `kaijutsu-acp` each carry a copy of the key-flag
