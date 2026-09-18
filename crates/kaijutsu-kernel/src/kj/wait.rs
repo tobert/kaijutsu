@@ -1,30 +1,13 @@
-//! Wait subcommand: park until a context's turn finishes, and report what it
-//! produced since the caller last looked.
+//! Wait for a context to become idle or for selected work to finish.
 //!
-//! POSIX mental model, completing the quartet: `fork` snapshots, `drive` execs
-//! the child, `wait` joins it. A player that delegates work drives a child and
-//! then parks here until the child's turn reaches a terminal state.
+//! Context waits require both evidence that a turn ran and no accepted turns
+//! left in flight. Terminal events wake the reader and supply outcome details;
+//! the turn registry owns liveness. Subscribe before reading the block log so
+//! a completion between those operations cannot be missed. Quiet polling reads
+//! the log and liveness again when events are lost.
 //!
-//! Two signals, because neither alone is sound:
-//!
-//! * The **flow bus** (`turn.completed` / `turn.failed`) is the fast wake, and
-//!   it is lossy and un-journaled — a completion published before the
-//!   subscription lands is gone with no catch-up. So the subscription is taken
-//!   **before** the first state read, never after.
-//! * Every quiet window re-reads the **block log** (did the turn produce a
-//!   model block) against the kernel's **turn-liveness registry**
-//!   (`Kernel::turn_in_flight` — process-lifetime, not block status; see its
-//!   doc) and resolves the wait when the turn both ran and is no longer in
-//!   flight. This is what makes a dropped completion cost a few seconds
-//!   instead of the whole timeout.
-//!
-//! `.data.resolved_by` says which of the two ended the wait, so a lossy bus
-//! shows up as an observation rather than a mystery.
-//!
-//! The tail is a **window over the durable log**, not a consumed queue: `--since`
-//! advances a cursor the caller owns. Two waiters therefore never steal each
-//! other's records, and nothing ages out under a capacity cap — a bounded
-//! in-memory ring would lose both properties.
+//! The tail is a window over the durable log. `--since` advances a caller-owned
+//! cursor; readers do not consume one another's results.
 
 use clap::{Parser, ValueEnum};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContentType, Role};
@@ -33,13 +16,7 @@ use super::effect::{Classify, Effect};
 use super::refs;
 use super::{KjCaller, KjDispatcher, KjResult};
 
-/// How long the bus must stay quiet before the durable log is re-read.
-///
-/// Long enough that an actively streaming turn never trips it (deltas land far
-/// more often than this), short enough that a dropped completion resolves in
-/// seconds rather than at the timeout. Polling is unconditional on quiet, not
-/// gated on a subscriber-side lag signal: a drop inside the bus leaves the
-/// subscription looking clean-with-a-hole, so a lag-gated recovery never arms.
+/// Maximum interval between state reads while no turn event arrives.
 const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// What a tail entry may carry.
@@ -69,7 +46,7 @@ impl TailFilter {
 #[derive(Parser, Debug)]
 #[command(
     name = "wait",
-    about = "Wait for a turn, shell operation, ask decision, or kaish job.",
+    about = "Wait for a context to finish its accepted turns, a shell operation, an ask decision, or a kaish job.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -81,16 +58,16 @@ pub(crate) struct WaitArgs {
     /// Wait for this ask's decision. Approval may start work that is still running.
     #[arg(long, conflicts_with_all = ["operation", "job", "since"])]
     ask: Option<String>,
-    /// Wait for this kaish job in the target context. Reports its command result;
+    /// Wait for this process-local kaish job in the target context. Reports status and exit code;
     /// use --operation to inspect durable publication and notification status.
     #[arg(long, conflicts_with_all = ["operation", "ask", "since"])]
     job: Option<u64>,
     /// Report only blocks after this one. Pass the `cursor` from a previous
-    /// `kj wait` to page through a long turn without re-reading what you have.
+    /// `kj wait` to read newly added blocks.
     #[arg(long)]
     since: Option<String>,
-    /// Stop parking after this many seconds and report status `running` with
-    /// whatever has landed so far. Waiting again resumes; nothing is lost.
+    /// Stop waiting after this many seconds and report status `running` with
+    /// the current observations. The timeout does not cancel work.
     #[arg(long, default_value_t = 120)]
     timeout: u64,
     /// Keep at most this many blocks in the tail, newest kept.
@@ -239,6 +216,8 @@ impl KjDispatcher {
         let since_key = parsed.since.clone();
         let started = std::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(parsed.timeout);
+        let mut terminal: Option<(&str, String, Option<String>)> = None;
+        let mut bus_open = true;
 
         loop {
             let blocks = match self.blocks.block_snapshots(target) {
@@ -278,6 +257,10 @@ impl KjDispatcher {
             // live LLM round trip during which nothing is `Running` even
             // though the turn is very much still going.
             let in_flight = self.kernel().turn_in_flight(target);
+            if !in_flight && let Some((status, detail, output)) = &terminal {
+                return self.wait_report(target, &blocks, since_idx, &parsed, status,
+                    Some(detail.clone()), output.clone(), "event", started);
+            }
             if turn_ran_and_settled(&blocks, floor, in_flight) {
                 return self.wait_report(
                     target, &blocks, since_idx, &parsed, "completed", None, None, "log", started,
@@ -291,52 +274,24 @@ impl KjDispatcher {
                 );
             }
 
-            // Park on the bus, waking at the quiet window so the durable log is
-            // re-read even when nothing is published.
-            let park = tokio::time::timeout(remaining.min(QUIET), sub.recv()).await;
-            let Ok(Some(msg)) = park else {
-                // Quiet window elapsed, or the bus closed. Either way the next
-                // loop re-reads the log, which is the authority.
+            // A closed or terminated subscription must not turn polling into
+            // a busy loop. The log and turn registry remain readable.
+            if !bus_open {
+                tokio::time::sleep(remaining.min(QUIET)).await;
                 continue;
-            };
-            match msg.payload {
-                crate::flows::TurnFlow::Completed {
-                    context_id,
-                    output_block_id,
-                    reason,
-                    ..
-                } if context_id == target => {
-                    let blocks = self.blocks.block_snapshots(target).unwrap_or(blocks);
-                    return self.wait_report(
-                        target,
-                        &blocks,
-                        since_idx,
-                        &parsed,
-                        "completed",
-                        Some(format!("{reason:?}")),
-                        output_block_id.map(|b| b.to_key()),
-                        "event",
-                        started,
-                    );
-                }
-                crate::flows::TurnFlow::Failed {
-                    context_id, error, ..
-                } if context_id == target => {
-                    let blocks = self.blocks.block_snapshots(target).unwrap_or(blocks);
-                    return self.wait_report(
-                        target,
-                        &blocks,
-                        since_idx,
-                        &parsed,
-                        "failed",
-                        Some(error),
-                        None,
-                        "event",
-                        started,
-                    );
-                }
-                _ => continue,
             }
+            let msg = match tokio::time::timeout(remaining.min(QUIET), sub.recv()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => { bus_open = false; continue; }
+                Err(_) => continue,
+            };
+            terminal = match msg.payload {
+                crate::flows::TurnFlow::Completed { context_id, output_block_id, reason, .. }
+                    if context_id == target => Some(("completed", format!("{reason:?}"), output_block_id.map(|b| b.to_key()))),
+                crate::flows::TurnFlow::Failed { context_id, error, .. }
+                    if context_id == target => Some(("failed", error, None)),
+                _ => continue,
+            };
         }
     }
 
@@ -727,12 +682,9 @@ mod tests {
         assert_eq!(data["blocks"].as_array().unwrap().len(), 2);
     }
 
-    /// The bus is the fast path and must resolve a wait the log alone never
-    /// would — here the turn is marked in flight, exactly as
-    /// runtime admission owns a real one, so the
-    /// log-poll leg can never resolve it on its own.
+    /// Terminal events supply outcome details after the last lease settles.
     #[tokio::test]
-    async fn a_completion_event_resolves_a_wait_the_log_would_never_settle() {
+    async fn a_completion_event_reports_its_detail_after_the_turn_settles() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("child"), None, principal);
@@ -771,6 +723,46 @@ mod tests {
         assert_eq!(data["status"], "completed");
         assert_eq!(data["resolved_by"], "event");
         assert_eq!(data["detail"], "EndTurn");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_does_not_finish_wait_while_another_turn_is_live() {
+        for failed_first in [false, true] {
+            let d = std::sync::Arc::new(test_dispatcher().await);
+            let principal = PrincipalId::new();
+            let context = register_context(&d, Some("overlapping-turns"), None, principal);
+            seed(&d, context, principal, &[(Role::User, BlockKind::Text, Status::Done, "go")]);
+            let first = d.kernel().turns().begin(context);
+            let second = d.kernel().turns().begin(context);
+            let caller = caller_with_context(context);
+            let waiting = d.clone();
+            let mut waiter = tokio::spawn(async move {
+                waiting.dispatch(&[s("wait"), s("--timeout"), s("30")], &caller).await
+            });
+            await_subscriber(&d, "turn.completed").await;
+            let event = if failed_first {
+                crate::flows::TurnFlow::Failed { turn_id: first.id(), context_id: context, principal_id: principal,
+                    error: "first failed".into(), origin: Default::default() }
+            } else {
+                crate::flows::TurnFlow::Completed { turn_id: first.id(), context_id: context, principal_id: principal,
+                    output_block_id: None, reason: crate::flows::TurnStopReason::EndTurn, origin: Default::default() }
+            };
+            d.kernel().turn_flows().publish(event);
+            drop(first);
+            let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter).await;
+            assert!(early.is_err(), "one terminal event cannot finish a wait with another accepted turn");
+            let last_id = second.id();
+            drop(second);
+            d.kernel().turn_flows().publish(crate::flows::TurnFlow::Failed {
+                turn_id: last_id, context_id: context, principal_id: principal,
+                error: "last turn failed".into(), origin: Default::default(),
+            });
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap();
+            let data = data_of(&result);
+            assert_eq!(data["status"], "failed");
+            assert_eq!(data["detail"], "last turn failed");
+            assert_eq!(data["resolved_by"], "event");
+        }
     }
 
     #[tokio::test]
@@ -815,6 +807,35 @@ mod tests {
 
     /// A turn that never starts must return `running` at the deadline, not hang
     /// and not claim success.
+    #[tokio::test]
+    async fn a_terminated_subscription_keeps_polling_without_blocking_turn_completion() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("lost-turn-events"), None, principal);
+        seed(&d, context, principal, &[
+            (Role::User, BlockKind::Text, Status::Done, "go"),
+            (Role::Model, BlockKind::Text, Status::Done, "captured"),
+        ]);
+        let lease = d.kernel().turns().begin(context);
+        let waiting = d.clone();
+        let waiter = tokio::spawn(async move {
+            waiting.dispatch(&[s("wait"), s("--timeout"), s("2")], &caller_with_context(context)).await
+        });
+        await_subscriber(&d, "turn.completed").await;
+        let unrelated = ContextId::new();
+        assert!((0..100_000).any(|_| d.kernel().turn_flows().publish(crate::flows::TurnFlow::Failed {
+            turn_id: kaijutsu_types::TurnId::new(), context_id: unrelated, principal_id: principal,
+            error: "unrelated traffic".into(), origin: Default::default(),
+        }) == 0), "the parked wait subscription must overflow");
+        // The completion must get runtime time even with an already-closed bus.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        drop(lease);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4), waiter).await.unwrap().unwrap();
+        let data = data_of(&result);
+        assert_eq!(data["status"], "completed");
+        assert_eq!(data["resolved_by"], "log");
+    }
+
     #[tokio::test]
     async fn an_unanswered_seed_times_out_to_running() {
         let d = test_dispatcher().await;

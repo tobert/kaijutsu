@@ -275,12 +275,24 @@ a suppressed disposition; audit already running conversations separately.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
-Audit context-level outcome consumers with overlapping turns. `kj wait` checks
-aggregate liveness when polling the log but returns on the first terminal event,
-even if another accepted turn remains. Decide whether it joins one turn or an
-idle context, then align the event and polling paths. Turn events now carry a
-`TurnId`, but clients still clear context activity on a terminal event. Per-turn
-runtime leases and callback IDs fix identity, not these consumer semantics.
+Context removal still requests cancellation through
+`ShellOperationRegistry::cancel_all_for_context`, then deletes metadata and the
+document without joining command settlement. Its test uses a bare kaish job,
+which has no receipt or block projection to expose that race. Audit admission
+fencing and settlement of turns, preparation, pending asks and jobs together;
+simply awaiting one job snapshot would leave new admission races.
+
+`kj wait` now joins an idle context: both event and polling paths require no
+accepted turns left in flight. It retains observed terminal details while
+waiting and uses paced polling after subscription termination. Audit the
+remaining context-level consumers: turn events carry a `TurnId`, but clients
+still clear context activity on a terminal event. Per-turn runtime leases and
+callback IDs fix identity, not these consumer semantics. Context waits still do
+not have durable per-turn outcomes: a failure before any model block plus a
+missed terminal event can time out as running. Stored event detail is only the
+latest observed outcome, not proof that every overlapping turn succeeded.
+The global ledger wake also re-reads an ask on unrelated changes; include
+fairness under continuous event traffic in the resource audit.
 
 ### Shared client recovery
 

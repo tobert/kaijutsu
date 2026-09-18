@@ -350,6 +350,12 @@ These are source observations, not promises that all paths behave alike.
   use kaish's job system with durable Kaijutsu receipts. Earlier notes claiming
   that a temporary shell cannot host work that outlives it are obsolete.
 
+Context-level `kj wait` requires no accepted turns left in flight on both its
+event and polling paths. It retains terminal details while other turns remain;
+a terminated subscription falls back to paced log/liveness polling. Explicit
+job waits report process-local status and exit code, while operation waits
+observe durable receipts. Numeric job IDs are not durable operation handles.
+
 ## Caller migration inventory
 
 Each row must move to the shared integration or have a specific, documented

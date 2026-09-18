@@ -693,3 +693,53 @@ fn performer_reassignment_rejects_a_queued_inference_over_the_wire() {
         server.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
+
+#[test]
+fn context_wait_over_rpc_keeps_waiting_for_overlapping_turns() {
+    run_local(async {
+        let (addr, shared) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "wait-target").await.unwrap();
+        let observer = create_context(&kernel, "wait-observer").await.unwrap();
+        let first = shared.kernel.turns().begin(context);
+        let last = shared.kernel.turns().begin(context);
+        let baseline = shared.kernel.turn_flows().topic_subscribers("turn.completed");
+        let args = ["wait".into(), "--timeout".into(), "10".into(), context.to_hex()];
+        let mut wait = Box::pin(kernel.execute_kj_quiet(observer, &args));
+        tokio::select! {
+            result = &mut wait => panic!("context wait returned before its turns: {result:?}"),
+            subscribed = tokio::time::timeout(Duration::from_secs(3), async {
+                while shared.kernel.turn_flows().topic_subscribers("turn.completed") <= baseline {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }) => subscribed.expect("wire wait must subscribe before events are published"),
+        }
+        let first_id = first.id();
+        drop(first);
+        shared.kernel.turn_flows().publish(kaijutsu_kernel::flows::TurnFlow::Completed {
+            turn_id: first_id, context_id: context, principal_id: PrincipalId::system(), output_block_id: None,
+            reason: kaijutsu_kernel::flows::TurnStopReason::EndTurn, origin: Default::default(),
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut wait).await.is_err(),
+            "the actual client must not see context completion while another accepted turn remains");
+        let last_id = last.id();
+        drop(last);
+        shared.kernel.turn_flows().publish(kaijutsu_kernel::flows::TurnFlow::Failed {
+            turn_id: last_id, context_id: context, principal_id: PrincipalId::system(),
+            error: "last controlled turn failed".into(), origin: Default::default(),
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), wait).await.unwrap().unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        let data = result.data.unwrap();
+        assert_eq!(data["status"], "failed");
+        assert_eq!(data["detail"], "last controlled turn failed");
+        assert_eq!(data["resolved_by"], "event");
+        let help = kernel.execute_kj_quiet(observer, &["wait".into(), "--help".into()]).await.unwrap();
+        assert_eq!(help.exit_code, 0, "{}", help.stderr);
+        println!("{}", help.stdout);
+        drop(kernel);
+        drop(client);
+        shared.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

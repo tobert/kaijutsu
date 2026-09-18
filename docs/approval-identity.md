@@ -243,13 +243,20 @@ keeps earlier conversation content stable while the coder does independent
 work, checkpoints, or signs off. The result must remain discoverable even
 when no model is automatically resumed.
 
-`kj wait` covers a context's model turn by default, or a shell operation with
-`--operation <id>`, an ask with `--ask <id>`, and a native kaish job with
-`--job <integer>` (optionally selecting a context). A wait timeout ends that
-wait only; it neither cancels work
-nor expires an ask. Waiting on an ask's decision and waiting on the approved
-command's completion are distinct conditions. A kaish job reports the captured
-command result. If durable publication fails, the job can finish while its
+`kj wait` waits for its target context to have no accepted turns left in flight
+and evidence that a turn ran. A terminal event cannot finish the wait while
+another turn remains. Events supply the latest observed terminal detail;
+quiet polling uses the block log and live turn registry if events are lost.
+A terminated subscription switches to paced state polling.
+
+Select a shell operation with `--operation <id>`, an ask with `--ask <id>`,
+or a native kaish job with `--job <integer>` (optionally selecting a context).
+Job IDs belong to the current process and context; durable operation IDs remain
+readable after restart or job cleanup. A wait timeout ends that wait only;
+it neither cancels work nor expires an ask. Waiting on an ask's decision and
+waiting on the approved command's completion are distinct conditions. A kaish
+job wait reports status and the captured command exit code. If durable
+publication fails, the job can finish while its
 operation remains pending; use `--operation` to inspect durable completion and
 notification status. Publication failure does not change the command's exit.
 A terminal-result write failure reports `state.retention_error` while the kernel

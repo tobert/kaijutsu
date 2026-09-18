@@ -2358,6 +2358,28 @@ all-targets checking. DeepSeek found no regression. Its claimed infinite
 retention retry was contradicted by the finite one-pass snapshot; admission
 pressure during prolonged faults remains tracked separately.
 
+Context-level `kj wait` now uses the same completion condition on both paths:
+evidence that a turn ran and no accepted turn still in flight. A regression
+showed its event path returning on the first of overlapping turns despite the
+polling path's aggregate liveness check. The reader retains the latest observed
+terminal detail while waiting for idle. It does not infer every turn's success
+from a lossy bus. Event-path block reads now fail explicitly instead of silently
+returning an older snapshot.
+
+A second regression reproduced a terminated subscription busy-looping until
+timeout, preventing the runtime timer that released the turn lease from
+running. Closed subscriptions now use the same paced state polling. Rewrote
+adjacent comments around the actual liveness contract and clarified that job
+waits expose process-local status/exit code while operation IDs are durable.
+Context-removal cancellation without joining/fencing and durable per-turn
+outcome recovery remain recorded work. Validation passed 3,201 kernel tests
+(6 ignored), 12 SSH/RPC tests, and workspace all-targets checking. The new wire
+test verifies overlapping turns and emits `kj wait --help`; its cursor and
+timeout descriptions now avoid promising unbounded history or lossless events.
+DeepSeek review added no confirmed regression. Its fairness and missing-event
+concerns are recorded; its claim that retained terminal detail was discarded
+contradicted the implementation.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It
