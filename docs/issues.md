@@ -433,6 +433,100 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   callsite ownership alongside the ledger test; the contributing factors are
   not established.
 
+## What running under a benchmark showed (2026-09-18)
+
+Harbor's ACP runner drove a coder context on a throwaway kernel with
+deepseek-v4-flash. Evidence, event logs and the code audit:
+`~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`. Recipe:
+`contrib/bench/README.md`. Amy's observation that prompted it: contexts "stop
+more readily than other agents". Open, most costly first:
+
+- **An approved command's output never reaches the model.** On an ask the tool
+  result says nothing was run; after approval the same ACP tool call completes
+  with the real output, but the model only gets the notice built in
+  `runtime/approval_resume.rs` ("It has run"), with no output. The next
+  inference still believed it was blocked and spent about twenty calls looking
+  for its own result: 35 inferences and 1.09M input tokens against 9 and 173K
+  for the same task with the commands allowed. Fold the settled output into
+  the notice, or make the settled pair visible to the next hydration.
+- **A turn can end before its ask is offered.** A mock turn raised an ask and
+  ended about 70 ms later; the ask-to-decision round trip measured 337 ms. The
+  ask stayed pending, the command never ran, and the ACP client saw no
+  permission request. Nothing holds the turn, or `session/prompt`, open for an
+  ask the turn raised. `contrib/bench/analysis/classify_run.py` reports these
+  as `asks_orphaned`.
+- **The waiting receipt is ambiguous.** `runtime/llm_stream.rs` returns "the
+  command has not run" with `is_error=false` and `Status::Done`; the ACP
+  status is `failed` in one phrasing and `completed` in another. A model
+  reading the text stops; one reading the status assumes it ran. The refusal
+  remedy (`kaijutsu-types/src/refusal.rs`) tells the reader to run
+  `kj ledger allow`, which a model cannot do for itself.
+- **Shell is asynchronous by default, and foreground is not a free fix.**
+  `mcp/servers/shell.rs` defaults `foreground` to false, so every command
+  costs a second `kj wait` call to read. The broker call timeout is 120 s for
+  `shell` and 315 s for `shell_write` (`mcp/policy.rs`), and on expiry the
+  model gets plain text with no partial output. A foreground default for the
+  coder type has to move with a larger `call_timeout` and partial output on
+  timeout.
+- **Any text with no tool call ends the turn** (`runtime/llm_stream.rs`, "no
+  tool calls this iteration"). There is no completion command, no check of
+  unfinished plan items and no continuation nudge. Direction from Amy: "a done
+  signal sounds right"; coder "will almost always be a subagent being driven
+  by a banto", so the coder rc can carry the delegated-worker contract and the
+  done signal reports to the driving context.
+- **The coder stance names yielding as a normal step**
+  (`assets/defaults/rc/coder/create/S00-stance.kai`, "Before yielding or
+  signing off…"), against one weaker persistence sentence in
+  `lib/create/S00-base.md`. A fresh coder seat is about 46,000 input tokens
+  before any work.
+- **Shell output is capped at 8 KiB**, keeping 1024 B of head and 512 B of
+  tail, with the exit code remapped to 3 on spill
+  (`runtime/embedded_kaish.rs`, `runtime/command_result.rs`). A failing test
+  suite is mostly unreadable to the model.
+- **`max_tokens` ends the turn** with no automatic continuation.
+- **No cumulative token count.** `context_usage` is a last-call snapshot, no
+  real run emitted an ACP `usage_update`, and `PromptResponse.usage` is unset,
+  so Harbor's token columns are empty. Totals come from the kernel log's
+  `LLM stream completed` lines today.
+- **ACP has no model selection.** Harbor's runner raises when `--model` is
+  passed and the agent advertises none; the model is chosen through the
+  agent's own flags meanwhile.
+- **ACP `mcpServers` are ignored** with a warning
+  (`crates/kaijutsu-acp/src/lib.rs`, `warn_ignored_mcp_servers`), which blocks
+  MCPMark and any task that ships MCP servers.
+- **Observed once, not isolated:** an approval-resumed statement with a `>`
+  redirect left a 0-byte file while the output sat in a block.
+- **File tools:** `read` truncates a line at 2000 characters with no way to
+  page within it; `grep` stops at 200 matches without saying how many remain
+  (`mcp/servers/file.rs`).
+
+Smaller, from the same work:
+
+- `kaijutsu-mcp` and `kaijutsu-acp` each carry a copy of the key-flag
+  resolution and the personal-key warning. Both are pure and belong beside
+  `KeySource` in `kaijutsu-client`.
+- `kaijutsu-mcp` names its context flag `--context-name`; `kaijutsu-acp` uses
+  `--context-type` and `--character`. There is still no way to run one `kj`
+  command against a kernel from a shell without speaking MCP or ACP;
+  `contrib/bench/kjmcp.py` fills that gap for the harness.
+- Provider HTTPS verifies through `rustls-platform-verifier`, which reads the
+  on-disk CA bundle with no bundled fallback. A static binary in an image
+  without `ca-certificates` fails every model call.
+- Static builds: `contrib/bench/Containerfile.static` duplicates the root
+  `Containerfile`'s build stage. Amy prefers static binaries for deployment.
+  Put the per-target link flags in `.cargo/config.toml`
+  (`[target.x86_64-unknown-linux-musl]`; a blanket `RUSTFLAGS` breaks
+  proc-macro crates), build the root image static, export the binaries from
+  it, and delete the second Containerfile. Measure musl's allocator under load
+  before a static kernel serves real work.
+- `crates/kaijutsu-server/src/rpc.rs` has a comment naming
+  `spawn_signal_checkpoint`; the function is `spawn_signal_shutdown`.
+- Harbor drives podman through `podman compose` and passes
+  `--project-directory`, which podman-compose does not accept; the local fix
+  is Docker Compose v2 as podman's compose provider
+  (`~/src/bench-work/harbor/NOTES.md`). Worth reporting upstream; ask Amy
+  first.
+
 ## The uncovered tier does not reach a `KjVerb` ask (2026-09-18)
 
 `gate.toml`'s `uncovered = "allow"` (`docs/gate-policy-tuning.md`, "The
