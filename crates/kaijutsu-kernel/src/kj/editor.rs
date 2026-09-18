@@ -121,6 +121,7 @@ impl KjDispatcher {
 
         let kernel = self.kernel();
         // Preserve invocation identity for `fg` and later shell reads;
+        // each later edit still carries its own input actor below.
         // a caller with no joined context degrades to a headless-style open.
         let opener = caller.context_id.map(|context_id| crate::editor::EditorOpener {
             principal: caller.principal_id,
@@ -148,7 +149,7 @@ impl KjDispatcher {
                 // it through; the kernel refuses a write intent at the point
                 // its own state machine finds one, not before.
                 let can_write = self.require_cap(caller, write_cap(), "editor keys").is_ok();
-                match kernel.editor_keys_checked(id, &keys, can_write).await {
+                match kernel.editor_keys_checked(id, &keys, caller.actor_id, can_write).await {
                     Ok(st) => {
                         // A dialect-level failure (bad `:cmd`, dirty-`:q` refusal,
                         // failed `:r`) rides the status line, not the error path —
@@ -170,7 +171,7 @@ impl KjDispatcher {
                 let id = EditorSessionId::from_u64(session);
                 // Synchronous, ungated — a paste carries no write intent, the
                 // same as a plain `keys` edit (see `write_cap`'s doc comment).
-                match kernel.editor_insert(id, &text) {
+                match kernel.editor_insert(id, &text, caller.actor_id) {
                     Ok(st) => {
                         // A refusal (the `:` line is open) rides the status
                         // line, not the error path — same as `Keys`.
@@ -222,7 +223,7 @@ impl KjDispatcher {
             }
             EditorCommand::Quit { session } => {
                 let id = EditorSessionId::from_u64(session);
-                match kernel.editor_quit(id) {
+                match kernel.editor_quit(id, caller.actor_id) {
                     Ok(()) => KjResult::ok(format!(
                         "session {session}: closed (rolled back to checkpoint)"
                     )),
@@ -419,6 +420,79 @@ mod tests {
             }
             other => panic!("expected ok-with-data, got {other:?}"),
         }
+    }
+
+    /// A shared editor keeps its opener for `:r !` reads, but each edit is
+    /// attributed to the player who submitted that input.
+    #[tokio::test]
+    async fn kj_editor_attributes_shared_input_to_the_current_actor() {
+        use kaijutsu_types::PrincipalId;
+
+        let d = test_dispatcher_rc().await;
+        let opener = test_caller();
+        let actor = PrincipalId::new();
+        let editor = opener.clone().with_actor(actor, opener.reviewer_id);
+        let s = |v: &str| v.to_string();
+
+        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &opener)
+            .await;
+        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &opener).await;
+        let id = session_of(&opened);
+        let target = crate::editor::resolve_editor_target(P, d.kernel().file_cache())
+            .await
+            .expect("opened editor target");
+        let text = || {
+            d.block_store()
+                .get(target.context_id)
+                .expect("editor document")
+                .doc
+                .block_text(&target.block_id)
+                .expect("editor block")
+        };
+
+        let keyed = d
+            .dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &editor)
+            .await;
+        assert!(matches!(keyed, KjResult::Ok { .. }), "keys failed: {keyed:?}");
+        assert_eq!(text(), "Xhello", "keys must change the block");
+
+        assert_eq!(
+            d.block_store().get(target.context_id).expect("editor document").doc.principal_id(),
+            actor,
+            "the input actor, not the editor opener, owns the mirrored edit"
+        );
+
+        let pasted = d
+            .dispatch(&[s("editor"), s("insert"), id.to_string(), s("paste")], &editor)
+            .await;
+        assert!(matches!(pasted, KjResult::Ok { .. }), "paste failed: {pasted:?}");
+        assert!(text().contains("paste"), "paste must change the block: {}", text());
+        assert_eq!(
+            d.block_store().get(target.context_id).expect("editor document").doc.principal_id(),
+            actor,
+            "the input actor owns a pasted edit"
+        );
+
+        let before_read = text().len();
+        let read = d
+            .dispatch(&[s("editor"), s("keys"), id.to_string(), format!(":r {P}<CR>")], &editor)
+            .await;
+        assert!(matches!(read, KjResult::Ok { .. }), ":r failed: {read:?}");
+        assert!(text().len() > before_read, ":r must splice file content: {}", text());
+        assert_eq!(
+            d.block_store().get(target.context_id).expect("editor document").doc.principal_id(),
+            actor,
+            "the input actor owns the asynchronous :r splice"
+        );
+
+        let quit = d.dispatch(&[s("editor"), s("quit"), id.to_string()], &editor).await;
+        assert!(matches!(quit, KjResult::Ok { .. }), "quit failed: {quit:?}");
+        assert_eq!(text(), "hello", "quit must restore the original block");
+        assert_eq!(
+            d.block_store().get(target.context_id).expect("editor document").doc.principal_id(),
+            actor,
+            "the input actor owns a rollback that rewrites the block"
+        );
     }
 
     /// `kj editor insert` refuses while the `:` command line is open — the

@@ -454,6 +454,14 @@ Notification hook evaluation and its final block insertion share one runtime
 owner; dropping a notification producer does not discard accepted evaluation.
 Cancellation suppresses that emission after cleanup.
 
+Adapter writes also carry the performing identity. `/v/docs` uses the shell's
+performer and the block store's atomic whole-text replacement. Editor input
+uses its current actor through keys, paste, asynchronous read insertion, and
+rollback. The opener remains the owner of `:r !` execution; the read result's
+insertion belongs to whoever submitted the keys. RPC input uses the connection
+principal and `kj editor` uses its invoking performer. Original block IDs and
+authors remain unchanged. Durable per-edit provenance remains separate work.
+
 ## Caller migration inventory
 
 Each row must move to the shared integration or have a specific, documented

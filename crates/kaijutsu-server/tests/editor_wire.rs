@@ -1,12 +1,7 @@
-//! e2e: the in-app editor **wire surface** — capnp `editorOpen`/`editorKeys`/
-//! `editorState`/`editorSave`/`editorQuit` + the `subscribeEditor` push channel.
+//! Editor RPCs and push updates through a real SSH connection.
 //!
-//! Drives a real SSH + Cap'n Proto round-trip end to end, no GUI — vi.md slice-2
-//! step 1a. The kernel-local editor semantics are already covered headless
-//! (`kaijutsu-kernel`); this proves the same surface survives the wire AND that
-//! a state change reaches a subscriber over the push channel (the reason the
-//! editor channel is push, not poll). The concurrent remote-merge push is step
-//! 1b (needs `EditorCore::apply_remote_ops`) and is tested there.
+//! The kernel owns editor state. These tests verify remote input, file reads,
+//! shared input attribution, rollback, and updates delivered to renderers.
 
 mod common;
 use common::{create_context};
@@ -21,6 +16,45 @@ use kaijutsu_client::{EditorState, PeerConfig, ServerEvent, editor_events_channe
 /// A script the server seeds into rc on a fresh kernel — guaranteed to
 /// exist, so `editorOpen` binds to a real block backing an rc host file.
 const RC_PATH: &str = "/config/rc/coder/create/S00-stance.kai";
+
+#[test]
+fn shared_editor_input_and_rollback_use_the_authenticated_player() {
+    run_local(async {
+        let (addr, owner) = common::start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (handle, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&handle, "editor-input-actor").await.unwrap();
+        let actor = owner.kernel_db.lock().get_context(context).unwrap().unwrap().created_by;
+        let opener = kaijutsu_types::PrincipalId::new();
+        assert_ne!(actor, opener);
+        let (session, initial) = owner.kernel.editor_open_as(RC_PATH, Some(kaijutsu_kernel::editor::EditorOpener {
+            principal: opener, performer: opener, reviewer: None, context_id: context,
+            session_id: kaijutsu_types::SessionId::new(),
+        })).await.unwrap();
+        let target = kaijutsu_kernel::editor::resolve_editor_target(RC_PATH, owner.kernel.file_cache())
+            .await.unwrap();
+        let original = owner.documents.get_non_draft_snapshot(target.context_id, &target.block_id)
+            .unwrap().unwrap().content;
+        let assert_actor = || assert_eq!(owner.documents.get(target.context_id).unwrap().doc.principal_id(), actor,
+            "a shared editor mutation must use its current input actor, not the opener or store default");
+
+        let state = handle.editor_keys(session.as_u64(), "iKEY<Esc>").await.unwrap();
+        assert!(state.text.starts_with("KEY"));
+        assert_actor();
+        let state = handle.editor_insert(session.as_u64(), "PASTE").await.unwrap();
+        assert!(state.text.contains("PASTE"));
+        assert_actor();
+        let state = handle.editor_keys(session.as_u64(), &format!(":r {RC_PATH}<CR>")).await.unwrap();
+        assert!(state.text.len() > initial.text.len());
+        assert_actor();
+        handle.editor_quit(session.as_u64()).await.unwrap();
+        assert_actor();
+        let restored = owner.documents.get_non_draft_snapshot(target.context_id, &target.block_id)
+            .unwrap().unwrap();
+        assert_eq!(restored.content, original);
+        owner.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
 
 /// Drain the editor push channel until a `EditorStateChanged` arrives (or fail
 /// loud on timeout — a missing push is the bug this test exists to catch).

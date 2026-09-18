@@ -386,30 +386,13 @@ impl KernelBackend for KaijutsuBackend {
                     )));
                 }
 
-                // For blocks, we need to replace the content
-                // First get current content length, then edit
-                let current_len = {
-                    let entry = self.blocks.get(ctx_id).ok_or_else(|| {
-                        BackendError::NotFound(format!("document not found: {}", ctx_id.to_hex()))
-                    })?;
-                    let blocks: Vec<_> = entry.doc.blocks_ordered().into_iter()
-                    .filter(|b| b.status != Status::Draft).collect();
-                    blocks
-                        .iter()
-                        .find(|b| b.id == block_id)
-                        .map(|b| b.content.chars().count())
-                        .ok_or_else(|| {
-                            BackendError::NotFound(format!(
-                                "block not found: {}",
-                                block_id.to_key()
-                            ))
-                        })?
-                };
-
-                // Delete all content then insert new content
-                self.blocks
-                    .edit_text(ctx_id, &block_id, 0, content_str, current_len)
-                    .map_err(|e| BackendError::Io(e.to_string()))?;
+                self.blocks.get_non_draft_snapshot(ctx_id, &block_id)
+                    .map_err(|error| BackendError::Io(error.to_string()))?
+                    .ok_or_else(|| BackendError::NotFound(format!("block not found: {}", block_id.to_key())))?;
+                // Resolve the replacement length under the store's mutation
+                // guard, preserving the performing identity and original block id.
+                self.blocks.replace_text_as(ctx_id, &block_id, content_str, Some(self.identity.performer))
+                    .map_err(|error| BackendError::Io(error.to_string()))?;
 
                 Ok(())
             }
@@ -1098,6 +1081,31 @@ mod tests {
         assert_eq!(backend.read(Path::new(&path), None).await.unwrap(), b"unfinished");
     }
 
+    #[tokio::test]
+    async fn docs_filesystem_writes_as_the_performer_and_preserves_the_block_author() {
+        use kaish_kernel::vfs::Filesystem;
+        let context = ContextId::new();
+        let requester = PrincipalId::new();
+        let performer = PrincipalId::new();
+        let (backend, _, _, _) = discovery_backend_as(ShellIdentity {
+            requester, performer, reviewer: None, context, session: SessionId::new(),
+        }).await;
+        let blocks = backend.blocks.clone();
+        blocks.create_document(context, DocKind::Conversation, None).unwrap();
+        let block = blocks.insert_block(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "original", Status::Done,
+            kaijutsu_types::ContentType::Plain).unwrap();
+        assert_eq!(block.principal_id, requester);
+        let filesystem = super::super::docs_filesystem::KaijutsuFilesystem::new(Arc::new(backend));
+        let path = std::path::PathBuf::from(format!("/{}/{}", context.to_hex(), block.to_key()));
+        filesystem.write(&path, "改善".as_bytes()).await.unwrap();
+        assert_eq!(blocks.get(context).unwrap().doc.principal_id(), performer,
+            "the live mutation must use the invoking performer, not the store default");
+        let edited = blocks.get_non_draft_snapshot(context, &block).unwrap().unwrap();
+        assert_eq!(edited.content, "改善");
+        assert_eq!(edited.id.principal_id, requester, "editing must preserve the block's original author");
+    }
+
     /// `append`/`patch` are unreachable through any live mount (see the doc
     /// comment on both methods) — pins that they refuse rather than silently
     /// no-op or panic now that their storage-backed bodies are gone.
@@ -1120,9 +1128,8 @@ mod tests {
         assert!(matches!(err, BackendError::InvalidOperation(_)));
     }
 
-    /// Overwriting a block replaces every character, not every byte: the
-    /// delete count handed to `edit_text` is in chars, so a block holding
-    /// multi-byte text must not trip the position guard or leave a tail.
+    /// A whole-block replacement preserves UTF-8 boundaries and removes all
+    /// previous text, including multibyte characters.
     #[tokio::test]
     async fn overwrite_of_a_multibyte_block_replaces_the_whole_block() {
         let ctx_id = ContextId::new();

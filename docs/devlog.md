@@ -2649,6 +2649,29 @@ scenario remains green alongside the new hook lifecycle cases. The emitted
 hook schemas were read from the compiled server. Workspace all-targets and
 diff checks passed.
 
+Editor keys, paste, asynchronous read insertion, and rollback now carry the
+current input actor through the kernel and block store. A shared session keeps
+its opener for shell reads and `fg`; opening it does not confer authorship of
+another player's later input. KJ uses the invoking performer and RPC uses the
+authenticated connection principal. `/v/docs` writes use the performer and the
+store's atomic whole-text replacement. Original block authors remain unchanged;
+durable per-edit provenance is still a separate recorded follow-up.
+
+Regression tests first failed on the discarded actor, then passed through KJ,
+the filesystem adapter, and actual SSH editor input. Source-execution coverage
+also checks that all three editor front doors retain the opener for `:r !`
+while inserting as the current input actor. Validation passed: 3,286 kernel
+tests (6 ignored), 14 SSH editor tests, workspace all-targets, and diff checks.
+The emitted editor help was read. Six socket fixtures required local socket
+access after the sandbox denied their first run.
+
+Kaibo/DeepSeek Flash found no confirmed regression (60,955 input / 824 output
+tokens). Its observation that save has no actor needs no change: save flushes
+a file and checkpoints the editor without mutating a block. Local tests cover
+the read execution and frontend paths omitted from the review excerpt. Review
+and disposition are in
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/edit-actor-*`.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

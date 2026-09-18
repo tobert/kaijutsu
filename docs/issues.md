@@ -126,19 +126,19 @@ retain that finding for the adapter audit instead of treating an empty result
 as proof that loading succeeded.
 
 Kaibo's identity review found remaining adapter policy/provenance gaps:
-- `/v/docs` writes and editor mirrors call `edit_text` with the store's default
-  principal. Carry the mutation performer's identity. For shared editor input,
-  distinguish the player making the edit from the opener retained for shell
-  reads; blindly attributing every edit to the opener would be wrong too.
-  `edit_text_as` currently records that principal only in the in-memory document;
-  `TextEdit`/`SyncPayload` and persisted snapshots do not retain an edit actor.
-  Carrying identity through adapters does not supply durable mutation provenance.
-  A persisted mutation audit record is separate follow-up work.
+- Adapter writes now carry their current performer; shared editor input keeps
+  its actor distinct from the opener used for shell reads. Mutation provenance
+  is still only live state: `TextEdit`/`SyncPayload` and persisted snapshots
+  do not retain an edit actor. A persisted mutation audit record remains
+  separate follow-up work.
 - `img_block_from_path` uses host `std::fs::read`, bypassing the shared mount
   namespace. Route it through the existing file/CAS integration.
 - `runtime/docs_filesystem.rs::docs_path` claims to normalize parent
   components but drops them: `a/../b` becomes `a/b`. Audit the adapter against
   kaish VFS path normalization before changing this separate path contract.
+- `KaijutsuBackend::write` treats a document-directory target as creation and
+  discards the supplied bytes. Audit reachability through the VFS and define
+  its directory-write contract; acknowledging discarded content is misleading.
 Review evidence and disposition are under
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 

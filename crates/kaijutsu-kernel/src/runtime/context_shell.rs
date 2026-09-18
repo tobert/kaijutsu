@@ -494,7 +494,10 @@ mod tests {
             let session = crate::editor::EditorSessionId::from_u64(data["session"].as_u64().unwrap());
             // Later shell switches do not retarget an existing editor's read.
             kaish.set_context_id(initial);
-            let state = d.kernel().editor_keys(session, ":r !kj block create --role user --kind text --content editor-performer; identity-probe<CR>").await.unwrap();
+            let state = d.kernel().editor_keys(session, ":r !kj block create --role user --kind text --content editor-performer; identity-probe<CR>", requester).await.unwrap();
+            let target = crate::editor::resolve_editor_target("/config/kernel/identity-editor.txt", d.kernel().file_cache()).await.unwrap();
+            assert_eq!(d.block_store().get(target.context_id).unwrap().doc.principal_id(), requester,
+                "the shell read keeps the opener identity, but its insertion belongs to the current input actor");
             let blocks = d.block_store().block_snapshots(switched).unwrap();
             let block = blocks.iter().find(|block| block.content == "editor-performer")
                 .unwrap_or_else(|| panic!("{front_door}: read must author in context at open; {:?}", state.message));

@@ -6,6 +6,12 @@ tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
 third *driver* of it. Same surface for all three.
 
+Every input mutation carries the current player's identity. `kj editor` uses
+its invoking performer; RPC keys, paste, and rollback use the authenticated
+connection's principal. Opening a shared editor does not make its opener the
+author of later players' edits. The original block author stays unchanged.
+This is live mutation attribution; durable per-edit audit remains separate.
+
 ## Underneath: file buffers
 
 The editor sits on the file-buffer layer — how kaijutsu holds file content, and
@@ -400,7 +406,8 @@ push channel; the app renders it read-only.
 - **Read:** `:r <file>` reads through `FileDocumentCache::try_read_content`.
   `:r !cmd` runs on the kernel runtime with the requester, performer, reviewer,
   session, and context captured when the editor opened. Later shell navigation
-  does not retarget the read. Both splice
+  does not retarget the read. The player who submits the keys owns the resulting
+  text insertion, even when another player opened the editor. Both splice
   **at the cursor**, rather than below its line. Accepted spellings also include
   `:read <file>`, `:read !cmd`, and the adjacent-bang `:r!cmd`.
   A missing file, denied or failed command, invalid UTF-8, or truncated output

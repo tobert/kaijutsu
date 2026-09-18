@@ -1394,8 +1394,9 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
+        actor: PrincipalId,
     ) -> Result<crate::editor::EditorState, String> {
-        self.editor_keys_checked(id, keys, true).await
+        self.editor_keys_checked(id, keys, actor, true).await
     }
 
     /// [`editor_keys`](Self::editor_keys), gated: `can_write` is the caller's
@@ -1410,6 +1411,7 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
         keys: &str,
+        actor: PrincipalId,
         can_write: bool,
     ) -> Result<crate::editor::EditorState, String> {
         let blocks = self.blocks();
@@ -1424,7 +1426,7 @@ impl Kernel {
             // Captured now (session still exists) — `Closed` outcomes below
             // drop the session before the kernel ever sees it again.
             let file_path = sessions.0.session_path(id);
-            let outcome = sessions.0.keys_checked(id, keys, blocks, can_write)?;
+            let outcome = sessions.0.keys_checked(id, keys, blocks, actor, can_write)?;
             let io = if matches!(outcome, crate::editor::KeysOutcome::Updated(_)) {
                 sessions.0.take_io(id)
             } else {
@@ -1454,7 +1456,7 @@ impl Kernel {
                     let at = io_cursor.unwrap_or(0);
                     let state = {
                         let mut sessions = self.editor_sessions.lock();
-                        sessions.0.insert_text(id, &content, at, blocks)?
+                        sessions.0.insert_text(id, &content, at, blocks, actor)?
                     };
                     state
                 }
@@ -1609,11 +1611,12 @@ impl Kernel {
         &self,
         id: crate::editor::EditorSessionId,
         text: &str,
+        actor: PrincipalId,
     ) -> Result<crate::editor::EditorState, String> {
         let blocks = self.blocks();
         let mut sessions = self.editor_sessions.lock();
         let file_path = sessions.0.session_path(id);
-        let state = sessions.0.insert_at_cursor(id, text, blocks)?;
+        let state = sessions.0.insert_at_cursor(id, text, blocks, actor)?;
         drop(sessions);
         if let Some(fp) = file_path.as_deref()
             && state.dirty
@@ -1746,11 +1749,15 @@ impl Kernel {
     /// that changes the block without flushing marks it dirty — this is one
     /// of them. Only fires when the block genuinely changed — a no-op
     /// rollback must not spuriously dirty an already-clean entry.
-    pub fn editor_quit(&self, id: crate::editor::EditorSessionId) -> Result<(), String> {
+    pub fn editor_quit(
+        &self,
+        id: crate::editor::EditorSessionId,
+        actor: PrincipalId,
+    ) -> Result<(), String> {
         let (file_path, rolled_back) = {
             let mut sessions = self.editor_sessions.lock();
             let file_path = sessions.0.session_path(id);
-            let rolled_back = sessions.0.quit(id, self.blocks())?;
+            let rolled_back = sessions.0.quit(id, self.blocks(), actor)?;
             (file_path, rolled_back)
         };
         let mark_err = if rolled_back
@@ -2278,14 +2285,14 @@ mod tests {
         // Open → type → state reflects, all through the kernel surface.
         let (id, st) = kernel.editor_open(path).await.unwrap();
         assert_eq!(st.text, "hello");
-        let st = kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        let st = kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(st.text, "Xhello");
         assert!(st.dirty);
         assert_eq!(kernel.editor_state(id).unwrap().text, "Xhello");
 
         // ZQ rolls the block back and closes the session.
-        kernel.editor_quit(id).unwrap();
-        let err = kernel.editor_keys(id, "x").await.unwrap_err();
+        kernel.editor_quit(id, kaijutsu_types::PrincipalId::system()).unwrap();
+        let err = kernel.editor_keys(id, "x", kaijutsu_types::PrincipalId::system()).await.unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
     }
 
@@ -2303,10 +2310,10 @@ mod tests {
         assert_eq!(st.text, "ab");
 
         // Enter insert mode (no Esc) before the paste lands.
-        let st = kernel.editor_keys(id, "i").await.unwrap();
+        let st = kernel.editor_keys(id, "i", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(st.mode.as_deref(), Some("-- INSERT --"));
 
-        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        let st = kernel.editor_insert(id, "PASTE", kaijutsu_types::PrincipalId::system()).unwrap();
         assert_eq!(st.text, "PASTEab", "the text lands at the cursor");
         assert_eq!(
             st.mode.as_deref(),
@@ -2325,7 +2332,7 @@ mod tests {
         let (id, st) = kernel.editor_open(path).await.unwrap();
         assert_eq!(st.mode, None, "starts in normal mode");
 
-        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        let st = kernel.editor_insert(id, "PASTE", kaijutsu_types::PrincipalId::system()).unwrap();
         assert_eq!(st.text, "PASTEab", "the text lands at the cursor");
         assert_eq!(
             st.mode, None,
@@ -2340,7 +2347,7 @@ mod tests {
         let path = "/config/rc/coder/create/S00.kai";
 
         let (id, _) = kernel.editor_open(path).await.unwrap();
-        let st = kernel.editor_insert(id, "one\ntwo\nthree\n").unwrap();
+        let st = kernel.editor_insert(id, "one\ntwo\nthree\n", kaijutsu_types::PrincipalId::system()).unwrap();
         assert_eq!(st.text, "one\ntwo\nthree\nend");
     }
 
@@ -2351,7 +2358,7 @@ mod tests {
         let path = "/config/rc/coder/create/S00.kai";
 
         let (id, _) = kernel.editor_open(path).await.unwrap();
-        let st = kernel.editor_insert(id, "X").unwrap();
+        let st = kernel.editor_insert(id, "X", kaijutsu_types::PrincipalId::system()).unwrap();
 
         let info = kernel
             .editor_list()
@@ -2378,10 +2385,10 @@ mod tests {
 
         let (id, _) = kernel.editor_open(path).await.unwrap();
         // Open the ':' bar without submitting.
-        let st = kernel.editor_keys(id, ":").await.unwrap();
+        let st = kernel.editor_keys(id, ":", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(st.command_line.as_deref(), Some(":"));
 
-        let st = kernel.editor_insert(id, "PASTE").unwrap();
+        let st = kernel.editor_insert(id, "PASTE", kaijutsu_types::PrincipalId::system()).unwrap();
         assert_eq!(st.text, "ab", "the buffer is untouched while ':' is open");
         assert!(
             st.message.is_some(),
@@ -2410,9 +2417,9 @@ mod tests {
         assert_eq!(st.text, "AB");
 
         // Move the cursor one char right (between A and B), then `:r` the file.
-        kernel.editor_keys(id, "l").await.unwrap();
+        kernel.editor_keys(id, "l", kaijutsu_types::PrincipalId::system()).await.unwrap();
         let after = kernel
-            .editor_keys(id, &format!(":r {read_path}<CR>"))
+            .editor_keys(id, &format!(":r {read_path}<CR>"), kaijutsu_types::PrincipalId::system())
             .await
             .unwrap();
         assert_eq!(after.text, "AINSERTEDB", "file content spliced at the cursor");
@@ -2493,7 +2500,7 @@ mod tests {
             .unwrap();
         // `:r !echo hi` splices the command's stdout at the cursor (buffer top).
         let state = kernel
-            .editor_keys(id, ":r !echo hi<CR>")
+            .editor_keys(id, ":r !echo hi<CR>", kaijutsu_types::PrincipalId::system())
             .await
             .unwrap();
         assert!(
@@ -2515,7 +2522,7 @@ mod tests {
         install_rc_script_file(&d, path, "unchanged").await;
         let opener = crate::editor::EditorOpener { principal, performer: principal, reviewer: None, context_id, session_id: kaijutsu_types::SessionId::new() };
         let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
-        let state = d.kernel().editor_keys(id, ":r !echo '/w==' | base64 -d<CR>").await.unwrap();
+        let state = d.kernel().editor_keys(id, ":r !echo '/w==' | base64 -d<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(state.text, "unchanged", "invalid UTF-8 must not become replacement characters");
         assert!(state.message.as_deref().unwrap_or("").contains("UTF-8"), "{:?}", state.message);
         assert!(!state.dirty);
@@ -2534,7 +2541,7 @@ mod tests {
         let opener = crate::editor::EditorOpener { principal, performer: principal, reviewer: None, context_id, session_id: kaijutsu_types::SessionId::new() };
         let (id, _) = d.kernel().editor_open_as(path, Some(opener)).await.unwrap();
         d.kernel().shutdown_runtime_worker().await.unwrap();
-        let state = d.kernel().editor_keys(id, ":r !echo must-not-run<CR>").await.unwrap();
+        let state = d.kernel().editor_keys(id, ":r !echo must-not-run<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(state.text, "unchanged", "shutdown forbids new editor shell execution");
         assert!(state.message.as_deref().unwrap_or("").contains("shut down"), "{:?}", state.message);
         assert!(!state.dirty);
@@ -2555,7 +2562,7 @@ mod tests {
             .await
             .unwrap();
         let state = kernel
-            .editor_keys(id, ":r !date<CR>")
+            .editor_keys(id, ":r !date<CR>", kaijutsu_types::PrincipalId::system())
             .await
             .expect("a failed :r does not error the RPC");
         let msg = state.message.as_deref().expect("the failure reports on the status line");
@@ -2580,7 +2587,7 @@ mod tests {
             .await
             .unwrap();
         let state = kernel
-            .editor_keys(id, ":r /nope/missing.txt<CR>")
+            .editor_keys(id, ":r /nope/missing.txt<CR>", kaijutsu_types::PrincipalId::system())
             .await
             .expect("a missing :r file does not error the RPC");
         assert!(
@@ -2589,7 +2596,7 @@ mod tests {
         );
         assert_eq!(state.text, "hi", "the buffer is untouched");
         // The session is alive and the message is transient.
-        let state = kernel.editor_keys(id, "l").await.unwrap();
+        let state = kernel.editor_keys(id, "l", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(state.message.is_none(), "message clears on the next batch");
     }
 
@@ -2629,7 +2636,7 @@ mod tests {
             "opening clean must not mark anything dirty"
         );
 
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         let rows = kernel.kernel_db().lock().list_dirty_file_buffers().unwrap();
         assert!(
@@ -2649,7 +2656,7 @@ mod tests {
         kernel.vfs().write_all(path, b"hello").await.unwrap();
 
         let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         // Not on disk yet — only `:w` flushes.
         assert_eq!(
             kernel.vfs().read_all(path).await.unwrap(),
@@ -2657,7 +2664,7 @@ mod tests {
             "an edit alone must not reach disk"
         );
 
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(!st.dirty, ":w clears the editor's own dirty flag");
         assert_eq!(
             String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
@@ -2687,8 +2694,8 @@ mod tests {
         let path_a = Path::new("/mem/a.txt");
         kernel.vfs().write_all(path_a, b"hello").await.unwrap();
         let (id_a, _) = kernel.editor_open("/mem/a.txt").await.unwrap();
-        kernel.editor_keys(id_a, "iX<Esc>").await.unwrap();
-        kernel.editor_keys(id_a, ":wq<CR>").await.unwrap();
+        kernel.editor_keys(id_a, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        kernel.editor_keys(id_a, ":wq<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(
             String::from_utf8(kernel.vfs().read_all(path_a).await.unwrap()).unwrap(),
             "Xhello",
@@ -2699,8 +2706,8 @@ mod tests {
         let path_b = Path::new("/mem/b.txt");
         kernel.vfs().write_all(path_b, b"hello").await.unwrap();
         let (id_b, _) = kernel.editor_open("/mem/b.txt").await.unwrap();
-        kernel.editor_keys(id_b, "iY<Esc>").await.unwrap();
-        kernel.editor_keys(id_b, "ZZ").await.unwrap();
+        kernel.editor_keys(id_b, "iY<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        kernel.editor_keys(id_b, "ZZ", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(
             String::from_utf8(kernel.vfs().read_all(path_b).await.unwrap()).unwrap(),
             "Yhello",
@@ -2739,7 +2746,7 @@ mod tests {
         kernel.vfs().write_all(path, b"hello").await.unwrap();
 
         let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(
             kernel
                 .kernel_db()
@@ -2794,7 +2801,7 @@ mod tests {
 
         let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
 
-        kernel.editor_keys(id, "ZQ").await.unwrap();
+        kernel.editor_keys(id, "ZQ", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         assert_eq!(
             String::from_utf8(
@@ -2831,7 +2838,7 @@ mod tests {
     {
         let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
 
-        kernel.editor_keys(id, "aY<Esc>ZQ").await.unwrap();
+        kernel.editor_keys(id, "aY<Esc>ZQ", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         assert!(
             kernel
@@ -2853,7 +2860,7 @@ mod tests {
     async fn editor_keys_colon_q_bang_after_an_acked_flush_marks_the_rolled_back_buffer_dirty() {
         let (kernel, id) = kernel_with_a_session_diverged_from_an_acked_flush().await;
 
-        kernel.editor_keys(id, ":q!<CR>").await.unwrap();
+        kernel.editor_keys(id, ":q!<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         assert!(
             kernel
@@ -2888,8 +2895,8 @@ mod tests {
         let (id, st) = kernel.editor_open("/mem/kanji.txt").await.unwrap();
         assert_eq!(st.text, "改善—work");
 
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert_eq!(st.text, "X改善—work");
 
         let disk = String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap();
@@ -2912,7 +2919,7 @@ mod tests {
         kernel.vfs().write_all(path, b"hello").await.unwrap();
 
         let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         // An external writer moves disk out from under the open buffer.
         kernel
@@ -2921,7 +2928,7 @@ mod tests {
             .await
             .unwrap();
 
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(
             st.dirty,
             "a refused :w must leave the buffer dirty — the checkpoint must not advance"
@@ -2948,7 +2955,7 @@ mod tests {
         );
 
         // `:w!` overrides the refusal.
-        let st = kernel.editor_keys(id, ":w!<CR>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w!<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(!st.dirty, ":w! must clear the editor's dirty flag once it lands");
         assert_eq!(
             String::from_utf8(kernel.vfs().read_all(path).await.unwrap()).unwrap(),
@@ -2982,8 +2989,8 @@ mod tests {
         let (id, st) = kernel.editor_open("/mem/note.txt").await.unwrap();
         assert_eq!(st.text, "hello");
 
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(
             st.dirty,
             "a flush that failed must not let the buffer read clean"
@@ -3018,7 +3025,7 @@ mod tests {
 
         // The swap row must survive the failed flush — a following `:q`
         // still refuses with vim's E37, exactly as if `:w` had never run.
-        let st = kernel.editor_keys(id, ":q<CR>").await.unwrap();
+        let st = kernel.editor_keys(id, ":q<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(
             st.message
                 .as_deref()
@@ -3049,8 +3056,8 @@ mod tests {
         let (kernel, dir) = kernel_with_readonly_fs(b"hello").await;
 
         let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(st.dirty, "first :w must fail against the read-only mount");
 
         // Whatever caused the failure clears (permissions restored, disk
@@ -3058,7 +3065,7 @@ mod tests {
         kernel.unmount("/mem").await;
         kernel.mount("/mem", LocalBackend::new(dir.path())).await;
 
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
         assert!(
             st.message.is_none(),
             "a retry must not report the swap-acknowledgement error, got: {:?}",
@@ -3122,8 +3129,8 @@ mod tests {
             kernel.file_cache().try_read_content(&other).await.unwrap();
         }
 
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        let st = kernel.editor_keys(id, ":w<CR>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        let st = kernel.editor_keys(id, ":w<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         // The pin (not a fallback reload) is the fix: `:w` must succeed
         // outright, never merely fail loud instead of silently no-op'ing.
@@ -3154,8 +3161,8 @@ mod tests {
         kernel.vfs().write_all(path, b"hello").await.unwrap();
 
         let (id, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
-        kernel.editor_keys(id, ":wq<CR>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
+        kernel.editor_keys(id, ":wq<CR>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         for i in 0..80 {
             let other = format!("/mem/other{i}.txt");
@@ -3180,22 +3187,10 @@ mod tests {
         assert!(err.contains("note.txt"), "error must name the path: {err}");
     }
 
-    /// BUG 1 regression at the layer the leak was actually observed (kaibo
-    /// review of `d45e0484`/`4369bd77`/`f02f3688`): `editor_quit` releases the
-    /// file-cache pin *after* `EditorSessions::quit` succeeds
-    /// (`sessions.0.quit(id, self.blocks())?`) — if that call instead failed
-    /// with the session already removed (the old `quit` behavior), this `?`
-    /// would return early and the pin taken at `editor_open_as` would never
-    /// be released, with no session left in `kj editor list` to explain why.
-    ///
-    /// `editor::session_tests::quit_keeps_the_session_when_rollback_fails_instead_of_leaking_it`
-    /// covers the fix itself (the session stays open); this test confirms
-    /// the consequence one layer up stays consistent: session state and pin
-    /// state agree. Forces the same rollback failure (delete the file's
-    /// document out from under the open session) and checks both sides
-    /// together — `editor_state` still resolving the session (not "no such
-    /// session") and the file cache still refusing to `invalidate` the path
-    /// (pin held). Neither side is orphaned relative to the other.
+    /// A failed rollback retains the editor session and its file-cache pin.
+    /// Deleting the backing document forces that failure; the player must
+    /// still be able to inspect the session, and invalidation must refuse
+    /// while its pin remains held.
     #[tokio::test]
     async fn editor_quit_does_not_leak_the_pin_when_rollback_fails() {
         use crate::vfs::VfsOps as _;
@@ -3206,7 +3201,7 @@ mod tests {
         kernel.vfs().write_all(Path::new(path), b"hello").await.unwrap();
 
         let (id, _) = kernel.editor_open(path).await.unwrap();
-        kernel.editor_keys(id, "iX<Esc>").await.unwrap();
+        kernel.editor_keys(id, "iX<Esc>", kaijutsu_types::PrincipalId::system()).await.unwrap();
 
         // Delete the file-document the session is bound to — forces the
         // rollback's `block_text` read to fail.
@@ -3214,7 +3209,7 @@ mod tests {
         kernel.blocks().delete_document(ctx_id).unwrap();
 
         let err = kernel
-            .editor_quit(id)
+            .editor_quit(id, kaijutsu_types::PrincipalId::system())
             .expect_err("quit must fail when the rollback can't read the block");
         assert!(err.contains("not found"), "got: {err}");
 

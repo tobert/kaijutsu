@@ -2798,10 +2798,11 @@ impl kernel::Server for KernelImpl {
         let keys = pry!(pry!(p.get_keys()).to_str()).to_owned();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
         let kernel = self.kernel.clone();
-        // `editor_keys` is async now (a `:r` read awaits a VFS/kaish fetch).
+        let actor = self.connection.borrow().principal;
+        // A :r read awaits a VFS or kaish fetch; its eventual edit keeps this actor.
         Promise::from_future(
             async move {
-                match kernel.kernel.editor_keys(id, &keys).await {
+                match kernel.kernel.editor_keys(id, &keys, actor).await {
                     Ok(state) => {
                         set_editor_state(results.get().init_state(), session_id, &state);
                         Ok(())
@@ -2826,7 +2827,8 @@ impl kernel::Server for KernelImpl {
         let session_id = p.get_session_id();
         let text = pry!(pry!(p.get_text()).to_str()).to_owned();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
-        match self.kernel.kernel.editor_insert(id, &text) {
+        let actor = self.connection.borrow().principal;
+        match self.kernel.kernel.editor_insert(id, &text, actor) {
             Ok(state) => {
                 set_editor_state(results.get().init_state(), session_id, &state);
                 Promise::ok(())
@@ -2887,7 +2889,8 @@ impl kernel::Server for KernelImpl {
         let _guard = extract_rpc_trace(p.get_trace(), "editor_quit").entered();
         let session_id = p.get_session_id();
         let id = kaijutsu_kernel::editor::EditorSessionId::from_u64(session_id);
-        match self.kernel.kernel.editor_quit(id) {
+        let actor = self.connection.borrow().principal;
+        match self.kernel.kernel.editor_quit(id, actor) {
             Ok(()) => Promise::ok(()),
             Err(e) => Promise::err(capnp::Error::failed(format!("editor_quit failed: {e}"))),
         }

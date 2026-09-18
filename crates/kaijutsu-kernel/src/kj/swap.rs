@@ -385,7 +385,7 @@ mod tests {
         let (id, _) = d.kernel().editor_open("/tmp/pinned.txt").await.unwrap();
         // Dirty the session's buffer — this is what gives it a
         // `dirty_file_buffers` row, the precondition `discard` checks for.
-        d.kernel().editor_keys(id, "iX<Esc>").await.unwrap();
+        d.kernel().editor_keys(id, "iX<Esc>", c.actor_id).await.unwrap();
 
         let result = d
             .dispatch(&[s("swap"), s("discard"), s("/tmp/pinned.txt")], &c)
@@ -451,7 +451,7 @@ mod tests {
 
         // Edit further — cache stays dirty (it already was), `swap_recovered`
         // is untouched by an ordinary edit.
-        d.kernel().editor_keys(id, "iMORE<Esc>").await.unwrap();
+        d.kernel().editor_keys(id, "iMORE<Esc>", c.actor_id).await.unwrap();
 
         // `kj swap ack` flushes the *edited* buffer ("MOREunsaved-edit") to
         // disk and clears `dirty` + the row — nothing gates this on the open
@@ -484,7 +484,7 @@ mod tests {
         // ("unsaved-edit"), diverging from what ack just put on disk
         // ("MOREunsaved-edit"). This is the real content change the fix
         // must account for.
-        d.kernel().editor_quit(id).unwrap();
+        d.kernel().editor_quit(id, c.actor_id).unwrap();
         assert_eq!(
             d.kernel().file_cache().try_read_content(path).await.unwrap(),
             "unsaved-edit",
@@ -559,7 +559,7 @@ mod tests {
 
         let (id, st) = d.kernel().editor_open(path).await.unwrap();
         assert_eq!(st.text, "unsaved-edit", "opens against the recovered swap");
-        d.kernel().editor_keys(id, "iMORE<Esc>").await.unwrap();
+        d.kernel().editor_keys(id, "iMORE<Esc>", c.actor_id).await.unwrap();
 
         // `ack` flushes the *edited* buffer to disk and clears the row.
         let acked = d.dispatch(&[s("swap"), s("ack"), s(path)], &c).await;
@@ -567,7 +567,7 @@ mod tests {
 
         // ZQ discards that edit: the block rolls back to "unsaved-edit",
         // while disk holds "MOREunsaved-edit".
-        d.kernel().editor_quit(id).unwrap();
+        d.kernel().editor_quit(id, c.actor_id).unwrap();
 
         // The rolled-back content must still be readable. Before the fix
         // this served "MOREunsaved-edit" — the pre-rollback disk bytes —

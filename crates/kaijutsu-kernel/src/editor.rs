@@ -45,7 +45,8 @@ pub const PASTE_REFUSED_COMMAND_LINE: &str =
     "paste refused — close the ':' command line first";
 
 /// The location an editor binds to: the context + block that own a path's
-/// text. Edits go to `block_store.edit_text(context_id, block_id, …)`.
+/// text. Edits go to `block_store.edit_text_as(context_id, block_id, …)` with
+/// the player who submitted that input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorTarget {
     pub context_id: ContextId,
@@ -259,7 +260,8 @@ struct EditorSession {
     terminator: String,
     /// Who opened the session + the context they opened from ([`EditorOpener`]).
     /// `fg` finds the caller's suspended editor by `principal`; `:r !cmd` runs in
-    /// the opener's `(principal, context_id, session_id)`. `None` for a headless
+    /// the opener's `(principal, context_id, session_id)`. Later edits use the
+    /// player who submitted each input, not this opener. `None` for a headless
     /// open (test / wire `editorOpen` — no caller to capture).
     opener: Option<EditorOpener>,
     /// Whether a **peer's** write merged into this session since the last
@@ -365,8 +367,9 @@ impl EditorSessions {
         id: EditorSessionId,
         keys: &str,
         blocks: &SharedBlockStore,
+        actor: PrincipalId,
     ) -> Result<KeysOutcome, String> {
-        self.keys_checked(id, keys, blocks, true)
+        self.keys_checked(id, keys, blocks, actor, true)
     }
 
     /// [`keys`](Self::keys), gated: a write intent in this batch (`ZZ`, or
@@ -388,6 +391,7 @@ impl EditorSessions {
         id: EditorSessionId,
         keys: &str,
         blocks: &SharedBlockStore,
+        actor: PrincipalId,
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
         let (close, commands) = {
@@ -395,12 +399,13 @@ impl EditorSessions {
             let ops = session.core.apply_keys(keys);
             for op in &ops {
                 blocks
-                    .edit_text(
+                    .edit_text_as(
                         session.target.context_id,
                         &session.target.block_id,
                         op.offset,
                         &op.insert,
                         op.delete,
+                        Some(actor),
                     )
                     .map_err(|e| format!("editor keys: block mirror failed: {e}"))?;
             }
@@ -419,7 +424,7 @@ impl EditorSessions {
                     // to that just-taken checkpoint is a no-op. `saved: true`
                     // tells the kernel layer to flush a file-backed session.
                     let state = self.save(id)?;
-                    let rolled_back = self.quit(id, blocks)?;
+                    let rolled_back = self.quit(id, blocks, actor)?;
                     (state, true, rolled_back)
                 }
                 CloseRequest::Discard => {
@@ -428,7 +433,7 @@ impl EditorSessions {
                     // the checkpoint. `rolled_back` tells the kernel layer
                     // whether that rollback actually rewrote the block.
                     let state = self.state(id)?;
-                    let rolled_back = self.quit(id, blocks)?;
+                    let rolled_back = self.quit(id, blocks, actor)?;
                     (state, false, rolled_back)
                 }
             };
@@ -447,7 +452,7 @@ impl EditorSessions {
         // renderer (the front door would otherwise surface it as a hard failure).
         if let Some(parsed) = commands {
             match parsed {
-                Ok(cmds) => return self.run_commands(id, cmds, blocks, can_write),
+                Ok(cmds) => return self.run_commands(id, cmds, blocks, actor, can_write),
                 Err(msg) => {
                     let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
                     let checkpoint = session.saved_content.clone();
@@ -521,6 +526,7 @@ impl EditorSessions {
         id: EditorSessionId,
         commands: Vec<CommandRequest>,
         blocks: &SharedBlockStore,
+        actor: PrincipalId,
         can_write: bool,
     ) -> Result<KeysOutcome, String> {
         let mut write_requested = false;
@@ -562,7 +568,7 @@ impl EditorSessions {
                             rolled_back: false,
                         }));
                     }
-                    let rolled_back = self.quit(id, blocks)?;
+                    let rolled_back = self.quit(id, blocks, actor)?;
                     // `write_requested` covers `:wq`/`:x` (Write ran earlier
                     // in this same batch); a bare `:q`/`:q!` never set it, so
                     // nothing to flush. `rolled_back` is independent of that —
@@ -668,17 +674,19 @@ impl EditorSessions {
         text: &str,
         offset: usize,
         blocks: &SharedBlockStore,
+        actor: PrincipalId,
     ) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let ops = session.core.insert_at(text, offset);
         for op in &ops {
             blocks
-                .edit_text(
+                .edit_text_as(
                     session.target.context_id,
                     &session.target.block_id,
                     op.offset,
                     &op.insert,
                     op.delete,
+                    Some(actor),
                 )
                 .map_err(|e| format!("editor :r: block mirror failed: {e}"))?;
         }
@@ -710,6 +718,7 @@ impl EditorSessions {
         id: EditorSessionId,
         text: &str,
         blocks: &SharedBlockStore,
+        actor: PrincipalId,
     ) -> Result<EditorState, String> {
         let current = self.state(id)?;
         if current.command_line.is_some() {
@@ -721,12 +730,13 @@ impl EditorSessions {
         let ops = session.core.insert_at_cursor(text);
         for op in &ops {
             blocks
-                .edit_text(
+                .edit_text_as(
                     session.target.context_id,
                     &session.target.block_id,
                     op.offset,
                     &op.insert,
                     op.delete,
+                    Some(actor),
                 )
                 .map_err(|e| format!("editor insert: block mirror failed: {e}"))?;
         }
@@ -774,28 +784,19 @@ impl EditorSessions {
     /// therefore just quits *this* player out of the doc and leaves the block's
     /// merged truth for the others (Amy, 2026-07-07; `docs/vi.md` → Rollback).
     ///
-    /// **Removes the session only once the rollback has actually landed** (P1,
-    /// kaibo review of `d45e0484`/`4369bd77`/`f02f3688`, "BUG 1"): this used to
-    /// `remove` up front and roll back after, so a rollback failure
-    /// (`block_text`/`edit_text` erroring — a block deleted out from under the
-    /// session, a store error) returned `Err` with the session already gone.
-    /// Both `Kernel` callers (`editor_keys_checked`, `editor_quit`) propagate
-    /// that `Err` with `?` before ever reaching their `unpin`, so the
-    /// file-cache pin taken at open (`docs/file-buffers.md`) leaked for the
-    /// kernel's lifetime — nothing left to call `unpin`, and no session left
-    /// to retry. One invariant here (never remove before the rollback
-    /// succeeds) closes it at both call sites at once, instead of teaching
-    /// each caller to unpin on its own error path.
+    /// Remove the session only after rollback succeeds. On failure, callers
+    /// retain both the session and its file-cache pin so the player can retry.
     ///
-    /// Returns whether the rollback actually rewrote the block (`false` for
-    /// the sibling/peer-wrote early return, or when the block already held
-    /// the checkpoint). This pure registry has no file cache to inform, so
-    /// it can't mark the entry dirty itself — `Kernel::editor_quit` reads
-    /// this to do that (kaibo review of `d45e0484`/`4369bd77`/`f02f3688`,
-    /// the `ack`-then-`ZQ` divergence: a content-changing rollback mutates
-    /// the block via a raw `edit_text` call the file cache's own
-    /// dirty/flush bookkeeping never sees).
-    pub fn quit(&mut self, id: EditorSessionId, blocks: &SharedBlockStore) -> Result<bool, String> {
+    /// Return whether rollback rewrote the block. The kernel uses this to mark
+    /// the file cache dirty; this registry has no file cache of its own.
+    /// Detaching after a peer write or restoring an unchanged checkpoint does
+    /// not mutate the block.
+    pub fn quit(
+        &mut self,
+        id: EditorSessionId,
+        blocks: &SharedBlockStore,
+        actor: PrincipalId,
+    ) -> Result<bool, String> {
         let session = self.sessions.get(&id).ok_or_else(|| no_session(id))?;
         let sibling_bound = self
             .sessions
@@ -812,12 +813,13 @@ impl EditorSessions {
         let rolled_back = current != restore;
         if rolled_back {
             blocks
-                .edit_text(
+                .edit_text_as(
                     session.target.context_id,
                     &session.target.block_id,
                     0,
                     &restore,
                     current.chars().count(),
+                    Some(actor),
                 )
                 .map_err(|e| format!("editor quit: rollback failed: {e}"))?;
         }
@@ -954,7 +956,7 @@ mod session_tests {
         assert!(!st.dirty);
 
         // Insert "X" at the start: i X <Esc>.
-        let outcome = sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        let outcome = sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(outcome.state().text, "Xhello");
         assert!(outcome.state().dirty, "buffer diverged from checkpoint");
 
@@ -969,7 +971,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         let st = sessions.save(id).unwrap();
         assert_eq!(st.text, "Xhello");
         assert!(!st.dirty, "save must clear dirty");
@@ -982,11 +984,11 @@ mod session_tests {
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         // Delete the first char, mirror lands on the block...
-        sessions.keys(id, "x", &blocks).unwrap();
+        sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "ello");
 
         // ...then ZQ restores the block to what we opened.
-        sessions.quit(id, &blocks).unwrap();
+        sessions.quit(id, &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
         assert!(!sessions.is_open(id), "quit drops the session");
     }
@@ -999,8 +1001,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
-        let outcome = sessions.keys(id, "ZZ", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, "ZZ", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Closed(_)),
             "ZZ closes the session"
@@ -1016,8 +1018,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
-        let outcome = sessions.keys(id, "ZQ", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, "ZQ", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Closed(_)),
             "ZQ closes the session"
@@ -1035,7 +1037,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let outcome = sessions.keys(id, "iZZ", &blocks).unwrap();
+        let outcome = sessions.keys(id, "iZZ", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Updated(_)));
         assert!(sessions.is_open(id), "inserted ZZ leaves the session open");
         assert_eq!(block_text(&blocks, &target).unwrap(), "ZZ");
@@ -1063,14 +1065,14 @@ mod session_tests {
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
         // Dirty the buffer so the rollback isn't a no-op (current != restore).
-        sessions.keys(id, "x", &blocks).unwrap();
+        sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap();
 
         // The document the session is bound to is gone — `block_text` (the
         // first step of `quit`'s rollback) must now fail.
         blocks.delete_document(target.context_id).unwrap();
 
         let err = sessions
-            .quit(id, &blocks)
+            .quit(id, &blocks, PrincipalId::system())
             .expect_err("quit must fail when the rollback can't read the block");
         assert!(
             err.contains("not found"),
@@ -1099,10 +1101,10 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
         sessions.save(id).unwrap(); // checkpoint = "Xhello"
-        sessions.keys(id, "iY<Esc>", &blocks).unwrap(); // -> "YXhello"
-        sessions.quit(id, &blocks).unwrap();
+        sessions.keys(id, "iY<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "YXhello"
+        sessions.quit(id, &blocks, PrincipalId::system()).unwrap();
 
         // Rolls back to the *saved* checkpoint, keeping the saved edit.
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
@@ -1120,10 +1122,10 @@ mod session_tests {
         assert_eq!(st.text, "hello");
         assert!(!st.dirty, "a newline-terminated block must open clean");
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello\n");
 
-        sessions.quit(id, &blocks).unwrap();
+        sessions.quit(id, &blocks, PrincipalId::system()).unwrap();
         assert_eq!(
             block_text(&blocks, &target).unwrap(),
             "hello\n",
@@ -1141,7 +1143,7 @@ mod session_tests {
         let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(a, "iX<Esc>", &blocks).unwrap();
+        sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
 
         let changed = sessions.reconcile_block(target.context_id, target.block_id, &blocks);
@@ -1168,8 +1170,8 @@ mod session_tests {
         let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(a, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
-        let outcome = sessions.keys(a, ":q!<CR>", &blocks).unwrap();
+        sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(a, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)), ":q! closes A");
         assert!(!sessions.is_open(a), "A is out of the doc");
         assert!(sessions.is_open(b), "B keeps playing");
@@ -1190,13 +1192,13 @@ mod session_tests {
         let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(b, "iB<Esc>", &blocks).unwrap(); // -> "Bhello"
+        sessions.keys(b, "iB<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Bhello"
         // The server's reconciler drives this off the block flow; simulate it.
         sessions.reconcile_block(target.context_id, target.block_id, &blocks);
-        let outcome = sessions.keys(b, "ZZ", &blocks).unwrap(); // B saves + leaves
+        let outcome = sessions.keys(b, "ZZ", &blocks, PrincipalId::system()).unwrap(); // B saves + leaves
         assert!(matches!(outcome, KeysOutcome::Closed(_)));
 
-        sessions.quit(a, &blocks).unwrap(); // A aborts
+        sessions.quit(a, &blocks, PrincipalId::system()).unwrap(); // A aborts
         assert_eq!(
             block_text(&blocks, &target).unwrap(),
             "Bhello",
@@ -1214,13 +1216,13 @@ mod session_tests {
         let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(b, "iB<Esc>", &blocks).unwrap(); // -> "Bhello"
+        sessions.keys(b, "iB<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Bhello"
         sessions.reconcile_block(target.context_id, target.block_id, &blocks);
         sessions.save(a).unwrap(); // A's checkpoint = "Bhello"; entanglement resets
-        sessions.keys(b, "ZZ", &blocks).unwrap(); // B leaves
+        sessions.keys(b, "ZZ", &blocks, PrincipalId::system()).unwrap(); // B leaves
 
-        sessions.keys(a, "iA<Esc>", &blocks).unwrap(); // -> "ABhello"
-        sessions.quit(a, &blocks).unwrap(); // alone + untangled → real rollback
+        sessions.keys(a, "iA<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "ABhello"
+        sessions.quit(a, &blocks, PrincipalId::system()).unwrap(); // alone + untangled → real rollback
         assert_eq!(
             block_text(&blocks, &target).unwrap(),
             "Bhello",
@@ -1242,8 +1244,8 @@ mod session_tests {
         let (blocks, target) = seeded(b"hello").await;
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
-        sessions.quit(id, &blocks).unwrap();
-        let err = sessions.keys(id, "x", &blocks).unwrap_err();
+        sessions.quit(id, &blocks, PrincipalId::system()).unwrap();
+        let err = sessions.keys(id, "x", &blocks, PrincipalId::system()).unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
     }
 
@@ -1257,8 +1259,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
-        let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, ":wq<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Closed(_)),
             ":wq closes the session"
@@ -1277,8 +1279,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // dirty
-        let outcome = sessions.keys(id, ":q<CR>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // dirty
+        let outcome = sessions.keys(id, ":q<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Updated(_)),
             "the refusal keeps the session open, not an error"
@@ -1296,9 +1298,9 @@ mod session_tests {
         );
 
         // The message is transient and `:q!` still gets you out.
-        let outcome = sessions.keys(id, "l", &blocks).unwrap();
+        let outcome = sessions.keys(id, "l", &blocks, PrincipalId::system()).unwrap();
         assert!(outcome.state().message.is_none(), "message clears on the next batch");
-        let outcome = sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)));
     }
 
@@ -1308,8 +1310,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap(); // -> "Xhello"
-        let outcome = sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello"
+        let outcome = sessions.keys(id, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)));
         assert!(!sessions.is_open(id));
         // Forced quit rolls back to the open checkpoint.
@@ -1328,8 +1330,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, "iX<Esc>", &blocks).unwrap();
-        let outcome = sessions.keys(id, ":w<CR>", &blocks).unwrap();
+        sessions.keys(id, "iX<Esc>", &blocks, PrincipalId::system()).unwrap();
+        let outcome = sessions.keys(id, ":w<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Updated(_)),
             ":w keeps the session open"
@@ -1344,7 +1346,7 @@ mod session_tests {
         let st = sessions.save(id).unwrap();
         assert!(!st.dirty, "save (the kernel layer's post-flush call) clears dirty");
         // A clean `:q` now succeeds.
-        let outcome = sessions.keys(id, ":q<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":q<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)));
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
     }
@@ -1358,7 +1360,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let outcome = sessions.keys(id, ":frobnicate<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":frobnicate<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(
             matches!(outcome, KeysOutcome::Updated(_)),
             "a bad command keeps the session open"
@@ -1374,7 +1376,7 @@ mod session_tests {
         assert_eq!(block_text(&blocks, &target).unwrap(), "hello");
 
         // The message clears on the next keystroke batch (vim-ish transience).
-        let outcome = sessions.keys(id, "l", &blocks).unwrap();
+        let outcome = sessions.keys(id, "l", &blocks, PrincipalId::system()).unwrap();
         assert!(
             outcome.state().message.is_none(),
             "the status message clears on the next keystroke"
@@ -1389,7 +1391,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let outcome = sessions.keys(id, ":s/alpha/ALPHA/g<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":s/alpha/ALPHA/g<CR>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(outcome.state().text, "ALPHA beta ALPHA");
         assert!(outcome.state().dirty, "a substitution dirties the buffer");
         // The invariant: the block equals the edited buffer.
@@ -1402,8 +1404,8 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, ":%s/x/Z/g<CR>", &blocks).unwrap();
-        let outcome = sessions.keys(id, ":wq<CR>", &blocks).unwrap();
+        sessions.keys(id, ":%s/x/Z/g<CR>", &blocks, PrincipalId::system()).unwrap();
+        let outcome = sessions.keys(id, ":wq<CR>", &blocks, PrincipalId::system()).unwrap();
         assert!(matches!(outcome, KeysOutcome::Closed(_)), ":wq closes");
         // The substitution survived the save+close.
         assert_eq!(block_text(&blocks, &target).unwrap(), "Z y\nZ y");
@@ -1416,9 +1418,9 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(id, ":s/keep/DROP/<CR>", &blocks).unwrap();
+        sessions.keys(id, ":s/keep/DROP/<CR>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "DROP me");
-        sessions.keys(id, ":q!<CR>", &blocks).unwrap();
+        sessions.keys(id, ":q!<CR>", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "keep me", ":q! discards :s");
     }
 
@@ -1431,7 +1433,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let outcome = sessions.keys(id, ":s/[/x/<CR>", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":s/[/x/<CR>", &blocks, PrincipalId::system()).unwrap();
         let msg = outcome
             .state()
             .message
@@ -1450,7 +1452,7 @@ mod session_tests {
         let mut sessions = EditorSessions::new();
         let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        let outcome = sessions.keys(id, ":w", &blocks).unwrap();
+        let outcome = sessions.keys(id, ":w", &blocks, PrincipalId::system()).unwrap();
         assert_eq!(
             outcome.state().command_line.as_deref(),
             Some(":w"),
@@ -1510,7 +1512,7 @@ mod session_tests {
         let (a, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
         let (b, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
 
-        sessions.keys(a, "iX<Esc>", &blocks).unwrap(); // -> "Xhello", dirties A only
+        sessions.keys(a, "iX<Esc>", &blocks, PrincipalId::system()).unwrap(); // -> "Xhello", dirties A only
 
         let list = sessions.list();
         assert_eq!(list.len(), 2, "both sessions are open");
@@ -1526,7 +1528,7 @@ mod session_tests {
              checkpoint, both still \"hello\""
         );
 
-        sessions.quit(a, &blocks).unwrap();
+        sessions.quit(a, &blocks, PrincipalId::system()).unwrap();
         let list = sessions.list();
         assert_eq!(list.len(), 1, "quitting A leaves only B");
         assert_eq!(list[0].session, b.as_u64());
