@@ -184,8 +184,13 @@ Streaming RPC also honors every hook verdict. Startup recovers retained pending
 projections without rerunning commands or hooks, preserving edits made after
 terminal publication. Initial outcome-retention failures still need live
 reporting/retry: background interactive callers log the error and approval
-resumes report it to the model. Also reconcile the runner's synthetic job failure
-on projection error with a receipt that may already have committed its outcome.
+resumes report it to the model. Job results now preserve the captured outcome
+when projection fails; they agree with retained and committed receipts. The
+persistence error remains separate, and an unfinished operation still needs
+projection recovery even when its job has finished.
+A failed document acceptance poisons that context until restart. Structured
+inspection from that context also refuses; inspect the target operation from a
+healthy context. The SSH fault regression exercises this distinction.
 Registered interrupted operations now settle their original blocks and receipts
 together. Receiptless writers use the atomic per-context orphan sweep.
 
@@ -205,8 +210,11 @@ worker shutdown now cancels and drains accepted work through settlement, includi
 paused hooks and retained review. Execution/state/hook panics settle before
 resuming the original unwind, preserving captured output and completed statement
 observations; a failed worker stops admission and reports an error from shutdown.
-Abrupt task destruction before capture still needs live terminal settlement and
-job/receipt agreement; startup reports interruption without replaying source.
+Tool policy preparation now precedes durable admission; dropping that wait
+leaves no operation. Dropping the admitted caller before its job is ready cancels
+and settles through the retained worker. Abrupt worker-task destruction before
+capture still needs live terminal settlement; startup reports interruption
+without replaying source.
 SIGTERM/SIGINT now await the runtime worker before checkpointing and exiting;
 host Drop remains a cancellation signal without a wait. Streaming RPC now uses
 the same worker for preparation and execution; its adapter retains slot/history,

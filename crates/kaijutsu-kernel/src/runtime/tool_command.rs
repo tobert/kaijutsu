@@ -42,10 +42,10 @@ pub(crate) struct ToolCommand {
 
 impl ToolCommand {
     pub(crate) async fn execute(self, cancel: CancellationToken) -> McpResult<KernelToolResult> {
+        let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
         let receipt = if self.foreground { None } else {
             Some(create_operation(&self.kernel, &self.call, &self.code, None).map_err(McpError::Protocol)?)
         };
-        let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (reply, completed) = tokio::sync::oneshot::channel();
         let (notices, mut reviews) = tokio::sync::mpsc::unbounded_channel();

@@ -2222,6 +2222,25 @@ requests are refused. DeepSeek's first review suggested a claim race inside one
 transaction; the database guard and transaction exclude it. Its policy question
 prompted the explicit compatibility regression and revised admission check.
 
+The caller-lifetime audit found an await between async receipt creation and
+worker admission: waiting for broker policy could lose the caller and strand
+the receipt. Policy now resolves before admission. A regression drops that wait
+and requires no operation, blocks, or events. A second drops the caller after
+admission but before job readiness; the retained worker cancels and settles the
+original pair without executing source.
+
+Projection failure also changed the job's result after retaining the original
+command outcome. A fault regression showed exit 1 in the job versus exit 0 in
+the retained outcome. Jobs now keep the captured hook-processed result; the
+publication error is returned separately. Receipt-write and post-commit
+compaction faults preserve job streams and agree with recovery. `kj wait` help
+and the identity contract distinguish a finished job from an operation awaiting
+durable publication. The SSH test observes both from a healthy context: the
+failed target document refuses further acceptance until restart. DeepSeek found
+no concrete defect; its remaining questions were checked against read-only
+policy lookup, retained worker ownership, and hook-processed result conversion.
+Initial outcome-retention failures remain unfinished work.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

@@ -307,12 +307,11 @@ pub async fn run_into_blocks(
     } else { None };
     if let Some(ready) = run.job_ready.take() { let _ = ready.send(()); }
     let job_output = run.job_output;
-    let mut attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
+    let attempt = capture_and_review(kaish, code, kernel, context_id, call_ctx,
         Some((*command_block_id, *output_block_id)), options, run, streams).await?;
-    let outcome = &mut attempt.outcome;
+    let outcome = &attempt.outcome;
     let settled = settle_outcome(kernel, context_id, command_block_id, output_block_id, outcome, None);
     if let Some((manager, job, sender)) = tracked_job {
-        if let Err(error) = &settled { outcome.settlement_error = Some(error.clone()); }
         let result = outcome.exec_result();
         let streams_result = match job_output {
             CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
@@ -744,6 +743,55 @@ mod fill_tests {
             let final_output = documents.get_block_snapshot(ctx, &output).unwrap().unwrap();
             assert_eq!(final_output.status, Status::Done);
             assert_eq!(final_output.content, "synthetic output");
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_failure_does_not_rewrite_the_job_outcome() {
+        for fault in ["receipt", "compaction"] {
+            let kernel = Arc::new(Kernel::new_ephemeral("job-projection-fault").await);
+            let documents = kernel.blocks().clone();
+            let context = ContextId::new();
+            documents.create_document(context, DocumentKind::Conversation, None).unwrap();
+            let command = documents.insert_tool_call(context, None, None, "shell_write", serde_json::json!({}), None).unwrap();
+            let output = documents.insert_tool_result(context, &command, Some(&command), "", false, None, None).unwrap();
+            let captured = if fault == "compaction" { "x".repeat(1_048_576) } else { "observed".into() };
+            let code = format!("echo '{captured}'; echo warning >&2");
+            let receipt = kernel.shell_operations().register(context, PrincipalId::system(), PrincipalId::system(),
+                command, output, &code, None).unwrap();
+            kernel.kernel_db().lock().conn_for_ledger().execute_batch(match fault {
+                "receipt" => "CREATE TRIGGER fail_projection BEFORE UPDATE OF completed_at ON shell_operations BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;",
+                _ => "CREATE TRIGGER fail_projection BEFORE INSERT ON doc_snapshots BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;",
+            }).unwrap();
+            let kaish = EmbeddedKaish::with_identity("job-projection-fault", documents.clone(), kernel.clone(), None,
+                crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
+                    reviewer: None, context, session: kaijutsu_types::SessionId::new() },
+                crate::runtime::context_engine::session_context_map(), super::super::embedded_kaish::ExternalExec::Deny,
+                super::super::embedded_kaish::OutputProfile::Internal, |_, _, _| {}).unwrap();
+            let call = crate::mcp::CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id());
+            let error = run_into_blocks(&kaish, &code, context, &command, &output, &kernel, &call,
+                CommandRunOptions::default()).await.unwrap_err();
+            assert!(error.contains("injected projection failure"), "{error}");
+            let outcome = kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap();
+            let state = kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap();
+            assert_eq!(state.completed_at.is_some(), fault == "compaction");
+            let jobs = kernel.context_job_manager(context);
+            let job = jobs.list().await.into_iter().find(|job| Some(job.id.to_string()) == state.receipt.job_id).unwrap();
+            let observed = jobs.wait(job.id).await.unwrap();
+            assert_eq!(observed, outcome.exec_result(), "{fault}: projection failure is not a different execution outcome");
+            let streams = jobs.streams(job.id).await.unwrap();
+            assert!(streams.stdout.is_closed().await && streams.stderr.is_closed().await);
+            assert_eq!(streams.stdout.read().await, format!("{captured}\n").as_bytes());
+            assert_eq!(streams.stderr.read().await, b"warning\n");
+            let db = kernel.kernel_db().clone();
+            db.lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_projection").unwrap();
+            let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
+            let blocks = crate::block_store::shared_block_store_with_db(db.clone(), workspace, PrincipalId::system());
+            let dir = tempfile::tempdir().unwrap();
+            let recovered = Kernel::new("job-projection-recovered", dir.path(), blocks, db).await;
+            let saved = recovered.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap();
+            assert_eq!(saved.envelope.unwrap().stdout, format!("{captured}\n"));
+            assert_eq!(recovered.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap().exec_result(), observed);
         }
     }
 

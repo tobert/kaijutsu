@@ -248,7 +248,11 @@ when no model is automatically resumed.
 `--job <integer>` (optionally selecting a context). A wait timeout ends that
 wait only; it neither cancels work
 nor expires an ask. Waiting on an ask's decision and waiting on the approved
-command's completion are distinct conditions. Waiting must not hold a context
+command's completion are distinct conditions. A kaish job reports the captured
+command result. If durable publication fails, the job can finish while its
+operation remains pending; use `--operation` to inspect durable completion and
+notification status. Publication failure does not change the command's exit.
+Waiting must not hold a context
 execution lock that prevents another invocation from writing a handoff or
 observing completion. Preserve the rule that no RPC waits indefinitely.
 

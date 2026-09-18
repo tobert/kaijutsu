@@ -117,3 +117,65 @@ fn interrupted_shell_keeps_observations_through_the_typed_client() {
         let _ = server.await;
     });
 }
+
+#[test]
+fn job_completion_reports_execution_while_operation_publication_is_pending() {
+    common::run_local(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
+        let key = config.root_key();
+        let path = config.data_dir.as_ref().unwrap().join("kernel.db");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server = tokio::task::spawn_local(async move {
+            SshServer::new(config).run_on_listener_with_kernel_sink(listener, tx).await.unwrap();
+        });
+        let shared = rx.await.unwrap();
+        let client = kaijutsu_client::connect_ssh(SshConfig {
+            host: addr.ip().to_string(), port: addr.port(), username: "amy".into(),
+            key_source: KeySource::InMemory(key), insecure: true,
+        }).await.unwrap();
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = common::create_context(&kj, "job-publication").await.unwrap();
+        let observer = common::create_context(&kj, "publication-observer").await.unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_receipt BEFORE UPDATE OF completed_at ON shell_operations
+            BEGIN SELECT RAISE(ABORT, 'injected receipt fault'); END;").unwrap();
+        let command = kj.shell_execute("echo observed; echo warning >&2", context, false).await.unwrap();
+        let operation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let operation = shared.kernel.shell_operations().list_for_context(context).unwrap().into_iter().find(|op| op.receipt.command_block_id == command);
+                if let Some(operation) = operation {
+                    if let Some(job) = &operation.receipt.job_id {
+                        let result = kj.execute_kj_quiet(observer, &[
+                            "wait".into(), "--job".into(), job.clone(), "--timeout".into(), "0".into(), context.to_hex(),
+                        ]).await.unwrap();
+                        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                        let data = result.data.unwrap();
+                        if data["timed_out"] == false {
+                            assert_eq!(data["state"]["exit_code"], 0);
+                            break operation;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("job settles even if durable projection fails");
+        let result = kj.execute_kj_quiet(observer, &[
+            "wait".into(), "--operation".into(), operation.receipt.operation_id.clone(),
+            "--timeout".into(), "0".into(), context.to_hex(),
+        ]).await.unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(result.data.unwrap()["timed_out"], true);
+        let retained = shared.kernel.shell_operations().outcome(&operation.receipt.operation_id, context).unwrap().unwrap();
+        assert_eq!(retained.envelope().exit_code, Some(0));
+        assert_eq!(retained.envelope().stdout, "observed\n");
+        assert_eq!(retained.envelope().stderr, "warning\n");
+        conn.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+        drop(kj);
+        drop(client);
+        shared.kernel.shutdown_runtime_worker().await.unwrap();
+        server.abort();
+        let _ = server.await;
+    });
+}

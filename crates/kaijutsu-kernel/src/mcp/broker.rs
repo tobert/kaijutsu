@@ -4565,6 +4565,79 @@ fn shrink_json_to_budget(value: &mut serde_json::Value, budget: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dropped_tool_after_admission_cancels_and_settles_its_operation() {
+        use crate::runtime::{embedded_kaish::EmbeddedKaish, tool_command::ToolCommand};
+        let kernel = Arc::new(crate::Kernel::new_ephemeral("dropped-admitted-tool").await);
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        kernel.spawn_runtime_task(move |_| async move {
+            entered.send(()).unwrap();
+            held.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }).unwrap();
+        ready.await.unwrap();
+        let kaish = EmbeddedKaish::new("dropped-admitted-tool", kernel.blocks().clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(context);
+        let call = ToolCommand {
+            kernel: kernel.clone(), broker: kernel.broker().clone(), kaish,
+            params: Broker::shell_write_hook_params("echo never"),
+            call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
+            code: "echo never".into(), stdin: None, foreground: false, read_only: false,
+        }.execute(CancellationToken::new());
+        let mut call = Box::pin(call);
+        assert!(futures::poll!(&mut call).is_pending());
+        let operations = kernel.shell_operations().list_for_context(context).unwrap();
+        assert_eq!(operations.len(), 1);
+        let id = &operations[0].receipt.operation_id;
+        drop(call);
+        release.send(()).unwrap();
+        let state = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let state = kernel.shell_operations().get(id, context).unwrap().unwrap();
+                if state.completed_at.is_some() { break state; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("kernel ownership must settle the dropped caller's operation");
+        let envelope = state.envelope.unwrap();
+        assert!(envelope.is_error());
+        assert!(envelope.stdout.is_empty());
+        assert!(envelope.error.unwrap().contains("cancelled before execution"));
+        for id in [state.receipt.command_block_id, state.receipt.output_block_id] {
+            assert_eq!(kernel.blocks().get_block_snapshot(context, &id).unwrap().unwrap().status, kaijutsu_types::Status::Error);
+        }
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_tool_policy_wait_leaves_no_unowned_operation() {
+        use crate::runtime::{embedded_kaish::EmbeddedKaish, tool_command::ToolCommand};
+        let kernel = Arc::new(crate::Kernel::new_ephemeral("cancelled-tool-admission").await);
+        let context = ContextId::new();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let broker = kernel.broker().clone();
+        let held = broker.policies.write().await;
+        let kaish = EmbeddedKaish::new("cancelled-tool-admission", kernel.blocks().clone(), kernel.clone(), None).unwrap();
+        kaish.set_context_id(context);
+        let mut events = kernel.block_flows().subscribe("block.*");
+        let call = ToolCommand {
+            kernel: kernel.clone(), broker: broker.clone(), kaish,
+            params: Broker::shell_write_hook_params("echo never"),
+            call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
+            code: "echo never".into(), stdin: None, foreground: false, read_only: false,
+        }.execute(CancellationToken::new());
+        let mut call = Box::pin(call);
+        assert!(futures::poll!(&mut call).is_pending());
+        drop(call);
+        drop(held);
+        assert!(kernel.shell_operations().list_for_context(context).unwrap().is_empty(),
+            "awaiting policy must precede durable admission");
+        assert!(kernel.blocks().block_snapshots(context).unwrap().is_empty());
+        assert!(events.try_recv().is_none());
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
     use std::future::Future;
     use std::time::Duration;
 

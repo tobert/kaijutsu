@@ -81,7 +81,8 @@ pub(crate) struct WaitArgs {
     /// Wait for this ask's decision. Approval may start work that is still running.
     #[arg(long, conflicts_with_all = ["operation", "job", "since"])]
     ask: Option<String>,
-    /// Wait for this kaish job in the target context.
+    /// Wait for this kaish job in the target context. Reports its command result;
+    /// use --operation to inspect durable publication and notification status.
     #[arg(long, conflicts_with_all = ["operation", "ask", "since"])]
     job: Option<u64>,
     /// Report only blocks after this one. Pass the `cursor` from a previous
