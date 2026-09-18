@@ -32,7 +32,7 @@ impl kaijutsu_index::BlockSource for BlockStoreSource {
         use crate::block_store::BlockStore;
         // In-memory first; hydrate from the DB on demand for a cold context.
         if !self.0.contains(ctx) {
-            let _ = self.0.load_one_from_db(ctx);
+            self.0.load_one_from_db(ctx).map_err(|error| error.to_string())?;
         }
         BlockStore::non_draft_snapshots(&self.0, ctx).map_err(|e| e.to_string())
     }
@@ -164,6 +164,17 @@ mod tests {
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, PrincipalId, Role, Status};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    #[tokio::test]
+    async fn synthesis_preserves_cold_source_failure_without_embedding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = Arc::new(BlockStoreSource(crate::block_store::shared_block_store(PrincipalId::new())));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = run_synthesis(ContextId::new(), Arc::new(CountingEmbedder(calls.clone())), source)
+            .await.unwrap_err();
+        assert!(error.to_string().contains("no database configured"), "original hydration error lost: {error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "failed input must not spend embedding work");
+    }
 
     /// Deterministic mock embedder (same as in kaijutsu-index).
     struct MockEmbedder {

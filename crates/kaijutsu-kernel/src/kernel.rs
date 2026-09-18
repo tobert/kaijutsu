@@ -791,7 +791,7 @@ impl Kernel {
 
         self.broker
             .register_silently(
-                Arc::new(BlockToolsServer::new(documents.clone(), self.cas.clone())),
+                Arc::new(BlockToolsServer::new(documents.clone(), self.cas.clone(), self.vfs.clone())),
                 InstancePolicy::for_kernel(self),
             )
             .await?;

@@ -121,9 +121,8 @@ callers move. Clean adjacent comments and module docs with each change.
 
 Contextual construction now lives in `runtime/context_shell.rs`; every factory
 caller uses `EmbeddedKaish::for_context`, and the dispatcher factory family is
-deleted. The synthesis block-source adapter still ignores hydration errors;
-retain that finding for the adapter audit instead of treating an empty result
-as proof that loading succeeded.
+deleted. Synthesis propagates block-source hydration errors before spending
+embedding work; store-level corruption reporting remains a separate issue below.
 
 Kaibo's identity review found remaining adapter policy/provenance gaps:
 - Adapter writes now carry their current performer; shared editor input keeps
@@ -131,16 +130,27 @@ Kaibo's identity review found remaining adapter policy/provenance gaps:
   is still only live state: `TextEdit`/`SyncPayload` and persisted snapshots
   do not retain an edit actor. A persisted mutation audit record remains
   separate follow-up work.
-- `img_block_from_path` uses host `std::fs::read`, bypassing the shared mount
-  namespace. Route it through the existing file/CAS integration.
-- `runtime/docs_filesystem.rs::docs_path` claims to normalize parent
-  components but drops them: `a/../b` becomes `a/b`. Audit the adapter against
-  kaish VFS path normalization before changing this separate path contract.
-- `KaijutsuBackend::write` treats a document-directory target as creation and
-  discards the supplied bytes. Audit reachability through the VFS and define
-  its directory-write contract; acknowledging discarded content is misleading.
+- File-tool edit/write and cached `MountBackend` writes still drop their
+  invoking performer. Carry the actor through `FileDocumentCache` replacement
+  and edit operations; keep file hydration distinct from later player input.
+- `BlockStore::load_one_from_db` reports snapshot decode/restore/read and
+  oplog decode/replay failures as `Ok(false)`, the same result as an absent
+  document. Give corruption and I/O failures explicit errors at the store
+  boundary; propagating adapter errors alone cannot distinguish them.
 Review evidence and disposition are under
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
+
+The adapter review also identified existing block-tool contracts to revisit:
+`block_edit` promises atomic operations but applies them sequentially after
+checking expected text against the initial snapshot. A later operation can
+fail after earlier ones have changed the block. Validate the complete edit and
+commit one mutation. `block_search` match offsets are line-relative bytes,
+while splice offsets are character positions in the block; document the units
+and conversion before clients compose the two. Image imports currently trust
+file type/extension rather than validate image bytes, and the two search tools
+have inconsistent empty-result conventions. These are separate tool-contract
+follow-ups, not changes in VFS routing. See the 2026-09-18 `adapters-*` review.
+
 
 Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
 uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and

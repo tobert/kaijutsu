@@ -15,9 +15,10 @@
 //!     └── Tool calls → MCP broker
 //! ```
 //!
-//! # Path Mapping
+//! # Internal path mapping
 //!
-//! VFS paths map to blocks as follows:
+//! `KaijutsuFilesystem` translates its mounted `/v/docs` paths to these
+//! backend-internal paths before calling this type:
 //!
 //! - `/docs/{ctx_hex}` - List blocks in a document
 //! - `/docs/{ctx_hex}/{block_key}` - Access a specific block's content
@@ -67,9 +68,9 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 /// Backend that routes kaish operations to kaijutsu's kernel block store.
 ///
 /// File operations become block operations:
-/// - `cat /docs/{ctx_hex}/block-key` → read block content
-/// - `echo "text" >> /docs/{ctx_hex}/block-key` → append to block
-/// - `ls /docs/` → list documents
+/// - `cat /v/docs/{ctx_hex}/block-key` → read block content
+/// - `echo "text" >> /v/docs/{ctx_hex}/block-key` → append to block
+/// - `ls /v/docs/` → list documents
 ///
 /// Tool calls preserve requester, performer, reviewer, and session through the
 /// MCP broker. Each call resolves the current context from the invocation's map.
@@ -340,44 +341,12 @@ impl KernelBackend for KaijutsuBackend {
         }
     }
 
-    async fn write(&self, path: &Path, content: &[u8], mode: WriteMode) -> BackendResult<()> {
-        let content_str =
-            std::str::from_utf8(content).map_err(|e| BackendError::Io(e.to_string()))?;
-
+    async fn write(&self, path: &Path, content: &[u8], _mode: WriteMode) -> BackendResult<()> {
         match self.resolve_path(path) {
-            PathResolution::Document(ctx_id) => {
-                // Create document if CreateNew or Overwrite
-                match mode {
-                    WriteMode::CreateNew => {
-                        if self.blocks.contains(ctx_id) {
-                            return Err(BackendError::AlreadyExists(ctx_id.to_hex()));
-                        }
-                        self.blocks
-                            .create_document(ctx_id, DocKind::File, None)
-                            .map_err(|e| BackendError::Io(e.to_string()))?;
-                    }
-                    WriteMode::UpdateOnly => {
-                        if !self.blocks.contains(ctx_id) {
-                            return Err(BackendError::NotFound(ctx_id.to_hex()));
-                        }
-                    }
-                    WriteMode::Overwrite | WriteMode::Truncate => {
-                        if !self.blocks.contains(ctx_id) {
-                            self.blocks
-                                .create_document(ctx_id, DocKind::File, None)
-                                .map_err(|e| BackendError::Io(e.to_string()))?;
-                        }
-                    }
-                    _ => {
-                        return Err(BackendError::InvalidOperation(
-                            "unsupported write mode".into(),
-                        ));
-                    }
-                }
-                let _ = content_str; // content unused for document-level writes
-                Ok(())
-            }
+            PathResolution::Document(ctx_id) => Err(BackendError::IsDirectory(ctx_id.to_hex())),
             PathResolution::Block(ctx_id, block_id) => {
+                let content_str =
+                    std::str::from_utf8(content).map_err(|e| BackendError::Io(e.to_string()))?;
                 // Write to block content
                 if !self.blocks.contains(ctx_id) {
                     return Err(BackendError::NotFound(format!(
@@ -1104,6 +1073,39 @@ mod tests {
         let edited = blocks.get_non_draft_snapshot(context, &block).unwrap().unwrap();
         assert_eq!(edited.content, "改善");
         assert_eq!(edited.id.principal_id, requester, "editing must preserve the block's original author");
+    }
+
+    #[tokio::test]
+    async fn docs_filesystem_refuses_writes_to_a_document_directory() {
+        use kaish_kernel::vfs::Filesystem;
+        let context = ContextId::new();
+        let (backend, _, _, _) = discovery_backend_as(ShellIdentity {
+            requester: PrincipalId::new(), performer: PrincipalId::new(), reviewer: None,
+            context, session: SessionId::new(),
+        }).await;
+        let blocks = backend.blocks.clone();
+        blocks.create_document(context, DocKind::Conversation, None).unwrap();
+        let block = blocks.insert_block(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "preserve me", Status::Done,
+            kaijutsu_types::ContentType::Plain).unwrap();
+        let filesystem = super::super::docs_filesystem::KaijutsuFilesystem::new(Arc::new(backend));
+
+        let error = filesystem.write(
+            std::path::Path::new(&context.to_hex()),
+            b"these bytes must not disappear",
+        ).await.expect_err("a context id names a directory, never a writable file");
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        let content = blocks.get(context).unwrap().doc.blocks_ordered().into_iter()
+            .find(|candidate| candidate.id == block).unwrap().content;
+        assert_eq!(content, "preserve me");
+
+        let absent = ContextId::new();
+        let error = filesystem.write(
+            std::path::Path::new(&absent.to_hex()),
+            b"a write must not create a document directory",
+        ).await.expect_err("a document-directory write must not create its target");
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(!blocks.contains(absent));
     }
 
     /// `append`/`patch` are unreachable through any live mount (see the doc

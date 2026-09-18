@@ -54,12 +54,21 @@ fn backend_to_io(err: BackendError) -> io::Error {
 ///
 /// The backend expects paths like `/docs/{doc_id}/{block_key}`, but the
 /// filesystem adapter receives paths relative to its mount point.
-/// Normalizes `.` and `..` components before joining.
+/// Resolve `.` and `..` lexically before joining, clamping parent traversal
+/// at this filesystem's root.
 fn docs_path(path: &Path) -> PathBuf {
-    let normalized: PathBuf = path
-        .components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .collect();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
     if normalized.as_os_str().is_empty() {
         PathBuf::from("/docs")
     } else {
@@ -188,5 +197,43 @@ mod tests {
         // Listing root of docs should succeed (may be empty)
         let entries = fs.list(Path::new("")).await;
         assert!(entries.is_ok());
+    }
+
+    #[tokio::test]
+    async fn docs_filesystem_folds_parent_components_without_escaping_the_mount() {
+        use kaish_kernel::vfs::Filesystem;
+        let context = kaijutsu_types::ContextId::new();
+        let blocks = shared_block_store(PrincipalId::system());
+        blocks.create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let block = blocks.insert_block(
+            context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "observable", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain,
+        ).unwrap();
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-docs-fs-parent").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, context);
+        let backend = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            crate::runtime::context_shell::ShellIdentity {
+                requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None,
+                context, session: sid,
+            },
+            session_contexts,
+        ));
+        let fs = KaijutsuFilesystem::new(backend);
+        let canonical = PathBuf::from(format!("{}/{}", context.to_hex(), block.to_key()));
+
+        assert_eq!(fs.read(&canonical).await.unwrap(), b"observable");
+        assert_eq!(
+            fs.read(&PathBuf::from(format!("stale/../{}", canonical.display()))).await.unwrap(),
+            b"observable",
+        );
+        assert_eq!(
+            fs.read(&PathBuf::from(format!("../../{}", canonical.display()))).await.unwrap(),
+            b"observable",
+        );
     }
 }

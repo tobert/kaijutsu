@@ -2672,6 +2672,32 @@ the read execution and frontend paths omitted from the review excerpt. Review
 and disposition are in
 `~/exomemory/kaijutsu/reviews/2026-09-18-execution/edit-actor-*`.
 
+Image imports now read through the kernel's mounted filesystem before storing
+bytes in CAS. Their schema names an absolute mounted path; host-backed mounts
+remain valid. The `/v/docs` adapter folds parent components within its mount
+root and refuses document-directory writes instead of discarding bytes or
+creating an empty document. Synthesis preserves the original cold-load error
+and spends no embedding work on failed input.
+
+Regressions failed before the fixes. Validation passed: 3,290 kernel tests
+(6 ignored), two SSH broker tests, workspace all-targets, emitted image schema,
+and diff checks. The SSH image test verifies exact CAS bytes and one asset
+through the retained shell with host execution denied. Its first fixture tried
+to add a mount after server startup; the corrected fixture uses the existing
+writable rc mount. Local dependency review used the pinned kaish revision,
+not the newer checkout HEAD.
+
+Kaibo/DeepSeek Flash reviewed whole adapter files (43,215 input / 1,800 output
+tokens); its response reached the cap. The image path description was clarified.
+Existing block-edit atomicity, search offset units, empty-search conventions,
+and image validation gaps were recorded separately. Store hydration still
+conflates some corrupt snapshots with absence. File-tool/cache mutation actor
+propagation is the remaining confirmed adapter migration gap. Broker-owned
+cancellation drops inline file walks, and virtual MCP results currently carry
+one stream, so those audit hypotheses did not establish defects. Review and
+disposition are in
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/adapters-*`.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

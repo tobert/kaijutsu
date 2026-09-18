@@ -1,5 +1,4 @@
-//! `BlockToolsServer` — virtual MCP server exposing block and content-creation
-//! tools (D-30).
+//! MCP block and content-creation tools over the kernel block store, VFS, and CAS.
 
 use std::sync::Arc;
 
@@ -11,9 +10,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::block_store::SharedBlockStore;
-// The `*_char_*` twins, NOT the byte variants: `apply_op` feeds
-// `edit_text_as`, and block text is char-indexed (byte offsets
-// corrupt multibyte content — the June file-tools bug class).
+// Block edits use character offsets; byte offsets would split multibyte text.
 use crate::block_tools::translate::{
     content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
     line_to_char_offset, validate_expected_text,
@@ -22,6 +19,7 @@ use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status, KIND_NAMES, 
 use kaijutsu_types::ContextId;
 use kaijutsu_cas::ContentStore;
 use crate::execution::{ExecContext, ExecResult};
+use crate::vfs::{MountTable, VfsOps};
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
@@ -212,7 +210,7 @@ pub struct ImgBlockParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ImgBlockFromPathParams {
-    /// Filesystem path to an image file.
+    /// Absolute path to an image in the mounted filesystem (e.g. /config/rc/cover.png).
     pub path: String,
 }
 
@@ -240,18 +238,20 @@ pub struct BlockToolsServer {
     instance_id: InstanceId,
     documents: SharedBlockStore,
     cas: Arc<FileStore>,
+    vfs: Arc<MountTable>,
     notif_tx: broadcast::Sender<ServerNotification>,
 }
 
 impl BlockToolsServer {
     pub const INSTANCE: &'static str = "builtin.block";
 
-    pub fn new(documents: SharedBlockStore, cas: Arc<FileStore>) -> Self {
+    pub fn new(documents: SharedBlockStore, cas: Arc<FileStore>, vfs: Arc<MountTable>) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
             instance_id: InstanceId::new(Self::INSTANCE),
             documents,
             cas,
+            vfs,
             notif_tx,
         }
     }
@@ -312,7 +312,7 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<AbcBlockParams>(&self.instance_id, "abc_block", "Append an ABC music notation block. Validates parse; renders as sheet music inline.")?,
             tool_def::<DiffBlockParams>(&self.instance_id, "diff_block", "Append a unified-diff block to the current context. Validates the diff parses strictly; renders as a diff view inline.")?,
             tool_def::<ImgBlockParams>(&self.instance_id, "img_block", "Append an image block referencing content already in the CAS by hash.")?,
-            tool_def::<ImgBlockFromPathParams>(&self.instance_id, "img_block_from_path", "Read an image file, store it in the CAS, and append an image block.")?,
+            tool_def::<ImgBlockFromPathParams>(&self.instance_id, "img_block_from_path", "Read an image from the mounted filesystem, store it in the CAS, and append an image block.")?,
         ])
     }
 
@@ -831,7 +831,7 @@ impl McpServerLike for BlockToolsServer {
                 let p: ImgBlockFromPathParams = serde_json::from_value(params.arguments)
                     .map_err(McpError::InvalidParams)?;
 
-                let data = match std::fs::read(&p.path) {
+                let data = match self.vfs.read_all(std::path::Path::new(&p.path)).await {
                     Ok(d) => d,
                     Err(e) => {
                         return Ok(from_exec_result(ExecResult::failure(
@@ -1050,6 +1050,8 @@ mod tests {
     use crate::block_store::{shared_block_store_with_db, DocumentKind};
     use crate::kernel_db::{DocumentRow, KernelDb};
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
+    use crate::vfs::{MountTable, VfsOps};
+    use crate::vfs::backends::MemoryBackend;
     use kaijutsu_cas::FileStore;
     use kaijutsu_types::{now_millis, PrincipalId};
 
@@ -1083,7 +1085,12 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
-        let server = Arc::new(BlockToolsServer::new(store.clone(), cas));
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/images", MemoryBackend::new()).await;
+        vfs.write_all(std::path::Path::new("/images/pixel.png"), b"mounted-image")
+            .await
+            .unwrap();
+        let server = Arc::new(BlockToolsServer::new(store.clone(), cas, vfs));
         let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())
@@ -1156,7 +1163,11 @@ mod tests {
         })).await;
         assert!(result.is_err() || result.as_ref().unwrap().is_error);
         let tmp = tempfile::tempdir().unwrap();
-        let server = BlockToolsServer::new(store, Arc::new(FileStore::at_path(tmp.path().join("cas"))));
+        let server = BlockToolsServer::new(
+            store,
+            Arc::new(FileStore::at_path(tmp.path().join("cas"))),
+            Arc::new(MountTable::new()),
+        );
         let tools = server.list_tools(&ctx).await.unwrap();
         let status = tools.iter().find(|tool| tool.name == "block_status").unwrap();
         println!("{status:?}");
@@ -1285,6 +1296,31 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
         assert!(response["block_id"].is_string());
         assert!(response["version"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn img_block_from_path_reads_a_mounted_image_not_the_host() {
+        let (broker, ctx, _db, store) = setup().await;
+
+        let result = call(
+            &broker,
+            &ctx,
+            "img_block_from_path",
+            serde_json::json!({ "path": "/images/pixel.png" }),
+        )
+        .await;
+
+        assert!(!result.is_error, "mounted image failed: {}", text_of(&result));
+        let response: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let block = kaijutsu_types::BlockId::from_key(response["block_id"].as_str().unwrap()).unwrap();
+        let snapshot = store.get_block_snapshot(ctx.context_id, &block).unwrap().unwrap();
+        assert_eq!(snapshot.role, Role::Asset);
+        assert_eq!(snapshot.content_type, ContentType::Image);
+        assert_eq!(
+            snapshot.content,
+            kaijutsu_cas::ContentHash::from_data(b"mounted-image").to_string(),
+            "the asset must hold the mounted bytes' CAS hash"
+        );
     }
 
     #[tokio::test]
