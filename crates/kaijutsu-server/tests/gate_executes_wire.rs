@@ -96,6 +96,7 @@ struct Seats {
     worker_kj: KernelHandle,
     approver_kj: KernelHandle,
     kernel: SharedKernel,
+    db_path: PathBuf,
     worker: ContextId,
     approver: ContextId,
 }
@@ -103,7 +104,7 @@ struct Seats {
 impl Seats {
     async fn close(self) {
         let Self {
-            _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker: _, approver: _,
+            _worker_client, _approver_client, worker_kj, approver_kj, kernel, db_path: _, worker: _, approver: _,
         } = self;
         drop(worker_kj);
         drop(approver_kj);
@@ -129,6 +130,7 @@ async fn seats() -> Seats {
     let addr = listener.local_addr().unwrap();
     let mut config = SshServerConfig::ephemeral(addr.port());
     config.auth_db_path = Some(auth_db_path);
+    let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
     let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
     tokio::task::spawn_local(async move {
         SshServer::new(config).run_on_listener_with_kernel_sink(listener, kernel_tx).await.unwrap();
@@ -183,6 +185,7 @@ async fn seats() -> Seats {
         worker_kj,
         approver_kj,
         kernel,
+        db_path,
         worker,
         approver,
     }
@@ -1398,6 +1401,45 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
 }
 
 #[test]
+fn result_review_checkpoint_failure_refuses_without_publishing_an_ask() {
+    run_local(async {
+        let s = seats().await;
+        let scratch = Scratch::new("review-checkpoint");
+        let marker = scratch.marker();
+        s.kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("failed-review-checkpoint".into()), match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())), match_context: Some(s.worker),
+            match_principal: None, action: HookAction::Ask(AskSpec { description: Some("Review captured output".into()) }),
+            priority: 0, kaish_script_id: None,
+        });
+        let conn = rusqlite::Connection::open(&s.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_review_link BEFORE INSERT ON shell_result_review_asks
+             BEGIN SELECT RAISE(ABORT, 'injected review link fault'); END;"
+        ).unwrap();
+        s.worker_kj.join_context(s.worker, "review-checkpoint").await.unwrap();
+        let submission = s.worker_kj.shell_submit(&format!("echo once >> '{}'; echo captured", marker.display()), s.worker, true).await.unwrap();
+        wait_for("checkpoint refusal settlement", || {
+            s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap().completed_at.is_some()
+        }).await;
+        let argv = ["wait", "--operation", &submission.operation_id, "--timeout", "0", &s.worker.to_hex()].into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let result = s.approver_kj.execute_kj_quiet(s.approver, &argv).await.unwrap();
+        let data = result.data.unwrap();
+        assert_eq!(data["state"]["envelope"]["status"], "error");
+        assert!(data["state"]["envelope"]["error"].as_str().unwrap().contains("injected review link fault"));
+        assert!(data["state"]["receipt"]["ask_id"].is_null());
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "once\n");
+        let captured = s.kernel.kernel.shell_operations().outcome(&submission.operation_id, s.worker).unwrap().unwrap();
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution else { panic!("lost captured execution") };
+        assert_eq!(raw.text_out(), "captured\n");
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM approvals WHERE origin='hook_result'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        conn.execute_batch("DROP TRIGGER fail_review_link").unwrap();
+        s.close().await;
+    });
+}
+
+#[test]
 fn post_call_approval_continues_hooks_without_executing_again() {
     run_local(result_review_case(false, true, false, false));
 }
@@ -1474,7 +1516,7 @@ fn structured_result_review_survives_rpc_disconnect() {
         let ask = refusal.ask.unwrap().request_id;
         let operation = s.kernel.kernel.shell_operations().get_by_ask(&ask, s.worker).unwrap().unwrap();
         let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
-        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver } = s;
+        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver, db_path: _ } = s;
         drop(worker_kj);
         drop(_worker_client);
         wait_for("structured submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;
@@ -1785,7 +1827,7 @@ fn mcp_result_review_survives_rpc_disconnect() {
             .receipt.ask_id.is_some()).await;
         let ask = s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap().receipt.ask_id.unwrap();
         let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
-        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver } = s;
+        let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver, db_path: _ } = s;
         drop(worker_kj);
         drop(_worker_client);
         wait_for("MCP submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;

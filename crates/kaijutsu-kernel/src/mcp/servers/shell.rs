@@ -1827,6 +1827,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn result_review_checkpoint_failure_leaves_no_actionable_ask() {
+        use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern, AskSpec};
+        for foreground in [false, true] {
+            for table in ["shell_result_reviews", "shell_result_review_asks"] {
+                let (broker, d) = wired().await;
+                let principal = PrincipalId::new();
+                let context = crate::kj::test_helpers::register_rooted_context(&d, Some("failed-review-admission"), principal);
+                d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+                let mut binding = ContextToolBinding::new();
+                binding.grant(Capability::Facade("shell".into()));
+                broker.set_binding(context, binding).await.unwrap();
+                broker.hooks().write().await.post_call.entries.push(HookEntry {
+                    id: HookId("failed-review-checkpoint".into()), match_instance: None,
+                    match_tool: Some(GlobPattern("shell".into())), match_context: Some(context), match_principal: None,
+                    action: HookAction::Ask(AskSpec { description: Some("Review captured output".into()) }),
+                    priority: 0, kaish_script_id: None,
+                });
+                d.kernel_db().lock().conn_for_ledger().execute_batch(&format!(
+                    "CREATE TRIGGER fail_checkpoint BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected checkpoint fault'); END;"
+                )).unwrap();
+                let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+                let params = if foreground { call("echo captured") } else { call_async("echo captured") };
+                let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
+                if foreground {
+                    let Err(McpError::Refused(refusal)) = result else { panic!("failed checkpoint must refuse review") };
+                    assert!(refusal.reason.contains("injected checkpoint fault"), "{refusal:?}");
+                } else {
+                    let id = body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned();
+                    let state = wait_for_operation(&d, context, &id).await;
+                    assert!(state.envelope.unwrap().is_error());
+                    let raw = d.kernel().shell_operations().outcome(&id, context).unwrap().unwrap();
+                    let crate::runtime::command_outcome::CommandExecution::Completed(result) = raw.execution else { panic!("lost capture") };
+                    assert_eq!(result.text_out(), "captured\n");
+                }
+                let asks: i64 = d.kernel_db().lock().conn_for_ledger().query_row(
+                    "SELECT COUNT(*) FROM approvals WHERE origin='hook_result'", [], |row| row.get(0)).unwrap();
+                assert_eq!(asks, 0, "checkpoint failure must roll back its ask, including abandoned rows");
+                let reviews: i64 = d.kernel_db().lock().conn_for_ledger().query_row(
+                    "SELECT COUNT(*) FROM shell_result_reviews", [], |row| row.get(0)).unwrap();
+                assert_eq!(reviews, 0, "link failure must roll back its captured review too");
+                d.kernel_db().lock().conn_for_ledger().execute_batch("DROP TRIGGER fail_checkpoint").unwrap();
+                d.kernel().shutdown_runtime_worker().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tool_result_reviews_retain_execution_for_foreground_and_background_calls() {
         use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern, AskSpec};
         for foreground in [false, true] {

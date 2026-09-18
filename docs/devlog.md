@@ -2263,6 +2263,26 @@ in the inventory. DeepSeek review questioned missing or contradictory receipt
 states; retaining the live owner and refusing clean shutdown is intentional,
 and no receipt-deletion path was found in the kernel.
 
+Result-review admission now commits the ask, captured execution, optional
+receipt update, and invocation link in one transaction before notification.
+The prior handoff overstated checkpoint failure: ordinary failures already
+became terminal hook refusals. The concrete gap was an announced ask without
+its captured result. Injected checkpoint/link failures reproduced an orphaned
+approval row. Admission now rolls all of those writes back, while terminal
+settlement preserves tracked execution. The wait only publishes Waiting state
+and consumes the answer; it does not create a second checkpoint.
+
+The gate uses the ledger's existing transaction callback. The callback receives
+the connection and never reacquires the database guard. Caller error types are
+preserved across that transaction. DeepSeek found no concrete admission
+regression; its questions about sequential reviews and automatic decisions were
+checked against the retained per-invocation owner and exact-statement policy.
+Validation passed 3,192 kernel tests, 170 ledger tests, and 33 SSH gate/publication
+tests; workspace all-targets also passed. The SSH failure regression reads from an unaffected reviewer context and
+checks refusal, absent ask, preserved raw execution, and one source execution.
+Cancellation/panic recovery read failures, abandonment failure, and prolonged
+storage-fault admission pressure remain in the inventory.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

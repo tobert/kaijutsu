@@ -322,62 +322,69 @@ impl ShellOperationRegistry {
         self.complete_record(id, envelope, None)
     }
 
-    /// Retain execution and link each ask to the same review. A command without
-    /// a transcript pair has no receipt; its call identity still scopes every ask.
+    #[cfg(test)]
     pub(crate) fn checkpoint_result_review(
         &self, review_id: &str, operation_id: Option<&str>, call: &crate::mcp::CallContext,
         outcome: &CommandOutcome,
     ) -> OperationResult<()> {
+        self.db.lock().in_transaction(|db| Self::checkpoint_result_review_in(
+            db.conn_for_ledger(), review_id, operation_id, call, outcome)).map_err(|e| e.to_string())
+    }
+
+    /// Link captured execution to its ask inside the ask's transaction. Calls
+    /// without a transcript pair retain their invocation identity without a receipt.
+    pub(crate) fn checkpoint_result_review_in(
+        conn: &rusqlite::Connection, review_id: &str, operation_id: Option<&str>, call: &crate::mcp::CallContext,
+        outcome: &CommandOutcome,
+    ) -> KernelDbResult<()> {
+        if conn.is_autocommit() { return Err(KernelDbError::Validation("result review checkpoint requires the ask transaction".into())); }
         let envelope = outcome.envelope();
-        if envelope.status != ShellStatus::Waiting { return Err("result review checkpoint is not waiting".into()); }
-        let ask = envelope.ask_id.ok_or("result review checkpoint has no ask")?;
-        let json = serde_json::to_string(outcome).map_err(|e| e.to_string())?;
-        let db = self.db.lock();
-        let tx = db.conn_for_ledger().unchecked_transaction().map_err(|e| e.to_string())?;
-        let valid: bool = tx.query_row(
+        if envelope.status != ShellStatus::Waiting { return Err(KernelDbError::Validation("result review checkpoint is not waiting".into())); }
+        let ask = envelope.ask_id.ok_or_else(|| KernelDbError::Validation("result review checkpoint has no ask".into()))?;
+        let json = serde_json::to_string(outcome).map_err(|e| KernelDbError::Validation(e.to_string()))?;
+        let valid: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM approvals WHERE request_id=?1 AND context_id=?2
              AND principal_id=?3 AND actor_id=?4 AND origin='hook_result' AND exec_source IS NULL)",
             rusqlite::params![ask, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes()],
             |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        if !valid { return Err("ask is not a result review for this invocation".into()); }
-        let prior: Option<String> = tx.query_row("SELECT outcome_json FROM shell_result_reviews WHERE review_id=?1",
-            [review_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        )?;
+        if !valid { return Err(KernelDbError::Validation("ask is not a result review for this invocation".into())); }
+        let prior: Option<String> = conn.query_row("SELECT outcome_json FROM shell_result_reviews WHERE review_id=?1",
+            [review_id], |r| r.get(0)).optional()?;
         if let Some(prior) = prior {
-            let mut captured: CommandOutcome = serde_json::from_str(&prior).map_err(|e| e.to_string())?;
+            let mut captured: CommandOutcome = serde_json::from_str(&prior).map_err(|e| KernelDbError::Validation(e.to_string()))?;
             let mut incoming = outcome.clone();
             captured.hook = None;
             incoming.hook = None;
-            if serde_json::to_string(&captured).map_err(|e| e.to_string())?
-                != serde_json::to_string(&incoming).map_err(|e| e.to_string())?
+            if serde_json::to_string(&captured).map_err(|e| KernelDbError::Validation(e.to_string()))?
+                != serde_json::to_string(&incoming).map_err(|e| KernelDbError::Validation(e.to_string()))?
             {
-                return Err("result review checkpoint cannot rewrite captured execution".into());
+                return Err(KernelDbError::Validation("result review checkpoint cannot rewrite captured execution".into()));
             }
         }
         if let Some(id) = operation_id {
-            let changed = tx.execute(
+            let changed = conn.execute(
                 "UPDATE shell_operations SET ask_id=?2 WHERE operation_id=?1 AND completed_at IS NULL
                  AND context_id=?3 AND principal_id=?4 AND actor_id=?5
                  AND operation_id NOT IN (SELECT operation_id FROM shell_operation_outcomes)",
                 rusqlite::params![id, ask, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes()],
-            ).map_err(|e| e.to_string())?;
-            require_changed(changed, id)?;
+            )?;
+            require_changed(changed, id).map_err(KernelDbError::Validation)?;
         }
-        let changed = tx.execute(
+        let changed = conn.execute(
             "INSERT INTO shell_result_reviews(review_id,operation_id,context_id,principal_id,actor_id,outcome_json)
              VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(review_id) DO UPDATE SET outcome_json=excluded.outcome_json
              WHERE shell_result_reviews.final_json IS NULL AND shell_result_reviews.operation_id IS excluded.operation_id
              AND shell_result_reviews.context_id=excluded.context_id AND shell_result_reviews.principal_id=excluded.principal_id
              AND shell_result_reviews.actor_id=excluded.actor_id",
             rusqlite::params![review_id, operation_id, call.context_id.as_bytes(), call.principal_id.as_bytes(), call.actor_id.as_bytes(), json],
-        ).map_err(|e| e.to_string())?;
-        require_changed(changed, review_id)?;
-        tx.execute("INSERT OR IGNORE INTO shell_result_review_asks(request_id,review_id) VALUES(?1,?2)",
-            rusqlite::params![ask, review_id]).map_err(|e| e.to_string())?;
-        let owner: String = tx.query_row("SELECT review_id FROM shell_result_review_asks WHERE request_id=?1", [&ask], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        if owner != review_id { return Err("result ask already belongs to another invocation".into()); }
-        tx.commit().map_err(|e| e.to_string())
+        )?;
+        require_changed(changed, review_id).map_err(KernelDbError::Validation)?;
+        conn.execute("INSERT OR IGNORE INTO shell_result_review_asks(request_id,review_id) VALUES(?1,?2)",
+            rusqlite::params![ask, review_id])?;
+        let owner: String = conn.query_row("SELECT review_id FROM shell_result_review_asks WHERE request_id=?1", [&ask], |r| r.get(0))?;
+        if owner != review_id { return Err(KernelDbError::Validation("result ask already belongs to another invocation".into())); }
+        Ok(())
     }
 
     /// Finish a receipt-free review if it opened an ask. Calls without an ask

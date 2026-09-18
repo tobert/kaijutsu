@@ -317,8 +317,8 @@ These are source observations, not promises that all paths behave alike.
 - Live reporting/retry of persistence failures remains open. Abrupt task
   destruction before capture still needs a durable terminal outcome; cooperative worker shutdown settles execution, paused hooks,
   and review with matching job/receipt results and closed streams.
-- `runtime/result_review.rs` checkpoints executed outcomes before waiting on a
-  PostCall or OnError ask. Approval continues the same ordered hook snapshot;
+- `runtime/result_review.rs` checkpoints executed outcomes and links them in
+  the PostCall or OnError ask transaction, before notification or waiting. Approval continues the same ordered hook snapshot;
   neither the command nor earlier hooks run again. Result-review asks have
   `hook_result` origin, no executable source, and a digest binding the phase,
   call, and captured result. The generic execution/resume driver excludes them;
@@ -347,7 +347,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Structured `executeKj` | kernel `runtime/structured.rs`, `runtime/command.rs`; server RPC adapter | Kernel admission, shared execution/settlement, addressed context, literal argv, typed refusals/latches, quiet review, data, state write-back, disconnect survival, and joined shutdown |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
-| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; abrupt worker destruction and review-checkpoint failure remain open |
+| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; abrupt worker destruction and interrupted-review settlement remain open |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
@@ -410,14 +410,18 @@ retained projection cannot be recovered.
 
 A command whose outcome was never retained remains subject to interrupted-run
 recovery: the kernel reports an unknown result and never reruns its source.
-Failure before the initial retention write still requires live reporting/retry;
-background interactive callers currently log that failure, and approval resumes
-report it to the model.
+While the process is alive, the receipt registry retains failed terminal writes
+for retry without execution. Process loss before SQLite accepts that outcome
+leaves only the durable observations available to interrupted-run recovery.
 
 Result-hook asks retain what already ran and resume hook processing without
-permission to rerun. Interactive/approved and authored structured commands
-checkpoint the outcome and current ask before publishing Waiting blocks.
-Cwd/exports persist before review.
+permission to rerun. Ask creation, the captured outcome, and the invocation link
+commit together before notifying reviewers. This includes quiet calls and
+automatic decisions. A checkpoint or link failure rolls back the ask; the caller
+receives a hook refusal, and tracked commands retain their captured execution
+through terminal settlement. Interactive/approved and authored structured
+commands publish Waiting blocks after this admission. Cwd/exports persist before
+review.
 Approval consumes the answer and continues the ordered hook snapshot; every
 sequential ask retains its link to that invocation. Captured execution remains
 inspectable after completion. Tracked review completion commits atomically with

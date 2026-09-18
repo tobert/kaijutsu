@@ -2338,12 +2338,21 @@ impl KernelDb {
 
     /// Record the caller's publication contract before an ask becomes visible.
     pub(crate) fn create_approval_ask(&self, ask: &approval_ledger::types::NewAsk, publishes_pair: bool) -> KernelDbResult<String> {
-        Ok(approval_ledger::ask::create_ask_recorded(self.conn_for_ledger(), ask, |conn, request| {
+        self.create_approval_ask_recorded(ask, publishes_pair, |_, _| Ok(()))
+    }
+
+    /// Commit related caller state before publishing an ask. The callback must
+    /// use this connection and must not acquire the database guard again.
+    pub(crate) fn create_approval_ask_recorded(
+        &self, ask: &approval_ledger::types::NewAsk, publishes_pair: bool,
+        record: impl FnOnce(&rusqlite::Connection, &str) -> KernelDbResult<()>,
+    ) -> KernelDbResult<String> {
+        approval_ledger::ask::create_ask_recorded(self.conn_for_ledger(), ask, |conn, request| {
             if publishes_pair {
                 conn.execute("INSERT INTO approval_pair_handoffs(request_id) VALUES (?1)", [request])?;
             }
-            Ok(())
-        })?)
+            record(conn, request)
+        })
     }
 
     pub(crate) fn approval_pair_expected(&self, request: &str) -> KernelDbResult<bool> {

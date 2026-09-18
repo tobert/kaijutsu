@@ -2416,12 +2416,16 @@ impl Broker {
         };
         gate_spec.publishes_pair = ctx.publishes_pair && phase == McpHookPhase::PreCall;
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
-        let outcome = crate::kj::gate::run_gate(
+        let outcome = crate::kj::gate::run_gate_recorded(
             dispatcher.kernel(),
             &caller,
             gate_spec,
             dispatcher.kernel().ledger_flows(),
             &gate_config,
+            &|conn, request| match review {
+                Some(review) => review.record_ask(conn, request),
+                None => Ok(()),
+            },
         )
         .await;
 
@@ -3553,6 +3557,9 @@ impl DryRunReport {
 /// Own a result-review wait without yielding its command for re-execution.
 #[async_trait::async_trait]
 pub trait ResultReview: Send + Sync {
+    /// Record captured execution using the ask transaction, without taking a database lock.
+    fn record_ask(&self, conn: &rusqlite::Connection, request: &str) -> crate::kernel_db::KernelDbResult<()>;
+
     async fn wait_for_review(&self, ask: &kaijutsu_types::AskRef) -> McpResult<()>;
 }
 

@@ -23,7 +23,7 @@ fn typed_client_distinguishes_approval_from_publication_abandonment() {
             let request = {
                 // Model a crash after the reviewer answers, before pair publication.
                 let conn = rusqlite::Connection::open(&path).unwrap();
-                let id = create_ask_recorded(&conn, &NewAsk {
+                let id = create_ask_recorded::<approval_ledger::error::LedgerError>(&conn, &NewAsk {
                     context_id: ContextId::new().as_bytes().to_vec(), principal_id: amy.as_bytes().to_vec(),
                     actor_id: PrincipalId::new().as_bytes().to_vec(), reviewer_id: amy.as_bytes().to_vec(),
                     origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,

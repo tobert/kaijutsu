@@ -185,9 +185,12 @@ projections without rerunning commands or hooks, preserving edits made after
 terminal publication. Failed terminal-outcome writes now retain an immutable
 live owner and retry on the existing worker. Shutdown reports any results still
 not durable. `kj wait --operation` and result-review `kj ledger show` expose
-retention errors. Failures while checkpointing a result review before terminal
-retention still need an ownership audit; a read failure in receipt lookup on
-preparation/refusal settlement also needs explicit disposition. Job results now preserve the captured outcome
+retention errors. Result-review ask creation, checkpoint and linkage now commit
+together; a failed checkpoint leaves no ask and becomes a terminal hook refusal.
+Cancellation/panic recovery still reads stored terminal outcomes before returning
+the captured result; read failure there can discard the live capture. Abandon
+failures and receipt lookup during preparation/refusal settlement also need
+explicit disposition. Job results now preserve the captured outcome
 when projection fails; they agree with retained and committed receipts. The
 persistence error remains separate, and an unfinished operation still needs
 projection recovery even when its job has finished.
@@ -253,7 +256,7 @@ repeat an already written seed. Denied/cancelled pair failures now retain the
 answer, and model refusal notifications consume it atomically with their block.
 Claimed approvals now retain completion ownership through notification failures;
 source is never replayed to recover a message. Continue the live terminal-result
-audit for abrupt worker destruction and result-review checkpoint faults. Session
+audit for abrupt worker destruction and interrupted-review settlement faults. Session
 refusals settle before a separate redemption; a retry can re-emit the same pair's
 metadata/status updates. Startup also suppresses old denied pairs rather than
 settling them. Periodic scans now drain larger backlogs; the four-item cap still

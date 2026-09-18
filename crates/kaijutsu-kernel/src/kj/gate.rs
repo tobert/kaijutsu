@@ -438,6 +438,17 @@ pub(crate) fn announce_ledger_change(
 /// `Unavailable`, a fault and not a decision, naming the file and the
 /// remedy. An origin the config layers do not apply to passes
 /// `gate_policy::no_config()`.
+pub(crate) async fn run_gate(
+    kernel: &crate::Kernel,
+    caller: &KjCaller,
+    spec: GateSpec,
+    ledger_flows: &SharedLedgerFlowBus,
+    config: &super::gate_policy::GateConfigLoad,
+) -> GateOutcome {
+    run_gate_recorded(kernel, caller, spec, ledger_flows, config, &|_, _| Ok(())).await
+}
+
+/// Record caller state in the ask transaction, before any ledger notification.
 #[tracing::instrument(
     name = "approval.gate",
     skip_all,
@@ -449,12 +460,13 @@ pub(crate) fn announce_ledger_change(
         ask.id = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_gate(
+pub(crate) async fn run_gate_recorded(
     kernel: &crate::Kernel,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
+    record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let db = kernel.kernel_db();
     let approval_span = tracing::Span::current();
@@ -659,7 +671,7 @@ pub(crate) async fn run_gate(
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
         ask.reviewer_id = reviewer.as_bytes().to_vec();
-        match db.create_approval_ask(&ask, spec.publishes_pair) {
+        match db.create_approval_ask_recorded(&ask, spec.publishes_pair, record) {
             Ok(id) => id,
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
         }

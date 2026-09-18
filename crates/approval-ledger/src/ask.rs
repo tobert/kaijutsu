@@ -36,15 +36,15 @@ pub fn create_ask(conn: &Connection, req: &NewAsk) -> Result<String> {
 /// Create an ask and related caller state in one transaction. The callback
 /// receives the new id before commit; an error rolls back the entire ask.
 /// This function, like `create_ask`, commits before returning its id.
-pub fn create_ask_recorded(
+pub fn create_ask_recorded<E: From<LedgerError>>(
     conn: &Connection, req: &NewAsk,
-    record: impl FnOnce(&Connection, &str) -> Result<()>,
-) -> Result<String> {
+    record: impl FnOnce(&Connection, &str) -> std::result::Result<(), E>,
+) -> std::result::Result<String, E> {
     let request_id = uuid::Uuid::now_v7().to_string();
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).map_err(LedgerError::from)?;
     insert_ask(&tx, &request_id, req)?;
     record(&tx, &request_id)?;
-    tx.commit()?;
+    tx.commit().map_err(LedgerError::from)?;
     Ok(request_id)
 }
 
@@ -1070,7 +1070,7 @@ mod tests {
         let conn = open_memory();
         conn.execute_batch("CREATE TABLE caller_state(request_id TEXT PRIMARY KEY REFERENCES approvals(request_id))").unwrap();
         let mut failed_id = None;
-        let failed = create_ask_recorded(&conn, &minimal_ask(), |conn, id| {
+        let failed = create_ask_recorded::<LedgerError>(&conn, &minimal_ask(), |conn, id| {
             failed_id = Some(id.to_owned());
             conn.execute("INSERT INTO caller_state VALUES (?1)", [id])?;
             conn.execute("INSERT INTO missing_table VALUES (1)", [])?;
@@ -1079,7 +1079,7 @@ mod tests {
         assert!(failed.is_err());
         assert!(get_approval(&conn, failed_id.as_deref().unwrap()).unwrap().is_none());
         assert_eq!(conn.query_row("SELECT count(*) FROM caller_state", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
-        let id = create_ask_recorded(&conn, &minimal_ask(), |conn, id| {
+        let id = create_ask_recorded::<LedgerError>(&conn, &minimal_ask(), |conn, id| {
             conn.execute("INSERT INTO caller_state VALUES (?1)", [id])?;
             Ok(())
         }).unwrap();

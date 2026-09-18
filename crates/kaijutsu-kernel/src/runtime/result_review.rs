@@ -56,6 +56,20 @@ impl Drop for ReviewGuard<'_> {
 
 #[async_trait::async_trait]
 impl crate::mcp::broker::ResultReview for CommandResultReview {
+    fn record_ask(&self, conn: &rusqlite::Connection, request: &str) -> crate::kernel_db::KernelDbResult<()> {
+        use crate::kernel_db::KernelDbError;
+        use rusqlite::OptionalExtension;
+        let operation: Option<String> = match self.pair {
+            Some((command, output)) => Some(conn.query_row(
+                "SELECT operation_id FROM shell_operations WHERE context_id=?1 AND command_block_id=?2 AND output_block_id=?3",
+                rusqlite::params![self.call.context_id.as_bytes(), command.to_key(), output.to_key()], |row| row.get(0),
+            ).optional()?.ok_or_else(|| KernelDbError::Validation("result review pair has no durable operation receipt".into()))?),
+            None => None,
+        };
+        crate::shell_operations::ShellOperationRegistry::checkpoint_result_review_in(
+            conn, &self.review_id, operation.as_deref(), &self.call, &self.waiting_outcome(request))
+    }
+
     async fn wait_for_review(&self, ask: &AskRef) -> McpResult<()> {
         let mut guard = ReviewGuard { owner: self, ask, armed: true };
         let result = self.wait_inner(ask).await;
@@ -100,21 +114,18 @@ impl CommandResultReview {
         Ok(outcome)
     }
 
-    async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
-        use approval_ledger::types::ApprovalStatus;
-        let operation = match self.pair {
-            Some((_, output)) => Some(self.kernel.shell_operations().get_by_output(&output, self.call.context_id)
-                .map_err(McpError::Protocol)?.ok_or_else(|| McpError::Protocol("result review pair has no durable operation receipt".into()))?),
-            None => None,
-        };
+    fn waiting_outcome(&self, request: &str) -> CommandOutcome {
         let mut waiting = self.captured.clone();
         waiting.hook = Some(CommandHookEffect::Refused {
             reason: "Captured execution awaits result review; approval continues processing without running source again.".into(),
-            refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()),
+            refusal: None, waiting: true, ask_id: Some(request.into()),
         });
-        self.kernel.shell_operations().checkpoint_result_review(&self.review_id,
-            operation.as_ref().map(|operation| operation.receipt.operation_id.as_str()), &self.call, &waiting)
-            .map_err(McpError::Protocol)?;
+        waiting
+    }
+
+    async fn wait_inner(&self, ask: &AskRef) -> McpResult<()> {
+        use approval_ledger::types::ApprovalStatus;
+        let waiting = self.waiting_outcome(&ask.request_id);
         if let Some((command, output)) = self.pair {
             super::command::settle_outcome(&self.kernel, self.call.context_id, &command, &output, &waiting, None)
                 .map_err(McpError::Protocol)?;
@@ -209,6 +220,7 @@ mod tests {
     async fn dropping_a_review_settles_captured_execution_without_rerunning_it() {
         let (review, ask, operation) = fixture(true).await;
         let operation = operation.unwrap();
+        review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
         let mut wait = Box::pin(review.wait_for_review(&ask));
         std::future::poll_fn(|cx| {
             assert!(wait.as_mut().poll(cx).is_pending());
@@ -228,6 +240,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_review_abandons_the_wait_without_authorizing_anything() {
         let (review, ask, _) = fixture(true).await;
+        review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
         review.cancel.cancel();
         let error = review.wait_for_review(&ask).await.unwrap_err();
         assert!(error.as_refusal().is_some());
@@ -347,6 +360,7 @@ mod tests {
     async fn quiet_review_drop_retains_execution_without_creating_blocks() {
         let (review, ask, operation) = fixture(false).await;
         assert!(operation.is_none());
+        review.kernel.kernel_db().lock().in_transaction(|db| review.record_ask(db.conn_for_ledger(), &ask.request_id)).unwrap();
         let mut wait = Box::pin(review.wait_for_review(&ask));
         std::future::poll_fn(|cx| {
             assert!(wait.as_mut().poll(cx).is_pending());
