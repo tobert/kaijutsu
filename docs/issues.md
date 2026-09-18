@@ -298,16 +298,14 @@ the job/controller lifetime work; do not claim the receipt currently identifies
 that process group. Linux parent-death cleanup covers direct spawned children;
 arbitrary descendant trees after SIGKILL need their own evidence.
 
-Submit rc receives its turn's cancellation token, but `KjBuiltin` does not
-carry that owner into `KjCaller`. Nested create/fork/drift/attach lifecycle runs
-therefore mint fresh tokens and can hold shutdown until their own timeout.
-Carry the execution owner explicitly; signal and join inline child cleanup.
-Do not drop the dispatch future or tie cancellation to archive/disconnect.
-Stop later, not-yet-admitted effects such as a fork's child turn or rotation
-commit after cancellation. Character-root caller derivation must preserve the
-session, recursion depth and owner too. Beat tick/rotate currently uses an
-untracked local task; move accepted lifecycle work under the existing joined
-runtime owner, preserving its admission proof.
+Inline rc now inherits its execution owner through `KjCaller`, and scheduled
+tick/rotate runs on the joined kernel runtime with the original admission proof.
+Cancellation preserves committed work and stops later unadmitted effects.
+Rc run-record failures still log and continue; audit their durability policy
+before considering lifecycle ownership complete. Hook evaluation also needs
+its own cancellation audit: the broker's ledger-only `KjCaller` values do not
+execute commands, and carrying a token on those records alone would not cancel
+hook bodies or join their cleanup.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while

@@ -505,11 +505,13 @@ fn timed_drives_keep_admission_targets_through_the_client() {
             ("KJ_PHRASE_BEATS".into(), "8".into()), ("KJ_TEMPO".into(), "120".into()),
             ("KJ_PHRASE".into(), "1".into()), ("KJ_HEARD".into(), "[]".into()),
         ]);
+        let cancel = tokio_util::sync::CancellationToken::new();
         kaijutsu_kernel::rc::run(&server.kj_dispatcher, kaijutsu_kernel::rc::RcInvocation {
-            vars, ..kaijutsu_kernel::rc::RcInvocation::new("tick", &admission)
+            vars, ..kaijutsu_kernel::rc::RcInvocation::new("tick", &admission, &cancel)
         }, &kaijutsu_kernel::KjCaller {
             principal_id: performer, actor_id: performer, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+            cancel,
         }).await.unwrap();
         assert_eq!(timeline.lock().future_len(), 1, "shipped tick script admits a score turn");
         assert!(server.documents.block_snapshots(context).unwrap().iter().any(|block|

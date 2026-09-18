@@ -73,14 +73,27 @@ enum CharacterCommand {
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
     },
-    /// Retire a character: stamp `retired_at`, and conclude + archive every
-    /// live context it plays, in the same act. There is no reassignment and
-    /// no verb to move a context to another character — a retired
-    /// character's contexts are archived, not orphaned.
+    /// Retire a character and conclude and archive every live context it plays.
+    /// The contexts retain their performer assignment.
     Retire {
         /// The character's name.
         name: String,
     },
+}
+
+fn root_lifecycle_caller(
+    caller: &KjCaller,
+    character: PrincipalId,
+    context: ContextId,
+) -> KjCaller {
+    KjCaller {
+        actor_id: character,
+        reviewer_id: None,
+        context_id: Some(context),
+        confirmed: false,
+        privileged: false,
+        ..caller.clone()
+    }
 }
 
 impl KjDispatcher {
@@ -168,11 +181,29 @@ impl KjDispatcher {
                 character_to_json(&row),
             );
         }
-        let root_ctx = match self.ensure_root_context(row.principal_id, caller.principal_id).await {
+        let root_ctx = match self.ensure_root_context(row.principal_id, caller).await {
             Ok(ctx) => ctx,
-            Err(e) => return KjResult::Err(format!(
-                "kj character create: created {name} as a root, but not its root context: {e}"
-            )),
+            Err(e) => {
+                let committed = match self.kernel_db().lock().get_character(row.principal_id) {
+                    Ok(Some(sheet)) => sheet.root_ctx,
+                    Ok(None) => None,
+                    Err(read_error) => return KjResult::Err(format!(
+                        "kj character create: created {name} as a root, but its root-context \
+                         lifecycle failed ({e}) and the committed state could not be read: \
+                         {read_error}"
+                    )),
+                };
+                return KjResult::Err(match committed {
+                    Some(context) => format!(
+                        "kj character create: created {name} as a root and committed root context \
+                         {}, but its lifecycle did not complete: {e}",
+                        context.short()
+                    ),
+                    None => format!(
+                        "kj character create: created {name} as a root, but not its root context: {e}"
+                    ),
+                });
+            }
         };
         let row = CharacterRow { root_ctx: Some(root_ctx), ..row };
         KjResult::ok_with_data(
@@ -198,8 +229,19 @@ impl KjDispatcher {
             .map(|row| row.principal_id)
             .collect();
         let mut created = Vec::with_capacity(missing.len());
+        let startup_caller = KjCaller {
+            principal_id: requester,
+            actor_id: requester,
+            reviewer_id: None,
+            context_id: None,
+            session_id: SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
         for principal in missing {
-            created.push(self.ensure_root_context(principal, requester).await?);
+            created.push(self.ensure_root_context(principal, &startup_caller).await?);
         }
         Ok(created)
     }
@@ -207,7 +249,8 @@ impl KjDispatcher {
     /// Return a live root character's root context, creating it when the
     /// sheet has none: type `root`, labeled with the character's name,
     /// played by it, with no parent. `requester` becomes `created_by`.
-    async fn ensure_root_context(&self, character: PrincipalId, requester: PrincipalId) -> Result<ContextId, String> {
+    async fn ensure_root_context(&self, character: PrincipalId, caller: &KjCaller) -> Result<ContextId, String> {
+        let requester = caller.principal_id;
         let new_id = ContextId::new();
         let (name, admission) = {
             let db = self.kernel_db().lock();
@@ -266,19 +309,10 @@ impl KjDispatcher {
             .register(new_id, Some(&name), None, requester)
             .map_err(|e| format!("could not register the root context '{name}': {e}"))?;
 
-        let rc_caller = KjCaller {
-            principal_id: requester,
-            actor_id: character,
-            reviewer_id: None,
-            context_id: Some(new_id),
-            session_id: SessionId::new(),
-            confirmed: false,
-            rc_depth: 0,
-            privileged: false,
-        };
+        let rc_caller = root_lifecycle_caller(caller, character, new_id);
         crate::rc::run(
             self,
-            crate::rc::RcInvocation::new("create", &admission),
+            crate::rc::RcInvocation::new("create", &admission, &rc_caller.cancel),
             &rc_caller,
         )
             .await
@@ -388,10 +422,25 @@ impl KjDispatcher {
             }
             row.principal_id
         };
-        if root && let Err(e) = self.ensure_root_context(principal_id, caller.principal_id).await {
-            return KjResult::Err(format!(
-                "kj character set: {name} is now a root, but has no root context: {e}"
-            ));
+        if root && let Err(e) = self.ensure_root_context(principal_id, caller).await {
+            let committed = match self.kernel_db().lock().get_character(principal_id) {
+                Ok(Some(sheet)) => sheet.root_ctx,
+                Ok(None) => None,
+                Err(read_error) => return KjResult::Err(format!(
+                    "kj character set: {name} is now a root, but its root-context lifecycle \
+                     failed ({e}) and the committed state could not be read: {read_error}"
+                )),
+            };
+            return KjResult::Err(match committed {
+                Some(context) => format!(
+                    "kj character set: {name} is now a root and root context {} was committed, \
+                     but its lifecycle did not complete: {e}",
+                    context.short()
+                ),
+                None => format!(
+                    "kj character set: {name} is now a root, but has no root context: {e}"
+                ),
+            });
         }
         let updated = match self.kernel_db().lock().get_character(principal_id) {
             Ok(Some(r)) => r,
@@ -512,6 +561,43 @@ mod tests {
 
     fn s(x: &str) -> String {
         x.to_string()
+    }
+
+    #[test]
+    fn root_lifecycle_caller_preserves_session_depth_and_owner() {
+        let mut caller = test_caller();
+        caller.rc_depth = 3;
+        let session = caller.session_id;
+        let character = PrincipalId::new();
+        let context = kaijutsu_types::ContextId::new();
+
+        let derived = super::root_lifecycle_caller(&caller, character, context);
+
+        assert_eq!(derived.principal_id, caller.principal_id);
+        assert_eq!(derived.actor_id, character);
+        assert_eq!(derived.context_id, Some(context));
+        assert_eq!(derived.session_id, session);
+        assert_eq!(derived.rc_depth, 3);
+        caller.cancel.cancel();
+        assert!(derived.cancel.is_cancelled(), "the root lifecycle keeps its invoking owner");
+    }
+
+    #[tokio::test]
+    async fn cancelled_root_creation_retains_committed_context_and_reports_partial_result() {
+        let d = super::super::test_helpers::test_dispatcher().await;
+        let caller = test_caller();
+        caller.cancel.cancel();
+
+        let result = d
+            .dispatch(&[s("character"), s("create"), s("cancelled-root"), s("--root")], &caller)
+            .await;
+
+        assert!(!result.is_ok(), "cancelled root lifecycle must be reported");
+        assert!(result.message().contains("rc create lifecycle"), "{}", result.message());
+        let sheet = d.kernel_db().lock()
+            .get_character_by_name("cancelled-root").unwrap().expect("character committed");
+        let context = sheet.root_ctx.expect("root context committed before cancellation");
+        assert!(d.kernel_db().lock().get_context(context).unwrap().is_some());
     }
 
     /// `create` mints a fresh principal and a sheet row.

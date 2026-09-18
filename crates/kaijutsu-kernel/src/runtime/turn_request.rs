@@ -114,8 +114,8 @@ pub(crate) fn queue_startup(
                             .ok_or("submit lifecycle requires a registered kj dispatcher")?,
                     };
                     if let Err(error) = crate::rc::run(&dispatcher, crate::rc::RcInvocation {
-                        vars: info.vars(), cancel: cancel.clone(),
-                        ..crate::rc::RcInvocation::new(crate::rc::VERB_SUBMIT, &admission)
+                        vars: info.vars(),
+                        ..crate::rc::RcInvocation::new(crate::rc::VERB_SUBMIT, &admission, &cancel)
                     }, &caller).await {
                         tracing::warn!(context = %request.context_id, "rc submit lifecycle: {error}");
                     }

@@ -1071,6 +1071,25 @@ impl DriftRouter {
         }
     }
 
+    /// Release items claimed by [`drain`](Self::drain) without recording a
+    /// delivery attempt. Used when the flush owner is cancelled before these
+    /// items are tried. A concurrent cancellation still wins and consumes its
+    /// item; every other item simply becomes eligible for a later flush with
+    /// its retry count unchanged.
+    pub fn release(&mut self, items: Vec<StagedDrift>) {
+        for item in items {
+            let Some(pos) = self.staging.iter().position(|staged| staged.id == item.id) else {
+                continue;
+            };
+            if self.staging[pos].cancelled {
+                self.staging.remove(pos);
+                self.mark_consumed(item.id);
+            } else {
+                self.staging[pos].in_flight = false;
+            }
+        }
+    }
+
     /// Check out every not-already-checked-out item in the dead letter
     /// queue for delivery, without marking its durable record consumed.
     ///
@@ -2541,6 +2560,26 @@ mod tests {
         assert!(ids.contains(&id2));
         // retry_count should have been incremented
         assert!(router.queue().iter().all(|s| s.retry_count == 1));
+    }
+
+    #[test]
+    fn releasing_unattempted_claims_preserves_retry_count() {
+        let mut router = DriftRouter::new();
+        let src = ContextId::new();
+        let tgt = ContextId::new();
+        router.register(src, Some("source"), None, PrincipalId::system()).unwrap();
+        router.register(tgt, Some("target"), None, PrincipalId::system()).unwrap();
+        router.stage(src, tgt, "first".into(), None, DriftKind::Push, PrincipalId::new()).unwrap();
+        router.stage(src, tgt, "second".into(), None, DriftKind::Push, PrincipalId::new()).unwrap();
+
+        let claimed = router.drain(None);
+        assert!(router.queue().iter().all(|item| item.in_flight));
+        router.release(claimed);
+
+        assert_eq!(router.queue().len(), 2);
+        assert!(router.queue().iter().all(|item| !item.in_flight));
+        assert!(router.queue().iter().all(|item| item.retry_count == 0));
+        assert_eq!(router.drain(None).len(), 2, "released items are claimable again");
     }
 
     #[test]

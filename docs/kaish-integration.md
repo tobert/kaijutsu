@@ -143,6 +143,16 @@ These are source observations, not promises that all paths behave alike.
   lifecycle callers use this entry point; dispatcher lifecycle methods are
   deleted. `rc/script_path.rs` owns the shared filename/path grammar, and
   `kj rc` remains a command adapter. Unknown lifecycle verbs fail explicitly.
+  `RcInvocation` requires an owner token. Inline `kj` re-entry carries the
+  interpreter's token through `KjCaller`; cancellation signals child execution
+  and waits for cleanup. Committed contexts, drift deliveries, and separately
+  admitted turns remain retained. A cancelled lifecycle does not admit a later
+  fork turn or commit a rotation. Character-root callers preserve session,
+  recursion depth, and owner while selecting the new root performer.
+- `runtime/rc_lifecycle.rs` queues scheduled tick/rotate work on the existing
+  kernel runtime with the scheduler's original admission and transport snapshot.
+  The beat thread runs only clock/transport work. Archive and client disconnect
+  do not cancel accepted lifecycles; runtime shutdown signals and joins them.
 - `runtime/command.rs` owns execution into a block pair for interactive
   commands, authored structured `kj`, and approval resume. Server `shell_run.rs`
   is deleted. `runtime/structured.rs` owns addressed `kj` construction, quoting,
@@ -430,7 +440,7 @@ remove the obsolete API in the same change as its final caller.
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
 | Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
-| Partial | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; submit cancellation signals and joins kaish; nested lifecycle cancellation propagation remains open |
+| Partial | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; lifecycle bookkeeping faults and output policy still need their audit |
 | Pending | Hook bodies | kernel `mcp/broker.rs` | Inline snapshot versus path-read semantics, internal output profile, hook timeout, exact verdict interpretation, and no recursive command-hook application |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
 | Partial | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | Scoped variables, exact approved inputs, shared serialization, and explicit write-back policy |

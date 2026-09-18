@@ -443,6 +443,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 

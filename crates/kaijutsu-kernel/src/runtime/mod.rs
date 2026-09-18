@@ -15,6 +15,7 @@
 //! remains a distinct owner; see `docs/kaish-integration.md`.
 
 pub mod admission;
+pub mod rc_lifecycle;
 pub mod prompt;
 pub mod turn_request;
 pub mod approval_resume;

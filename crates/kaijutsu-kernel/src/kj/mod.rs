@@ -64,6 +64,7 @@ pub mod wait;
 pub mod workspace;
 
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use kaijutsu_types::{ContentType, ContextId, KernelId, PrincipalId, SessionId};
 
@@ -163,6 +164,10 @@ pub struct KjCaller {
     /// Gates binding *writes*: only a privileged or `binding_admin` caller may
     /// widen a loadout; everyone else may only narrow their own.
     pub privileged: bool,
+    /// Lifetime owner for work performed inline by this invocation. Nested rc
+    /// lifecycles inherit a child token so owner cancellation reaches cleanup
+    /// without letting nested work cancel its parent.
+    pub cancel: CancellationToken,
 }
 
 impl KjCaller {
@@ -1449,6 +1454,7 @@ pub(crate) mod test_helpers {
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -1492,6 +1498,7 @@ pub(crate) mod test_helpers {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -1519,6 +1526,7 @@ pub(crate) mod test_helpers {
             confirmed: true,
             rc_depth: 0,
             privileged: true,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -1639,6 +1647,7 @@ mod unjoined_context_tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: CancellationToken::new(),
         }
     }
 

@@ -270,6 +270,7 @@ impl McpServerLike for ShellServer {
                 confirmed: false,
                 rc_depth: 0,
                 privileged: false,
+                cancel: cancel.clone(),
             };
             // The gate records a durable ask without waiting. The approval
             // driver or a matching retry consumes its answer once.

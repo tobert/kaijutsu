@@ -1903,7 +1903,11 @@ mod tests {
             &d,
             crate::rc::RcInvocation {
                 vars: vars.clone(),
-                ..crate::rc::RcInvocation::new("rotate", &admission)
+                ..crate::rc::RcInvocation::new(
+                    "rotate",
+                    &admission,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
             },
             &caller,
         )

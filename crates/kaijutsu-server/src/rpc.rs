@@ -10535,11 +10535,18 @@ mod rc_thread_stack_tests {
     /// deliberate, reviewed decision rather than a silent exemption. Matched
     /// against a small window of lines around the bare builder, so a name
     /// set a line or two away from `.new()` still counts.
-    const ALLOWED_NON_KAISH: &[(&str, &str)] = &[(
-        "editor-reconciler",
-        "reconciles open editor sessions against merged block text; \
-         touches no kaish state (rpc.rs, spawn_editor_reconciler)",
-    )];
+    const ALLOWED_NON_KAISH: &[(&str, &str)] = &[
+        (
+            "editor-reconciler",
+            "reconciles open editor sessions against merged block text; \
+             touches no kaish state (rpc.rs, spawn_editor_reconciler)",
+        ),
+        (
+            "beat-scheduler",
+            "advances the clock and serves transport commands; lifecycle scripts \
+             are queued on the kernel runtime (beat.rs, spawn_beat_scheduler)",
+        ),
+    ];
 
     /// Lines around `hit.line` in its file (1-based, inclusive `before`, `after`).
     fn window(hit: &Hit, before: usize, after: usize) -> Vec<String> {

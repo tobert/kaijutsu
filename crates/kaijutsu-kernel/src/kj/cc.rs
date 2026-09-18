@@ -732,6 +732,7 @@ mod tests {
                 confirmed: false,
                 rc_depth: 0,
                 privileged: false,
+                cancel: tokio_util::sync::CancellationToken::new(),
             };
             let result = d.dispatch(&[s("cc"), s("--help")], &c).await;
             assert!(

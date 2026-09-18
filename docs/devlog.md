@@ -2531,6 +2531,41 @@ After integrating the concurrent benchmark and standalone ACP commits, the
 combined tree passed 3,247 kernel tests (6 ignored), 66 server tests and
 156 MCP tests, and workspace all-targets checking.
 
+Nested lifecycle cancellation now follows the invoking execution through
+`KjCaller` and `RcInvocation`. A child rc script receives a child token and
+finishes cleanup before its caller settles. Character-root creation preserves
+the invoking session and recursion depth. Cancellation retains committed
+contexts and drift deliveries, stops later fork turns and rotation commits,
+and releases untouched drift claims without consuming retries. Error results
+name the committed work instead of claiming nothing happened.
+
+Scheduled tick and rotate lifecycles now use the existing joined kernel runtime.
+The clock thread captures admission and transport variables, queues the work,
+and continues serving pulse deadlines. Runtime shutdown signals and joins rc;
+archive and SSH disconnect leave accepted work running. The clock no longer
+needs an interpreter stack or a LocalSet. Its caller remains the system
+performer. The thread-stack guard records that clock-only exception.
+
+The nested cancellation regression first timed out waiting for cleanup; the
+scheduler shutdown regression first returned before a cancellation diagnostic
+was written. Both pass. Real SSH tests cover shutdown during a nested create
+and completion after confirmed disconnect and archive. Beat tests cover tick
+and rotate cleanup, and the queued-lifecycle test preserves its original
+admission and captured tick after archive. These fixtures deny system execution;
+their waits use kaish builtins. Auditing emitted help also removed an obsolete
+claim that contexts cannot change performer.
+
+Kaibo/DeepSeek Flash found no confirmed defect (120,841 input / 1,652 output
+tokens). Admission and kernel shutdown wrappers were checked locally outside
+the review packet. Source, findings, and disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/rc-owner-*`.
+Rc bookkeeping failure policy, output preservation, and hook ownership remain
+explicit work in the caller inventory.
+Validation passed: 3,257 kernel tests (6 ignored), 477 server tests, 156 MCP
+tests, 29 kernel integration tests, and workspace all-targets checking. Emitted
+help was read from the current clap command tree. No deployment or reseed was
+performed.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

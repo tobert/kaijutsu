@@ -48,7 +48,8 @@ pub async fn submit(
             };
             let caller = KjCaller { principal_id: principal, actor_id: principal,
                 reviewer_id: None, context_id: Some(context), session_id: session,
-                confirmed: false, rc_depth: 0, privileged: false };
+                confirmed: false, rc_depth: 0, privileged: false,
+                cancel: lease.interrupt().cancel.child_token() };
             (block, None, None, Some((info, caller)))
         }
     };

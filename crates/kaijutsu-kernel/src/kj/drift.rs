@@ -17,6 +17,11 @@ use super::format::format_drift_queue;
 use super::refs;
 use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 
+enum DriftDeliveryOutcome {
+    Complete,
+    LifecycleCancelled(String),
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "drift",
@@ -191,7 +196,7 @@ impl KjDispatcher {
         drift_kind: DriftKind,
         edge_metadata: String,
         caller: &KjCaller,
-    ) -> Result<(), String> {
+    ) -> Result<DriftDeliveryOutcome, String> {
         let admission = self.kernel().admit_context(target_ctx)?;
         let after = self.block_store().last_block_id(target_ctx);
         // The drift block is the one block in the target that legitimately
@@ -232,7 +237,7 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 drift: Some(crate::rc::DriftInfo {
@@ -241,20 +246,25 @@ impl KjDispatcher {
                     target_ctx,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
             },
             caller,
         )
-            .await
-        {
+            .await;
+        if let Err(e) = &lifecycle {
             tracing::warn!(
                 "rc drift lifecycle {} → {}: {e}",
                 source_ctx.short(),
                 target_ctx.short()
             );
         }
+        if caller.cancel.is_cancelled() {
+            return Ok(DriftDeliveryOutcome::LifecycleCancelled(
+                lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into()),
+            ));
+        }
 
-        Ok(())
+        Ok(DriftDeliveryOutcome::Complete)
     }
 
     /// The refusal a drift delivery into a non-live target gets — the SAME
@@ -413,7 +423,10 @@ impl KjDispatcher {
                 )
                 .await
             {
-                Ok(()) => KjResult::ok(format!("drifted → {}", dst_query)),
+                Ok(DriftDeliveryOutcome::Complete) => KjResult::ok(format!("drifted → {}", dst_query)),
+                Ok(DriftDeliveryOutcome::LifecycleCancelled(error)) => KjResult::Err(format!(
+                    "kj drift push: delivered to {dst_query}, but its rc lifecycle was cancelled: {error}"
+                )),
                 Err(e) => stage_after_failure(e),
             };
         }
@@ -541,7 +554,7 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 drift: Some(crate::rc::DriftInfo {
@@ -550,13 +563,19 @@ impl KjDispatcher {
                     target_ctx: context_id,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
             },
             caller,
         )
-            .await
-        {
+            .await;
+        if let Err(e) = &lifecycle {
             tracing::warn!("rc drift lifecycle (pull): {e}");
+        }
+        if caller.cancel.is_cancelled() {
+            let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
+            return KjResult::Err(format!(
+                "kj drift pull: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+            ));
         }
 
         // Preview: first ~200 chars
@@ -668,7 +687,7 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = crate::rc::run(
+        let lifecycle = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 drift: Some(crate::rc::DriftInfo {
@@ -677,13 +696,19 @@ impl KjDispatcher {
                     target_ctx: target_id,
                     source_model,
                 }),
-                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
+                ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
             },
             caller,
         )
-            .await
-        {
+            .await;
+        if let Err(e) = &lifecycle {
             tracing::warn!("rc drift lifecycle (merge): {e}");
+        }
+        if caller.cancel.is_cancelled() {
+            let error = lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into());
+            return KjResult::Err(format!(
+                "kj drift merge: delivery and edge were committed, but its rc lifecycle was cancelled: {error}"
+            ));
         }
 
         // Preview: first ~200 chars
@@ -710,6 +735,11 @@ impl KjDispatcher {
     }
 
     async fn drift_flush(&self, caller: &KjCaller) -> KjResult {
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(
+                "kj drift flush: owner cancelled before any queued delivery was claimed".into(),
+            );
+        }
         let staged = {
             let mut router = self.drift_router().write();
             router.drain(caller.context_id)
@@ -729,8 +759,17 @@ impl KjDispatcher {
         let count = staged.len();
         let mut injected = 0;
         let mut failed = Vec::new();
+        let mut released = Vec::new();
+        let mut lifecycle_cancelled = false;
 
-        for drift in staged {
+        let mut staged = staged.into_iter();
+        while let Some(drift) = staged.next() {
+            if caller.cancel.is_cancelled() {
+                released.push(drift);
+                released.extend(staged);
+                lifecycle_cancelled = true;
+                break;
+            }
             // Slice 2 (docs/drifting-dead-letters.md): a peer-origin item
             // has no `ContextId` by construction, and `insert_drift_block_as`
             // (block_store.rs, outside this lane's territory) requires a
@@ -832,7 +871,7 @@ impl KjDispatcher {
                                 target_ctx: drift.target_ctx,
                                 source_model: drift.source_model.clone(),
                             }),
-                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission)
+                            ..crate::rc::RcInvocation::new(crate::rc::VERB_DRIFT, &admission, &caller.cancel)
                         },
                         caller,
                     )
@@ -843,6 +882,11 @@ impl KjDispatcher {
                             source_ctx.short(),
                             drift.target_ctx.short()
                         );
+                    }
+                    if caller.cancel.is_cancelled() {
+                        released.extend(staged);
+                        lifecycle_cancelled = true;
+                        break;
                     }
                 }
                 Err(e) => {
@@ -861,6 +905,17 @@ impl KjDispatcher {
         if !failed.is_empty() {
             let mut router = self.drift_router().write();
             router.requeue(failed);
+        }
+        let release_count = released.len();
+        if !released.is_empty() {
+            self.drift_router().write().release(released);
+        }
+        if lifecycle_cancelled {
+            return KjResult::Err(format!(
+                "kj drift flush: delivered {injected}/{count} drift(s), but an rc lifecycle \
+                 was cancelled; {fail_count} failed item(s) were requeued and {release_count} \
+                 unattempted item(s) were released without consuming a retry"
+            ));
         }
 
         // Drain dead letters (items that exceeded MAX_DRIFT_RETRIES, plus any
@@ -1743,6 +1798,36 @@ mod tests {
             .any(|b| b.kind == kaijutsu_types::BlockKind::Drift));
     }
 
+    #[tokio::test]
+    async fn cancelled_drift_reports_committed_delivery_without_staging_a_duplicate() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("cancelled-drift-source"), None, principal);
+        let target = register_context(&d, Some("cancelled-drift-target"), None, principal);
+        d.block_store()
+            .create_document(target, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        c.cancel.cancel();
+
+        let result = d.dispatch(
+            &[s("drift"), s("push"), s("cancelled-drift-target"), s("delivered-once")],
+            &c,
+        ).await;
+
+        assert!(!result.is_ok(), "cancelled lifecycle must report partial completion");
+        assert!(result.message().contains("delivered to"), "{}", result.message());
+        let delivered = d.block_store().block_snapshots(target).unwrap().into_iter()
+            .filter(|block| block.kind == kaijutsu_types::BlockKind::Drift
+                && block.content == "delivered-once")
+            .count();
+        assert_eq!(delivered, 1, "the accepted delivery is retained exactly once");
+        assert!(
+            d.drift_router().read().queue().is_empty(),
+            "a committed delivery must not also be staged for retry"
+        );
+    }
+
     /// An ambiguous label prefix must still report every candidate rather
     /// than silently picking one. This is the failure mode the crowded
     /// `cc-*` namespace produces in the field, so it is worth pinning.
@@ -1981,6 +2066,66 @@ mod tests {
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
         assert!(result.message().contains("flushed 1 drift"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_flush_after_first_delivery_releases_unattempted_remainder() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("cancel-flush-source"), None, principal);
+        let dst = register_context(&d, Some("cancel-flush-target"), None, principal);
+        d.kernel_db().lock().update_context_type(dst, "cancel-flush").unwrap();
+        d.block_store()
+            .create_document(dst, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        install_rc_script_file(
+            &d,
+            "/config/rc/cancel-flush/drift/S00-block.kai",
+            "kj block create --role system --kind notification --content flush-before-cancel; sleep 10",
+        )
+        .await;
+        let caller = caller_with_context(src);
+        for content in ["first-delivery", "unattempted-delivery"] {
+            let staged = d.dispatch(
+                &[s("drift"), s("push"), s("--stage"), s("cancel-flush-target"), s(content)],
+                &caller,
+            ).await;
+            assert!(staged.is_ok(), "stage failed: {}", staged.message());
+        }
+
+        let flush_argv = [s("drift"), s("flush")];
+        let flush = d.dispatch(&flush_argv, &caller);
+        tokio::pin!(flush);
+        let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut flush => panic!("flush ended before cancellation: {result:?}"),
+                    _ = inspect.tick() => {
+                        let blocks = d.block_store().block_snapshots(dst).unwrap_or_default();
+                        if blocks.iter().any(|block| block.content == "flush-before-cancel") {
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.expect("first delivery lifecycle must reach its blocking script");
+
+        caller.cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut flush)
+            .await.expect("flush cancellation must await rc cleanup");
+        assert!(!result.is_ok(), "cancelled flush must report partial completion");
+        assert!(result.message().contains("released without consuming a retry"), "{}", result.message());
+
+        let blocks = d.block_store().block_snapshots(dst).unwrap();
+        assert!(blocks.iter().any(|block| block.content == "first-delivery"));
+        assert!(!blocks.iter().any(|block| block.content == "unattempted-delivery"));
+        let router = d.drift_router().read();
+        assert_eq!(router.queue().len(), 1);
+        assert_eq!(router.queue()[0].content, "unattempted-delivery");
+        assert_eq!(router.queue()[0].retry_count, 0);
+        assert!(!router.queue()[0].in_flight);
     }
 
     #[tokio::test]

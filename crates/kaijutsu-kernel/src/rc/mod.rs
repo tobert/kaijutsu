@@ -174,7 +174,11 @@ pub struct RcInvocation<'a> {
 }
 
 impl<'a> RcInvocation<'a> {
-    pub fn new(verb: &'a str, admission: &'a ContextAdmission) -> Self {
+    pub fn new(
+        verb: &'a str,
+        admission: &'a ContextAdmission,
+        owner: &CancellationToken,
+    ) -> Self {
         Self {
             verb,
             admission,
@@ -182,7 +186,7 @@ impl<'a> RcInvocation<'a> {
             fork_kind: None,
             drift: None,
             vars: HashMap::new(),
-            cancel: CancellationToken::new(),
+            cancel: owner.child_token(),
         }
     }
 }
@@ -464,8 +468,6 @@ async fn run_kai_script(
     caller: &KjCaller,
     principal: PrincipalId,
 ) -> ScriptRunResult {
-    use kaijutsu_types::SessionId;
-
     let new_id = invocation.admission.context();
     let parent_id = invocation.parent;
     let fork_kind = invocation.fork_kind;
@@ -501,7 +503,7 @@ async fn run_kai_script(
             "rc",
             ShellIdentity {
                 requester: principal, performer: caller.actor_id, reviewer: caller.reviewer_id,
-                context: new_id, session: SessionId::new(),
+                context: new_id, session: caller.session_id,
             },
             ShellPolicy::Rc(RcAuthority { _private: () }), ShellCwd::Context,
             None,

@@ -1079,11 +1079,16 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let admission = d.kernel().admit_context(ctx).expect("admit create lifecycle");
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("create", &admission),
+            crate::rc::RcInvocation::new(
+                "create",
+                &admission,
+                &tokio_util::sync::CancellationToken::new(),
+            ),
             &caller,
         )
             .await

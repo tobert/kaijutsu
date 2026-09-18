@@ -1099,6 +1099,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let pending = async {
             tracing::callsite::rebuild_interest_cache();

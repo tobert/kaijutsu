@@ -455,6 +455,7 @@ impl Tool for KjBuiltin {
             confirmed,
             rc_depth,
             privileged: self.privileged,
+            cancel: ctx.cancel.child_token(),
         };
 
         // Synthesis uses this invocation's explicit index and block source;

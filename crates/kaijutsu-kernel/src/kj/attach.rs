@@ -72,7 +72,7 @@ impl KjDispatcher {
         // script effects remain in the target if applying the switch later fails.
         if let Err(e) = crate::rc::run(
             self,
-            crate::rc::RcInvocation::new("attach", &admission),
+            crate::rc::RcInvocation::new("attach", &admission, &caller.cancel),
             caller,
         )
             .await
@@ -127,6 +127,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 

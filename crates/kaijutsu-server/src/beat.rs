@@ -44,10 +44,10 @@ use kaijutsu_kernel::hyoushigi::{
 use kaijutsu_kernel::kernel_db::{
     ContextRow, DEFAULT_HYDRATION_WINDOW, PersistedAttachment, PersistedTrack,
 };
-use kaijutsu_kernel::{ContentStore, Kernel, KjCaller, KjDispatcher};
+use kaijutsu_kernel::{ContentStore, Kernel, KjDispatcher};
 use kaijutsu_types::{
     BlockSnapshot, ConsentMode, ContentType, ContextId, ContextState, DocKind, PrincipalId,
-    SessionId, Tick, TickDelta, TrackId, now_millis,
+    Tick, TickDelta, TrackId, now_millis,
 };
 
 use crate::clock::{ClockSource, ClockSourceKind};
@@ -2029,9 +2029,8 @@ impl BeatScheduler {
         vars
     }
 
-    /// Fire an rc lifecycle `verb` for `ctx`, fire-and-forget on the local set so
-    /// the scheduler never blocks. The transport env is snapshotted synchronously
-    /// (on this thread) and moved into the spawned task.
+    /// Admit a lifecycle and capture its transport variables on the clock thread.
+    /// The kernel runtime owns execution and cleanup without blocking the pulse.
     fn fire_lifecycle(&self, ctx: ContextId, verb: &'static str) {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return;
@@ -2044,30 +2043,9 @@ impl BeatScheduler {
             }
         };
         let vars = self.transport_env(ctx);
-        tokio::task::spawn_local(async move {
-            let caller = KjCaller {
-                principal_id: PrincipalId::system(),
-                actor_id: PrincipalId::system(),
-                reviewer_id: None,
-                context_id: Some(ctx),
-                session_id: SessionId::new(),
-                confirmed: false,
-                rc_depth: 0,
-                privileged: false,
-            };
-            if let Err(e) = kaijutsu_kernel::rc::run(
-                &dispatcher,
-                kaijutsu_kernel::rc::RcInvocation {
-                    vars: vars.clone(),
-                    ..kaijutsu_kernel::rc::RcInvocation::new(verb, &admission)
-                },
-                &caller,
-            )
-                .await
-            {
-                log::warn!("beat: {verb} verb failed for context {ctx}: {e}");
-            }
-        });
+        if let Err(error) = kaijutsu_kernel::runtime::rc_lifecycle::submit(dispatcher, admission, verb, vars) {
+            log::warn!("beat: accepted {verb} lifecycle for context {ctx} could not start: {error}");
+        }
     }
 
     /// Fire the `tick` rc verb — the OODA hook (`kj drive`). Its kaish only
@@ -2092,15 +2070,9 @@ impl BeatScheduler {
     /// `Arm` creates the entry (always `Ok`); `Disarm` is idempotent (`Ok`); the
     /// rest require the context to be armed.
     ///
-    /// MUST STAY FULLY SYNCHRONOUS — no `.await`. This runs inside `run`'s
-    /// `select!` ingress arm, and a rc-lifecycle script (`fire_rotate` /
-    /// `fire_lifecycle`, both `spawn_local` onto *this same LocalSet*) can issue a
-    /// `kj transport` command and then await the `BeatAck` reply. That awaiting rc
-    /// task only makes progress when this loop yields back to poll it; if
-    /// `apply_command` ever awaits, the rc-fired path can self-deadlock (the
-    /// scheduler parked awaiting something the rc task can't deliver because the
-    /// rc task is parked awaiting this reply). Keep the work here non-blocking and
-    /// reply before yielding.
+    /// Keep this synchronous and nonblocking. Rc runs on the kernel runtime
+    /// and may await the command's reply; the clock loop must keep serving
+    /// transport requests and pulse deadlines while that work is pending.
     fn apply_command(&mut self, command: BeatCommand) -> BeatAck {
         match command {
             BeatCommand::Attach { track, context_id, attachment, policy } => {
@@ -2218,10 +2190,8 @@ impl BeatScheduler {
                 biased;
                 msg = ingress.recv() => match msg {
                     Some(BeatRequest::Command { command, reply }) => {
-                        // `apply_command` is synchronous on purpose: a rc-fired
-                        // `kj transport` (spawn_local on this LocalSet) awaits the
-                        // reply below, so this arm must compute + send without
-                        // yielding or it self-deadlocks. See `apply_command` doc.
+                        // Reply without waiting for lifecycle execution. The
+                        // clock keeps serving transport while rc runs elsewhere.
                         let ack = self.apply_command(command);
                         // Report the real outcome to a caller that wants it (`kj
                         // transport`), so its message can't lie about an un-armed
@@ -2275,10 +2245,8 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
-/// Spawn the server-lifetime beat scheduler on a dedicated current-thread
-/// runtime and LocalSet, since firing the `tick`
-/// verb uses `spawn_local`. Installs the ingress sender on the kernel so the rc
-/// lifecycle and `kj transport` can arm/drive musician contexts.
+/// Spawn the server-lifetime clock/transport runtime. Lifecycle execution is
+/// queued on the kernel runtime; transport commands return through this ingress.
 pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let (tx, rx) = mpsc::unbounded_channel::<BeatRequest>();
     registry.kernel.kernel.set_beat_ingress(tx);
@@ -2286,15 +2254,7 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
     let kernel = registry.kernel.kernel.clone();
     let documents = registry.kernel.documents.clone();
     let dispatcher = registry.kernel.kj_dispatcher.clone();
-    // A `rotate` page-turn runs a deeply self-re-entrant rc chain on THIS
-    // thread (fire_rotate → rc::run → `kj fork` → the child's fork +
-    // attach rc → `kj transport attach`/`play`, each `kj` re-entering kaish via
-    // `.await`, so the whole nest accumulates on one stack). The default 2 MiB
-    // thread stack is too small for that depth with kaish's interpreter — it
-    // SIGABRTs the scheduler mid-rotate. Reserve a generous stack; it's virtual
-    // address space, committed page-by-page only as used. See
-    // `spawn_kaish_thread`.
-    if let Err(e) = kaijutsu_kernel::spawn_kaish_thread("beat-scheduler", move || {
+    if let Err(e) = std::thread::Builder::new().name("beat-scheduler".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2305,8 +2265,7 @@ pub fn spawn_beat_scheduler(registry: Arc<ServerRegistry>) {
                 return;
             }
         };
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async move {
+        rt.block_on(async move {
             BeatScheduler::new(kernel, documents)
                 .with_dispatcher(dispatcher)
                 .run(rx)
@@ -4047,85 +4006,148 @@ mod tests {
         (kernel, documents, db, ctx)
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn archived_context_does_not_fire_tick_lifecycle() {
-        tokio::task::LocalSet::new().run_until(async {
-            use kaijutsu_kernel::kernel_db::ContextRow;
-            use kaijutsu_kernel::vfs::{MemoryBackend, VfsOps};
-            use kaijutsu_kernel::KjDispatcher;
-            use kaijutsu_types::{ConsentMode, ContextState};
-            use std::path::Path;
+    async fn lifecycle_scheduler(verb: &str, body: &str) -> (BeatScheduler, Arc<Kernel>, ContextId) {
+        use kaijutsu_kernel::kernel_db::ContextRow;
+        use kaijutsu_kernel::vfs::{MemoryBackend, VfsOps};
+        use kaijutsu_kernel::KjDispatcher;
+        use kaijutsu_types::{ConsentMode, ContextState};
+        use std::path::Path;
 
-            let kernel = Arc::new(Kernel::new_ephemeral("archived-tick").await);
-            let db = kernel.kernel_db().clone();
-            let documents = kernel.blocks().clone();
-            let principal = PrincipalId::new();
-            let ctx = ContextId::new();
-            {
-                let db = db.lock();
-                let workspace = db.get_or_create_default_workspace(principal).unwrap();
-                db.insert_context_with_document(
-                    &ContextRow {
-                        context_id: ctx,
-                        label: Some("archived-tick".to_string()),
-                        provider: None,
-                        model: None,
-                        system_prompt: None,
-                        consent_mode: ConsentMode::default(),
-                        context_state: ContextState::Live,
-                        context_type: "musician".to_string(),
-                        created_at: 0,
-                        created_by: principal,
-                        forked_from: None,
-                        fork_kind: None,
-                        archived_at: None,
-                        workspace_id: None,
-                        preset_id: None,
-                        concluded_at: None,
-                        last_activity_at: None,
-                        promoted_at: None,
-                        demoted_at: None,
-                        paused_at: None,
-                        cast_id: None,
-                        origin_host: None,
-                        played_by: None,
-                        reviewer_id: None,
-                        director_id: None,
-                    },
-                    workspace,
-                )
-                .unwrap();
-            }
-            documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
-            db.lock().archive_context(ctx).unwrap();
-            let rc = MemoryBackend::new();
-            rc.mkdir(Path::new("/musician"), 0o755).await.unwrap();
-            rc.mkdir(Path::new("/musician/tick"), 0o755).await.unwrap();
-            rc.write_all(
-                Path::new("/musician/tick/S00-marker.kai"),
-                b"kj block create --role system --kind text --content tick-must-not-run",
+        let kernel = Arc::new(Kernel::new_ephemeral("archived-tick").await);
+        let db = kernel.kernel_db().clone();
+        let documents = kernel.blocks().clone();
+        let principal = PrincipalId::new();
+        let ctx = ContextId::new();
+        {
+            let db = db.lock();
+            let workspace = db.get_or_create_default_workspace(principal).unwrap();
+            db.insert_context_with_document(
+                &ContextRow {
+                    context_id: ctx,
+                    label: Some("archived-tick".to_string()),
+                    provider: None,
+                    model: None,
+                    system_prompt: None,
+                    consent_mode: ConsentMode::default(),
+                    context_state: ContextState::Live,
+                    context_type: "musician".to_string(),
+                    created_at: 0,
+                    created_by: principal,
+                    forked_from: None,
+                    fork_kind: None,
+                    archived_at: None,
+                    workspace_id: None,
+                    preset_id: None,
+                    concluded_at: None,
+                    last_activity_at: None,
+                    promoted_at: None,
+                    demoted_at: None,
+                    paused_at: None,
+                    cast_id: None,
+                    origin_host: None,
+                    played_by: None,
+                    reviewer_id: None,
+                    director_id: None,
+                },
+                workspace,
             )
-            .await
             .unwrap();
-            kernel.mount("/config/rc", rc).await;
-            let dispatcher = Arc::new(KjDispatcher::new(
-                kernel.drift().clone(),
-                documents.clone(),
-                db.clone(),
-                kernel.clone(),
-            ));
-            dispatcher.set_self_arc();
-            let scheduler = BeatScheduler::new(kernel, documents.clone()).with_dispatcher(dispatcher);
+        }
+        documents.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let rc = MemoryBackend::new();
+        rc.mkdir(Path::new("/musician"), 0o755).await.unwrap();
+        rc.mkdir(Path::new(&format!("/musician/{verb}")), 0o755).await.unwrap();
+        rc.write_all(
+            Path::new(&format!("/musician/{verb}/S00-marker.kai")),
+            body.as_bytes(),
+        )
+        .await
+        .unwrap();
+        kernel.mount("/", kaijutsu_kernel::LocalBackend::read_only("/")).await;
+        kernel.mount("/config/rc", rc).await;
+        let dispatcher = Arc::new(KjDispatcher::new(
+            kernel.drift().clone(),
+            documents.clone(),
+            db.clone(),
+            kernel.clone(),
+        ));
+        dispatcher.set_self_arc();
+        let scheduler = BeatScheduler::new(kernel.clone(), documents.clone()).with_dispatcher(dispatcher);
 
+        (scheduler, kernel, ctx)
+    }
+
+    fn run_lifecycle_test<F: std::future::Future<Output = ()> + 'static>(
+        make: impl FnOnce() -> F + Send + 'static,
+    ) {
+        kaijutsu_kernel::spawn_kaish_thread("beat-lifecycle-test", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            tokio::task::LocalSet::new().block_on(&runtime, make());
+        }).unwrap().join().unwrap();
+    }
+
+    async fn wait_for_lifecycle_marker(kernel: &Kernel, context: ContextId, marker: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if kernel.blocks().block_snapshots(context).unwrap().iter().any(|block| block.content == marker) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("lifecycle marker did not arrive: {marker}"));
+    }
+
+    #[test]
+    fn archived_context_does_not_fire_tick_lifecycle() {
+        run_lifecycle_test(|| async {
+            let (scheduler, kernel, ctx) = lifecycle_scheduler("tick",
+                "kj block create --role system --kind text --content tick-must-not-run").await;
+            kernel.kernel_db().lock().archive_context(ctx).unwrap();
             scheduler.fire_tick(ctx);
             tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(kernel.blocks().block_snapshots(ctx).unwrap().iter()
+                .all(|block| block.content != "tick-must-not-run"));
+            kernel.shutdown_runtime_worker().await.unwrap();
+        });
+    }
 
-            let blocks = documents.block_snapshots(ctx).unwrap();
-            assert!(
-                blocks.iter().all(|block| block.content != "tick-must-not-run"),
-                "an archived tick must not run its lifecycle: {blocks:?}"
-            );
-        }).await;
+    #[test]
+    fn shutdown_joins_active_tick_and_rotate_lifecycles() {
+        run_lifecycle_test(|| async {
+            for verb in ["tick", "rotate"] {
+                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                    "kj block create --role system --kind text --content lifecycle-entered\nsleep 60\n").await;
+                use kaijutsu_kernel::vfs::VfsOps;
+                kernel.vfs().write_all(std::path::Path::new(&format!("/config/rc/musician/{verb}/S10-later.kai")),
+                    b"kj block create --role system --kind text --content must-not-run").await.unwrap();
+                scheduler.fire_lifecycle(ctx, verb);
+                wait_for_lifecycle_marker(&kernel, ctx, "lifecycle-entered").await;
+                tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
+                    .expect("shutdown must signal and join the accepted lifecycle").unwrap();
+                let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
+                assert!(blocks.iter().any(|block| block.kind == kaijutsu_types::BlockKind::Error
+                    && block.content.contains("cancelled")),
+                    "shutdown returned before {verb} cleanup recorded its failure: {blocks:?}");
+                assert!(!kernel.blocks().block_snapshots(ctx).unwrap().iter().any(|block| block.content == "must-not-run"));
+            }
+        });
+    }
+
+    #[test]
+    fn admitted_tick_and_rotate_lifecycles_survive_archive() {
+        run_lifecycle_test(|| async {
+            for verb in ["tick", "rotate"] {
+                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                    "kj block create --role system --kind text --content lifecycle-entered\nwhile test ! -e /config/rc/release; do sleep 0.01; done\nkj block create --role system --kind text --content lifecycle-finished").await;
+                scheduler.fire_lifecycle(ctx, verb);
+                wait_for_lifecycle_marker(&kernel, ctx, "lifecycle-entered").await;
+                kernel.kernel_db().lock().archive_context(ctx).unwrap();
+                use kaijutsu_kernel::vfs::VfsOps;
+                kernel.vfs().write_all(std::path::Path::new("/config/rc/release"), b"release").await.unwrap();
+                wait_for_lifecycle_marker(&kernel, ctx, "lifecycle-finished").await;
+                kernel.shutdown_runtime_worker().await.unwrap();
+            }
+        });
     }
 
     /// Attach + tempo + rotate write the live clock through to the `tracks` row and

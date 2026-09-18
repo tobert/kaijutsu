@@ -2248,6 +2248,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let pending = gate_once(&d, &caller, spec()).await;
         let request_id = pending.ask.expect("gate asks").request_id;
@@ -3748,6 +3749,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -4374,7 +4376,7 @@ mod tests {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             }
         }
-        let amy_caller = KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let amy_caller = KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         assert!(d.dispatch(&[s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")], &amy_caller).await.is_ok());
         d.kernel_db().lock().conn_for_ledger().execute("UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [lead.as_bytes().as_slice()]).unwrap();
         let result = d.dispatch(&[s("ledger"), s("delegation"), s("revoke"), s("lead")], &amy_caller).await;
@@ -4397,7 +4399,7 @@ mod tests {
                 db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root }).unwrap();
             }
         }
-        let caller = |actor| KjCaller { principal_id: actor, actor_id: actor, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let caller = |actor| KjCaller { principal_id: actor, actor_id: actor, reviewer_id: None, context_id: None, session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         let grant = [s("ledger"), s("delegation"), s("grant"), s("lead"), s("--to"), s("judge")];
         let refused = d.dispatch(&grant, &caller(lead)).await;
         assert!(!refused.is_ok() && refused.message().contains("only a live root character"), "{}", refused.message());
@@ -4585,6 +4587,7 @@ mod tests {
                 confirmed: false,
                 rc_depth: 0,
                 privileged: false,
+                cancel: tokio_util::sync::CancellationToken::new(),
             };
             let result = d.dispatch(&[s("ledger"), s("list")], &c).await;
             assert!(result.is_ok(), "{result:?}");

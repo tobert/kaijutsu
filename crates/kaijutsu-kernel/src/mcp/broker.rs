@@ -2309,6 +2309,8 @@ impl Broker {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            // Ledger attribution only; this caller does not execute commands or rc.
+            cancel: CancellationToken::new(),
         };
         let spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
         crate::kj::gate::record_dry_run_ask(
@@ -2397,6 +2399,8 @@ impl Broker {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            // Ledger attribution only; this caller does not execute commands or rc.
+            cancel: CancellationToken::new(),
         };
         let mut gate_spec = if matches!(phase, McpHookPhase::PostCall | McpHookPhase::OnError) {
             if review.is_none() {

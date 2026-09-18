@@ -394,6 +394,7 @@ async fn kj_binding_allow_narrows_and_enforces_end_to_end() {
         confirmed: false,
         rc_depth: 0,
         privileged: true,
+        cancel: tokio_util::sync::CancellationToken::new(),
     };
 
     let argv: Vec<String> = ["binding", "allow", "builtin.file:read"]

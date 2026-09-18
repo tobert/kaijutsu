@@ -146,6 +146,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
 
         let result = resolve_context_ref(&ContextRef::Current, &caller, &db);
@@ -198,6 +199,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
 
         let result = resolve_context_ref(&ContextRef::Parent(1), &caller, &db);
@@ -323,6 +325,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
 
         // .parent → parent_id

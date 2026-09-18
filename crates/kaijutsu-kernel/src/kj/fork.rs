@@ -809,13 +809,21 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(fork_kind),
-                ..crate::rc::RcInvocation::new("fork", &admission)
+                ..crate::rc::RcInvocation::new("fork", &admission, &caller.cancel)
             },
             caller,
         )
             .await
         {
             tracing::warn!("rc fork lifecycle: {e}");
+        }
+
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj fork: child {} was committed, but its rc lifecycle was cancelled; \
+                 no child turn was admitted",
+                new_id.short()
+            ));
         }
 
         let switch = args.switch;
@@ -1081,13 +1089,21 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(ForkKind::Compact),
-                ..crate::rc::RcInvocation::new("fork", &admission)
+                ..crate::rc::RcInvocation::new("fork", &admission, &caller.cancel)
             },
             caller,
         )
             .await
         {
             tracing::warn!("rc fork lifecycle (compact): {e}");
+        }
+
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj fork --compact: child {} was committed, but its rc lifecycle was \
+                 cancelled; no child turn was admitted",
+                new_id.short()
+            ));
         }
 
         // POSIX-style: drive the child's autonomous turn (if --prompt) after all
@@ -1368,13 +1384,21 @@ impl KjDispatcher {
             crate::rc::RcInvocation {
                 parent: Some(source_id),
                 fork_kind: Some(ForkKind::Subtree),
-                ..crate::rc::RcInvocation::new("fork", &admission)
+                ..crate::rc::RcInvocation::new("fork", &admission, &caller.cancel)
             },
             caller,
         )
             .await
         {
             tracing::warn!("rc fork lifecycle (subtree): {e}");
+        }
+
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj fork --as: subtree root {} was committed, but its rc lifecycle \
+                 was cancelled; no child turn was admitted",
+                new_root_id.short()
+            ));
         }
 
         // POSIX-style: the prompt/turn targets the subtree root. Drive it after
@@ -1466,6 +1490,13 @@ impl KjDispatcher {
     ) {
         let Some(note) = prompt else { return };
         if staging {
+            return;
+        }
+        if caller.cancel.is_cancelled() {
+            tracing::warn!(
+                context_id = %new_id,
+                "kj fork --prompt: owner cancelled before the child turn was admitted"
+            );
             return;
         }
         let Some(after) = self.block_store().last_block_id(new_id) else {
@@ -3174,6 +3205,41 @@ mod tests {
             }
             other => panic!("expected Requested, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_fork_retains_child_without_admitting_prompt_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let source = register_context(&d, Some("cancelled-parent"), None, principal);
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        c.cancel.cancel();
+        let mut sub = d.kernel().turn_flows().subscribe("turn.requested");
+
+        let result = d
+            .dispatch(
+                &[
+                    s("fork"),
+                    s("--name"),
+                    s("cancelled-child"),
+                    s("--prompt"),
+                    s("must not start"),
+                ],
+                &c,
+            )
+            .await;
+
+        assert!(!result.is_ok(), "cancelled fork must report partial completion");
+        assert!(result.message().contains("was committed"), "{}", result.message());
+        assert!(result.message().contains("no child turn was admitted"), "{}", result.message());
+        assert!(
+            d.kernel_db().lock().find_context_by_label("cancelled-child").unwrap().is_some(),
+            "the forked child remains committed"
+        );
+        assert!(sub.try_recv().is_none(), "cancellation must stop the later prompt turn");
     }
 
     #[tokio::test]

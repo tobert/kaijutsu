@@ -6,6 +6,10 @@
         d.kernel().admit_context(context).expect("admit rc lifecycle")
     }
 
+    fn test_invocation<'a>(verb: &'a str, admission: &'a crate::runtime::admission::ContextAdmission) -> RcInvocation<'a> {
+        RcInvocation::new(verb, admission, &tokio_util::sync::CancellationToken::new())
+    }
+
     #[tokio::test]
     async fn default_seed_does_not_enable_host_exec_for_later_create_scripts() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -24,7 +28,7 @@
         let admission = admit(&d, context);
         crate::rc::run(
             &d,
-            RcInvocation::new("create", &admission),
+            test_invocation("create", &admission),
             &caller_with_context(context),
         )
         .await
@@ -52,7 +56,7 @@
         let admission = admit(&d, context);
         crate::rc::run(
             &d,
-            RcInvocation::new("create", &admission),
+            test_invocation("create", &admission),
             &caller_with_context(context),
         )
         .await
@@ -77,7 +81,7 @@
         "#).await;
         install_rc_script_file(&d, "/config/rc/snapshot/create/S10-author.md", "old data").await;
         let admission = admit(&d, ctx);
-        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
+        crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
         assert_eq!(instructions.len(), 1);
@@ -146,7 +150,7 @@
             std::path::Path::new("missing-target.md"),
         ).await.unwrap();
         let admission = admit(&d, ctx);
-        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
+        crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
         assert!(d.block_store().block_snapshots(ctx).unwrap().is_empty());
         let run = find_run_for_context(&d, ctx, "create").unwrap();
         assert_eq!(run.script_count, Some(0));
@@ -183,7 +187,7 @@
                 install_rc_script_file(&d, path, program).await;
             }
             let admission = admit(&d, ctx);
-            crate::rc::run(&d, RcInvocation::new("create", &admission), &caller).await.unwrap();
+            crate::rc::run(&d, test_invocation("create", &admission), &caller).await.unwrap();
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             let instructions: Vec<_> = blocks.iter()
                 .filter(|b| b.role == Role::System && b.kind == BlockKind::Text).collect();
@@ -215,7 +219,7 @@
                     &[b'a', 0xff, b'\n']).await.unwrap();
             }
             let admission = admit(&d, ctx);
-            crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
+            crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
             let blocks = d.block_store().block_snapshots(ctx).unwrap();
             assert!(!blocks.iter().any(|b| b.kind == BlockKind::Text));
             assert!(blocks.iter().any(|b| b.kind == BlockKind::Error), "input failure must be visible");
@@ -236,7 +240,7 @@
         "#).await;
         install_rc_script_file(&d, "/config/rc/precedence/create/S00-instructions.kai.txt", "").await;
         let admission = admit(&d, ctx);
-        crate::rc::run(&d, RcInvocation::new("create", &admission), &caller_with_context(ctx)).await.unwrap();
+        crate::rc::run(&d, test_invocation("create", &admission), &caller_with_context(ctx)).await.unwrap();
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let instructions: Vec<_> = blocks.iter().filter(|b| b.kind == BlockKind::Text).collect();
         assert_eq!(instructions.len(), 2);
@@ -253,7 +257,7 @@
         let admission = admit(&d, context);
         let result = crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("cretae", &admission),
+            test_invocation("cretae", &admission),
             &caller,
         ).await;
         assert!(result.is_err(), "an unknown lifecycle verb must not succeed without running");
@@ -281,6 +285,7 @@
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -632,7 +637,7 @@
             &d,
             crate::rc::RcInvocation {
                 vars: vars.clone(),
-                ..crate::rc::RcInvocation::new("tick", &admission)
+                ..test_invocation("tick", &admission)
             },
             &caller,
         )
@@ -671,7 +676,7 @@
         let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", &admission),
+            test_invocation("tick", &admission),
             &caller,
         )
             .await
@@ -716,7 +721,7 @@
         let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", &admission),
+            test_invocation("tick", &admission),
             &visitor,
         )
             .await
@@ -824,7 +829,7 @@
         let admission = admit(&d, new_id);
         crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("tick", &admission),
+            test_invocation("tick", &admission),
             &visitor,
         )
             .await
@@ -898,7 +903,7 @@
             crate::rc::RcInvocation {
                 parent: Some(parent),
                 fork_kind: Some(fork_kind),
-                ..crate::rc::RcInvocation::new("fork", &admission)
+                ..test_invocation("fork", &admission)
             },
             &caller,
         )
@@ -1327,7 +1332,7 @@
         let admission = admit(&d, target);
         let res = crate::rc::run(
             &d,
-            crate::rc::RcInvocation::new("attach", &admission),
+            test_invocation("attach", &admission),
             &caller,
         )
             .await;
@@ -1356,7 +1361,7 @@
         let admission = admit(&d, target);
         d.kernel_db().lock().archive_context(target).unwrap();
 
-        crate::rc::run(&d, RcInvocation::new("tick", &admission), &caller_with_context(target))
+        crate::rc::run(&d, test_invocation("tick", &admission), &caller_with_context(target))
             .await.expect("accepted lifecycle survives later archive");
 
         let contents = block_contents_in(&d, target);
@@ -1448,7 +1453,7 @@ esac
                     target_ctx: dst,
                     source_model: Some("claude-opus-4-7".into()),
                 }),
-                ..crate::rc::RcInvocation::new("drift", &admission)
+                ..test_invocation("drift", &admission)
             },
             &caller,
         )
@@ -1495,7 +1500,7 @@ esac
                     target_ctx: parent,
                     source_model: None,
                 }),
-                ..crate::rc::RcInvocation::new("drift", &admission)
+                ..test_invocation("drift", &admission)
             },
             &caller,
         )
@@ -1876,7 +1881,7 @@ esac
 
         let admission = admit(&d, context);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let invocation = RcInvocation { cancel: cancel.clone(), ..RcInvocation::new("create", &admission) };
+        let invocation = RcInvocation::new("create", &admission, &cancel);
         let caller = caller_with_context(context);
         let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
         let run = crate::rc::run(&d, invocation, &caller);
@@ -1915,6 +1920,96 @@ esac
         );
         let run = find_run_for_context(&d, context, "create").expect("durable run row");
         assert_eq!(run.outcome, Some(RcOutcome::Failed));
+    }
+
+    /// A lifecycle re-entering rc through `kj` remains part of the same owner.
+    /// Cancellation must reach the child interpreter and await its cleanup,
+    /// while preserving the child context and effects committed before it.
+    #[test]
+    fn cancelling_an_rc_lifecycle_cancels_nested_create_after_cleanup() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(cancelling_an_rc_lifecycle_cancels_nested_create_after_cleanup_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn cancelling_an_rc_lifecycle_cancels_nested_create_after_cleanup_body() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let outer = register_context(&d, Some("nested-cancel-outer"), None, PrincipalId::new());
+        set_context_type(&d, outer, "nested-cancel-outer");
+        install_rc_script_file(
+            &d,
+            "/config/rc/nested-cancel-outer/create/S00-create-child.kai",
+            "kj context create nested-cancel-child --type nested-cancel-child",
+        )
+        .await;
+        install_rc_script_file(
+            &d,
+            "/config/rc/nested-cancel-child/create/S00-block.kai",
+            "echo retained-nested-output; kj block create --role system --kind notification --content nested-before-cancel; sleep 10",
+        )
+        .await;
+        install_rc_script_file(
+            &d,
+            "/config/rc/nested-cancel-child/create/S20-later.kai",
+            "kj block create --role system --kind notification --content nested-must-not-run",
+        )
+        .await;
+
+        let admission = admit(&d, outer);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let invocation = RcInvocation::new("create", &admission, &cancel);
+        let caller = caller_with_context(outer);
+        let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
+        let run = crate::rc::run(&d, invocation, &caller);
+        tokio::pin!(run);
+        let child = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut run => panic!("outer lifecycle ended before nested cancellation: {result:?}"),
+                    _ = inspect.tick() => {
+                        let child = d.kernel_db().lock()
+                            .find_context_by_label("nested-cancel-child").unwrap()
+                            .map(|row| row.context_id);
+                        if let Some(child) = child
+                            && block_contents_in(&d, child).iter()
+                                .any(|content| content.contains("nested-before-cancel"))
+                        {
+                            break child;
+                        }
+                    }
+                }
+            }
+        }).await.expect("the nested lifecycle must commit its marker before cancellation");
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), &mut run)
+            .await
+            .expect("nested cancellation must await cleanup without waiting for sleep");
+        let error = result.expect_err("the cancelled outer lifecycle must report cancellation");
+        assert!(error.contains("cancel"), "{error}");
+        assert!(
+            d.kernel_db().lock().get_context(child).unwrap().is_some(),
+            "the committed child context must survive cancellation"
+        );
+        let contents = block_contents_in(&d, child);
+        assert!(
+            contents.iter().any(|content| content.contains("retained-nested-output")),
+            "the nested cancellation diagnostic must retain active output: {contents:?}"
+        );
+        assert!(
+            !contents.iter().any(|content| content.contains("nested-must-not-run")),
+            "nested cancellation must stop later child scripts: {contents:?}"
+        );
+        let child_run = find_run_for_context(&d, child, "create").expect("nested create run");
+        assert_eq!(child_run.outcome, Some(RcOutcome::Failed));
     }
 
     /// All `.kai` scripts run under the kernel-wide `rc_script_timeout`

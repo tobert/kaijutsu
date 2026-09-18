@@ -92,6 +92,7 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         confirmed: false,
         rc_depth: 0,
         privileged: false,
+        cancel: tokio_util::sync::CancellationToken::new(),
     };
     let argv: Vec<String> = ["context", "create", label, "--type", context_type]
         .iter()
@@ -359,6 +360,7 @@ async fn character_create_root_binds_its_root_context() {
         confirmed: false,
         rc_depth: 0,
         privileged: true,
+        cancel: tokio_util::sync::CancellationToken::new(),
     };
     let argv: Vec<String> = ["character", "create", "keeper", "--root"].iter().map(|s| s.to_string()).collect();
     let res = h.dispatcher.dispatch(&argv, &caller).await;

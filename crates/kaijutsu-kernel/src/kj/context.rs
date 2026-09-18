@@ -1480,16 +1480,14 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
         };
 
-        // Run rc create-lifecycle scripts. Failures surface as Error
-        // blocks in the new context — they don't abort context creation
-        // (Amy, 2026-08-12: a fresh context holds nothing worth saving, so
-        // aborting buys little and destroys the Error blocks that explain the
-        // failure; `kj context rebind` is the repair).
+        // Run rc create-lifecycle scripts after committing the context. A
+        // lifecycle failure retains the context and its Error blocks so
+        // `kj context rebind` can repair a missing loadout.
         if let Err(e) = crate::rc::run(
             self,
             crate::rc::RcInvocation {
                 parent: parent_id,
-                ..crate::rc::RcInvocation::new("create", &admission)
+                ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel)
             },
             caller,
         )
@@ -1498,17 +1496,20 @@ impl KjDispatcher {
             tracing::warn!("rc create lifecycle: {e}");
         }
 
-        // The beat arm now lives in the musician's `create/` rc (run above), not
-        // here — see the note at the top of this fn and `docs/chameleon.md`.
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj context create: context '{}' ({}) was committed, but its rc \
+                 create lifecycle was cancelled",
+                label,
+                new_id.short()
+            ));
+        }
 
         let mut msg = format!("created context '{}' ({})", label, new_id.short());
         if !config_changes.is_empty() {
             msg.push_str(&format!(" [{}]", config_changes.join(", ")));
         }
-        // Report the *outcome*, not just the log line. A failed lifecycle used
-        // to be a `tracing::warn!` under a plain success message — the operator
-        // was told creation worked and only found out when the new context
-        // refused its first real verb.
+        // Report whether the retained context received a usable loadout.
         match self.has_usable_loadout(new_id) {
             Ok(true) => {}
             Ok(false) => msg.push_str(
@@ -1527,15 +1528,9 @@ impl KjDispatcher {
     }
 
     /// `kj context rebind [<ctx>]` — re-run the `create` rc lifecycle against a
-    /// context that has no usable loadout. The repair half of the create-time
-    /// rc failure: creation succeeds even when its rc lifecycle fails, and
-    /// this verb fixes the result afterward.
-    ///
-    /// Amy ruled (2026-08-12) against aborting creation when the lifecycle
-    /// fails: a fresh context holds nothing worth saving, and aborting would
-    /// destroy the Error blocks that explain *why* it failed — the one part of
-    /// diagnosis that works today, since reading stays ungated. So creation
-    /// still succeeds, loudly, and this verb repairs the result.
+    /// context that has no usable loadout. Context creation retains the context
+    /// and its Error blocks when lifecycle policy fails; rebind repairs only
+    /// that missing-loadout state.
     ///
     /// **Ungated on the same argument that leaves `create` ungated** (see
     /// `dispatch_context`): the loadout comes from the rc lifecycle, not from
@@ -1612,7 +1607,7 @@ impl KjDispatcher {
             self,
             crate::rc::RcInvocation {
                 parent: row.forked_from,
-                ..crate::rc::RcInvocation::new("create", &admission)
+                ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel)
             },
             caller,
         )
@@ -2246,12 +2241,18 @@ impl KjDispatcher {
 
         if let Err(e) = crate::rc::run(
             self,
-            crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", &admission) },
+            crate::rc::RcInvocation { parent, ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel) },
             caller,
         )
         .await
         {
             tracing::warn!("rc create lifecycle for rotation successor: {e}");
+        }
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj context rotate: owner cancelled after creating successor {successor_id}; \
+                 {name} stays live"
+            ));
         }
         match self.has_usable_loadout(successor_id) {
             Ok(true) => {}
@@ -2264,6 +2265,12 @@ impl KjDispatcher {
             )),
         }
 
+        if caller.cancel.is_cancelled() {
+            return KjResult::Err(format!(
+                "kj context rotate: owner cancelled before committing successor {successor_id}; \
+                 {name} stays live"
+            ));
+        }
         let moved = match self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id) {
             Ok(moved) => moved,
             Err(e) => return KjResult::Err(format!(
@@ -2772,7 +2779,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired-reviewer".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             db.update_context_review_assignment(context, None, Some(retired), None).unwrap();
         }
-        let caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         let result = d.dispatch(&[s("context"), s("set"), s("."), s("--reviewer"), s("amy")], &caller).await;
         assert!(result.is_ok(), "{}", result.message());
         let row = d.kernel_db().lock().get_context(context).unwrap().unwrap();
@@ -2813,6 +2820,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let assign = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &lead_caller).await;
         assert!(assign.is_ok(), "{}", assign.message());
@@ -2843,11 +2851,11 @@ mod tests {
             }
             db.update_context_review_assignment(context, Some(coder), Some(amy), None).unwrap();
         }
-        let gate_caller = crate::kj::KjCaller { principal_id: amy, actor_id: coder, reviewer_id: Some(amy), context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let gate_caller = crate::kj::KjCaller { principal_id: amy, actor_id: coder, reviewer_id: Some(amy), context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         let spec = crate::kj::gate::GateSpec { publishes_pair: false, origin: approval_ledger::types::Origin::Hook, instance: "test".into(), tool: "test".into(), hook_id: None, description: "pending".into(), authorized_label: "pending".into(), statements: vec![crate::kj::gate::GatedStatement { rendered: "pending".into(), statement_kind: "test".into(), vars: vec![], source_index: None }], exec_source: None, exec_stdin: None, planned: vec![] };
         let outcome = crate::kj::gate::run_gate(d.kernel(), &gate_caller, spec, d.kernel().ledger_flows(), &crate::kj::gate_policy::no_config()).await;
         assert!(outcome.ask.is_some());
-        let amy_caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let amy_caller = crate::kj::KjCaller { principal_id: amy, actor_id: amy, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         for argv in [[s("context"), s("set"), s("."), s("--reviewer"), s("lead")], [s("context"), s("set"), s("."), s("--director"), s("lead")]] {
             let result = d.dispatch(&argv, &amy_caller).await;
             assert!(!result.is_ok());
@@ -2869,7 +2877,7 @@ mod tests {
             db.insert_character(&crate::kernel_db::CharacterRow { principal_id: retired, name: "retired".into(), created_at: 0, retired_at: Some(1), handoff_ctx: None, root_ctx: None, root: false }).unwrap();
             db.update_context_review_assignment(context, Some(owner), Some(retired), None).unwrap();
         }
-        let caller = crate::kj::KjCaller { principal_id: owner, actor_id: owner, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false };
+        let caller = crate::kj::KjCaller { principal_id: owner, actor_id: owner, reviewer_id: None, context_id: Some(context), session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false, cancel: tokio_util::sync::CancellationToken::new() };
         let result = d.dispatch(&[s("context"), s("info"), s(".")], &caller).await;
         assert!(result.is_ok(), "{}", result.message());
         assert!(result.message().contains("Reviewer error:"));
@@ -2942,6 +2950,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_context_create_reports_the_committed_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("cancelled-create-parent"), None, principal);
+        let c = caller_with_context(parent);
+        c.cancel.cancel();
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("cancelled-create-child")], &c)
+            .await;
+
+        assert!(!result.is_ok(), "cancelled create must report partial completion");
+        assert!(result.message().contains("was committed"), "{}", result.message());
+        assert!(result.message().contains("lifecycle was cancelled"), "{}", result.message());
+        assert!(
+            d.kernel_db().lock().find_context_by_label("cancelled-create-child").unwrap().is_some(),
+            "the context remains committed for diagnosis"
+        );
+    }
+
+    #[tokio::test]
     async fn context_review_assignment_belongs_to_the_director() {
         let d = test_dispatcher().await;
         let amy_id = test_reviewer_principal();
@@ -2954,6 +2983,7 @@ mod tests {
             confirmed: false,
             rc_depth: 0,
             privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
@@ -3001,6 +3031,7 @@ mod tests {
         let caller = |actor| crate::kj::KjCaller {
             principal_id: actor, actor_id: actor, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let set_reviewer = [s("context"), s("set"), s("."), s("--reviewer"), s("judge")];
         for outsider in [bob, lead] {
@@ -3033,6 +3064,7 @@ mod tests {
         let banto_caller = crate::kj::KjCaller {
             principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let assigned = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &banto_caller).await;
         assert!(assigned.is_ok(), "banto directs this context: {}", assigned.message());
@@ -3059,6 +3091,7 @@ mod tests {
         let banto_caller = crate::kj::KjCaller {
             principal_id: banto, actor_id: banto, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &banto_caller).await;
         assert!(!refused.is_ok(), "a root has no model to cast");
@@ -3069,6 +3102,7 @@ mod tests {
         let amy = crate::kj::KjCaller {
             principal_id: amy_id, actor_id: amy_id, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("sovereign")], &amy).await;
         assert!(!refused.is_ok(), "{}", refused.message());
@@ -3095,6 +3129,7 @@ mod tests {
         let sibling_caller = crate::kj::KjCaller {
             principal_id: sibling, actor_id: sibling, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder")], &sibling_caller).await;
         assert!(!refused.is_ok(), "sibling does not direct this context");
@@ -3169,6 +3204,7 @@ mod tests {
         crate::kj::KjCaller {
             principal_id: actor, actor_id: actor, reviewer_id: None, context_id: Some(context),
             session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -3257,6 +3293,32 @@ mod tests {
         assert!(seat.archived_at.is_none() && seat.promoted_at.is_some());
         assert_eq!(db.resolve_context("banto").unwrap(), f.seat);
         assert_eq!(db.get_character(f.banto).unwrap().unwrap().root_ctx, Some(f.seat));
+    }
+
+    #[tokio::test]
+    async fn cancelled_rotation_retains_successor_without_replacing_predecessor() {
+        let f = rotation_fixture().await;
+        let caller = rotation_caller(f.seat, f.banto);
+        caller.cancel.cancel();
+
+        let result = f.d.dispatch(&[s("context"), s("rotate")], &caller).await;
+
+        assert!(!result.is_ok(), "cancelled rotation must report partial completion");
+        assert!(result.message().contains("owner cancelled"), "{}", result.message());
+        assert!(result.message().contains("stays live"), "{}", result.message());
+        let db = f.d.kernel_db().lock();
+        let predecessor = db.get_context(f.seat).unwrap().unwrap();
+        assert!(predecessor.archived_at.is_none(), "the predecessor remains live");
+        assert_eq!(db.resolve_context("banto").unwrap(), f.seat, "the predecessor keeps its label");
+        assert!(
+            db.list_all_contexts().unwrap().iter().any(|row| {
+                row.context_id != f.seat
+                    && row.context_id != f.root
+                    && row.forked_from == Some(f.root)
+                    && row.archived_at.is_none()
+            }),
+            "the committed successor remains available for diagnosis"
+        );
     }
 
     #[test]
