@@ -314,17 +314,23 @@ instrument. The control is mini-swe-agent — the standard bash-only harness —
 on the same tasks and the same model, so the difference between the two rows is
 kaijutsu.
 
-This section is a stub: `contrib/bench/harbor/run-control.sh` is being written,
-and the invocation below is read from Harbor's source, not yet run. Harbor
-routes mini-swe-agent through litellm, and DeepSeek is a first-class provider
-there (`harbor/agents/model_connection.py`, `PROVIDERS`). The model name must
-carry a `provider/` prefix or mini-swe-agent refuses it.
+Run it with `contrib/bench/harbor/run-control.sh`, which takes the same
+arguments as `run-harbor.sh` and handles the key and the post-run scan the same
+way (`contrib/bench/harbor/README-control.md`):
 
 ```bash
-harbor run --agent mini-swe-agent --model deepseek/deepseek-v4-flash \
-  --ae DEEPSEEK_API_KEY='${DEEPSEEK_API_KEY}' \
-  --dataset "terminal-bench@2.0" -i fix-git -e podman -y
+HARBOR_CONTROL_AGENT_TIMEOUT_MULTIPLIER=1 HARBOR_CONTROL_STEP_LIMIT=100 \
+HARBOR_CONTROL_COST_LIMIT="0.25" \
+contrib/bench/harbor/run-control.sh --job-name ctl-tb2-miniswe \
+  --dataset "terminal-bench@2.0" --task-file contrib/bench/analysis/tb2-subset.txt
 ```
+
+The model string is `deepseek/deepseek-v4-flash`; litellm already prices it.
+mini-swe-agent ships with no step limit, and Harbor overrides its $3 cost limit
+to unlimited, so set `HARBOR_CONTROL_STEP_LIMIT` to match kaijutsu's
+100-iteration cap. Its shell inherits the process environment: a model that
+runs `env` puts the provider key in its transcript. That happened once in the
+recorded control run; the post-run scan exits 3 and names the file to scrub.
 
 `summarize_job.py` already reads a non-ACP trial: it reports
 `turn_end_class: "n/a"` and takes tokens and cost from Harbor's own
@@ -336,6 +342,9 @@ A Terminal-Bench 2.0 task costs about $0.02 on `deepseek-v4-flash`. Measured by
 DeepSeek account balance before and after `kj-calib-1`: three tasks, 2.65M input
 tokens, $0.05. The account is shared with kaibo's DeepSeek cast, so a balance
 delta is an upper bound on what a run spent, never an under-count.
+
+A full day of this work, about 70 task runs across four arms plus reviews,
+took the balance from $60.07 to $56.21.
 
 Per-run token counts come from `summarize_job.py`, which reads the kernel log.
 They are exact; only the dollar figure is a bound.
@@ -350,7 +359,8 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-18 | `kj-hw-1`, `kj-fixgit-1` | not recorded (predates provenance) | deepseek-v4-flash | shipped coder, collaborative, 16K ceiling, multiplier 5 and 2 | 2 (hello-world, fix-git) | 2 | 43K and 1.39M | 0 | 0 | 0 | no verdict line |
 | 2026-09-18 | `kj-calib-1` | `e9802591…` → `c9ad92c4` (dirty) | deepseek-v4-flash | shipped coder, collaborative, 16K ceiling, multiplier 1 | 3 (openssl-selfsigned-cert, regex-log, sqlite-with-gcov) | 1 | 756K | 0 | 0 | 2 | no verdict line |
 | 2026-09-18 | `kj-tb2-armA-shipped` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | 14 (0.70) | 3.29M | 0 | 0 | 6 | no verdict line in this arm |
-| TBD | `kj-tb2-armB-driven` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | `coder-driven` overlay, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | TBD | TBD | TBD | TBD | TBD | TBD |
+| 2026-09-18 | `kj-tb2-armB-driven` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | `coder-driven` overlay, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | 15 (0.75) | 3.89M | 0 | 0 | 4 | line present 17/20; done and solved 14, done but failed 2, blocked and failed 1 |
+| 2026-09-18 | `kj-tb2-armC-lost6-ceilingfix` | `d5d21d59…` → `413b9ce0` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1, ran beside arm B | 6 (the tasks arm A lost) | 5 | 4.64M | 0 | 0 | 1 | no verdict line in this arm |
 | 2026-09-18 | `ctl-tb2-miniswe` (control) | mini-swe-agent as Harbor installs it | deepseek/deepseek-v4-flash | step limit 100, cost limit $0.25 per task, multiplier 1, ran beside arm A | 20 (tb2-subset) | 18 (0.90) | 1.79M | n/a | n/a | 2 | n/a |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
@@ -364,10 +374,53 @@ the output ceiling after 4, 9 and 16 inferences (`headless-terminal`,
 cap (`dna-assembly`), one failed on a dropped provider stream
 (`db-wal-recovery`), and one hit Harbor's agent timeout (`chess-best-move`).
 The control solved all six of those tasks. Its own two losses,
-`configure-git-webserver` and `query-optimize`, were both solved by arm A. Median time for a solved task was 374 s for arm A and 291 s for the
-control. The control's transcript for `db-wal-recovery` contained the provider
+`configure-git-webserver` and `query-optimize`, were both solved by arm A.
+Median time for a solved task was 374 s for arm A and 291 s for the control. The control's transcript for `db-wal-recovery` contained the provider
 key, because the model ran `env` and mini-swe-agent's shell inherits the
 process environment; the post-run scan caught it and the file was scrubbed.
+
+### What each change moved
+
+One attempt per task is noisy, and arm C measured how noisy. It reran the six
+tasks arm A lost with one change, the turn-loop fix, and solved five. Only one
+of the five is the fix: `model-extraction-relu-logits` hit the output ceiling
+again, continued, and finished at 42 inferences where arm A's turn ended at 4.
+`headless-terminal` and `raman-fitting` never reached the ceiling this time,
+and `chess-best-move` and `db-wal-recovery` failed in arm A for reasons the fix
+does not touch. Four of six lost tasks flipped with nothing relevant changed.
+Read a difference of a few tasks between two k=1 rows as noise, and repeat a
+run before calling anything a personal best.
+
+What is supported:
+
+- **The harness costs pass rate, tokens and time against a bash-only control
+  on the same model:** 14 and 15 of 20 against 18, about twice the tokens per
+  solved task, and a slower median solve. A fresh coder seat carries about
+  46,000 input tokens of instructions on every inference; hello-world cost
+  42,497 input tokens against the control's 3,670.
+- **Every ceiling stop in arm A was fatal** (three of three), and the one
+  ceiling stop in arm C was survived. That is the turn-loop change
+  (`413b9ce0`): a turn now continues past the output ceiling, at most three
+  times, and a tool call with cut-off arguments returns an error instead of
+  failing the turn.
+- **The `coder-driven` instructions changed what the model does, measurably.**
+  Shell calls passing `foreground: true` went from 86% (666 of 772) to 95% (783
+  of 827), `kj wait` calls from 8 to 4, agent timeouts from 2 to 0. The shipped
+  instructions already reached 86%, so asynchronous-by-default shell cost less
+  in practice than the code audit predicted. Pass rate moved from 14 to 15,
+  which is inside the noise.
+- **The verdict line works as a done signal.** It ended 17 of 20 final
+  messages, which is every turn that ended on its own; the three without it
+  stopped at the iteration cap, the output ceiling and a dropped stream.
+  `RESULT: done` was right 14 times of 16, and the one `RESULT: blocked` was a
+  real loss. A driver can read it today; a kernel-side completion command would
+  make the three abnormal endings visible the same way.
+- **Under the sandbox gate nothing asks**, so these runs say nothing about the
+  approval path. The host-loop findings in `docs/issues.md` stand.
+
+Left unmeasured: the Rust polyglot slice (`contrib/bench/analysis/polyglot-rust.md`)
+has not been run with a model; the turn-loop fix has not had a full 20-task
+run; Anthropic models are untested end to end.
 
 ## Known limits
 

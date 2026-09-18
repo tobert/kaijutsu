@@ -2893,7 +2893,31 @@ a test can go red. Mutating a lane's new classifier tests showed the red
 evidence was muddled, and the mutations that do fail are now named in the
 commit that introduced them.
 
+The recorded runs then said where the instrument costs the most. On 20 pinned
+Terminal-Bench 2.0 tasks with `deepseek-v4-flash`, kaijutsu solved 14 with the
+shipped coder instructions and 15 with the driven-worker variant; mini-swe-agent
+solved 18 on the same tasks and model, with about half the tokens per solved
+task. The answer to "stops more readily" was not the model giving up: every
+turn that reached the output ceiling while reasoning simply ended, three of
+three, after 4, 9 and 16 inferences. The turn loop now continues past the
+ceiling, at most three times, and returns an error for a tool call whose
+arguments were cut off instead of failing the turn. kaibo's review of that
+change mattered more than the tests did: the first version replayed a
+reasoning-only assistant message, the one shape the hydrator refuses to emit,
+in exactly the case the fix was for. A live probe then showed DeepSeek accepting
+the corrected requests and a turn finishing that used to end at its first
+inference.
+
+The lesson that outlasts the numbers: one attempt per task is noisy. Rerunning
+arm A's six losses with only the turn-loop fix solved five, and only one of the
+five was the fix. `docs/benchmarks.md` records that beside the rows, so a later
+personal best gets repeated before anyone believes it. The driven-worker
+instructions did move behavior that can be counted: more foreground shell
+calls, fewer waits, no agent timeouts, and a `RESULT:` verdict line on every
+turn that ended on its own, right 14 times of 16. That line is the done signal
+in its rc-only form; the kernel-side completion command is still open.
+
 Credits: Claude Fable 5.1 led, Claude Opus and Claude Sonnet built the lanes,
-and kaibo's DeepSeek V4 Flash cast reviewed every slice. Model spend for the
-day's runs was about $0.15 on `deepseek-v4-flash`, roughly $0.02 per
-Terminal-Bench task.
+and kaibo's DeepSeek V4 Flash cast reviewed every slice. About 70 task runs
+across four arms, plus the reviews, took the DeepSeek balance from $60.07 to
+$56.21, roughly $0.02 to $0.05 per Terminal-Bench task.
