@@ -16,6 +16,21 @@
 #
 # A file that does not parse refuses every gated shell submission until it
 # is fixed; `kj config reset gate.toml` restores this default.
+#
+# `uncovered` decides what happens to a statement no key covers: "ask" (the
+# default, and what this file ships) or "allow". Set "allow" only on a
+# sandboxed or throwaway kernel — a benchmark container, a kernel whose
+# work you are ready to discard. It removes the human from the loop for
+# that section: every statement no key covers runs, redirects, heredocs and
+# substituted arguments included. No PreCall hook sees a program the tier
+# allows outright, so the scorer and the shell-escape guard never run on
+# one; a mixed program, where one statement is ask-tier or deny-tier, still
+# meets the hooks. Explicit ask and deny keys still fire, and a learned
+# ledger rule still outranks it. `kj ledger rules` states the posture when
+# it is on.
+#
+#   [context_type.coder]
+#   uncovered = "allow"   # sandboxed benchmark kernels only
 
 [global]
 allow = [
@@ -37,9 +52,9 @@ deny = [
   "dd",                  # no kaijutsu seat has a reason; uniform loud refusal
 ]
 
-[context_type.explorer]
+[context_type.toolie]
 deny = [
-  "kj context create",   # an explorer explores; lifecycle belongs to its parent
+  "kj context create",   # a toolie uses tools; lifecycle belongs to its parent
 ]
 
 [context_type.mcp]

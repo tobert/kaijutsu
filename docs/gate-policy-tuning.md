@@ -3,7 +3,8 @@
 Status: designed 2026-09-08; slices 1–3 (the evaluator seam, the config
 layer, learned family rules — `kj/gate_policy.rs`,
 `assets/defaults/gate.toml`, `approval_rule_families`) shipped 2026-09-10,
-slice 5 unbuilt, slice 4 retired by the verb class. Amy's rulings of the same day are quoted
+slice 5 unbuilt, slice 4 retired by the verb class; slice 6, the uncovered
+tier, shipped 2026-09-18. Amy's rulings of the same day are quoted
 where they decide a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
 canonical for the gate-policy evaluator; `docs/gate-and-shell-split.md`
@@ -79,9 +80,13 @@ names the layer and key, so the refusal stays distinguishable per
 `docs/gate-and-shell-split.md`, ruling 2, with no new `RefusalKind`); every
 statement Allow → hooks are skipped, replacing today's
 `program_is_gate_exempt` consult; anything else → hooks run as they do now.
-All three RPC paths reach this: `execute`, `execute_shell_command`, and
-`execute_kj_command` each evaluate PreCall with `tool = shell_write`
-(`kaijutsu-server/src/rpc.rs:3625`, `:9738`, `:10163`).
+All three RPC paths reach this with `tool = shell_write`, each through a
+runtime entry point that calls `Broker::shell_pre_call_hooks`:
+`kaijutsu-server/src/rpc.rs`'s `execute` (via `runtime::streaming::execute`),
+`execute_shell_command` (via `runtime::interactive::submit`), and
+`execute_kj_command` (via `runtime::structured::execute_kj`). A fourth,
+`shell_dry_run`, takes the same evaluator in dry-run mode and enforces
+nothing (`docs/gate-and-shell-split.md`, "Dry-run mode").
 
 Inside `run_gate` the evaluator replaces the direct `rules::redeem` call as
 step 1. The archived-context check still runs first and is never bypassed by
@@ -224,9 +229,9 @@ deny = [
   "dd",                  # no kaijutsu seat has a reason; uniform loud refusal
 ]
 
-[context_type.explorer]
+[context_type.toolie]
 deny = [
-  "kj context create",   # an explorer explores; lifecycle belongs to its parent
+  "kj context create",   # a toolie uses tools; lifecycle belongs to its parent
 ]
 [context_type.mcp]
 allow = [
@@ -239,6 +244,76 @@ Unknown sections or verdict words fail the load loudly, naming the section
 and key (a TOML syntax error names the line) —
 a policy file that silently half-parses is the failure shape this repo does
 not ship.
+
+**A `[context_type.<name>]` section must name a live context type**, one
+with an rc bucket under `/config/rc` (`kj::rc::known_context_types`, the
+list `kj context create --type` validates against). A section naming no live
+type applies to nobody, so a typo'd `ask` tier leaves its type on whatever
+`[global]` said — fail-open for exactly the role the operator meant to
+protect. The refusal names the section and lists the known types, and it
+covers a section holding only key lists too, which is inert the same way.
+The check needs the live rc tree, so it runs in `load_config` rather than
+`GateConfig::parse`, which stays a pure shape check over the text. An rc
+tree that lists nothing accepts every section, the rule
+`kj::rc::check_context_type` already states for `--type`.
+
+A context whose stored `context_type` predates a rename is the one hazard
+this creates: the section naming its old type refuses the whole file. The
+remedy is the same one the message gives — correct the section.
+
+## The uncovered tier: a sandbox posture
+
+```toml
+[context_type.coder]
+uncovered = "allow"   # sandboxed or throwaway kernels only
+```
+
+`uncovered` decides what happens to a statement no key covers: `ask` (the
+default, and what the shipped file leaves in force) or `allow`. Under
+`allow`, every statement the lists above do not name is allowed — redirects,
+heredocs, background flags and substituted arguments included — and nothing
+asks anyone. Explicit `ask` and `deny` keys still fire, and a learned ledger
+rule still outranks the tier; the tier is decided last, after every key and
+after the structural veto. A section's own setting wins over `[global]`, so
+a global sandbox can be withheld from one context type with
+`uncovered = "ask"`.
+
+**Set it only where the work is disposable**: a benchmark container, a
+throwaway kernel. It removes the human from the loop for that context type.
+It also removes every PreCall hook: broker PreCall skips hooks for a program
+it allows outright, so the scorer and the shell-escape guard never run on
+one. That is consistent with the design — the gate is an ergonomic nudge
+inside one trust boundary, not a security boundary
+(`docs/instrument-design.md`, "Many hands, one trust boundary") — and it is
+the reason the setting is explicit, per section, and absent from the shipped
+file.
+
+The reason a list cannot do this job: an allow covers a command *key*, never
+its arguments (§Structural refusals veto family allows). A coder's real
+traffic is `python3 build.py > log 2>&1`, `cargo test 2>&1 | tee out`,
+`sed -i …`, `bash -c '…'` — each drops back to `Uncovered`, so every one of
+them asks. Measured on a coder turn, nearly every command a model ran was
+uncovered, and each ask cost the model roughly six times the tokens hunting
+for output it had not been given
+(`~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`).
+
+**An operator sees the posture.** An auto-decision made by the tier reads
+`gate policy: context_type config (coder) uncovered tier allows python3
+build.py` in its durable row, never as an allow-list hit, and `kj ledger
+rules` lists `uncovered / allow` with the section that set it plus one line
+of prose. `KJ_TOOL_PLAN` stamps `tier = "allow"` on each such command.
+
+Two boundaries the tier does not cross. A program that does not parse still
+meets the hooks, as before. An `Origin::KjVerb` ask (`kj cc send`) never
+reaches the config layers, so it still asks — `docs/issues.md`, "The
+uncovered tier does not reach a `KjVerb` ask".
+
+A whole gate file for a benchmark container is two lines:
+
+```toml
+[global]
+uncovered = "allow"
+```
 
 ## Learned family rules
 
@@ -404,6 +479,19 @@ unreleased one:
    MCP shell" — its option 1, arrived at through the general mechanism
    instead of a scorer special case. Delete the jq exemptions (safe now:
    slice 2's allow-tier drop is in).
+6. **The uncovered tier — shipped.** `uncovered = "ask" | "allow"` on
+   `[global]` and each `[context_type.<type>]` (§The uncovered tier), decided
+   last in `command_verdict` and, for a statement with no command, in
+   `statement_verdict`; a new `Layer::UncoveredAllow` so a tier decision
+   never reads as an allow-list hit; the row and the prose line in
+   `kj ledger rules`; the commented, disabled example in the shipped file.
+   Two behavior changes ride with it, both deliberate. A
+   `[context_type.<name>]` section naming no live context type now fails the
+   load (§The file), which caught the shipped `[context_type.explorer]`
+   section — inert since that type was renamed, now `[context_type.toolie]`,
+   so its `kj context create` deny is live for the first time. And
+   `load_config` reads the rc tree, which `GateConfig::parse` does not: the
+   validation is at load, not in the pure shape check.
 
 ### Tests each slice must land with
 
@@ -423,6 +511,20 @@ The repo's own standard — a test that cannot fail is not a test:
 5. Guarantee-4 carve-out (slice 3): a family allow learned under label A
    covers the same key under label B with no `LabelMismatch`, beside the
    digest-rule test that pins the opposite (`rules.rs:526`).
+6. The uncovered tier (slice 6), in `kj/gate_policy.rs` unless noted:
+   absent by default and absent from the shipped file; the tier reaching
+   only the section that sets it and a context type's setting outranking
+   `[global]`; an unknown `uncovered` word failing the load; deny and ask
+   outranking the tier, and an allow-list entry the structural veto drops
+   falling through to it while a plain allow-list hit still reads as one;
+   the per-command `tier` word; which constructs plan a commandless
+   statement, beside the branch that decides one; an unknown
+   `[context_type.<name>]` section failing the load, with the fail-open
+   scenario it prevents and the shipped file loading against the shipped rc
+   tree; and through the gate itself (`kj/ledger.rs`) a whole program
+   auto-allowing with the tier named in its durable row, a remembered
+   family deny and a remembered exact-statement deny each still winning,
+   and `kj ledger rules` stating the posture.
 
 ## Inspection
 
@@ -435,6 +537,7 @@ verdict for the calling context, each naming its winning layer:
   kj handoff note      allow    user family rule (always, rule 01a0…)
 
   GATE.TOML KEY        VERDICT  LAYER
+  uncovered            allow    context_type config (coder) uncovered tier
   kj rc add            ask      global config
   dd                   deny     global config
 
@@ -444,8 +547,9 @@ forget with: kj ledger forget <rule-id>
 
 As built: the learned rules of both kinds come first, newest first and
 cut by `--limit`; the `gate.toml` tiers in force for the caller's
-context type follow, uncounted; the builtin layer is one line rather than
-a row per Read verb. The listing is not context-scoped — another
+context type follow, uncounted, the uncovered tier first when it is on and
+with a line of prose beneath the table; the builtin layer is one line rather
+than a row per Read verb. The listing is not context-scoped — another
 context's session rules appear too — which is how the digest listing
 already behaved.
 

@@ -30,13 +30,23 @@
 //! PreCall and inside `run_gate`. `ask` is firm: no lower layer can allow
 //! the statement, and each stack's own ask machinery does the asking.
 //!
+//! **The uncovered tier.** `uncovered = "allow"` in a `gate.toml` section
+//! allows every statement no key covers, redirects and all — the sandbox
+//! posture, off unless the file says so. It is decided last, so an `ask`
+//! key stays firm, a `deny` key still denies, and a user rule still
+//! outranks it; what it catches is everything no list names. Its decisions
+//! read as `… uncovered tier allows …`, never as an allow-list hit, so a
+//! ledger row says which is in force. The `Ask` tier is the default and
+//! today's behavior.
+//!
 //! **Structural refusals veto allows.** An allow from a family rule, a
 //! config layer or the builtin layer covers a *key*, never arguments, so a redirect, a
 //! background flag, a heredoc or a non-plain argument drops the statement
 //! to `Uncovered` and it meets the classifier and the gate as usual. A deny
 //! or an ask fires regardless of structure. A command whose arguments the
 //! evaluator cannot read as plain text has no key at all and is
-//! `Uncovered`, which fails toward the default: ask.
+//! `Uncovered`, which fails toward the default: ask — or toward the
+//! uncovered tier where a section sets one.
 //!
 //! Composition per program is the ledger's own [`AskCoverage`] rule: a Deny
 //! anywhere denies the whole submission, every statement must be Allow to
@@ -46,7 +56,9 @@
 //! **Origin boundary.** Layers 2–4 classify a *planned command tree*, which
 //! a [`GateSpec`] carries for `Origin::ShellGate` and for a shell-shaped
 //! `Origin::Hook` ask, but not for `Origin::KjVerb`. A `KjVerb` ask meets
-//! the user-rule layer only and is otherwise `Uncovered`.
+//! the user-rule layer only and is otherwise `Uncovered`. The uncovered
+//! tier rides the config layers, so it reaches exactly what they reach: a
+//! `KjVerb` ask still asks.
 //!
 //! **The file fails loudly.** An unreadable or unparseable `gate.toml`
 //! refuses every shell submission that consults it, naming the file and the
@@ -85,6 +97,10 @@ pub(crate) enum Layer {
     /// The verb's declared effect, the `kj ledger` structural exemption, or
     /// a `kj … --help` invocation.
     Builtin,
+    /// `uncovered = "allow"` in `gate.toml` — the sandbox posture. `Some`
+    /// names the `[context_type.<type>]` section that set it; `None` is
+    /// `[global]`.
+    UncoveredAllow(Option<String>),
 }
 
 impl std::fmt::Display for Layer {
@@ -95,6 +111,8 @@ impl std::fmt::Display for Layer {
             Self::ContextTypeConfig(t) => write!(f, "context_type config ({t})"),
             Self::GlobalConfig => f.write_str("global config"),
             Self::Builtin => f.write_str("builtin"),
+            Self::UncoveredAllow(None) => f.write_str("global config uncovered tier"),
+            Self::UncoveredAllow(Some(t)) => write!(f, "context_type config ({t}) uncovered tier"),
         }
     }
 }
@@ -246,6 +264,32 @@ impl TierVerdict {
     }
 }
 
+/// What a section does with a statement no key covers. `Ask` is the
+/// default and today's behavior: the statement meets the classifier and the
+/// gate. `Allow` is the sandbox posture — see [`GateConfig::uncovered_for`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum UncoveredTier {
+    #[default]
+    Ask,
+    Allow,
+}
+
+impl UncoveredTier {
+    /// The two words `uncovered` takes. `deny` is not one of them: a
+    /// standing refusal is a key in the `deny` list, not a posture.
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "ask" => Ok(Self::Ask),
+            "allow" => Ok(Self::Allow),
+            other => Err(format!(
+                "`{other}` is not an uncovered tier — `ask` (the default: a statement no key \
+                 covers meets the classifier and the gate) or `allow` (a sandboxed or throwaway \
+                 kernel, where no ask reaches a human)"
+            )),
+        }
+    }
+}
+
 /// One tier table: `[global]` or one `[context_type.<type>]` section, keys
 /// normalized to canonical names.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -253,6 +297,8 @@ struct TierTable {
     /// `(normalized key, verdict)`; a key may appear under more than one
     /// verdict, and the higher rank wins.
     entries: Vec<(String, TierVerdict)>,
+    /// This section's `uncovered` setting, when it states one.
+    uncovered: Option<UncoveredTier>,
 }
 
 impl TierTable {
@@ -299,6 +345,8 @@ struct TierToml {
     ask: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
+    /// `ask` (the default) or `allow`.
+    uncovered: Option<String>,
 }
 
 /// Why `gate.toml` could not be used. Every variant refuses the
@@ -372,7 +420,61 @@ impl GateConfig {
                 entries.push((key, verdict));
             }
         }
-        Ok(TierTable { entries })
+        let uncovered = match &tier.uncovered {
+            Some(raw) => Some(UncoveredTier::parse(raw).map_err(|why| {
+                GateConfigError::Parse(format!("{section} uncovered: {why}"))
+            })?),
+            None => None,
+        };
+        Ok(TierTable { entries, uncovered })
+    }
+
+    /// The uncovered tier in force for a caller of `context_type`, and the
+    /// section that set it: the context type's own setting when it states
+    /// one, else `[global]`, else `ask`.
+    pub(crate) fn uncovered_for(
+        &self,
+        context_type: Option<&str>,
+    ) -> (UncoveredTier, Option<String>) {
+        if let Some(t) = context_type
+            && let Some(tier) = self.context_types.get(t).and_then(|table| table.uncovered)
+        {
+            return (tier, Some(t.to_string()));
+        }
+        (self.global.uncovered.unwrap_or_default(), None)
+    }
+
+    /// Refuse a `[context_type.<name>]` section naming no live context
+    /// type, whatever the section holds: an unknown section applies to
+    /// nobody, so a typo'd `ask` tier silently leaves its type on whatever
+    /// `[global]` said.
+    ///
+    /// `known` is the rc tree's list (`kj::rc::known_context_types`), and
+    /// an empty list accepts every section — there is nothing to validate
+    /// against, and a kernel with no rc tree is a legitimate shape. That is
+    /// the rule `kj::rc::check_context_type` states for `--type`, kept as
+    /// one rule with one meaning.
+    pub(crate) fn check_context_types(&self, known: &[String]) -> Result<(), GateConfigError> {
+        if known.is_empty() {
+            return Ok(());
+        }
+        for name in self.context_types.keys() {
+            if !known.iter().any(|t| t == name) {
+                return Err(GateConfigError::Parse(format!(
+                    "[context_type.{name}] names no context type: no rc bucket at {}/{name}; \
+                     known types: {}",
+                    kaijutsu_types::paths::RC_ROOT,
+                    known.join(", "),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the sandbox posture is on for a caller of `context_type` —
+    /// what `kj ledger rules` states plainly.
+    pub(crate) fn allows_uncovered(&self, context_type: Option<&str>) -> bool {
+        self.uncovered_for(context_type).0 == UncoveredTier::Allow
     }
 
     /// The config entries in force for a caller of `context_type`, for
@@ -380,6 +482,11 @@ impl GateConfig {
     /// first.
     pub(crate) fn entries_for(&self, context_type: Option<&str>) -> Vec<(Layer, String, &'static str)> {
         let mut out = Vec::new();
+        // The widest entry first: it decides every key the lists below do
+        // not name.
+        if let (UncoveredTier::Allow, section) = self.uncovered_for(context_type) {
+            out.push((Layer::UncoveredAllow(section), "uncovered".to_string(), "allow"));
+        }
         if let Some(t) = context_type
             && let Some(table) = self.context_types.get(t)
         {
@@ -454,9 +561,12 @@ fn normalize_config_key(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Read and parse `/config/kernel/gate.toml`. An absent file (or no
-/// `/config/kernel` mount) is the empty config; any other failure is an
+/// Read, parse and validate `/config/kernel/gate.toml`. An absent file (or
+/// no `/config/kernel` mount) is the empty config; any other failure is an
 /// error the caller must refuse on.
+///
+/// Validation needs the live rc tree, which is why it lives here and not in
+/// [`GateConfig::parse`]: `parse` is a pure shape check over the text.
 pub(crate) async fn load_config(vfs: &MountTable) -> GateConfigLoad {
     use crate::vfs::{VfsError, VfsOps};
     let path = kaijutsu_types::paths::config_path(GATE_CONFIG_FILE);
@@ -469,7 +579,12 @@ pub(crate) async fn load_config(vfs: &MountTable) -> GateConfigLoad {
     };
     let text = String::from_utf8(bytes)
         .map_err(|e| GateConfigError::Parse(format!("not valid UTF-8: {e}")))?;
-    GateConfig::parse(&text)
+    let config = GateConfig::parse(&text)?;
+    let known = super::rc::known_context_types(vfs)
+        .await
+        .map_err(GateConfigError::Read)?;
+    config.check_context_types(&known)?;
+    Ok(config)
 }
 
 // ── Layers for one evaluation ───────────────────────────────────────────
@@ -480,6 +595,30 @@ pub(crate) async fn load_config(vfs: &MountTable) -> GateConfigLoad {
 pub(crate) struct Layers<'a> {
     pub config: &'a GateConfig,
     pub context_type: Option<&'a str>,
+}
+
+impl Layers<'_> {
+    /// The decision the uncovered tier contributes, or `None` when the tier
+    /// is `ask` — today's default, where an uncovered statement meets the
+    /// classifier and the gate. `key` names what was allowed.
+    fn uncovered_allow(&self, key: impl FnOnce() -> String) -> Option<Decision> {
+        match self.config.uncovered_for(self.context_type) {
+            (UncoveredTier::Allow, section) => Some(Decision {
+                layer: Layer::UncoveredAllow(section),
+                key: key(),
+            }),
+            (UncoveredTier::Ask, _) => None,
+        }
+    }
+
+    /// [`Self::uncovered_allow`] as a whole verdict, for a caller holding an
+    /// `Uncovered` it may convert.
+    fn uncovered_verdict(&self, key: impl FnOnce() -> String) -> PolicyVerdict {
+        match self.uncovered_allow(key) {
+            Some(decision) => PolicyVerdict::Allow(vec![decision]),
+            None => PolicyVerdict::Uncovered,
+        }
+    }
 }
 
 /// The `context_type` of a context, read off its row. `None` for a caller
@@ -718,7 +857,32 @@ fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>) -> Policy
         .iter()
         .map(|cmd| command_verdict(cmd, layers))
         .collect();
-    fold_verdicts(verdicts)
+    match fold_verdicts(verdicts) {
+        // A statement with no command has nothing to key on, so the tier
+        // decides it directly; without this, one assignment in a program
+        // would escalate the whole submission. The condition is "no
+        // command", not "an assignment": an exit, a return, `break`,
+        // `continue`, arithmetic, a `[[ ]]` test, a loop or case over
+        // literals, and a function definition whose body runs nothing all
+        // plan this way. It rests on kaish collecting every nested command,
+        // including one inside an assignment value, a test operand or a
+        // redirect target, so a commandless statement invokes nothing the
+        // classifier or a hook would have judged. A statement that has
+        // commands is decided per command and keeps that verdict, so this
+        // reason never names the wrong thing.
+        PolicyVerdict::Uncovered if statement.plan.commands.is_empty() => {
+            layers.uncovered_verdict(|| statement_key(statement))
+        }
+        decided => decided,
+    }
+}
+
+/// What the uncovered tier allowed when a statement has no command to name.
+fn statement_key(statement: &PlannedStatement) -> String {
+    format!(
+        "`{}`, a statement with no command",
+        truncate_for_reason(&statement.plan.rendered)
+    )
 }
 
 /// Deny anywhere → that deny; else ask anywhere → that ask; else every
@@ -751,9 +915,27 @@ fn fold_verdicts(verdicts: Vec<PolicyVerdict>) -> PolicyVerdict {
 }
 
 /// One command's verdict through layers 2–4: the context_type table, then
-/// the global table, then the builtin layer. This is also what stamps the
-/// per-command `tier` on `KJ_TOOL_PLAN`.
+/// the global table, then the builtin layer, and last the uncovered tier.
+/// This is also what stamps the per-command `tier` on `KJ_TOOL_PLAN`.
 pub(crate) fn command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
+    match keyed_command_verdict(cmd, layers) {
+        // The tier is last on purpose: every key a layer names, and every
+        // structural refusal of an allow, is decided above it.
+        PolicyVerdict::Uncovered => layers.uncovered_verdict(|| command_key(cmd)),
+        decided => decided,
+    }
+}
+
+/// The command's most specific key, or its name when it has none — what
+/// the uncovered tier reports it allowed.
+fn command_key(cmd: &PlannedCommand) -> String {
+    command_keys(cmd)
+        .and_then(|keys| keys.candidates.into_iter().next())
+        .unwrap_or_else(|| cmd.name.clone())
+}
+
+/// [`command_verdict`] without the uncovered tier: the keyed layers alone.
+fn keyed_command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerdict {
     if let Some(keys) = command_keys(cmd) {
         let context_table = layers
             .context_type
@@ -1346,6 +1528,249 @@ deny = ["kj context create"]
         assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "score");
     }
 
+    // ── the uncovered tier ──────────────────────────────────────────
+
+    /// A sandbox posture on one context type, beside ordinary tiers.
+    const SANDBOX: &str = r#"
+[global]
+allow = ["rg"]
+ask = ["git push"]
+deny = ["dd"]
+
+[context_type.coder]
+uncovered = "allow"
+"#;
+
+    /// Which constructs plan a statement with no command — what the
+    /// statement-level branch of the tier decides. kaish's `collect_stmt`
+    /// walks every nested construct, including a `$(…)` inside an
+    /// assignment, a test or an arithmetic operand, so a statement with no
+    /// planned command invokes nothing: an assignment to a literal, a
+    /// `test`, arithmetic, a control-flow statement over literals, a
+    /// function definition whose body runs nothing, and the loop keywords.
+    /// It is not assignments alone, which is why the branch is written
+    /// against "no command" rather than against the statement kind.
+    #[test]
+    fn a_statement_with_no_command_is_more_than_an_assignment() {
+        let commandless = |src: &str| {
+            let statements = plan(src);
+            assert_eq!(statements.len(), 1, "{src}");
+            statements[0].plan.commands.is_empty()
+        };
+        for src in [
+            "OUT=log",                     // assignment
+            "exit 3",                      // exit
+            "return",                      // return
+            "break",                       // break
+            "continue",                    // continue
+            "(( i + 1 ))",                 // arith
+            "[[ -f /etc/passwd ]]",        // test
+            "for x in a b; do Y=$x; done", // for
+            "case $x in a) Y=1;; esac",    // case
+            "deploy() { X=1 }",            // tooldef
+            "function deploy { X=1 }",     // tooldef
+        ] {
+            assert!(commandless(src), "{src} was expected to plan no command");
+        }
+        // A nested command is collected wherever it hides, so these are not
+        // commandless and the per-command layers decide them. `test -f x`
+        // is an ordinary command named `test`, not the `test` statement.
+        for src in [
+            "OUT=$(ls)",
+            "if ls; then X=1; fi",
+            "for x in $(ls); do Y=$x; done",
+            "test -f /etc/passwd",
+        ] {
+            assert!(!commandless(src), "{src} was expected to plan a command");
+        }
+    }
+
+    /// The tier covers a commandless statement, and without it that one
+    /// statement escalates the whole submission.
+    #[test]
+    fn the_tier_covers_a_commandless_statement_and_the_default_still_escalates_it() {
+        let cfg = config(SANDBOX);
+        let v = first_verdict("OUT=log", &cfg, Some("coder"));
+        assert_eq!(
+            allow_keys(&v),
+            vec![(
+                Layer::UncoveredAllow(Some("coder".to_string())),
+                "`OUT=log`, a statement with no command".to_string()
+            )]
+        );
+        assert_eq!(
+            first_verdict("OUT=log", &cfg, Some("director")),
+            PolicyVerdict::Uncovered,
+            "with the tier off, a commandless statement escalates as it does today"
+        );
+    }
+
+    /// The posture: a statement no key covers is allowed, redirect and all,
+    /// and the decision names the tier rather than an allow list.
+    #[test]
+    fn the_uncovered_tier_allows_what_no_key_covers() {
+        let cfg = config(SANDBOX);
+        let v = first_verdict("python3 build.py > log 2>&1", &cfg, Some("coder"));
+        assert_eq!(
+            allow_keys(&v),
+            vec![(
+                Layer::UncoveredAllow(Some("coder".to_string())),
+                "python3 build.py".to_string()
+            )]
+        );
+        // A kj write verb is uncovered too, and the tier decides it.
+        assert!(matches!(
+            first_verdict("kj context remove 01a0-abc", &cfg, Some("coder")),
+            PolicyVerdict::Allow(_)
+        ));
+    }
+
+    /// The setting is per section: another context type, and a caller with
+    /// no context type at all, keep today's behavior.
+    #[test]
+    fn the_uncovered_tier_reaches_only_the_section_that_sets_it() {
+        let cfg = config(SANDBOX);
+        assert_eq!(
+            first_verdict("python3 build.py > log", &cfg, Some("explorer")),
+            PolicyVerdict::Uncovered
+        );
+        assert_eq!(first_verdict("python3 build.py", &cfg, None), PolicyVerdict::Uncovered);
+    }
+
+    /// Absent is today's behavior, and the shipped default leaves it absent.
+    #[test]
+    fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
+        let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        for context_type in [None, Some("coder"), Some("mcp"), Some("explorer")] {
+            assert_eq!(
+                cfg.uncovered_for(context_type),
+                (UncoveredTier::Ask, None),
+                "{context_type:?}"
+            );
+            assert_eq!(
+                first_verdict("python3 build.py", &cfg, context_type),
+                PolicyVerdict::Uncovered,
+                "{context_type:?}"
+            );
+        }
+        assert_eq!(config(EXAMPLE).uncovered_for(Some("coder")), (UncoveredTier::Ask, None));
+    }
+
+    /// Ask stays firm and deny stays deny: both are decided before the
+    /// tier is reached.
+    #[test]
+    fn deny_and_ask_outrank_the_uncovered_tier() {
+        let cfg = config(SANDBOX);
+        assert!(matches!(
+            first_verdict("dd if=/dev/zero of=/dev/sda", &cfg, Some("coder")),
+            PolicyVerdict::Deny(_)
+        ));
+        assert!(matches!(
+            first_verdict("git push origin main", &cfg, Some("coder")),
+            PolicyVerdict::Ask(_)
+        ));
+        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        assert_eq!(
+            evaluate_planned(&plan("python3 x.py; git push origin main"), layers).verdict(),
+            AskVerdict::Escalate,
+            "one ask-tier statement still escalates the submission"
+        );
+    }
+
+    /// An allow list entry the structural veto drops falls through to the
+    /// tier, and an ordinary allow-list hit still reads as one — an
+    /// operator can tell the two apart in a ledger row.
+    #[test]
+    fn a_structurally_vetoed_allow_falls_through_to_the_tier_and_stays_distinguishable() {
+        let cfg = config(SANDBOX);
+        let v = first_verdict("rg foo > ~/.bashrc", &cfg, Some("coder"));
+        assert_eq!(
+            allow_keys(&v),
+            vec![(Layer::UncoveredAllow(Some("coder".to_string())), "rg foo".to_string())]
+        );
+        let v = first_verdict("rg foo src", &cfg, Some("coder"));
+        assert_eq!(allow_keys(&v), vec![(Layer::GlobalConfig, "rg".to_string())]);
+    }
+
+    /// The whole submission auto-allows: every statement is an Allow,
+    /// including a bare assignment, which has no command to key on.
+    #[test]
+    fn a_whole_program_auto_allows_under_the_uncovered_tier() {
+        let cfg = config(SANDBOX);
+        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        let e = evaluate_planned(
+            &plan("OUT=log; cargo test --workspace 2>&1 | tee $OUT; kj block create --role user --kind text"),
+            layers,
+        );
+        assert_eq!(e.verdict(), AskVerdict::Allow, "{:?}", e.per_statement);
+        assert_eq!(
+            e.describe(&[], true).contains("uncovered tier"),
+            true,
+            "{}",
+            e.describe(&[], true)
+        );
+    }
+
+    /// The hook stack reads the same tier off `KJ_TOOL_PLAN`: an allow-tier
+    /// command is dropped from the scored clause set, so nothing re-scores
+    /// what the tier allowed.
+    #[test]
+    fn the_uncovered_tier_stamps_allow_on_every_command() {
+        let cfg = config(SANDBOX);
+        let layers = Layers { config: &cfg, context_type: Some("coder") };
+        let stmt = &plan("cat /etc/passwd")[0];
+        assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "allow");
+        let layers = Layers { config: &cfg, context_type: Some("explorer") };
+        assert_eq!(command_verdict(&stmt.plan.commands[0], layers).tier(), "score");
+    }
+
+    /// A context type's setting wins over the global one, in both
+    /// directions — a global sandbox can be withheld from one role.
+    #[test]
+    fn a_context_type_setting_outranks_the_global_one() {
+        let cfg = config("[global]\nuncovered = \"allow\"\n[context_type.director]\nuncovered = \"ask\"\n");
+        let v = first_verdict("cat x", &cfg, Some("coder"));
+        assert_eq!(allow_keys(&v), vec![(Layer::UncoveredAllow(None), "cat x".to_string())]);
+        assert_eq!(first_verdict("cat x", &cfg, Some("director")), PolicyVerdict::Uncovered);
+    }
+
+    #[test]
+    fn an_unknown_uncovered_value_fails_the_load_naming_the_words_it_takes() {
+        let err = GateConfig::parse("[global]\nuncovered = \"yes\"\n").unwrap_err();
+        let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
+        assert!(
+            m.contains("[global]") && m.contains("yes") && m.contains("ask") && m.contains("allow"),
+            "{m}"
+        );
+        // `deny` is a key list, never a posture: denying everything unlisted
+        // is not offered here.
+        let err = GateConfig::parse("[context_type.coder]\nuncovered = \"deny\"\n").unwrap_err();
+        let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
+        assert!(m.contains("[context_type.coder]") && m.contains("deny"), "{m}");
+    }
+
+    /// `kj ledger rules` lists the posture, so an operator sees it without
+    /// reading the file.
+    #[test]
+    fn the_uncovered_tier_is_listed_for_the_context_it_applies_to() {
+        let cfg = config(SANDBOX);
+        let entries = cfg.entries_for(Some("coder"));
+        assert_eq!(
+            entries.first().map(|(l, k, v)| (l.clone(), k.clone(), *v)),
+            Some((
+                Layer::UncoveredAllow(Some("coder".to_string())),
+                "uncovered".to_string(),
+                "allow"
+            )),
+            "{entries:?}"
+        );
+        assert!(cfg.allows_uncovered(Some("coder")));
+        assert!(!cfg.allows_uncovered(Some("explorer")));
+        assert!(!cfg.entries_for(Some("explorer")).iter().any(|(l, _, _)| {
+            matches!(l, Layer::UncoveredAllow(_))
+        }));
+    }
+
     // ── family keys ─────────────────────────────────────────────────
 
     #[test]
@@ -1383,6 +1808,118 @@ deny = ["kj context create"]
             vec!["kj ledger allow", "cat /tmp/id"]
         );
         assert!(err("kj blok list").contains("names no kj verb"));
+    }
+
+    // ── context_type sections ───────────────────────────────────────
+
+    /// A `MountTable` with an rc tree naming `types`, for the section
+    /// validation `load_config` does.
+    async fn rc_tree(types: &[&str]) -> (MountTable, tempfile::TempDir, tempfile::TempDir) {
+        use crate::vfs::LocalBackend;
+        let rc = tempfile::tempdir().unwrap();
+        for t in types {
+            std::fs::create_dir_all(rc.path().join(t)).unwrap();
+        }
+        let config = tempfile::tempdir().unwrap();
+        let vfs = MountTable::new();
+        vfs.mount(kaijutsu_types::paths::RC_ROOT, LocalBackend::new(rc.path())).await;
+        vfs.mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path())).await;
+        (vfs, rc, config)
+    }
+
+    fn write_gate(config: &tempfile::TempDir, text: &str) {
+        std::fs::write(config.path().join(GATE_CONFIG_FILE), text).unwrap();
+    }
+
+    /// A typo'd section names no context type, so it applies to nobody and
+    /// the type it meant to name keeps whatever `[global]` said. The load
+    /// refuses it the way a kj key naming no verb is refused.
+    #[tokio::test]
+    async fn an_unknown_context_type_section_fails_the_load_naming_the_known_types() {
+        let (vfs, _rc, config) = rc_tree(&["coder", "director", "lib"]).await;
+        write_gate(
+            &config,
+            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
+        );
+        let err = load_config(&vfs).await.unwrap_err();
+        let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
+        assert!(
+            m.contains("context_type.directer") && m.contains("coder, director"),
+            "{m}"
+        );
+        assert!(!m.contains("lib"), "`lib` is not a seat: {m}");
+    }
+
+    /// The fail-open shape the check exists for: without it the typo'd
+    /// section is inert and `director` inherits the global allow. With the
+    /// name spelled right, the section applies and holds the tier at ask.
+    #[tokio::test]
+    async fn a_typo_can_no_longer_leave_a_context_type_on_the_global_allow() {
+        let (vfs, _rc, config) = rc_tree(&["coder", "director"]).await;
+        write_gate(
+            &config,
+            "[global]\nuncovered = \"allow\"\n[context_type.director]\nuncovered = \"ask\"\n",
+        );
+        let cfg = load_config(&vfs).await.expect("the spelled-right file loads");
+        assert!(cfg.allows_uncovered(Some("coder")));
+        assert!(!cfg.allows_uncovered(Some("director")), "the section protects its type");
+
+        // The same file with the name misspelled must not load at all: a
+        // parsed-clean typo would leave `director` on the global allow.
+        write_gate(
+            &config,
+            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
+        );
+        let typo = load_config(&vfs).await;
+        assert!(typo.is_err(), "a typo'd section must refuse the file");
+        let parsed = GateConfig::parse(
+            "[global]\nuncovered = \"allow\"\n[context_type.directer]\nuncovered = \"ask\"\n",
+        )
+        .expect("parse itself stays a pure shape check");
+        assert!(
+            parsed.allows_uncovered(Some("director")),
+            "this is what the load refuses to hand out: the typo'd section applies to nobody"
+        );
+    }
+
+    /// Any unknown section, not only one setting `uncovered`: a typo'd
+    /// allow list is inert in the same way.
+    #[tokio::test]
+    async fn an_unknown_section_with_only_a_key_list_fails_the_load_too() {
+        let (vfs, _rc, config) = rc_tree(&["coder"]).await;
+        write_gate(&config, "[context_type.codr]\nallow = [\"rg\"]\n");
+        assert!(matches!(load_config(&vfs).await, Err(GateConfigError::Parse(_))));
+    }
+
+    /// An rc tree that lists nothing accepts every section — there is
+    /// nothing to validate against, and a kernel with no rc tree is a
+    /// legitimate shape. The rule `kj::rc::check_context_type` states.
+    #[tokio::test]
+    async fn an_empty_rc_tree_accepts_any_section() {
+        let (vfs, _rc, config) = rc_tree(&[]).await;
+        write_gate(&config, "[context_type.anything-goes]\nallow = [\"rg\"]\n");
+        assert!(load_config(&vfs).await.is_ok());
+    }
+
+    /// The shipped `gate.toml` must load against the shipped rc tree.
+    /// `[context_type.explorer]` did not: the type was renamed and the
+    /// section had been inert ever since.
+    #[tokio::test]
+    async fn the_shipped_default_loads_against_the_shipped_rc_tree() {
+        use crate::vfs::LocalBackend;
+        let rc = tempfile::tempdir().unwrap();
+        crate::seed_scripts::ensure_rc_seed_files(rc.path()).expect("seed rc");
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join(GATE_CONFIG_FILE),
+            crate::config_seed::DEFAULT_GATE_CONFIG,
+        )
+        .unwrap();
+        let vfs = MountTable::new();
+        vfs.mount(kaijutsu_types::paths::RC_ROOT, LocalBackend::new(rc.path())).await;
+        vfs.mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path())).await;
+        let loaded = load_config(&vfs).await;
+        assert!(loaded.is_ok(), "{loaded:?}");
     }
 
     #[tokio::test]

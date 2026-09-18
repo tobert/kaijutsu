@@ -1,0 +1,19 @@
+# Sandbox gate policy: a benchmark container or a throwaway kernel.
+#
+# `uncovered = "allow"` lets every statement no key here covers run with no
+# ask — redirects, heredocs, background flags and substituted arguments
+# included. It removes the human from the loop. No PreCall hook sees a
+# program the tier allows outright, so the scorer and the shell-escape guard
+# never run on one; a mixed program, where one statement is ask-tier or
+# deny-tier, still meets the hooks. Use it only where the kernel and its
+# work are disposable.
+#
+# Install it by replacing /config/kernel/gate.toml. Appending the key to the
+# shipped file keeps the shipped `ask` list (`git push`, `kj rc add`, …),
+# which stays firm above the tier and would hang an unattended run.
+#
+# `kj ledger rules` states the posture while it is in force.
+# docs/gate-policy-tuning.md, "The uncovered tier: a sandbox posture".
+
+[global]
+uncovered = "allow"

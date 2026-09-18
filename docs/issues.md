@@ -433,6 +433,55 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   callsite ownership alongside the ledger test; the contributing factors are
   not established.
 
+## The uncovered tier does not reach a `KjVerb` ask (2026-09-18)
+
+`gate.toml`'s `uncovered = "allow"` (`docs/gate-policy-tuning.md`, "The
+uncovered tier: a sandbox posture") rides the config layers, and an
+`Origin::KjVerb` ask never meets them: its one live caller passes
+`gate_policy::no_config()` (`kj/cc.rs:112`, `kj cc send`), and
+`lower_layers_per_gated_statement` (`kj/gate_policy.rs:810`) returns
+`Uncovered` for that origin because there is no planned program to key on.
+So a sandboxed kernel still asks on those. Either those callers should load
+the file and the evaluator should let the tier decide a plan-less ask, or
+the boundary stays and the `kj cc` help says so. No benchmark has hit it
+yet.
+
+## The uncovered tier: three seams left open (2026-09-18)
+
+`docs/gate-policy-tuning.md`, "The uncovered tier: a sandbox posture".
+
+- **No broker-level PreCall test loads the tier.** The evaluator is pinned
+  in `kj/gate_policy.rs` and the shell gate in `kj/ledger.rs`, but nothing
+  asserts that `evaluate_phase_with_mode` (`mcp/broker.rs`) skips hooks for
+  a program the tier allows, which is the behavior an operator feels most.
+  It needs a test in broker.rs's own test module.
+- **A commandless statement carries no tier stamp on `KJ_TOOL_PLAN`.** The
+  stamping loop zips `stmt.plan.commands` with the JSON twin
+  (`mcp/broker.rs`, `run_kaish_hook`), so a statement with no command — an
+  assignment, an exit, a `[[ ]]` test — gets no `tier` field. The evaluator
+  still decides it, and a hook that reads tiers per command finds nothing to
+  read, so this is cosmetic today. It becomes real if a hook ever scores
+  statements rather than commands.
+- **No startup line says the posture is on.** `kj ledger rules` states it,
+  and every auto-decision names it in its durable row, but a kernel booted
+  with a copied-in sandbox `gate.toml` says nothing. The place for one is
+  `create_shared_kernel` in `kaijutsu-server/src/rpc.rs`, in the loop that
+  seeds and mounts each config tree and already logs where a non-default
+  tree came from; the line would load `gate.toml` there and name the
+  sections setting `uncovered = "allow"`. A boot-time load also has to
+  decide what an unloadable file does at boot, where today nothing reads it
+  until the first shell submission.
+
+## The isotest harness could use the uncovered tier (2026-09-18)
+
+`crates/kaijutsu-isotest/tests/common/mod.rs:65` keeps `HARNESS_ROOT_ALLOW`,
+a hand-listed allow tier for the harness's own setup commands, because an
+unanswered ask hung the run. The harness tests process isolation and VFS
+protection, not the gate, and it throws its kernel away per run — a
+`[context_type.root] uncovered = "allow"` section would replace the list and
+stop it drifting as setup commands change. Left alone here: that crate is
+another lane's this week.
+
 ## isotest process tests cannot find a job's process group (2026-09-17)
 
 `contrib/isotest` passes `filesystem.rs` (8) and fails all 6 `isolation.rs`

@@ -1538,6 +1538,15 @@ impl KjDispatcher {
                         lines.push(format!("  {:<40}  {:<7}  {layer}", truncate_key(&key), verdict));
                     }
                 }
+                if config.allows_uncovered(context_type.as_deref()) {
+                    lines.push(String::new());
+                    lines.push(
+                        "gate.toml sets uncovered = \"allow\" for this context: every statement \
+                         no key above covers runs, and no ask reaches a human. It is for a \
+                         sandboxed or throwaway kernel."
+                            .to_string(),
+                    );
+                }
             }
             Err(e) => lines.push(format!("gate.toml: {e}")),
         }
@@ -3170,6 +3179,149 @@ mod tests {
         .await;
         assert_eq!(next.verdict, crate::kj::gate::GateVerdict::Denied, "{}", next.reason);
         assert!(next.reason.contains("user family rule denies git push"), "{}", next.reason);
+    }
+
+    /// The sandbox posture through the shell gate itself
+    /// (`gate_policy::evaluate`, the second pinch point): `uncovered =
+    /// "allow"` auto-allows a program no key covers, the durable row names
+    /// the tier, a remembered deny still outranks it, and `kj ledger rules`
+    /// says the posture is on.
+    ///
+    /// Falsified by dropping the uncovered tier from
+    /// `gate_policy::command_verdict` (the first call comes back
+    /// `Pending`).
+    #[tokio::test]
+    async fn the_uncovered_tier_auto_allows_through_the_gate_and_a_remembered_deny_still_wins() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let sandbox = Ok(crate::kj::gate_policy::GateConfig::parse(
+            "[global]\nuncovered = \"allow\"\n",
+        )
+        .unwrap());
+
+        // A shape no allow list can cover: a redirect and a substituted
+        // argument, exactly what a coder emits all day.
+        let allowed = run_gate(
+            d.kernel(),
+            &c,
+            planned_shell_spec("python3 $(ls build.py) --jobs 4 > /tmp/log 2>&1"),
+            d.kernel.ledger_flows(),
+            &sandbox,
+        )
+        .await;
+        assert_eq!(allowed.verdict, crate::kj::gate::GateVerdict::Allowed, "{}", allowed.reason);
+        assert!(
+            allowed.reason.contains("global config uncovered tier allows"),
+            "the durable row names the tier, not an allow list: {}",
+            allowed.reason
+        );
+
+        // A human's remembered deny sits above the tier.
+        let asked = gate_once(&d, &c, planned_shell_spec("git push origin main")).await;
+        let request_id = asked.ask.expect("an escalated ask has a row").request_id;
+        let answered = d
+            .dispatch(
+                &[s("ledger"), s("deny"), s(&request_id), s("--remember"), s("always"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(answered.is_ok(), "{answered:?}");
+        let denied = run_gate(
+            d.kernel(),
+            &c,
+            planned_shell_spec("git push other branch > /tmp/log"),
+            d.kernel.ledger_flows(),
+            &sandbox,
+        )
+        .await;
+        assert_eq!(denied.verdict, crate::kj::gate::GateVerdict::Denied, "{}", denied.reason);
+        assert!(denied.reason.contains("user family rule denies git push"), "{}", denied.reason);
+    }
+
+    /// A remembered exact-statement (digest) deny outranks the uncovered
+    /// tier — the layer above config that the family test does not cover.
+    ///
+    /// There is no digest ASK to test beside it: a `RuleRow` carries
+    /// `allow: bool`, so the user-rule layer has two verdicts and an ask is
+    /// not one of them. The firm ask lives in the config layer, pinned in
+    /// `kj/gate_policy.rs`.
+    ///
+    /// Falsified by consulting the lower layers before digest coverage in
+    /// `gate_policy::evaluate`.
+    #[tokio::test]
+    async fn a_remembered_exact_statement_deny_outranks_the_uncovered_tier() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let program = "python3 /srv/deploy.py --production";
+
+        let first = gate_once(&d, &c, planned_shell_spec(program)).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+        let answered = d
+            .dispatch(
+                &[s("ledger"), s("deny"), s(&request_id), s("--remember"), s("always")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(answered.is_ok(), "{answered:?}");
+
+        let sandbox = Ok(crate::kj::gate_policy::GateConfig::parse(
+            "[global]\nuncovered = \"allow\"\n",
+        )
+        .unwrap());
+        let next = run_gate(
+            d.kernel(),
+            &c,
+            planned_shell_spec(program),
+            d.kernel.ledger_flows(),
+            &sandbox,
+        )
+        .await;
+        assert_eq!(next.verdict, crate::kj::gate::GateVerdict::Denied, "{}", next.reason);
+        assert!(
+            next.reason.contains("user rule denies the exact statement"),
+            "{}",
+            next.reason
+        );
+    }
+
+    /// `kj ledger rules` states the sandbox posture in words, so an
+    /// operator sees it without reading `gate.toml`.
+    ///
+    /// Falsified by deleting the `allows_uncovered` branch in
+    /// `ledger_rules`.
+    #[tokio::test]
+    async fn ledger_rules_says_when_the_uncovered_tier_is_on() {
+        use crate::vfs::VfsOps;
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let path = kaijutsu_types::paths::config_path(
+            crate::kj::gate_policy::GATE_CONFIG_FILE,
+        );
+
+        let before = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(before.is_ok(), "{before:?}");
+        assert!(
+            !before.message().contains("uncovered"),
+            "the shipped default says nothing about it: {}",
+            before.message()
+        );
+
+        d.kernel()
+            .vfs()
+            .write_all(
+                std::path::Path::new(&path),
+                b"[global]\nuncovered = \"allow\"\n",
+            )
+            .await
+            .expect("write gate.toml");
+        let after = d.dispatch(&[s("ledger"), s("rules")], &c).await;
+        assert!(after.is_ok(), "{after:?}");
+        assert!(
+            after.message().contains("uncovered")
+                && after.message().contains("no ask reaches a human"),
+            "{}",
+            after.message()
+        );
     }
 
     /// A family is refused on structure, naming the condition, while the
