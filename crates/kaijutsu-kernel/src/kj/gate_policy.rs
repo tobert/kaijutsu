@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn a_write_verb_is_uncovered() {
-        let e = unconfigured("kj context remove 01a0-abc");
+        let e = unconfigured("kj context archive 01a0-abc");
         assert_eq!(e.per_statement[0], PolicyVerdict::Uncovered);
         assert_eq!(e.verdict(), AskVerdict::Escalate);
     }

@@ -1108,17 +1108,8 @@ impl KjDispatcher {
                                 reviewer_id: None,
                                 director_id: None,
                             };
-                            db.insert_context_with_document(&row, ws)
-                                .map_err(|e| format!("failed to persist lost+found context row: {e}"))
-                        })
-                        .and_then(|_| {
-                            db.set_well_known_context(
-                                crate::kernel_db::WellKnownRole::LostFound,
-                                id,
-                            )
-                            .map_err(|e| {
-                                format!("failed to register lost+found in well-known registry: {e}")
-                            })
+                            db.insert_well_known_context(&row, ws, crate::kernel_db::WellKnownRole::LostFound)
+                                .map_err(|e| format!("failed to publish lost+found context: {e}"))
                         })
                         .map(|_| label)
                 }

@@ -44,7 +44,7 @@ impl From<Effect> for Severity {
 /// authored read on it.
 #[derive(Debug, Clone, Serialize)]
 pub struct KjVerb {
-    /// Space-joined leaf path without the `kj` prefix: "context remove".
+    /// Space-joined leaf path without the `kj` prefix: "context archive".
     pub path: String,
     /// Leaf aliases from clap, visible and hidden: ["rm"].
     pub aliases: Vec<String>,

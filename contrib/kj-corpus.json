@@ -186,17 +186,6 @@
       "note": null
     },
     {
-      "path": "context remove",
-      "aliases": [
-        "rm"
-      ],
-      "about": "Permanently delete a context (latched)",
-      "clause": "kj context remove 019a2f3c --confirm",
-      "expect": "data-critical",
-      "effect": "destroy",
-      "note": null
-    },
-    {
       "path": "context retag",
       "aliases": [],
       "about": "Move a label to a different context (latched)",

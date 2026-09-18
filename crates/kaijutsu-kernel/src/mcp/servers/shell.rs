@@ -1244,20 +1244,20 @@ mod tests {
         // instead of scraping the confirmation prose out of stdout. This test
         // is the regression guard for that.
         let r = crate::runtime::kj_builtin::latch_result(
-            "kj context remove",
+            "kj context archive",
             "doomed",
             "removing a context is destructive",
-            "kj context remove doomed --confirm".to_string(),
+            "kj context archive doomed --confirm".to_string(),
         );
         let structured = envelope_of(r);
         assert_eq!(
             structured["latch"]["command"],
-            serde_json::json!("kj context remove")
+            serde_json::json!("kj context archive")
         );
         assert_eq!(structured["latch"]["target"], serde_json::json!("doomed"));
         assert_eq!(
             structured["latch"]["hint"],
-            serde_json::json!("kj context remove doomed --confirm"),
+            serde_json::json!("kj context archive doomed --confirm"),
             "the ready-to-run confirmation command must ride the envelope"
         );
 

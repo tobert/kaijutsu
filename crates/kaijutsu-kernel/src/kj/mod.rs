@@ -1115,7 +1115,7 @@ fn unbound_denial(verb: &str, ctx: ContextId, state: &str, label: &str) -> KjRes
          Read this context's Error blocks for why it failed. \
          Repair: `kj context rebind`. Or leave it: `kj context create <label-of-new>` \
          then `kj context switch <label-of-new>` (both ungated), and \
-         `kj context remove {ctx_short}` from there.",
+         `kj context archive {ctx_short}` from there.",
         ctx_short = ctx.short()
     ))
 }

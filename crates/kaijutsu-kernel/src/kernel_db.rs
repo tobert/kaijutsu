@@ -3503,12 +3503,19 @@ impl KernelDb {
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
     }
 
-    /// Delete a document (CASCADE deletes snapshots, input_docs, and context).
+    /// Delete a document that has no context. Context history is retained.
     pub fn delete_document(&self, id: ContextId) -> KernelDbResult<bool> {
-        let deleted = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        if self.get_context(id)?.is_some() {
+            return Err(KernelDbError::Validation(format!(
+                "context history is retained; use `kj context archive {id}`"
+            )));
+        }
+        let deleted = tx.execute(
             "DELETE FROM documents WHERE document_id = ?1",
             params![blob_param(id.as_bytes())],
         )?;
+        tx.commit()?;
         Ok(deleted > 0)
     }
 
@@ -4258,21 +4265,12 @@ impl KernelDb {
         Ok(())
     }
 
-    /// Archive a context (soft delete). Returns true if it was active. Also
-    /// clears `promoted_at` and `demoted_at` — an archived context holds no
-    /// ring seat, hand-picked or otherwise — and abandons every unresolved
-    /// ask the context raised.
+    /// Archive a context while retaining its history. Returns true if it was
+    /// active. Clears ring placement and abandons unresolved asks without
+    /// deleting their records. Decided asks retain their answers.
     ///
-    /// The sweep is here rather than in the `kj` verb so every archive path
-    /// gets it. An archived context runs nothing, so an ask it left open is
-    /// answerable and dead at once: a human would answer it, be told
-    /// nothing, and nothing would happen. Decided asks are untouched —
-    /// abandoning one would destroy a human's answer, and the audit trail
-    /// keeps it whether or not anything can collect it.
-    ///
-    /// A sweep failure does not fail the archive: the context IS archived by
-    /// then, every gate refuses it, and leaving the rows is a stale queue
-    /// rather than a live hazard. It is logged rather than swallowed.
+    /// The ask sweep runs after the state change. Its failure is logged;
+    /// the context remains archived. This method does not stop running work.
     pub fn archive_context(&self, id: ContextId) -> KernelDbResult<bool> {
         let now = now_millis();
         let updated = self.conn.execute(
@@ -6870,18 +6868,6 @@ impl KernelDb {
         Ok(deleted > 0)
     }
 
-    /// Hard-delete a context and all its edges (CASCADE).
-    ///
-    /// Used by `kj context remove`. This is permanent — use `archive_context`
-    /// for soft delete.
-    pub fn delete_context(&self, id: ContextId) -> KernelDbResult<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM contexts WHERE context_id = ?1",
-            params![blob_param(id.as_bytes())],
-        )?;
-        Ok(deleted > 0)
-    }
-
     /// Count contexts using a specific preset.
     pub fn contexts_using_preset(&self, preset_id: PresetId) -> KernelDbResult<usize> {
         let count: i64 = self.conn.query_row(
@@ -6940,6 +6926,21 @@ impl KernelDb {
             Some(row) => Ok(Some(read_context_id(row, 0)?)),
             None => Ok(None),
         }
+    }
+
+    /// Publish a context and its well-known role atomically. Failed publication
+    /// leaves no context, so its unregistered document can be discarded.
+    pub fn insert_well_known_context(
+        &self,
+        row: &ContextRow,
+        workspace: WorkspaceId,
+        role: WellKnownRole,
+    ) -> KernelDbResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.insert_context_with_document(row, workspace)?;
+        self.set_well_known_context(role, row.context_id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Assign `id` to `role` — the rotation primitive. Upserts: a role that
@@ -11402,6 +11403,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_well_known_publication_leaves_only_a_discardable_document() {
+        for role in [WellKnownRole::DriftQueue, WellKnownRole::LostFound] {
+            let db = KernelDb::temporary().unwrap();
+            let workspace = setup_test_db(&db);
+            let row = make_context_row(Some("unpublished"));
+            db.insert_document(&DocumentRow {
+                document_id: row.context_id, workspace_id: workspace,
+                doc_kind: DocKind::Conversation, language: None, path: None,
+                created_at: row.created_at, created_by: row.created_by,
+            }).unwrap();
+            db.conn.execute_batch("CREATE TRIGGER reject_role BEFORE INSERT ON well_known_contexts BEGIN SELECT RAISE(ABORT, 'injected role fault'); END;").unwrap();
+            let error = db.insert_well_known_context(&row, workspace, role).unwrap_err();
+            assert!(error.to_string().contains("injected role fault"), "{error}");
+            assert!(db.get_context(row.context_id).unwrap().is_none());
+            assert!(db.well_known_context(role).unwrap().is_none());
+            assert!(db.get_document(row.context_id).unwrap().is_some());
+            assert!(db.delete_document(row.context_id).unwrap());
+            db.conn.execute_batch("DROP TRIGGER reject_role").unwrap();
+            db.insert_well_known_context(&row, workspace, role).unwrap();
+            assert_eq!(db.well_known_context(role).unwrap(), Some(row.context_id));
+            assert!(db.get_context(row.context_id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn document_deletion_refuses_live_and_archived_contexts() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("retained"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+        for archived in [false, true] {
+            if archived {
+                db.archive_context(ctx.context_id).unwrap();
+            }
+            let error = db.delete_document(ctx.context_id).expect_err("context history must survive document deletion");
+            assert!(error.to_string().contains("archive"), "{error}");
+            assert!(db.get_document(ctx.context_id).unwrap().is_some());
+            assert!(db.get_context(ctx.context_id).unwrap().is_some());
+        }
+    }
+
+    #[test]
     fn context_shell_cascade_delete() {
         let db = KernelDb::temporary().unwrap();
         let ws_id = setup_test_db(&db);
@@ -11417,7 +11460,8 @@ mod tests {
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_some());
 
         // Delete context → shell row should cascade
-        db.delete_context(ctx.context_id).unwrap();
+        db.conn.execute("DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(ctx.context_id.as_bytes())]).unwrap();
         assert!(db.get_context_shell(ctx.context_id).unwrap().is_none());
     }
 
@@ -11651,7 +11695,8 @@ mod tests {
         .unwrap();
         assert!(db.get_context_binding(ctx.context_id).unwrap().is_some());
 
-        db.delete_context(ctx.context_id).unwrap();
+        db.conn.execute("DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(ctx.context_id.as_bytes())]).unwrap();
         assert!(db.get_context_binding(ctx.context_id).unwrap().is_none());
 
         // Children rows must also be gone (belt-and-suspenders on the
@@ -12159,7 +12204,8 @@ mod tests {
         db.set_context_env(ctx.context_id, "FOO", "bar").unwrap();
         db.set_context_env(ctx.context_id, "BAZ", "qux").unwrap();
 
-        db.delete_context(ctx.context_id).unwrap();
+        db.conn.execute("DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(ctx.context_id.as_bytes())]).unwrap();
         let vars = db.get_context_env(ctx.context_id).unwrap();
         assert!(vars.is_empty());
     }
@@ -13121,7 +13167,8 @@ mod tests {
         )
         .unwrap();
 
-        db.delete_context(ctx.context_id).unwrap();
+        db.conn.execute("DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(ctx.context_id.as_bytes())]).unwrap();
 
         assert!(
             db.list_cache_breakpoints(ctx.context_id).unwrap().is_empty(),

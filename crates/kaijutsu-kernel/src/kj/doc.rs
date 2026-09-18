@@ -2,8 +2,8 @@
 //!
 //! A document is the storage primitive; a context layers conversation
 //! metadata (model binding, system prompt, fork lineage) on top of a
-//! Conversation-kind document. Non-conversation kinds (Code, Text,
-//! Config) exist as documents only — `kj context list` hides them.
+//! Conversation-kind document. File and Symlink kinds exist as documents
+//! only — `kj context list` hides them.
 //! This namespace is the kj surface that sees them.
 //!
 //! ```text
@@ -72,10 +72,8 @@ enum DocCommand {
         #[arg(long)]
         id: Option<String>,
     },
-    /// Delete a document and all its blocks. CASCADEs to drop the
-    /// contexts row, oplog, snapshots — irreversible. Two-step: the first
-    /// invocation refuses and prints what would be destroyed, a second with
-    /// --confirm performs the deletion (latch pattern shared with archive).
+    /// Delete a document that has no context, including its blocks and history.
+    /// Requires --confirm. Contexts must be archived with `kj context archive`.
     Delete {
         /// Document id (hex UUID)
         doc_id: String,
@@ -382,9 +380,7 @@ impl KjDispatcher {
         .preserving_record(record)
     }
 
-    /// Delete a document and CASCADE-drop its contexts row, oplog,
-    /// snapshots. `Destroy`-classed (`kj/effect.rs`); the
-    /// dispatcher latches an unconfirmed call before this handler runs.
+    /// Delete a document without context metadata after confirmation.
     fn doc_delete(&self, id_str: &str) -> KjResult {
         let ctx_id = match ContextId::parse(id_str) {
             Ok(id) => id,
@@ -395,6 +391,13 @@ impl KjDispatcher {
             }
         };
 
+        match self.kernel_db().lock().get_context(ctx_id) {
+            Ok(Some(_)) => return KjResult::Err(format!(
+                "context history is retained; use `kj context archive {ctx_id}`"
+            )),
+            Ok(None) => {}
+            Err(e) => return KjResult::Err(format!("kj doc delete: {e}")),
+        }
         let row = self.kernel_db().lock().get_document(ctx_id);
         let kind_str = match row {
             Ok(Some(row)) => row.doc_kind.as_str().to_string(),
@@ -952,7 +955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doc_delete_with_confirmed_caller_succeeds() {
+    async fn doc_delete_with_confirmed_caller_retains_context() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let conv = register_context_with_doc(&d, Some("c"), principal);
@@ -962,9 +965,9 @@ mod tests {
         let result = d
             .dispatch(&[s("doc"), s("delete"), conv.to_hex()], &c)
             .await;
-        assert!(result.is_ok(), "delete failed: {}", result.message());
-        // Memory store dropped.
-        assert!(d.block_store().get(conv).is_none());
+        assert!(!result.is_ok(), "context deletion must fail");
+        assert!(result.message().contains("archive"), "{}", result.message());
+        assert!(d.block_store().get(conv).is_some());
     }
 
     #[tokio::test]

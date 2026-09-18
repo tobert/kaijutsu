@@ -1,4 +1,4 @@
-//! Context subcommands: list, info, switch, create, set, log, move, archive, remove, retag.
+//! Context subcommands: list, info, switch, create, set, log, move, archive, retag.
 
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_types::{BlockId, ConsentMode, ContentType, ContextId, ContextState, EdgeKind, PrincipalId};
@@ -206,9 +206,8 @@ enum ContextCommand {
         /// labels come from `kj context list`.
         context: Option<String>,
     },
-    /// Soft-delete one context (latched). Its children are untouched and
-    /// keep their parent edge: an archived context stays in the graph as
-    /// lineage.
+    /// Archive one context, retaining its history (latched). Children keep
+    /// their parent edge and state. Restore with `kj context promote <id>`.
     Archive {
         /// Context to archive. Ids and labels come from `kj context list`.
         context: String,
@@ -232,7 +231,7 @@ enum ContextCommand {
     },
     /// Push a context outward one step on the demote ladder: promoted →
     /// unpromoted, unpromoted/undemoted → demoted, already demoted →
-    /// archived. Not latched (each step is reversible except the last).
+    /// archived. Not latched; restore with `kj context promote <id>`.
     Demote {
         /// Context to push one step down the ladder. Ids and labels come
         /// from `kj context list`.
@@ -249,13 +248,6 @@ enum ContextCommand {
     /// Clear the "suspend activity" flag.
     Resume {
         /// Context to resume. Ids and labels come from `kj context list`.
-        context: String,
-    },
-    /// Permanently delete a context (latched).
-    #[command(alias = "rm")]
-    Remove {
-        /// Context to delete. Cannot be the current context. Ids and
-        /// labels come from `kj context list`.
         context: String,
     },
     /// Move a label to a different context (latched).
@@ -644,7 +636,6 @@ impl KjDispatcher {
                 | ContextCommand::Rename { .. }
                 | ContextCommand::Archive { .. }
                 | ContextCommand::Rotate { .. }
-                | ContextCommand::Remove { .. }
                 | ContextCommand::Retag { .. }
                 | ContextCommand::Hydrate { .. }
         ) && let Err(denied) =
@@ -708,7 +699,6 @@ impl KjDispatcher {
             ContextCommand::Demote { context } => self.context_demote(&context, caller).await,
             ContextCommand::Pause { context } => self.context_pause(&context, caller, true).await,
             ContextCommand::Resume { context } => self.context_pause(&context, caller, false).await,
-            ContextCommand::Remove { context } => self.context_remove(&context, caller).await,
             ContextCommand::Rename { name, context } => {
                 self.context_rename(&name, context.as_deref(), caller).await
             }
@@ -2106,7 +2096,7 @@ impl KjDispatcher {
         KjResult::ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
     }
 
-    /// `kj context archive <ctx>` — soft-delete one context. `Destroy`-classed
+    /// `kj context archive <ctx>` — retain one context outside the active set. `Destroy`-classed
     /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
     ///
@@ -2250,7 +2240,7 @@ impl KjDispatcher {
             Ok(true) => {}
             Ok(false) => return KjResult::Err(format!(
                 "kj context rotate: the successor {successor_id} has no loadout after its create lifecycle, so {name} stays live. \
-                 Read the successor's Error blocks, then remove it with `kj context remove {successor_id}`"
+                 Read the successor's Error blocks, then archive it with `kj context archive {successor_id}`"
             )),
             Err(e) => return KjResult::Err(format!(
                 "kj context rotate: could not read the successor's loadout, so {name} stays live: {e}"
@@ -2444,57 +2434,6 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj context remove <ctx>` — permanently delete a context.
-    /// `Destroy`-classed (`kj/effect.rs`); the dispatcher latches
-    /// an unconfirmed call before this handler runs.
-    async fn context_remove(&self, ctx_ref: &str, caller: &KjCaller) -> KjResult {
-        let (target_id, target_label) = {
-            let db = self.kernel_db().lock();
-            let target_id =
-                match super::refs::resolve_context_arg(Some(ctx_ref), caller, &db) {
-                    Ok(id) => id,
-                    Err(e) => return KjResult::Err(format!("kj context remove: {e}")),
-                };
-            let label = db
-                .get_context(target_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.label)
-                .unwrap_or_else(|| target_id.short());
-            (target_id, label)
-        };
-
-        if Some(target_id) == caller.context_id {
-            return KjResult::Err(
-                "kj context remove: cannot remove the current context".to_string(),
-            );
-        }
-
-        // MCP subscription cleanup removed alongside the legacy MCP pool
-        // in Phase 1 M5.
-
-        if let Err(e) = self.kernel().shell_operations().cancel_all_for_context(target_id).await {
-            return KjResult::Err(format!("could not cancel context shell operations: {e}"));
-        }
-
-        // Delete from DB (CASCADE deletes edges)
-        {
-            let db = self.kernel_db().lock();
-            if let Err(e) = db.delete_context(target_id) {
-                return KjResult::Err(format!("kj context remove: {e}"));
-            }
-        }
-
-        // Remove document from BlockStore
-        let _ = self.block_store().delete_document(target_id);
-
-        // Unregister from DriftRouter (no db lock held)
-        let mut drift = self.drift_router().write();
-        drift.unregister(target_id);
-
-        KjResult::ok(format!("removed context '{}'", target_label))
-    }
-
     /// `kj context rename <name> [--context <ref>]` — set a context's label.
     /// Unlike `kj context retag` below, this is not latched: it renames the
     /// resolved context's own label rather than moving a label between
@@ -2645,7 +2584,7 @@ impl Classify for ContextCommand {
             | Self::Pause { .. }
             | Self::Resume { .. }
             | Self::Hydrate { .. } => Effect::Write,
-            Self::Archive { .. } | Self::Remove { .. } | Self::Retag { .. } => Effect::Destroy,
+            Self::Archive { .. } | Self::Retag { .. } => Effect::Destroy,
         }
     }
 }
@@ -4442,7 +4381,7 @@ mod tests {
     async fn context_promote_and_demote_are_not_capability_gated() {
         // Same authority level as conclude: an unprivileged caller whose
         // context binding denies everything (Operator included) can still
-        // promote/demote — unlike `archive`/`remove`, which `require_cap`
+        // promote/demote — unlike `archive`, which `require_cap`
         // would deny here. Deny-all is written straight to the DB — the
         // authoritative store `require_cap` reads (see
         // `drive_denied_without_drive_capability` for the same pattern).
@@ -4619,73 +4558,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_remove_requires_latch() {
-        let d = test_dispatcher().await;
+    async fn contexts_retain_history_instead_of_supporting_removal() {
+        let d = test_dispatcher_persistent().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
-        let _target = register_context(&d, Some("victim"), Some(parent), principal);
-
-        let c = caller_with_context(parent);
-        let result = d
-            .dispatch(&[s("context"), s("remove"), s("victim")], &c)
-            .await;
-        assert!(result.is_latch(), "expected latch, got: {:?}", result);
-    }
-
-    #[tokio::test]
-    async fn context_remove_confirmed() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let target = register_context(&d, Some("target"), Some(parent), principal);
-
-        let c = confirmed_caller(parent);
-        let result = d
-            .dispatch(&[s("context"), s("remove"), s("target")], &c)
-            .await;
-        assert!(result.is_ok(), "remove failed: {}", result.message());
-
-        // Verify gone from DB
-        let db = d.kernel_db().lock();
-        assert!(db.get_context(target).unwrap().is_none());
-
-        // Verify gone from DriftRouter
-        drop(db);
-        let router = d.drift_router().read();
-        assert!(router.get(target).is_none());
-    }
-
-    #[tokio::test]
-    async fn context_remove_cannot_remove_current() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("current"), None, principal);
-
-        let c = confirmed_caller(ctx);
-        let result = d
-            .dispatch(&[s("context"), s("remove"), s("current")], &c)
-            .await;
-        assert!(!result.is_ok(), "should not allow removing current context");
-    }
-
-    #[tokio::test]
-    async fn context_remove_cancels_owned_kaish_jobs() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let parent = register_context(&d, Some("parent"), None, principal);
-        let target = register_context(&d, Some("victim"), Some(parent), principal);
+        let target = register_context(&d, Some("retained"), Some(parent), principal);
         d.block_store().create_document(target, kaijutsu_types::DocKind::Conversation, None).unwrap();
-        let manager = d.kernel().context_job_manager(target);
-        let kaish = kaish_kernel::Kernel::new(
-            kaish_kernel::KernelConfig::default().with_job_manager(manager.clone()),
-        ).unwrap();
-        let job = kaish.execute_background_with_options("sleep 30", kaish_kernel::ExecuteOptions::default()).await.unwrap();
-        let c = confirmed_caller(parent);
-        let result = d.dispatch(&[s("context"), s("remove"), s("victim")], &c).await;
-        assert!(result.is_ok(), "{}", result.message());
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait(job)).await.unwrap().unwrap();
-        assert_ne!(result.code, 0);
-        assert_eq!(manager.get(job).await.unwrap().status, kaish_kernel::scheduler::JobStatus::Killed);
+        let block = d.block_store().insert_block_as(target, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "retained history", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(principal)).unwrap();
+        let caller = confirmed_caller(parent);
+        for verb in ["remove", "rm"] {
+            let result = d.dispatch(&[s("context"), s(verb), target.to_hex()], &caller).await;
+            assert!(!result.is_ok(), "{verb} must not delete contexts");
+            assert!(result.message().contains("unrecognized subcommand"), "{}", result.message());
+        }
+        let archived = d.dispatch(&[s("context"), s("archive"), target.to_hex()], &caller).await;
+        assert!(archived.is_ok(), "{}", archived.message());
+        assert!(d.kernel_db().lock().get_context(target).unwrap().unwrap().is_archived());
+        let deleted = d.dispatch(&[s("doc"), s("delete"), target.to_hex()], &caller).await;
+        assert!(!deleted.is_ok(), "document deletion must not bypass context retention");
+        assert!(deleted.message().contains("archive"), "{}", deleted.message());
+        assert_eq!(d.block_store().get_block_snapshot(target, &block).unwrap().unwrap().content, "retained history");
+        assert_eq!(d.kernel_db().lock().get_context(target).unwrap().unwrap().forked_from, Some(parent));
+        let db = d.kernel_db().clone();
+        let workspace = db.lock().get_or_create_default_workspace(principal).unwrap();
+        let restored = crate::block_store::BlockStore::with_db(db, workspace, principal);
+        restored.load_from_db().unwrap();
+        assert_eq!(restored.get_block_snapshot(target, &block).unwrap().unwrap().content, "retained history");
     }
 
     #[tokio::test]

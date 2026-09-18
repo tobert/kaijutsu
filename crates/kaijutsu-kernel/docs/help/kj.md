@@ -88,8 +88,8 @@ config          Read or reset files under /config/kernel and /config/client.
                 Edit them with the file tools or `kj editor`. For model
                 configuration, see `kj backend`, `kj cast`, and `kj alias`.
 context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
-                set, unset, log, move, rename, archive, conclude, promote,
-                demote, pause, resume, remove, retag, hydrate — prompt renders
+                set, unset, log, move, rename, rotate, archive, conclude, promote,
+                demote, pause, resume, retag, hydrate — prompt renders
                 a context's system prompt; rebind repairs a context left with
                 no usable loadout by re-running `create`'s rc lifecycle,
                 ungated (a broken context can always diagnose and repair

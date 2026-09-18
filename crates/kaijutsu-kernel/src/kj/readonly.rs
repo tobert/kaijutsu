@@ -478,7 +478,7 @@ mod tests {
     fn a_root_flag_before_the_verb_does_not_hide_a_ledger_answer() {
         assert!(is_gate_exempt_kj(&plan_one("kj --json ledger allow 01a0-abc")));
         assert!(is_gate_exempt_kj(&plan_one("kj --confirm ledger deny 01a0-abc")));
-        assert!(!is_gate_exempt_kj(&plan_one("kj --json context remove 01a0-abc")));
+        assert!(!is_gate_exempt_kj(&plan_one("kj --json context archive 01a0-abc")));
     }
 
     /// `kj ledger list` is read-only on its own merits, and `kj ledger

@@ -439,9 +439,9 @@ impl DriftRouter {
         Ok(())
     }
 
-    /// Unregister a context (e.g., when a context is destroyed).
-    #[tracing::instrument(skip(self), name = "drift.unregister")]
-    pub fn unregister(&mut self, id: ContextId) {
+    /// Simulate a missing context for drift recovery tests.
+    #[cfg(test)]
+    fn forget_context_for_test(&mut self, id: ContextId) {
         if let Some(handle) = self.contexts.remove(&id)
             && let Some(label) = &handle.label
         {
@@ -1327,14 +1327,8 @@ pub fn ensure_drift_queue_context(
                     reviewer_id: None,
                     director_id: None,
                 };
-                db.insert_context_with_document(&row, ws)
-                    .map_err(|e| format!("failed to persist drift-queue context row: {e}"))
-            })
-            .and_then(|_| {
-                db.set_well_known_context(WellKnownRole::DriftQueue, id)
-                    .map_err(|e| {
-                        format!("failed to register drift-queue in well-known registry: {e}")
-                    })
+                db.insert_well_known_context(&row, ws, WellKnownRole::DriftQueue)
+                    .map_err(|e| format!("failed to publish drift-queue context: {e}"))
             })
     };
 
@@ -1959,7 +1953,7 @@ mod tests {
         router.register(id, Some("test"), None, PrincipalId::system()).unwrap();
 
         assert!(router.get(id).is_some());
-        router.unregister(id);
+        router.forget_context_for_test(id);
         assert!(router.get(id).is_none());
         assert!(router.resolve_context("test").is_err());
     }
@@ -2500,7 +2494,7 @@ mod tests {
         // Unregister target (simulating context shutdown).
         // New behavior: staged drifts targeting the removed context move to the
         // dead letter queue rather than remaining in staging indefinitely.
-        router.unregister(tgt);
+        router.forget_context_for_test(tgt);
 
         // Staging queue is now empty — item moved to dead letter.
         assert!(
@@ -2787,7 +2781,7 @@ mod tests {
         router.register(id, Some("ephemeral"), None, PrincipalId::system()).unwrap();
 
         assert!(router.get(id).is_some());
-        router.unregister(id);
+        router.forget_context_for_test(id);
         assert!(router.get(id).is_none());
         assert!(router.resolve_context("ephemeral").is_err());
     }
@@ -2931,7 +2925,7 @@ mod tests {
             .stage(origin, tgt, "content".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
-        router.unregister(unrelated);
+        router.forget_context_for_test(unrelated);
         assert_eq!(router.queue().len(), 1, "a peer origin has no context to match unregister");
     }
 
@@ -2951,7 +2945,7 @@ mod tests {
             .stage(origin.clone(), tgt, "content".into(), None, DriftKind::Push, PrincipalId::new())
             .unwrap();
 
-        router.unregister(tgt);
+        router.forget_context_for_test(tgt);
         assert!(router.queue().is_empty());
         // Check via the non-consuming inspect view first — `drain_dead_letter`
         // itself sets `in_flight`, so the flag has to be checked BEFORE
@@ -2991,7 +2985,7 @@ mod tests {
         assert!(router.queue()[0].in_flight);
 
         // Its target is torn down mid-flight.
-        router.unregister(tgt);
+        router.forget_context_for_test(tgt);
 
         let dl = router.dead_letters();
         assert_eq!(dl.len(), 1);
@@ -3663,7 +3657,7 @@ mod tests {
                 router
                     .stage(src, tgt, "orphaned by unregister".into(), None, DriftKind::Push, PrincipalId::new())
                     .unwrap();
-                router.unregister(tgt);
+                router.forget_context_for_test(tgt);
                 assert_eq!(router.dead_letters().len(), 1);
 
                 std::mem::forget(router);

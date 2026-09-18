@@ -256,7 +256,7 @@ fn severity_str(s: Severity) -> &'static str {
 // --- corpus flattening + scoring ----------------------------------------
 
 /// One corpus clause, flattened to the shape the scorer table wants. The
-/// `label` column is `family/path`: a verb's `path` ("context remove") or
+/// `label` column is `family/path`: a verb's `path` ("context archive") or
 /// an extra's `family` ("severity") -- whichever the source row carries.
 struct Probe {
     label: String,

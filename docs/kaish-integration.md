@@ -35,6 +35,15 @@ The runtime must support re-entry: a command can call `kj fork`, whose rc script
 can call another `kj` command. Do not hold a global execution lock across that
 chain or dispatch nested work onto a worker that is waiting for itself.
 
+Contexts are retained. `kj context archive <id> --confirm` removes a context
+from the active set while preserving lineage, blocks, execution receipts and
+approval history. `kj context promote <id>` restores it. There is no context
+removal command, and document deletion refuses documents owned by contexts.
+Already accepted commands retain their settlement destination across archive;
+consistent archive admission remains in the runtime audit. Index eligibility
+is separate pending policy; see `docs/issues.md`, "Context retention and index
+eligibility".
+
 ## Current implementation
 
 These are source observations, not promises that all paths behave alike.

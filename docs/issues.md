@@ -275,12 +275,16 @@ a suppressed disposition; audit already running conversations separately.
 Kaibo review and disposition:
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
-Context removal still requests cancellation through
-`ShellOperationRegistry::cancel_all_for_context`, then deletes metadata and the
-document without joining command settlement. Its test uses a bare kaish job,
-which has no receipt or block projection to expose that race. Audit admission
-fencing and settlement of turns, preparation, pending asks and jobs together;
-simply awaiting one job snapshot would leave new admission races.
+Contexts retain their history: `kj context remove` and its alias are deleted,
+and document deletion refuses registered contexts. Archive leaves accepted
+commands able to settle against their original blocks and receipts. Audit
+archive admission consistently across turns, preparations, pending asks, rc
+and jobs; existing archived-state checks are uneven, so archive is not yet a
+universal admission fence. Do not discard accepted outcomes or add a
+cancel-and-delete sequence. The archive handler also suppresses label-read
+errors, and an ask-sweep failure after the state update is logged but not
+retried by an already-archived call. Include explicit read failures and sweep
+recovery in that audit.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while
@@ -373,11 +377,7 @@ covered; these are not:
    Operator alone. A lane could reparent itself under a root and change
    its reviewer and its lineage root. Require the authority of the new parent's responsible
    character or the reviewer's, as casting does.
-2. **`kj context remove` orphans children.** `forked_from` is
-   `ON DELETE SET NULL`, so a removed context's children become forest
-   roots and their asks lose their reviewer with nothing recorded. Refuse
-   while live children exist.
-3. **Handoff logs are parentless.** `kj handoff note` mints the
+2. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
    parentless context played by a model. The kernel must not guess a root
    (Amy, 2026-09-16), so it needs an explicit parent. Since the default
@@ -1133,6 +1133,32 @@ From a sibling session's bridge work, not yet folded into
   TUI can share it. The kernel backend dials `ws://` only, so it cannot
   reach that unit; a unix-socket `JsonlTransport` is the small fix, the
   stdio proxy above the general one.
+
+## Checked-in gate probe corpus is stale
+
+`contrib/kj-corpus.json` predates current prompt help and some context commands.
+The removed context-deletion row is deleted, but the remaining snapshot needs
+regeneration and policy review against the live reflection in
+`examples/lfm2d-probe`. Treat it as a probe artifact, not current command help.
+
+## Context retention and index eligibility (Amy, 2026-09-18)
+
+Amy: "archive should be good enough for everyone. perhaps we can mark some as
+don't-index or something so they don't get picked up by classifiers and so on
+building search indices."
+
+Context history and audit records are retained; archiving removes a context
+from the active set and preserves its parent edges. Index eligibility is a
+separate policy still to implement. `kj search --all` uses active contexts,
+but the semantic-index watcher consumes terminal block events through
+`BlockStoreSource`, with no context-state lookup. Archiving alone neither
+prevents future embedding/classification nor evicts existing vectors.
+
+Design an explicit opt-out with consistent selection for automatic indexing,
+manual synthesis/index refresh, classifiers, and search results. Preserve
+explicit history reads. Handle existing vectors, in-flight refresh publication,
+and later opt-in together; filtering only the watcher leaves other producers
+and stale search entries. Do not present archive as a don't-index guarantee.
 
 ## Synthesis re-embeds the whole context on every block write (2026-09-01)
 

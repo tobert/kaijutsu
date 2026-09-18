@@ -640,7 +640,7 @@ fn is_gated_verb(argv: &[String]) -> bool {
 //
 // kaish 0.13 gave an embedder a typed control-plane field for this
 // (`ExecResult.latch` / `ExecContext::latch_result`); 0.14 deleted the latch
-// outright. kj's OWN gate — the one that holds `kj context remove`,
+// outright. kj's OWN gate — the one that holds `kj context archive`,
 // `kj context archive`, `kj context retag`, `kj doc delete`, `kj preset
 // remove` and `kj workspace remove` at exit 2 until `--confirm` — is
 // kaijutsu policy, not kaish's, so it survives the removal. What it lost is
@@ -650,7 +650,7 @@ fn is_gated_verb(argv: &[String]) -> bool {
 // `.data` does. Producer and consumers are all kaijutsu, so the keys below
 // are the whole protocol.
 
-/// Baggage key: the canonical command that latched (e.g. `kj context remove`).
+/// Baggage key: the canonical command that latched (e.g. `kj context archive`).
 pub const LATCH_COMMAND_KEY: &str = "kj.latch.command";
 /// Baggage key: what the command would have acted on.
 pub const LATCH_TARGET_KEY: &str = "kj.latch.target";
@@ -1253,43 +1253,21 @@ mod tests {
         );
     }
 
-    /// The `rm` alias reaches the same confirmation gate as the canonical
-    /// `remove` verb, and `--confirm` releases it through the alias too. This
-    /// used to be a nonce-scope canonicalization test (a nonce issued for
-    /// "kj context remove" had to validate against a confirm spelled
-    /// "kj context rm"); kaish 0.14 deleted the nonce store, so the property
-    /// worth holding is now the plain one: neither spelling can delete
-    /// unconfirmed, and either spelling can confirm.
+    /// Archive requires confirmation and retains the context once confirmed.
     #[tokio::test]
-    async fn rm_alias_reaches_the_same_confirmation_gate() {
+    async fn archive_confirmation_retains_context() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
         let principal = PrincipalId::new();
-        let home = register_context(&dispatcher, Some("alias-home"), None, principal);
-        let _doomed = register_context(&dispatcher, Some("doomed"), Some(home), principal);
+        let home = register_context(&dispatcher, Some("archive-home"), None, principal);
+        let target = register_context(&dispatcher, Some("retained"), Some(home), principal);
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
-
-        let held = kaish
-            .execute_with_options("kj context rm doomed", ExecuteOptions::default())
-            .await
-            .expect("kaish exec (alias, unconfirmed)");
-        assert_eq!(
-            held.code, 2,
-            "the `rm` alias must latch exactly like `remove`: out={} err={}",
-            held.text_out(),
-            held.err
-        );
-
-        let done = kaish
-            .execute_with_options("kj context rm doomed --confirm", ExecuteOptions::default())
-            .await
-            .expect("kaish exec (alias, confirmed)");
-        assert!(
-            done.ok(),
-            "`--confirm` must release the gate through the alias, got code {} / err {:?}",
-            done.code,
-            done.err
-        );
+        let held = kaish.execute_with_options("kj context archive retained", ExecuteOptions::default()).await.unwrap();
+        assert_eq!(held.code, 2, "{}", held.err);
+        assert!(!dispatcher.kernel_db().lock().get_context(target).unwrap().unwrap().is_archived());
+        let done = kaish.execute_with_options("kj context archive retained --confirm", ExecuteOptions::default()).await.unwrap();
+        assert!(done.ok(), "{}", done.err);
+        assert!(dispatcher.kernel_db().lock().get_context(target).unwrap().unwrap().is_archived());
     }
 
     /// A space-separated valued flag (`--type default`) must reach kj
@@ -2337,7 +2315,7 @@ mod tests {
 
         let res = kaish
             .execute_with_options(
-                "kj context remove doomed --json",
+                "kj context archive doomed --json",
                 ExecuteOptions::default(),
             )
             .await
@@ -2369,7 +2347,7 @@ mod tests {
         // (`shell_result_to_envelope`) still reads it from the returned result.
         let latch = latch_from_result(&res)
             .expect("the kj latch baggage must survive kaish's --json formatting");
-        assert_eq!(latch.command, "kj context remove");
+        assert_eq!(latch.command, "kj context archive");
         assert_eq!(latch.target, "doomed");
         assert!(
             latch.hint.contains("--confirm") && latch.hint.contains("doomed"),
@@ -2380,7 +2358,7 @@ mod tests {
 
     /// End-to-end proof that a *real* latched kj command stamps its gate onto
     /// `ExecResult::baggage` through the full kaish bridge — not just the
-    /// synthetic constructions the envelope tests use. `kj context remove
+    /// synthetic constructions the envelope tests use. `kj context archive
     /// <child>` without `--confirm` must come back exit 2 with a hint that
     /// re-runs the exact command with `--confirm`. This is what feeds the
     /// `--json`/MCP-shell/RPC surfacing.
@@ -2390,12 +2368,12 @@ mod tests {
         dispatcher.set_self_arc();
         let principal = PrincipalId::new();
         let home = register_context(&dispatcher, Some("latch-home"), None, principal);
-        // A removable child of the shell's context.
+        // A child of the shell's context.
         let _doomed = register_context(&dispatcher, Some("doomed"), Some(home), principal);
         let kaish = embedded_with_kj(dispatcher.clone(), home).await;
 
         let res = kaish
-            .execute_with_options("kj context remove doomed", ExecuteOptions::default())
+            .execute_with_options("kj context archive doomed", ExecuteOptions::default())
             .await
             .expect("kaish exec");
         assert_eq!(
@@ -2406,7 +2384,7 @@ mod tests {
         );
         let latch = latch_from_result(&res)
             .expect("a latched kj result must carry its gate on baggage through the bridge");
-        assert_eq!(latch.command, "kj context remove");
+        assert_eq!(latch.command, "kj context archive");
         assert_eq!(latch.target, "doomed");
         assert!(
             latch.hint.contains("--confirm") && latch.hint.contains("doomed"),

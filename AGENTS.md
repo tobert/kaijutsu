@@ -46,6 +46,9 @@ Treat unexpected edits as another player's work. Coordinate overlapping
 changes. A context fork does not isolate files; use git worktrees under
 `~/src/wt/` for pull requests. Working on main is normal here.
 
+Use Terra subagents for well-defined tasks and Sol when the work is ambiguous.
+Give each a bounded assignment and coordinate shared-file edits.
+
 Prefer Kaibo when reviewing code. Use DeepSeek through its own API for bulk
 model work; choose cheap models for probes. OpenRouter is for comparisons,
 and hosted GPT sol-tier spend is deliberate. Ask Amy before posting publicly
@@ -112,6 +115,12 @@ without a design conversation. See `docs/crdt-position-2026-08.md`.
 A **context** is durable metadata and a kernel-sequenced block log, with edits
 and exclusions. A **conversation** is the live append-only message sequence
 hydrated from it at fork, new, cold start, or attach.
+
+Archive contexts with `kj context archive <id> --confirm`; retain their blocks,
+lineage, execution receipts, and approval history. Restore with
+`kj context promote <id>`. There is no context removal command. Document
+deletion must not bypass context retention. Archive is not an index opt-out;
+that policy remains open in `docs/issues.md`.
 
 `kj stage exclude <id> && kj fork` removes unwanted history from the child's
 conversation. History edits wait for hydration; stored system instruction edits

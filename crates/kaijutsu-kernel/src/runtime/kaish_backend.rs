@@ -846,6 +846,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn virtual_document_removal_retains_context_history() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        let dispatcher = test_dispatcher_persistent().await;
+        let context = register_context(&dispatcher, Some("retained"), None, PrincipalId::system());
+        dispatcher.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let session = SessionId::new();
+        let contexts = crate::runtime::context_engine::session_context_map();
+        contexts.insert(session, context);
+        let backend = KaijutsuBackend::new(dispatcher.block_store().clone(), dispatcher.kernel().clone(),
+            ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context, session }, contexts);
+        let path = format!("/docs/{}", context.to_hex());
+        for archived in [false, true] {
+            if archived { dispatcher.kernel_db().lock().archive_context(context).unwrap(); }
+            let error = backend.remove(Path::new(&path), true).await.unwrap_err();
+            assert!(error.to_string().contains("archive"), "{error}");
+            assert!(dispatcher.block_store().contains(context));
+            assert!(dispatcher.kernel_db().lock().get_context(context).unwrap().is_some());
+        }
+    }
+
     /// Fresh `KaijutsuBackend` over an empty block store, joined to `ctx_id`
     /// via the session map — enough identity for the stub methods below,
     /// which never touch storage.

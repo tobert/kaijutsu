@@ -755,7 +755,8 @@ impl BlockStore {
         self.documents.contains_key(&context_id)
     }
 
-    /// Delete a document.
+    /// Delete a document without context metadata. Durable deletion must
+    /// succeed before its cached blocks and live status are removed.
     pub fn delete_document(&self, context_id: ContextId) -> BlockStoreResult<()> {
         use dashmap::mapref::entry::Entry;
         let slot = self.documents.entry(context_id);

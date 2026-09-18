@@ -58,3 +58,49 @@ fn a_duplicate_label_is_refused_with_a_label_conflict() {
         assert!(error.contains("label conflict"), "clients retry on this text: {error}");
     });
 }
+
+#[test]
+fn contexts_archive_and_restore_without_a_deletion_command() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let parent = choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap().context_id;
+        let target = create_context(&kj, "retained-history").await.unwrap();
+        let before = kj.get_blocks(target, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        assert!(!before.is_empty(), "created contexts must have instructions to retain");
+        for verb in ["remove", "rm"] {
+            let result = kj.execute_kj_quiet(parent, &["context".into(), verb.into(), target.to_hex(), "--confirm".into()]).await.unwrap();
+            assert_ne!(result.exit_code, 0, "{verb} must not delete history");
+            assert!(result.stderr.contains("unrecognized subcommand"), "{}", result.stderr);
+        }
+        let help = kj.execute_kj_quiet(parent, &["context".into(), "--help".into()]).await.unwrap();
+        assert_eq!(help.exit_code, 0, "{}", help.stderr);
+        println!("{}", help.stdout);
+        assert!(!help.stdout.lines().any(|line| line.trim_start().starts_with("remove ")));
+        for args in [vec!["context", "archive", "--help"], vec!["doc", "delete", "--help"]] {
+            let help = kj.execute_kj_quiet(parent, &args.into_iter().map(String::from).collect::<Vec<_>>()).await.unwrap();
+            assert_eq!(help.exit_code, 0, "{}", help.stderr);
+            println!("{}", help.stdout);
+        }
+        let archive = kj.execute_kj_quiet(parent, &["context".into(), "archive".into(), target.to_hex(), "--confirm".into()]).await.unwrap();
+        assert_eq!(archive.exit_code, 0, "{}", archive.stderr);
+        assert!(kernel.kernel_db.lock().get_context(target).unwrap().unwrap().is_archived());
+        let delete = kj.execute_kj_quiet(parent, &["doc".into(), "delete".into(), target.to_hex(), "--confirm".into()]).await.unwrap();
+        assert_ne!(delete.exit_code, 0);
+        assert!(delete.stderr.contains("archive"), "{}", delete.stderr);
+        let retained = kj.get_blocks(target, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        assert_eq!(retained.iter().map(|b| (&b.id, &b.content)).collect::<Vec<_>>(), before.iter().map(|b| (&b.id, &b.content)).collect::<Vec<_>>());
+        let restore = kj.execute_kj_quiet(parent, &["context".into(), "promote".into(), target.to_hex()]).await.unwrap();
+        assert_eq!(restore.exit_code, 0, "{}", restore.stderr);
+        assert!(!kernel.kernel_db.lock().get_context(target).unwrap().unwrap().is_archived());
+        let file = kj.execute_kj_quiet(parent, &["doc".into(), "create".into(), "--kind".into(), "file".into()]).await.unwrap();
+        assert_eq!(file.exit_code, 0, "{}", file.stderr);
+        let file = kaijutsu_types::ContextId::parse(file.data.as_ref().unwrap()[0].as_str().unwrap()).unwrap();
+        let deleted = kj.execute_kj_quiet(parent, &["doc".into(), "delete".into(), file.to_hex(), "--confirm".into()]).await.unwrap();
+        assert_eq!(deleted.exit_code, 0, "{}", deleted.stderr);
+        assert!(kernel.kernel_db.lock().get_document(file).unwrap().is_none());
+        assert!(!kernel.documents.contains(file));
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

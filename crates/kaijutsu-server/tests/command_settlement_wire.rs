@@ -143,6 +143,46 @@ fn interactive_lifetime(shutdown: bool) {
     });
 }
 
+#[test]
+fn archiving_preserves_an_accepted_commands_settlement_and_receipt() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let observer = kaijutsu_client::choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap().context_id;
+        let context = create_context(&kj, "archive-during-settlement").await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        kernel.kernel.broker().hooks().write().await.post_call.entries.push(HookEntry {
+            id: HookId("archive-during-settlement".into()), match_instance: None, match_tool: None,
+            match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+            action: HookAction::Invoke(HookBody::Builtin { name: "pause".into(),
+                hook: Arc::new(PausedHook { entered: entered.clone(), release: release.clone() }) }),
+        });
+        let submission = kj.shell_submit("echo retained-after-archive", context, true).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
+        let archive = kj.execute_kj_quiet(observer, &["context".into(), "archive".into(), context.to_hex(), "--confirm".into()]).await.unwrap();
+        assert_eq!(archive.exit_code, 0, "{}", archive.stderr);
+        release.notify_one();
+        let operation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = kernel.kernel.shell_operations().get(&submission.operation_id, context).unwrap().unwrap();
+                if operation.completed_at.is_some() { break operation; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("accepted commands must settle in retained history");
+        let outcome = kernel.kernel.shell_operations().outcome(&submission.operation_id, context).unwrap().unwrap();
+        let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = outcome.execution
+            else { panic!("captured output was lost on archive") };
+        assert_eq!(raw.text_out(), "retained-after-archive\n");
+        assert!(operation.envelope.is_some());
+        let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        assert!(blocks.iter().any(|b| b.content.contains("retained-after-archive") && b.status.is_terminal()));
+        assert!(kernel.kernel_db.lock().get_context(context).unwrap().unwrap().is_archived());
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
 #[async_trait::async_trait]
 impl Hook for PausedHook {
     async fn invoke(&self, _: &KernelCallParams, _: &CallContext) -> McpResult<()> {

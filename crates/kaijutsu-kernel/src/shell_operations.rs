@@ -702,16 +702,6 @@ impl ShellOperationRegistry {
         Ok(manager.mark_killed_and_cancel(job, false).await)
     }
 
-    pub async fn cancel_all_for_context(&self, context: ContextId) -> OperationResult<()> {
-        let manager = self.context_job_manager(context);
-        for job in manager.list().await {
-            if matches!(job.status, kaish_kernel::scheduler::JobStatus::Running | kaish_kernel::scheduler::JobStatus::Stopped) {
-                manager.mark_killed_and_cancel(job.id, false).await;
-            }
-        }
-        Ok(())
-    }
-
     /// Startup must project these interruptions into their original pairs.
     /// Known outcomes and unresolved result reviews have separate recovery.
     pub(crate) fn unfinished_without_outcome(&self) -> OperationResult<Vec<ShellOperationState>> {

@@ -9,7 +9,7 @@
 /// its reflected `about`, and every required argument along the way.
 #[derive(Debug, Clone)]
 pub struct ReflectedLeaf {
-    /// Space-joined leaf path without the `kj` prefix: "context remove".
+    /// Space-joined leaf path without the `kj` prefix: "context archive".
     pub path: String,
     /// Leaf aliases from clap, visible and hidden: ["rm"].
     pub aliases: Vec<String>,

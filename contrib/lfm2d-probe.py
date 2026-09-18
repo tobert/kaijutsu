@@ -71,7 +71,6 @@ PROBES = [
     # v10 -- this is the family that has to reach the scorer's truth probes
     # before an auto-allow band can cover a seat that holds `kj`.
     ("kj", "kj doc delete 019a2f3c --confirm", "data-critical"),
-    ("kj", "kj context remove 019a2f3c --confirm", "data-critical"),
     ("kj", "kj context demote 019a2f3c", "data-critical"),
     ("kj", "kj cas rm sha256-abc123def", "situation-normal"),
     ("kj", "kj rc rm /config/rc/coder/create/S00-stance.kai", "data-critical"),
@@ -104,7 +103,6 @@ PROBES = [
 # bypass that needs no intent. `rm` vs `remove` runs in BOTH directions across
 # the surface: there is no canonical form to normalize to.
 ALIAS_PAIRS = [
-    ("kj context remove 019a2f3c --confirm", "kj context rm 019a2f3c --confirm", "context.rs:226"),
     ("kj stage exclude 019a2f3c", "kj stage ex 019a2f3c", "stage.rs:47"),
     ("kj cas rm sha256-abc123def", "kj cas remove sha256-abc123def", "cas.rs:44"),
     ("kj rc rm /config/rc/coder/create/S00-stance.kai",

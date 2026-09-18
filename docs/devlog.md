@@ -2380,6 +2380,38 @@ DeepSeek review added no confirmed regression. Its fairness and missing-event
 concerns are recorded; its claim that retained terminal detail was discarded
 contradicted the implementation.
 
+Amy changed the context lifetime policy while we audited cancellation on
+removal: "`kj context remove` probably shouldn't exist in the system" and
+"archive should be good enough for everyone." Retired `remove` and `rm`, the
+metadata-only deletion API, and its unused cancellation helper. Archive keeps
+blocks, lineage, receipts, and approval history; promote restores the context.
+Document deletion now refuses registered contexts in a database transaction,
+including archived contexts, so `kj doc delete` and the virtual document
+filesystem cannot bypass retention. Unregistered documents remain deletable.
+
+Well-known context publication now commits its context row and role assignment
+together. Injecting a role-write failure reproduced a partial context; rollback
+now leaves only an unregistered document that creation can discard. Tests also
+failed first on context removal and document deletion, then passed with the
+retention policy. Actual SSH/RPC clients verify archive/restore and a command
+finishing after archive with its captured output and durable receipt retained.
+
+Archive admission still needs a consistent contract across execution paths.
+Index eligibility is separate: `kj search --all` skips archived contexts, while
+the semantic watcher sees terminal blocks without context-state filtering.
+Recorded Amy's suggested don't-index policy, including existing vectors and
+in-flight publication, rather than claiming archive provides that guarantee.
+
+Validation: 3,201 kernel tests passed (6 ignored), 12 SSH/RPC tests passed,
+and workspace all-targets checking passed. A final client assertion confirms
+standalone File documents remain deletable. The retired drift unregister API
+is now only a private recovery-test helper; 122 drift tests passed afterward.
+The offline probe generator produced 193 live verbs and 16 extras with no
+context-deletion command. Removed stale deletion probes; the older checked-in
+corpus still needs a broader refresh. Kaibo/DeepSeek Flash found no confirmed
+defect (25,646 input / 637 output tokens). Review and disposition are archived
+in `~/exomemory/kaijutsu/reviews/2026-09-18-execution/archive-*`.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

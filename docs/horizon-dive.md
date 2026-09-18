@@ -284,7 +284,7 @@ one and a half:
 budgeted ~1 day for a `horizonContexts` RPC. That line is crossed off, not
 shrunk. `listContexts` already returns the *entire* corpus including archived
 contexts — archive/conclude/demote only `set_state` on a handle that stays in
-the map, and nothing but `kj context remove` ever unregisters one. The app
+the map. Context removal has since been retired; history is retained. The app
 already polls that into `DriftState.contexts` for the well, and
 `assign_ring_seats` already computes the horizon set app-side. `family` and
 `state` need no new wire fields either: both are pure client-side derivations
