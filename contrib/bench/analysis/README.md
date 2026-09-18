@@ -39,6 +39,18 @@ row filled in from `classify_run`'s analysis; a non-ACP agent (`oracle`,
 `nop`, `mini-swe-agent`, `terminus-2`, ...) gets `turn_end_class: "n/a"`
 and whatever tokens/cost Harbor's own `agent_result` provides.
 
+A trial whose `agent/acp.txt` exists (the kaijutsu kernel log riding the
+agent's stderr, always present for a Harbor ACP trial) gets `tokens_in`,
+`tokens_out`, and `llm_inferences` filled from that log's `"LLM stream
+completed"` lines, scoped to the trial's own session id, using the same
+`parse_kernel_log` that backs `classify_run.py --kernel-log`. This
+overrides `agent_result`'s tokens, since Harbor's ACP adapter never
+populates those fields itself. `tokens_source` reports where a row's
+tokens came from (`"kernel_log"`, `"agent_result"`, or null). When
+`acp.txt` exists but no log line matches the session, tokens and
+`llm_inferences` are null with `tokens_absent_reason` explaining why —
+never reported as zero.
+
 ```bash
 python3 summarize_job.py /home/atobey/src/bench-work/harbor/jobs/hello-world-oracle
 python3 summarize_job.py /home/atobey/src/bench-work/harbor/jobs/hello-world-oracle --format jsonl

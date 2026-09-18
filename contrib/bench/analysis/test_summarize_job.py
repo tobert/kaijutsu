@@ -48,6 +48,19 @@ def write_trial_result(trial_dir: Path, **overrides) -> None:
     (trial_dir / "result.json").write_text(json.dumps(result))
 
 
+KERNEL_LOG_TEMPLATE = (
+    '2026-09-18T14:28:10.500818Z  INFO llm.turn{{context.id={ctx}}}: '
+    'kaijutsu_kernel::runtime::llm_stream: LLM stream completed: '
+    'stop_reason=Some("{stop}"), tokens_in=Some({tin}), tokens_out=Some({tout})\n'
+)
+
+
+def write_acp_kernel_log(trial_dir: Path, lines: str) -> None:
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "acp.txt").write_text(lines)
+
+
 def write_acp_logs(trial_dir: Path, *, session_id: str = "s" * 32) -> None:
     agent_dir = trial_dir / "agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +222,98 @@ class TestSyntheticJob(unittest.TestCase):
             self.assertEqual(lines[-1]["kind"], "totals")
 
 
+def dashed(session_id: str) -> str:
+    """Render a 32-hex-char session id as a dashed UUID, as kernel log lines carry it."""
+    return f"{session_id[0:8]}-{session_id[8:12]}-{session_id[12:16]}-{session_id[16:20]}-{session_id[20:32]}"
+
+
+class TestAcpKernelLogTokens(unittest.TestCase):
+    SESSION_ID = "01a0b4eae5567b7180dfd2d5d59e40d5"
+
+    def test_fills_tokens_and_inference_count_from_matching_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__aaa"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "kaijutsu-solo-acp", "version": "0.1.0", "model_info": None},
+                agent_result={"n_input_tokens": None, "n_cache_tokens": None, "n_output_tokens": None, "cost_usd": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(trial_dir, session_id=self.SESSION_ID)
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="tool_calls", tin=100, tout=10)
+                + KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="end_turn", tin=200, tout=20)
+                # a different session's line must not be counted
+                + KERNEL_LOG_TEMPLATE.format(ctx=dashed("f" * 32), stop="end_turn", tin=999, tout=999),
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["tokens_in"], 300)
+            self.assertEqual(row["tokens_out"], 30)
+            self.assertEqual(row["llm_inferences"], 2)
+            self.assertEqual(row["tokens_source"], "kernel_log")
+            self.assertIsNone(row["tokens_absent_reason"])
+
+    def test_zero_matching_lines_reports_absent_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__bbb"
+            write_trial_result(trial_dir, verifier_result={"rewards": {"reward": 0.0}})
+            write_acp_logs(trial_dir, session_id=self.SESSION_ID)
+            # A log with LLM stream completed lines, but none for this session.
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed("f" * 32), stop="end_turn", tin=999, tout=999),
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertIsNone(row["tokens_in"])
+            self.assertIsNone(row["tokens_out"])
+            self.assertIsNone(row["llm_inferences"])
+            self.assertIsNone(row["tokens_source"])
+            self.assertIsNotNone(row["tokens_absent_reason"])
+            self.assertNotEqual(row["tokens_in"], 0)
+
+    def test_empty_kernel_log_reports_absent_not_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__ccc"
+            write_trial_result(trial_dir, verifier_result={"rewards": {"reward": 0.0}})
+            write_acp_logs(trial_dir, session_id=self.SESSION_ID)
+            write_acp_kernel_log(trial_dir, "no matching lines at all\n")
+            row = sj.summarize_trial(trial_dir)
+            self.assertIsNone(row["tokens_in"])
+            self.assertIsNone(row["tokens_out"])
+            self.assertIsNotNone(row["tokens_absent_reason"])
+
+    def test_no_acp_txt_leaves_tokens_from_agent_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "hello-world__ddd"
+            write_trial_result(
+                trial_dir,
+                agent_result={"n_input_tokens": 5, "n_cache_tokens": 0, "n_output_tokens": 2, "cost_usd": 0.0},
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["tokens_in"], 5)
+            self.assertEqual(row["tokens_out"], 2)
+            self.assertIsNone(row["llm_inferences"])
+            self.assertEqual(row["tokens_source"], "agent_result")
+            self.assertIsNone(row["tokens_absent_reason"])
+
+    def test_acp_txt_without_summary_json_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__eee"
+            write_trial_result(trial_dir)
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="end_turn", tin=1, tout=1),
+            )
+            with self.assertRaises(SystemExit):
+                sj.summarize_trial(trial_dir)
+
+
 class TestRealOracleJobs(unittest.TestCase):
     def _run(self, job_name: str, fmt: str = "jsonl") -> list[dict]:
         job_dir = REAL_JOBS_DIR / job_name
@@ -248,6 +353,30 @@ class TestRealOracleJobs(unittest.TestCase):
         trials = [line for line in lines if line["kind"] == "trial"]
         self.assertEqual(trials[0]["task_name"], "fix-git")
         self.assertEqual(trials[0]["reward"], 1.0)
+
+    def test_kj_fixgit_1_token_totals_from_kernel_log(self):
+        lines = self._run("kj-fixgit-1")
+        trials = [line for line in lines if line["kind"] == "trial"]
+        totals = [line for line in lines if line["kind"] == "totals"][0]
+        self.assertEqual(len(trials), 1)
+        self.assertEqual(trials[0]["llm_inferences"], 42)
+        self.assertEqual(trials[0]["tokens_in"], 1_368_224)
+        self.assertEqual(trials[0]["tokens_out"], 20_935)
+        self.assertEqual(trials[0]["tokens_source"], "kernel_log")
+        self.assertIsNone(trials[0]["tokens_absent_reason"])
+        self.assertEqual(totals["tokens_per_solved_task"], 1_368_224 + 20_935)
+        self.assertEqual(totals["n_solved_with_token_data"], 1)
+
+    def test_kj_hw_1_token_totals_from_kernel_log(self):
+        lines = self._run("kj-hw-1")
+        trials = [line for line in lines if line["kind"] == "trial"]
+        totals = [line for line in lines if line["kind"] == "totals"][0]
+        self.assertEqual(len(trials), 1)
+        self.assertEqual(trials[0]["llm_inferences"], 3)
+        self.assertEqual(trials[0]["tokens_in"], 42_497)
+        self.assertEqual(trials[0]["tokens_out"], 158)
+        self.assertEqual(totals["tokens_per_solved_task"], 42_497 + 158)
+        self.assertEqual(totals["n_solved_with_token_data"], 1)
 
 
 if __name__ == "__main__":

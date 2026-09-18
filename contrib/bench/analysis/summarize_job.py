@@ -11,6 +11,17 @@ mini-swe-agent, ...) has no such logs; its row reports `turn_end_class`
 as "n/a" and fills tokens/cost from Harbor's own `agent_result`, when
 present.
 
+When a trial's `agent/acp.txt` exists (a kaijutsu kernel log riding the
+agent's stderr, always present for a Harbor ACP trial since the adapter
+sets `RUST_LOG=info`), this parses it with classify_run's
+`parse_kernel_log`, scoped to the session id in `acp-summary.json`, and
+fills `tokens_in`, `tokens_out`, and `llm_inferences` from it, overriding
+whatever `agent_result` carried. `tokens_source` reports where a trial's
+tokens came from: `"kernel_log"`, `"agent_result"`, or null when neither
+had data. When `acp.txt` exists but no log line matches the trial's
+session, tokens and `llm_inferences` are null with `tokens_absent_reason`
+set to why — never reported as zero.
+
 Usage:
     summarize_job.py JOB_DIR [--format markdown|jsonl]
 
@@ -100,6 +111,57 @@ def acp_analysis_for_trial(trial_dir: Path) -> dict[str, Any] | None:
     return cr.analyze_run(events, summary)
 
 
+def acp_kernel_log_tokens(trial_dir: Path) -> dict[str, Any] | None:
+    """Read a trial's `agent/acp.txt` kernel log for per-inference token totals.
+
+    Returns None when `agent/acp.txt` does not exist — this trial carries
+    no ACP kernel log to read, and its token fields come from Harbor's own
+    `agent_result` instead. When it exists, scopes the parse to the
+    session id from `agent/acp-summary.json`'s `session.sessionId` (missing
+    or empty is a hard error: `acp.txt` without a session id to scope it to
+    is corrupt trial data, not an absent-ACP trial). Returns tokens_in,
+    tokens_out, and llm_inferences as None with a reason string when no
+    log line matches that session — never as zero.
+    """
+    acp_log_path = trial_dir / "agent" / "acp.txt"
+    if not acp_log_path.is_file():
+        return None
+
+    summary_path = trial_dir / "agent" / "acp-summary.json"
+    if not summary_path.is_file():
+        raise SystemExit(
+            f"{acp_log_path} exists but {summary_path} does not; cannot scope "
+            "kernel log token totals to a session id"
+        )
+    summary = load_json(summary_path)
+    session = summary.get("session")
+    session_id = session.get("sessionId") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise SystemExit(
+            f"{summary_path}: no session.sessionId; cannot scope {acp_log_path}'s "
+            "kernel log token totals to this trial's run"
+        )
+
+    parsed = cr.parse_kernel_log(acp_log_path, session_id)
+    lines_matched = parsed["kernel_log_lines_matched"]
+    lines_in_scope = parsed["kernel_log_lines_parsed"]
+
+    if lines_in_scope == 0:
+        reason = (
+            f"{acp_log_path} has no 'LLM stream completed' lines"
+            if lines_matched == 0
+            else f"{acp_log_path}: no 'LLM stream completed' line matched session {session_id}"
+        )
+        return {"tokens_in": None, "tokens_out": None, "llm_inferences": None, "reason": reason}
+
+    return {
+        "tokens_in": parsed["tokens_in_total"],
+        "tokens_out": parsed["tokens_out_total"],
+        "llm_inferences": lines_in_scope,
+        "reason": None,
+    }
+
+
 def summarize_trial(trial_dir: Path) -> dict[str, Any]:
     result = load_json(trial_dir / "result.json")
 
@@ -135,6 +197,14 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
         "tool_calls_total": None,
         "permission_requests": None,
         "asks_orphaned": None,
+        "llm_inferences": None,
+        "tokens_source": (
+            "agent_result"
+            if isinstance(agent_result.get("n_input_tokens"), (int, float))
+            and isinstance(agent_result.get("n_output_tokens"), (int, float))
+            else None
+        ),
+        "tokens_absent_reason": None,
     }
 
     acp = acp_analysis_for_trial(trial_dir)
@@ -143,6 +213,14 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
         row["tool_calls_total"] = acp["tool_calls_total"]
         row["permission_requests"] = acp["permission_requests"]
         row["asks_orphaned"] = acp["asks_orphaned"]
+
+    kernel_tokens = acp_kernel_log_tokens(trial_dir)
+    if kernel_tokens is not None:
+        row["tokens_in"] = kernel_tokens["tokens_in"]
+        row["tokens_out"] = kernel_tokens["tokens_out"]
+        row["llm_inferences"] = kernel_tokens["llm_inferences"]
+        row["tokens_source"] = "kernel_log" if kernel_tokens["tokens_in"] is not None else None
+        row["tokens_absent_reason"] = kernel_tokens["reason"]
 
     row["stalled"] = row["turn_end_class"] in ("yielded_on_ask", "yielded_on_async") or (
         (row["asks_orphaned"] or 0) > 0
@@ -207,6 +285,8 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "asks_orphaned",
         "tokens_in",
         "tokens_out",
+        "llm_inferences",
+        "tokens_source",
         "cost_usd",
         "duration_seconds",
         "exception_type",
