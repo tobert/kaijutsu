@@ -11,6 +11,7 @@ members = [
     "crates/kaijutsu-mcp",
     "crates/kaijutsu-present",
     "crates/kaijutsu-acp",
+    "crates/kaijutsu-solo-acp",
     "crates/kaijutsu-tui",
     "crates/kaijutsu-telemetry",
     "crates/kaijutsu-agent-tools",

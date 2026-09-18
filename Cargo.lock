@@ -6314,6 +6314,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-solo-acp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kaijutsu-acp",
+ "kaijutsu-client",
+ "kaijutsu-kernel",
+ "kaijutsu-server",
+ "kaijutsu-types",
+ "kaish-kernel",
+ "libc",
+ "parking_lot",
+ "rand 0.10.1",
+ "russh",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "whoami",
+]
+
+[[package]]
 name = "kaijutsu-telemetry"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,12 @@
+[
+  [
+    {"ToolUse": {"id": "solo-file-1", "name": "write", "input": {"path": "solo-wrote-this.txt", "content": "written by the solo kernel\n"}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "wrote it"},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ]
+]

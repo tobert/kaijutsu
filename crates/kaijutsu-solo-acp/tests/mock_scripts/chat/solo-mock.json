@@ -1,0 +1,8 @@
+[
+  [
+    "TextStart",
+    {"TextDelta": "solo mock speaking"},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ]
+]

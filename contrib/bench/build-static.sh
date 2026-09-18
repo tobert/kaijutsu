@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build fully static x86_64 kaijutsu-server + kaijutsu-acp binaries for
-# arbitrary benchmark task containers, and prove portability. Runs entirely
+# Build fully static x86_64 kaijutsu-solo-acp, kaijutsu-server and
+# kaijutsu-acp binaries for arbitrary benchmark task containers, and prove
+# portability. Runs entirely
 # in a rootless podman container; the host and this worktree are never
 # touched by cargo. All build output lives under WORK_ROOT (real disk), not
 # /tmp.
@@ -19,6 +20,14 @@ OUT_DIR="${WORK_ROOT}/out"
 PKG_DIR="${WORK_ROOT}"
 
 IMAGE="localhost/kaijutsu-static-builder:latest"
+
+# kaijutsu-solo-acp is the one-command agent a benchmark launches; the server
+# and bridge ride along for a two-process setup.
+BINS=("kaijutsu-solo-acp" "kaijutsu-server" "kaijutsu-acp")
+PACKAGE_ARGS=()
+for b in "${BINS[@]}"; do
+    PACKAGE_ARGS+=("--package" "${b}")
+done
 
 mkdir -p "${CARGO_HOME_DIR}" "${TARGET_DIR}" "${OUT_DIR}"
 
@@ -57,19 +66,19 @@ time podman run --rm \
     "${IMAGE}" \
     cargo build --release --locked \
         --target x86_64-unknown-linux-musl \
-        --package kaijutsu-server \
-        --package kaijutsu-acp
+        "${PACKAGE_ARGS[@]}"
 
 BIN_SRC="${TARGET_DIR}/x86_64-unknown-linux-musl/release"
 
 echo "==> [3/5] copying + stripping binaries"
-cp -f "${BIN_SRC}/kaijutsu-server" "${OUT_DIR}/kaijutsu-server"
-cp -f "${BIN_SRC}/kaijutsu-acp" "${OUT_DIR}/kaijutsu-acp"
-chmod +w "${OUT_DIR}/kaijutsu-server" "${OUT_DIR}/kaijutsu-acp"
-strip "${OUT_DIR}/kaijutsu-server" "${OUT_DIR}/kaijutsu-acp"
+for b in "${BINS[@]}"; do
+    cp -f "${BIN_SRC}/${b}" "${OUT_DIR}/${b}"
+    chmod +w "${OUT_DIR}/${b}"
+    strip "${OUT_DIR}/${b}"
+done
 
 echo "==> linkage evidence"
-for b in kaijutsu-server kaijutsu-acp; do
+for b in "${BINS[@]}"; do
     echo "--- ${b} ---"
     file "${OUT_DIR}/${b}"
     ldd "${OUT_DIR}/${b}" 2>&1 || true
@@ -79,15 +88,14 @@ echo "==> [4/5] portability smoke tests (debian bookworm-slim, ubuntu 24.04, alp
 for img in "docker.io/library/debian:bookworm-slim" "docker.io/library/ubuntu:24.04" "docker.io/library/alpine:3.22"; do
     echo "--- ${img} ---"
     podman run --rm \
-        -v "${OUT_DIR}/kaijutsu-server:/kaijutsu-server:ro" \
-        -v "${OUT_DIR}/kaijutsu-acp:/kaijutsu-acp:ro" \
+        -v "${OUT_DIR}:/dist:ro" \
         "${img}" \
-        sh -c '/kaijutsu-server --help >/tmp/s.out 2>&1; echo "server exit=$?"; /kaijutsu-acp --help >/tmp/a.out 2>&1; echo "acp exit=$?"; head -3 /tmp/s.out; head -3 /tmp/a.out'
+        sh -c 'for b in "$@"; do "/dist/${b}" --help >"/tmp/${b}.out" 2>&1; echo "${b} exit=$?"; head -2 "/tmp/${b}.out"; done' sh "${BINS[@]}"
 done
 
 echo "==> [5/5] packaging"
 TARBALL="${PKG_DIR}/kaijutsu-agent-linux-x86_64.tar.gz"
-tar -C "${OUT_DIR}" -czf "${TARBALL}" kaijutsu-server kaijutsu-acp
+tar -C "${OUT_DIR}" -czf "${TARBALL}" "${BINS[@]}"
 sha256sum "${TARBALL}"
 ls -lh "${TARBALL}"
 
