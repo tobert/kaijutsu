@@ -1,6 +1,7 @@
 //! Contextual command execution and model turns.
 //!
-//! `turn_request` admits headless requests; `approval_resume` delivers answered
+//! `prompt` persists interactive input; `turn_request` owns preparation for
+//! interactive and headless turns. `approval_resume` delivers answered
 //! asks and executes captured approved source. `llm_stream` owns model turns;
 //! `turn_state` owns their conversations and interrupts. `context_shell` owns contextual construction and builtin wiring.
 //! `command` owns captured execution, result review, and block-pair settlement;
@@ -14,6 +15,7 @@
 //! remains a distinct owner; see `docs/kaish-integration.md`.
 
 pub mod admission;
+pub mod prompt;
 pub mod turn_request;
 pub mod approval_resume;
 pub(crate) mod completion_notice;

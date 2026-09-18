@@ -27,6 +27,7 @@ use crate::runtime::admission::ContextAdmission;
 use crate::runtime::embedded_kaish::EmbeddedKaish;
 use std::collections::HashMap;
 use crate::runtime::synthesis::NoopBlockSource;
+use tokio_util::sync::CancellationToken;
 
 use approval_ledger::rc_runs;
 use approval_ledger::types::RcOutcome;
@@ -168,17 +169,28 @@ pub struct RcInvocation<'a> {
     pub fork_kind: Option<ForkKind>,
     pub drift: Option<DriftInfo>,
     pub vars: HashMap<String, String>,
+    /// Signals active execution and stops discovery or later scripts.
+    pub cancel: CancellationToken,
 }
 
 impl<'a> RcInvocation<'a> {
     pub fn new(verb: &'a str, admission: &'a ContextAdmission) -> Self {
-        Self { verb, admission, parent: None, fork_kind: None, drift: None, vars: HashMap::new() }
+        Self {
+            verb,
+            admission,
+            parent: None,
+            fork_kind: None,
+            drift: None,
+            vars: HashMap::new(),
+            cancel: CancellationToken::new(),
+        }
     }
 }
 
 /// Run a context type's scripts after the triggering state change is committed.
-/// Script failures are recorded and later scripts continue; invalid verbs and
-/// context or discovery failures return an error to the caller.
+/// Script failures are recorded and later scripts continue. Cancellation stops
+/// the lifecycle after active execution cleans up. Invalid verbs and context or
+/// discovery failures return an error to the caller.
 #[tracing::instrument(
     skip(dispatcher, invocation, caller),
     fields(verb = %invocation.verb, ctx = %invocation.admission.context().short(), rc_depth = caller.rc_depth),
@@ -227,7 +239,19 @@ pub async fn run(
     };
     let mut run_guard = RunGuard::new(dispatcher, run_id);
 
-    let scripts = match load_scripts(dispatcher, &context_type, verb).await {
+    if invocation.cancel.is_cancelled() {
+        run_guard.finish(RcOutcome::Failed);
+        return Err(format!("rc lifecycle {verb} cancelled before script discovery"));
+    }
+
+    let scripts = match tokio::select! {
+        biased;
+        _ = invocation.cancel.cancelled() => {
+            run_guard.finish(RcOutcome::Failed);
+            return Err(format!("rc lifecycle {verb} cancelled during script discovery"));
+        }
+        scripts = load_scripts(dispatcher, &context_type, verb) => scripts,
+    } {
         Ok(s) => s,
         Err(e) => {
             // A loader error happens before the ordinary script path below
@@ -267,6 +291,11 @@ pub async fn run(
     // failed — the two are otherwise identical in the log, both landing
     // as `Failed`.
     run_guard.record_script_count(scripts.len());
+
+    if invocation.cancel.is_cancelled() {
+        run_guard.finish(RcOutcome::Failed);
+        return Err(format!("rc lifecycle {verb} cancelled after script discovery"));
+    }
 
     if scripts.is_empty() {
         run_guard.finish(RcOutcome::Ok);
@@ -313,12 +342,27 @@ pub async fn run(
     let mut any_script_failed = false;
 
     for script in &scripts {
+        if invocation.cancel.is_cancelled() {
+            run_guard.finish(RcOutcome::Failed);
+            return Err(format!(
+                "rc lifecycle {verb} cancelled before {}",
+                script.path
+            ));
+        }
         let script_started_at = now_millis();
         let result = run_kai_script(dispatcher, &invocation, &context_type, script, caller, owner).await;
-        if matches!(result, ScriptRunResult::Failed { .. }) {
+        if matches!(result, ScriptRunResult::Failed { .. } | ScriptRunResult::Cancelled) {
             any_script_failed = true;
         }
         run_guard.record_script(script, script_started_at, &result);
+        if matches!(result, ScriptRunResult::Cancelled) {
+            run_guard.finish(RcOutcome::Failed);
+            return Err(format!("rc lifecycle {verb} cancelled while running {}", script.path));
+        }
+        if invocation.cancel.is_cancelled() {
+            run_guard.finish(RcOutcome::Failed);
+            return Err(format!("rc lifecycle {verb} cancelled after {}", script.path));
+        }
     }
 
     // SysV init.d semantics: one script failing does not stop the rest
@@ -407,6 +451,9 @@ async fn load_scripts(
 enum ScriptRunResult {
     Ok,
     Failed { exit_code: Option<i32> },
+    /// The lifecycle stopped before execution or after interpreter cleanup.
+    /// Record the conventional interrupted exit code, then stop.
+    Cancelled,
 }
 
 async fn run_kai_script(
@@ -427,24 +474,40 @@ async fn run_kai_script(
     let child_depth = caller.rc_depth + 1;
     let extra_vars = &invocation.vars;
 
+    if invocation.cancel.is_cancelled() {
+        insert_rc_failure_block(
+            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
+            "rc lifecycle cancelled before contextual shell construction".into(), principal,
+        );
+        return ScriptRunResult::Cancelled;
+    }
+
     // Each rc script runs in its own single-use context shell — a snapshot of
     // the context's durable state (env + cwd). Scripts evolve durable state
     // only through the explicit `kj context set` channel, so later scripts in
     // the phase see earlier ones' deliberate writes, never their transients.
     // rc uses the bare kj surface (no semantic index): `NoopBlockSource`.
-    let kaish = match EmbeddedKaish::for_context(
-        dispatcher,
-        "rc",
-        ShellIdentity {
-            requester: principal, performer: caller.actor_id, reviewer: caller.reviewer_id,
-            context: new_id, session: SessionId::new(),
-        },
-        ShellPolicy::Rc(RcAuthority { _private: () }), ShellCwd::Context,
-        None,
-        std::sync::Arc::new(NoopBlockSource),
-    )
-        .await
-    {
+    let kaish = match tokio::select! {
+        biased;
+        _ = invocation.cancel.cancelled() => {
+            insert_rc_failure_block(
+                dispatcher, new_id, &script.path, &script.sort_key, Some(130),
+                "rc lifecycle cancelled during contextual shell construction".into(), principal,
+            );
+            return ScriptRunResult::Cancelled;
+        }
+        kaish = EmbeddedKaish::for_context(
+            dispatcher,
+            "rc",
+            ShellIdentity {
+                requester: principal, performer: caller.actor_id, reviewer: caller.reviewer_id,
+                context: new_id, session: SessionId::new(),
+            },
+            ShellPolicy::Rc(RcAuthority { _private: () }), ShellCwd::Context,
+            None,
+            std::sync::Arc::new(NoopBlockSource),
+        ) => kaish,
+    } {
         Ok(k) => k,
         Err(e) => {
             insert_rc_failure_block(
@@ -534,12 +597,43 @@ async fn run_kai_script(
 
     kaish.set_positional(&script.path, Vec::new()).await;
 
+    if invocation.cancel.is_cancelled() {
+        insert_rc_failure_block(
+            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
+            "rc lifecycle cancelled before script execution".into(), principal,
+        );
+        return ScriptRunResult::Cancelled;
+    }
+
     // Apply the kernel's rc timeout independently to each script.
     let timeout = kaish.timeouts().rc_script_timeout;
     let opts = kaish_kernel::ExecuteOptions::new()
         .with_vars(vars)
+        .with_cancel_token(invocation.cancel.clone())
         .with_timeout(timeout);
-    match kaish.execute_with_options(&script.content, opts).await {
+    // Do not select cancellation against this future: kaish owns child cleanup
+    // (TERM, grace, KILL) and must finish it before the lifecycle reports done.
+    let execution = kaish.execute_with_options(&script.content, opts).await;
+    if invocation.cancel.is_cancelled() {
+        let diagnostic = match execution {
+            Ok(exec) => {
+                let stdout = exec.text_out();
+                let output = tail_output(&stdout, &exec.err);
+                if output.is_empty() {
+                    "rc lifecycle cancelled during script execution".into()
+                } else {
+                    format!("rc lifecycle cancelled during script execution\n{output}")
+                }
+            }
+            Err(e) => format!("rc lifecycle cancelled during script execution: {e}"),
+        };
+        insert_rc_failure_block(
+            dispatcher, new_id, &script.path, &script.sort_key, Some(130),
+            diagnostic, principal,
+        );
+        return ScriptRunResult::Cancelled;
+    }
+    match execution {
         Ok(exec) if exec.code == 0 => {
             // Capture stdout/stderr from a successful run into a Trace
             // block. Hidden from the LLM (Trace skips hydrate) but kept
@@ -679,6 +773,7 @@ impl<'a> RunGuard<'a> {
         let exit_code = match result {
             ScriptRunResult::Ok => Some(0i64),
             ScriptRunResult::Failed { exit_code } => exit_code.map(i64::from),
+            ScriptRunResult::Cancelled => Some(130i64),
         };
         if let Err(e) = rc_runs::record_run_script(
             conn,

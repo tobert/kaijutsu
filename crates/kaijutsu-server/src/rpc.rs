@@ -75,7 +75,6 @@ use capnp_rpc::pry;
 
 use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
 use crate::kaijutsu_capnp::*;
-use kaijutsu_kernel::runtime::llm_stream::spawn_llm_for_prompt;
 use kaijutsu_kernel::runtime::shell_state::context_cwd;
 
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, TaskStatus};
@@ -3424,96 +3423,11 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                log::debug!("prompt future started for context_id={}", context_id);
-                let admission = kernel.kernel.admit_context(context_id).map_err(capnp::Error::failed)?;
-
-                // Resolve cwd from the context's durable L1 state.
-                let tool_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
-                    Some(cwd) => kaijutsu_kernel::ExecContext::new(
-                        user_principal_id,
-                        context_id,
-                        cwd,
-                        session_id,
-                        kernel.id,
-                    ),
-                    None => kaijutsu_kernel::ExecContext::new_without_cwd(
-                        user_principal_id,
-                        context_id,
-                        session_id,
-                        kernel.id,
-                    ),
-                };
-
-                let documents = kernel.documents.clone();
-
-                // Document must exist — join_context is the sole creator
-                if documents.get(context_id).is_none() {
-                    return Err(capnp::Error::failed(format!(
-                        "context {} not found — call join_context first",
-                        context_id
-                    )));
-                }
-
-                // Create user message block at the end of the document
-                let last_block = documents.last_block_id(context_id);
-                log::info!(
-                    "Inserting user block into context {}, after={:?}",
-                    context_id,
-                    last_block
-                );
-                let user_block_id = documents
-                    .insert_block_as(
-                        context_id,
-                        None,
-                        last_block.as_ref(),
-                        Role::User,
-                        BlockKind::Text,
-                        &content,
-                        Status::Done,
-                        ContentType::Plain,
-                        Some(user_principal_id),
-                    )
-                    .map_err(|e| {
-                        log::error!("Failed to insert user block: {}", e);
-                        capnp::Error::failed(format!("failed to insert user block: {}", e))
-                    })?;
-                log::debug!("Inserted user block: {:?}", user_block_id);
-
-                // Generate prompt ID
-                let prompt_id = uuid::Uuid::new_v4().to_string();
-                log::debug!("Generated prompt_id={}", prompt_id);
-
-                log::info!("User message block inserted, spawning LLM stream task");
-                log::info!(
-                    "Using model: {} (requested: {:?})",
-                    model.as_deref().unwrap_or("default"),
-                    model
-                );
-
-                // Spawn LLM streaming in background. An interactive human
-                // prompt: it announces like every other turn, and the
-                // `Interactive` origin is what keeps the musician's OODA Act
-                // from crystallizing it (design §7) — the filter lives on the
-                // consumer now, so a `subscribeTurnEvents` client still hears
-                // this turn finish.
-                spawn_llm_for_prompt(
-                    &kernel.kernel,
-                    admission,
-                    model.as_deref(),
-                    &user_block_id,
-                    tool_ctx,
-                    user_principal_id,
-                    TurnOrigin::Interactive,
-                    None,
-                )
-                .await.map_err(capnp::Error::failed)?;
-
-                // Return immediately with prompt_id - streaming happens in background
-                results.get().set_prompt_id(&prompt_id);
-                log::debug!(
-                    "prompt() returning immediately with prompt_id={}",
-                    prompt_id
-                );
+                kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel, context_id,
+                    user_principal_id, session_id,
+                    kaijutsu_kernel::runtime::prompt::PromptSource::Text { content, model })
+                    .await.map_err(capnp::Error::failed)?;
+                results.get().set_prompt_id(&uuid::Uuid::new_v4().to_string());
                 Ok(())
             }
             .instrument(trace_span),
@@ -5808,94 +5722,11 @@ impl kernel::Server for KernelImpl {
                         }
                     }
                 } else {
-                    let admission = kernel.kernel.admit_context(context_id).map_err(capnp::Error::failed)?;
-                    // Chat prompt — the draft IS the user message. Submitting is
-                    // a status transition on the block they typed into, so the
-                    // text is never in flight between two homes. Refuses an empty
-                    // draft without clearing it.
-                    let (user_block_id, _text) = documents
-                        .submit_draft(context_id, user_principal_id, edge)
-                        .map_err(|e| capnp::Error::failed(format!("submit: {}", e)))?;
-
                     let session_id = connection.borrow().session_id;
-
-                    // Fire the `submit` rc verb with the submit facts, awaited
-                    // inline so whatever a script writes is durable before
-                    // the reply and before the turn below hydrates. Turn
-                    // liveness is read here, before `spawn_llm_for_prompt`
-                    // marks this submit's own turn. A script failure is an
-                    // Error block in the context, not a refused submit.
-                    let submit_info = kaijutsu_kernel::rc::SubmitInfo {
-                        input_block: user_block_id,
-                        edge_block: edge.map(|e| e.block),
-                        edge_shown: edge.and_then(|e| e.shown),
-                        log_tail: documents.log_tail(context_id, &user_block_id),
-                        turn_live: kernel.kernel.turn_in_flight(context_id),
-                    };
-                    let rc_caller = kaijutsu_kernel::KjCaller {
-                        principal_id: user_principal_id,
-                        actor_id: user_principal_id,
-                        reviewer_id: None,
-                        context_id: Some(context_id),
-                        session_id,
-                        confirmed: false,
-                        rc_depth: 0,
-                        privileged: false,
-                    };
-                    if let Err(e) = kaijutsu_kernel::rc::run(
-                        &kernel.kj_dispatcher,
-                        kaijutsu_kernel::rc::RcInvocation {
-                            vars: submit_info.vars(),
-                            ..kaijutsu_kernel::rc::RcInvocation::new(kaijutsu_kernel::rc::VERB_SUBMIT, &admission)
-                        },
-                        &rc_caller,
-                    )
-                        .await
-                    {
-                        log::warn!("rc submit lifecycle for {}: {e}", context_id.short());
-                    }
-
-                    // Build ToolContext from connection state; cwd is durable
-                    // context-scoped state (L1).
-                    let tool_ctx = match context_cwd(&kernel.kernel, context_id).map_err(capnp::Error::failed)? {
-                        Some(cwd) => kaijutsu_kernel::ExecContext::new(
-                            user_principal_id,
-                            context_id,
-                            cwd,
-                            session_id,
-                            kernel.id,
-                        ),
-                        None => kaijutsu_kernel::ExecContext::new_without_cwd(
-                            user_principal_id,
-                            context_id,
-                            session_id,
-                            kernel.id,
-                        ),
-                    };
-
-                    // No user block is created here: `submit_draft` already
-                    // promoted the one the player typed into. This is where the
-                    // old data-loss window lived — the draft was cleared above
-                    // and re-authored here, so a failure between the two lost
-                    // the message.
-
-                    // Spawn LLM streaming in background. An interactive chat
-                    // prompt via submit_input: it announces like every other
-                    // turn; the `Interactive` origin keeps it out of the
-                    // musician's OODA Act (design §7) while still reaching every
-                    // `subscribeTurnEvents` client — this is the turn an ACP
-                    // frontend is waiting on.
-                    spawn_llm_for_prompt(
-                        &kernel.kernel,
-                        admission,
-                        None,
-                        &user_block_id,
-                        tool_ctx,
-                        user_principal_id,
-                        TurnOrigin::Interactive,
-                        None,
-                    )
-                    .await.map_err(capnp::Error::failed)?;
+                    let user_block_id = kaijutsu_kernel::runtime::prompt::submit(&kernel.kernel,
+                        context_id, user_principal_id, session_id,
+                        kaijutsu_kernel::runtime::prompt::PromptSource::Draft { edge })
+                        .await.map_err(capnp::Error::failed)?;
 
                     let mut b = results.get().init_outcome().init_ok();
                     set_block_id_builder(&mut b, &user_block_id);

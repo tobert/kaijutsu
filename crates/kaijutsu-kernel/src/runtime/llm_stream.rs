@@ -297,34 +297,8 @@ async fn build_tool_definitions(
         .collect())
 }
 
-/// Resolve a turn and admit its stream to the kernel worker.
-///
-/// Interactive submissions and headless requests share identity checks,
-/// provider resolution, tool selection, and conversation state. Startup errors
-/// return to the caller; the running task publishes a terminal turn event.
-pub async fn spawn_llm_for_prompt(
-    kernel: &Arc<Kernel>,
-    context_admission: super::admission::ContextAdmission,
-    model: Option<&str>,
-    after_block_id: &kaijutsu_types::BlockId,
-    tool_ctx: crate::ExecContext,
-    user_principal_id: PrincipalId,
-    // Who asked for this turn. Rides onto the `TurnFlow` outcome the stream
-    // publishes at its end, so the one consumer that must ignore human turns
-    // (the beat scheduler's OODA Act) can filter on the event instead of the
-    // producer staying silent. EVERY turn announces — an interactive turn's
-    // completion is precisely what a wire subscriber (`subscribeTurnEvents`,
-    // the ACP adapter) is waiting for.
-    origin: TurnOrigin,
-    // An answered gate preserves the epoch that started the turn which raised
-    // it. Every other request is an explicit drive and opens a fresh window.
-    continuation_epoch: Option<i64>,
-) -> Result<(), String> {
-    let context_id = context_admission.context();
-    spawn_admitted_turn(kernel, context_id, model, after_block_id, tool_ctx,
-        user_principal_id, origin, continuation_epoch, None, context_admission).await
-}
-
+/// Prepare an admitted turn and transfer its existing lease to inference.
+/// Startup ownership and cancellation belong to `turn_request::queue_startup`.
 pub(super) async fn spawn_admitted_turn(
     kernel: &Arc<Kernel>,
     context_id: ContextId,
@@ -334,7 +308,7 @@ pub(super) async fn spawn_admitted_turn(
     user_principal_id: PrincipalId,
     origin: TurnOrigin,
     continuation_epoch: Option<i64>,
-    admission: Option<TurnLease>,
+    turn_lease: TurnLease,
     context_admission: super::admission::ContextAdmission,
 ) -> Result<(), String> {
     debug_assert_eq!(context_admission.context(), context_id);
@@ -381,7 +355,7 @@ pub(super) async fn spawn_admitted_turn(
     let tool_ctx = tool_ctx.with_actor(identity.actor, Some(identity.reviewer));
 
     // Every turn checks the durable quiesce flag before provider work. Refuse
-    // unreadable state. Headless admission already owns a lease; startup failure
+    // unreadable state. Admission already owns a lease; startup failure
     // drops it while retaining the durable seed. Running turns are unaffected.
     let quiesce = {
         let db = kernel_db.lock();
@@ -606,9 +580,6 @@ pub(super) async fn spawn_admitted_turn(
     // Automatic continuation claims its epoch before starting inference.
     let continuation_epoch = match continuation_epoch {
         Some(epoch) => {
-            if admission.is_none() && kernel_arc.turn_in_flight(context_id) {
-                return Err("automatic continuation found another accepted turn".into());
-            }
             let window = kernel_arc.gate_resume_window().await?;
             let window_ms = i64::try_from(window.as_millis())
                 .map_err(|error| error.to_string())?;
@@ -631,10 +602,11 @@ pub(super) async fn spawn_admitted_turn(
         },
     };
 
-    let turn_lease = admission.unwrap_or_else(|| kernel.turns().begin(context_id));
     assert_eq!(turn_lease.context(), context_id, "turn lease belongs to its request");
     let interrupt = turn_lease.interrupt();
 
+    // Queue admission and this function's return must stay in the same poll.
+    // Startup owns refusal; the queued stream owns its terminal event.
     let accepted = kernel.spawn_runtime_task(move |stop| async move {
         let cancel = interrupt.clone();
         let run = process_llm_stream(
@@ -5403,6 +5375,34 @@ mod gate_resume_cache_eviction_tests {
 
 #[cfg(test)]
 mod lifetime_tests {
+    // Existing fixture input still uses the production startup owner.
+    async fn start_fixture_turn(
+        kernel: &Arc<Kernel>,
+        context_admission: crate::runtime::admission::ContextAdmission,
+        model: Option<&str>,
+        after_block_id: &kaijutsu_types::BlockId,
+        tool_ctx: crate::ExecContext,
+        user_principal_id: PrincipalId,
+        origin: TurnOrigin,
+        continuation_epoch: Option<i64>,
+    ) -> Result<(), String> {
+        let context_id = context_admission.context();
+        let lease = match continuation_epoch {
+            Some(_) => kernel.turns().begin_if_idle(context_id)
+                .ok_or("automatic continuation found another accepted turn")?,
+            None => kernel.turns().begin(context_id),
+        };
+        crate::runtime::turn_request::queue_startup(kernel, crate::runtime::turn_request::StartupRequest {
+            admission: context_admission, lease,
+            request: crate::runtime::turn_request::TurnRequest {
+                context_id, after_block_id: *after_block_id, content: String::new(),
+                principal_id: user_principal_id, model: model.map(str::to_owned),
+                continuation_epoch, score: None,
+            },
+            origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None,
+        }, None)?.await.map_err(|_| "turn preparation stopped before replying".to_string())?
+    }
+
     use super::*;
     use crate::llm::MockClient;
     use kaijutsu_types::{BlockId, ContextState, SessionId};
@@ -5451,11 +5451,69 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn dropped_prompt_preparation_wait_keeps_its_live_turn() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("owned preparation"))).await;
+        let admission = kernel.admit_context(context).unwrap();
+        let held = kernel.llm().write().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let mut startup = Box::pin(start_fixture_turn(&kernel, admission, None,
+            &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(kernel.turn_in_flight(context), "accepted preparation owns its turn before provider selection");
+        drop(startup);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(3), completed.recv()).await
+            .expect("caller drop must not discard accepted preparation").unwrap();
+        kernel.shutdown_runtime_worker().await.unwrap();
+        assert!(kernel.blocks().block_snapshots(context).unwrap().iter().any(|block|
+            block.role == Role::Model && block.content == "owned preparation" && block.status == Status::Done));
+        assert!(!kernel.turn_in_flight(context));
+    }
+
+    #[tokio::test]
+    async fn shutdown_settles_prompt_preparation_without_provider_selection() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("must not start"))).await;
+        let admission = kernel.admit_context(context).unwrap();
+        let held = kernel.llm().write().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let mut startup = Box::pin(start_fixture_turn(&kernel, admission, None,
+            &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
+        assert!(futures::poll!(&mut startup).is_pending());
+        tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), startup).await
+            .expect("shutdown owns pending preparation").unwrap_err();
+        assert!(error.contains("shut down"), "{error}");
+        let event = tokio::time::timeout(Duration::from_secs(1), completed.recv()).await.unwrap().unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed {
+            origin: TurnOrigin::Interactive, reason: TurnStopReason::Cancelled { immediate: true }, .. }));
+        assert!(!kernel.turn_in_flight(context));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn hard_interrupt_settles_prompt_preparation_without_provider_selection() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("must not start"))).await;
+        let held = kernel.llm().write().await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let mut startup = Box::pin(start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(),
+            None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(kernel.turns().interrupt(context, true));
+        assert!(tokio::time::timeout(Duration::from_secs(1), startup).await.unwrap().is_err());
+        let event = tokio::time::timeout(Duration::from_secs(1), completed.recv()).await.unwrap().unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, .. }));
+        assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_runtime_worker().await.unwrap();
+        drop(held);
+    }
+
+    #[tokio::test]
     async fn accepted_model_preparation_can_finish_after_archive() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("accepted answer"))).await;
         let held = kernel.llm().write().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let startup = spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None,
+        let startup = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None,
             &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None);
         tokio::pin!(startup);
         assert!(futures::poll!(&mut startup).is_pending(), "provider preparation is paused after admission");
@@ -5478,7 +5536,7 @@ mod lifetime_tests {
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         for _ in 0..2 {
-            spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         }
         assert_eq!(kernel.turns().active_count(context), 2);
@@ -5721,7 +5779,8 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
         let event = events.try_recv().expect("accepted startup must settle during shutdown");
         assert_eq!(event.payload.turn_id(), id);
-        assert!(matches!(event.payload, TurnFlow::Failed { ref error, .. } if error.contains("shut down before turn startup")));
+        assert!(matches!(event.payload, TurnFlow::Completed {
+            reason: TurnStopReason::Cancelled { immediate: true }, .. }));
         assert!(!kernel.turn_in_flight(context));
         assert!(events.try_recv().is_none());
     }
@@ -5755,8 +5814,9 @@ mod lifetime_tests {
     async fn explicit_preparation_cannot_open_an_epoch_for_a_replaced_performer() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![]))).await;
         let held = kernel.llm().write().await;
-        let startup = spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
-            call.principal_id, TurnOrigin::Interactive, None);
+        let startup = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),
+            kernel.admit_context(context).unwrap());
         tokio::pin!(startup);
         assert!(futures::poll!(&mut startup).is_pending(), "provider selection waits after resolving identity");
         kernel.kernel_db().lock().update_context_review(context, None, Some(call.principal_id)).unwrap();
@@ -5774,7 +5834,7 @@ mod lifetime_tests {
             let session = kernel.turns().conversations().get_or_create(context);
             let held = session.lock().await;
             let mut events = kernel.turn_flows().subscribe("turn.*");
-            spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             {
                 let db = kernel.kernel_db().lock();
@@ -5823,7 +5883,7 @@ mod lifetime_tests {
             let session = kernel.turns().conversations().get_or_create(context);
             let held_conversation = session.lock().await;
             let release = if after_claim {
-                spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                     call.principal_id, TurnOrigin::Autonomous, Some(epoch)).await.unwrap();
                 None
             } else {
@@ -5874,7 +5934,7 @@ mod lifetime_tests {
     #[tokio::test]
     async fn rejected_startup_leaves_no_interrupt() {
         let (kernel, context, after, call) = fixture(None).await;
-        let error = spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("No LLM backend"), "{error}");
         assert!(kernel.turns().active_count(context) == 0, "no task owns this interrupt");
@@ -5888,7 +5948,7 @@ mod lifetime_tests {
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let local = tokio::task::LocalSet::new();
-        local.run_until(spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        local.run_until(start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None)).await.unwrap();
         assert!(kernel.turn_in_flight(context));
         drop(local);
@@ -5909,7 +5969,7 @@ mod lifetime_tests {
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
                 .expect("shutdown must drain accepted turns").unwrap();
@@ -6025,7 +6085,7 @@ mod lifetime_tests {
                 let session = kernel.turns().conversations().get_or_create(context);
                 let held = session.lock().await;
                 let mut terminal = kernel.turn_flows().subscribe("turn.*");
-                spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+                start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
                 kernel.blocks().arm_accept_fault(match refused { "call" => 1, "result" => 2, _ => 0 });
                 drop(held);
                 let event = tokio::time::timeout(Duration::from_secs(3), terminal.recv()).await.unwrap().unwrap().payload;
@@ -6175,7 +6235,7 @@ mod lifetime_tests {
             documents: kernel.blocks().clone() }), InstancePolicy::default()).await.unwrap();
         kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
         let mut failures = kernel.turn_flows().subscribe("turn.failed");
-        spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(), call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.expect("fault must interrupt the pending sibling").unwrap();
         let blocks = kernel.blocks().block_snapshots(context).unwrap();
         let sibling = blocks.iter().find(|block| block.kind == BlockKind::ToolResult
@@ -6221,7 +6281,7 @@ mod lifetime_tests {
             kernel.broker().register(Arc::new(PanickingTool { id: instance.clone(), cancel: cancel.clone() }), InstancePolicy::default()).await.unwrap();
             kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
             let mut failures = kernel.turn_flows().subscribe("turn.failed");
-            spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                 call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
             let blocks = kernel.blocks().block_snapshots(context).unwrap();
@@ -6254,7 +6314,7 @@ mod lifetime_tests {
                 let lease = kernel.turns().begin(context);
                 let id = lease.id();
                 spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
-                    call.principal_id, TurnOrigin::Interactive, None, Some(lease), kernel.admit_context(context).unwrap()).await.unwrap();
+                    call.principal_id, TurnOrigin::Interactive, None, lease, kernel.admit_context(context).unwrap()).await.unwrap();
                 id
             };
             let event = tokio::time::timeout(Duration::from_secs(3), failed.recv()).await
@@ -6272,7 +6332,7 @@ mod lifetime_tests {
     async fn stopped_worker_refuses_turn_without_leaving_state() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new("unused"))).await;
         kernel.shutdown_runtime_worker().await.unwrap();
-        let error = spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
         assert!(error.contains("shut down"), "{error}");
         assert!(!kernel.turn_in_flight(context));
@@ -6287,7 +6347,7 @@ mod lifetime_tests {
         let session = kernel.turns().conversations().get_or_create(context);
         let held = session.lock().await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), kernel.shutdown_runtime_worker()).await
             .expect("queued turn must cancel without acquiring the held lock").unwrap();
@@ -6306,7 +6366,7 @@ mod lifetime_tests {
         ]]).hangs_when_exhausted();
         let (kernel, context, after, call) = fixture(Some(mock)).await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -6331,7 +6391,7 @@ mod lifetime_tests {
         mock.stream_start_delay = Duration::from_secs(5);
         let (kernel, context, after, call) = fixture(Some(mock)).await;
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        spawn_llm_for_prompt(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
             call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {

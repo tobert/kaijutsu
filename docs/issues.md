@@ -281,14 +281,21 @@ commands able to settle against their original blocks and receipts. Runtime
 entry points now carry context admission through preparation, and rc borrows
 the triggering request's proof. Archive and unresolved-ask cleanup are atomic,
 including nested transactions and retries; read failures are explicit.
-Interactive prompt preparation remains caller-owned until the stream is
-queued, and its turn lease starts late. Move that preparation into the existing
-worker and test dropped RPC waits and shutdown before provider selection.
-Admission proof alone does not supply task ownership or observable liveness.
+Interactive prompt preparation now shares the headless startup owner and owns
+its turn lease before submit rc or provider selection. Disconnect preserves
+accepted preparation; shutdown signals and joins rc cleanup before completing
+the cancelled turn. Admission proof and task ownership remain distinct.
 Generic `executeTool` RPC still dispatches non-shell tools without context
 admission and keeps their preparation on the caller. Audit it alongside prompt
-ownership; shell tools now admit at their own runtime entry point. Preserve
+callers; shell tools now admit at their own runtime entry point. Preserve
 accepted nested tool execution rather than gating every broker dispatch anew.
+It also lacks durable result retention after disconnect, and resolves its
+reviewer for the configured performer while assigning the invoking principal
+as actor. Inspect actual callers before choosing retention or retiring the
+generic RPC; see `~/exomemory/kaijutsu/tool-rpc-ownership-design.md`.
+Submit rc receives its turn's cancellation token. Other lifecycle producers
+still create fresh tokens; audit propagation through nested `kj` lifecycle
+calls and their owning task before claiming cancellation across all re-entry.
 
 `kj wait` now joins an idle context: both event and polling paths require no
 accepted turns left in flight. It retains observed terminal details while

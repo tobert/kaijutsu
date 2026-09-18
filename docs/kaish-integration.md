@@ -63,7 +63,7 @@ These are source observations, not promises that all paths behave alike.
   rotation transactions; retry also cleans asks on an already archived row.
   Gate ask creation and redemption repeat the canonical context check under
   their database guard, so archive during input capture cannot leave a new ask.
-  Interactive model preparation still needs the caller-lifetime audit below.
+  Interactive model preparation shares the headless startup owner below.
   Generic non-shell `executeTool` RPC admission and task ownership remain open;
   shell tools enforce this contract at their runtime entry point.
 - `src/lib.rs::spawn_kaish_thread` reserves the 16 MiB stack for dedicated
@@ -330,6 +330,16 @@ These are source observations, not promises that all paths behave alike.
   reject invalidated work; signoff and newer explicit drives still allow accepted
   turns to finish without refreshing those windows. The dedicated request thread
   is deleted.
+  `runtime/prompt.rs` admits interactive text and compose drafts before changing
+  input. It captures submit facts before registering its own turn, then gives
+  submit rc and model preparation to the same startup owner as headless work.
+  Every path owns a turn lease before its first await. A departed RPC caller
+  cannot discard preparation; shutdown or hard interruption cancels it and
+  publishes the admitted turn's cancelled outcome. Preparation faults publish
+  Failed. Rc cancellation stops discovery or construction, signals an active
+  interpreter and awaits cleanup, records the stopped script, and skips later
+  scripts. The provider starts only after submit rc finishes. The caller-owned
+  `spawn_llm_for_prompt` API and late lease creation are deleted.
   `runtime/approval_resume.rs` owns answer delivery, claims, captured cwd/env,
   approved execution, and follow-up seeds on the same kernel worker. Startup
   installs one subscription and snapshots old answers before returning; failure

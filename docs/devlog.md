@@ -2416,9 +2416,37 @@ A regression pauses input capture after the early check and archives the
 context; without the final check it creates a pending ask, and with it no ask
 is recorded. Redemption uses the same check before spending an answer.
 
-The proof does not own an asynchronous task. Interactive model preparation
-still needs to move under the existing worker before its first await; the
-caller-lifetime audit remains part of the execution migration.
+The proof does not own an asynchronous task. Interactive prompts now persist
+their input in `runtime/prompt.rs` and share the headless startup owner. Their
+turn lease begins before the first await, including compose's submit lifecycle.
+The RPC keeps its response builder; the kernel owns preparation and inference.
+The old caller-owned model startup API and late lease creation are deleted.
+
+The next regressions failed on invisible preparation and shutdown leaving a
+provider-selection wait behind. Actual SSH clients reproduced both prompt and
+compose preparation disappearing with the submitter. The shared owner now
+continues after disconnect and reports a single terminal event for its admitted
+turn. Shutdown and hard interruption publish cancellation; preparation errors
+publish failure. Headless startup uses the same distinction.
+
+An active rc script needs cancellation and a joined interpreter, not a dropped
+future. Its owner now passes a cancellation token through discovery, shell
+construction and execution. It awaits kaish cleanup, retains captured output in
+the diagnostic, records the interrupted script, and skips later scripts.
+The shutdown client test first timed out in the old rc execution path, then
+passed with already committed effects retained and no provider work started.
+Generic non-shell tool RPC ownership and durable results remain required work;
+Sol recorded their identity and nested-admission questions for the next step.
+
+Preparation validation: 3,218 kernel tests passed (6 ignored), 52 SSH/RPC tests
+passed, and workspace all-targets checking passed. A corrected rc fixture test
+observes its durable marker; that fixture has no block event publisher.
+Kaibo/DeepSeek Flash reviewed whole source modules and complete functions
+(31,763 input / 1,024 output tokens), with no confirmed defect. Its duplicate
+terminal concern assumed an await after stream queueing; queue acceptance and
+successful return occupy one poll. Existing cancellation and panic tests check
+that no second terminal event appears. Review/disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/prompt-owner-*`.
 
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed

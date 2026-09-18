@@ -1,7 +1,9 @@
-//! Headless turn admission. FlowBus reports accepted work; it never authorizes it.
+//! Turn preparation ownership and headless admission on the kernel worker.
+//! FlowBus reports accepted work; it never authorizes it.
 
 use std::sync::Arc;
 use futures::FutureExt;
+use tracing::Instrument;
 use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId, TurnId};
 use crate::{ExecContext, Kernel};
 use crate::flows::{TurnFlow, TurnOrigin};
@@ -48,42 +50,11 @@ impl Kernel {
         ).transpose()?;
         let work_id = score.as_ref().map(|(id, _)| *id);
         let accepted = request.clone();
-        let kernel = self.clone();
         let (release, ready) = tokio::sync::oneshot::channel();
-        let admitted = self.spawn_runtime_task(move |stop| async move {
-            if ready.await.is_err() {
-                drop(lease);
-                report_failure(&kernel, turn_id, &accepted, "turn admission ended before publication".into());
-                return;
-            }
-            let result = {
-                let startup = std::panic::AssertUnwindSafe(async {
-                    let tool_ctx = match context_cwd(&kernel, accepted.context_id)? {
-                        Some(cwd) => ExecContext::new(accepted.principal_id, accepted.context_id,
-                            cwd, SessionId::new(), kernel.id()),
-                        None => ExecContext::new_without_cwd(accepted.principal_id, accepted.context_id,
-                            SessionId::new(), kernel.id()),
-                    };
-                    spawn_admitted_turn(&kernel, accepted.context_id, accepted.model.as_deref(),
-                        &accepted.after_block_id, tool_ctx, accepted.principal_id,
-                        TurnOrigin::Autonomous, accepted.continuation_epoch, Some(lease), admission).await
-                }).catch_unwind();
-                tokio::pin!(startup);
-                tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => Ok(Err("kernel runtime shut down before turn startup".into())),
-                    result = &mut startup => result,
-                }
-            };
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => report_failure(&kernel, turn_id, &accepted, error),
-                Err(panic) => {
-                    report_failure(&kernel, turn_id, &accepted, "turn startup panicked".into());
-                    std::panic::resume_unwind(panic);
-                }
-            }
-        });
+        let admitted = queue_startup(self, StartupRequest {
+            admission, lease, request: accepted, origin: TurnOrigin::Autonomous,
+            tool_ctx: None, session: SessionId::new(), submit: None,
+        }, Some(ready));
         if let Err(error) = admitted {
             if let Some((id, timeline)) = score { timeline.lock().cancel(id); }
             return Err(error);
@@ -100,12 +71,114 @@ impl Kernel {
     }
 }
 
-fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, error: String) {
+/// Preparation and inference share one lease, even while a caller waits for
+/// the startup result. Dropping that wait does not cancel accepted work.
+pub(crate) struct StartupRequest {
+    pub admission: super::admission::ContextAdmission,
+    pub lease: super::turn_state::TurnLease,
+    pub request: TurnRequest,
+    pub origin: TurnOrigin,
+    pub tool_ctx: Option<ExecContext>,
+    pub session: SessionId,
+    pub submit: Option<(crate::rc::SubmitInfo, crate::KjCaller)>,
+}
+
+pub(crate) fn queue_startup(
+    kernel: &Arc<Kernel>, accepted: StartupRequest,
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let host = kernel.clone();
+    let span = tracing::Span::current();
+    kernel.spawn_runtime_task(move |stop| async move {
+        let StartupRequest { admission, lease, request, origin, tool_ctx, session, submit } = accepted;
+        let turn_id = lease.id();
+        let interrupt = lease.interrupt();
+        let cancel = interrupt.cancel.clone();
+        if let Some(ready) = ready {
+            if ready.await.is_err() {
+                drop(lease);
+                let error = "turn admission ended before publication".to_string();
+                report_failure(&host, turn_id, &request, origin, error.clone());
+                let _ = reply.send(Err(error));
+                return;
+            }
+        }
+        let outcome = {
+            let startup = std::panic::AssertUnwindSafe(async {
+                if let Some((info, caller)) = submit {
+                    let dispatcher = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err("turn cancelled before submit lifecycle".to_string()),
+                        dispatcher = host.broker().kj_dispatcher() => dispatcher
+                            .ok_or("submit lifecycle requires a registered kj dispatcher")?,
+                    };
+                    if let Err(error) = crate::rc::run(&dispatcher, crate::rc::RcInvocation {
+                        vars: info.vars(), cancel: cancel.clone(),
+                        ..crate::rc::RcInvocation::new(crate::rc::VERB_SUBMIT, &admission)
+                    }, &caller).await {
+                        tracing::warn!(context = %request.context_id, "rc submit lifecycle: {error}");
+                    }
+                }
+                let tool_ctx = match tool_ctx {
+                    Some(context) => context,
+                    None => match context_cwd(&host, request.context_id)? {
+                        Some(cwd) => ExecContext::new(request.principal_id, request.context_id,
+                            cwd, session, host.id()),
+                        None => ExecContext::new_without_cwd(request.principal_id, request.context_id,
+                            session, host.id()),
+                    },
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err("turn cancelled before model startup".into()),
+                    result = spawn_admitted_turn(&host, request.context_id, request.model.as_deref(),
+                        &request.after_block_id, tool_ctx, request.principal_id, origin,
+                        request.continuation_epoch, lease, admission) => result,
+                }
+            }).catch_unwind();
+            tokio::pin!(startup);
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => { interrupt.hard(); startup.await },
+                outcome = &mut startup => outcome,
+            }
+        };
+        match outcome {
+            Ok(result) => {
+                if let Err(error) = &result {
+                    if cancel.is_cancelled() {
+                        host.turn_flows().publish(TurnFlow::Completed {
+                            turn_id, context_id: request.context_id, principal_id: request.principal_id,
+                            output_block_id: None, origin,
+                            reason: crate::flows::TurnStopReason::Cancelled { immediate: true },
+                        });
+                    } else {
+                        report_failure(&host, turn_id, &request, origin, error.clone());
+                    }
+                }
+                let result = if result.is_err() && stop.is_cancelled() {
+                    Err("kernel runtime shut down before turn startup".to_string())
+                } else { result };
+                let _ = reply.send(result);
+            }
+            Err(panic) => {
+                let error = "turn startup panicked".to_string();
+                report_failure(&host, turn_id, &request, origin, error.clone());
+                let _ = reply.send(Err(error));
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }.instrument(span))?;
+    Ok(result)
+}
+
+fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, origin: TurnOrigin, error: String) {
     let payload = kaijutsu_types::ErrorPayload {
         category: kaijutsu_types::ErrorCategory::Stream,
         severity: kaijutsu_types::ErrorSeverity::Error,
         code: None,
-        detail: Some(format!("autonomous turn failed to run for this context: {error}")),
+        detail: Some(format!("turn failed to run for this context: {error}")),
         span: None, source_kind: None,
     };
     if let Err(insert_error) = kernel.blocks().insert_error_block_as(
@@ -117,7 +190,7 @@ fn report_failure(kernel: &Kernel, turn_id: TurnId, request: &TurnRequest, error
     kernel.turn_flows().publish(TurnFlow::Failed {
         turn_id,
         context_id: request.context_id, principal_id: request.principal_id,
-        error, origin: TurnOrigin::Autonomous,
+        error, origin,
     });
 }
 

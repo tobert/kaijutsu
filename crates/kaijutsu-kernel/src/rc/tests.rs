@@ -1797,6 +1797,70 @@ esac
         );
     }
 
+    /// Cancellation keeps effects an earlier script committed, but waits for
+    /// the active interpreter to clean up and never starts a later script.
+    #[tokio::test]
+    async fn cancelling_an_rc_lifecycle_stops_later_scripts_after_cleanup() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let context = register_context(&d, Some("cancel-lifecycle"), None, PrincipalId::new());
+        set_context_type(&d, context, "cancel");
+        install_rc_script_file(
+            &d,
+            "/config/rc/cancel/create/S00-first.kai",
+            "echo retained-active-output; kj block create --role system --kind notification --content retained-before-cancel; sleep 10",
+        )
+        .await;
+        install_rc_script_file(
+            &d,
+            "/config/rc/cancel/create/S20-later.kai",
+            "kj block create --role system --kind notification --content must-not-run",
+        )
+        .await;
+
+        let admission = admit(&d, context);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let invocation = RcInvocation { cancel: cancel.clone(), ..RcInvocation::new("create", &admission) };
+        let caller = caller_with_context(context);
+        let mut inspect = tokio::time::interval(std::time::Duration::from_millis(5));
+        let run = crate::rc::run(&d, invocation, &caller);
+        tokio::pin!(run);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut run => panic!("rc lifecycle ended before cancellation: {result:?}"),
+                    _ = inspect.tick() => {
+                        if block_contents_in(&d, context).iter().any(|content| content.contains("retained-before-cancel")) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.expect("the active script must commit its marker before cancellation");
+
+        cancel.cancel();
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut run).await {
+            Ok(result) => result,
+            Err(_) => {
+                panic!("cancellation must await interpreter cleanup instead of waiting for sleep")
+            }
+        };
+        let error = result.expect_err("cancelled lifecycle must return a cancellation error");
+        assert!(error.contains("cancel"), "{error}");
+        assert!(
+            block_contents_in(&d, context)
+                .iter()
+                .any(|content| content.contains("retained-active-output")),
+            "cancellation diagnostic must retain output from the active script"
+        );
+        assert!(
+            !block_contents_in(&d, context).iter().any(|content| content.contains("must-not-run")),
+            "cancellation must stop later scripts"
+        );
+        let run = find_run_for_context(&d, context, "create").expect("durable run row");
+        assert_eq!(run.outcome, Some(RcOutcome::Failed));
+    }
+
     /// All `.kai` scripts run under the kernel-wide `rc_script_timeout`
     /// (per-script overrides were dropped with the move to files). Pin it
     /// to 200ms, well under the script's 1s sleep, and confirm the runaway
