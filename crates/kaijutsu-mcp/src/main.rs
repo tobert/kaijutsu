@@ -70,6 +70,15 @@ struct ServeArgs {
     #[arg(long, default_value_t = 2222)]
     port: u16,
 
+    /// Accept the server's host key without checking known_hosts (testing
+    /// only). Off by default: the connection verifies the key and learns it
+    /// on first use. Pass this for a throwaway kernel, which mints a fresh
+    /// host key at every boot — otherwise the first connection writes your
+    /// real ~/.ssh/known_hosts, and the next boot on the same port is refused
+    /// as a host-key mismatch. Same flag, same meaning, as kaijutsu-acp.
+    #[arg(long)]
+    insecure: bool,
+
     /// Kernel ID to attach to
     #[arg(long, default_value = "lobby")]
     kernel: String,
@@ -215,6 +224,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 detected_session_id.as_deref(),
                 detected_agent_name,
                 key_source.clone(),
+                args.insecure,
             ).await?
             .with_parent(args.parent.clone().or_else(|| {
                 std::env::var("KAIJUTSU_PARENT").ok().filter(|value| !value.trim().is_empty())
@@ -685,6 +695,24 @@ mod tests {
             clap::error::ErrorKind::InvalidSubcommand,
             "an unrecognized positional must be refused, never absorbed"
         );
+    }
+
+    /// A bench or CI kernel mints a fresh host key each boot. Without this
+    /// flag the client learns it by TOFU and writes the operator's real
+    /// `~/.ssh/known_hosts`, and the next boot on the same port fails with a
+    /// host-key mismatch. `kaijutsu-acp` has had the escape hatch; this is
+    /// the same one, spelled the same way.
+    #[test]
+    fn insecure_reaches_the_field_run_serve_reads() {
+        let cli = Cli::try_parse_from(["kaijutsu-mcp", "--connect", "--insecure"])
+            .expect("--insecure parses alongside --connect");
+        assert!(cli.serve.insecure, "the flag must reach the field run_serve reads");
+    }
+
+    #[test]
+    fn known_hosts_verification_is_on_unless_asked_otherwise() {
+        let cli = Cli::try_parse_from(["kaijutsu-mcp", "--connect"]).expect("bare --connect parses");
+        assert!(!cli.serve.insecure, "skipping verification must be opt-in");
     }
 
     #[test]

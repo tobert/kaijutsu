@@ -723,6 +723,11 @@ impl KaijutsuMcp {
     /// `KeySource::AgentKey`/`KeySource::File` pin the connection to one
     /// named identity instead. Must be called within a `LocalSet`.
     ///
+    /// `insecure` accepts the server's host key without consulting
+    /// known_hosts. Leave it false for an ordinary kernel. A throwaway kernel
+    /// mints a fresh host key at every boot, and learning those by trust on
+    /// first use writes the operator's real `~/.ssh/known_hosts`.
+    ///
     /// Establishes the SSH connection and spawns the actor, but does NOT
     /// join a context. Call `register_session` to create and join a context.
     pub async fn connect(
@@ -732,12 +737,14 @@ impl KaijutsuMcp {
         session_id: Option<&str>,
         agent_name: Option<&str>,
         key_source: KeySource,
+        insecure: bool,
     ) -> Result<Self, anyhow::Error> {
         let config = SshConfig {
             host: host.to_string(),
             port,
             username: whoami::username(),
             key_source,
+            insecure,
             ..SshConfig::default()
         };
         let mut server = Self::connect_with_config(config, context_name, session_id).await?;

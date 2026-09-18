@@ -1,0 +1,20 @@
+[
+  [
+    {"ToolUse": {"id": "bench-1", "name": "shell_write", "input": {"command": "touch /home/atobey/src/bench-work/tasks/stage0/gate-touch.txt", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "bench-2", "name": "shell_write", "input": {"command": "sleep 20", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    {"ToolUse": {"id": "bench-3", "name": "shell_write", "input": {"command": "wc -c /home/atobey/src/bench-work/tasks/stage0/gate-touch.txt", "foreground": true}}},
+    {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ],
+  [
+    "TextStart",
+    {"TextDelta": "bench mock done"},
+    "TextEnd",
+    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+  ]
+]
