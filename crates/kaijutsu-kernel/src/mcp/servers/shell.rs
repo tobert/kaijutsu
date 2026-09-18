@@ -2080,6 +2080,94 @@ mod tests {
         assert_eq!(d.kernel().shell_operations().list_for_context(context).unwrap().len(), 1);
     }
 
+    /// A real model shell run whose output exceeds the cap spills, keeps the
+    /// command's real exit code (not kaish's spill marker), and the durable
+    /// output block, the operation envelope and the job agree.
+    #[tokio::test]
+    async fn spilled_output_keeps_the_real_exit_and_block_and_job_agree() {
+        for (command, real_exit) in [("seq 1 5000", 0)] {
+            // Foreground `call`.
+            let (broker, d) = wired().await;
+            let principal = PrincipalId::new();
+            let context = register_context(&d, Some("spill-sync"), None, principal);
+            d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+            let mut binding = ContextToolBinding::new();
+            binding.grant(Capability::Facade("shell".into()));
+            broker.set_binding(context, binding).await.unwrap();
+            let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+            let result = broker.call_tool(call(command), &cc, CancellationToken::new()).await.unwrap();
+            let body = body_of(&result);
+            assert_eq!(body["did_spill"], serde_json::json!(true), "`{command}` must spill: {body}");
+            assert_eq!(body["exit_code"], serde_json::json!(real_exit), "`{command}` real exit: {body}");
+            assert_eq!(result.is_error, real_exit != 0, "`{command}`: {body}");
+            assert_eq!(body["status"], serde_json::json!(if real_exit == 0 { "done" } else { "error" }));
+            let stdout = body["stdout"].as_str().unwrap();
+            assert!(stdout.len() < 5000 * 5, "spilled stdout must be capped, got {} bytes", stdout.len());
+            assert!(stdout.starts_with("1\n"), "the head is kept: {:?}", &stdout[..stdout.len().min(40)]);
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+
+            // Background `call_async`.
+            let (broker, d) = wired().await;
+            let context = register_context(&d, Some("spill-async"), None, principal);
+            d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+            let mut binding = ContextToolBinding::new();
+            binding.grant(Capability::Facade("shell".into()));
+            broker.set_binding(context, binding).await.unwrap();
+            let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+            let receipt = broker.call_tool(call_async(command), &cc, CancellationToken::new()).await.unwrap();
+            let id = body_of(&receipt)["operation_id"].as_str().unwrap().to_owned();
+            let state = wait_for_operation(&d, context, &id).await;
+            let envelope = state.envelope.clone().expect("completion envelope");
+            assert_eq!(envelope.did_spill, Some(true), "`{command}` async envelope must record the spill");
+            assert_eq!(envelope.exit_code, Some(real_exit), "`{command}` async real exit");
+            assert_eq!(envelope.status, if real_exit == 0 { ShellStatus::Done } else { ShellStatus::Error });
+
+            let block = d.block_store().get_block_snapshot(context, &state.receipt.output_block_id).unwrap().unwrap();
+            assert_eq!(
+                block.status,
+                if real_exit == 0 { kaijutsu_types::Status::Done } else { kaijutsu_types::Status::Error },
+                "the output block's status must follow the real exit, not the spill marker"
+            );
+            assert_eq!(block.content, envelope.stdout, "block and envelope must carry the same capped text");
+
+            let jobs = d.kernel().context_job_manager(context);
+            let job = jobs.list().await.into_iter()
+                .find(|job| Some(job.id.to_string()) == state.receipt.job_id)
+                .expect("the operation's job");
+            let result = jobs.wait(job.id).await.unwrap();
+            assert!(result.did_spill, "the job's own result must record the spill");
+            assert_eq!(result.original_code.unwrap_or(result.code), real_exit, "job real exit");
+            assert_eq!(result.text_out(), envelope.stdout, "job and envelope must carry the same capped text");
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
+    /// KNOWN DEFECT (not fixed here): when a spilled statement is followed by
+    /// a failing one, the program reports exit 0. kaish's `accumulate_result`
+    /// (kaish-kernel kernel.rs) keeps the FIRST statement's `original_code`
+    /// (0, the spilled `seq`) while `code` follows the last statement (1);
+    /// kaijutsu's envelope reads `original_code.unwrap_or(code)`
+    /// (runtime/command_result.rs:191) and so reports the spilled statement's
+    /// exit, hiding the later failure. docs/shell-envelope.md says a capped
+    /// result is "judged by the command's real exit".
+    #[ignore = "seq 1 5000; false reports exit 0 with did_spill: original_code from the spilled statement masks the last statement's failure (kaish accumulate_result vs command_result.rs:191)"]
+    #[tokio::test]
+    async fn spilled_statement_does_not_mask_a_later_failure() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("spill-mask"), None, principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let result = broker.call_tool(call("seq 1 5000; false"), &cc, CancellationToken::new()).await.unwrap();
+        let body = body_of(&result);
+        assert_eq!(body["did_spill"], serde_json::json!(true));
+        assert_eq!(body["exit_code"], serde_json::json!(1), "the last statement failed: {body}");
+        assert!(result.is_error);
+    }
+
     #[tokio::test]
     async fn async_safe_shell_denies_external_commands_without_host_fallback() {
         let (broker, d) = wired().await;

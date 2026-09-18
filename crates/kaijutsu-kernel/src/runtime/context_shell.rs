@@ -925,6 +925,61 @@ mod tests {
         );
     }
 
+    /// A plain (non-exported) variable stays inside its shell: neither another
+    /// principal's shell nor a fresh materialization for the same principal
+    /// sees it. Companion to the exported-variable check above.
+    #[tokio::test]
+    async fn unexported_variable_does_not_leak_to_another_shell() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let alice = PrincipalId::new();
+        let bob = PrincipalId::new();
+        let ctx = register_context(&d, Some("shared-plain"), None, alice);
+        let mk = |name: &'static str, principal: PrincipalId| {
+            let d = d.clone();
+            async move {
+                EmbeddedKaish::for_context(
+                    &d,
+                    name,
+                    ShellIdentity {
+                        requester: principal, performer: principal, reviewer: None,
+                        context: ctx, session: SessionId::new(),
+                    },
+                    ShellPolicy::Agent, ShellCwd::Context,
+                    None,
+                    Arc::new(NoopBlockSource),
+                )
+                    .await
+                    .expect("materialize shell")
+            }
+        };
+        let ka = mk("alice", alice).await;
+        let kb = mk("bob", bob).await;
+
+        // Run through the durable write-back, as a shell call does.
+        let before = crate::runtime::shell_state::snapshot_shell_state(&ka).await;
+        let own = ka
+            .execute_with_options("LOCAL_ONLY=1; echo \"[$LOCAL_ONLY]\"", ExecuteOptions::default())
+            .await
+            .expect("set in alice");
+        assert_eq!(own.text_out().trim(), "[1]", "control: the setter sees its own variable");
+        let after = crate::runtime::shell_state::snapshot_shell_state(&ka).await;
+        crate::runtime::shell_state::persist_shell_state(d.kernel_db(), ctx, &before, &after)
+            .expect("persist shell state");
+
+        for (who, shell) in [("bob", &kb), ("a fresh alice", &mk("alice-2", alice).await)] {
+            let leaked = shell
+                .execute_with_options("echo \"[$LOCAL_ONLY]\"", ExecuteOptions::default())
+                .await
+                .expect("read in other shell");
+            assert_eq!(
+                leaked.text_out().trim(),
+                "[]",
+                "an unexported variable must not reach {who}",
+            );
+        }
+    }
+
     /// Model synthesis sees context blocks; rc and hook sources are empty.
     #[tokio::test]
     async fn block_source_surfaces_real_blocks_where_noop_is_blind() {

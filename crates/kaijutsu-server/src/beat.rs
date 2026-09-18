@@ -4111,6 +4111,25 @@ mod tests {
         });
     }
 
+    /// The scheduler's own entry points must reach their rc verbs; the tests
+    /// below fire `fire_lifecycle` directly and would pass if `fire_tick` or
+    /// `fire_rotate` named the wrong verb or stopped calling it.
+    #[test]
+    fn fire_tick_and_fire_rotate_run_their_own_verbs() {
+        run_lifecycle_test(|| async {
+            for verb in ["tick", "rotate"] {
+                let (scheduler, kernel, ctx) = lifecycle_scheduler(verb,
+                    &format!("kj block create --role system --kind text --content {verb}-fired")).await;
+                match verb {
+                    "tick" => scheduler.fire_tick(ctx),
+                    _ => scheduler.fire_rotate(ctx),
+                }
+                wait_for_lifecycle_marker(&kernel, ctx, &format!("{verb}-fired")).await;
+                kernel.shutdown_runtime_worker().await.unwrap();
+            }
+        });
+    }
+
     #[test]
     fn shutdown_joins_active_tick_and_rotate_lifecycles() {
         run_lifecycle_test(|| async {

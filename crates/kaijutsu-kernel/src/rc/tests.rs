@@ -2602,6 +2602,228 @@ esac
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
     }
 
+    /// Scripts run in lexical filename order regardless of creation order,
+    /// with a same-prefix tie broken by name. Files are created in reverse
+    /// so directory or insertion order cannot satisfy the assertion.
+    #[tokio::test]
+    async fn rc_scripts_run_in_lexical_order_with_name_tiebreak() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        for name in ["S10-b", "S10-a", "S00-z"] {
+            install_rc_script_file(
+                &d,
+                &format!("/config/rc/test/create/{name}.kai"),
+                &format!(
+                    "kj block create --role system --kind text --content-type text/markdown --content 'order-{name}'"
+                ),
+            )
+            .await;
+        }
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-order", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-order");
+
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        let scripts = {
+            let db = d.kernel_db().lock();
+            approval_ledger::rc_runs::list_run_scripts(db.conn_for_ledger(), &run.run_id).unwrap()
+        };
+        let paths: Vec<&str> = scripts.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/config/rc/test/create/S00-z.kai",
+                "/config/rc/test/create/S10-a.kai",
+                "/config/rc/test/create/S10-b.kai",
+            ],
+            "run rows must be in lexical order"
+        );
+
+        let authored: Vec<String> = block_contents_in(&d, new_id)
+            .into_iter()
+            .filter(|c| c.starts_with("order-"))
+            .collect();
+        assert_eq!(
+            authored,
+            ["order-S00-z", "order-S10-a", "order-S10-b"],
+            "authored block order must follow script order"
+        );
+    }
+
+    /// Source identity is the link path: an init.d-style symlink is recorded,
+    /// and named in failure blocks, by the path the rc directory lists, not by
+    /// the file it resolves to.
+    #[tokio::test]
+    async fn rc_symlinked_script_identity_is_the_link_path() {
+        use crate::vfs::VfsOps;
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/lib/create/S00-shared.kai", "exit 3").await;
+        d.kernel()
+            .vfs()
+            .symlink(
+                std::path::Path::new("/config/rc/test/create/S00-stance.kai"),
+                std::path::Path::new("../../lib/create/S00-shared.kai"),
+            )
+            .await
+            .expect("create rc symlink");
+
+        let caller = unjoined_caller();
+        let result = d
+            .dispatch(&argv(&["context", "create", "ctx-link-id", "--type", "test"]), &caller)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        let new_id = lookup_context_id(&d, "ctx-link-id");
+
+        let link = "/config/rc/test/create/S00-stance.kai";
+        let run = find_run_for_context(&d, new_id, "create").expect("run row");
+        let scripts = {
+            let db = d.kernel_db().lock();
+            approval_ledger::rc_runs::list_run_scripts(db.conn_for_ledger(), &run.run_id).unwrap()
+        };
+        assert_eq!(scripts.len(), 1, "{scripts:?}");
+        assert_eq!(scripts[0].path, link, "run row must record the link path");
+        assert_eq!(scripts[0].exit_code, Some(3));
+
+        let errors: Vec<String> = d
+            .block_store()
+            .block_snapshots(new_id)
+            .expect("read blocks")
+            .into_iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Error)
+            .map(|b| b.content)
+            .collect();
+        assert!(
+            errors.iter().any(|c| c.contains(link)),
+            "Error block must name the link path: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|c| !c.contains("S00-shared.kai")),
+            "Error block must not name the resolved target: {errors:?}"
+        );
+    }
+
+    /// Verbs whose only caller is the beat scheduler in `kaijutsu-server`
+    /// (`BeatScheduler::fire_tick` / `fire_rotate`); the kernel crate cannot
+    /// reach it. Its tests live in `kaijutsu-server/src/beat.rs`.
+    const SERVER_FIRED_VERBS: &[&str] = &[VERB_TICK, VERB_ROTATE];
+
+    fn run_rows_for_verb(d: &KjDispatcher, verb: &str) -> Vec<approval_ledger::types::RcRunRow> {
+        let db = d.kernel_db().lock();
+        approval_ledger::rc_runs::list_runs(db.conn_for_ledger())
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.verb == verb)
+            .collect()
+    }
+
+    /// Fire one verb through the caller users reach, with a marker script
+    /// installed. Returns the dispatcher and the context the run belongs to.
+    async fn fire_verb_through_its_caller(verb: &str) -> (std::sync::Arc<KjDispatcher>, ContextId) {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        install_rc_script_file(&d, &format!("/config/rc/test/{verb}/S00-noop.kai"), "true").await;
+        let principal = PrincipalId::new();
+        let ctx = match verb {
+            VERB_CREATE => {
+                let r = d
+                    .dispatch(
+                        &argv(&["context", "create", "wired-create", "--type", "test"]),
+                        &unjoined_caller(),
+                    )
+                    .await;
+                assert!(r.is_ok(), "create failed: {}", r.message());
+                lookup_context_id(&d, "wired-create")
+            }
+            VERB_FORK => {
+                // Fork runs the child's `fork` scripts; the parent's type is
+                // irrelevant, so build it without a create lifecycle.
+                let parent = register_context(&d, Some("wired-parent"), None, principal);
+                set_context_type(&d, parent, "test");
+                d.block_store()
+                    .create_document(parent, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+                let caller = KjCaller { privileged: true, ..caller_with_context(parent) };
+                let r = d.dispatch(&argv(&["fork", "--name", "wired-child"]), &caller).await;
+                assert!(r.is_ok(), "fork failed: {}", r.message());
+                lookup_context_id(&d, "wired-child")
+            }
+            VERB_ATTACH => {
+                let target = register_context(&d, Some("wired-attach"), None, principal);
+                set_context_type(&d, target, "test");
+                let r = d.dispatch(&argv(&["attach", "wired-attach"]), &unjoined_caller()).await;
+                assert!(matches!(r, crate::KjResult::Switch(..)), "attach failed: {}", r.message());
+                target
+            }
+            VERB_DRIFT => {
+                let src = register_context(&d, Some("wired-src"), None, principal);
+                let dst = register_context(&d, Some("wired-dst"), None, principal);
+                set_context_type(&d, dst, "test");
+                d.block_store()
+                    .create_document(dst, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+                let caller = caller_with_context(src);
+                let r = d
+                    .dispatch(&argv(&["drift", "push", "--stage", "wired-dst", "hello"]), &caller)
+                    .await;
+                assert!(r.is_ok(), "push failed: {}", r.message());
+                let r = d.dispatch(&argv(&["drift", "flush"]), &caller).await;
+                assert!(r.is_ok(), "flush failed: {}", r.message());
+                dst
+            }
+            VERB_SUBMIT => {
+                let ctx = register_context(&d, Some("wired-submit"), None, principal);
+                set_context_type(&d, ctx, "test");
+                d.block_store()
+                    .create_document(ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+                d.block_store().edit_draft(ctx, principal, 0, "hello", 0).unwrap();
+                // No provider is configured, so startup fails after the
+                // lifecycle; only the run row is under test.
+                let _ = crate::runtime::prompt::submit(
+                    d.kernel(),
+                    ctx,
+                    principal,
+                    kaijutsu_types::SessionId::new(),
+                    crate::runtime::prompt::PromptSource::Draft { edge: None },
+                )
+                .await;
+                ctx
+            }
+            other => panic!(
+                "RC_VERBS gained '{other}': add its real caller here, or list it in \
+                 SERVER_FIRED_VERBS and cover it in kaijutsu-server beat tests"
+            ),
+        };
+        (d, ctx)
+    }
+
+    /// Every canonical verb has a caller that reaches `rc::run` and leaves a
+    /// run row. Deleting a caller (or renaming its verb string) fails here.
+    #[tokio::test]
+    async fn every_kernel_fired_verb_is_wired_through_its_caller() {
+        for verb in RC_VERBS.iter().filter(|v| !SERVER_FIRED_VERBS.contains(v)) {
+            let (d, ctx) = fire_verb_through_its_caller(verb).await;
+            let rows = run_rows_for_verb(&d, verb);
+            assert_eq!(rows.len(), 1, "verb '{verb}' must leave exactly one run row: {rows:?}");
+            assert_eq!(rows[0].context_id, ctx.as_bytes().to_vec(), "verb '{verb}' ran on the wrong context");
+            assert!(rows[0].finished_at.is_some(), "verb '{verb}' run must finish: {:?}", rows[0]);
+            let db = d.kernel_db().lock();
+            let scripts =
+                approval_ledger::rc_runs::list_run_scripts(db.conn_for_ledger(), &rows[0].run_id).unwrap();
+            assert_eq!(scripts.len(), 1, "verb '{verb}' must run its marker script: {scripts:?}");
+            drop(db);
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+        }
+        for verb in SERVER_FIRED_VERBS {
+            assert!(RC_VERBS.contains(verb), "SERVER_FIRED_VERBS names a non-canonical verb '{verb}'");
+        }
+    }
+
     // ── submit verb (docs/prompts.md, "The submit verb") ─────────────────
 
     #[test]

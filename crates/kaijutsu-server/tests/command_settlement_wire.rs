@@ -377,6 +377,54 @@ fn interactive_hook_replacements_agree_with_durable_receipts() {
     });
 }
 
+/// OnError substitution on the interactive path: a command that fails before
+/// it can run (an unterminated quote) has its error replaced by the hook, and
+/// the durable output block and the operation receipt agree with the
+/// replacement.
+#[test]
+fn interactive_on_error_replacement_agrees_with_durable_receipts() {
+    run_local(async {
+        use kaijutsu_kernel::mcp::KernelToolResult;
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let contexts = kj.list_contexts().await.unwrap();
+        let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
+        kj.join_context(context, "settlement-test").await.unwrap();
+        {
+            let mut hooks = kernel.kernel.broker().hooks().write().await;
+            hooks.pre_call.entries.clear();
+            hooks.post_call.entries.clear();
+            hooks.on_error.entries.clear();
+            hooks.on_error.entries.push(HookEntry {
+                id: HookId("replace-error".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::ShortCircuit(KernelToolResult::text("recovered")),
+            });
+        }
+        let submission = kj.shell_submit("echo '", context, true).await.unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+                if let Some(output) = blocks.into_iter().find(|block| {
+                    block.kind == kaijutsu_types::BlockKind::ToolResult
+                        && block.tool_call_id == Some(submission.command_block_id)
+                        && matches!(block.status, Status::Done | Status::Error)
+                }) { break output; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(output.status, Status::Done, "OnError substitution turns the failure into a success");
+        assert_eq!(output.content, "recovered");
+        assert_eq!(output.exit_code, None, "a synthetic replacement has no physical exit");
+        let state = kernel.kernel.shell_operations().get(&submission.operation_id, context).unwrap().unwrap();
+        let envelope = state.envelope.expect("terminal block implies committed receipt");
+        assert!(!envelope.is_error());
+        assert_eq!(envelope.exit_code, None);
+        assert_eq!(envelope.stdout, output.content);
+    });
+}
+
 #[test]
 fn structured_kj_replacements_preserve_data_and_clear_execution_metadata() {
     run_local(async {
