@@ -274,7 +274,11 @@ These are source observations, not promises that all paths behave alike.
   worker. Fork/drive, approval continuation, and async shell completion all call
   it; FlowBus subscriber counts never authorize execution. Requested publishes
   after admission and before any terminal event. Automatic continuation only
-  reserves an idle context. The dedicated request thread is deleted.
+  reserves an idle context. Performer reassignment atomically closes the window
+  and invalidates previous epochs. Startup claims and later inference admission
+  reject invalidated work; signoff and newer explicit drives still allow accepted
+  turns to finish without refreshing those windows. The dedicated request thread
+  is deleted.
   `runtime/approval_resume.rs` owns answer delivery, claims, captured cwd/env,
   approved execution, and follow-up seeds on the same kernel worker. Startup
   installs one subscription and snapshots old answers before returning; failure

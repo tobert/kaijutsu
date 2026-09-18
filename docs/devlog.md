@@ -2202,6 +2202,26 @@ before worker admission; terminal/suppressed summaries are intentional audit dat
 and corrupt ownership refuses startup. Its reassignment concern prompted a check
 of continuation admission, where the existing epoch does not bind the performer.
 
+Performer reassignment now invalidates earlier continuation epochs atomically
+with the assignment. Queued startup checks its claim; every inference attempt
+checks invalidation before provider entry. A regression proved that closing only
+the window was insufficient after a claim: the provider loop ignored a failed
+request stamp. A second regression rejected treating every failed stamp as a
+refusal: explicit signoff and newer drives must leave already accepted work able
+to finish. The continuation row now retains an invalidation watermark across
+new epochs. Request stamping remains separate from inference admission, so old
+accepted turns cannot extend a closed or newer window. Explicit preparation
+also rechecks performer assignment before opening an epoch.
+
+Tests cover assignment rollback, reassignment back to the original performer,
+legacy-schema migration, queued startup, the wait after claiming, and signoff
+and newer-drive compatibility. A real SSH client changes the performer while
+inference waits, then observes failure without provider output. An inference
+admitted before reassignment may finish with its captured identity; subsequent
+requests are refused. DeepSeek's first review suggested a claim race inside one
+transaction; the database guard and transaction exclude it. Its policy question
+prompted the explicit compatibility regression and revised admission check.
+
 ## The kernel with no one to answer to (September 16)
 
 Amy wiped her local kernel and started it fresh, and it deadlocked quietly. It

@@ -225,6 +225,17 @@ inference request. Each inference request, including a tool-loop iteration,
 refreshes that time. Yielding, polling, and tool activity do not. `kj handoff
 signoff <note>` closes the window immediately.
 
+Changing a context's performer closes its continuation and invalidates all
+previous epochs in the same transaction as the assignment. Queued automatic
+startup and each later inference attempt reject those epochs, including after
+assigning the original performer again. An inference admitted before reassignment
+may finish under its original performer; the next request is refused. Explicit
+turn preparation rechecks the performer before opening an epoch.
+
+Signoff and a newer explicit drive only close automatic resumption. Already
+accepted turns can finish, but their requests do not refresh a closed window or
+a newer epoch. Reviewer-only changes preserve the performer's continuation.
+
 Async shell submission returns a stable receipt naming the operation and any
 approval dependency. Completion is a separate durable fact,
 not a replacement for an acknowledgement already sent to the model. This

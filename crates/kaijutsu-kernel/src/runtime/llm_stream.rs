@@ -616,15 +616,16 @@ pub(super) async fn spawn_admitted_turn(
             }
             Some(epoch)
         },
-        None => Some(
-            kernel_db
-                .lock()
-                .begin_continuation(context_id, kaijutsu_types::now_millis() as i64)
-                .map_err(|error| format!(
-                    "Could not open continuation window: {error}"
-                ))?
-                .epoch,
-        ),
+        None => {
+            let db = kernel_db.lock();
+            let current = db.get_context(context_id).map_err(|error| error.to_string())?
+                .ok_or("context disappeared during turn preparation")?;
+            if current.played_by != Some(identity.actor) {
+                return Err("performer changed during turn preparation; submit a new drive".into());
+            }
+            Some(db.begin_continuation(context_id, kaijutsu_types::now_millis() as i64)
+                .map_err(|error| format!("Could not open continuation window: {error}"))?.epoch)
+        },
     };
 
     let turn_lease = admission.unwrap_or_else(|| kernel.turns().begin(context_id));
@@ -1911,10 +1912,13 @@ async fn run_llm_stream(
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                let stamp = continuation_epoch.map(|epoch| kernel_db.lock().record_continuation_request(
+                let stamp = continuation_epoch.map(|epoch| kernel_db.lock().admit_inference_request(
                     context_id, epoch, kaijutsu_types::now_millis() as i64,
                 )).transpose();
                 let started = match stamp {
+                    Ok(Some(false)) => Err(LlmError::InvalidRequest(
+                        "The continuation closed after performer reassignment; this inference request was not started.".into()
+                    )),
                     Ok(_) => tokio::select! {
                         biased;
                         _ = interrupt.cancel.cancelled() => {
@@ -5723,6 +5727,108 @@ mod lifetime_tests {
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
         assert!(events.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_preparation_cannot_open_an_epoch_for_a_replaced_performer() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new("").with_scripted_stream(vec![]))).await;
+        let held = kernel.llm().write().await;
+        let startup = spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None);
+        tokio::pin!(startup);
+        assert!(futures::poll!(&mut startup).is_pending(), "provider selection waits after resolving identity");
+        kernel.kernel_db().lock().update_context_review(context, None, Some(call.principal_id)).unwrap();
+        drop(held);
+        let error = startup.await.unwrap_err();
+        assert!(error.contains("performer changed during turn preparation"), "{error}");
+        assert_eq!(kernel.kernel_db().lock().continuation_epoch(context).unwrap(), None);
+        assert!(!kernel.turn_in_flight(context));
+    }
+
+    #[tokio::test]
+    async fn accepted_inference_survives_signoff_and_a_new_explicit_epoch() {
+        for signoff in [true, false] {
+            let (kernel, context, after, call) = fixture(Some(MockClient::new("accepted answer"))).await;
+            let session = kernel.turns().conversations().get_or_create(context);
+            let held = session.lock().await;
+            let mut events = kernel.turn_flows().subscribe("turn.*");
+            spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+            {
+                let db = kernel.kernel_db().lock();
+                let now = kaijutsu_types::now_millis() as i64;
+                if signoff { db.sign_off_continuation(context, now).unwrap(); }
+                else { db.begin_continuation(context, now).unwrap(); }
+            }
+            drop(held);
+            let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if matches!(event.payload, TurnFlow::Completed { .. } | TurnFlow::Failed { .. }) { break event.payload; }
+                }
+            }).await.unwrap();
+            assert!(matches!(terminal, TurnFlow::Completed { output_block_id: Some(_), .. }), "{signoff}: {terminal:?}");
+            let unstamped: bool = kernel.kernel_db().lock().conn_for_ledger().query_row(
+                "SELECT last_request_at IS NULL FROM context_continuations WHERE context_id=?1",
+                [context.as_bytes().as_slice()], |row| row.get(0),
+            ).unwrap();
+            assert!(unstamped, "an old turn cannot refresh a closed or newer window");
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reassignment_rejects_queued_continuation_before_provider_entry() {
+        use super::super::turn_request::TurnRequest;
+        for after_claim in [false, true] {
+            // An empty script panics on provider entry: no inference is allowed.
+            let (kernel, context, after, call) = fixture(Some(
+                MockClient::new("").with_scripted_stream(vec![]))).await;
+            let replacement = PrincipalId::new();
+            let epoch = {
+                let db = kernel.kernel_db().lock();
+                db.insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id: replacement, name: "replacement".into(), created_at: 0,
+                    retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+                let now = kaijutsu_types::now_millis() as i64;
+                let epoch = db.begin_continuation(context, now).unwrap().epoch;
+                db.record_continuation_request(context, epoch, now).unwrap();
+                db.record_continuation_yield(context, epoch, now).unwrap();
+                epoch
+            };
+            let mut failures = kernel.turn_flows().subscribe("turn.failed");
+            let session = kernel.turns().conversations().get_or_create(context);
+            let held_conversation = session.lock().await;
+            let release = if after_claim {
+                spawn_llm_for_prompt(&kernel, context, None, &after, call.clone(),
+                    call.principal_id, TurnOrigin::Autonomous, Some(epoch)).await.unwrap();
+                None
+            } else {
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let (release, held) = std::sync::mpsc::channel();
+                kernel.spawn_runtime_task(move |_| async move {
+                    entered.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(5)).unwrap();
+                }).unwrap();
+                ready.await.unwrap();
+                kernel.request_turn(TurnRequest {
+                    score: None, context_id: context, after_block_id: after,
+                    content: String::new(), principal_id: call.principal_id,
+                    model: None, continuation_epoch: Some(epoch),
+                }).unwrap();
+                Some(release)
+            };
+            kernel.kernel_db().lock().update_context_review(context, Some(replacement), Some(call.principal_id)).unwrap();
+            drop(held_conversation);
+            if let Some(release) = release { release.send(()).unwrap(); }
+            let event = tokio::time::timeout(Duration::from_secs(3), failures.recv()).await
+                .expect("stale continuation must settle").unwrap();
+            let TurnFlow::Failed { error, .. } = event.payload else { panic!("expected failed continuation") };
+            assert!(error.contains("continuation") && error.contains("closed"), "{after_claim}: {error}");
+            assert!(!kernel.turn_in_flight(context));
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
     }
 
     #[tokio::test]

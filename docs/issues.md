@@ -552,13 +552,6 @@ message that knew where the player was looking"). Left:
 
 ## Async completion recovery follow-ups
 
-- Completion publication rechecks performer and context state under its database
-  guard. Automatic turn admission is later and carries a continuation epoch,
-  but no expected performer. `update_context_review_assignment` currently leaves
-  that epoch open. A reassignment after the wake check can therefore race turn
-  startup; invalidate the old continuation or bind admission to its performer,
-  with a delayed-start regression. A validly published notice remains context
-  history if the performer changes afterward.
 - Completion during a model's final inference can reach the durable mailbox
   after that request was sent. The current automatic wake check skips an
   in-flight turn. Reconcile unread completion notifications when the turn

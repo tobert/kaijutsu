@@ -706,7 +706,8 @@ CREATE TABLE IF NOT EXISTS context_continuations (
     opened_at      INTEGER NOT NULL,
     last_request_at INTEGER,
     yielded_at     INTEGER,
-    signed_off_at  INTEGER
+    signed_off_at  INTEGER,
+    invalidated_through INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
@@ -2002,6 +2003,22 @@ impl KernelDb {
         )? != 0)
     }
 
+    /// Admit inference from an accepted turn unless its performer was reassigned.
+    /// Signoff and newer explicit drives only close automatic resumption; an
+    /// accepted request can finish without refreshing a closed or newer window.
+    pub(crate) fn admit_inference_request(&self, context_id: ContextId, epoch: i64, requested_at: i64) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.admit_inference_request(context_id, epoch, requested_at));
+        }
+        let valid: bool = self.conn.query_row(
+            "SELECT ?2 > invalidated_through AND ?2 <= epoch FROM context_continuations WHERE context_id = ?1",
+            params![blob_param(context_id.as_bytes()), epoch], |row| row.get(0),
+        )?;
+        if !valid { return Ok(false); }
+        self.record_continuation_request(context_id, epoch, requested_at)?;
+        Ok(true)
+    }
+
     /// Return the current unsigned continuation epoch, if this context has one.
     pub fn continuation_epoch(&self, context_id: ContextId) -> KernelDbResult<Option<i64>> {
         self.conn.query_row(
@@ -2536,6 +2553,7 @@ impl KernelDb {
             tracing::info!("migrated builtin embedding configuration to the default lfm2d service");
         }
         let alters = [
+            "ALTER TABLE context_continuations ADD COLUMN invalidated_through INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE approval_pair_handoffs ADD COLUMN abandoned_reason TEXT",
             "ALTER TABLE contexts ADD COLUMN concluded_at INTEGER",
             "ALTER TABLE tracks ADD COLUMN score_context_id BLOB",
@@ -4129,6 +4147,10 @@ impl KernelDb {
             .ok_or_else(|| KernelDbError::NotFound(format!("context {}", id.short())))?;
         if current.played_by != played_by {
             let now = now_millis();
+            self.conn.execute(
+                "UPDATE context_continuations SET signed_off_at = COALESCE(signed_off_at, ?1), invalidated_through = epoch WHERE context_id = ?2",
+                params![now, blob_param(id.as_bytes())],
+            )?;
             self.conn.execute(
                 "UPDATE approval_rules SET revoked_at = ?1 WHERE context_id = ?2 AND scope = 'session' AND revoked_at IS NULL",
                 params![now, blob_param(id.as_bytes())],
@@ -15330,6 +15352,56 @@ mod label_index_tests {
             .insert_context_with_document(&dup, ws_id)
             .expect_err("a second live ROOT must be refused");
         assert!(err.to_string().contains("already in use"), "{err}");
+    }
+
+    #[test]
+    fn continuation_invalidation_migrates_without_closing_existing_work() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("legacy-continuation"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
+        db.conn.execute_batch("ALTER TABLE context_continuations DROP COLUMN invalidated_through").unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert_eq!(db.continuation_epoch(row.context_id).unwrap(), Some(origin.epoch));
+        assert!(db.admit_inference_request(row.context_id, origin.epoch, 1_100).unwrap());
+        assert!(!db.admit_inference_request(row.context_id, origin.epoch + 1, 1_100).unwrap());
+    }
+
+    #[test]
+    fn performer_reassignment_closes_continuation_atomically() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("reassigned-continuation"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let actor = PrincipalId::new();
+        let other = PrincipalId::new();
+        db.update_context_review(row.context_id, Some(actor), None).unwrap();
+        let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
+        db.record_continuation_request(row.context_id, origin.epoch, 1_100).unwrap();
+        db.record_continuation_yield(row.context_id, origin.epoch, 1_200).unwrap();
+        // Changing only review policy preserves this performer's continuation.
+        db.update_context_review(row.context_id, Some(actor), Some(other)).unwrap();
+        assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
+        db.conn.execute_batch("CREATE TRIGGER reject_assignment BEFORE UPDATE OF played_by ON contexts
+            BEGIN SELECT RAISE(ABORT, 'injected reassignment fault'); END;").unwrap();
+        assert!(db.update_context_review(row.context_id, Some(other), None).is_err());
+        assert_eq!(db.get_context(row.context_id).unwrap().unwrap().played_by, Some(actor));
+        assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
+        db.conn.execute_batch("DROP TRIGGER reject_assignment").unwrap();
+        db.update_context_review(row.context_id, Some(other), None).unwrap();
+        assert_eq!(db.continuation_epoch(row.context_id).unwrap(), None);
+        assert!(!db.admit_inference_request(row.context_id, origin.epoch, 1_300).unwrap());
+        assert!(!db.claim_automatic_resume(row.context_id, origin.epoch, 1_300, 600).unwrap());
+        assert!(!db.record_continuation_request(row.context_id, origin.epoch, 1_300).unwrap());
+        db.update_context_review(row.context_id, Some(actor), None).unwrap();
+        assert!(!db.claim_automatic_resume(row.context_id, origin.epoch, 1_300, 600).unwrap(),
+            "assigning the original performer again must not revive old work");
+        let next = db.begin_continuation(row.context_id, 1_400).unwrap();
+        assert!(next.epoch > origin.epoch);
+        assert!(!db.admit_inference_request(row.context_id, origin.epoch, 1_400).unwrap());
+        assert!(db.admit_inference_request(row.context_id, next.epoch, 1_400).unwrap());
+        assert!(db.record_continuation_request(row.context_id, next.epoch, 1_400).unwrap());
     }
 
     #[test]

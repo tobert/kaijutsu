@@ -642,3 +642,54 @@ fn authored_tool_results_preserve_their_initial_status() {
         }
     });
 }
+
+#[test]
+fn performer_reassignment_rejects_a_queued_inference_over_the_wire() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MockClient, Provider};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "reassigned-turn").await.unwrap();
+        let performer = PrincipalId::new();
+        let replacement = PrincipalId::new();
+        {
+            let db = server.kernel_db.lock();
+            let requester = db.get_context(context).unwrap().unwrap().created_by;
+            for (principal_id, name) in [(performer, "first-performer"), (replacement, "next-performer")] {
+                db.insert_character(&kaijutsu_kernel::kernel_db::CharacterRow {
+                    principal_id, name: name.into(), created_at: 0, retired_at: None,
+                    handoff_ctx: None, root_ctx: None, root: false,
+                }).unwrap();
+            }
+            db.update_context_review(context, Some(performer), Some(requester)).unwrap();
+        }
+        {
+            let mut registry = server.kernel.llm().write().await;
+            registry.register("mock", std::sync::Arc::new(Provider::Mock(
+                MockClient::new("").with_scripted_stream(vec![]))));
+        }
+        let (callback, mut events) = turn_events_channel(64);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let session = server.kernel.turns().conversations().get_or_create(context);
+        let held = session.lock().await;
+        kj.prompt("queued for the first performer", None, context).await.unwrap();
+        let epoch = server.kernel_db.lock().continuation_epoch(context).unwrap()
+            .expect("accepted prompt opens its continuation before returning");
+        let result = kj.execute_kj_quiet(context, &[
+            "context".into(), "set".into(), ".".into(), "--as".into(), "next-performer".into(),
+        ]).await.unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(server.kernel_db.lock().continuation_epoch(context).unwrap(), None);
+        drop(held);
+        match recv_turn_event(&mut events, context).await {
+            ServerEvent::TurnFailed { error, .. } => assert!(error.contains("continuation closed"), "{error}"),
+            other => panic!("reassigned inference must not run: {other:?}"),
+        }
+        assert!(!server.kernel_db.lock().record_continuation_request(context, epoch, kaijutsu_types::now_millis() as i64).unwrap());
+        assert!(!server.kernel.turn_in_flight(context));
+        let blocks = get_all_blocks(&kj, context).await;
+        assert!(!blocks.iter().any(|block| block.role == Role::Model && block.kind == BlockKind::Text));
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
