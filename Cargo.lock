@@ -6151,12 +6151,15 @@ name = "kaijutsu-isotest"
 version = "0.1.0"
 dependencies = [
  "kaijutsu-client",
+ "kaijutsu-kernel",
+ "kaijutsu-server",
  "kaijutsu-types",
  "libc",
  "rand 0.10.1",
  "russh",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -2475,6 +2475,41 @@ locally through references and workspace compilation; it was outside the review
 packet. Packet, result and disposition are archived under
 `~/exomemory/kaijutsu/reviews/2026-09-18-execution/tool-retirement-*`.
 
+The final generic tool RPC, `callMcpTool`, is now retired at reserved ordinal
+58. Its only consumers were tests. Client cases now submit retained shell
+commands; native broker fixtures keep testing the intended tool when kaish
+has a same-named builtin. The kernel broker boundary requires an explicit
+cancellation token. No generic replacement command was added.
+
+Amy asked that "most of the tests should be using a kaish without system exec
+at all, unless they're specifically testing some exec thing." Temporary SSH
+and kernel rc fixtures now remove the seeded exec grants, with explicit opt-in
+for subprocess tests. Real lifecycle tests prove a later create script cannot
+inherit host execution from S10 unless opted in. The default case first failed
+because the original seed enabled its external command. The SSH broker identity
+test also caught host `whoami` shadowing the native tool before the default
+changed. Kaish's `sleep` is a builtin and needs no subprocess permission.
+
+Moving process tests to retained client submission exposed surviving external
+children after server death. The shared embedded-kaish constructor now enables
+kaish's existing Linux parent-death handling. Container tests check SIGKILL,
+SIGTERM, restart, group cancellation, and accepted work surviving disconnect.
+Filesystem tests build the production kernel and use native file tools with
+host execution denied. Their read-only mount, cache, and symlink checks remain
+real filesystem tests. The interactive receipt's outer job lacks nested process
+groups; tests pair durable attachment with unique process observation inside
+the container. That observability gap and arbitrary descendants after SIGKILL
+remain recorded for the job/controller audit.
+
+Validation: 3,221 kernel tests passed (6 ignored), 465 server tests, 154 MCP
+tests, 183 client tests, and 24 broker integration tests passed. The container
+suites passed all 6 process and 8 filesystem tests. Workspace all-targets and
+diff checks passed. No deployment or rc reseed was performed.
+Kaibo/DeepSeek Flash found no confirmed defect (87,450 input / 1,608 output
+tokens). Source, review, and disposition are archived under
+`~/exomemory/kaijutsu/reviews/2026-09-18-execution/rpc58-*`. Wire/client deletion
+was verified locally through references and compilation.
+
 Admission validation: 3,214 kernel tests passed (6 ignored), 49 SSH/RPC tests
 passed, and workspace all-targets checking passed. Kaibo/DeepSeek Flash reviewed
 the source (72,000 input / 907 output tokens), with no confirmed defect. Its

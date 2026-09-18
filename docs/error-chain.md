@@ -241,13 +241,13 @@ slot for a verdict and a failed call can only mean delivery broke.
 declining is already carried as ordinary data in
 `McpElicitationResponse.action` (`accept`/`decline`/`cancel`).
 
-### The 33 are six families, not 33 conversations
+### Verdict families
 
 | family | count | what it is |
 |---|---|---|
 | VFS permission / read-only | 14 | `Vfs` methods, all through one function |
 | caller-input validation | 3 | `getBlocks`, `renameContext`, `reportMidiPresence` |
-| gate / hook verdicts | 4 | `execute`, `shellExecute`, `executeKj`, `callMcpTool` |
+| gate / hook verdicts | 3 | `execute`, `shellExecute`, `executeKj` |
 | policy and administrative | 4 | `mount` (frozen), `prompt` (quiesced), `setBlockExcluded` (state), `bindKernel` (wire version) |
 | editor writes reaching the VFS | 3 | `editorOpen`, `editorKeys`, `editorSave` — family 1 by another door |
 | capability / facade denial | 3 | `editInput`, `submitInput`, `commitCapture` |

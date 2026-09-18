@@ -102,7 +102,8 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
             priority: 0, kaish_script_id: None,
         });
         coder_kj.join_context(work, "coder-work").await.unwrap();
-        assert!(coder_kj.call_mcp_tool("shell_write", &serde_json::json!({"command":"true"})).await.is_err());
+        let submission = coder_kj.shell_submit("true", work, true).await.unwrap();
+        assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
         let ask = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
         assert_eq!(ask.actor_id.as_deref(), Some(coder.as_bytes().as_slice()));
         assert_eq!(ask.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()));
@@ -147,7 +148,8 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         kj_fails(&lead_kj, lead_context, &["ledger", "delegation", "grant", "lead", "--to", "judge"]).await;
         kj(&amy_kj, work, &["ledger", "delegation", "grant", "lead", "--to", "judge"]).await;
         coder_kj.join_context(work, "coder-work").await.unwrap();
-        assert!(coder_kj.call_mcp_tool("shell_write", &serde_json::json!({"command":"true"})).await.is_err());
+        let submission = coder_kj.shell_submit("true", work, true).await.unwrap();
+        assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
         let delegated = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
         assert_eq!(delegated.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
         kj_fails(&amy_kj, work, &["ledger", "allow", &delegated.request_id]).await;
@@ -156,7 +158,8 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         assert!(kernel.kernel_db.lock().get_approval(&delegated.request_id).unwrap().unwrap().status.is_allowed());
 
         coder_kj.join_context(work, "coder-work").await.unwrap();
-        assert!(coder_kj.call_mcp_tool("shell_write", &serde_json::json!({"command":"true"})).await.is_err());
+        let submission = coder_kj.shell_submit("true", work, true).await.unwrap();
+        assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
         let reclaimed = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
         assert_eq!(reclaimed.reviewer_id.as_deref(), Some(judge.as_bytes().as_slice()));
         amy_kj.join_context(work, "coder-work").await.unwrap();
@@ -169,7 +172,8 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         kj(&amy_kj, work, &["ledger", "delegation", "revoke", "lead"]).await;
         let other = create_context(&coder_kj, "coder-other").await.unwrap();
         coder_kj.join_context(work, "coder-work").await.unwrap();
-        assert!(coder_kj.call_mcp_tool("shell_write", &serde_json::json!({"command":"false"})).await.is_err());
+        let submission = coder_kj.shell_submit("false", work, true).await.unwrap();
+        assert!(submission.refusal.is_some(), "the retained shell submission must carry the gate refusal");
         let second = kernel.kernel_db.lock().list_pending_asks().unwrap().pop().unwrap();
         assert_eq!(second.reviewer_id.as_deref(), Some(amy.as_bytes().as_slice()), "a revoked delegation sends the next ask back to Amy");
         kj_fails(&coder_kj, other, &["ledger", "allow", &second.request_id]).await;

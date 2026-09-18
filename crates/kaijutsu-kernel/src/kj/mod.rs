@@ -1203,22 +1203,28 @@ pub(crate) mod test_helpers {
         test_dispatcher_with_timeouts(kaijutsu_types::TimeoutPolicy::default()).await
     }
 
+    /// Create a test dispatcher whose temporary rc bindings allow host subprocesses.
+    #[allow(dead_code)] // Explicit opt-in for a test that reaches an rc lifecycle.
+    pub async fn test_dispatcher_with_host_exec() -> KjDispatcher {
+        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), false, true).await
+    }
+
     /// Variant of `test_dispatcher` that installs a custom `TimeoutPolicy`
     /// before the kernel is wrapped in `Arc`. Used by tests that need
     /// per-call bounds (rc, hooks) tighter than the production defaults.
     pub async fn test_dispatcher_with_timeouts(
         policy: kaijutsu_types::TimeoutPolicy,
     ) -> KjDispatcher {
-        test_dispatcher_with_storage(policy, false).await
+        test_dispatcher_with_storage(policy, false, false).await
     }
 
     /// Exercise receipt/journal transactions against the same database.
     pub async fn test_dispatcher_persistent() -> KjDispatcher {
-        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), true).await
+        test_dispatcher_with_storage(kaijutsu_types::TimeoutPolicy::default(), true, false).await
     }
 
     async fn test_dispatcher_with_storage(
-        policy: kaijutsu_types::TimeoutPolicy, persistent: bool,
+        policy: kaijutsu_types::TimeoutPolicy, persistent: bool, host_exec: bool,
     ) -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
@@ -1255,7 +1261,7 @@ pub(crate) mod test_helpers {
         let rc_tmp = root.join("rc");
         std::fs::create_dir_all(&kernel_data).expect("create kernel data dir");
         std::fs::create_dir_all(&rc_tmp).expect("create rc test dir");
-        crate::seed_scripts::ensure_rc_seed_files(&rc_tmp).expect("seed rc test files");
+        seed_test_rc(&rc_tmp, host_exec);
         let kernel = Arc::new(
             Kernel::new("test", &kernel_data, blocks.clone(), kernel_db.clone())
                 .await
@@ -1294,6 +1300,15 @@ pub(crate) mod test_helpers {
     /// issue tracked separately — so it is deliberately *not* the global
     /// `test_dispatcher`; only rc-scoped tests (which never fork) use it.
     pub async fn test_dispatcher_rc() -> KjDispatcher {
+        test_dispatcher_rc_configured(false).await
+    }
+
+    /// Create an rc test dispatcher with host subprocess execution enabled.
+    pub async fn test_dispatcher_rc_with_host_exec() -> KjDispatcher {
+        test_dispatcher_rc_configured(true).await
+    }
+
+    async fn test_dispatcher_rc_configured(host_exec: bool) -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
             KernelDb::temporary().expect("temporary KernelDb"),
@@ -1315,7 +1330,7 @@ pub(crate) mod test_helpers {
         );
         let rc_dir = root.join("rc");
         std::fs::create_dir_all(&rc_dir).expect("create rc dir");
-        crate::seed_scripts::ensure_rc_seed_files(&rc_dir).expect("seed rc into the tree");
+        seed_test_rc(&rc_dir, host_exec);
         kernel.mount(RC_ROOT, crate::vfs::LocalBackend::new(&rc_dir)).await;
         // Config files live on the same host-directory shape at /config/kernel
         // — seed it too so `kj config` tests exercise the real path.
@@ -1368,6 +1383,39 @@ pub(crate) mod test_helpers {
             .mount(kaijutsu_types::paths::ROSTER_RUN_ROOT, crate::vfs::RosterFs::new(roster.clone()))
             .await;
         KjDispatcher::new_with_roster(drift, blocks, kernel_db, kernel, roster)
+    }
+
+    /// Seed a temporary rc tree and choose whether its role bindings may grant
+    /// host subprocess execution.
+    fn seed_test_rc(rc_root: &std::path::Path, host_exec: bool) {
+        crate::seed_scripts::ensure_rc_seed_files(rc_root).expect("seed rc test files");
+        if host_exec {
+            return;
+        }
+
+        let prefix = format!("{RC_ROOT}/");
+        for (canonical, body) in crate::seed_scripts::seed_files() {
+            if !matches!(
+                canonical.as_str(),
+                "/config/rc/root/create/S10-binding.kai"
+                    | "/config/rc/director/create/S10-binding.kai"
+                    | "/config/rc/lib/create/S10-binding.kai"
+            ) {
+                continue;
+            }
+            let rel = canonical
+                .strip_prefix(&prefix)
+                .expect("every seed path lives under the rc root");
+            assert!(
+                body.contains("kj binding allow \"exec\"\n"),
+                "test rc seed {canonical} lacks its exec grant"
+            );
+            std::fs::write(
+                rc_root.join(rel),
+                body.replace("kj binding allow \"exec\"\n", ""),
+            )
+            .expect("remove host-exec grant from test rc seed");
+        }
     }
 
     /// Install an rc script in the mounted `/config/rc` tree, through the same

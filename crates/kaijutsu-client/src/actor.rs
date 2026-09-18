@@ -85,7 +85,7 @@ const CONTEXT_FEED_QUEUE: usize = 256;
 
 use crate::rpc::{
     Completion, ContextCluster, ContextInfo, EditorState, HistoryEntry, Identity, InputState,
-    KernelInfo, LlmConfigInfo, McpResource, McpToolResult, PeerInfo, ShellValue, SimilarContext,
+    KernelInfo, LlmConfigInfo, McpResource, PeerInfo, ShellValue, SimilarContext,
     StagedDriftInfo, SubmitResult, ToolSchema, VersionSnapshot,
 };
 use crate::subscriptions::{
@@ -169,14 +169,9 @@ pub enum CallError {
     #[error("{0}")]
     Refused(kaijutsu_types::Refusal),
 
-    /// Per-call deadline exceeded — `RPC_CALL_TIMEOUT` for most commands
-    /// (`dispatch!`), or a per-call override for the few dispatched through
-    /// `dispatch_deadline!` instead (today: `CallMcpTool`
-    /// and `ExecuteKj`, at `kaijutsu_types::timeout::gate::CLIENT_CALL`,
-    /// because each can reach a gate holding for a human answer). The carried
-    /// `Duration` is always the deadline that actually fired, so the
-    /// message names the right number either way.
-    /// Connection is NOT torn down — the handler hung, not the pipe.
+    /// Per-call deadline exceeded. The carried duration is the deadline that
+    /// fired; structured commands use the gate-aware override. A timeout stops
+    /// the reply wait without closing the connection or cancelling accepted work.
     #[error("call timed out after {0:?}")]
     Timeout(Duration),
 
@@ -651,12 +646,6 @@ enum RpcCommand {
     GetToolSchemas {
         reply: oneshot::Sender<Result<Vec<ToolSchema>, CallError>>,
     },
-    CallMcpTool {
-        tool: String,
-        arguments: serde_json::Value,
-        reply: oneshot::Sender<Result<McpToolResult, CallError>>,
-    },
-
     // ── MCP Resources ────────────────────────────────────────────────────
     ListMcpResources {
         server: String,
@@ -853,7 +842,6 @@ impl RpcCommand {
             Self::EditorKeys { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::EditorInsert { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetToolSchemas { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::CallMcpTool { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListMcpResources { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::Prompt { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ConfigureLlm { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1846,20 +1834,6 @@ impl ActorHandle {
     pub async fn get_tool_schemas(&self) -> Result<Vec<ToolSchema>, CallError> {
         self.send(|reply| RpcCommand::GetToolSchemas { reply })
             .await
-    }
-
-    #[tracing::instrument(skip(self, arguments))]
-    pub async fn call_mcp_tool(
-        &self,
-        tool: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<McpToolResult, CallError> {
-        self.send(|reply| RpcCommand::CallMcpTool {
-            tool: tool.into(),
-            arguments: arguments.clone(),
-            reply,
-        })
-        .await
     }
 
     // ── MCP Resources ────────────────────────────────────────────────────
@@ -3928,16 +3902,6 @@ async fn dispatch_kernel_command(
         RpcCommand::GetToolSchemas { reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_tool_schemas());
         }
-        RpcCommand::CallMcpTool {
-            tool, arguments, reply,
-        } => {
-            dispatch_deadline!(
-                kernel, reply, close_tx, k,
-                kaijutsu_types::timeout::gate::CLIENT_CALL,
-                k.call_mcp_tool(&tool, &arguments)
-            );
-        }
-
         // ── MCP Resources ──
         RpcCommand::ListMcpResources { server, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.list_mcp_resources(&server));

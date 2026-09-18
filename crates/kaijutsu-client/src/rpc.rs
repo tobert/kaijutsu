@@ -1517,46 +1517,6 @@ impl KernelHandle {
         Ok(result)
     }
 
-    /// Call an MCP tool.
-    ///
-    /// Tool name is resolved against the calling context's binding.
-    #[tracing::instrument(skip(self, arguments), name = "rpc_client.call_mcp_tool")]
-    pub async fn call_mcp_tool(
-        &self,
-        tool: &str,
-        arguments: &serde_json::Value,
-    ) -> Result<McpToolResult, RpcError> {
-        let mut request = self.kernel.call_mcp_tool_request();
-        {
-            let mut call = request.get().init_call();
-            call.set_tool(tool);
-            call.set_arguments(
-                &serde_json::to_string(arguments).map_err(|e| {
-                    RpcError::Other(format!("Failed to serialize MCP arguments: {e}"))
-                })?,
-            );
-        }
-        {
-            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
-            let mut trace = request.get().init_trace();
-            trace.set_traceparent(&traceparent);
-            trace.set_tracestate(&tracestate);
-        }
-        let response = request.send().promise.await?;
-        match response.get()?.get_outcome()?.which()? {
-            crate::kaijutsu_capnp::call_mcp_tool_outcome::Ok(result) => {
-                let result = result?;
-                Ok(McpToolResult {
-                    content: result.get_content()?.to_string()?,
-                    is_error: result.get_is_error(),
-                })
-            }
-            crate::kaijutsu_capnp::call_mcp_tool_outcome::Refused(r) => {
-                Err(RpcError::Refused(refusal_from_capnp(r?)?))
-            }
-        }
-    }
-
     // =========================================================================
     // MCP Resource operations (push-first with caching)
     // =========================================================================
@@ -4586,13 +4546,6 @@ pub struct ToolSchema {
     pub description: String,
     pub category: String,
     pub input_schema: String,
-}
-
-/// Result from an MCP tool call
-#[derive(Debug, Clone)]
-pub struct McpToolResult {
-    pub content: String,
-    pub is_error: bool,
 }
 
 /// Information about an MCP resource

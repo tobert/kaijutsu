@@ -153,10 +153,11 @@ async fn builtin_block_roundtrip() {
 
     let create = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "block_create",
             r#"{"role":"user","kind":"text","content":"roundtrip"}"#,
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("block_create dispatch");
@@ -176,7 +177,7 @@ async fn builtin_block_roundtrip() {
     .to_string();
     let read = fx
         .kernel
-        .dispatch_tool_via_broker("block_read", &read_params, &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("block_read", &read_params, &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect("block_read dispatch");
     assert!(read.success, "block_read failed: {}", read.stderr);
@@ -225,10 +226,11 @@ async fn tool_search_returns_scored_matches() {
 
     let exec = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "tool_search",
             &serde_json::json!({"query": "block"}).to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("dispatch");
@@ -545,10 +547,11 @@ async fn tool_search_no_match_returns_empty() {
 
     let exec = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "tool_search",
             &serde_json::json!({"query": "xyzzy_no_such_tool"}).to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("dispatch");
@@ -586,10 +589,11 @@ async fn tool_search_tiebreak_is_alphabetical() {
 
     let exec = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "tool_search",
             &serde_json::json!({"query": "hook_"}).to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("dispatch");
@@ -653,10 +657,11 @@ async fn policy_show_and_set_round_trip() {
     // Show: builtin.kernel_info should have the default policy.
     let show = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "policy_show",
             &serde_json::json!({"instance": "builtin.kernel_info"}).to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("show");
@@ -669,7 +674,7 @@ async fn policy_show_and_set_round_trip() {
     let new_timeout: u64 = 7777;
     let set = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "policy_set",
             &serde_json::json!({
                 "instance": "builtin.kernel_info",
@@ -677,6 +682,7 @@ async fn policy_show_and_set_round_trip() {
             })
             .to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("set");
@@ -688,10 +694,11 @@ async fn policy_show_and_set_round_trip() {
     // Subsequent show reflects the change.
     let show2 = fx
         .kernel
-        .dispatch_tool_via_broker(
+        .dispatch_tool_via_broker_with_cancel(
             "policy_show",
             &serde_json::json!({"instance": "builtin.kernel_info"}).to_string(),
             &fx.exec_ctx,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("show2");
@@ -710,7 +717,7 @@ async fn unknown_tool_name_surfaces_a_sorted_available_list() {
 
     let err = fx
         .kernel
-        .dispatch_tool_via_broker("does_not_exist", "{}", &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("does_not_exist", "{}", &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect_err("unknown tool must error");
 
@@ -780,7 +787,7 @@ async fn tool_resolution_error_truncates_over_the_cap_and_says_how_many_were_omi
 
     let err = fx
         .kernel
-        .dispatch_tool_via_broker("does_not_exist_either", "{}", &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("does_not_exist_either", "{}", &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect_err("unknown tool must error");
     let msg = err.to_string();
@@ -827,7 +834,7 @@ async fn denied_tool_call_names_the_tool_and_context_not_an_empty_or_confusing_e
 
     let err = fx
         .kernel
-        .dispatch_tool_via_broker("write", r#"{"path":"/x","content":"y"}"#, &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("write", r#"{"path":"/x","content":"y"}"#, &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect_err("ungranted-but-registered tool must error");
 
@@ -922,7 +929,7 @@ async fn is_error_result_maps_to_exec_failure() {
 
     let result = fx
         .kernel
-        .dispatch_tool_via_broker("fail", "{}", &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("fail", "{}", &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect("broker call itself should succeed");
 
@@ -977,7 +984,7 @@ async fn a_failing_tool_with_no_text_still_reports_through_stderr() {
 
     let result = fx
         .kernel
-        .dispatch_tool_via_broker("fail", "{}", &fx.exec_ctx)
+        .dispatch_tool_via_broker_with_cancel("fail", "{}", &fx.exec_ctx, tokio_util::sync::CancellationToken::new())
         .await
         .expect("broker call itself should succeed");
 

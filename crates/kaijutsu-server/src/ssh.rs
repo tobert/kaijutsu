@@ -157,8 +157,8 @@ pub fn default_rc_dir() -> PathBuf {
     .host_dir(kaijutsu_types::paths::RC_ROOT)
 }
 
-/// Pre-seed `rc_root` from the embedded defaults and leave every
-/// `create/S50-lfm2d.kai` present but empty.
+/// Pre-seed `rc_root` from the embedded defaults, deny host execution, and
+/// leave every `create/S50-lfm2d.kai` present but empty.
 ///
 /// A test kernel must never reach a network classifier, and the seed
 /// installs that hook on every seat that holds a shell — `default` included,
@@ -169,7 +169,7 @@ pub fn default_rc_dir() -> PathBuf {
 /// the broker's table directly.
 ///
 /// Fails loudly: a half-seeded test tree is a test that lies.
-fn blank_network_scorer(rc_root: &Path) {
+fn seed_ephemeral_rc(rc_root: &Path) {
     kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(rc_root)
         .expect("seed the ephemeral rc tree");
     let prefix = format!("{}/", kaijutsu_types::paths::RC_ROOT);
@@ -187,6 +187,37 @@ fn blank_network_scorer(rc_root: &Path) {
             fs::remove_file(&path).expect("remove the seeded scorer link");
         }
         fs::write(&path, "").expect("blank the seeded scorer");
+    }
+    set_ephemeral_host_exec(rc_root, false);
+}
+
+/// Set the exec grant in the ephemeral rc bodies without changing their
+/// ordering or composition links.
+fn set_ephemeral_host_exec(rc_root: &Path, enabled: bool) {
+    let prefix = format!("{}/", kaijutsu_types::paths::RC_ROOT);
+    for (canonical, body) in kaijutsu_kernel::seed_scripts::seed_files() {
+        if !matches!(
+            canonical.as_str(),
+            "/config/rc/root/create/S10-binding.kai"
+                | "/config/rc/director/create/S10-binding.kai"
+                | "/config/rc/lib/create/S10-binding.kai"
+        ) {
+            continue;
+        }
+        let rel = canonical
+            .strip_prefix(&prefix)
+            .expect("every seed path lives under the rc root");
+        let path = rc_root.join(rel);
+        let body = if enabled {
+            (*body).to_owned()
+        } else {
+            assert!(
+                body.contains("kj binding allow \"exec\"\n"),
+                "ephemeral host-exec seed {canonical} lacks its exec grant"
+            );
+            body.replace("kj binding allow \"exec\"\n", "")
+        };
+        fs::write(path, body).expect("set the ephemeral host-exec grant");
     }
 }
 
@@ -228,7 +259,7 @@ impl SshServerConfig {
         ));
         std::fs::create_dir_all(&path).ok();
         let config_mounts = crate::config_mounts::ConfigMounts::new(path.join("config"));
-        blank_network_scorer(&config_mounts.host_dir(kaijutsu_types::paths::RC_ROOT));
+        seed_ephemeral_rc(&config_mounts.host_dir(kaijutsu_types::paths::RC_ROOT));
 
         let root_key = russh::keys::PrivateKey::random(
             &mut rand_v10::rng(),
@@ -268,6 +299,20 @@ impl SshServerConfig {
     /// Panics on a production config, which has no generated key.
     pub fn root_key(&self) -> std::sync::Arc<russh::keys::PrivateKey> {
         self.root_key.clone().expect("root_key is set only by SshServerConfig::ephemeral")
+    }
+
+    /// Allow host subprocesses in an ephemeral test server.
+    ///
+    /// Ephemeral servers deny them by default. This only changes their
+    /// temporary rc binding bodies; production rc remains unchanged.
+    pub fn with_host_exec(self) -> Self {
+        assert!(
+            self._cleanup.is_some(),
+            "with_host_exec is only valid on an ephemeral server config"
+        );
+        let rc_root = self.config_mounts.host_dir(kaijutsu_types::paths::RC_ROOT);
+        set_ephemeral_host_exec(&rc_root, true);
+        self
     }
 
     /// Create production config with persistent host key and auth database.
@@ -364,15 +409,10 @@ impl SshServer {
     /// `SharedKernel` back through `kernel_tx` right after it is built —
     /// before the server starts accepting connections.
     ///
-    /// Test-only hook. Most wire behaviors have a real RPC surface a test
-    /// can drive to produce a genuine event (e.g. a test using `hook_add` +
-    /// `call_mcp_tool`). `LedgerFlow` has no such surface
-    /// reachable without exercising the approval-ledger's rule/escalation
-    /// machinery, which is out of this crate's territory — so
-    /// `ledger_events_wire.rs` uses this to publish `LedgerFlow::Changed`
-    /// directly onto the live kernel's own bus, proving the
-    /// `subscribeLedgerEvents` bridge on the exact instance a connected
-    /// client is talking to.
+    /// Test-only hook for inspecting the kernel behind a connected client or
+    /// exercising native broker tools. `ledger_events_wire.rs` also uses it
+    /// to publish `LedgerFlow::Changed` on the kernel bus and check the
+    /// `subscribeLedgerEvents` bridge independently of approval decisions.
     #[doc(hidden)]
     pub async fn run_on_listener_with_kernel_sink(
         &self,

@@ -7,6 +7,62 @@
     }
 
     #[tokio::test]
+    async fn default_seed_does_not_enable_host_exec_for_later_create_scripts() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let context = register_context(&d, Some("no-host-exec"), None, PrincipalId::new());
+        install_rc_script_file(
+            &d,
+            "/config/rc/default/create/S99-host-exec.kai",
+            "/usr/bin/printf unexpected",
+        )
+        .await;
+
+        let admission = admit(&d, context);
+        crate::rc::run(
+            &d,
+            RcInvocation::new("create", &admission),
+            &caller_with_context(context),
+        )
+        .await
+        .unwrap();
+
+        let run = find_run_for_context(&d, context, "create").expect("create run");
+        assert_eq!(run.outcome, Some(RcOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn host_exec_opt_in_enables_later_create_scripts() {
+        let d = std::sync::Arc::new(test_dispatcher_rc_with_host_exec().await);
+        d.set_self_arc();
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let context = register_context(&d, Some("host-exec"), None, PrincipalId::new());
+        install_rc_script_file(
+            &d,
+            "/config/rc/default/create/S99-host-exec.kai",
+            "/usr/bin/printf expected",
+        )
+        .await;
+
+        let admission = admit(&d, context);
+        crate::rc::run(
+            &d,
+            RcInvocation::new("create", &admission),
+            &caller_with_context(context),
+        )
+        .await
+        .unwrap();
+
+        let run = find_run_for_context(&d, context, "create").expect("create run");
+        assert_eq!(run.outcome, Some(RcOutcome::Ok));
+    }
+
+    #[tokio::test]
     async fn rc_snapshots_programs_but_reads_companion_data_at_execution() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();

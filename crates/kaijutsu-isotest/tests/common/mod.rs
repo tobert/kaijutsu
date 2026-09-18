@@ -4,14 +4,7 @@
 //!
 //! `tests/common/mod.rs` (a subdirectory, not a bare `tests/common.rs`) is
 //! the standard Rust convention for code shared between integration test
-//! binaries without cargo treating it as a test target of its own —
-//! `contrib/isotest`'s `cargo test --no-run --message-format=json`
-//! discovery only picks up `tests/*.rs`, never `tests/*/*.rs`.
-//!
-//! Originally lived only in `isolation.rs` (the process-lifecycle suite);
-//! extracted here so `filesystem.rs` (slice 2, VFS protection) can reuse the
-//! exact same boot/connect/join path rather than a second copy that could
-//! drift from it.
+//! binaries without cargo treating it as a test target of its own.
 #![allow(dead_code)] // not every test binary uses every helper here
 
 use std::path::PathBuf;
@@ -21,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use kaijutsu_client::rpc::KernelHandle;
 use kaijutsu_client::{connect_ssh, KeySource, RpcClient, SshConfig};
+use kaijutsu_types::{BlockKind, BlockQuery, ContextId, Status};
 use russh::keys::{Algorithm, PrivateKey};
 
 /// Skip unless we're inside the contrib/isotest container. Keeps a bare host
@@ -67,7 +61,7 @@ const HARNESS_ROOT_ALLOW: &[&str] = &[
     "kj binding allow",
     "/usr/bin/sleep",
     "/usr/bin/timeout",
-    "jobs",
+    "cancel_shell_operation",
 ];
 
 /// Write `/config/kernel/gate.toml` under `home` before boot: the shipped
@@ -226,7 +220,7 @@ impl TestKernel {
 /// the box) and return the handle ready for tool calls. The context's label
 /// is the root character's name — `"tester"`, the name `TestKernel::boot_at`
 /// passes to `kaijutsu-server init`.
-pub async fn join_root(kernel: &KernelHandle) {
+pub async fn join_root(kernel: &KernelHandle) -> ContextId {
     let root = kernel
         .resolve_context_label("tester")
         .await
@@ -236,68 +230,92 @@ pub async fn join_root(kernel: &KernelHandle) {
         .join_context(root.id, "isotest")
         .await
         .expect("join root context");
+    root.id
 }
 
 /// Start an asynchronous shell operation and return its durable receipt ID.
-pub async fn start_bg(kernel: &KernelHandle, command: &str) -> String {
-    let r = kernel
-        .call_mcp_tool("shell_write", &serde_json::json!({"command": command, "foreground": false}))
+pub async fn start_bg(kernel: &KernelHandle, context: ContextId, command: &str) -> String {
+    let submission = kernel
+        .shell_submit(command, context, false)
         .await
-        .expect("call shell_write");
-    assert!(!r.is_error, "asynchronous shell_write errored: {}", r.content);
-    serde_json::from_str::<serde_json::Value>(&r.content)
-        .expect("shell_write envelope")
-        .get("operation_id").and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("missing operation_id: {}", r.content)).to_string()
+        .expect("submit background shell operation");
+    assert!(submission.refusal.is_none(), "background shell operation was refused: {:?}", submission.refusal);
+    submission.operation_id
 }
 
-/// Execute kaish through the foreground shell tool; host fixtures use std::fs.
-pub async fn run_shell(kernel: &KernelHandle, command: &str) -> String {
-    let r = kernel
-        .call_mcp_tool("shell_write", &serde_json::json!({"command": command, "foreground": true}))
+/// Execute kaish through the retained interactive shell RPC and wait for its
+/// durable output block. Host fixtures use std::fs.
+pub async fn run_shell(kernel: &KernelHandle, context: ContextId, command: &str) -> String {
+    let submission = kernel
+        .shell_submit(command, context, false)
         .await
-        .expect("call shell tool");
-    assert!(
-        !r.is_error,
-        "setup command failed: `{command}` -> {}",
-        r.content
-    );
-    serde_json::from_str::<serde_json::Value>(&r.content)
-        .expect("shell_write envelope")
-        .get("stdout").and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("missing stdout: {}", r.content)).to_string()
-}
-
-/// Resolve an operation's kaish job PID through durable operation metadata.
-pub async fn bg_pid(kernel: &KernelHandle, bg_id: &str) -> u32 {
-    let r = kernel
-        .call_mcp_tool("list_shell_operations", &serde_json::json!({}))
-        .await
-        .expect("list_shell_operations");
-    let operations: serde_json::Value = serde_json::from_str(&r.content).expect("operation list JSON");
-    let job_id = operations.as_array().and_then(|rows| rows.iter().find(|row|
-        row.pointer("/receipt/operation_id").and_then(|v| v.as_str()) == Some(bg_id)
-    )).and_then(|row| row.pointer("/receipt/job_id")).and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("no kaish job for operation {bg_id}: {}", r.content));
-    let job_id: u64 = job_id.parse().expect("numeric kaish job id");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        .unwrap_or_else(|e| panic!("submit shell command `{command}`: {e}"));
+    assert!(submission.refusal.is_none(), "setup command was refused: `{command}` -> {:?}", submission.refusal);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let result = kernel.call_mcp_tool("shell_write", &serde_json::json!({
-            "command": "jobs --json", "foreground": true,
-        })).await.expect("jobs query");
-        assert!(!result.is_error, "jobs query failed: {}", result.content);
-        let envelope: serde_json::Value = serde_json::from_str(&result.content).expect("jobs envelope");
-        let jobs = envelope.get("data").filter(|data| data.is_array()).cloned()
-            .unwrap_or_else(|| serde_json::from_str(envelope["stdout"].as_str().expect("jobs stdout"))
-                .expect("jobs JSON"));
-        if let Some(pid) = jobs.as_array().and_then(|rows| rows.iter().find(|row|
-            row.get("id").and_then(|v| v.as_u64()) == Some(job_id)
-        )).and_then(|row| row.pointer("/pgids/0")).and_then(|v| v.as_u64()) {
-            return u32::try_from(pid).expect("process group fits pid");
+        let blocks = kernel.get_blocks(context, &BlockQuery::All).await.expect("read shell output");
+        if let Some(output) = blocks.iter().find(|block|
+            block.kind == BlockKind::ToolResult
+                && block.tool_call_id == Some(submission.command_block_id)
+                && matches!(block.status, Status::Done | Status::Error)
+        ) {
+            assert_eq!(output.status, Status::Done,
+                "setup command failed: `{command}` -> stdout={:?} stderr={:?}",
+                output.content, output.stderr);
+            return output.content.clone();
         }
-        assert!(std::time::Instant::now() < deadline, "no external process for job {job_id}: {jobs}");
+        assert!(Instant::now() < deadline, "shell command did not settle: `{command}`");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Resolve an operation's kaish job id through durable operation metadata.
+pub async fn bg_job_id(kernel: &KernelHandle, context: ContextId, bg_id: &str) -> u64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let argv = ["wait", "--operation", bg_id, "--timeout", "0"]
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let result = kernel.execute_kj_quiet(context, &argv).await.expect("read shell operation");
+        assert_eq!(result.exit_code, 0, "kj wait failed: {}", result.stderr);
+        if let Some(job_id) = result.data.as_ref()
+            .and_then(|data| data.pointer("/state/receipt/job_id"))
+            .and_then(|value| value.as_str())
+        {
+            return job_id.parse::<u64>().expect("numeric kaish job id");
+        }
+        assert!(std::time::Instant::now() < deadline,
+            "operation {bg_id} never attached a kaish job: {:?}", result.data);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Resolve an operation's external process-group leader in the container's
+/// otherwise-empty PID namespace. The durable job attachment proves startup
+/// reached kaish; `/proc` observes the process that lifecycle tests exercise.
+pub async fn bg_pid(
+    kernel: &KernelHandle,
+    context: ContextId,
+    bg_id: &str,
+    command: &str,
+) -> u32 {
+    let job_id = bg_job_id(kernel, context, bg_id).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let processes = pids_matching(command);
+        if let Some((pid, _)) = processes.first() {
+            assert_eq!(processes.len(), 1,
+                "job {job_id} has ambiguous external process leaders: {processes:?}");
+            return *pid;
+        }
+        assert!(std::time::Instant::now() < deadline,
+            "no external process for job {job_id} matching `{command}`");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Cancel an operation's kaish job through the retained shell surface.
+pub async fn cancel_bg(kernel: &KernelHandle, context: ContextId, bg_id: &str) {
+    run_shell(kernel, context, &format!("cancel_shell_operation --id '{bg_id}'")).await;
 }
 
 // ---------------------------------------------------------------------------

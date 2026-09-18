@@ -1,94 +1,99 @@
-# isotest — containerized isolation & process-lifecycle tests
+# isotest — containerized process and filesystem tests
 
-`contrib/isotest` runs functional tests that need a **real kernel restart**:
-in-process integration suites (`kaijutsu-server/tests/`) cannot replace the
-server they live inside. The harness checks durable shell-operation receipts,
-completion, and restart handling as regular, repeatable assertions.
+`contrib/isotest` runs functional tests that need an isolated process table or
+a real filesystem. The process suite starts a real server and connects over
+SSH. The filesystem suite builds a production kernel in the test process and
+calls its native file tools through the broker.
 
 ## Why a container
 
-Not for security — for **observability and blast radius**:
+The container provides observability and limits the effect of a failed test:
 
-- The podman PID namespace starts empty, so a restart loop and hostile
-  filesystem layout cannot touch the host or a live kernel.
-- `--network=none` (loopback only), `--pids-limit` (a fork storm fails the
-  test, not the machine), tmpfs `$HOME`. All rootless-friendly; no privileges.
+- The Podman PID namespace starts empty, so every child process belongs to the
+  test and a survivor is visible.
+- The test can create hostile files and symlinks without touching the
+  developer's filesystem.
+- `--network=none` allows loopback only, `--pids-limit` bounds process growth,
+  and `$HOME` is a fresh tmpfs. The suite needs no privileges.
 
 ## Running
 
 ```sh
 contrib/isotest                  # the kaijutsu-isotest suite
-contrib/isotest shell_operation  # filter by test name
+contrib/isotest --test isolation # process lifecycle only
+contrib/isotest --test filesystem
 contrib/isotest --keep           # keep the exited container for inspection
 contrib/isotest --pull           # refresh the Arch base image
 contrib/isotest -p kaijutsu-kernel --test broker_e2e
-                                 # containerize any workspace test target
+                                 # containerize another workspace test target
 ```
 
-Test executables are discovered from `cargo test --no-run
---message-format=json` (survives renames and hash churn). Binaries are built
-on the host and bind-mounted read-only; `contrib/Containerfile.isotest` is a
-near-empty Arch base whose only job is supplying a compatible userland — an
-`ldd` preflight fails loudly on glibc skew. Cadence today: run it by hand
-after touching shell-operation or lifecycle paths. CI eventually.
+The runner discovers executables from `cargo test --no-run
+--message-format=json`, builds them on the host, and bind-mounts them read-only.
+`contrib/Containerfile.isotest` supplies a compatible userland; an `ldd`
+preflight fails on a glibc mismatch. The runner sets `--test-threads=1` because
+the lifecycle assertions share the container's process table.
 
-## Topology
+## Process lifecycle
 
-catatonit (podman `--init`, PID 1) → test binary → spawns `kaijutsu-server`
-as a real child on a fresh tmpfs `$HOME` → connects over loopback SSH with
-`kaijutsu-client` → joins the root character's root context (an admin
-context: `exec` + `facade:shell` already granted) → drives the `shell` tool
-→ restarts the server → reads the durable operation state.
+`crates/kaijutsu-isotest/tests/isolation.rs` runs this topology:
 
-**Credentials: always ephemeral, always labeled.** Every key the suite
-mints is generated fresh per boot and carries the `isotest-ephemeral` label
-in the pubkey comment and the SSH username — a stray entry can never be
-mistaken for a durable identity. `auth.db` carries no name of its own
-(`docs/character.md`, "`auth.db` is a keyring"), so registration binds the
-key to a root character the harness creates itself: the server refuses to
-start against a `kernel.db` with no live root character and there is no
-registration RPC, so the harness runs `kaijutsu-server init --as tester
---key <pubfile>` (the same `$HOME`/XDG env the server itself will use)
-BEFORE spawning the server, creating the root character and binding the
-key in one step, then boots the server against that already-initialized
-`$HOME`. Most tests authenticate with an in-memory key; the agent test runs
-a real `ssh-agent` inside the namespace and injects the key via the agent
-protocol, so that private key never touches disk at all.
+```text
+catatonit (PID 1)
+  └─ isotest
+       └─ kaijutsu-server
+            └─ external command
+```
 
-Tests run `--test-threads=1` (the runner enforces it): lifecycle assertions
-must never interleave.
+The harness initializes a fresh `$HOME`, starts `kaijutsu-server`, connects
+over loopback SSH with `kaijutsu-client`, and joins the root character's root
+context. It submits work through the retained shell RPC. `kj wait --operation`
+observes the durable operation and job attachment. The unshadowed
+`cancel_shell_operation` broker tool remains reachable as a kaish command for
+operation-scoped cancellation. The empty PID namespace supplies the final
+process-liveness observation.
 
-## What it pins (crates/kaijutsu-isotest/tests/isolation.rs)
+Every credential is generated for one boot and labeled `isotest-ephemeral` in
+the public-key comment and SSH username. The harness runs
+`kaijutsu-server init --as tester --key <pubfile>` before starting the server,
+which creates the root character and binds the key. Most tests authenticate
+with an in-memory key. The agent-auth test starts a real `ssh-agent` in the
+namespace and adds the ephemeral private key through the agent protocol.
 
-- **Shell-operation restart and scope coverage** — an asynchronous call has a
-  durable receipt and context-owned kaish job. A restarted kernel records an
-  unfinished operation as abandoned instead of claiming it still runs; another
-  context cannot read, wait for, or cancel that receipt.
-- **Whole-program completion coverage** — `foreground: false` returns before
-  the complete kaish program finishes, then settles its separate output block
-  and terminal envelope. `foreground: true` retains the completed-result
-  contract.
-- **`agent_auth_production_path`** — the auth lane real clients use:
-  kaijutsu-mcp/-acp authenticate via `KeySource::Agent`, which no other
-  test touches. A real ssh-agent runs in the namespace, receives the
-  ephemeral key over the agent protocol, and an asynchronous shell operation
-  round-trips
-  through an agent-authenticated session.
-- **Client-disconnect coverage** — a context-owned kaish job and its durable
-  operation receipt outlive the client connection that submitted them.
+The suite checks:
 
-## Honest limits
+- SIGKILL and SIGTERM leave no external child alive.
+- operation cancellation reaps an external process group and its children.
+- restart marks unfinished durable work as no longer running.
+- context-owned work survives client disconnect.
+- the production SSH-agent authentication path can submit external work.
 
-- A restarted kernel cannot retain an in-memory kaish job manager. The durable
-  registry records unfinished operations as abandoned; it does not claim that
-  a job can continue across the restart.
-- The container shares the host kernel; this validates operation lifecycle
-  handling, not kernel-level containment.
-- Boot noise: the embedded `mcp.toml` tries to launch `bevy_brp_mcp` and a
-  hardcoded kaibo path; both fail loudly and harmlessly in the container.
+## Filesystem protection
 
-## Slice 2 (planned)
+`crates/kaijutsu-isotest/tests/filesystem.rs` calls
+`kaijutsu_server::rpc::create_shared_kernel`, the same builder that supplies the
+server's mount topology. `/` is read-only and `/tmp` is writable. The fixture
+revokes `exec`, grants only the native `builtin.file` tools under test, and
+dispatches each call through the production broker with an explicit
+cancellation token. No subprocess is needed for a file-tool call.
 
-Filesystem-protection tests: read-only mounts surfacing as clean errors (not
-corruption), the filesystem-root walk refusal (`ce0a4146`), symlink-escape
-probes against the VFS. Same harness, new test file.
+The suite checks:
+
+- writes to a read-only mount fail without changing disk or cached content;
+- `glob` and `grep` refuse a walk rooted at `/`;
+- a symlink cannot escape its mount for reads, writes, or directory walks;
+- a symlink that stays within its mount continues to work.
+
+The probes use the container's real filesystem. This exercises production
+`LocalBackend` mount and canonicalization behavior instead of a synthetic VFS.
+
+## Limits
+
+- The container shares the host's OS kernel. These tests cover Kaijutsu
+  process and VFS behavior, not OS-level containment.
+- On Linux, PDEATHSIG covers a direct child of the server thread that spawned
+  it. The process-group cancellation test separately covers child processes
+  created by an external command.
+- The in-process filesystem suite does not exercise SSH transport. It uses the
+  production kernel builder, broker, native file server, mount table, and file
+  cache directly.

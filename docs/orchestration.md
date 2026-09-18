@@ -51,8 +51,9 @@ bindings mean different viewpoints, costs, and capabilities.
 Two `whoami`s answer different questions:
 
 - The **MCP-server** `whoami` returns User, peer info, registered context.
-- The **kernel-side** `whoami` (via `shell "whoami"` or a native model tool call) returns
-  context id, label, model, provider, and `forked_from`.
+- The **kernel-side** `whoami` native model tool returns context id, label,
+  model, provider, and `forked_from`. From a shell, use `kj context info`; a
+  host `whoami` executable can take precedence over the broker tool.
 
 Keep both in mind. The MCP layer's notion of "who am I" is about your
 connection; the kernel's is about which context you're acting in.
@@ -316,7 +317,7 @@ A short recipe that exercises the basics: register, observe, fork, drift.
 ```
 # 1. Register and look around
 register_session label="orchestrator"
-shell "whoami"                        # confirm registered context
+shell "kj context info"               # inspect registered context
 shell "kj context list --tree"         # see the DAG (read result block)
 
 # 2. Fork a scout with a different binding

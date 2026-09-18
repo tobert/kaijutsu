@@ -285,13 +285,18 @@ Interactive prompt preparation now shares the headless startup owner and owns
 its turn lease before submit rc or provider selection. Disconnect preserves
 accepted preparation; shutdown signals and joins rc cleanup before completing
 the cancelled turn. Admission proof and task ownership remain distinct.
-The duplicate `executeTool` RPC and MCP `kaish_exec` are retired; the published
-MCP shell retains ordinary broker command output. `callMcpTool` has only test
-and isotest consumers, but still dispatches non-shell tools without context
-admission, task ownership or durable output. Its reviewer is resolved for the
-configured performer while its actor is the invoking principal. Migrate those
-tests to retained client execution or lower-level broker fixtures, then retire
-the RPC. Preserve accepted nested calls rather than gating every broker entry.
+Both generic tool RPCs (`executeTool` and `callMcpTool`) are retired. Client
+execution uses retained shell submissions. Native broker fixtures preserve
+approval ownership and file-cache behavior without a generic wire escape
+hatch. Broker dispatch now requires an explicit cancellation token.
+
+The retained interactive receipt points to its outer kaish job. `jobs --json`
+does not expose the nested external process group under that outer job, so the
+isotest process checks pair a durable job attachment with an exact process
+match in the isolated PID namespace. Audit job-to-process observability with
+the job/controller lifetime work; do not claim the receipt currently identifies
+that process group. Linux parent-death cleanup covers direct spawned children;
+arbitrary descendant trees after SIGKILL need their own evidence.
 
 Kaish backend discovery enumerates raw global broker names instead of the
 context's visible names. Qualified names for broker-broker collisions are

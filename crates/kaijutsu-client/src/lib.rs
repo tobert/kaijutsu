@@ -30,7 +30,7 @@ pub use actor::{
 pub use rpc::{
     AuthorBlock, Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
     EditorState, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
-    LlmConfigInfo, LlmProviderInfo, McpResource, McpToolResult, MountSpec, PeerInfo, PresetInfo,
+    LlmConfigInfo, LlmProviderInfo, McpResource, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellDryRunOutcome, ShellDryRunReport, ShellSubmission, ShellValue, SimilarContext,
     SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolSchema, TrackInfo,
     VersionSnapshot, VfsActivityEntry, VfsFileType,

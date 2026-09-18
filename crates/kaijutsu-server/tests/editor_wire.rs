@@ -486,18 +486,18 @@ fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
             "kj block $(echo create) --role user --kind text --content must-not-land".to_string(),
             "block_create --role user --kind text --content must-not-land".to_string(),
         ] {
-            let refused = kernel.call_mcp_tool("shell", &serde_json::json!({
-                "command": command, "foreground": true,
-            })).await.unwrap();
-            assert!(refused.is_error && refused.content.contains("read-only"), "{command}: {refused:?}");
+            let quoted = command.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
+            let (_, content, status) = common::shell_exec_wait(&kernel,
+                &format!("shell --foreground --command \"{quoted}\""), context).await;
+            assert_eq!(status, kaijutsu_types::Status::Error, "{command}: {content}");
+            assert!(content.contains("read-only"), "{command}: {content}");
         }
         let unchanged = kernel.editor_state(session).await.unwrap();
         assert_eq!(unchanged.text, original.text);
         assert_eq!(unchanged.dirty, original.dirty);
-        let read = kernel.call_mcp_tool("shell", &serde_json::json!({
-            "command": "kj editor list", "foreground": true,
-        })).await.unwrap();
-        assert!(!read.is_error, "{read:?}");
+        let (_, content, status) = common::shell_exec_wait(&kernel,
+            "shell --foreground --command 'kj editor list'", context).await;
+        assert_eq!(status, kaijutsu_types::Status::Done, "{content}");
         let direct = kernel.editor_keys(session, ":r !echo direct-read<CR>").await.unwrap();
         assert_eq!(direct.text, format!("direct-read\n{}", original.text));
         kernel.editor_keys(session, ":q!<CR>").await.unwrap();

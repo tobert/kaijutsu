@@ -573,16 +573,23 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         worker_kj.join_context(worker_ctx, "worker").await.unwrap();
         coder_kj.join_context(coder_ctx, "coder").await.unwrap();
 
-        // Raise the ask the same way `gate_executes_wire.rs`'s `raise()`
-        // does — a gated `shell_write` MCP call needs no custom hook; a
-        // fresh kernel gates it by default.
-        let refusal = worker_kj
-            .call_mcp_tool("shell_write", &serde_json::json!({
-                "command": "echo should-not-run",
-                "foreground": true,
-            }))
-            .await;
-        assert!(refusal.is_err(), "a gated shell_write must refuse rather than run");
+        // The retained shell invokes the native shell_write tool, whose gate
+        // records the authenticated identity on its pending ask.
+        let submission = worker_kj
+            .shell_submit("shell_write --command 'echo should-not-run' --foreground", worker_ctx, true)
+            .await
+            .unwrap();
+        assert!(!submission.operation_id.is_empty(), "the retained shell submission needs an operation id");
+        wait_for("the worker's pending shell ask", || {
+            server
+                .kernel_db
+                .lock()
+                .list_pending_asks()
+                .unwrap()
+                .iter()
+                .any(|r| r.exec_source.as_deref() == Some("echo should-not-run"))
+        })
+        .await;
         let ask_id = server
             .kernel_db
             .lock()

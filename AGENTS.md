@@ -42,6 +42,14 @@ inferences, and unknowns; report what ran and any verification left undone.
 Investigate contributing factors. Fail loudly rather than continue on a wrong
 assumption or corrupt data.
 
+Tests should deny host subprocess execution unless they test subprocess
+behavior. `SshServerConfig::ephemeral` follows this rule; use
+`.with_host_exec()` only for an explicit subprocess case. Kaish builtins such
+as `sleep` do not need that opt-in. Stand up a kernel and drive its client when
+construction, identity, settlement, or lifecycle behavior is part of the test.
+Keep native broker tests on the broker when a same-named shell builtin would
+exercise a different implementation.
+
 Treat unexpected edits as another player's work. Coordinate overlapping
 changes. A context fork does not isolate files; use git worktrees under
 `~/src/wt/` for pull requests. Working on main is normal here.

@@ -536,113 +536,36 @@ fn test_create_context_unique_ids() {
 }
 
 // ============================================================================
-// MCP Remote-Mode Tests (M6-G3)
+// Broker commands through retained shell execution
 // ============================================================================
 
 #[test]
-fn test_call_mcp_tool_dispatches_builtin_over_ssh() {
-    // SSH-connected dispatch through call_mcp_tool. Exercises the full
-    // wire: client → SSH channel → capnp → rpc.rs → broker → builtin
-    // server → result back. Uses `whoami` (KernelInfoServer) — no LLM
-    // configured, no external state, deterministic shape.
+fn shell_dispatches_broker_tool_over_ssh() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
-
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let ctx_id = create_context(&kernel, "mcp-remote-test").await.unwrap();
-        kernel.join_context(ctx_id, "test-mcp").await.unwrap();
-
-        let result = kernel
-            .call_mcp_tool("whoami", &serde_json::json!({}))
-            .await
-            .expect("call_mcp_tool over SSH");
-        assert!(
-            !result.is_error,
-            "whoami should not be an error: content={}",
-            result.content
-        );
-        assert!(
-            !result.content.is_empty(),
-            "whoami should return non-empty content"
-        );
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "broker-shell").await.unwrap();
+        let (_, output, status) = shell_exec_wait(&kernel, "whoami", context).await;
+        assert_eq!(status, kaijutsu_types::Status::Done, "{output}");
+        let identity: serde_json::Value = serde_json::from_str(&output).expect("broker identity JSON");
+        assert_eq!(identity["context_id"], context.to_hex(), "{identity}");
     });
 }
 
 #[test]
-fn test_call_mcp_tool_unknown_tool_errors() {
-    // Unknown tool name surfaces over the wire as an Err, not a silent
-    // success. Locks in the error-propagation path through the SSH +
-    // capnp + broker stack.
+fn unknown_shell_command_retains_its_diagnostic_over_ssh() {
     run_local(async {
         let addr = start_server().await;
         let client = connect_client(addr).await;
-
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let ctx_id = create_context(&kernel, "mcp-remote-error").await.unwrap();
-        kernel.join_context(ctx_id, "test-mcp").await.unwrap();
-
-        let result = kernel
-            .call_mcp_tool("no_such_tool", &serde_json::json!({}))
-            .await;
-        assert!(
-            result.is_err(),
-            "unknown tool should surface as Err over SSH, got: {result:?}"
-        );
-    });
-}
-
-#[test]
-fn test_call_mcp_tool_requires_joined_context() {
-    // Without a joined context, call_mcp_tool errors instead of falling
-    // back to a default — the dispatch path needs context_id to resolve
-    // the binding.
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await;
-
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        // No join_context call.
-
-        let result = kernel
-            .call_mcp_tool("whoami", &serde_json::json!({}))
-            .await;
-        assert!(
-            result.is_err(),
-            "call_mcp_tool without joined context should error, got: {result:?}"
-        );
-    });
-}
-
-/// A failed broker call must carry its diagnostic over the legacy one-field
-/// reply. The root context has no durable cwd, so file tools refuse the write.
-#[test]
-fn test_call_mcp_tool_failure_message_reaches_the_wire() {
-    run_local(async {
-        let addr = start_server().await;
-        let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-        let root = kernel
-            .resolve_context_label(kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT)
-            .await
-            .unwrap()
-            .expect("the root character's root context exists on a fresh kernel");
-        kernel.join_context(root.id, "test-mcp-error").await.unwrap();
-
-        let result = kernel
-            .call_mcp_tool("write", &serde_json::json!({"path": "/tmp/x.txt", "content": "y"}))
-            .await
-            .expect("call_mcp_tool over SSH");
-        assert!(result.is_error, "write on a cwd-less context must fail");
-        assert!(
-            !result.content.is_empty(),
-            "a failed call_mcp_tool must carry its message over the wire, not just is_error=true"
-        );
-        assert!(
-            result.content.contains("working directory"),
-            "expected the no-cwd refusal message, got: {}",
-            result.content
-        );
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "broker-error").await.unwrap();
+        let (command, _, status) = shell_exec_wait(&kernel, "no_such_tool", context).await;
+        assert_eq!(status, kaijutsu_types::Status::Error);
+        let blocks = kernel.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        let output = blocks.iter().find(|block| block.tool_call_id == Some(command)
+            && block.kind == kaijutsu_types::BlockKind::ToolResult).unwrap();
+        assert!(output.stderr.as_deref().unwrap_or("").contains("no_such_tool"), "{output:?}");
     });
 }
 

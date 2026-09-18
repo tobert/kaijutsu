@@ -39,7 +39,7 @@ use kaijutsu_client::{KernelHandle, KeySource, RpcClient, RpcError, SshClient, S
 use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_kernel::PairOwner;
 use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
-use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, Status, ToolKind};
+use kaijutsu_types::{BlockId, BlockKind, ContextId, PrincipalId, SessionId, Status, ToolKind};
 use kaijutsu_types::shell_envelope::ShellStatus;
 use russh::keys::{Algorithm, PrivateKey};
 
@@ -192,18 +192,55 @@ async fn seats() -> Seats {
 }
 
 impl Seats {
-    /// Call the gated `shell_write` tool from the worker seat. It refuses
-    /// with `Pending` and leaves one durable ask carrying `command` as its
-    /// `exec_source`; this returns that ask's id.
+    /// Exercise a native broker tool with the durable identity of a context.
+    async fn native_tool(
+        &self,
+        context: ContextId,
+        session: SessionId,
+        tool: &str,
+        params: serde_json::Value,
+    ) -> Result<kaijutsu_kernel::ExecResult, kaijutsu_kernel::mcp::McpError> {
+        let row = self.kernel.kernel_db.lock().get_context(context).unwrap().unwrap();
+        let actor = row.played_by.expect("native tool fixture assigns a performer");
+        let exec = kaijutsu_kernel::ExecContext::new_without_cwd(
+            row.created_by,
+            context,
+            session,
+            self.kernel.kernel.id(),
+        )
+        .with_actor(actor, row.reviewer_id);
+        self.kernel
+            .kernel
+            .dispatch_tool_via_broker_with_cancel(
+                tool,
+                &params.to_string(),
+                &exec,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// Exercise the native no-pair `shell_write` shape. Interactive shell
+    /// submission instead owns a session pair, which is not the case here.
+    async fn native_shell_write(
+        &self,
+        context: ContextId,
+        command: &str,
+        foreground: bool,
+    ) -> Result<kaijutsu_kernel::ExecResult, kaijutsu_kernel::mcp::McpError> {
+        self.native_tool(
+            context,
+            SessionId::new(),
+            "shell_write",
+            serde_json::json!({ "command": command, "foreground": foreground }),
+        )
+        .await
+    }
+
+    /// The native `shell_write` call refuses with `Pending` and leaves one
+    /// durable ask carrying `command` as its `exec_source`; return that ask.
     async fn raise(&self, command: &str) -> String {
-        let kj = &self.worker_kj;
-        kj.join_context(self.worker, "gate-exec-worker").await.unwrap();
-        let refusal = kj
-            .call_mcp_tool("shell_write", &serde_json::json!({
-                "command": command,
-                "foreground": true,
-            }))
-            .await;
+        let refusal = self.native_shell_write(self.worker, command, true).await;
         assert!(
             refusal.is_err(),
             "a gated shell_write must refuse rather than run: {refusal:?}"
@@ -894,14 +931,12 @@ fn default_async_shell_write_waits_then_approval_fills_its_operation_pair() {
         let marker = scratch.marker();
         let code = format!("echo async-approved > {}", marker.display());
 
-        s.worker_kj.join_context(s.worker, "gate-exec-worker").await.unwrap();
         let receipt = s
-            .worker_kj
-            .call_mcp_tool("shell_write", &serde_json::json!({ "command": code }))
+            .native_shell_write(s.worker, &code, false)
             .await
             .expect("default async shell_write returns a waiting receipt");
-        assert!(!receipt.is_error, "waiting is not an execution error: {receipt:?}");
-        let body: serde_json::Value = serde_json::from_str(&receipt.content)
+        assert!(receipt.success, "waiting is not an execution error: {receipt:?}");
+        let body: serde_json::Value = serde_json::from_str(&receipt.stdout)
             .expect("shell receipt is JSON");
         assert_eq!(body["status"], "waiting");
         let operation_id = body["operation_id"].as_str().expect("stable operation id");
@@ -1135,13 +1170,10 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
             .and_then(|row| row.played_by)
             .expect("worker has its explicit performer");
         s.kernel.kernel_db.lock().update_context_review(blocker_ctx, Some(actor), Some(reviewer)).unwrap();
-        kj.join_context(blocker_ctx, "gate-exec-blocker").await.unwrap();
-        let blocker_refusal = kj
-            .call_mcp_tool("shell_write", &serde_json::json!({
-                "command": "/bin/sleep 5",
-                "foreground": true,
-            }))
-            .await;
+        let mut binding = s.kernel.kernel.broker().binding(&blocker_ctx).await.unwrap();
+        binding.grant(kaijutsu_kernel::mcp::Capability::Exec);
+        s.kernel.kernel.broker().set_binding(blocker_ctx, binding).await.unwrap();
+        let blocker_refusal = s.native_shell_write(blocker_ctx, "/bin/sleep 5", true).await;
         assert!(blocker_refusal.is_err(), "the blocker must be gated too");
         let blocker_ask = s
             .kernel
@@ -1820,7 +1852,7 @@ fn shutdown_settles_retained_stream_review_before_join_returns() {
 }
 
 #[test]
-fn mcp_result_review_survives_rpc_disconnect() {
+fn native_shell_result_review_survives_submitter_disconnect() {
     run_local(async {
         use kaijutsu_kernel::mcp::{Capability, ContextToolBinding, KernelToolResult};
         let s = seats().await;
@@ -1838,28 +1870,36 @@ fn mcp_result_review_survives_rpc_disconnect() {
                 action, priority, kaish_script_id: None });
         }
         drop(hooks);
-        let receipt = s.worker_kj.call_mcp_tool("shell", &serde_json::json!({"command": "echo captured MCP output"})).await.unwrap();
-        let body: serde_json::Value = serde_json::from_str(&receipt.content).unwrap();
+        let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker)
+            .expect("worker connection has a registered session")
+            .key();
+        let receipt = s.native_tool(
+            s.worker,
+            session,
+            "shell",
+            serde_json::json!({ "command": "echo captured MCP output" }),
+        ).await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&receipt.stdout).unwrap();
         assert_eq!(body["status"], "running");
         let operation = body["operation_id"].as_str().unwrap().to_owned();
-        wait_for("MCP result checkpoint", || s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap()
+        wait_for("native shell result checkpoint", || s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap()
             .receipt.ask_id.is_some()).await;
         let ask = s.kernel.kernel.shell_operations().get(&operation, s.worker).unwrap().unwrap().receipt.ask_id.unwrap();
-        let session = *s.kernel.session_contexts.iter().find(|entry| *entry.value() == s.worker).unwrap().key();
+        assert!(s.kernel.session_contexts.contains_key(&session), "the retained call uses the worker session until disconnect");
         let Seats { _worker_client, _approver_client, worker_kj, approver_kj, kernel, worker, approver, db_path: _ } = s;
         drop(worker_kj);
         drop(_worker_client);
-        wait_for("MCP submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;
+        wait_for("submitting session to close", || !kernel.session_contexts.contains_key(&session)).await;
         let answer = approver_kj.execute_kj_quiet(approver, &["ledger".into(), "allow".into(), ask.clone()]).await.unwrap();
         assert_eq!(answer.exit_code, 0, "{}", answer.stderr);
-        wait_for("MCP review completion after disconnect", || kernel.kernel.shell_operations()
+        wait_for("native shell review completion after disconnect", || kernel.kernel.shell_operations()
             .get(&operation, worker).unwrap().unwrap().completed_at.is_some()).await;
         let result = kernel.kernel.shell_operations().get(&operation, worker).unwrap().unwrap().envelope.unwrap();
         assert_eq!(result.stdout, "reviewed after disconnect");
         assert_eq!(result.status, ShellStatus::Done);
         let captured = kernel.kernel.shell_operations().outcome(&operation, worker).unwrap().unwrap();
         let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution
-            else { panic!("lost MCP execution") };
+            else { panic!("lost native shell execution") };
         assert_eq!(raw.text_out(), "captured MCP output\n");
         drop(approver_kj);
         drop(_approver_client);

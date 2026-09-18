@@ -2,26 +2,22 @@
 //!
 //! Topology inside the container: catatonit (podman --init) is PID 1, this
 //! binary spawns `kaijutsu-server` as a real child on a fresh $HOME, connects
-//! over loopback SSH, starts background jobs through the `shell` tool, then
-//! kills the server for real and asserts on `/proc`. The PID namespace
-//! started empty, so any survivor is ours and `assert_no_survivors` is a
-//! provable invariant, not a heuristic.
+//! over loopback SSH, submits background work through the retained shell RPC,
+//! then kills the server for real and asserts on `/proc`. The PID namespace
+//! starts empty, so any survivor belongs to this test.
 //!
-//! Honest limits: PDEATHSIG fires when the spawning *thread* dies. `kill -9`
-//! takes every thread with it, so these tests cover the real dev-loop
-//! scenario (runner restart, OOM kill). The inverse footgun — a healthy
-//! kernel whose spawning thread exits early, spuriously killing a job — is
-//! exercised only by `bg_job_survives_client_disconnect` below, which pins
-//! the *documented* lifetime contract.
+//! On Linux, PDEATHSIG ties a direct child to the OS thread that spawned it.
+//! `kill -9` ends every server thread, so it covers abrupt server loss. It
+//! does not by itself cover arbitrary grandchildren; the cancellation test
+//! separately checks process-group cleanup. The disconnect test checks that
+//! completion of a connection task does not end context-owned work.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
-
 mod common;
 use common::{
-    assert_no_survivors, bg_pid, cmdline, established_conns, join_root, pid_alive, pids_matching,
+    assert_no_survivors, bg_pid, cancel_bg, cmdline, established_conns, join_root, pid_alive, pids_matching,
     run_local, skip_unless_isotest, start_bg, wait_gone, TestKernel,
 };
 
@@ -38,16 +34,14 @@ fn orphan_guard_on_sigkill() {
     run_local(async {
         let mut tk = TestKernel::boot("sigkill", 2301);
         let kernel = tk.connect().await;
-        join_root(&kernel).await;
+        let context = join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
-        let job = bg_pid(&kernel, &bg).await;
+        let bg = start_bg(&kernel, context, "/usr/bin/sleep 300").await;
+        let job = bg_pid(&kernel, context, &bg, "/usr/bin/sleep 300").await;
         assert!(pid_alive(job), "background job should be running");
 
-        // The client connection stays open across the kill: the job's
-        // PDEATHSIG is bound to the server's per-connection thread, so
-        // dropping the client first would kill the job for the wrong
-        // reason and pass vacuously.
+        // Keep the submission connection open so this test changes only the
+        // server process lifetime. Disconnect behavior has its own test.
         tk.sigkill();
 
         assert!(
@@ -68,10 +62,10 @@ fn orphan_guard_on_sigterm() {
     run_local(async {
         let mut tk = TestKernel::boot("sigterm", 2302);
         let kernel = tk.connect().await;
-        join_root(&kernel).await;
+        let context = join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
-        let job = bg_pid(&kernel, &bg).await;
+        let bg = start_bg(&kernel, context, "/usr/bin/sleep 300").await;
+        let job = bg_pid(&kernel, context, &bg, "/usr/bin/sleep 300").await;
         assert!(pid_alive(job));
 
         tk.sigterm_and_wait();
@@ -91,10 +85,15 @@ fn kill_reaps_whole_process_tree() {
     run_local(async {
         let mut tk = TestKernel::boot("treekill", 2303);
         let kernel = tk.connect().await;
-        join_root(&kernel).await;
+        let context = join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "/usr/bin/timeout 301 /usr/bin/sleep 302").await;
-        let job = bg_pid(&kernel, &bg).await;
+        let bg = start_bg(&kernel, context, "/usr/bin/timeout 301 /usr/bin/sleep 302").await;
+        let job = bg_pid(
+            &kernel,
+            context,
+            &bg,
+            "/usr/bin/timeout 301 /usr/bin/sleep 302",
+        ).await;
 
         // Wait for the grandchildren to exist before killing.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -104,11 +103,7 @@ fn kill_reaps_whole_process_tree() {
         let tree = pids_matching("sleep 30");
         assert!(tree.len() >= 2, "grandchildren never appeared: {tree:?}");
 
-        let r = kernel
-            .call_mcp_tool("cancel_shell_operation", &json!({"id": bg}))
-            .await
-            .expect("cancel_shell_operation");
-        assert!(!r.is_error, "kill errored: {}", r.content);
+        cancel_bg(&kernel, context, &bg).await;
 
         assert!(wait_gone(job, Duration::from_secs(5)), "timeout leader survived");
         for (pid, cmd) in tree {
@@ -133,10 +128,10 @@ fn restart_leaves_no_orphans_and_registry_stays_honest() {
         let home = std::env::temp_dir().join("isotest-restart");
         let mut tk = TestKernel::boot_at(home.clone(), 2304);
         let kernel = tk.connect().await;
-        join_root(&kernel).await;
+        let context = join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
-        let job = bg_pid(&kernel, &bg).await;
+        let bg = start_bg(&kernel, context, "/usr/bin/sleep 300").await;
+        let job = bg_pid(&kernel, context, &bg, "/usr/bin/sleep 300").await;
         assert!(pid_alive(job));
 
         tk.sigkill();
@@ -146,20 +141,17 @@ fn restart_leaves_no_orphans_and_registry_stays_honest() {
         // listener TIME_WAIT flakes.
         let mut tk2 = TestKernel::boot_at(home, 2305);
         let kernel2 = tk2.connect().await;
-        join_root(&kernel2).await;
+        let context2 = join_root(&kernel2).await;
 
-        let r = kernel2
-            .call_mcp_tool("list_shell_operations", &json!({}))
-            .await
-            .expect("list_shell_operations after restart");
-        let operations: serde_json::Value = serde_json::from_str(&r.content)
-            .expect("shell operation list JSON");
-        let operations = operations.as_array().expect("shell operation array");
+        let argv = ["wait", "--operation", bg.as_str(), "--timeout", "0"]
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let operation = kernel2.execute_kj_quiet(context2, &argv).await
+            .expect("read operation after restart");
+        assert_eq!(operation.exit_code, 0, "kj wait failed: {}", operation.stderr);
+        let state = operation.data.expect("operation state after restart");
         assert!(
-            operations.iter().all(|row|
-                row.get("status").and_then(|value| value.as_str()) != Some("running")
-            ),
-            "registry lies after restart — claims running: {}", r.content
+            state.get("status").and_then(|value| value.as_str()) != Some("running"),
+            "registry lies after restart — claims running: {state}"
         );
         assert!(
             pids_matching("/usr/bin/sleep 300").is_empty(),
@@ -186,13 +178,13 @@ fn bg_job_survives_client_disconnect() {
                 .connect_client(KeySource::InMemory(tk.key.clone()))
                 .await;
             let (kernel, _id) = client.bind_kernel().await.expect("bind");
-            join_root(&kernel).await;
-            let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
-            let job = bg_pid(&kernel, &bg).await;
+            let context = join_root(&kernel).await;
+            let bg = start_bg(&kernel, context, "/usr/bin/sleep 300").await;
+            let job = bg_pid(&kernel, context, &bg, "/usr/bin/sleep 300").await;
             assert!(pid_alive(job));
             job
             // client + kernel drop here → SSH connection closes → the
-            // server's per-connection thread unwinds.
+            // server's connection task finishes.
         };
 
         // Don't trust the drop: wait until the transport is observably gone
@@ -217,8 +209,7 @@ fn bg_job_survives_client_disconnect() {
         assert!(
             alive,
             "documented contract broken: background job died when its \
-             starting client disconnected (PDEATHSIG bound to the server's \
-             per-connection thread, not the kernel's lifetime)"
+             starting client disconnected"
         );
     });
 }
@@ -266,10 +257,10 @@ fn agent_auth_production_path() {
 
         let client = tk.connect_client(KeySource::Agent).await;
         let (kernel, _id) = client.bind_kernel().await.expect("bind via agent auth");
-        join_root(&kernel).await;
+        let context = join_root(&kernel).await;
 
-        let bg = start_bg(&kernel, "/usr/bin/sleep 300").await;
-        let job = bg_pid(&kernel, &bg).await;
+        let bg = start_bg(&kernel, context, "/usr/bin/sleep 300").await;
+        let job = bg_pid(&kernel, context, &bg, "/usr/bin/sleep 300").await;
         assert!(pid_alive(job), "job started through agent-auth session");
 
         tk.sigterm_and_wait();

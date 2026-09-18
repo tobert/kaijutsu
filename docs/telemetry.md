@@ -111,7 +111,7 @@ Sync methods use `span.entered()` guards.
 | Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
 | Document / history | `push_ops`, `get_context_history`, `compact_context` |
 | Drift | `drift_queue`, `drift_cancel` (push/pull/merge/flush moved into `kj` dispatch, `kaijutsu-kernel/src/kj/drift.rs`) |
-| MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `call_mcp_tool`, `list_mcp_resources`, `read_mcp_resource` |
+| MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `list_mcp_resources`, `read_mcp_resource` |
 | LLM config | `configure_llm`, `get_llm_config`, `set_default_provider`, `set_default_model` |
 | Tools | `get_tool_schemas`, `get_tool_filter`, `set_tool_filter` |
 | Git | `get_current_branch`, `list_branches`, `switch_branch`, `flush_git`, `register_repo`, `unregister_repo`, `list_repos` |

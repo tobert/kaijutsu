@@ -518,13 +518,6 @@ struct SubmitInputOutcome {
   }
 }
 
-struct CallMcpToolOutcome {
-  union {
-    ok @0 :McpToolResult;
-    refused @1 :Refusal;
-  }
-}
-
 struct CommitCaptureOutcome {
   union {
     ok @0 :BlockId;
@@ -1674,16 +1667,6 @@ struct McpToolInfo {
   inputSchema @2 :Text;       # JSON Schema for parameters
 }
 
-struct McpToolCall {
-  tool @0 :Text;              # Tool name (e.g., "git_status")
-  arguments @1 :Text;         # JSON-encoded arguments
-}
-
-struct McpToolResult {
-  content @0 :Text;           # Result content (text)
-  isError @1 :Bool;           # True if the tool returned an error
-}
-
 struct McpResource {
   uri @0 :Text;               # Resource URI (e.g., "file:///path/to/file")
   name @1 :Text;              # Resource name
@@ -2364,7 +2347,7 @@ interface Kernel {
 
   listMcpServers @57 () -> (servers :List(McpServerInfo));
 
-  callMcpTool @58 (call :McpToolCall, trace :TraceContext) -> (outcome :CallMcpToolOutcome);
+  retired58 @58 ();
 
   # MCP Resources (push-first with caching)
   listMcpResources @59 (server :Text, trace :TraceContext) -> (resources :List(McpResource));

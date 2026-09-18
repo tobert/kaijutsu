@@ -505,39 +505,9 @@ impl Kernel {
         self
     }
 
-    /// Dispatch a tool call through the broker using the internal
-    /// `ExecContext` call-site shape.
-    ///
-    /// This is the shim kaijutsu-server / kaijutsu-mcp call from the legacy
-    /// dispatch sites; it resolves the tool through the context's
-    /// `ContextToolBinding`, executes via the broker, and flattens the
-    /// `KernelToolResult` back into an `ExecResult` so the surrounding
-    /// agentic-loop error handling keeps working without further rewriting.
-    ///
-    /// Resolves `tool_name` through the context's `ContextToolBinding`,
-    /// auto-populating the binding on first call with all registered
-    /// instances.
-    pub async fn dispatch_tool_via_broker(
-        &self,
-        tool_name: &str,
-        params_json: &str,
-        tool_ctx: &ExecContext,
-    ) -> Result<ExecResult, crate::mcp::McpError> {
-        use tokio_util::sync::CancellationToken;
-        // Default path: no propagated cancellation. Callers that need it
-        // (LLM streaming) call `dispatch_tool_via_broker_with_cancel`.
-        self.dispatch_tool_via_broker_with_cancel(
-            tool_name,
-            params_json,
-            tool_ctx,
-            CancellationToken::new(),
-        )
-        .await
-    }
-
-    /// Same as `dispatch_tool_via_broker` but threads an externally-managed
-    /// `CancellationToken` into the broker call (M2-B5). Cancelling the token
-    /// causes the in-flight broker call to abort within a bounded time.
+    /// Resolve a tool through the context's binding and execute it with the
+    /// invocation's cancellation token. Flatten its content for command and
+    /// model consumers; a failed tool's body remains on stdout.
     pub async fn dispatch_tool_via_broker_with_cancel(
         &self,
         tool_name: &str,

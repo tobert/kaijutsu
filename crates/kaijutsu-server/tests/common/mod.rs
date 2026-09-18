@@ -81,6 +81,26 @@ pub async fn start_server() -> SocketAddr {
     addr
 }
 
+/// Start an ephemeral server whose temporary rc bindings allow host subprocesses.
+#[allow(dead_code)] // Shared helper: only host-exec tests need the opt-in.
+pub async fn start_server_with_host_exec() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let config = SshServerConfig::ephemeral(addr.port()).with_host_exec();
+    register_root_key(addr, config.root_key());
+
+    tokio::task::spawn_local(async move {
+        let server = SshServer::new(config);
+        if let Err(e) = server.run_on_listener(listener).await {
+            log::error!("Server error: {}", e);
+        }
+    });
+
+    tokio::task::yield_now().await;
+    addr
+}
+
 /// Seed a `mock`-kind backend into the kernel DB at `data_dir` and make it the
 /// default, so `initialize_kernel_models()` brings up a registry a test can
 /// drive without a live provider.
@@ -288,8 +308,7 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
 /// `run_on_listener_with_kernel_sink` — so a test can reach kernel-internal
 /// buses (e.g. `LedgerFlow`) that have no dedicated RPC to drive them.
 ///
-/// See `ledger_events_wire.rs` for the motivating case: unlike a permission
-/// ask (drivable via `hook_add` + `call_mcp_tool`), producing a genuine
+/// See `ledger_events_wire.rs` for the motivating case: producing a genuine
 /// approval-ledger change means exercising the ledger's rule/escalation
 /// machinery — kernel territory, not this crate's. This lets the wire test
 /// stay honest about testing the bridge (kaijutsu-server's job) without

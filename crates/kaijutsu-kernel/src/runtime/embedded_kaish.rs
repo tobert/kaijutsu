@@ -337,6 +337,9 @@ impl EmbeddedKaish {
         // constructor so this survives kaish config-API churn.
         let mut config = KaishConfig::named(name)
             .with_ignore_config(IgnoreConfig::agent())
+            // On Linux, tie direct external children to their spawning OS
+            // thread so abrupt server death does not leave them running.
+            .with_kill_children_on_parent_death(true)
             // Output cap by consumer, not by trust — see `OutputProfile`.
             // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
             // editor shells use the larger internal ceiling. Both can spill.
