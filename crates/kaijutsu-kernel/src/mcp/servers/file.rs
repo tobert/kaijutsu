@@ -170,7 +170,7 @@ impl McpServerLike for FileToolsServer {
                 "Find files matching a glob pattern (supports **, gitignore)"
             )?,
             tool_def::<GrepParams>(&self.instance_id, "grep",
-                "Search file content with regex, document-aware (sees unflushed edits)"
+                "Search file content with regex, document-aware (sees unflushed edits). Files over 1,000,000 bytes are skipped, each named in a `# WARNING: skipped` line; stops at 200 matches."
             )?,
         ])
     }
@@ -351,16 +351,32 @@ impl McpServerLike for FileToolsServer {
                     };
                     const MAX_MATCHES: usize = 200;
                     const MAX_FILE_SIZE: usize = 1_000_000;
+                    // Above this many oversize files, stop printing one
+                    // warning line each and fold the rest into a trailing
+                    // count — a search over a tree with hundreds of large
+                    // files must not drown its actual matches in warnings.
+                    const MAX_SKIP_WARNINGS: usize = 20;
                     let mut output = String::new();
                     let mut total_matches = 0;
+                    let mut skipped_for_size = 0usize;
                     for file_path in &files {
                         if total_matches >= MAX_MATCHES {
                             break;
                         }
                         let path_str = file_path.display().to_string();
+                        let mut warn_oversize = |size: u64| {
+                            skipped_for_size += 1;
+                            if skipped_for_size <= MAX_SKIP_WARNINGS {
+                                output.push_str(&format!(
+                                    "# WARNING: skipped {} ({} bytes exceeds the {}-byte search limit)\n",
+                                    path_str, size, MAX_FILE_SIZE
+                                ));
+                            }
+                        };
                         let content = match self.cache.try_read_content(&path_str).await {
                             Ok(c) => {
                                 if c.len() > MAX_FILE_SIZE {
+                                    warn_oversize(c.len() as u64);
                                     continue;
                                 }
                                 c
@@ -373,6 +389,7 @@ impl McpServerLike for FileToolsServer {
                                 if let Ok(attr) = self.vfs.getattr(file_path).await
                                     && attr.size as usize > MAX_FILE_SIZE
                                 {
+                                    warn_oversize(attr.size);
                                     continue;
                                 }
                                 match self.vfs.read_all(file_path).await {
@@ -413,8 +430,19 @@ impl McpServerLike for FileToolsServer {
                             }
                         }
                     }
+                    if skipped_for_size > MAX_SKIP_WARNINGS {
+                        output.push_str(&format!(
+                            "# WARNING: {} more file(s) skipped for exceeding the {}-byte search limit\n",
+                            skipped_for_size - MAX_SKIP_WARNINGS,
+                            MAX_FILE_SIZE
+                        ));
+                    }
                     if total_matches == 0 {
-                        ExecResult::success("No matches found.")
+                        if output.is_empty() {
+                            ExecResult::success("No matches found.")
+                        } else {
+                            ExecResult::success(format!("{}\nNo matches found.", output.trim_end()))
+                        }
                     } else {
                         let truncated = if total_matches >= MAX_MATCHES {
                             format!(" (truncated at {} matches)", MAX_MATCHES)
@@ -1391,6 +1419,116 @@ mod tests {
              pins has changed — update or remove this test rather than treating \
              the change as a break: {}",
             text_of(&res)
+        );
+    }
+
+    /// Mounts several files directly on the VFS backend, the way
+    /// `broker_with_vfs_file` does for one file, so the walker `grep` and
+    /// `glob` use actually finds them (unlike `broker_with_file`, whose
+    /// cached content never reaches the backend).
+    async fn broker_with_vfs_files(files: &[(&str, &str)]) -> (Arc<Broker>, Arc<FileDocumentCache>) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        for (path, content) in files {
+            vfs.write_all(std::path::Path::new(path), content.as_bytes())
+                .await
+                .unwrap();
+        }
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+        (broker, cache)
+    }
+
+    /// A file over the 1,000,000-byte search limit must be named in a
+    /// warning, not silently dropped from the walk — the model asking for
+    /// the search otherwise has no way to know part of its query never ran.
+    /// This file is never loaded into the document cache, so it exercises
+    /// the `CacheReadError::NotCached` branch that sizes the file through
+    /// `vfs.getattr`.
+    #[tokio::test]
+    async fn grep_warns_when_an_uncached_file_exceeds_the_search_limit() {
+        let huge = "x".repeat(1_000_001);
+        let (broker, _cache) = broker_with_vfs_files(&[
+            ("/tmp/huge.txt", huge.as_str()),
+            ("/tmp/small.txt", "needle here\n"),
+        ])
+        .await;
+
+        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
+
+        assert!(!res.is_error, "grep failed: {}", text_of(&res));
+        let text = text_of(&res);
+        assert!(
+            text.contains(
+                "# WARNING: skipped /tmp/huge.txt (1000001 bytes exceeds the 1000000-byte search limit)"
+            ),
+            "warning must name the path, size, and limit: {text}"
+        );
+        assert!(
+            text.contains("/tmp/small.txt:1:needle here"),
+            "a small file's match must still return alongside the warning: {text}"
+        );
+    }
+
+    /// Same oversize warning, but for a file already loaded into the
+    /// document cache (as `read` or `edit` would leave it) — the
+    /// cached-content branch, checked before the `vfs.getattr` fallback.
+    #[tokio::test]
+    async fn grep_warns_when_a_cached_file_exceeds_the_search_limit() {
+        let huge = "y".repeat(1_500_000);
+        let (broker, cache) = broker_with_vfs_files(&[
+            ("/tmp/huge-cached.txt", huge.as_str()),
+            ("/tmp/small.txt", "needle here\n"),
+        ])
+        .await;
+        cache.create_or_replace("/tmp/huge-cached.txt", &huge).await.unwrap();
+
+        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
+
+        assert!(!res.is_error, "grep failed: {}", text_of(&res));
+        let text = text_of(&res);
+        assert!(
+            text.contains(
+                "# WARNING: skipped /tmp/huge-cached.txt (1500000 bytes exceeds the 1000000-byte search limit)"
+            ),
+            "the cached branch must warn too: {text}"
+        );
+        assert!(text.contains("/tmp/small.txt:1:needle here"), "{text}");
+    }
+
+    /// Many oversize files must not flood the output with one warning line
+    /// each — the skip warnings are capped, and the remainder is reported
+    /// as a count instead of a wall of near-identical lines.
+    #[tokio::test]
+    async fn grep_caps_skip_warnings_and_counts_the_rest() {
+        let huge = "z".repeat(1_000_001);
+        let mut files: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("/tmp/huge-{i:02}.txt"), huge.clone()))
+            .collect();
+        files.push(("/tmp/small.txt".to_string(), "needle here\n".to_string()));
+        let file_refs: Vec<(&str, &str)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let (broker, _cache) = broker_with_vfs_files(&file_refs).await;
+
+        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
+
+        assert!(!res.is_error, "grep failed: {}", text_of(&res));
+        let text = text_of(&res);
+        let warning_lines = text.lines().filter(|l| l.starts_with("# WARNING: skipped /tmp/huge")).count();
+        assert!(
+            warning_lines < 30,
+            "30 oversize files must not each get their own warning line: {warning_lines} lines in {text}"
+        );
+        assert!(
+            text.contains("more file(s) skipped"),
+            "the files beyond the cap must be summarized by count: {text}"
+        );
+        assert!(
+            text.contains("/tmp/small.txt:1:needle here"),
+            "the small file's match must still return: {text}"
         );
     }
 
