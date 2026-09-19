@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Classify how one Harbor ACP run's turn ended.
 
-This reads the three files Harbor's ACP runner writes into a run directory
+This reads the files Harbor's ACP runner writes into a run directory
 (`acp-events.jsonl`, `acp-summary.json`, and optionally a launcher log this
 tool does not use) and reports one `turn_end_class`: how the model's turn
 ended. It does not say whether the task passed — Harbor's verifier decides
@@ -9,10 +9,23 @@ that from `reward.txt`/`ctrf.json`, not from this tool.
 
 Usage:
     classify_run.py RUN_DIR [--format json|text] [--kernel-log PATH]
+                     [--trial-result PATH]
 
-RUN_DIR must contain `acp-events.jsonl` and `acp-summary.json`; both are
-required. `--format text` prints a short human summary instead of JSON
-(the default).
+RUN_DIR must contain `acp-events.jsonl`; that file is required. A trial
+Harbor killed with `AgentTimeoutError` — or one still running — never gets
+an `acp-summary.json` (the ACP runner writes it only when it exits on its
+own), and this is normal, not corrupt: `acp-summary.json`'s absence
+degrades the report rather than failing it. Without it, `turn_end_class`
+is `"agent_timeout"` when `--trial-result` names a Harbor `result.json`
+whose `exception_info.exception_type` is `AgentTimeoutError`, else
+`"unclassified_stop_reason"`. `--format text` prints a short human summary
+instead of JSON (the default).
+
+`--trial-result PATH` names the trial's `result.json`, one directory above
+RUN_DIR in a Harbor layout (RUN_DIR is `agent/`; `result.json` sits in its
+parent, the trial directory). Only its `exception_info` is read. Optional;
+without it, a summary-less run cannot be told apart from one that is
+otherwise unclassifiable.
 
 `--kernel-log PATH` sums per-inference token counts from lines containing
 "LLM stream completed" in a kaijutsu kernel log. That log can span several
@@ -21,6 +34,22 @@ own session id (`acp-summary.json`'s `session.sessionId`, matched against
 the log line's `context.id` with dashes normalized). A malformed "LLM
 stream completed" line is a hard error — token totals are either exact or
 refused, never silently partial.
+
+For a run classified `agent_timeout`, the report also carries
+`timeout_last_tool_call_name`, `timeout_last_tool_call_status`,
+`timeout_seconds_since_last_event`, and
+`timeout_seconds_since_last_event_source`: what the agent was doing when
+Harbor killed it. Seconds-since is null with source `"unavailable"` when
+no event in the run carries a timestamp this tool can read (see
+`estimate_duration`'s two-tier extraction). `inferences` (the
+`usage_update` event count) doubles as the in-progress inference count at
+kill time; there is no separate field for it.
+
+`failure_detail` surfaces a `provider_failure`/`setup_failure` run's
+`error.message`, truncated to 300 characters. When that message is only
+"Internal error" (a JSON-RPC error whose real cause rides `data.turnFailed`
+in `acp.txt`, not `acp-summary.json`), this instead reads the matching
+`"LLM stream error: ..."` line from `acp.txt` next to RUN_DIR, if present.
 
 This reads real text kaijutsu and Harbor emit today. Where a match count
 in the output is zero, either nothing of that kind happened, or the
@@ -34,6 +63,7 @@ import json
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -359,7 +389,25 @@ def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallSt
 # ---------------------------------------------------------------------------
 
 
-def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) -> dict[str, Any]:
+def analyze_run(
+    events: list[dict[str, Any]],
+    summary: dict[str, Any] | None,
+    *,
+    trial_result: dict[str, Any] | None = None,
+    acp_log_path: Path | None = None,
+) -> dict[str, Any]:
+    """Analyze one run's events, with a summary that may be absent.
+
+    `trial_result` is the trial's Harbor `result.json` (one directory above
+    the run dir), read only for `exception_info.exception_type`: when
+    `summary` is None and it is `"AgentTimeoutError"`, `turn_end_class`
+    becomes `"agent_timeout"` instead of `"unclassified_stop_reason"`.
+    `acp_log_path` is the run's `agent/acp.txt`, read only to recover a
+    `provider_failure`/`setup_failure` run's real error text when
+    `acp-summary.json`'s `error.message` is the generic "Internal error".
+    Both are optional and every caller that omits them gets the same
+    report shape, with the fields they feed left null.
+    """
     tool_states: dict[str, ToolCallState] = {}
     tool_order: list[str] = []
     permission_events: list[dict[str, Any]] = []
@@ -576,6 +624,13 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
             successful_execution_after_edit = True
             break
 
+    inference_count = session_update_counts.get("usage_update", None)
+    # usage_update is emitted once per completed LLM turn in ACP; absent a
+    # usage_update stream, this is not derivable from events alone. Computed
+    # before classify_turn_end so an agent_timeout run can report it as
+    # "inferences so far".
+    latest_event_epoch_ms, latest_event_epoch_ms_source = _latest_event_epoch_ms(events)
+
     turn_end_class, turn_end_evidence = classify_turn_end(
         summary=summary,
         tools_by_recency=tools_by_recency,
@@ -586,6 +641,10 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
         spilled_last_two=spilled_last_two,
         last_edit_id=last_edit_id,
         successful_execution_after_edit=successful_execution_after_edit,
+        trial_result=trial_result,
+        inference_count=inference_count,
+        latest_event_epoch_ms=latest_event_epoch_ms,
+        latest_event_epoch_ms_source=latest_event_epoch_ms_source,
     )
 
     tool_calls_by_name: Counter[str] = Counter()
@@ -594,10 +653,6 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
         state = tool_states[tool_call_id]
         tool_calls_by_name[state.resolved_name()] += 1
         tool_calls_by_status[state.status or "unknown"] += 1
-
-    inference_count = session_update_counts.get("usage_update", None)
-    # usage_update is emitted once per completed LLM turn in ACP; absent a
-    # usage_update stream, this is not derivable from events alone.
 
     permission_requests_observed = len(permission_events)
     result: dict[str, Any] = {
@@ -629,6 +684,21 @@ def analyze_run(events: list[dict[str, Any]], summary: dict[str, Any] | None) ->
         "final_message_truncated": len(trailing_message) > FINAL_MESSAGE_LIMIT,
         "verdict": verdict,
         "verdict_reason": verdict_reason,
+        # Populated only when turn_end_class == "agent_timeout"; null otherwise,
+        # never omitted, so a reader can always look these keys up.
+        "timeout_last_tool_call_name": turn_end_evidence.get("last_tool_call_name")
+        if turn_end_class == "agent_timeout"
+        else None,
+        "timeout_last_tool_call_status": turn_end_evidence.get("last_tool_call_status")
+        if turn_end_class == "agent_timeout"
+        else None,
+        "timeout_seconds_since_last_event": turn_end_evidence.get("seconds_since_last_event")
+        if turn_end_class == "agent_timeout"
+        else None,
+        "timeout_seconds_since_last_event_source": turn_end_evidence.get("seconds_since_last_event_source")
+        if turn_end_class == "agent_timeout"
+        else None,
+        "failure_detail": failure_detail_for(summary, acp_log_path),
     }
     result.update(shell_command_stats(tool_order, tool_states))
 
@@ -654,18 +724,57 @@ def classify_turn_end(
     spilled_last_two: list[dict[str, Any]],
     last_edit_id: str | None,
     successful_execution_after_edit: bool,
+    trial_result: dict[str, Any] | None = None,
+    inference_count: int | None = None,
+    latest_event_epoch_ms: float | None = None,
+    latest_event_epoch_ms_source: str = "unavailable",
 ) -> tuple[str, dict[str, Any]]:
     """First-match-wins classification of how the turn ended.
 
-    Order: provider_failure/setup_failure, token_ceiling, iteration_cap,
-    cancelled, yielded_on_ask, yielded_on_async, output_starved,
-    completed_verified, ended_unverified. A stop reason this scheme does
-    not name (ACP also defines "refusal") reports as
-    unclassified_stop_reason with the raw value, rather than being folded
-    into a class it may not fit.
+    Order: agent_timeout (only when summary is absent), provider_failure/
+    setup_failure, token_ceiling, iteration_cap, cancelled, yielded_on_ask,
+    yielded_on_async, output_starved, completed_verified, ended_unverified.
+    A stop reason this scheme does not name (ACP also defines "refusal")
+    reports as unclassified_stop_reason with the raw value, rather than
+    being folded into a class it may not fit.
     """
     if summary is None:
-        return "unclassified_stop_reason", {"reason": "no acp-summary.json data available"}
+        exception_type = None
+        occurred_at = None
+        if isinstance(trial_result, dict):
+            exception_info = trial_result.get("exception_info")
+            if isinstance(exception_info, dict):
+                exception_type = exception_info.get("exception_type")
+                occurred_at = exception_info.get("occurred_at")
+
+        if exception_type != "AgentTimeoutError":
+            return "unclassified_stop_reason", {"reason": "no acp-summary.json data available"}
+
+        last_tool_call_name = last_tool_call_status = None
+        if tools_by_recency:
+            last_state = tool_states[tools_by_recency[-1]]
+            last_tool_call_name = last_state.resolved_name()
+            last_tool_call_status = last_state.status
+
+        seconds_since_last_event = None
+        seconds_since_last_event_source = "unavailable"
+        if latest_event_epoch_ms is not None:
+            occurred_epoch = _parse_iso(occurred_at)
+            if occurred_epoch is not None:
+                seconds_since_last_event = occurred_epoch - (latest_event_epoch_ms / 1000.0)
+                seconds_since_last_event_source = latest_event_epoch_ms_source
+
+        return "agent_timeout", {
+            "reason": (
+                "acp-summary.json absent; trial result.json's exception_info "
+                "records AgentTimeoutError"
+            ),
+            "last_tool_call_name": last_tool_call_name,
+            "last_tool_call_status": last_tool_call_status,
+            "seconds_since_last_event": seconds_since_last_event,
+            "seconds_since_last_event_source": seconds_since_last_event_source,
+            "inferences_so_far": inference_count,
+        }
 
     if "error" in summary:
         session = summary.get("session")
@@ -811,6 +920,140 @@ def parse_kernel_log(path: Path, session_id: str | None) -> dict[str, Any]:
     }
 
 
+def session_ids_in_events(events: list[dict[str, Any]]) -> list[str]:
+    """Distinct normalized session ids carried by session_update events'
+    `payload.session_id`, sorted. A trial's `acp.txt` belongs to exactly one
+    ACP session, so real data yields at most one id here; more than one
+    signals ambiguous session recovery to the caller.
+    """
+    ids: set[str] = set()
+    for event in events:
+        if event.get("event_type") != "session_update":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        sid = payload.get("session_id")
+        if isinstance(sid, str) and sid:
+            ids.add(normalize_session_id(sid))
+    return sorted(ids)
+
+
+def context_ids_in_kernel_log(path: Path) -> list[str]:
+    """Distinct normalized `context.id` values on "LLM stream completed" lines."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise SystemExit(f"cannot read {path}: {exc}") from exc
+    ids: set[str] = set()
+    for raw_line in raw.splitlines():
+        if "LLM stream completed" not in raw_line:
+            continue
+        clean = _ANSI_RE.sub("", raw_line)
+        match = _CONTEXT_ID_RE.search(clean)
+        if match:
+            ids.add(normalize_session_id(match.group(1)))
+    return sorted(ids)
+
+
+def resolve_session_id(
+    summary: dict[str, Any] | None,
+    events: list[dict[str, Any]] | None,
+    kernel_log_path: Path,
+) -> tuple[str | None, str | None, list[str]]:
+    """Resolve the ACP session id to scope a kernel log's tokens to.
+
+    Tries, in order: (1) `summary`'s `session.sessionId`, when present and
+    non-empty; (2) `events`' `session_update` events' `session_id`, when
+    exactly one distinct id appears; (3) `kernel_log_path`'s own "LLM
+    stream completed" lines' `context.id`, when exactly one distinct id
+    appears there. A trial's `acp.txt` belongs to exactly one agent
+    process serving one ACP session, so real data resolves at one of
+    these three stages.
+
+    Returns `(session_id, source, ids_seen)`. `source` is `"acp_summary"`,
+    `"acp_events"`, or `"kernel_log_single_context"` when a session id was
+    found — the caller maps these to the `tokens_source` values
+    `"kernel_log"`, `"kernel_log_events_session"`, and
+    `"kernel_log_single_context"` respectively. When none of the three
+    stages resolved to exactly one id, `session_id` and `source` are both
+    None and `ids_seen` carries the kernel log's own distinct context ids
+    (empty when it has no "LLM stream completed" lines at all, several
+    when it has more than one distinct id and neither `summary` nor
+    `events` disambiguated) — the caller's reason string names these.
+    """
+    if isinstance(summary, dict):
+        session = summary.get("session")
+        sid = session.get("sessionId") if isinstance(session, dict) else None
+        if isinstance(sid, str) and sid:
+            return sid, "acp_summary", [sid]
+
+    if events is not None:
+        ids = session_ids_in_events(events)
+        if len(ids) == 1:
+            return ids[0], "acp_events", ids
+
+    ids = context_ids_in_kernel_log(kernel_log_path)
+    if len(ids) == 1:
+        return ids[0], "kernel_log_single_context", ids
+    return None, None, ids
+
+
+# Anchored on the module-qualified form kaijutsu's own ERROR line emits
+# (mirroring "LLM stream completed"'s own scoping in parse_kernel_log), not
+# a bare "LLM stream error:" substring: a later WARN line logs the same
+# text again, Rust-Debug-quoted inside a `turnFailed` JSON blob (trailing
+# `")}) }` and all) when it relays the JSON-RPC error response — matching
+# that line too would carry that trailing artifact into failure_detail.
+_LLM_STREAM_ERROR_MARKER = "kaijutsu_kernel::runtime::llm_stream: LLM stream error: "
+_LLM_STREAM_ERROR_RE = re.compile(re.escape(_LLM_STREAM_ERROR_MARKER) + r"(.*)$")
+
+
+def extract_llm_stream_error(path: Path) -> str | None:
+    """The text after the last kaijutsu "LLM stream error: " line in a kernel log.
+
+    Used only to recover a provider_failure/setup_failure run's real cause
+    when `acp-summary.json`'s `error.message` is the generic "Internal
+    error" a JSON-RPC error's outer message carries — the specific cause
+    rides the kernel log's error line instead (`data.turnFailed` on the
+    wire, never written into `acp-summary.json`).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise SystemExit(f"cannot read {path}: {exc}") from exc
+    last: str | None = None
+    for raw_line in raw.splitlines():
+        if _LLM_STREAM_ERROR_MARKER not in raw_line:
+            continue
+        clean = _ANSI_RE.sub("", raw_line)
+        match = _LLM_STREAM_ERROR_RE.search(clean)
+        if match:
+            last = match.group(1).strip()
+    return last
+
+
+def failure_detail_for(summary: dict[str, Any] | None, acp_log_path: Path | None) -> str | None:
+    """A provider_failure/setup_failure run's error text, truncated to 300 chars.
+
+    None when `summary` carries no "error" (not a failed run) or that
+    error has no string message. When the message is only "Internal
+    error", falls back to `extract_llm_stream_error(acp_log_path)` when
+    that path is given and exists.
+    """
+    if not isinstance(summary, dict) or "error" not in summary:
+        return None
+    error = summary["error"]
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str):
+        return None
+    if message == "Internal error" and acp_log_path is not None and acp_log_path.is_file():
+        detail = extract_llm_stream_error(acp_log_path)
+        if detail:
+            message = detail
+    return message[:300]
+
+
 # ---------------------------------------------------------------------------
 # Duration
 # ---------------------------------------------------------------------------
@@ -857,6 +1100,46 @@ def estimate_duration(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {"duration_seconds": None, "duration_source": "unavailable"}
 
 
+def _latest_event_epoch_ms(events: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """The single latest wall-clock instant found among `events`, if any.
+
+    Same two-tier extraction as `estimate_duration` (literal timestamp
+    fields, else kaijutsu shell receipt `created_at`/`completed_at`), but
+    reports the maximum alone rather than a first-to-last span — used to
+    place an `agent_timeout` run's last known activity relative to when
+    Harbor killed it.
+    """
+    event_ms = find_epoch_ms_timestamps(events, _TIMESTAMP_KEYS)
+    if event_ms:
+        return max(event_ms), "event_timestamps"
+
+    receipt_ms: list[int] = []
+    for event in events:
+        if event.get("event_type") != "session_update":
+            continue
+        payload = event.get("payload")
+        update = payload.get("update") if isinstance(payload, dict) else None
+        if not isinstance(update, dict):
+            continue
+        text = content_text(update.get("content"))
+        if text:
+            receipt_ms.extend(extract_receipt_epoch_ms(text))
+    if receipt_ms:
+        return max(receipt_ms), "operation_receipt_timestamps"
+
+    return None, "unavailable"
+
+
+def _parse_iso(ts: Any) -> float | None:
+    """Parse an ISO-8601 timestamp (bare offset or trailing 'Z') to epoch seconds."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -888,6 +1171,15 @@ def format_text(report: dict[str, Any]) -> str:
         )
         + ")",
     ]
+    if report["turn_end_class"] == "agent_timeout":
+        lines.append(
+            f"timeout: last_tool_call={report['timeout_last_tool_call_name']} "
+            f"({report['timeout_last_tool_call_status']}), "
+            f"seconds_since_last_event={report['timeout_seconds_since_last_event']} "
+            f"(source: {report['timeout_seconds_since_last_event_source']})"
+        )
+    if report["failure_detail"]:
+        lines.append(f"failure_detail: {report['failure_detail']}")
     if "duration_seconds" in report:
         lines.append(
             f"duration_seconds: {report['duration_seconds']} (source: {report['duration_source']})"
@@ -917,7 +1209,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "run_dir",
         type=Path,
-        help="Run directory containing acp-events.jsonl and acp-summary.json (both required).",
+        help=(
+            "Run directory containing acp-events.jsonl (required). "
+            "acp-summary.json is read when present; its absence is normal "
+            "for a still-running or Harbor-timed-out trial, not an error "
+            "(see --trial-result)."
+        ),
     )
     parser.add_argument(
         "--format",
@@ -932,7 +1229,23 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Path to a kaijutsu kernel log to sum per-inference token counts from. "
             "Optional; omitted, no token totals are reported. A malformed "
-            "'LLM stream completed' line is a hard error, not a skipped line."
+            "'LLM stream completed' line is a hard error, not a skipped line. "
+            "Session id is resolved in order from acp-summary.json, "
+            "acp-events.jsonl, then this log's own single context id (see "
+            "resolve_session_id); unresolved, the whole file is summed "
+            "unscoped, as an under-determined last resort."
+        ),
+    )
+    parser.add_argument(
+        "--trial-result",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the trial's result.json (Harbor layout: one directory "
+            "above RUN_DIR, which is agent/). Read only for exception_info: "
+            "when acp-summary.json is absent and this names an "
+            "AgentTimeoutError, turn_end_class becomes 'agent_timeout' "
+            "instead of 'unclassified_stop_reason'."
         ),
     )
     args = parser.parse_args(argv)
@@ -941,18 +1254,24 @@ def main(argv: list[str] | None = None) -> int:
     summary_path = args.run_dir / "acp-summary.json"
     if not events_path.is_file():
         raise SystemExit(f"{events_path} not found; classify_run needs the run's captured events")
-    if not summary_path.is_file():
-        raise SystemExit(f"{summary_path} not found; classify_run needs the run's stop reason")
 
     events = load_jsonl(events_path)
-    summary = load_summary(summary_path)
+    summary = load_summary(summary_path) if summary_path.is_file() else None
+    trial_result = load_summary(args.trial_result) if args.trial_result is not None else None
+    acp_log_path = args.run_dir / "acp.txt"
 
-    report = analyze_run(events, summary)
+    report = analyze_run(
+        events,
+        summary,
+        trial_result=trial_result,
+        acp_log_path=acp_log_path if acp_log_path.is_file() else None,
+    )
     report.update(estimate_duration(events))
 
     if args.kernel_log is not None:
-        session = summary.get("session")
-        session_id = session.get("sessionId") if isinstance(session, dict) else None
+        session_id, _source, ids_seen = resolve_session_id(summary, events, args.kernel_log)
+        if session_id is None:
+            report["kernel_log_session_resolution_ids_seen"] = ids_seen
         report.update(parse_kernel_log(args.kernel_log, session_id))
 
     if args.format == "json":

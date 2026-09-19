@@ -491,7 +491,15 @@ more readily than other agents". Open, most costly first:
   tail, with the exit code remapped to 3 on spill
   (`runtime/embedded_kaish.rs`, `runtime/command_result.rs`). A failing test
   suite is mostly unreadable to the model.
-- **`max_tokens` ends the turn** with no automatic continuation.
+- **A turn can still spend several output ceilings.** A ceiling stop now
+  continues the turn with a notice instead of ending it, bounded by
+  `MAX_OUTPUT_CEILING_CONTINUATIONS` (`runtime/llm_stream.rs`); see
+  `docs/conversation-session.md`, "When an inference stops at the output
+  ceiling". A model that reasons past the ceiling every time therefore costs
+  up to that many ceilings before the turn ends anyway. Measure continuations
+  per turn and how many of them recovered in the next benchmark arm before
+  tuning the bound, and decide there whether the notice should also lower
+  `effort` for the continuation.
 - **No cumulative token count.** `context_usage` is a last-call snapshot, no
   real run emitted an ACP `usage_update`, and `PromptResponse.usage` is unset,
   so Harbor's token columns are empty. Totals come from the kernel log's
@@ -511,18 +519,18 @@ more readily than other agents". Open, most costly first:
 From the first Terminal-Bench 2.0 runs in containers (jobs under
 `~/src/bench-work/harbor/jobs/kj-calib-1`):
 
-- **A truncated tool call fails the whole turn.** On `regex-log` the model's
-  `write` call arrived with its JSON arguments cut off ("EOF while parsing a
-  string at line 1 column 7174"), `runtime/llm_stream.rs` raised "LLM stream
-  error: tool_call input JSON parse failed", the turn failed, and the ACP
-  client saw only "Internal error". The model never learned its call was cut
-  off. Likely cause, not confirmed: the output ceiling (factory `max_tokens`
-  16384 with effort max, so reasoning spends the same budget). Return an
-  error tool result that says the call was cut off and how large it was, and
-  continue the turn; surface the provider's finish reason when it is `length`.
-  `kaijutsu-solo-acp --max-tokens <N>` (2026-09-18, `docs/solo-acp.md`) lets a
-  benchmark operator raise the ceiling as a workaround; the truncation failure
-  mode itself, and every other caller of the factory default, are unchanged.
+- **A mid-stream transport failure still fails the turn.** The recorded runs
+  carry "error decoding response body" and "Connection closed" after content
+  had already streamed into blocks. Retrying there means deciding what happens
+  to the partial blocks the first attempt wrote, which the stream-start retry
+  policy does not cover; `runtime/llm_stream.rs` deliberately does not retry
+  mid-stream to avoid duplicate kernel blocks. Bring partial-block handling to
+  the design before changing it.
+- **The factory output ceiling is small for effort max.** `max_tokens` 16384
+  with effort max means reasoning spends the same budget, which is what
+  truncated the `write` call on `regex-log`. `kaijutsu-solo-acp --max-tokens
+  <N>` (2026-09-18, `docs/solo-acp.md`) lets a benchmark operator raise it;
+  every other caller of the factory default is unchanged.
 - **The iteration cap assumes a human is present.** `sqlite-with-gcov` stopped
   at "Paused after 50 agentic iteration(s) (consent: collaborative). Send a
   follow-up to continue". A driven worker has nobody to send one. The cap and
@@ -549,6 +557,20 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   its dumpable flag, which stops a same-uid reader but not root. A provider key
   that reaches the kernel by environment is readable there; use a run-scoped
   key in a disposable container.
+- **`--consent` on a context is accepted and does nothing.** `kj context
+  create --consent` and `kj context set --consent` both write
+  `ContextRow.consent_mode` through the shared `ContextConfigArgs`
+  (`kj/context.rs:38-40`, flattened into `Create` at `:125` and `Set` at
+  `:156`; the write is `db.update_settings` at `:551`). The turn loop never
+  reads that row: `runtime/llm_stream.rs:1755` takes
+  `kernel.consent_mode().await`, the kernel-wide value, under a TODO at
+  `:1751-1754` that names the split and points here. So a per-context consent
+  mode is stored, reported back by `kj context info` (`:1011`), and ignored by
+  the iteration cap it appears to set. `kaijutsu-solo-acp --consent` is the
+  available workaround and sets the kernel-wide value
+  (`Kernel::set_consent_mode`, `kernel.rs:1904`), which is why the benchmark
+  arms carry a consent mode at all. Decide per-context resolution or retire
+  the field; see "Consent setting ownership" above for the constraints.
 
 ## `SoloState::prepare(None)` shares one temp-directory registry per test binary (2026-09-18)
 

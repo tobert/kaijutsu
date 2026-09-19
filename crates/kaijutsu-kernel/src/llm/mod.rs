@@ -103,6 +103,12 @@ pub struct MockClient {
     /// for that model — a fixture bug, not a fallback case.
     script_by_model:
         Option<Arc<parking_lot::Mutex<HashMap<String, ScriptedModelQueue>>>>,
+    /// The message list each `Provider::stream` call received, in call order,
+    /// when a test asked for it with `recording_sent_messages`. Mocked events
+    /// say what the model produced; this says what the provider was actually
+    /// handed — the only way a test can pin the shape of a request the wire
+    /// would have to accept. `None` records nothing.
+    sent: Option<Arc<parking_lot::Mutex<Vec<Vec<Message>>>>>,
 }
 
 /// One model's scripted turns plus the count it started with, so an
@@ -128,7 +134,18 @@ impl MockClient {
             event_delay: std::time::Duration::ZERO,
             script_dir: None,
             script_by_model: None,
+            sent: None,
         }
+    }
+
+    /// Builder: record the message list handed to every `Provider::stream`
+    /// call. The returned handle reads them in call order.
+    pub fn recording_sent_messages(
+        mut self,
+    ) -> (Self, Arc<parking_lot::Mutex<Vec<Vec<Message>>>>) {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        self.sent = Some(sent.clone());
+        (self, sent)
     }
 
     /// Builder: make `prompt`/`prompt_with_system` sleep `delay` before
@@ -974,6 +991,9 @@ impl Provider {
             Self::CodexApp(client) => client.stream(opts, messages).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
+                if let Some(sent) = &mock.sent {
+                    sent.lock().push(messages.clone());
+                }
                 if !mock.stream_start_delay.is_zero() {
                     tokio::time::sleep(mock.stream_start_delay).await;
                 }

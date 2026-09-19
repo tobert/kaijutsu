@@ -40,6 +40,9 @@ impl TurnLease {
         assert!(self.delivery.is_none(), "one score delivery per admitted turn");
         self.delivery = Some(delivery);
     }
+    /// Whether a timed delivery waits on this turn. Work a beat is waiting for
+    /// takes no inference its caller did not budget for.
+    pub(crate) fn owes_timed_delivery(&self) -> bool { self.delivery.is_some() }
     pub(super) async fn finish(mut self, event: &crate::flows::TurnFlow) {
         assert_eq!(self.id, event.turn_id(), "terminal outcome belongs to its lease");
         if let Some(delivery) = self.delivery.take() {
