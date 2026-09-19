@@ -77,6 +77,24 @@ pub enum BlockStoreError {
     /// `insert_or_reconcile_document`.
     #[error("document {id} diverged from its persisted row: {detail}")]
     DocumentDiverged { id: ContextId, detail: String },
+
+    /// The document's persisted compaction snapshot could not be decoded or
+    /// restored into a `BlockDocument`. The context was refused rather than
+    /// loaded empty or partial, and its row is untouched — every other
+    /// context keeps loading. See `load_one_from_db`.
+    #[error("context {context} not loaded: snapshot is corrupt ({reason})")]
+    CorruptSnapshot { context: ContextId, reason: String },
+
+    /// One of the document's persisted oplog entries, at sequence `seq`,
+    /// could not be decoded or replayed. The context was refused rather
+    /// than loaded partial or truncated, and its rows are untouched — every
+    /// other context keeps loading. See `load_one_from_db`.
+    #[error("context {context} not loaded: oplog entry {seq} is corrupt ({reason})")]
+    CorruptOplog {
+        context: ContextId,
+        seq: i64,
+        reason: String,
+    },
 }
 
 /// Result type alias for BlockStore operations.
@@ -3244,7 +3262,13 @@ impl BlockStore {
     ///
     /// Returns `true` if the document was loaded, `false` if it was already
     /// present or not found in the database. This is an explicit hydration
-    /// path — not called automatically on `get()`.
+    /// path — not called automatically on `get()`. A persisted snapshot or
+    /// oplog entry that fails to decode, restore, or replay refuses the
+    /// context with an `Err` instead — `Ok(false)` is reserved for "already
+    /// loaded" and "no such document"; it never stands in for corruption. A
+    /// refused context is left out of the in-memory store, exactly like a
+    /// document that failed to load for any other reason, and its rows are
+    /// left untouched for recovery.
     pub fn load_one_from_db(&self, context_id: ContextId) -> BlockStoreResult<bool> {
         use dashmap::mapref::entry::Entry;
 
@@ -3273,36 +3297,29 @@ impl BlockStore {
 
         // Load base snapshot if available. `snap_row.version` is the context
         // version it was taken at — see the version note in `load_from_db`.
-        let (mut document, base_seq, base_version) = match db_guard.load_latest_snapshot(context_id) {
-            Ok(Some(snap_row)) => {
-                match codec::decode::<StoreSnapshot>(&snap_row.state) {
-                    Ok(store_snapshot) => {
-                        tracing::debug!(
-                            document_id = %context_id.to_hex(),
-                            blocks = store_snapshot.blocks.len(),
-                            snap_seq = snap_row.seq,
-                            snap_version = snap_row.version,
-                            "Hydrated document from snapshot"
-                        );
-                        match BlockDocument::from_snapshot(store_snapshot, principal_id) {
-                            Ok(store) => (store, snap_row.seq, snap_row.version.max(0) as u64),
-                            Err(e) => {
-                                tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to restore snapshot");
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to deserialize snapshot");
-                        return Ok(false);
-                    }
-                }
+        let (mut document, base_seq, base_version) = match db_guard
+            .load_latest_snapshot(context_id)
+            .map_err(|e| BlockStoreError::Db(e.to_string()))?
+        {
+            Some(snap_row) => {
+                let store_snapshot = codec::decode::<StoreSnapshot>(&snap_row.state).map_err(|e| {
+                    tracing::error!(document_id = %context_id.to_hex(), error = %e, "Refusing to load context: snapshot failed to decode");
+                    BlockStoreError::CorruptSnapshot { context: context_id, reason: e.to_string() }
+                })?;
+                tracing::debug!(
+                    document_id = %context_id.to_hex(),
+                    blocks = store_snapshot.blocks.len(),
+                    snap_seq = snap_row.seq,
+                    snap_version = snap_row.version,
+                    "Hydrated document from snapshot"
+                );
+                let store = BlockDocument::from_snapshot(store_snapshot, principal_id).map_err(|e| {
+                    tracing::error!(document_id = %context_id.to_hex(), error = %e, "Refusing to load context: snapshot failed to restore");
+                    BlockStoreError::CorruptSnapshot { context: context_id, reason: e.to_string() }
+                })?;
+                (store, snap_row.seq, snap_row.version.max(0) as u64)
             }
-            Ok(None) => (BlockDocument::new(context_id, principal_id), 0, 0),
-            Err(e) => {
-                tracing::warn!(document_id = %context_id.to_hex(), error = %e, "Failed to load snapshot");
-                return Ok(false);
-            }
+            None => (BlockDocument::new(context_id, principal_id), 0, 0),
         };
 
         // Replay oplog entries since the snapshot
@@ -3315,28 +3332,14 @@ impl BlockStore {
         for (seq, payload_bytes) in &oplog_entries {
             max_seq = max_seq.max(*seq);
             total_bytes += payload_bytes.len() as u64;
-            match codec::decode::<SyncPayload>(payload_bytes) {
-                Ok(payload) => {
-                    if let Err(e) = document.merge_ops(payload) {
-                        tracing::warn!(
-                            document_id = %context_id.to_hex(),
-                            seq = seq,
-                            error = %e,
-                            "Failed to replay oplog entry"
-                        );
-                        return Ok(false);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        document_id = %context_id.to_hex(),
-                        seq = seq,
-                        error = %e,
-                        "Failed to deserialize oplog entry"
-                    );
-                    return Ok(false);
-                }
-            }
+            let payload = codec::decode::<SyncPayload>(payload_bytes).map_err(|e| {
+                tracing::error!(document_id = %context_id.to_hex(), seq = seq, error = %e, "Refusing to load context: oplog entry failed to decode");
+                BlockStoreError::CorruptOplog { context: context_id, seq: *seq, reason: e.to_string() }
+            })?;
+            document.merge_ops(payload).map_err(|e| {
+                tracing::error!(document_id = %context_id.to_hex(), seq = seq, error = %e, "Refusing to load context: oplog entry failed to replay");
+                BlockStoreError::CorruptOplog { context: context_id, seq: *seq, reason: e.to_string() }
+            })?;
         }
 
         if !oplog_entries.is_empty() {
@@ -8266,6 +8269,137 @@ mod tests {
 
         let eager = drop_and_reload(db, ws);
         assert_eq!(eager.version(ctx).unwrap(), before);
+    }
+
+    /// A snapshot row that fails to decode must refuse the context loudly
+    /// (docs/issues.md, "Turn execution and shell settlement") instead of
+    /// reporting `Ok(false)`, the same result an absent document gives. The
+    /// row is untouched, the context stays out of the in-memory store, and a
+    /// second, healthy context in the same database is unaffected.
+    #[test]
+    fn load_one_from_db_refuses_a_context_with_an_undecodable_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "hello", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let healthy = ContextId::new();
+        store.create_document(healthy, DocumentKind::Conversation, None).unwrap();
+        store
+            .insert_block(
+                healthy, None, None, Role::User, BlockKind::Text,
+                "fine", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        db.lock()
+            .write_snapshot_and_truncate(ctx, 0, 1, b"not a valid StoreSnapshot")
+            .unwrap();
+        drop(store);
+
+        let reloaded = BlockStore::with_db(db.clone(), ws, PrincipalId::system());
+        let err = reloaded.load_one_from_db(ctx).unwrap_err();
+        assert!(
+            matches!(&err, BlockStoreError::CorruptSnapshot { context, .. } if *context == ctx),
+            "unexpected error: {err:?}"
+        );
+        assert!(!reloaded.contains(ctx), "a refused context must not enter the in-memory store");
+
+        assert!(
+            reloaded.load_one_from_db(healthy).unwrap(),
+            "a healthy context in the same database must still load"
+        );
+    }
+
+    /// An oplog row that fails to decode must refuse the context the same
+    /// way a corrupt snapshot does, naming the offending sequence number.
+    #[test]
+    fn load_one_from_db_refuses_a_context_with_an_undecodable_oplog_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "hello", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let healthy = ContextId::new();
+        store.create_document(healthy, DocumentKind::Conversation, None).unwrap();
+        store
+            .insert_block(
+                healthy, None, None, Role::User, BlockKind::Text,
+                "fine", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        db.lock().append_op(ctx, 999, b"not a valid SyncPayload").unwrap();
+        drop(store);
+
+        let reloaded = BlockStore::with_db(db.clone(), ws, PrincipalId::system());
+        let err = reloaded.load_one_from_db(ctx).unwrap_err();
+        assert!(
+            matches!(&err, BlockStoreError::CorruptOplog { context, seq: 999, .. } if *context == ctx),
+            "unexpected error: {err:?}"
+        );
+        assert!(!reloaded.contains(ctx), "a refused context must not enter the in-memory store");
+
+        assert!(
+            reloaded.load_one_from_db(healthy).unwrap(),
+            "a healthy context in the same database must still load"
+        );
+    }
+
+    /// An oplog row that decodes but fails to replay (a text edit past the
+    /// end of a block it names) is corruption too, and must refuse the
+    /// context rather than silently drop or truncate the edit.
+    #[test]
+    fn load_one_from_db_refuses_a_context_with_an_oplog_entry_that_fails_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        let block_id = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "hi", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let healthy = ContextId::new();
+        store.create_document(healthy, DocumentKind::Conversation, None).unwrap();
+        store
+            .insert_block(
+                healthy, None, None, Role::User, BlockKind::Text,
+                "fine", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+
+        let bad_payload = SyncPayload {
+            block_ops: vec![(block_id, TextEdit { pos: Some(9_999), insert: "x".into(), delete: 0 })],
+            new_blocks: Vec::new(),
+            updated_headers: Vec::new(),
+            deleted_blocks: Vec::new(),
+            updated_snapshots: Vec::new(),
+        };
+        let bytes = codec::encode(&bad_payload).expect("encode payload");
+        db.lock().append_op(ctx, 999, &bytes).unwrap();
+        drop(store);
+
+        let reloaded = BlockStore::with_db(db.clone(), ws, PrincipalId::system());
+        let err = reloaded.load_one_from_db(ctx).unwrap_err();
+        assert!(
+            matches!(&err, BlockStoreError::CorruptOplog { context, seq: 999, .. } if *context == ctx),
+            "unexpected error: {err:?}"
+        );
+        assert!(!reloaded.contains(ctx), "a refused context must not enter the in-memory store");
+
+        assert!(
+            reloaded.load_one_from_db(healthy).unwrap(),
+            "a healthy context in the same database must still load"
+        );
     }
 
     /// The version rides on the event, not on the delivery, so a subscriber can

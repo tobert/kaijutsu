@@ -133,10 +133,11 @@ Kaibo's identity review found remaining adapter policy/provenance gaps:
 - File-tool edit/write and cached `MountBackend` writes still drop their
   invoking performer. Carry the actor through `FileDocumentCache` replacement
   and edit operations; keep file hydration distinct from later player input.
-- `BlockStore::load_one_from_db` reports snapshot decode/restore/read and
-  oplog decode/replay failures as `Ok(false)`, the same result as an absent
-  document. Give corruption and I/O failures explicit errors at the store
-  boundary; propagating adapter errors alone cannot distinguish them.
+- `BlockStore::load_one_from_db` now refuses a corrupt context with
+  `CorruptSnapshot` or `CorruptOplog`. The bulk boot path `load_from_db` still
+  logs and skips a corrupt document, so after boot it is absent with only a
+  log line as evidence (an explicit load then reports the error). Return the
+  skipped contexts and their errors to the caller so startup can surface them.
 Review evidence and disposition are under
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
