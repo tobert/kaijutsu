@@ -2863,13 +2863,23 @@ experiment" — treat `Editor` as provisional until that sweep.
 
 ## Shell settlement follow-ups
 
-- **Spill masks a later failure.** `seq 1 5000; false` reports exit 0 with
-  `did_spill`: kaish's `accumulate_result` keeps the first statement's
-  `original_code` and `runtime/command_result.rs:191` reads
-  `original_code.unwrap_or(code)`. `docs/shell-envelope.md` says the real exit
-  judges a capped result. Decide whether kaish or the glue changes. The ignored
-  test `spilled_statement_does_not_mask_a_later_failure` in
-  `mcp/servers/shell.rs` becomes the regression.
+- **Spill masks a later failure: fixed upstream, pin not moved.** kaish
+  `adc39f1f` (tobert/kaish#454) assigns `original_code` like `code`, so
+  `seq 1 5000; false` reports a real exit of 1 and `seq 1 5000; exit 5`
+  reports 5. The glue in `runtime/command_result.rs` needs no change. Move the
+  `[patch.crates-io]` rev, review what else lies between the two revs, and
+  un-ignore `spilled_statement_does_not_mask_a_later_failure` in
+  `mcp/servers/shell.rs`.
+- **`did_spill` misses nested spills (kaish, open upstream).** Only a
+  top-level statement's spill reaches the program-level flag.
+  `x=$(seq 1 100000)` truncates the captured value and reports
+  `did_spill: false`; the same holds inside function bodies and `if`/`while`
+  conditions. The shell envelope presents `did_spill` as "output was capped",
+  so a caller can believe it received everything. Also upstream:
+  `seq 1 100000 && echo YES` never runs the right side, because the spilled
+  left operand is remapped to exit 3 before `&&` reads it, while
+  `if seq 1 100000` is true. The kaish lead has a follow-up PR approved; check
+  `docs/shell-envelope.md` wording when it lands.
 - **No timeout knob on the server kernel**, so the wire timeout test proxies
   with `exit 124`; a real one needs an injectable `TimeoutPolicy`.
 - **A failed wake after a completion notice is never retried.**
