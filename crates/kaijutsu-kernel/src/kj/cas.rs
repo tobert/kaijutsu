@@ -355,6 +355,16 @@ pub fn is_supported_image_mime(mime: &str) -> bool {
 /// type and, when one was found, the detected type — no silent fallback and
 /// no re-labeling to the sniffed type.
 pub fn validate_image_bytes(declared_mime: &str, data: &[u8]) -> Result<(), String> {
+    if declared_mime == "image/svg+xml" {
+        // SVG has no magic number: accept XML text whose opening names an
+        // `<svg` element.
+        let head = String::from_utf8_lossy(&data[..data.len().min(1024)]);
+        return if head.trim_start_matches('\u{feff}').trim_start().starts_with('<') && head.contains("<svg") {
+            Ok(())
+        } else {
+            Err(format!("declared image type '{declared_mime}' but the bytes do not open an <svg> element"))
+        };
+    }
     match sniff_image_format(data) {
         Some(fmt) if fmt.mime() == declared_mime => Ok(()),
         Some(fmt) => Err(format!(
@@ -442,6 +452,14 @@ mod tests {
         for brand in compatible { data.extend_from_slice(*brand); }
         data.extend_from_slice(b"\0\0\0\x08mdat");
         data
+    }
+
+    #[test]
+    fn validate_accepts_svg_text_and_refuses_other_text_named_svg() {
+        let svg = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+        assert!(validate_image_bytes("image/svg+xml", svg).is_ok());
+        assert!(validate_image_bytes("image/svg+xml", b"plain text").is_err());
+        assert!(validate_image_bytes("image/svg+xml", REAL_PNG).is_err());
     }
 
     #[test]
