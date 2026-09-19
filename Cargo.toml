@@ -224,9 +224,9 @@ tempfile = "3"
 
 # Whole-program async kaish API, reviewed in tobert/kaish#445.
 [patch.crates-io]
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
-kaish-types = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
-kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
-kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
-kaish-glob = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "a9807a64078f136b7a559e8fbde562086149889f" }
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "adc39f1f792c2cca92f1476f3201e1c0cb13fd85" }

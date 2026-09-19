@@ -2142,15 +2142,11 @@ mod tests {
         }
     }
 
-    /// KNOWN DEFECT (not fixed here): when a spilled statement is followed by
-    /// a failing one, the program reports exit 0. kaish's `accumulate_result`
-    /// (kaish-kernel kernel.rs) keeps the FIRST statement's `original_code`
-    /// (0, the spilled `seq`) while `code` follows the last statement (1);
-    /// kaijutsu's envelope reads `original_code.unwrap_or(code)`
-    /// (runtime/command_result.rs:191) and so reports the spilled statement's
-    /// exit, hiding the later failure. docs/shell-envelope.md says a capped
-    /// result is "judged by the command's real exit".
-    #[ignore = "seq 1 5000; false reports exit 0 with did_spill: original_code from the spilled statement masks the last statement's failure (kaish accumulate_result vs command_result.rs:191)"]
+    /// A capped result is judged by the program's real exit, which is the
+    /// last statement's. A spilled statement followed by a failing one reports
+    /// the failure and still says output was capped. kaish assigns
+    /// `original_code` per statement, so the envelope's
+    /// `original_code.unwrap_or(code)` reads the last statement's exit.
     #[tokio::test]
     async fn spilled_statement_does_not_mask_a_later_failure() {
         let (broker, d) = wired().await;

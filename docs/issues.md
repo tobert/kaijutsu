@@ -2865,13 +2865,6 @@ experiment" — treat `Editor` as provisional until that sweep.
 
 ## Shell settlement follow-ups
 
-- **Spill masks a later failure: fixed upstream, pin not moved.** kaish
-  `adc39f1f` (tobert/kaish#454) assigns `original_code` like `code`, so
-  `seq 1 5000; false` reports a real exit of 1 and `seq 1 5000; exit 5`
-  reports 5. The glue in `runtime/command_result.rs` needs no change. Move the
-  `[patch.crates-io]` rev, review what else lies between the two revs, and
-  un-ignore `spilled_statement_does_not_mask_a_later_failure` in
-  `mcp/servers/shell.rs`.
 - **`did_spill` misses nested spills (kaish, open upstream).** Only a
   top-level statement's spill reaches the program-level flag.
   `x=$(seq 1 100000)` truncates the captured value and reports
