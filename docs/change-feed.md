@@ -141,7 +141,7 @@ the rule). Non-append producers reaching *conversation* blocks:
 
 | producer | site |
 |---|---|
-| MCP `block_edit` | `kernel/src/mcp/servers/block.rs` (~`:877-969`) |
+| MCP `block_edit` | `kernel/src/mcp/servers/block.rs`, the `block_edit` handler and `simulate_edit_op` |
 | MCP `block_splice` | `kernel/src/mcp/servers/block.rs:414-421` — a *separate* tool |
 | `kj block edit` | `kernel/src/kj/block.rs:858-963` |
 | kaish VFS write to `/docs/<ctx>/<block>` | `kernel/src/runtime/kaish_backend.rs:348-382` |

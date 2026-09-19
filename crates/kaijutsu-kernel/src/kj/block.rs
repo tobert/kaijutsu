@@ -1782,7 +1782,7 @@ impl KjDispatcher {
         let obj_path = cas.path(&hash).ok_or_else(|| {
             format!("CAS hash {hash} not found — cannot verify it is a {content_type} image")
         })?;
-        let mut header = [0u8; 32];
+        let mut header = [0u8; super::cas::SNIFF_LEN];
         let n = {
             use std::io::Read;
             std::fs::File::open(&obj_path)

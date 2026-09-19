@@ -117,8 +117,10 @@ impl KjDispatcher {
         // its own staging file (see `StreamingWriter`'s `Drop`).
         let needs_image_check = is_supported_image_mime(mime);
         let mut image_checked = !needs_image_check;
+        let mut first = true;
         loop {
-            let n = match file.read(&mut buf) {
+            let read = if std::mem::take(&mut first) { read_header(&mut file, &mut buf) } else { file.read(&mut buf) };
+            let n = match read {
                 Ok(n) => n,
                 Err(e) => return KjResult::Err(format!("kj cas put: {}: {}", path_str, e)),
             };
@@ -322,8 +324,16 @@ pub fn sniff_image_format(data: &[u8]) -> Option<SniffedImageFormat> {
     if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         return Some(SniffedImageFormat::WebP);
     }
-    if data.len() >= 12 && &data[4..8] == b"ftyp" && matches!(&data[8..12], b"avif" | b"avis") {
-        return Some(SniffedImageFormat::Avif);
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        // An AVIF file may carry a HEIF major brand and name `avif` only
+        // among the compatible brands, which follow the 4-byte minor version.
+        let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let end = size.clamp(12, data.len());
+        let major = &data[8..12];
+        let compatible = data.get(16..end).unwrap_or(&[]).chunks_exact(4);
+        if std::iter::once(major).chain(compatible).any(|brand| matches!(brand, b"avif" | b"avis")) {
+            return Some(SniffedImageFormat::Avif);
+        }
     }
     None
 }
@@ -356,6 +366,22 @@ pub fn validate_image_bytes(declared_mime: &str, data: &[u8]) -> Result<(), Stri
              format (checked PNG, JPEG, GIF, WebP, AVIF magic numbers)"
         )),
     }
+}
+
+/// Bytes a caller should offer [`sniff_image_format`]: enough for an `ftyp`
+/// box with a long compatible-brands list.
+pub const SNIFF_LEN: usize = 64;
+
+/// Read until `buf` holds at least [`SNIFF_LEN`] bytes or the reader ends.
+fn read_header(reader: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < SNIFF_LEN.min(buf.len()) {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 pub fn mime_from_extension(path: &str) -> &'static str {
@@ -406,6 +432,49 @@ impl Classify for CasCommand {
 #[cfg(test)]
 mod tests {
     use super::{sniff_image_format, validate_image_bytes, SniffedImageFormat};
+
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let size = (16 + 4 * compatible.len()) as u32;
+        let mut data = size.to_be_bytes().to_vec();
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(major);
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        for brand in compatible { data.extend_from_slice(*brand); }
+        data.extend_from_slice(b"\0\0\0\x08mdat");
+        data
+    }
+
+    #[test]
+    fn sniff_accepts_avif_named_only_in_the_compatible_brands() {
+        let data = ftyp(b"mif1", &[b"mif1", b"avif", b"miaf"]);
+        assert_eq!(sniff_image_format(&data), Some(SniffedImageFormat::Avif));
+    }
+
+    #[test]
+    fn sniff_refuses_a_heif_container_without_an_avif_brand() {
+        let data = ftyp(b"mif1", &[b"mif1", b"heic"]);
+        assert_eq!(sniff_image_format(&data), None);
+    }
+
+    /// A pipe or device may return a few bytes per read; the sniff needs the
+    /// header whole.
+    #[test]
+    fn read_header_fills_across_short_reads() {
+        struct Trickle<'a>(&'a [u8]);
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(3).min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let mut buf = vec![0u8; 4096];
+        let n = super::read_header(&mut Trickle(REAL_PNG), &mut buf).unwrap();
+        assert!(n >= super::SNIFF_LEN.min(REAL_PNG.len()), "read {n} bytes");
+        assert_eq!(sniff_image_format(&buf[..n]), Some(SniffedImageFormat::Png));
+    }
+
     use crate::kj::test_helpers::{test_caller, test_dispatcher};
     use kaijutsu_cas::ContentStore;
     use std::sync::Arc;
