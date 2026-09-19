@@ -31,7 +31,8 @@ work. `docs/audio-inference.md` records the workload and measured costs.
 3. **Align execution with that proof.** Audit admission through completion
    and commitment against exact work ownership and intended musical time.
    Keep slow preparation outside timeline locks; give attempts bounded
-   resource admission and explicit cancellation/shutdown behavior. Preserve
+   resource admission (`docs/resource-admission.md`) and explicit
+   cancellation/shutdown behavior. Preserve
    a small synchronous commit step. Use existing runtime and resolver seams;
    delete superseded paths as the scenario starts passing.
 4. **Expose the feedback needed to play.** Record intended musical time,
@@ -2893,7 +2894,7 @@ experiment" — treat `Editor` as provisional until that sweep.
   Approval delivery loses its wake the same way by design, but keeps a
   redeemable answer. Decide between recording an owed wake durably and
   reserving turn admission before the notice insert; see the resource admission
-  memo, `~/exomemory/kaijutsu/resource-admission-design-2026-09-19.md`.
+  design, `docs/resource-admission.md`, "Known hazards".
 - **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);
   the mailbox notice block for a paused PostCall; wire-level interactive cancel
   (no wire cancel exists for durable interactive commands).
