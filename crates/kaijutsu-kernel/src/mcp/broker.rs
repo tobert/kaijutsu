@@ -4898,7 +4898,7 @@ mod tests {
         }
     }
 
-    // ── Phase 3 M2: trait defaults for resource methods ───────────────
+    // ── McpServerLike trait defaults for resource methods ───────────────
 
     /// A minimal `McpServerLike` that does NOT override the resource
     /// methods. Used to prove the trait default returns `Unsupported`.
@@ -5777,7 +5777,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // Phase 2 (M3) — notification emission
+    // Notification emission: ToolAdded, ToolRemoved, and Coalesced blocks
     // ═════════════════════════════════════════════════════════════════════
 
     use crate::block_store::{SharedBlockStore, shared_block_store};
@@ -6284,7 +6284,7 @@ mod tests {
         );
     }
 
-    // ── Phase 3 M3: resource dispatch + subscription lifecycle ───────
+    // ── Resource dispatch and subscription lifecycle ───────
 
     use crate::mcp::KernelResource;
     use crate::mcp::KernelResourceContents;
@@ -6907,7 +6907,7 @@ mod tests {
         );
     }
 
-    // ── Phase 3 post-review bugfixes ────────────────────────────────────
+    // ── Regression coverage for unregister and subscription races ────────────────────────────────────
 
     /// Bug #1 (unregister subscription-leak race): after `unregister`, the
     /// broker's view of `instances` must not carry the removed id, and a
@@ -7090,7 +7090,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // Phase 4 (M1) — hook evaluation wiring
+    // Hook evaluation: match, priority, and action dispatch
     // ═════════════════════════════════════════════════════════════════════
 
     use super::super::hook_table::{
@@ -7737,7 +7737,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // Phase 4 (M2) — OnNotification post-coalesce wiring
+    // OnNotification hooks fire once per emitted block, after coalescing
     // ═════════════════════════════════════════════════════════════════════
 
     /// OnNotification fires once per emitted block. A PassThrough Log block
@@ -8052,7 +8052,7 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    // Phase 4 (M5) — reentrancy cap
+    // Reentrant hooks are capped at MAX_HOOK_DEPTH
     // ═════════════════════════════════════════════════════════════════════
 
     /// Exit #5: a reentrant hook that recurses past `MAX_HOOK_DEPTH`
@@ -9567,7 +9567,7 @@ mod tests {
         );
     }
 
-    // ── Phase 5 M2: binding mutation + ListTools filter ───────────────
+    // ── Binding mutation and ListTools filtering ───────────────
 
     /// `bind` with a previously-registered instance emits a single
     /// `ToolAdded` block into the calling context listing every tool that
@@ -9950,11 +9950,11 @@ mod tests {
         assert_eq!(visible, vec!["file_read".to_string()]);
     }
 
-    // ── Hook persistence (M2) ────────────────────────────────────────
+    // ── Hook persistence round-trip ────────────────────────────────────
     //
     // These tests exercise the round-trip: in-memory HookTables →
     // `persist_hook_insert` → SQLite → `set_db` → hydrate → HookTables.
-    // The M5 e2e test stitches this through the admin handler; these
+    // An end-to-end test stitches this through the admin handler; these
     // tests isolate each direction.
 
     fn hook_db() -> DbHandle {
@@ -10830,8 +10830,8 @@ mod tests {
         }
     }
 
-    // ── D-57: HookAction::Ask goes through the ledger ────────────────────
-    // (`docs/gate-and-shell-split.md`, "The shared seam"). There is no
+    // ── HookAction::Ask goes through the approval ledger ────────────────────
+    // See `docs/gate-and-shell-split.md`, "The shared seam". There is no
     // scripted asker double; `run_permission_ask` calls `kj::gate::run_gate`
     // for real, so these tests wire a real `KjDispatcher` (mirroring
     // `wired_kaish_broker` above) and answer/inspect the durable ledger

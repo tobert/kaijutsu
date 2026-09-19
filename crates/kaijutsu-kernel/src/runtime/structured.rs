@@ -109,7 +109,7 @@ async fn run_kj(
                     context_switch: CommandContextSwitch::Pinned, review_notices: Some(notices),
                     cancel: Some(stop), ..Default::default() }).await?,
             None => command::run_without_blocks(&kaish, &code, kernel, &call_ctx,
-                kaish_kernel::ExecuteOptions::default(), CommandRunOptions { stdin: None,
+                CommandRunOptions { stdin: None,
                     context_switch: CommandContextSwitch::Pinned, review_notices: Some(notices),
                     cancel: Some(stop), ..Default::default() }).await?,
         },

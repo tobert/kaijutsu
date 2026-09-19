@@ -46,7 +46,7 @@ pub async fn execute(
             let outcome = match replacement {
                 Some(outcome) => Ok(outcome),
                 None => command::run_without_blocks(&kaish, &code, &owner, &call,
-                    kaish_kernel::ExecuteOptions::default(), CommandRunOptions {
+                    CommandRunOptions {
                         cancel: Some(cancel.clone()), context_switch: CommandContextSwitch::Publish(Some(&record)),
                         ..Default::default()
                     }).await,

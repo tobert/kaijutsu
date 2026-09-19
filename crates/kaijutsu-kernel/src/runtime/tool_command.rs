@@ -71,8 +71,7 @@ impl ToolCommand {
                 };
                 let execute = async { match &completion_receipt {
                     Some(receipt) => command::run_into_blocks(&self.kaish, &self.code, receipt, &self.kernel, &self.call, run).await,
-                    None => command::run_without_blocks(&self.kaish, &self.code, &self.kernel, &self.call,
-                        kaish_kernel::ExecuteOptions::default(), run).await,
+                    None => command::run_without_blocks(&self.kaish, &self.code, &self.kernel, &self.call, run).await,
                 } };
                 tokio::pin!(execute);
                 let outcome = tokio::select! {

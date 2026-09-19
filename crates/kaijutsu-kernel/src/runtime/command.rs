@@ -362,9 +362,9 @@ pub async fn run_without_blocks(
     code: &str,
     kernel: &Arc<Kernel>,
     call_ctx: &crate::mcp::CallContext,
-    mut options: kaish_kernel::ExecuteOptions,
     mut run: CommandRunOptions<'_>,
 ) -> Result<CommandOutcome, String> {
+    let mut options = kaish_kernel::ExecuteOptions::default();
     if let Some(stdin) = run.stdin.take() { options = options.with_stdin(stdin); }
     if let Some(cancel) = run.cancel.clone() { options.cancel_token = Some(cancel); }
     let attempt = capture_and_review(kaish, code, kernel, call_ctx.context_id, call_ctx,
@@ -692,7 +692,7 @@ mod fill_tests {
         cancel.cancel();
         let call = crate::mcp::CallContext::new(PrincipalId::system(), ctx, kaijutsu_types::SessionId::new(), kernel.id());
         let outcome = run_without_blocks(&kaish, "export SHOULD_NOT_RUN=yes", &kernel, &call,
-            kaish_kernel::ExecuteOptions::default(), CommandRunOptions { cancel: Some(cancel), ..Default::default() })
+            CommandRunOptions { cancel: Some(cancel), ..Default::default() })
             .await.unwrap();
         assert!(matches!(outcome.execution, CommandExecution::NotRun), "cancelled admission must not start execution");
         assert!(outcome.envelope().is_error());
