@@ -1983,8 +1983,15 @@ impl BlockStore {
                 return Err(BlockStoreError::Validation(format!(
                     "block {block_id} changed while the edit was prepared; read it again and retry")));
             }
-            let len = entry.doc.block_content_len(block_id).unwrap_or(0);
-            self.prepare_text_edit(entry, context_id, block_id, 0, text, len, principal_id)
+            // Commit only the span that differs: an edit near the end of a
+            // large block then journals and publishes that span, and new
+            // text at the end stays an append.
+            let prefix = current.chars().zip(text.chars()).take_while(|(a, b)| a == b).count();
+            let (old_rest, new_rest) = (current.chars().count() - prefix, text.chars().count() - prefix);
+            let suffix = current.chars().rev().zip(text.chars().rev())
+                .take(old_rest.min(new_rest)).take_while(|(a, b)| a == b).count();
+            let insert: String = text.chars().skip(prefix).take(new_rest - suffix).collect();
+            self.prepare_text_edit(entry, context_id, block_id, prefix, &insert, old_rest - suffix, principal_id)
         })
     }
 
@@ -9294,6 +9301,31 @@ mod tests {
             .expect("block exists")
             .content;
         assert_eq!(text, "real output");
+    }
+
+    /// A guarded replacement commits only the span that differs, so new text
+    /// at the end is published as an append and the journal holds the suffix.
+    #[test]
+    fn replace_text_if_unchanged_commits_only_the_changed_span() {
+        let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
+        let store = BlockStore::with_flows(test_agent(), bus.clone());
+        let mut sub = bus.subscribe("block.>");
+        let ctx = ContextId::new();
+        store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+        let block = store
+            .insert_block(ctx, None, None, Role::Model, BlockKind::Text, "héllo\nwörld\n", Status::Done, ContentType::Plain)
+            .unwrap();
+        while sub.try_recv().is_some() {}
+
+        store.replace_text_if_unchanged_as(ctx, &block, "héllo\nwörld\n", "héllo\nwörld\nmore\n", Some(test_agent())).unwrap();
+        match sub.try_recv().expect("the append is published").payload {
+            BlockFlow::TextAppended { ref suffix, .. } => assert_eq!(&**suffix, "more\n"),
+            other => panic!("expected TextAppended, got {other:?}"),
+        }
+
+        store.replace_text_if_unchanged_as(ctx, &block, "héllo\nwörld\nmore\n", "héllo\nwürld\nmore\n", Some(test_agent())).unwrap();
+        let text = store.get_block_snapshot(ctx, &block).unwrap().expect("block exists").content;
+        assert_eq!(text, "héllo\nwürld\nmore\n");
     }
 
     /// A whole-text replacement computed from a snapshot refuses when the
