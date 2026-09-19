@@ -58,8 +58,11 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 /// File access uses `MountBackend`; document access and tool dispatch use
 /// `KaijutsuBackend`.
 pub struct EmbeddedKaish {
-    /// The embedded kaish kernel.
-    kernel: KaishKernel,
+    /// The embedded kaish kernel. Held as `Arc` via `into_arc()` so
+    /// `Kernel::dispatcher()` can upgrade its `self_weak` — builtins that
+    /// dispatch an inner command through the full resolution chain (e.g.
+    /// `timeout`) need `ctx.dispatcher`, which is only populated this way.
+    kernel: Arc<KaishKernel>,
     /// Kernel name/id.
     name: String,
     /// Invocation-local session map for context tracking.
@@ -402,6 +405,11 @@ impl EmbeddedKaish {
                 }
             },
         )?;
+        // Populate `self_weak` so `Kernel::dispatcher()` can hand out an
+        // `Arc<dyn CommandDispatcher>` to builtins like `timeout` — without
+        // this, `ctx.dispatcher` is always `None` and those builtins refuse
+        // with "no dispatcher available".
+        let kaish_kernel = kaish_kernel.into_arc();
 
         Ok(Self {
             kernel: kaish_kernel,
@@ -1327,6 +1335,95 @@ mod tests {
             cwd
         );
         assert!(cwd.is_absolute(), "cwd should be absolute, got {:?}", cwd);
+    }
+
+    /// `timeout` (a kaish builtin) dispatches its inner command through
+    /// `ctx.dispatcher`, which comes from `kaish_kernel::Kernel::dispatcher()`
+    /// — populated only when the kernel is wrapped via `into_arc()`. A bare
+    /// `Kernel` (no `into_arc`) makes `dispatcher()` return `None`, and
+    /// `timeout` refuses with "no dispatcher available". This pins that
+    /// `EmbeddedKaish` wraps its kaish kernel in `Arc` via `into_arc()` so
+    /// `timeout` (and anything else needing `ctx.dispatcher`) works.
+    #[tokio::test]
+    async fn timeout_builtin_dispatches_through_the_wrapped_kernel() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = test_kernel("test-timeout").await;
+        let kaish = EmbeddedKaish::new("test-timeout", blocks, kernel, None).unwrap();
+
+        let r = kaish
+            .execute_with_options("timeout 5 echo hi", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`timeout 5 echo hi` failed: {e}"));
+        assert_eq!(r.code, 0, "timeout wrapping a builtin must succeed: {}", r.err);
+        assert_eq!(r.text_out(), "hi\n", "stdout should be the wrapped command's output");
+
+        // An expiring timeout: `sleep` is a kaish builtin (no host subprocess),
+        // so this stays within the read-only-shell-safe surface. Observed exit
+        // code is reported rather than assumed.
+        let r = kaish
+            .execute_with_options("timeout 1 sleep 5", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`timeout 1 sleep 5` failed: {e}"));
+        assert_eq!(r.code, 124, "an expired timeout should report exit 124, got: {r:?}");
+    }
+
+    /// Probe: does a `&` background job need the TOP-LEVEL kernel wrapped via
+    /// `into_arc()`, or does it work regardless because `execute_background`
+    /// forks (`fork_inner` always ends with `fork.into_arc()` on the fork
+    /// itself — kaish kernel.rs `fork_inner`/`execute_background`, ~1470 and
+    /// ~3586) and the background task's `ctx.dispatcher` is taken from the
+    /// FORK's own `dispatcher()`, not the parent's? A forked kernel's
+    /// dispatcher is legitimately `None` immediately after `fork()`/`fork_attached()`
+    /// (repopulated lazily on first dispatch) — this test does not assert an
+    /// "always Some" invariant anywhere, only the observable behavior of
+    /// `&` + `wait` end to end, builtins only (no host subprocess).
+    ///
+    /// Observed: this passes identically whether or not the parent kernel
+    /// itself is wrapped via `into_arc()` — the background job's own fork
+    /// wraps itself independently of the parent, so `&` jobs (including one
+    /// wrapped in `timeout`) do not depend on the parent's dispatcher.
+    #[tokio::test]
+    async fn background_jobs_of_builtins_complete_and_report_through_wait() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = test_kernel("test-bg-jobs").await;
+        let kaish = EmbeddedKaish::new("test-bg-jobs", blocks, kernel, None).unwrap();
+
+        // Plain builtin background job.
+        let r = kaish
+            .execute_with_options("sleep 0.1 &", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`sleep 0.1 &` failed: {e}"));
+        assert!(r.ok(), "backgrounding a builtin should succeed: {}", r.err);
+        assert!(r.err.contains("[1]"), "job announcement rides stderr: {:?}", r.err);
+
+        let r = kaish
+            .execute_with_options("wait", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`wait` failed: {e}"));
+        assert!(r.ok(), "wait on a completed builtin job should succeed: code={} err={} out={}",
+            r.code, r.err, r.text_out());
+        assert!(r.text_out().contains("[1] Done"),
+            "expected wait to report job 1 done, got: {}", r.text_out());
+
+        // `timeout` wrapping a builtin, itself backgrounded — exercises the
+        // fork's own dispatcher, not the parent's.
+        let r = kaish
+            .execute_with_options("timeout 5 echo hi &", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`timeout 5 echo hi &` failed: {e}"));
+        assert!(r.ok(), "backgrounding a timeout-wrapped builtin should succeed: {}", r.err);
+        assert!(r.err.contains("[2]"), "job announcement rides stderr: {:?}", r.err);
+
+        let r = kaish
+            .execute_with_options("wait 2", ExecuteOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("`wait 2` failed: {e}"));
+        assert!(r.ok(), "wait on the backgrounded timeout job should succeed: code={} err={} out={}",
+            r.code, r.err, r.text_out());
+        assert!(r.text_out().contains("[2] Done"),
+            "expected wait to report job 2 done (timeout must have found its \
+             dispatcher via the FORK's own into_arc, not the parent's), got: {}",
+            r.text_out());
     }
 
     #[tokio::test]

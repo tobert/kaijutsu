@@ -146,9 +146,12 @@ checking expected text against the initial snapshot. A later operation can
 fail after earlier ones have changed the block. Validate the complete edit and
 commit one mutation. `block_search` match offsets are line-relative bytes,
 while splice offsets are character positions in the block; document the units
-and conversion before clients compose the two. Image imports currently trust
-file type/extension rather than validate image bytes, and the two search tools
-have inconsistent empty-result conventions. These are separate tool-contract
+and conversion before clients compose the two. `kj cas put` and `kj block create` now
+validate image bytes by magic number; the MCP `img_block_from_path` still trusts
+the extension, and `img_block` does not compare the CAS object's recorded type
+with `ContentType::Image`. `kj block append --text` can append to an Image
+block's CAS-hash content without checking that a hash remains. The two search
+tools have inconsistent empty-result conventions. These are separate tool-contract
 follow-ups, not changes in VFS routing. See the 2026-09-18 `adapters-*` review.
 
 
@@ -2870,14 +2873,15 @@ experiment" — treat `Editor` as provisional until that sweep.
   judges a capped result. Decide whether kaish or the glue changes. The ignored
   test `spilled_statement_does_not_mask_a_later_failure` in
   `mcp/servers/shell.rs` becomes the regression.
-- **`timeout` builtin under embedded kaish** fails with "no dispatcher available
-  (Kernel must be created via into_arc())".
 - **No timeout knob on the server kernel**, so the wire timeout test proxies
   with `exit 124`; a real one needs an injectable `TimeoutPolicy`.
-- **`kaish_kernel::ExecuteOptions` built outside the shared owner:**
-  `streaming.rs:49` and `structured.rs:112` pass a default into
-  `command::run_without_blocks`; `rc/mod.rs`, `mcp/broker.rs` and
-  `runtime/editor_read.rs` build options themselves.
+- **Scope of `runtime/command.rs` as the execution owner.** `rc/mod.rs`
+  (`run_kai_script`), `mcp/broker.rs` (`run_kaish_hook`) and
+  `runtime/editor_read.rs` build `kaish_kernel::ExecuteOptions` themselves
+  because they call `EmbeddedKaish::execute_with_options` directly: no block
+  pair, receipt or result hooks. Decide whether the owner covers only
+  block/receipt-producing commands (then close this) or all kaish execution
+  (then it needs a no-projection mode with a vars overlay and timeout).
 - **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);
   the mailbox notice block for a paused PostCall; wire-level interactive cancel
   (no wire cancel exists for durable interactive commands).
