@@ -22,7 +22,7 @@ impl kaijutsu_index::BlockSource for NoopBlockSource {
 }
 
 /// Non-draft context blocks for search and synthesis.
-pub(crate) struct BlockStoreSource(pub(crate) crate::block_store::SharedBlockStore);
+pub struct BlockStoreSource(pub crate::block_store::SharedBlockStore);
 
 impl kaijutsu_index::BlockSource for BlockStoreSource {
     fn block_snapshots(
