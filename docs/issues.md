@@ -2882,6 +2882,17 @@ experiment" — treat `Editor` as provisional until that sweep.
   pair, receipt or result hooks. Decide whether the owner covers only
   block/receipt-producing commands (then close this) or all kaish execution
   (then it needs a no-projection mode with a vars overlay and timeout).
+- **A failed wake after a completion notice is never retried.**
+  `completion_notice::deliver` commits the notice block, which stamps
+  `block_id` (`block_store.rs`, `insert_completion_notice`), then calls
+  `request_turn`. If that fails (context archived during the
+  `gate_resume_window` await, or the worker shutting down), every later scan and
+  startup recovery skips the row because they select `block_id IS NULL`. The
+  notice block survives; the owed continuation is lost with no durable record.
+  Approval delivery loses its wake the same way by design, but keeps a
+  redeemable answer. Decide between recording an owed wake durably and
+  reserving turn admission before the notice insert; see the resource admission
+  memo, `~/exomemory/kaijutsu/resource-admission-design-2026-09-19.md`.
 - **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);
   the mailbox notice block for a paused PostCall; wire-level interactive cancel
   (no wire cancel exists for durable interactive commands).
