@@ -180,6 +180,31 @@ pub fn validate_expected_text(
     }
 }
 
+/// Apply a CHARACTER-offset splice to `content`, returning the resulting
+/// text without touching any store. `pos` and `delete` are char counts, the
+/// same units `edit_text`/`edit_text_as` take; `pos + delete` is clamped to
+/// `content`'s length the way `TextContent::edit_text` clamps it
+/// (`blocks/content.rs`). Lets a caller (`block_edit`'s batch simulation)
+/// fold a sequence of line-based operations into one final string before any
+/// operation commits.
+pub fn splice_chars(content: &str, pos: usize, insert: &str, delete: usize) -> String {
+    let char_to_byte = |idx: usize| -> usize {
+        content
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(content.len())
+    };
+    let byte_start = char_to_byte(pos);
+    let byte_end = char_to_byte(pos + delete);
+    let mut result =
+        String::with_capacity(content.len() - (byte_end - byte_start) + insert.len());
+    result.push_str(&content[..byte_start]);
+    result.push_str(insert);
+    result.push_str(&content[byte_end..]);
+    result
+}
+
 /// Count the number of lines in content.
 pub fn line_count(content: &str) -> u32 {
     if content.is_empty() {
@@ -361,6 +386,35 @@ mod tests {
         // Check lines 1-3 (0-indexed)
         let result = validate_expected_text(content, 1, 3, "two\nthree");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_splice_chars_insert() {
+        assert_eq!(splice_chars("ab", 1, "X", 0), "aXb");
+    }
+
+    #[test]
+    fn test_splice_chars_delete() {
+        assert_eq!(splice_chars("abcd", 1, "", 2), "ad");
+    }
+
+    #[test]
+    fn test_splice_chars_replace() {
+        assert_eq!(splice_chars("abcd", 1, "XY", 2), "aXYd");
+    }
+
+    #[test]
+    fn test_splice_chars_multibyte_char_units_not_bytes() {
+        // "改善" is 2 chars / 6 bytes; a byte-indexed splice at pos=1 would
+        // land mid-character. The char-indexed splice must not.
+        let content = "改善end";
+        let result = splice_chars(content, 1, "X", 0);
+        assert_eq!(result, "改X善end");
+    }
+
+    #[test]
+    fn test_splice_chars_pos_past_end_clamps() {
+        assert_eq!(splice_chars("ab", 5, "X", 0), "abX");
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub use error::{EditError, Result};
 pub use translate::{
     byte_to_char_offset, content_with_line_numbers, extract_lines_with_numbers, line_count,
     line_range_to_byte_range, line_range_to_char_range, line_to_byte_offset, line_to_char_offset,
-    validate_expected_text,
+    splice_chars, validate_expected_text,
 };
 
 #[cfg(test)]

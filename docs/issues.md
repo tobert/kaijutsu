@@ -140,18 +140,17 @@ Kaibo's identity review found remaining adapter policy/provenance gaps:
 Review evidence and disposition are under
 `~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
 
-The adapter review also identified existing block-tool contracts to revisit:
-`block_edit` promises atomic operations but applies them sequentially after
-checking expected text against the initial snapshot. A later operation can
-fail after earlier ones have changed the block. Validate the complete edit and
-commit one mutation. `block_search` match offsets are line-relative bytes,
-while splice offsets are character positions in the block; document the units
-and conversion before clients compose the two. `kj cas put` and `kj block create` now
-validate image bytes by magic number; the MCP `img_block_from_path` still trusts
-the extension, and `img_block` does not compare the CAS object's recorded type
-with `ContentType::Image`. `kj block append --text` can append to an Image
-block's CAS-hash content without checking that a hash remains. The two search
-tools have inconsistent empty-result conventions. These are separate tool-contract
+Block-tool contracts still open after the adapter review: `block_search`
+reports byte offsets within the matched line while `block_splice` takes
+whole-block character positions. The tool descriptions now say so; a
+block-relative character offset on `SearchMatch` (new fields, leaving the byte
+fields alone) would let clients compose the two without converting.
+`block_search` returns a protocol error on no matches while `kernel_search`
+returns a success payload with an empty `matches` array; choose one convention.
+MCP `img_block` takes a CAS hash and does not compare the object's recorded
+type with `ContentType::Image`. `kj block append --text` can append to an Image
+block's CAS-hash content without checking that a hash remains.
+These are separate tool-contract
 follow-ups, not changes in VFS routing. See the 2026-09-18 `adapters-*` review.
 
 

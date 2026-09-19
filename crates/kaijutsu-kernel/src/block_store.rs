@@ -1944,6 +1944,32 @@ impl BlockStore {
         })
     }
 
+    /// Replace a block's whole text only if it still equals `expected`.
+    ///
+    /// The comparison and the replacement are one accepted mutation, so a
+    /// replacement computed from a snapshot cannot overwrite text written
+    /// after that snapshot.
+    pub fn replace_text_if_unchanged_as(
+        &self,
+        context_id: ContextId,
+        block_id: &BlockId,
+        expected: &str,
+        text: &str,
+        principal_id: Option<PrincipalId>,
+    ) -> BlockStoreResult<()> {
+        self.accept(context_id, |entry| {
+            let current = entry.doc.get_block_snapshot(block_id)
+                .ok_or_else(|| BlockStoreError::Validation(format!("block not found: {block_id}")))?
+                .content;
+            if current != expected {
+                return Err(BlockStoreError::Validation(format!(
+                    "block {block_id} changed while the edit was prepared; read it again and retry")));
+            }
+            let len = entry.doc.block_content_len(block_id).unwrap_or(0);
+            self.prepare_text_edit(entry, context_id, block_id, 0, text, len, principal_id)
+        })
+    }
+
     /// Edit text within a block with an explicit author identity.
     pub fn edit_text_as(
         &self,
@@ -9134,6 +9160,33 @@ mod tests {
             .expect("block exists")
             .content;
         assert_eq!(text, "real output");
+    }
+
+    /// A whole-text replacement computed from a snapshot refuses when the
+    /// block changed after that snapshot, and leaves the newer text in place.
+    #[test]
+    fn replace_text_if_unchanged_refuses_a_stale_basis() {
+        let store = BlockStore::new(test_agent());
+        let ctx = ContextId::new();
+        store
+            .create_document(ctx, DocumentKind::Conversation, None)
+            .unwrap();
+        let call = store
+            .insert_tool_call(ctx, None, None, "shell_write", serde_json::json!({}), None)
+            .unwrap();
+        let result = store
+            .insert_tool_result(ctx, &call, Some(&call), "basis", true, None, None)
+            .unwrap();
+
+        store
+            .replace_text_if_unchanged_as(ctx, &result, "basis", "first edit", Some(test_agent()))
+            .unwrap();
+        let stale = store
+            .replace_text_if_unchanged_as(ctx, &result, "basis", "second edit", Some(test_agent()));
+        assert!(matches!(stale, Err(BlockStoreError::Validation(_))), "a stale basis must be refused: {stale:?}");
+
+        let text = store.get_block_snapshot(ctx, &result).unwrap().expect("block exists").content;
+        assert_eq!(text, "first edit");
     }
 
     #[test]

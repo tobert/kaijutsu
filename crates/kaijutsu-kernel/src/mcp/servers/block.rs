@@ -13,7 +13,7 @@ use crate::block_store::SharedBlockStore;
 // Block edits use character offsets; byte offsets would split multibyte text.
 use crate::block_tools::translate::{
     content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
-    line_to_char_offset, validate_expected_text,
+    line_to_char_offset, splice_chars, validate_expected_text,
 };
 use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
 use kaijutsu_types::ContextId;
@@ -218,7 +218,15 @@ pub struct ImgBlockFromPathParams {
 pub struct SearchMatch {
     pub line: u32,
     pub content: String,
+    /// The regex match's start, as a BYTE offset within `line`'s own text —
+    /// not a block-relative offset, and not the CHARACTER offset
+    /// `block_splice`'s `offset` and `block_edit`'s line-range CAS check
+    /// both use. A caller composing this into either editing tool must
+    /// convert it first: resolve `line` to a block-relative char offset with
+    /// `line_to_char_offset`, then add the char count of `content[..match_start]`.
     pub match_start: u32,
+    /// Same units and the same conversion as `match_start` (byte offset
+    /// within `line`, exclusive end).
     pub match_end: u32,
 }
 
@@ -302,9 +310,9 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<BlockCreateParams>(&self.instance_id, "block_create", "Create a new block with role, kind, and optional content")?,
             tool_def::<BlockAppendParams>(&self.instance_id, "block_append", "Append text to a block")?,
             tool_def::<BlockEditParams>(&self.instance_id, "block_edit", "Edit block content atomically with line operations")?,
-            tool_def::<BlockSpliceParams>(&self.instance_id, "block_splice", "Character-based editing (for programmatic tools)")?,
+            tool_def::<BlockSpliceParams>(&self.instance_id, "block_splice", "Character-based editing (for programmatic tools). offset/delete_count are whole-block CHARACTER positions, not the line-relative byte offsets block_search reports.")?,
             tool_def::<BlockReadParams>(&self.instance_id, "block_read", "Read block content with optional line numbers and range")?,
-            tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns")?,
+            tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns. match_start/match_end are BYTE offsets within the matched line, not block-relative and not the CHARACTER offsets block_splice/block_edit take.")?,
             tool_def::<BlockListParams>(&self.instance_id, "block_list", "List blocks with optional filters")?,
             tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status: pending, running, waiting, done, or error")?,
             tool_def::<KernelSearchParams>(&self.instance_id, "kernel_search", "Search across all blocks using regex, with filters and context")?,
@@ -398,35 +406,34 @@ impl McpServerLike for BlockToolsServer {
                     .map_err(McpError::InvalidParams)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
 
-                // Pre-validate CAS checks
-                {
-                    let content = self.documents
-                        .get(context_id)
-                        .and_then(|entry| {
-                            entry
-                                .doc
-                                .get_block_snapshot(&block_id)
-                                .map(|s| s.content.clone())
-                        })
-                        .unwrap_or_default();
+                let original = self.documents
+                    .get(context_id)
+                    .and_then(|entry| {
+                        entry
+                            .doc
+                            .get_block_snapshot(&block_id)
+                            .map(|s| s.content.clone())
+                    })
+                    .ok_or_else(|| McpError::Protocol(format!("block not found: {}", p.block_id)))?;
 
-                    for (idx, op) in p.operations.iter().enumerate() {
-                        if let EditOp::Replace {
-                            start_line,
-                            end_line,
-                            expected_text: Some(expected),
-                            ..
-                        } = op
-                        {
-                            validate_expected_text(&content, *start_line, *end_line, expected)
-                                .map_err(|e| McpError::Protocol(format!("CAS error at op {}: {}", idx, e)))?;
-                        }
-                    }
+                // Validate and fold the whole batch against progressively
+                // updated text, in memory, before touching the store: op N's
+                // line numbers and CAS check apply to the text as ops
+                // 0..N-1 would leave it, and a failure here must not have
+                // mutated anything, since nothing has been written yet.
+                let mut working = original.clone();
+                for (idx, op) in p.operations.iter().enumerate() {
+                    working = Self::simulate_edit_op(&working, op)
+                        .map_err(|e| McpError::Protocol(format!("edit error at op {}: {}", idx, e)))?;
                 }
 
-                for (idx, op) in p.operations.into_iter().enumerate() {
-                    self.apply_op(context_id, &block_id, op, &tool_ctx)
-                        .map_err(|e| McpError::Protocol(format!("edit error at op {}: {}", idx, e)))?;
+                // Commit the whole batch as one mutation and one event. The
+                // store compares against `original` inside that mutation, so
+                // text written since the snapshot is never overwritten.
+                if working != original {
+                    self.documents
+                        .replace_text_if_unchanged_as(context_id, &block_id, &original, &working, Some(tool_ctx.actor_id))
+                        .map_err(|e| McpError::Protocol(e.to_string()))?;
                 }
 
                 let version = self.documents.get(context_id).map(|c| c.version()).unwrap_or(0);
@@ -842,6 +849,9 @@ impl McpServerLike for BlockToolsServer {
                 };
 
                 let mime = crate::kj::cas::mime_from_extension(&p.path);
+                if let Err(e) = crate::kj::cas::validate_image_bytes(mime, &data) {
+                    return Ok(from_exec_result(ExecResult::failure(1, format!("{}: {}", p.path, e))));
+                }
                 let hash = self.cas.store(&data, mime).map_err(|e| McpError::Protocol(format!("CAS error: {e}")))?;
                 let hash_str = hash.to_string();
 
@@ -948,66 +958,35 @@ impl BlockToolsServer {
             .map_err(|e| McpError::Protocol(e.to_string()))
     }
 
-    fn apply_op(
-        &self,
-        context_id: ContextId,
-        block_id: &BlockId,
-        op: EditOp,
-        ctx: &ExecContext,
-    ) -> McpResult<()> {
-        let content = {
-            let entry = self
-                .documents
-                .get(context_id)
-                .ok_or_else(|| McpError::Protocol("document not found".into()))?;
-
-            entry
-                .doc
-                .get_block_snapshot(block_id)
-                .map(|s| s.content.clone())
-                .ok_or_else(|| McpError::Protocol(format!("block not found: {}", block_id)))?
-        };
-
+    /// Applies one line-based edit operation to `content` in memory,
+    /// returning the resulting text. `block_edit` folds a whole batch
+    /// through this, op by op, before any operation touches the store: each
+    /// op's line numbers and CAS check (`expected_text`) are checked against
+    /// the text as the PRECEDING ops in the same batch would leave it, never
+    /// against a stale snapshot from before the batch started.
+    fn simulate_edit_op(content: &str, op: &EditOp) -> crate::block_tools::Result<String> {
         match op {
             EditOp::Insert {
                 line,
                 content: text,
             } => {
-                let pos = line_to_char_offset(&content, line)
-                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                let pos = line_to_char_offset(content, *line)?;
                 let text_with_newline = if text.ends_with('\n') || content.is_empty() {
-                    text
+                    text.clone()
                 } else {
                     format!("{}\n", text)
                 };
-                self.documents
-                    .edit_text_as(
-                        context_id,
-                        block_id,
-                        pos,
-                        &text_with_newline,
-                        0,
-                        Some(ctx.actor_id),
-                    )
-                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                Ok(splice_chars(content, pos, &text_with_newline, 0))
             }
             EditOp::Delete {
                 start_line,
                 end_line,
             } => {
-                let (start, end) = line_range_to_char_range(&content, start_line, end_line)
-                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                let (start, end) = line_range_to_char_range(content, *start_line, *end_line)?;
                 if start < end {
-                    self.documents
-                        .edit_text_as(
-                            context_id,
-                            block_id,
-                            start,
-                            "",
-                            end - start,
-                            Some(ctx.actor_id),
-                        )
-                        .map_err(|e| McpError::Protocol(e.to_string()))?;
+                    Ok(splice_chars(content, start, "", end - start))
+                } else {
+                    Ok(content.to_string())
                 }
             }
             EditOp::Replace {
@@ -1017,30 +996,18 @@ impl BlockToolsServer {
                 expected_text,
             } => {
                 if let Some(expected) = expected_text {
-                    validate_expected_text(&content, start_line, end_line, &expected).map_err(|e| McpError::Protocol(e.to_string()))?;
+                    validate_expected_text(content, *start_line, *end_line, expected)?;
                 }
 
-                let (start, end) = line_range_to_char_range(&content, start_line, end_line)
-                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                let (start, end) = line_range_to_char_range(content, *start_line, *end_line)?;
                 let text_with_newline = if text.ends_with('\n') || text.is_empty() {
-                    text
+                    text.clone()
                 } else {
                     format!("{}\n", text)
                 };
-                self.documents
-                    .edit_text_as(
-                        context_id,
-                        block_id,
-                        start,
-                        &text_with_newline,
-                        end - start,
-                        Some(ctx.actor_id),
-                    )
-                    .map_err(|e| McpError::Protocol(e.to_string()))?;
+                Ok(splice_chars(content, start, &text_with_newline, end - start))
             }
         }
-
-        Ok(())
     }
 }
 
@@ -1087,9 +1054,12 @@ mod tests {
         let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
         let vfs = Arc::new(MountTable::new());
         vfs.mount("/images", MemoryBackend::new()).await;
-        vfs.write_all(std::path::Path::new("/images/pixel.png"), b"mounted-image")
+        vfs.write_all(std::path::Path::new("/images/pixel.png"), MOUNTED_PNG)
             .await
             .unwrap();
+        for path in ["/images/fake.png", "/images/notes.txt"] {
+            vfs.write_all(std::path::Path::new(path), b"plain text").await.unwrap();
+        }
         let server = Arc::new(BlockToolsServer::new(store.clone(), cas, vfs));
         let broker = Arc::new(Broker::new());
         broker
@@ -1298,6 +1268,21 @@ mod tests {
         assert!(response["version"].is_u64());
     }
 
+    /// The PNG signature followed by filler: enough for header sniffing.
+    const MOUNTED_PNG: &[u8] = b"\x89PNG\r\n\x1a\nmounted-image";
+
+    #[tokio::test]
+    async fn img_block_from_path_refuses_bytes_that_are_not_the_named_image_type() {
+        let (broker, ctx, _db, store) = setup().await;
+        let before = store.block_snapshots(ctx.context_id).unwrap().len();
+
+        for path in ["/images/fake.png", "/images/notes.txt"] {
+            let result = call(&broker, &ctx, "img_block_from_path", serde_json::json!({ "path": path })).await;
+            assert!(result.is_error, "{path} must be refused: {}", text_of(&result));
+        }
+        assert_eq!(store.block_snapshots(ctx.context_id).unwrap().len(), before, "a refused import appends no block");
+    }
+
     #[tokio::test]
     async fn img_block_from_path_reads_a_mounted_image_not_the_host() {
         let (broker, ctx, _db, store) = setup().await;
@@ -1318,7 +1303,7 @@ mod tests {
         assert_eq!(snapshot.content_type, ContentType::Image);
         assert_eq!(
             snapshot.content,
-            kaijutsu_cas::ContentHash::from_data(b"mounted-image").to_string(),
+            kaijutsu_cas::ContentHash::from_data(MOUNTED_PNG).to_string(),
             "the asset must hold the mounted bytes' CAS hash"
         );
     }
@@ -2019,6 +2004,69 @@ mod tests {
         assert!(
             snapshot.content.contains("BBB"),
             "second replace should be applied"
+        );
+    }
+
+    /// The adapter review's atomicity finding (docs/issues.md, "Turn
+    /// execution and shell settlement"): a later operation must be checked
+    /// against the text as the preceding operations in the same batch would
+    /// leave it, and a failing operation must leave the block unchanged with
+    /// no event. The CAS-only pre-validation loop this guards against
+    /// checked `expected_text` against the ORIGINAL snapshot and missed a
+    /// non-CAS failure (an out-of-range line) that only exists because an
+    /// earlier op in the same batch already committed.
+    #[tokio::test]
+    async fn test_block_edit_batch_leaves_block_unchanged_when_a_later_op_fails() {
+        let (broker, ctx, _db, store) = setup().await;
+        let block_id = store
+            .insert_block(
+                ctx.context_id,
+                None,
+                None,
+                Role::User,
+                BlockKind::Text,
+                "aaa\nbbb\n",
+                Status::Done,
+                ContentType::Plain,
+            )
+            .unwrap();
+
+        let version_before = store.get(ctx.context_id).unwrap().version();
+
+        // Op 0 deletes line 0, leaving one line ("bbb\n"). Op 1 then
+        // addresses start_line=1/end_line=2 as if two lines still existed —
+        // valid against the ORIGINAL text, out of range against the text as
+        // op 0 leaves it. Neither op carries expected_text, so a CAS-only
+        // pre-check lets this batch through and op 0 commits before op 1's
+        // failure surfaces.
+        let res = call_res(
+            &broker,
+            &ctx,
+            "block_edit",
+            serde_json::json!({
+                "block_id": block_id.to_key(),
+                "operations": [
+                    {"op": "delete", "start_line": 0, "end_line": 1},
+                    {"op": "replace", "start_line": 1, "end_line": 2, "content": "ZZZ"}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "op 1's out-of-range line must fail the whole batch"
+        );
+
+        let entry = store.get(ctx.context_id).unwrap();
+        let snapshot = entry.doc.get_block_snapshot(&block_id).unwrap();
+        assert_eq!(
+            snapshot.content, "aaa\nbbb\n",
+            "a failing operation must leave the block unchanged"
+        );
+        assert_eq!(
+            entry.version(),
+            version_before,
+            "a failing operation must produce no event/mutation"
         );
     }
 
