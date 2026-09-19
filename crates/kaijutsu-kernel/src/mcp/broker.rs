@@ -4667,13 +4667,7 @@ mod tests {
         let kernel = dispatcher.kernel().clone();
         let context = crate::kj::test_helpers::register_context(&dispatcher, Some("dropped-admitted-tool"), None, PrincipalId::system());
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, held) = std::sync::mpsc::channel();
-        kernel.spawn_runtime_task(move |_| async move {
-            entered.send(()).unwrap();
-            held.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        }).unwrap();
-        ready.await.unwrap();
+        let releases = crate::kj::test_helpers::park_runtime_pool(&kernel).await;
         let kaish = EmbeddedKaish::new("dropped-admitted-tool", kernel.blocks().clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(context);
         let call = ToolCommand {
@@ -4689,7 +4683,7 @@ mod tests {
         assert_eq!(operations.len(), 1);
         let id = &operations[0].receipt.operation_id;
         drop(call);
-        release.send(()).unwrap();
+        drop(releases);
         let state = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 let state = kernel.shell_operations().get(id, context).unwrap().unwrap();

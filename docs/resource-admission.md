@@ -1,7 +1,8 @@
 # Resource admission for the kernel worker
 
-Status: planned. No code exists. The assumptions were checked against the
-source; "What the source check found" records the result.
+Status: slice 1 is built (`runtime/worker.rs`, `RuntimePool`): the pool, the
+supervisor, `pick_thread`, local re-entry, eager start and whole-pool shutdown,
+with an unbounded queue and no running limit. Slices 2 to 6 are planned.
 
 The kernel worker runs every prompt turn, `kj drive`, shell command, structured
 `kj` call, MCP shell call, rc lifecycle run, approval resume, and scheduled
@@ -60,9 +61,18 @@ written. **Admission** is the existing `ContextAdmission` proof
 - **All threads share one cancellation token.** A panic in any thread's task
   then stops admission everywhere and is reported by shutdown, as it is today.
   Shutdown closes the queue, dispatches what it holds, and joins every thread.
-- **No context affinity.** Work for one context may run on any thread. If
-  same-context ordering turns out to be a promise, `pick_thread` hashes the
-  context to a thread and nothing else changes.
+- **No context affinity.** Work for one context may run on any thread. Two
+  submissions to one context that are in flight together can land their block
+  pairs in either order: measured at 4 runs in 30 with both sent on one
+  connection before either reply, and 0 in 15 with every task on one thread.
+  `interactive::prepare` awaits `EmbeddedKaish::for_context` before
+  `start_shell_operation`, and on two threads those preparations run in
+  parallel. A caller that awaits each reply before sending the next is
+  unaffected. The test is
+  `two_in_flight_submissions_to_one_context_keep_their_pair_order`
+  (`kaijutsu-server/tests/command_settlement_wire.rs`), ignored while the
+  order is not a promise. If it becomes one, `pick_thread` hashes the context
+  to a thread and nothing else changes.
 - **Refusal is a fault, not a `Refusal`.** RPC returns a capnp `Overloaded`
   error; the MCP shell tool returns a `Rejected` shell envelope a model can
   read and retry; `kj` returns an error naming the limit. `Refusal` stays
@@ -107,6 +117,8 @@ is a bound on model spend, which needs its own count of provider requests.
   submitting to one context can land their block pairs in either order. Each
   pair is still written atomically under the document guard. The slice 1
   ordering test decides whether `pick_thread` hashes the context.
+- **One blocking pool per worker runtime.** `spawn_blocking` work now has N
+  pools of tokio's default size, so its ceiling is N times higher.
 - **Work outside the count.** `tokio::spawn` tasks started from a worker task
   (broker pump loops, flush timers, `kj audio keep`) and `spawn_blocking` work
   (`kj audio beats`, CAS preparation) are not bounded by the pool.
@@ -119,9 +131,11 @@ is a bound on model spend, which needs its own count of provider requests.
 1. **Pool and dispatch, limits generous.** N threads, the supervisor,
    `pick_thread`, the worker-thread marker, local re-entry, shutdown that drains
    and joins every thread. Tests: a chain of nested work completes with the
-   pool full; two back-to-back submissions to one context, held at a barrier,
-   keep their block order (this test decides whether affinity is needed); a
-   panic in one thread stops admission and is reported by shutdown.
+   pool full; re-entry from a `tokio::spawn`ed task; a panic in one thread
+   stops admission and is reported by shutdown; shutdown drains every thread.
+   A test that needs the pool to hold work back parks every thread
+   (`kj::test_helpers::park_runtime_pool`); parking one no longer holds
+   anything.
 2. **The bounded queue and reserve-first call sites.** `try_reserve_owned` in
    the funnel; move the reservation ahead of the writes listed above and ahead
    of `beat::fire_lifecycle`'s work. Test through a stood-up kernel and its

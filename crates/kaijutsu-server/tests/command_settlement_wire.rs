@@ -41,6 +41,38 @@ fn interactive_submission_uses_its_addressed_context() {
     });
 }
 
+/// Two submissions to one context, both in flight before either is prepared,
+/// must land their command/output pairs in submission order. Under the worker
+/// pool the two preparations run on different threads at once, so the order is
+/// whichever thread reaches `start_shell_operation` first. This test decides
+/// whether `pick_thread` hashes the context; see `docs/resource-admission.md`,
+/// "Same-context order across transports".
+#[test]
+#[ignore = "the worker pool runs two same-context submissions on different threads, so their pair order is a race; affinity is out of scope for slice 1"]
+fn two_in_flight_submissions_to_one_context_keep_their_pair_order() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "same-context-order").await.unwrap();
+        kj.join_context(context, "same-context-order").await.unwrap();
+        // One connection, both requests on the wire before either is answered:
+        // the server reads them in order, so submission order is the send order.
+        let (first, second) = futures::join!(
+            kj.shell_submit("echo first", context, true),
+            kj.shell_submit("echo second", context, true),
+        );
+        let first = first.unwrap().command_block_id;
+        let second = second.unwrap().command_block_id;
+        let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        let position = |id| blocks.iter().position(|block| block.id == id)
+            .unwrap_or_else(|| panic!("submission {id} left no command block"));
+        assert!(position(first) < position(second),
+            "two submissions to one context must keep their pair order: {first} landed after {second}");
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
 #[test]
 fn shutdown_settles_interactive_execution_paused_in_post_call() {
     interactive_lifetime(true);

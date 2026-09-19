@@ -1222,6 +1222,26 @@ pub(crate) mod test_helpers {
         test_dispatcher().await
     }
 
+    /// Occupy every worker-pool thread with a task that blocks its thread, so
+    /// work submitted afterwards stays queued and unstarted. Use this wherever
+    /// a test needs the pool to hold a submission back; one parked task is not
+    /// enough, because the pool has more than one thread. Send or drop the
+    /// returned releases to free the pool.
+    pub async fn park_runtime_pool(kernel: &Kernel) -> Vec<std::sync::mpsc::Sender<()>> {
+        let mut releases = Vec::with_capacity(kernel.runtime_threads());
+        for _ in 0..kernel.runtime_threads() {
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            kernel.spawn_runtime_task(move |_| async move {
+                entered.send(()).unwrap();
+                let _ = held.recv();
+            }).expect("the worker pool must accept a parking task");
+            ready.await.expect("a parking task must reach its thread");
+            releases.push(release);
+        }
+        releases
+    }
+
     async fn test_dispatcher_configured(
         policy: kaijutsu_types::TimeoutPolicy,
     ) -> KjDispatcher {

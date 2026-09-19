@@ -74,13 +74,7 @@ mod tests {
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let identity = ShellIdentity { requester: principal, performer: principal, reviewer: None,
                 context, session: SessionId::new() };
-            let (entered, ready) = tokio::sync::oneshot::channel();
-            let (release, held) = std::sync::mpsc::channel();
-            kernel.spawn_runtime_task(move |_| async move {
-                entered.send(()).unwrap();
-                held.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-            }).unwrap();
-            ready.await.unwrap();
+            let releases = crate::kj::test_helpers::park_runtime_pool(kernel).await;
             let request = async {
                 match path {
                     "interactive" => {
@@ -115,7 +109,7 @@ mod tests {
             assert!(futures::poll!(&mut request).is_pending(), "admitted preparation waits for the worker");
             assert!(kernel.shell_operations().list_for_context(context).unwrap().is_empty(), "no receipt exists before preparation");
             kernel.kernel_db().lock().archive_context(context).unwrap();
-            release.send(()).unwrap();
+            drop(releases);
             let output = request.await;
             assert!(output.contains("admitted-before-archive"), "{path}: {output}");
             kernel.shutdown_runtime_worker().await.unwrap();

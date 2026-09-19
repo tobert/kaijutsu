@@ -6670,14 +6670,8 @@ mod lifetime_tests {
     async fn shutdown_before_headless_startup_settles_the_admitted_id() {
         use super::super::turn_request::{TurnAdmission, TurnRequest};
         let (kernel, context, after, call) = fixture(None).await;
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, held) = std::sync::mpsc::channel();
-        kernel.spawn_runtime_task(move |_| async move {
-            entered.send(()).unwrap();
-            // Hold this test's dedicated runtime before it can poll admission.
-            held.recv_timeout(Duration::from_secs(5)).unwrap();
-        }).unwrap();
-        ready.await.unwrap();
+        // Hold the whole pool before it can poll admission.
+        let releases = crate::kj::test_helpers::park_runtime_pool(&kernel).await;
         let mut events = kernel.turn_flows().subscribe("turn.*");
         let TurnAdmission::Accepted { turn_id: id, .. } = kernel.request_turn(TurnRequest {
             score: None,
@@ -6686,7 +6680,7 @@ mod lifetime_tests {
         }).unwrap() else { panic!("explicit request must be admitted") };
         assert_eq!(events.try_recv().unwrap().payload.turn_id(), id);
         kernel.stop_runtime_worker();
-        release.send(()).unwrap();
+        drop(releases);
         kernel.shutdown_runtime_worker().await.unwrap();
         let event = events.try_recv().expect("accepted startup must settle during shutdown");
         assert_eq!(event.payload.turn_id(), id);
@@ -6793,28 +6787,22 @@ mod lifetime_tests {
             let mut failures = kernel.turn_flows().subscribe("turn.failed");
             let session = kernel.turns().conversations().get_or_create(context);
             let held_conversation = session.lock().await;
-            let release = if after_claim {
+            let releases = if after_claim {
                 start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
                     call.principal_id, TurnOrigin::Autonomous, Some(epoch)).await.unwrap();
                 None
             } else {
-                let (entered, ready) = tokio::sync::oneshot::channel();
-                let (release, held) = std::sync::mpsc::channel();
-                kernel.spawn_runtime_task(move |_| async move {
-                    entered.send(()).unwrap();
-                    held.recv_timeout(Duration::from_secs(5)).unwrap();
-                }).unwrap();
-                ready.await.unwrap();
+                let releases = crate::kj::test_helpers::park_runtime_pool(&kernel).await;
                 kernel.request_turn(TurnRequest {
                     score: None, context_id: context, after_block_id: after,
                     content: String::new(), principal_id: call.principal_id,
                     model: None, continuation_epoch: Some(epoch),
                 }).unwrap();
-                Some(release)
+                Some(releases)
             };
             kernel.kernel_db().lock().update_context_review(context, Some(replacement), Some(call.principal_id)).unwrap();
             drop(held_conversation);
-            if let Some(release) = release { release.send(()).unwrap(); }
+            drop(releases);
             let event = tokio::time::timeout(Duration::from_secs(3), failures.recv()).await
                 .expect("stale continuation must settle").unwrap();
             let TurnFlow::Failed { error, .. } = event.payload else { panic!("expected failed continuation") };

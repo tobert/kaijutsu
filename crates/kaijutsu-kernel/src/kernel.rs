@@ -171,8 +171,15 @@ pub struct Kernel {
     /// Durable rc results and the live owners of post-execution write faults.
     rc_settlements: crate::rc::settlement::RcSettlements,
     turn_state: crate::runtime::turn_state::TurnState,
-    runtime_worker: OnceLock<Result<crate::runtime::worker::RuntimeWorker, String>>,
+    /// The worker pool that runs commands, model turns, rc lifecycle runs and
+    /// approval delivery. Started at construction: the beat's clock thread
+    /// reaches the funnel through `beat::fire_lifecycle`, and starting a thread
+    /// there would make the pulse wait. A start failure is kept and returned by
+    /// every `spawn_runtime_task`.
+    runtime_pool: Result<crate::runtime::worker::RuntimePool, String>,
     approval_delivery: OnceLock<Result<(), String>>,
+    /// The pool's one cancellation token. Every task holds a child of it, so a
+    /// failed task on any thread stops admission on all of them.
     runtime_worker_shutdown: tokio_util::sync::CancellationToken,
     /// The bound Claude Code peer inbox (`cc_inbox.rs`, `docs/cc-peer.md`
     /// "Order from here: kernel wiring of the inbox"). `OnceLock` like
@@ -310,6 +317,13 @@ impl Kernel {
     /// need no db plumbing of their own. `blocks()`/`file_cache()` expose
     /// them for callers that need to share the same instances.
     pub async fn new_ephemeral(name: impl Into<String>) -> Self {
+        Self::new_ephemeral_with_threads(name, crate::runtime::worker::default_pool_threads()).await
+    }
+
+    /// [`Self::new_ephemeral`] with the worker pool sized explicitly. Tests that
+    /// observe dispatch across threads, or that want one thread, state the
+    /// count here; everything else takes the default.
+    pub async fn new_ephemeral_with_threads(name: impl Into<String>, runtime_threads: usize) -> Self {
         let dir = std::env::temp_dir()
             .join(format!("kj-eph-{}", kaijutsu_types::KernelId::new().to_hex()));
         std::fs::create_dir_all(&dir).expect("create ephemeral kernel data dir");
@@ -323,7 +337,15 @@ impl Kernel {
             .get_or_create_default_workspace(principal)
             .expect("create ephemeral kernel default workspace");
         let blocks = crate::block_store::shared_block_store_with_db(db.clone(), ws, principal);
-        let mut kernel = Self::new(name, &dir, blocks, db).await;
+        let mut kernel = Self::with_flows_and_threads(
+            kaijutsu_types::KernelId::new(),
+            name,
+            shared_block_flow_bus(default_flow_capacity()),
+            &dir,
+            blocks,
+            db,
+            runtime_threads,
+        ).await;
         kernel.temp_cleanup = Some(std::sync::Arc::new(TempDirGuard(dir)));
         kernel
     }
@@ -342,6 +364,22 @@ impl Kernel {
         blocks: crate::block_store::SharedBlockStore,
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
     ) -> Self {
+        Self::with_flows_and_threads(id, name, block_flows, data_dir, blocks, db,
+            crate::runtime::worker::default_pool_threads()).await
+    }
+
+    /// [`Self::with_flows`] with the worker pool sized explicitly. The pool
+    /// starts here, so the count is a construction parameter rather than a
+    /// builder: a kernel never runs without its pool.
+    pub async fn with_flows_and_threads(
+        id: kaijutsu_types::KernelId,
+        name: impl Into<String>,
+        block_flows: SharedBlockFlowBus,
+        data_dir: &Path,
+        blocks: crate::block_store::SharedBlockStore,
+        db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
+        runtime_threads: usize,
+    ) -> Self {
         let name = name.into();
         let vfs = Arc::new(MountTable::new());
         let file_cache = Arc::new(crate::file_tools::FileDocumentCache::new(
@@ -353,6 +391,9 @@ impl Kernel {
             db.clone(),
             blocks.clone(),
         );
+        let runtime_worker_shutdown = tokio_util::sync::CancellationToken::new();
+        let runtime_pool = crate::runtime::worker::RuntimePool::start(
+            runtime_threads, runtime_worker_shutdown.clone());
 
         let kernel = Self {
             id,
@@ -396,9 +437,9 @@ impl Kernel {
             },
             rc_settlements,
             turn_state: crate::runtime::turn_state::TurnState::default(),
-            runtime_worker: OnceLock::new(),
+            runtime_pool,
             approval_delivery: OnceLock::new(),
-            runtime_worker_shutdown: tokio_util::sync::CancellationToken::new(),
+            runtime_worker_shutdown,
             cc_inbox: OnceLock::new(),
         };
         crate::runtime::command::recover_settlements(&kernel).expect("recover shell command projections");
@@ -416,22 +457,26 @@ impl Kernel {
         &self.rc_settlements
     }
 
-    /// Admit a task to the shared executor. Shutdown cancels its token and
-    /// joins the task; each owner must finish its settlement before returning.
+    /// Admit a task to the worker pool. Work submitted from a pool thread runs
+    /// on that same thread. Shutdown cancels its token and joins the task; each
+    /// owner must finish its settlement before returning.
     pub(crate) fn spawn_runtime_task<F, W>(&self, work: W) -> Result<(), String>
     where F: std::future::Future<Output = ()> + 'static, W: FnOnce(tokio_util::sync::CancellationToken) -> F + Send + 'static {
-        if self.runtime_worker_shutdown.is_cancelled() { return Err("kernel runtime worker is shut down".into()); }
-        let worker = self.runtime_worker.get_or_init(crate::runtime::worker::RuntimeWorker::start)
-            .as_ref().map_err(Clone::clone)?;
-        if self.runtime_worker_shutdown.is_cancelled() {
-            worker.stop();
-            return Err("kernel runtime worker is shut down".into());
-        }
-        worker.submit(work)
+        self.runtime_pool.as_ref().map_err(Clone::clone)?.submit(work)
     }
 
-    /// Start exactly one approval delivery subscription on the runtime worker.
+    /// Threads in the worker pool, or zero when the pool failed to start.
+    /// A test that must hold the pool busy parks one task on each thread;
+    /// production code never chooses work by thread.
+    pub fn runtime_threads(&self) -> usize {
+        self.runtime_pool.as_ref().map(|pool| pool.worker_threads()).unwrap_or(0)
+    }
+
+    /// Start exactly one approval delivery subscription on the worker pool.
     /// Subscription and backlog reads finish before this returns.
+    /// `run_delivery`'s unlocked state — the `woken` set and its check of a
+    /// turn in flight before it seeds one — is correct only because this is the
+    /// process's only delivery task. The pool must never start a second.
     pub fn start_approval_delivery(self: &Arc<Self>) -> Result<(), String> {
         if self.runtime_worker_shutdown.is_cancelled() {
             return Err("kernel runtime is shut down".into());
@@ -439,20 +484,20 @@ impl Kernel {
         self.approval_delivery.get_or_init(|| crate::runtime::approval_resume::start(self)).clone()
     }
 
-    /// Signal commands, model turns, and approval delivery to stop before worker exit.
-    /// This does not wait for the worker; transport disconnects do not stop it.
+    /// Signal commands, model turns, and approval delivery to stop before the
+    /// pool exits. This does not wait for the pool; transport disconnects do
+    /// not stop it.
     pub fn stop_runtime_worker(&self) {
         self.runtime_worker_shutdown.cancel();
-        if let Some(Ok(worker)) = self.runtime_worker.get() { worker.stop(); }
     }
 
-    /// Stop accepting work and join commands, turns, and approval delivery.
+    /// Stop accepting work and join commands, turns, and approval delivery on
+    /// every pool thread.
     pub async fn shutdown_runtime_worker(&self) -> Result<(), String> {
         self.stop_runtime_worker();
-        let joined = match self.runtime_worker.get() {
-            Some(Ok(worker)) => worker.join().await,
-            Some(Err(error)) => Err(error.clone()),
-            None => Ok(()),
+        let joined = match &self.runtime_pool {
+            Ok(pool) => pool.join().await,
+            Err(error) => Err(error.clone()),
         };
         let retried = crate::runtime::command::retry_retained_outcomes(self, usize::MAX);
         let rc_retried = self.rc_settlements.retry_pending();
