@@ -1,7 +1,7 @@
 # Resource admission for the kernel worker
 
-Status: planned. No code exists. The assumptions under "Checks before slice 1"
-are being verified against the source.
+Status: planned. No code exists. The assumptions were checked against the
+source; "What the source check found" records the result.
 
 The kernel worker runs every prompt turn, `kj drive`, shell command, structured
 `kj` call, MCP shell call, rc lifecycle run, approval resume, and scheduled
@@ -47,10 +47,19 @@ written. **Admission** is the existing `ContextAdmission` proof
   piece of work to the thread with the fewest running tasks, while that thread
   is under its running limit. Thread choice lives in one function,
   `pick_thread`.
-- **Re-entry stays local.** A thread-local marks a worker thread. When it is
-  set, `spawn_runtime_task` calls `spawn_local` on the current thread and skips
-  the queue. Nesting depth is bounded by the existing hook depth limit and, if
+- **Re-entry stays local.** A thread-local holds the current worker thread's
+  own work sender. When it is set, `spawn_runtime_task` sends to that thread
+  and skips the bounded queue. It does not call the free `spawn_local`: that
+  panics outside a `LocalSet` poll, and `tokio::spawn`ed tasks such as broker
+  pump loops run on a worker thread's runtime but outside its `LocalSet`.
+  Nesting depth is bounded by the existing hook depth limit and, if
   measurement asks for it, a per-thread nested count.
+- **The pool starts at kernel boot.** The worker starts lazily today, and the
+  start blocks while a thread comes up. The clock thread reaches the funnel
+  through `beat::fire_lifecycle`, so a lazy start would make the pulse wait.
+- **All threads share one cancellation token.** A panic in any thread's task
+  then stops admission everywhere and is reported by shutdown, as it is today.
+  Shutdown closes the queue, dispatches what it holds, and joins every thread.
 - **No context affinity.** Work for one context may run on any thread. If
   same-context ordering turns out to be a promise, `pick_thread` hashes the
   context to a thread and nothing else changes.
@@ -81,7 +90,23 @@ is a bound on model spend, which needs its own count of provider requests.
   hook body; an approved command run inline by the delivery task.
 - **Long-lived occupants.** The approval delivery task never ends, and
   `kj wait` holds its task for the whole timeout while computing nothing.
-  Neither may count against a thread's running limit.
+  A parked-occupant guard around the delivery loop's idle wait and `kj wait`'s
+  park releases the thread's running count while held. The delivery scan
+  itself, which runs approved commands inline, stays counted.
+- **Exactly one delivery task.** Its `woken` set and its check of a turn in
+  flight before seeding are unlocked, and correct only because
+  `Kernel::approval_delivery` is a `OnceLock`. The pool must not start a second.
+- **Background tasks follow the thread that spawned them.** Broker pump loops,
+  flush timers and `kj audio keep` jobs are `tokio::spawn`ed from worker tasks,
+  so with N runtimes they scatter across threads. Spawn them on one designated
+  thread or the host runtime.
+- **Same-context order across transports.** Each entry point does its first
+  synchronous step on the caller's thread and then awaits a reply, so one
+  caller's submissions stay ordered. `start_shell_operation` and
+  `consume_draft` run inside the task after an await, so two transports
+  submitting to one context can land their block pairs in either order. Each
+  pair is still written atomically under the document guard. The slice 1
+  ordering test decides whether `pick_thread` hashes the context.
 - **Work outside the count.** `tokio::spawn` tasks started from a worker task
   (broker pump loops, flush timers, `kj audio keep`) and `spawn_blocking` work
   (`kj audio beats`, CAS preparation) are not bounded by the pool.
@@ -116,14 +141,28 @@ is a bound on model spend, which needs its own count of provider requests.
 Tests use barriers and explicit completion delivery, no sleeps and no hosted
 models.
 
-## Checks before slice 1
+## What the source check found
 
-- The task futures are `!Send`, and what makes them so. If they are `Send`, a
-  multi-thread runtime replaces the thread-per-`LocalSet` pool.
-- Nothing relies on the single worker thread for mutual exclusion or ordering.
-- Every blocking re-entry path reaches the funnel on a worker thread.
-- `try_reserve_owned` fits each call site without holding the slot across a
-  database guard in a way that can deadlock.
+- **The task futures are `!Send`, for a shallow reason.** `ContextSwitchSink`
+  (`runtime/command.rs`) is a borrowed `dyn Fn` returning a `LocalBoxFuture`,
+  and `CommandRunOptions` carries it through every command future. There is no
+  `Rc`, no production `thread_local!`, and no lock guard held across an await.
+  Making the sink `Send` could open the way to a multi-thread runtime, but the
+  rest of the tree (kaish execution, `rc::run`, provider streams) is unchecked
+  and needs a compile to find out. The thread-per-`LocalSet` pool does not
+  depend on it.
+- **Nothing relies on the single thread for mutual exclusion.** `Kernel` is
+  already shared with RPC threads and the clock thread; its state is behind
+  locks. Per-context turn exclusion is an async mutex held for the turn, and
+  turn admission is ordered by the database guard.
+- **Every blocking re-entry reaches the funnel from a worker task.** No
+  `spawn_blocking` closure reaches it. Callers on other threads hold no worker
+  slot, so a full pool refuses them; it cannot deadlock them. A refused
+  `emit_notification_block` drops its notification with a warning.
+- **`try_reserve_owned` fits.** The pinned tokio has it, the slot is
+  `Send + 'static`, and no call site holds it across an await. `request_turn`
+  needs a form that takes a slot its caller already holds, because `kj drive`
+  writes its seed block first.
 
 Evidence (entry-point inventory, review findings, file and line references):
 `~/exomemory/kaijutsu/resource-admission-evidence-2026-09-19.md`.
