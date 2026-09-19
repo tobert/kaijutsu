@@ -145,8 +145,6 @@ reports byte offsets within the matched line while `block_splice` takes
 whole-block character positions. The tool descriptions now say so; a
 block-relative character offset on `SearchMatch` (new fields, leaving the byte
 fields alone) would let clients compose the two without converting.
-`block_search` returns a protocol error on no matches while `kernel_search`
-returns a success payload with an empty `matches` array; choose one convention.
 MCP `img_block` takes a CAS hash and does not compare the object's recorded
 type with `ContentType::Image`. `kj block append --text` can append to an Image
 block's CAS-hash content without checking that a hash remains.
@@ -2874,13 +2872,6 @@ experiment" — treat `Editor` as provisional until that sweep.
   `mcp/servers/shell.rs` becomes the regression.
 - **No timeout knob on the server kernel**, so the wire timeout test proxies
   with `exit 124`; a real one needs an injectable `TimeoutPolicy`.
-- **Scope of `runtime/command.rs` as the execution owner.** `rc/mod.rs`
-  (`run_kai_script`), `mcp/broker.rs` (`run_kaish_hook`) and
-  `runtime/editor_read.rs` build `kaish_kernel::ExecuteOptions` themselves
-  because they call `EmbeddedKaish::execute_with_options` directly: no block
-  pair, receipt or result hooks. Decide whether the owner covers only
-  block/receipt-producing commands (then close this) or all kaish execution
-  (then it needs a no-projection mode with a vars overlay and timeout).
 - **A failed wake after a completion notice is never retried.**
   `completion_notice::deliver` commits the notice block, which stamps
   `block_id` (`block_store.rs`, `insert_completion_notice`), then calls

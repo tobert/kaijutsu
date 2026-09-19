@@ -562,10 +562,6 @@ impl McpServerLike for BlockToolsServer {
                     }
                 }
 
-                if search_matches.is_empty() {
-                    return Err(McpError::Protocol("No matches found".to_string()));
-                }
-
                 let res_json = serde_json::json!({
                     "matches": search_matches,
                     "total_matches": search_matches.len()
@@ -1487,6 +1483,23 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
         let matches = response["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 2); // apple and apricot
+    }
+
+    /// No matches is an answer: a success payload with an empty `matches`
+    /// array, the same convention as `kernel_search`.
+    #[tokio::test]
+    async fn block_search_with_no_matches_succeeds_with_an_empty_list() {
+        let (broker, ctx, _db, store) = setup().await;
+        let block_id = store
+            .insert_block(ctx.context_id, None, None, Role::User, BlockKind::Text, "apple\n", Status::Done, ContentType::Plain)
+            .unwrap();
+
+        let res = call(&broker, &ctx, "block_search",
+            serde_json::json!({ "block_id": block_id.to_key(), "query": "zebra" })).await;
+        assert!(!res.is_error, "an empty search is not an error: {}", text_of(&res));
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        assert_eq!(response["matches"], serde_json::json!([]));
+        assert_eq!(response["total_matches"], 0);
     }
 
     /// `summary` is the kernel-derived line a settled Thinking block carries
