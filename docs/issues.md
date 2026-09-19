@@ -2884,6 +2884,13 @@ experiment" — treat `Editor` as provisional until that sweep.
   `docs/shell-envelope.md` wording when it lands.
 - **No timeout knob on the server kernel**, so the wire timeout test proxies
   with `exit 124`; a real one needs an injectable `TimeoutPolicy`.
+- **Interruption elsewhere still reads as a plain failure.** An interrupted
+  result review now projects exit 130. A structured `kj` call returns the
+  refusal reason as an RPC error before `exec_result` is read
+  (`runtime/structured.rs`, the `Refused` early return), and an unpublished
+  approval pair recovered at restart (`approval_resume.rs`,
+  `recover_unpublished_pairs`) projects 1. Decide whether either should carry
+  the interruption marker.
 - **A failed wake after a completion notice is never retried.**
   `completion_notice::deliver` commits the notice block, which stamps
   `block_id` (`block_store.rs`, `insert_completion_notice`), then calls

@@ -72,6 +72,14 @@ payload supply the new result. Raw records are separate from ordinary receipt
 polls. Structured RPC, streaming RPC, and MCP completion are still being migrated;
 see `docs/kaish-integration.md`.
 
+Owner cancellation (kernel shutdown or a caller's disconnect) can end result
+review while a hook is still paused or running on already-captured output. The
+captured execution is retained exactly as run; only its publication stops.
+This is not a hook refusal and not the command's own exit: the job and RPC
+adapters that need an integer report the kernel's existing cancellation code,
+130, so a script can tell interruption apart from both. The envelope still
+claims no physical exit for it, the same as any other hook effect.
+
 ## The body is the envelope
 
 The envelope is what the model reads, not a side channel next to a prose body.

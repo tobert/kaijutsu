@@ -1032,9 +1032,12 @@ mod fill_tests {
         assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst), "terminal settlement must await hook cleanup");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let saved = kernel.shell_operations().outcome(&receipt.operation_id, context).unwrap().unwrap();
+        assert_eq!(saved.exec_result().code, 130, "an interrupted result hook reports the kernel's signal-style code, not a bare 1");
         let CommandExecution::Completed(raw) = saved.execution else { panic!("lost captured execution") };
         assert_eq!(raw.text_out(), "captured exactly once");
-        assert!(kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap().completed_at.is_some());
+        let state = kernel.shell_operations().get(&receipt.operation_id, context).unwrap().unwrap();
+        assert!(state.completed_at.is_some());
+        assert_eq!(state.envelope.as_ref().unwrap().exit_code, None, "no physical exit is claimed for this synthetic result");
     }
 
     #[async_trait::async_trait]

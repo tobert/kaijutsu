@@ -25,6 +25,12 @@ pub enum CommandHookEffect {
         reason: String, waiting: bool, ask_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refusal: Option<kaijutsu_types::Refusal>,
+        /// Owner cancellation ended result review before a verdict was
+        /// reached; this is not the hook table's own answer. `exec_result`
+        /// reports it with the kernel's cancellation code, 130, so a script
+        /// can tell it apart from a refusal or a command's own exit 1.
+        #[serde(default)]
+        interrupted: bool,
     },
 }
 
@@ -59,6 +65,7 @@ impl CommandOutcome {
                 refusal: error.as_refusal(),
                 waiting: error.settled_block_status() == Status::Waiting,
                 ask_id: error.as_refusal().and_then(|refusal| refusal.ask_id().map(str::to_owned)),
+                interrupted: false,
             }),
         };
     }
@@ -138,8 +145,10 @@ impl CommandOutcome {
 
     /// Project into an ExecResult for jobs and RPC adapters that require an
     /// integer completion code. Preserve executed results when applicable;
-    /// synthetic results use 0/1 and identify themselves in baggage. Durable
-    /// envelopes never claim a physical exit for a synthetic result.
+    /// synthetic results use 0/1/130 and identify themselves in baggage.
+    /// Durable envelopes never claim a physical exit for a synthetic result:
+    /// an interrupted review's 130 lives only in this projected code, the
+    /// same signal-style value background job cancellation already uses.
     pub fn exec_result(&self) -> ExecResult {
         if self.hook.is_none() && self.settlement_error.is_none()
             && let CommandExecution::Completed(result) = &self.execution
@@ -147,7 +156,11 @@ impl CommandOutcome {
             return result.clone();
         }
         let envelope = self.envelope();
-        let code = if envelope.is_error() { 1 } else { 0 };
+        let code = match &self.hook {
+            Some(CommandHookEffect::Refused { interrupted: true, .. }) => 130,
+            _ if envelope.is_error() => 1,
+            _ => 0,
+        };
         let mut result = ExecResult::success(envelope.stdout);
         result.code = code;
         result.err = envelope.stderr;
@@ -233,5 +246,36 @@ mod tests {
             assert_eq!(outcome.block_status(), Status::Error);
             assert!(outcome.exec_result().code != 0);
         }
+    }
+
+    /// Owner cancellation during result review reports a signal-style exit,
+    /// so a script can tell the review was interrupted rather than that the
+    /// captured command itself failed. The envelope still claims no physical
+    /// exit for this synthetic result — only the projected job code changes.
+    #[test]
+    fn an_interrupted_result_review_projects_exit_130_not_a_bare_failure() {
+        let mut outcome = CommandOutcome::new(CommandExecution::Completed(ExecResult::success("captured")), 5);
+        outcome.hook = Some(CommandHookEffect::Refused {
+            reason: "Result review was cancelled; captured execution was not repeated.".into(),
+            waiting: false, ask_id: None, refusal: None, interrupted: true,
+        });
+        assert!(outcome.envelope().is_error());
+        assert_eq!(outcome.envelope().exit_code, None, "no physical exit is claimed for a synthetic result");
+        assert_eq!(outcome.exec_result().code, 130);
+        assert_eq!(outcome.block_status(), Status::Error);
+    }
+
+    /// The same hook effect without the interruption marker is an ordinary
+    /// refusal and keeps reporting the fault convention of a bare 1. This is
+    /// the guard: only interruption may claim 130.
+    #[test]
+    fn a_genuine_hook_refusal_keeps_exit_1_not_130() {
+        let mut outcome = CommandOutcome::new(CommandExecution::Completed(ExecResult::success("captured")), 5);
+        outcome.apply_hook(ShellHookVerdict::Denied(crate::mcp::McpError::refused_gate(
+            kaijutsu_types::RefusalKind::Denied, "policy-hook", None, "denied by policy",
+        )));
+        assert!(outcome.refusal().is_some(), "a gate refusal carries a Refusal");
+        assert!(outcome.envelope().is_error());
+        assert_eq!(outcome.exec_result().code, 1);
     }
 }

@@ -577,6 +577,7 @@ pub(crate) fn recover_unpublished_pairs(kernel: &Kernel) -> Result<usize, String
             let mut outcome = super::command_outcome::CommandOutcome::new(super::command_outcome::CommandExecution::NotRun, 0);
             outcome.hook = Some(super::command_outcome::CommandHookEffect::Refused {
                 reason: reason.into(), waiting: false, ask_id: Some(request.clone()), refusal: None,
+                interrupted: false,
             });
             super::command::settle_outcome(kernel, context, &command, &output, &outcome, Some(owner))?;
         } else {
@@ -1225,6 +1226,7 @@ mod lifetime_tests {
             let mut waiting = super::super::command_outcome::CommandOutcome::new(super::super::command_outcome::CommandExecution::NotRun, 0);
             waiting.hook = Some(super::super::command_outcome::CommandHookEffect::Refused {
                 reason: "waiting for review".into(), waiting: true, ask_id: Some(request.clone()), refusal: None,
+                interrupted: false,
             });
             if matches!(mode, "stopped" | "abandon-fault") { waiting.settlement_error = Some("caller stopped before handing off execution".into()); }
             let result = super::super::command::settle_outcome(kernel, context, &command, &output, &waiting, Some(crate::PairOwner::Session));

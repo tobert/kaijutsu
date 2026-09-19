@@ -76,7 +76,7 @@ fn shutdown_settles_streaming_execution_paused_in_post_call() {
             panic!("streaming output closed without an exit");
         })
             .await.expect("joined shutdown must leave a completed streaming output");
-        assert_eq!(exit, 1, "cancelling result review reports the hook refusal, not the captured echo exit 0 or kaish cancellation 130");
+        assert_eq!(exit, 130, "cancelling result review reports the kernel's signal-style interruption code, not the captured echo exit 0 or a bare refusal 1");
     });
 }
 
@@ -225,6 +225,8 @@ fn interactive_lifetime(shutdown: bool) {
             }
         }).await.expect("accepted interactive execution must settle without its submitting RPC task");
         let outcome = kernel.kernel.shell_operations().outcome(&submission.operation_id, context).unwrap().unwrap();
+        assert_eq!(outcome.exec_result().code, if shutdown { 130 } else { 0 },
+            "shutdown cancelling a paused PostCall hook reports the kernel's signal-style code, not a bare 1");
         let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = outcome.execution
             else { panic!("captured interactive output was lost") };
         assert_eq!(raw.text_out(), "retained-interactive\n");

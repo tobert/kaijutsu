@@ -102,6 +102,7 @@ impl CommandResultReview {
             let mut outcome = self.captured.clone();
             outcome.hook = Some(CommandHookEffect::Refused {
                 reason: reason.into(), refusal: None, waiting: false, ask_id: ask.map(str::to_owned),
+                interrupted: true,
             });
             outcome
         }).clone()
@@ -111,7 +112,7 @@ impl CommandResultReview {
         let mut waiting = self.captured.clone();
         waiting.hook = Some(CommandHookEffect::Refused {
             reason: "Captured execution awaits result review; approval continues processing without running source again.".into(),
-            refusal: None, waiting: true, ask_id: Some(request.into()),
+            refusal: None, waiting: true, ask_id: Some(request.into()), interrupted: false,
         });
         waiting
     }
@@ -398,7 +399,7 @@ mod tests {
         assert_eq!(store.get_by_ask(&original, context).unwrap().unwrap().receipt.operation_id, operation);
         let mut checkpoint = review.captured.clone();
         checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
-            waiting: true, ask_id: Some(ask.request_id.clone()) });
+            waiting: true, ask_id: Some(ask.request_id.clone()), interrupted: false });
         store.checkpoint_result_review(&review.review_id, Some(&operation), &review.call, &checkpoint).unwrap();
         for request in [&original, &ask.request_id] {
             let state = store.get_by_ask(request, context).unwrap().expect("every ask retains its original receipt");
@@ -424,7 +425,7 @@ mod tests {
         let store = review.kernel.shell_operations();
         let mut checkpoint = review.captured.clone();
         checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
-            waiting: true, ask_id: Some(ask.request_id.clone()) });
+            waiting: true, ask_id: Some(ask.request_id.clone()), interrupted: false });
         store.checkpoint_result_review(&review.review_id, None, &review.call, &checkpoint).unwrap();
         review.kernel.kernel_db().lock().conn_for_ledger().execute_batch(
             "CREATE TRIGGER fail_review_retention BEFORE UPDATE OF final_json ON shell_result_reviews
@@ -449,7 +450,7 @@ mod tests {
         let (review, ask, _) = fixture(false).await;
         let mut checkpoint = review.captured.clone();
         checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
-            waiting: true, ask_id: Some(ask.request_id.clone()) });
+            waiting: true, ask_id: Some(ask.request_id.clone()), interrupted: false });
         let store = review.kernel.shell_operations();
         store.checkpoint_result_review(&review.review_id, None, &review.call, &checkpoint).unwrap();
         let mut changed = checkpoint.clone();
@@ -471,7 +472,7 @@ mod tests {
         let (review, ask, operation) = fixture(true).await;
         let mut checkpoint = review.captured.clone();
         checkpoint.hook = Some(CommandHookEffect::Refused { reason: "review".into(), refusal: None,
-            waiting: true, ask_id: Some(ask.request_id.clone()) });
+            waiting: true, ask_id: Some(ask.request_id.clone()), interrupted: false });
         let store = review.kernel.shell_operations();
         store.checkpoint_result_review(&review.review_id, operation.as_deref(), &review.call, &checkpoint).unwrap();
         assert!(store.finish_result_review(&review.review_id, &review.captured).is_err(),
@@ -507,7 +508,7 @@ mod tests {
             let (review, ask, operation) = fixture(authored).await;
             let mut checkpoint = review.captured.clone();
             checkpoint.hook = Some(CommandHookEffect::Refused { reason: "awaiting result review".into(),
-                refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()) });
+                refusal: None, waiting: true, ask_id: Some(ask.request_id.clone()), interrupted: false });
             if legacy {
                 let db = review.kernel.kernel_db().lock();
                 db.conn_for_ledger().execute_batch("DROP TABLE shell_result_review_asks; DROP TABLE shell_result_reviews;
