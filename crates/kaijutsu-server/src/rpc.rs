@@ -9577,6 +9577,7 @@ fn set_file_attr(
     builder.set_mtime_secs(duration.as_secs());
     builder.set_mtime_nanos(duration.subsec_nanos());
     builder.set_nlink(attr.nlink);
+    builder.set_generation(attr.generation);
 }
 
 impl vfs::Server for VfsImpl {
@@ -9702,6 +9703,32 @@ impl vfs::Server for VfsImpl {
             Ok(())
         })
     }
+
+    fn getattr(
+        self: Rc<Self>,
+        params: vfs::GetattrParams,
+        mut results: vfs::GetattrResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let path = match params.get_path().and_then(|p| get_path_str(p)) {
+            Ok(s) => s.to_owned(),
+            Err(e) => return Promise::err(capnp::Error::failed(format!("{}", e))),
+        };
+        let kernel = self.kernel.clone();
+
+        Promise::from_future(async move {
+            let attr = kernel
+                .getattr(Path::new(&path))
+                .await
+                .map_err(vfs_err_to_capnp)?;
+            let mut builder = results.get().init_attr();
+            set_file_attr(&mut builder, &attr);
+            Ok(())
+        })
+    }
 }
 
 /// Recursively fill a capnp `SnapshotNode` builder from the owned kernel tree
@@ -9727,6 +9754,89 @@ fn set_snapshot_node(
     for (i, child) in node.children.iter().enumerate() {
         let mut child_builder = children.reborrow().get(i as u32);
         set_snapshot_node(&mut child_builder, child);
+    }
+}
+
+#[cfg(test)]
+mod vfs_getattr_generation_tests {
+    //! `Vfs.getattr`'s `generation` field (docs/issues.md, "The wire
+    //! `FileAttr` carries no `generation`") — the coherence primitive a
+    //! poller compares against a cached value to skip a re-`read`. Drives
+    //! `VfsImpl` as a local, in-process capnp-rpc client/server pair (no
+    //! socket, no SSH, no subprocess — the same `capnp_rpc::new_client`
+    //! seam `semantic_search_tests` uses above) against a real `Kernel`
+    //! over a mounted `MemoryBackend`, so the whole kernel-attr → wire-attr
+    //! mapping is exercised, not just `set_file_attr` in isolation.
+    use super::*;
+    use kaijutsu_kernel::MemoryBackend;
+
+    /// Round-trip a `Vfs.getattr` call over the in-process client and
+    /// return the wire `generation`.
+    async fn wire_generation(client: &vfs::Client, path: &str) -> u64 {
+        let mut request = client.getattr_request();
+        request.get().set_path(path);
+        let response = request.send().promise.await.expect("getattr over the wire");
+        response
+            .get()
+            .expect("getattr results")
+            .get_attr()
+            .expect("attr")
+            .get_generation()
+    }
+
+    #[tokio::test]
+    async fn generation_matches_kernel_stamp_is_stable_across_reads_and_advances_on_write() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let kernel = Arc::new(Kernel::new_ephemeral("vfs-getattr-test").await);
+                kernel.mount("/scratch", MemoryBackend::new()).await;
+                kernel
+                    .create(Path::new("/scratch/a.txt"), 0o644)
+                    .await
+                    .expect("create");
+                kernel
+                    .write(Path::new("/scratch/a.txt"), 0, b"hello")
+                    .await
+                    .expect("write");
+
+                // The mapping seam: what the kernel actually stamped.
+                let direct_attr = kernel
+                    .getattr(Path::new("/scratch/a.txt"))
+                    .await
+                    .expect("direct kernel getattr");
+                assert_ne!(
+                    direct_attr.generation, 0,
+                    "a write must stamp a non-zero generation"
+                );
+
+                let client: vfs::Client = capnp_rpc::new_client(VfsImpl::new(kernel.clone()));
+
+                let wire_gen_1 = wire_generation(&client, "/scratch/a.txt").await;
+                assert_eq!(
+                    wire_gen_1, direct_attr.generation,
+                    "a getattr response must carry the kernel's stamped generation"
+                );
+
+                // Stable across a second read with no write between — the
+                // whole point of the field: a client can skip a re-fetch.
+                let wire_gen_2 = wire_generation(&client, "/scratch/a.txt").await;
+                assert_eq!(
+                    wire_gen_2, wire_gen_1,
+                    "generation must not change across reads with no write between"
+                );
+
+                // Changes after a write.
+                kernel
+                    .write(Path::new("/scratch/a.txt"), 0, b"world")
+                    .await
+                    .expect("second write");
+                let wire_gen_3 = wire_generation(&client, "/scratch/a.txt").await;
+                assert_ne!(
+                    wire_gen_3, wire_gen_2,
+                    "generation must advance after a write"
+                );
+            })
+            .await;
     }
 }
 

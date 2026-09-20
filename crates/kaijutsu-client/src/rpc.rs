@@ -2918,6 +2918,25 @@ impl KernelHandle {
         })
     }
 
+    /// Attributes only, no data (`docs/issues.md`, "The wire `FileAttr`
+    /// carries no `generation`") — lets a poller compare `attr.generation`
+    /// against a cached value and skip a `vfs_read_all` entirely when it
+    /// hasn't moved. See `FileAttr::generation`'s doc comment
+    /// (kaijutsu-kernel) for the coherence contract.
+    #[tracing::instrument(skip(self), name = "rpc_client.vfs_getattr")]
+    pub async fn vfs_getattr(&self, path: &str) -> Result<FileAttr, RpcError> {
+        let vfs_response = self.kernel.vfs_request().send().promise.await?;
+        let vfs = vfs_response.get()?.get_vfs()?;
+
+        let mut request = vfs.getattr_request();
+        {
+            let mut p = request.get();
+            p.set_path(path);
+        }
+        let response = request.send().promise.await?;
+        parse_file_attr(response.get()?.get_attr()?)
+    }
+
     /// Read a whole VFS file over the existing `Vfs` capability — no new wire
     /// method. Chunked at [`VFS_READ_CHUNK`] and stopping on the documented
     /// zero-length-read EOF signal, so it works against every backend
@@ -3039,6 +3058,45 @@ pub enum VfsFileType {
     File,
     Directory,
     Symlink,
+}
+
+/// Result of [`KernelHandle::vfs_getattr`] — owned mirror of the wire
+/// `FileAttr` struct. `generation` is the coherence primitive: a
+/// strictly-advancing content version a caller can cache and compare
+/// against a later `vfs_getattr` to tell whether a `vfs_read_all` would see
+/// new content, without doing the read. `mtime_*` is display-only (`ls -l`,
+/// SFTP attrs) — never use it for that comparison, see `FileAttr::generation`'s
+/// doc comment (kaijutsu-kernel) for why. `0` means unknown / never observed
+/// a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileAttr {
+    pub size: u64,
+    pub kind: VfsFileType,
+    pub perm: u32,
+    pub mtime_secs: u64,
+    pub mtime_nanos: u32,
+    pub nlink: u32,
+    pub generation: u64,
+}
+
+/// Parse a capnp `FileAttr` reader into the owned client type.
+fn parse_file_attr(
+    reader: crate::kaijutsu_capnp::file_attr::Reader<'_>,
+) -> Result<FileAttr, RpcError> {
+    let kind = match reader.get_kind()? {
+        crate::kaijutsu_capnp::FileType::File => VfsFileType::File,
+        crate::kaijutsu_capnp::FileType::Directory => VfsFileType::Directory,
+        crate::kaijutsu_capnp::FileType::Symlink => VfsFileType::Symlink,
+    };
+    Ok(FileAttr {
+        size: reader.get_size(),
+        kind,
+        perm: reader.get_perm(),
+        mtime_secs: reader.get_mtime_secs(),
+        mtime_nanos: reader.get_mtime_nanos(),
+        nlink: reader.get_nlink(),
+        generation: reader.get_generation(),
+    })
 }
 
 /// One node of a `Vfs.snapshot` reply — owned, recursive mirror of the wire
@@ -4832,6 +4890,44 @@ mod tests {
         let data = parse_output_data(reader).expect("parse_output_data");
 
         assert_eq!(data.rich_json, None);
+    }
+
+    /// `parse_file_attr` — the wire `FileAttr` → owned client `FileAttr`
+    /// mapping, including the `generation` field (docs/issues.md, "The wire
+    /// `FileAttr` carries no `generation`"). The kernel-side `set_file_attr`
+    /// → wire mapping is covered server-side
+    /// (`kaijutsu-server::rpc::vfs_getattr_generation_tests`); this is the
+    /// symmetric client-side half of the same wire struct.
+    #[test]
+    fn parse_file_attr_round_trip_carries_generation() {
+        let mut message = MessageBuilder::new_default();
+        {
+            let mut builder = message.init_root::<crate::kaijutsu_capnp::file_attr::Builder>();
+            builder.set_size(1234);
+            builder.set_kind(crate::kaijutsu_capnp::FileType::Directory);
+            builder.set_perm(0o755);
+            builder.set_mtime_secs(1_700_000_000);
+            builder.set_mtime_nanos(42);
+            builder.set_nlink(2);
+            builder.set_generation(7);
+        }
+        let reader = message
+            .get_root_as_reader::<crate::kaijutsu_capnp::file_attr::Reader>()
+            .unwrap();
+        let attr = parse_file_attr(reader).expect("parse_file_attr");
+
+        assert_eq!(
+            attr,
+            FileAttr {
+                size: 1234,
+                kind: VfsFileType::Directory,
+                perm: 0o755,
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 42,
+                nlink: 2,
+                generation: 7,
+            }
+        );
     }
 
     /// Helper: build a BlockSnapshot capnp message, set fields, then parse it back

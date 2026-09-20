@@ -29,17 +29,16 @@
 //!
 //! ## Why the whole file, every poll
 //!
-//! The kernel stamps `FileAttr::generation` on this file precisely so a
-//! caching reader can skip the read — but the **wire** `FileAttr`
-//! (`kaijutsu.capnp`) has no `generation` field, so `Vfs.getattr` cannot
-//! carry it to a client today, and `Vfs.snapshot` reports generation `0` for
-//! any non-directory (`MountTable::snapshot_node`). A getattr-then-maybe-read
-//! poll would therefore be two round trips that cannot actually skip the
-//! second one. Until that wire gap closes (docs/issues.md) we read the whole
-//! index — it is a handful of short lines — and re-parse only when the bytes
-//! changed, which is where the real work is anyway. [`RosterFeed::revision`]
-//! is a LOCAL content revision, not the kernel's generation; nothing here
-//! pretends otherwise.
+//! The kernel stamps `FileAttr::generation` on this file so a caching reader
+//! can skip the read, and the wire now carries it: `Vfs.getattr` returns it
+//! and `KernelHandle::vfs_getattr` decodes it. This feed does not use it yet —
+//! it reads the whole index, a handful of short lines, and re-parses only when
+//! the bytes changed, which is where the real work is. Switching to
+//! getattr-then-maybe-read needs the call threaded through `ActorHandle`
+//! (docs/issues.md). Note that `Vfs.snapshot` still reports generation `0` for
+//! any non-directory (`MountTable::snapshot_node`), so the snapshot path is
+//! not the one to read it from. [`RosterFeed::revision`] is a LOCAL content
+//! revision, not the kernel's generation; nothing here pretends otherwise.
 //!
 //! The poll/drain shape (clone the handle, spawn an `IoTaskPool` task, ship
 //! the result back through `RpcResultChannel`, drain it in a chained system)

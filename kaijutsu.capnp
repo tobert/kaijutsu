@@ -1345,6 +1345,11 @@ struct FileAttr {
   mtimeSecs @3 :UInt64;        # Seconds since UNIX epoch
   mtimeNanos @4 :UInt32;       # Nanoseconds
   nlink @5 :UInt32;
+  generation @6 :UInt64;       # Strictly-advancing content version — the
+                                # coherence primitive (kernel FileAttr::generation).
+                                # A client compares this, not mtimeSecs/mtimeNanos,
+                                # to detect an external edit; 0 means unknown /
+                                # never observed a write.
 }
 
 struct DirEntry {
@@ -1415,7 +1420,7 @@ interface VfsActivityEvents {
 }
 
 interface Vfs {
-  # Next free ordinal: 17. Ordinals are dense and permanent — never
+  # Next free ordinal: 18. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -1466,6 +1471,15 @@ interface Vfs {
   # partial tree that would look indistinguishable from an intentional cut.
   snapshot @16 (path :Text, depth :UInt32, maxEntries :UInt32)
       -> (root :SnapshotNode, generation :UInt64, truncated :Bool);
+
+  # Attributes only, no data — lets a client compare `attr.generation`
+  # against a cached value and skip a `read` entirely when it hasn't moved
+  # (`docs/issues.md`, "The wire `FileAttr` carries no `generation`"). A
+  # refused lookup is a transport fault here (unlike `read`'s `VfsErrorKind`
+  # result): the only caller (a coherence poll) has no fallback path that
+  # would benefit from a distinguishable refusal today, and stat calls are
+  # rare enough that this can grow a result type later if that changes.
+  getattr @17 (path :Text) -> (attr :FileAttr);
 }
 
 # ============================================================================
