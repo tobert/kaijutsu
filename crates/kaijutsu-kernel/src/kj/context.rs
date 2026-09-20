@@ -2064,25 +2064,29 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
         };
 
-        // Delete old structural edges pointing to ctx_id
+        // Delete the old structural edges and insert the new one (with
+        // cycle detection) in one transaction: a refused move (cycle
+        // detected) must not have destroyed the old edge, leaving the
+        // context orphaned (`docs/issues.md`, "`kj context move` still
+        // isn't atomic").
         let old_parents = match db.structural_parents(ctx_id) {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
         };
-        for parent in &old_parents {
-            let _ = db.delete_structural_edge(parent.context_id, ctx_id);
-        }
-
-        // Insert new structural edge (with cycle detection)
-        let edge = ContextEdgeRow {
-            edge_id: uuid::Uuid::now_v7(),
-            source_id: new_parent_id,
-            target_id: ctx_id,
-            kind: EdgeKind::Structural,
-            metadata: None,
-            created_at: kaijutsu_types::now_millis() as i64,
-        };
-        if let Err(e) = db.insert_edge(&edge) {
+        let moved = db.in_transaction(|db| {
+            for parent in &old_parents {
+                db.delete_structural_edge(parent.context_id, ctx_id)?;
+            }
+            db.insert_edge(&ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id: new_parent_id,
+                target_id: ctx_id,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })
+        });
+        if let Err(e) = moved {
             return KjResult::Err(format!("kj context move: {e}"));
         }
 
@@ -4200,6 +4204,64 @@ mod tests {
         assert_eq!(parents[0].context_id, b);
     }
 
+    /// A move that the cycle check refuses must not have touched the old
+    /// structural edge. `docs/issues.md`, "`kj context move` still isn't
+    /// atomic": the buggy sequence deletes every existing parent edge
+    /// *then* calls `insert_edge` (where cycle detection lives), so a
+    /// refused move orphaned the context.
+    #[tokio::test]
+    async fn context_move_refused_for_cycle_leaves_original_edge_intact() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let root = register_context(&d, Some("root"), None, principal);
+        let mid = register_context(&d, Some("mid"), Some(root), principal);
+        let leaf = register_context(&d, Some("leaf"), Some(mid), principal);
+
+        // root → mid → leaf
+        {
+            let db = d.kernel_db().lock();
+            db.insert_edge(&ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id: root,
+                target_id: mid,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+            db.insert_edge(&ContextEdgeRow {
+                edge_id: uuid::Uuid::now_v7(),
+                source_id: mid,
+                target_id: leaf,
+                kind: EdgeKind::Structural,
+                metadata: None,
+                created_at: kaijutsu_types::now_millis() as i64,
+            })
+            .unwrap();
+        }
+
+        // Move mid under its own descendant leaf — the cycle check must
+        // refuse this.
+        let c = caller_with_context(root);
+        let result = d
+            .dispatch(&[s("context"), s("move"), s("mid"), s("leaf")], &c)
+            .await;
+        assert!(
+            !result.is_ok(),
+            "expected the cycle to be refused, got: {}",
+            result.message()
+        );
+
+        let db = d.kernel_db().lock();
+        let parents = db.structural_parents(mid).unwrap();
+        assert_eq!(
+            parents.len(),
+            1,
+            "mid must keep exactly its original parent edge after a refused move"
+        );
+        assert_eq!(parents[0].context_id, root);
+    }
+
     #[tokio::test]
     async fn context_archive_requires_latch() {
         let d = test_dispatcher().await;
@@ -5644,6 +5706,46 @@ mod tests {
         let list = d.dispatch(&[s("context"), s("list")], &c).await;
         assert!(list.is_ok());
         assert!(list.message().contains("[cast:house]"), "list: {}", list.message());
+    }
+
+    /// `docs/issues.md`, "`kj context create --cast` has no test that info
+    /// reports the cast": `kj context create --cast <label>` must resolve
+    /// its model through the cast slot and report it in `kj context info`,
+    /// same as `kj context set --cast` above.
+    #[tokio::test]
+    async fn context_create_with_cast_surfaces_the_cast_label() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("staffing-parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        d.dispatch(&[s("cast"), s("create"), s("budget")], &c).await;
+
+        let create = d
+            .dispatch(
+                &[s("context"), s("create"), s("staffed-child"), s("--cast"), s("budget")],
+                &c,
+            )
+            .await;
+        assert!(create.is_ok(), "create --cast failed: {}", create.message());
+
+        let child_caller = caller_with_context(
+            d.kernel_db()
+                .lock()
+                .find_context_by_label("staffed-child")
+                .unwrap()
+                .expect("staffed-child should exist")
+                .context_id,
+        );
+
+        let info = d.dispatch(&[s("context"), s("info")], &child_caller).await;
+        assert!(info.is_ok());
+        assert!(info.message().contains("Cast:    budget"), "info: {}", info.message());
+
+        let KjResult::Ok { data: Some(data), .. } = &info else {
+            panic!("context info returns structured data: {info:?}");
+        };
+        assert_eq!(data["cast_label"], "budget", "info json: {data}");
     }
 
     #[tokio::test]
