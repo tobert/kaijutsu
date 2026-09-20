@@ -2168,7 +2168,7 @@ impl BlockStore {
             // `order_key` lives on `BlockSnapshot`, not `BlockHeader` — a
             // header-only payload can't carry it through oplog replay
             // before the next compaction. Journal the full post-move
-            // snapshot instead so `merge_ops` can recover it.
+            // snapshot instead so `apply_ops` can recover it.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -2339,7 +2339,7 @@ impl BlockStore {
             // `stderr` is a write-once snapshot field, not part of
             // `BlockHeader` — a header-only payload can't carry it through
             // oplog replay before the next compaction. Journal the full
-            // post-mutation snapshot instead so `merge_ops` can recover it.
+            // post-mutation snapshot instead so `apply_ops` can recover it.
             let snapshot = entry.doc.get_block_snapshot(block_id).expect(
                 "block must exist: the mutation against it just succeeded under this same guard",
             );
@@ -3037,31 +3037,7 @@ impl BlockStore {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };
-        let mut db_guard = db.lock();
-
-        // One-time, dated cleanup for the 2026-08-16 diamond-types-extended
-        // cutover, which left a day of oplog rows in a shape this binary cannot
-        // decode. It runs here rather than in `KernelDb::open` because deciding
-        // "does this row decode?" needs `SyncPayload`, and the payload format is
-        // the block store's business, not the SQL layer's — so the SQL layer
-        // owns the scan, the transaction and the marker, and we hand it the
-        // decoder. It must also run before the replay loop below, which would
-        // otherwise poison those documents again on this very boot.
-        //
-        // This is NOT a general repair: the poison-and-skip branch further down
-        // is untouched and still refuses to serve a document with an
-        // undecodable op. See `KernelDb::purge_dte_cutover_oplog_rows`.
-        let purge = db_guard
-            .purge_dte_cutover_oplog_rows(&|bytes| codec::decode::<SyncPayload>(bytes).is_ok())
-            .map_err(|e| BlockStoreError::Db(e.to_string()))?;
-        if !purge.already_applied {
-            tracing::info!(
-                examined = purge.examined,
-                deleted = purge.deleted,
-                documents = purge.documents,
-                "One-time 2026-08-16 DTE-cutover oplog cleanup: dropped undecodable oplog rows so their documents can load"
-            );
-        }
+        let db_guard = db.lock();
 
         let docs = db_guard
             .list_documents()
@@ -3183,7 +3159,7 @@ impl BlockStore {
             for (seq, payload_bytes) in &oplog_entries {
                 match codec::decode::<SyncPayload>(payload_bytes) {
                     Ok(payload) => {
-                        if let Err(e) = document.merge_ops(payload) {
+                        if let Err(e) = document.apply_ops(payload) {
                             tracing::error!(
                                 document_id = %context_id.to_hex(),
                                 seq = seq,
@@ -3343,7 +3319,7 @@ impl BlockStore {
                 tracing::error!(document_id = %context_id.to_hex(), seq = seq, error = %e, "Refusing to load context: oplog entry failed to decode");
                 BlockStoreError::CorruptOplog { context: context_id, seq: *seq, reason: e.to_string() }
             })?;
-            document.merge_ops(payload).map_err(|e| {
+            document.apply_ops(payload).map_err(|e| {
                 tracing::error!(document_id = %context_id.to_hex(), seq = seq, error = %e, "Refusing to load context: oplog entry failed to replay");
                 BlockStoreError::CorruptOplog { context: context_id, seq: *seq, reason: e.to_string() }
             })?;
@@ -3495,7 +3471,7 @@ impl BlockStore {
             expected += 1;
             let payload = codec::decode::<SyncPayload>(&payload_bytes)
                 .map_err(|e| BlockStoreError::Serialization(e.to_string()))?;
-            replay.merge_ops(payload)?;
+            replay.apply_ops(payload)?;
         }
         if expected <= seq {
             return Err(BlockStoreError::Validation(format!(
@@ -4969,7 +4945,7 @@ mod tests {
             let payload: SyncPayload =
                 codec::decode(payload_bytes).unwrap_or_else(|e| panic!("decode oplog {seq}: {e}"));
             client
-                .merge_ops(payload)
+                .apply_ops(payload)
                 .unwrap_or_else(|e| panic!("replay oplog {seq}: {e}"));
         }
         client
@@ -5824,7 +5800,7 @@ mod tests {
         assert_eq!(oplog.len(), 5, "insert + 4 appends should each journal one entry");
         for (_seq, payload_bytes) in &oplog {
             let payload: SyncPayload = codec::decode(payload_bytes).expect("decode oplog entry");
-            client.merge_ops(payload).expect("replay oplog entry");
+            client.apply_ops(payload).expect("replay oplog entry");
         }
 
         let snapshot = client.get_block_snapshot(&block_id).unwrap();
@@ -6484,7 +6460,7 @@ mod tests {
 
     /// Header metadata — not just text — survives a kernel restart. A
     /// `set_status`/`set_collapsed` journal entry replays through
-    /// `merge_ops`'s header-apply path (`BlockDocument::replace_header`) on
+    /// `apply_ops`'s header-apply path (`BlockDocument::replace_header`) on
     /// reload; this pins that the replayed header lands, not just that the
     /// oplog decodes.
     #[test]
@@ -6773,11 +6749,11 @@ mod tests {
     }
 
     /// T8 (design §8 Phase 3) — the locked ordering+tick regression, exercised
-    /// through the REAL restore path (load_from_db → from_snapshot → merge_ops
+    /// through the REAL restore path (load_from_db → from_snapshot → apply_ops
     /// per oplog row). `test_block_order_preserved` never appends after reload —
     /// the exact gap this pins. A fresh append after reload must (a) sort LAST in
     /// the ordered log (successor-derived order key beats any stale next_tick) and
-    /// (b) stamp a tick strictly greater than every pre-reload tick (merge_ops
+    /// (b) stamp a tick strictly greater than every pre-reload tick (apply_ops
     /// restores the tick high-water, §2.3). Both fail under the old tick-driven
     /// calc_order_key + stale-counter behavior.
     #[test]
@@ -6813,7 +6789,7 @@ mod tests {
         }
 
         // More STRUCTURAL inserts AFTER compaction — these live in the oplog past
-        // the snapshot, so the reload path must replay them via merge_ops (the
+        // the snapshot, so the reload path must replay them via apply_ops (the
         // arm that restores next_tick, §2.3).
         for i in 0..3 {
             let bid = store
@@ -6871,7 +6847,7 @@ mod tests {
         );
 
         // (b) The fresh append's tick strictly exceeds every pre-reload tick —
-        //     merge_ops restored the tick high-water across the snapshot boundary.
+        //     apply_ops restored the tick high-water across the snapshot boundary.
         let appended_tick = snaps_after
             .iter()
             .find(|s| s.id == appended)
@@ -7065,7 +7041,7 @@ mod tests {
 
     /// 5. A matching row already in the DB (same id, kind, path=None) is the
     ///    genuine benign-recovery case: `create_document` must still return
-    ///    `Ok` and the in-memory entry must exist. `test_merge_ops_persists_to_db`
+    ///    `Ok` and the in-memory entry must exist. `test_apply_ops_persists_to_db`
     ///    already depends on this staying `Ok` — this test pins it directly.
     #[test]
     fn create_document_recovers_when_db_row_matches() {
@@ -8630,215 +8606,6 @@ mod tests {
             .unwrap()
             .expect("block must still exist");
         assert_eq!(snap.summary, Some(summary));
-    }
-
-    // ========================================================================
-    // 2026-08-16 DTE-CUTOVER OPLOG CLEANUP
-    //
-    // One-time migration, see `KernelDb::purge_dte_cutover_oplog_rows`. These
-    // tests exist to prove the cleanup is SURGICAL — it drops rows that
-    // genuinely fail to decode and nothing else — because the failure mode
-    // that would matter (truncating a healthy oplog) is silent.
-    // ========================================================================
-
-    /// The pre-`fc616aa6` shape of `TextEdit`: no `insert` field, because
-    /// block text was still a diamond-types-extended CRDT. Encoding this
-    /// through the same `codec` the real journal uses reproduces exactly what
-    /// the 2026-08-16 boot hit — well-formed CBOR that cannot become a
-    /// `SyncPayload` (`missing field \`insert\``). Serialize-only: nothing in
-    /// the tree can read the real DTE ops any more, and this must not pretend
-    /// otherwise.
-    #[derive(serde::Serialize)]
-    struct LegacyTextEdit {
-        pos: Option<usize>,
-        delete: usize,
-    }
-
-    #[derive(serde::Serialize)]
-    struct LegacySyncPayload {
-        block_ops: Vec<(BlockId, LegacyTextEdit)>,
-        // Empty in this fixture; the missing `insert` inside `block_ops` is
-        // what makes the payload undecodable, and typing these as `Vec<String>`
-        // keeps the encoded CBOR an empty array either way.
-        new_blocks: Vec<String>,
-        updated_headers: Vec<String>,
-        deleted_blocks: Vec<String>,
-    }
-
-    /// The predicate `load_from_db` hands the migration.
-    fn sync_payload_decodable(bytes: &[u8]) -> bool {
-        codec::decode::<SyncPayload>(bytes).is_ok()
-    }
-
-    /// Encode one old-shape payload naming `block_id`.
-    fn legacy_dte_payload(block_id: &BlockId) -> Vec<u8> {
-        let bytes = codec::encode(&LegacySyncPayload {
-            block_ops: vec![(
-                block_id.clone(),
-                LegacyTextEdit { pos: Some(0), delete: 0 },
-            )],
-            new_blocks: Vec::new(),
-            updated_headers: Vec::new(),
-            deleted_blocks: Vec::new(),
-        })
-        .expect("encode legacy payload");
-        let err = codec::decode::<SyncPayload>(&bytes)
-            .err()
-            .expect("fixture is only meaningful if it fails to decode as the CURRENT SyncPayload");
-        assert!(
-            err.to_string().contains("missing field `insert`"),
-            "fixture must reproduce the 2026-08-16 boot's actual error, got {err}"
-        );
-        bytes
-    }
-
-    /// The whole point: an undecodable row is dropped, the valid row beside it
-    /// survives byte-for-byte, and the document loads instead of staying dark.
-    #[test]
-    fn dte_cutover_cleanup_drops_bad_row_keeps_good_row_and_document_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, ws) = fresh_db_store(dir.path());
-
-        let doomed = store
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "authored before the cutover", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-        store
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "authored after the cutover", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        let rows = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        assert!(
-            rows.len() >= 2,
-            "fixture needs at least two journalled ops, got {}",
-            rows.len()
-        );
-        let bad_seq = rows[0].0;
-        let (good_seq, good_payload) = rows[rows.len() - 1].clone();
-
-        // Rewrite the FIRST row in the old shape, in place — the real
-        // situation was old rows followed by new ones in the same journal.
-        let legacy = legacy_dte_payload(&doomed);
-        {
-            let db_guard = db.lock();
-            db_guard.delete_oplog_row_for_test(ctx, bad_seq).unwrap();
-            db_guard.append_op(ctx, bad_seq, &legacy).unwrap();
-        }
-
-        drop(store);
-        let store2 = drop_and_reload(db.clone(), ws);
-
-        let content = store2
-            .get_content(ctx)
-            .expect("document must load after the cleanup instead of being skipped");
-        assert!(
-            content.contains("authored after the cutover"),
-            "the surviving op must have replayed, got {content:?}"
-        );
-
-        let after = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        assert!(
-            !after.iter().any(|(seq, _)| *seq == bad_seq),
-            "the undecodable row must be gone"
-        );
-        let survivor = after
-            .iter()
-            .find(|(seq, _)| *seq == good_seq)
-            .expect("the valid row must survive — this is not a truncation");
-        assert_eq!(
-            survivor.1, good_payload,
-            "the valid row's payload must be untouched"
-        );
-    }
-
-    /// A healthy oplog is not a repair target. Nothing is deleted, the row set
-    /// is identical afterwards, and `examined` still reports the full scan so
-    /// the INFO line is honest about what it looked at.
-    #[test]
-    fn dte_cutover_cleanup_leaves_a_healthy_oplog_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
-
-        store
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "healthy", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-        store
-            .insert_block(
-                ctx, None, None, Role::Model, BlockKind::Text,
-                "also healthy", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-
-        let before = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        assert!(!before.is_empty(), "fixture must journal something");
-
-        let report = db
-            .lock()
-            .purge_dte_cutover_oplog_rows(&sync_payload_decodable)
-            .expect("migration");
-
-        assert!(!report.already_applied, "first run must actually scan");
-        assert_eq!(report.examined, before.len() as u64, "every row is examined");
-        assert_eq!(report.deleted, 0, "nothing decodes badly, so nothing goes");
-        assert_eq!(report.documents, 0, "no document was affected");
-
-        let after = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        assert_eq!(before, after, "a healthy oplog must be byte-identical after");
-    }
-
-    /// Running twice is safe: the marker gates the second run, so it neither
-    /// rescans the (large) oplog nor deletes anything further.
-    #[test]
-    fn dte_cutover_cleanup_is_gated_and_safe_to_run_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        let (db, store, ctx, _ws) = fresh_db_store(dir.path());
-
-        let doomed = store
-            .insert_block(
-                ctx, None, None, Role::User, BlockKind::Text,
-                "authored before the cutover", Status::Done, ContentType::Plain,
-            )
-            .unwrap();
-        let rows = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        let bad_seq = rows[0].0;
-        let legacy = legacy_dte_payload(&doomed);
-        {
-            let db_guard = db.lock();
-            db_guard.delete_oplog_row_for_test(ctx, bad_seq).unwrap();
-            db_guard.append_op(ctx, bad_seq, &legacy).unwrap();
-        }
-
-        let first = db
-            .lock()
-            .purge_dte_cutover_oplog_rows(&sync_payload_decodable)
-            .expect("first run");
-        assert!(!first.already_applied, "first run must scan");
-        assert_eq!(first.deleted, 1, "the one bad row goes");
-        assert_eq!(first.documents, 1, "one document was affected");
-
-        let between = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-
-        let second = db
-            .lock()
-            .purge_dte_cutover_oplog_rows(&sync_payload_decodable)
-            .expect("second run");
-        assert!(second.already_applied, "the marker must gate the second run");
-        assert_eq!(second.deleted, 0, "second run deletes nothing");
-        assert_eq!(
-            second.examined, 0,
-            "a gated run must not scan the oplog at all"
-        );
-
-        let after = db.lock().load_oplog_since(ctx, 0).expect("load oplog");
-        assert_eq!(between, after, "second run must not touch a single row");
     }
 
     // ========================================================================

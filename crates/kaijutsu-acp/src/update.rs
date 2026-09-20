@@ -615,7 +615,7 @@ impl UpdateMapper {
     /// message onto what it already has.
     ///
     /// kaijutsu's block content is not append-only, though: `block_splice`,
-    /// `block_edit`, `kj block edit`, a kaish VFS write, and `merge_ops` can
+    /// `block_edit`, `kj block edit`, a kaish VFS write, and `apply_ops` can
     /// all rewrite a block's content anywhere, not just its tail. A
     /// count-only high-water mark cannot tell "the tail grew" from "the
     /// content was rewritten to something that happens to be the same length

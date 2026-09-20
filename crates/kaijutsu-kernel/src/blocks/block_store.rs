@@ -962,7 +962,7 @@ impl BlockDocument {
             }
         }
         // Advance next_tick past a carried tick (design §11.4) — mirroring the
-        // own-mint `next_position` (:355), `merge_ops` (§2.3, :1268), and the fork
+        // own-mint `next_position` (:355), `apply_ops` (§2.3, :1274), and the fork
         // paths. A beat block enters here at a tick well above the conversation's
         // last; without the bump the next ORDINARY append (which mints via
         // next_position from next_tick) would stamp a lower tick and calc_order_key
@@ -1258,68 +1258,8 @@ impl BlockDocument {
     // Sync Operations
     // =========================================================================
 
-    /// The IDs of every live block this store currently holds — a peer's
-    /// "what I already know about" marker for [`ops_since`](Self::ops_since).
-    /// Named to match the pre-migration DTE `Frontier` concept it replaces
-    /// (a per-block version marker), though this one only ever means
-    /// "known or not" — see `ops_since`'s doc comment for why.
-    ///
-    /// No production caller: every kernel mutation builds its own
-    /// single-op `SyncPayload` directly at the point of mutation instead of
-    /// diffing against a captured marker (`block_store.rs`, kernel crate,
-    /// "Durable state and the wire"). This pair exists for the two-store
-    /// integration tests below, which exercise `merge_ops` the way a
-    /// from-scratch peer catching up once did.
-    pub fn frontier(&self) -> HashSet<BlockId> {
-        self.blocks
-            .iter()
-            .filter(|(_, b)| !b.is_deleted())
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Build a payload for everything a peer holding `known` doesn't have
-    /// yet: full snapshots for blocks outside `known`, current headers for
-    /// blocks inside it, tombstones for anything `known` that's since been
-    /// deleted here.
-    ///
-    /// Deliberately does NOT attempt incremental text sync for a block
-    /// already in `known` — a bare `BlockId` marker can't distinguish "this
-    /// block's text never changed" from "it changed to the same length,"
-    /// and guessing wrong here would be exactly the silent-corruption class
-    /// this migration exists to close. A block already known to the peer
-    /// keeps whatever text it had; only a fresh snapshot (not yet in
-    /// `known`) carries content through this path.
-    pub fn ops_since(&self, known: &HashSet<BlockId>) -> SyncPayload {
-        let mut new_blocks = Vec::new();
-        let mut updated_headers = Vec::new();
-        let mut deleted_blocks = Vec::new();
-
-        for (id, block) in &self.blocks {
-            if block.is_deleted() {
-                if known.contains(id) {
-                    deleted_blocks.push(*id);
-                }
-                continue;
-            }
-            if known.contains(id) {
-                updated_headers.push(*block.header());
-            } else {
-                new_blocks.push(block.snapshot());
-            }
-        }
-
-        SyncPayload {
-            block_ops: Vec::new(),
-            new_blocks,
-            updated_headers,
-            deleted_blocks,
-            updated_snapshots: Vec::new(),
-        }
-    }
-
-    /// Apply a sync payload — new blocks, header updates, per-block text
-    /// edits, tombstones.
+    /// Apply an oplog entry — new blocks, header updates, per-block text
+    /// edits, tombstones — to this document.
     ///
     /// The kernel is the sole sequencer (CLAUDE.md "Durable state and the
     /// wire"), so the only real caller is oplog replay: applying one
@@ -1331,7 +1271,7 @@ impl BlockDocument {
     /// `block_ops` entry is therefore replayed as the literal edit it
     /// records (append or edit), not merged against a tracked
     /// causal history.
-    pub fn merge_ops(&mut self, payload: SyncPayload) -> Result<()> {
+    pub fn apply_ops(&mut self, payload: SyncPayload) -> Result<()> {
         // Restore the tick high-water across the merge: a freshly-stamped tick
         // after this merge must exceed every merged tick (design §2.3). Mirrors
         // the seq-lane restore — semantic correctness (tick values), separate
@@ -1732,7 +1672,7 @@ impl BlockDocument {
             // so a restored block must sort AFTER the blocks restored before it.
             // The old decimal `{:020}` minted keys below every 'V' canonical key
             // (since '0' < 'V') — the same latent PREPEND hazard §2.3 killed in
-            // merge_ops. Take the successor of the current tail instead (or the
+            // apply_ops. Take the successor of the current tail instead (or the
             // tick key when the store is still empty). `from_snapshot` only reaches
             // this when block_snap.order_key is None.
             // Only the key-less legacy path needs a fallback; the successor-of-tail
@@ -1843,7 +1783,7 @@ pub struct SyncPayload {
     /// a field that lives on `BlockSnapshot` but not `BlockHeader` —
     /// `stderr`/`signature`/`summary`/`output`/`tool_use_id` (write-once
     /// metadata) and `order_key` (`move_block`). `updated_headers` alone
-    /// can't carry these through oplog replay (`merge_ops` never reads a
+    /// can't carry these through oplog replay (`apply_ops` never reads a
     /// field the header doesn't have).
     ///
     /// `#[serde(default)]` is LOAD-BEARING: this struct is journaled as
@@ -2030,7 +1970,7 @@ mod tests {
         // And the whole point: replaying an old-shape row into a fresh
         // document must still work end to end, not just decode.
         let mut doc = test_store();
-        doc.merge_ops(restored).expect("replay old-shape payload");
+        doc.apply_ops(restored).expect("replay old-shape payload");
         assert_eq!(doc.get_block_snapshot(&id).map(|s| s.content), Some("hello".to_string()));
     }
 
@@ -2095,7 +2035,7 @@ mod tests {
         // And the whole point: replaying an old-shape row into a fresh
         // document must still work end to end, not just decode.
         let mut doc = test_store();
-        doc.merge_ops(restored).expect("replay old-shape payload");
+        doc.apply_ops(restored).expect("replay old-shape payload");
         assert_eq!(doc.get_block_snapshot(&id).map(|s| s.content), Some("hello".to_string()));
     }
 
@@ -3018,245 +2958,17 @@ mod tests {
         assert_eq!(blocks[0].content, "First");
     }
 
-    #[test]
-    fn test_sync_round_trip() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id1 = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello from store1",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Sync store1 → store2
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-
-        assert_eq!(store2.block_count(), 1);
-        let snap = store2.get_block_snapshot(&id1).unwrap();
-        assert_eq!(snap.content, "Hello from store1");
-    }
-
-    #[test]
-    fn test_incremental_sync_new_block() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id1 = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "Hello",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Initial sync
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-        assert_eq!(store2.block_count(), 1);
-
-        // Store1 adds a new block
-        let id2 = store1
-            .insert_block(
-                Some(&id1),
-                Some(&id1),
-                Role::Model,
-                BlockKind::Text,
-                "World",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Incremental sync — new block arrives as full snapshot
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
-        assert_eq!(
-            payload.new_blocks.len(),
-            1,
-            "new block should be in new_blocks"
-        );
-        store2.merge_ops(payload).unwrap();
-
-        assert_eq!(store2.block_count(), 2);
-        let snap = store2.get_block_snapshot(&id2).unwrap();
-        assert_eq!(snap.content, "World");
-        assert_eq!(snap.parent_id, Some(id1));
-    }
-
-    #[test]
-    fn test_new_block_sync_no_redundant_header() {
-        // Create store1 with a block, sync to store2, then add a new block to store1
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id1 = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "First",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Initial sync so store2 knows about id1
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-        assert_eq!(store2.block_count(), 1);
-
-        // Add a new block to store1
-        let id2 = store1
-            .insert_block(
-                Some(&id1),
-                Some(&id1),
-                Role::Model,
-                BlockKind::Text,
-                "Second",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Generate incremental sync payload
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
-
-        // The new block should appear in new_blocks (as a snapshot)
-        assert_eq!(
-            payload.new_blocks.len(),
-            1,
-            "new block should be in new_blocks"
-        );
-        assert_eq!(payload.new_blocks[0].id, id2);
-
-        // The new block's header should NOT also appear in updated_headers —
-        // the snapshot already contains all header data; sending both is redundant.
-        let redundant = payload.updated_headers.iter().any(|h| h.id == id2);
-        assert!(
-            !redundant,
-            "new block header should not appear in updated_headers (snapshot is sufficient)"
-        );
-
-        // Merge into store2 and verify all header fields match
-        store2.merge_ops(payload).unwrap();
-        assert_eq!(store2.block_count(), 2);
-
-        let snap1 = store1.get_block_snapshot(&id2).unwrap();
-        let snap2 = store2.get_block_snapshot(&id2).unwrap();
-        assert_eq!(snap2.role, snap1.role);
-        assert_eq!(snap2.kind, snap1.kind);
-        assert_eq!(snap2.status, snap1.status);
-        assert_eq!(snap2.parent_id, snap1.parent_id);
-        assert_eq!(snap2.content, snap1.content);
-        assert_eq!(snap2.collapsed, snap1.collapsed);
-        assert_eq!(snap2.ephemeral, snap1.ephemeral);
-    }
-
-    // ── Sync: header propagation ──────────────────────────────────────
-
-    #[test]
-    fn test_sync_propagates_status_change() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id = store1
-            .insert_block(
-                None,
-                None,
-                Role::Model,
-                BlockKind::ToolCall,
-                "{}",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Initial sync
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-
-        // Store1 changes status
-        store1.set_status(&id, Status::Done).unwrap();
-
-        // Incremental sync — header update should propagate
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
-        assert!(
-            !payload.updated_headers.is_empty(),
-            "should include updated header"
-        );
-        store2.merge_ops(payload).unwrap();
-
-        let snap = store2.get_block_snapshot(&id).unwrap();
-        assert_eq!(
-            snap.status,
-            Status::Done,
-            "status change should propagate via sync"
-        );
-    }
-
-    #[test]
-    fn test_sync_propagates_collapsed() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id = store1
-            .insert_block(
-                None,
-                None,
-                Role::Model,
-                BlockKind::Thinking,
-                "Thinking...",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Initial sync
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-
-        // Store1 collapses the block
-        store1.set_collapsed(&id, true).unwrap();
-
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
-        store2.merge_ops(payload).unwrap();
-
-        assert!(
-            store2.get_block_snapshot(&id).unwrap().collapsed,
-            "collapsed state should propagate via sync"
-        );
-    }
-
     // ── Sync: deletion propagation ────────────────────────────────────
 
+    /// A deletion is journaled as `SyncPayload::from_deletion(id)` (see
+    /// `delete_block`, `block_store.rs`, kernel crate); oplog replay applies
+    /// the tombstone via `apply_ops`.
     #[test]
-    fn test_sync_propagates_deletion() {
+    fn apply_ops_replays_a_deletion_tombstone() {
         let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
+        let mut store = BlockDocument::new(ctx, PrincipalId::new());
 
-        let id1 = store1
+        let id1 = store
             .insert_block(
                 None,
                 None,
@@ -3267,7 +2979,7 @@ mod tests {
                 ContentType::Plain,
             )
             .unwrap();
-        let id2 = store1
+        let id2 = store
             .insert_block(
                 None,
                 Some(&id1),
@@ -3278,94 +2990,19 @@ mod tests {
                 ContentType::Plain,
             )
             .unwrap();
+        assert_eq!(store.block_count(), 2);
 
-        // Initial sync
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-        assert_eq!(store2.block_count(), 2);
+        store.apply_ops(SyncPayload::from_deletion(id2)).unwrap();
 
-        // Store1 deletes a block
-        store1.delete_block(&id2).unwrap();
-
-        // Incremental sync — deletion should propagate
-        let frontiers = store2.frontier();
-        let payload = store1.ops_since(&frontiers);
         assert_eq!(
-            payload.deleted_blocks.len(),
+            store.block_count(),
             1,
-            "should include deleted block ID"
+            "deletion tombstone must remove the block on replay"
         );
-        assert_eq!(payload.deleted_blocks[0], id2);
-        store2.merge_ops(payload).unwrap();
-
-        assert_eq!(
-            store2.block_count(),
-            1,
-            "deletion should propagate via sync"
-        );
-        assert!(store2.get_block_snapshot(&id2).is_none());
-    }
-
-    // ── Sync: order_key propagation ───────────────────────────────────
-
-    #[test]
-    fn test_sync_preserves_order_key() {
-        let ctx = ContextId::new();
-        let mut store1 = BlockDocument::new(ctx, PrincipalId::new());
-        let mut store2 = BlockDocument::new(ctx, PrincipalId::new());
-
-        let id1 = store1
-            .insert_block(
-                None,
-                None,
-                Role::User,
-                BlockKind::Text,
-                "First",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let id2 = store1
-            .insert_block(
-                None,
-                Some(&id1),
-                Role::User,
-                BlockKind::Text,
-                "Second",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-        let _id3 = store1
-            .insert_block(
-                None,
-                Some(&id2),
-                Role::User,
-                BlockKind::Text,
-                "Third",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Sync to store2
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
-
-        // Ordering should match
-        let order1: Vec<_> = store1
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.content.clone())
-            .collect();
-        let order2: Vec<_> = store2
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.content.clone())
-            .collect();
-        assert_eq!(
-            order1, order2,
-            "synced store should preserve document order"
+        assert!(store.get_block_snapshot(&id2).is_none());
+        assert!(
+            store.get_block_snapshot(&id1).is_some(),
+            "unrelated block must survive replay"
         );
     }
 
@@ -3396,85 +3033,6 @@ mod tests {
             key,
             suffix
         );
-    }
-
-    #[test]
-    fn test_concurrent_inserts_no_interleaving() {
-        // Two stores inserting sequentially at the end — after sync,
-        // blocks from each store should be grouped, not interleaved.
-        let ctx = ContextId::new();
-        let agent1 = PrincipalId::new();
-        let agent2 = PrincipalId::new();
-        let mut store1 = BlockDocument::new(ctx, agent1);
-        let mut store2 = BlockDocument::new(ctx, agent2);
-
-        // Store1 inserts A, B
-        let a = store1
-            .insert_block(None, None, Role::User, BlockKind::Text, "A", Status::Done, ContentType::Plain)
-            .unwrap();
-        let _b = store1
-            .insert_block(
-                None,
-                Some(&a),
-                Role::User,
-                BlockKind::Text,
-                "B",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Store2 inserts C, D (independently)
-        let c = store2
-            .insert_block(None, None, Role::User, BlockKind::Text, "C", Status::Done, ContentType::Plain)
-            .unwrap();
-        let _d = store2
-            .insert_block(
-                None,
-                Some(&c),
-                Role::User,
-                BlockKind::Text,
-                "D",
-                Status::Done,
-                ContentType::Plain,
-            )
-            .unwrap();
-
-        // Sync both ways
-        let payload1 = store1.ops_since(&HashSet::new());
-        let payload2 = store2.ops_since(&HashSet::new());
-        store1.merge_ops(payload2).unwrap();
-        store2.merge_ops(payload1).unwrap();
-
-        // Both stores should see 4 blocks in the same order
-        let order1: Vec<_> = store1
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.content.clone())
-            .collect();
-        let order2: Vec<_> = store2
-            .blocks_ordered()
-            .iter()
-            .map(|b| b.content.clone())
-            .collect();
-        // Deterministic convergence still holds: both replicas agree on order.
-        assert_eq!(order1, order2, "both stores should converge to same order");
-
-        let a_pos = order1.iter().position(|c| c == "A").unwrap();
-        let b_pos = order1.iter().position(|c| c == "B").unwrap();
-        let c_pos = order1.iter().position(|c| c == "C").unwrap();
-        let d_pos = order1.iter().position(|c| c == "D").unwrap();
-
-        // Per-replica tick order is preserved (each replica's own counter is
-        // monotonic): A precedes B, C precedes D.
-        assert!(a_pos < b_pos, "A should precede B (tick order within replica 1)");
-        assert!(c_pos < d_pos, "C should precede D (tick order within replica 2)");
-
-        // NOTE: cross-replica *grouping* (A,B adjacent; C,D adjacent) is no longer
-        // guaranteed. With tick-derived order_keys, two replicas that independently
-        // assign the same tick interleave by tick instead of grouping by author.
-        // Non-interleaving across writers is a multi-writer-timeline property that
-        // is explicitly deferred — see docs/hyoushigi.md ("single-writer first").
     }
 
     #[test]
@@ -3578,13 +3136,11 @@ mod tests {
         assert!(ordered.iter().all(|b| b.order_key.as_ref().unwrap().starts_with("V0")));
     }
 
-    /// A text edit on a block already known to a peer reaches that peer
-    /// through `merge_ops` when it travels as an explicit `TextEdit` — the
-    /// shape every real journal entry takes (kernel `edit_text_as`/
+    /// A text edit reaches a document that already holds the block through
+    /// `apply_ops` when it travels as an explicit `TextEdit` — the shape
+    /// every real journal entry takes (kernel `edit_text_as`/
     /// `append_text_as` build exactly this; see `block_store.rs`, kernel
-    /// crate, "Durable state and the wire"). `frontier`/`ops_since`
-    /// deliberately do NOT attempt this for a known block (see their doc
-    /// comments) — this test exercises the actual mechanism that does.
+    /// crate, "Durable state and the wire").
     #[test]
     fn test_incremental_text_sync_after_merge() {
         let ctx = ContextId::new();
@@ -3595,21 +3151,23 @@ mod tests {
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
 
-        // Sync the new block to store2.
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
+        // Seed store2 with the same block store1 holds — a direct insert,
+        // not a diff, since this test exercises the TextEdit replay path.
+        store2
+            .insert_from_snapshot(store1.get_block_snapshot(&id).unwrap(), None)
+            .unwrap();
         assert_eq!(store2.block_count(), 1);
 
         // Store1 appends text locally...
         store1.append_text(&id, "Hello").unwrap();
 
         // ...and the same edit, expressed as an explicit TextEdit, reaches
-        // store2 through merge_ops.
+        // store2 through apply_ops.
         let payload = SyncPayload::from_text_edit(
             id,
             TextEdit { pos: None, insert: "Hello".to_string(), delete: 0 },
         );
-        let result = store2.merge_ops(payload);
+        let result = store2.apply_ops(payload);
 
         assert!(result.is_ok(), "incremental text sync failed: {:?}", result);
         let snap = store2.get_block_snapshot(&id).unwrap();
@@ -3974,7 +3532,7 @@ mod tests {
             snap_for(ctx, p_lo, 1, 3),
         ];
         store
-            .merge_ops(SyncPayload {
+            .apply_ops(SyncPayload {
                 block_ops: vec![],
                 new_blocks,
                 updated_headers: vec![],
@@ -4348,11 +3906,8 @@ mod tests {
     // Text-only merge
     // =====================================================================
 
-    /// A block already known to a peer, then a text-only edit merged in — no
-    /// header change, no new block — must still apply. Before this migration
-    /// this exercised a "DTE-only" payload (a header-stripped `ops_since`
-    /// sync); `ops_since` no longer carries incremental text at all (see its
-    /// doc comment), so this builds the direct `TextEdit` payload a real
+    /// A text-only edit — no header change, no new block — must still apply
+    /// through `apply_ops`. Builds the direct `TextEdit` payload a real
     /// oplog entry actually is (see `test_incremental_text_sync_after_merge`).
     #[test]
     fn test_text_only_merge_applies() {
@@ -4363,8 +3918,9 @@ mod tests {
         let id = store1
             .insert_block(None, None, Role::Model, BlockKind::Text, "", Status::Done, ContentType::Plain)
             .unwrap();
-        let payload = store1.ops_since(&HashSet::new());
-        store2.merge_ops(payload).unwrap();
+        store2
+            .insert_from_snapshot(store1.get_block_snapshot(&id).unwrap(), None)
+            .unwrap();
         assert_eq!(store2.block_count(), 1);
 
         store1.append_text(&id, "Hello world").unwrap();
@@ -4377,7 +3933,7 @@ mod tests {
         assert!(payload.new_blocks.is_empty(), "payload should have no new blocks");
         assert!(payload.updated_headers.is_empty(), "payload should have no updated headers");
 
-        store2.merge_ops(payload).unwrap();
+        store2.apply_ops(payload).unwrap();
 
         let snap = store2.get_block_snapshot(&id).unwrap();
         assert_eq!(snap.content, "Hello world");
@@ -4569,10 +4125,11 @@ mod tests {
         assert_eq!(snaps[0].content, "keep");
     }
 
-    /// A status change on one peer's block reaches the other peer through
-    /// `merge_ops`'s header replay.
+    /// A status change replays onto a document that already holds the block
+    /// through `apply_ops`'s header replay — the shape a real `set_status`
+    /// oplog entry takes (`SyncPayload::from_updated_header`).
     #[test]
-    fn test_status_change_reaches_peer_through_merge_ops() {
+    fn test_status_change_reaches_peer_through_apply_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4591,23 +4148,26 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
-        store_b.merge_ops(payload).unwrap();
+        store_b
+            .insert_from_snapshot(store_a.get_block_snapshot(&block_id).unwrap(), None)
+            .unwrap();
 
         store_a.set_status(&block_id, Status::Done).unwrap();
         store_a.set_collapsed(&block_id, true).unwrap();
 
-        let payload = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload).unwrap();
+        let header_a = *store_a.blocks.get(&block_id).unwrap().header();
+        store_b
+            .apply_ops(SyncPayload::from_updated_header(header_a))
+            .unwrap();
 
         let header_b = store_b.blocks.get(&block_id).unwrap().header();
         assert_eq!(header_b.status, Status::Done, "status must reach the peer");
         assert!(header_b.collapsed, "collapsed must reach the peer");
     }
 
-    /// `content_type` changes propagate through `merge_ops`'s header replay.
+    /// `content_type` changes propagate through `apply_ops`'s header replay.
     #[test]
-    fn test_content_type_reaches_peer_through_merge_ops() {
+    fn test_content_type_reaches_peer_through_apply_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4626,15 +4186,18 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
-        store_b.merge_ops(payload).unwrap();
+        store_b
+            .insert_from_snapshot(store_a.get_block_snapshot(&block_id).unwrap(), None)
+            .unwrap();
 
         store_a
             .set_content_type(&block_id, ContentType::Markdown)
             .unwrap();
 
-        let payload = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload).unwrap();
+        let header_a = *store_a.blocks.get(&block_id).unwrap().header();
+        store_b
+            .apply_ops(SyncPayload::from_updated_header(header_a))
+            .unwrap();
 
         let header_b = store_b.blocks.get(&block_id).unwrap().header();
         assert_eq!(header_b.content_type, ContentType::Markdown);
@@ -4675,10 +4238,10 @@ mod tests {
         assert_eq!(snap_after.status, Status::Done);
     }
 
-    /// `task_status` changes propagate through `merge_ops`'s header replay,
+    /// `task_status` changes propagate through `apply_ops`'s header replay,
     /// same path as `content_type` and `status`.
     #[test]
-    fn test_task_status_reaches_peer_through_merge_ops() {
+    fn test_task_status_reaches_peer_through_apply_ops() {
         let ctx = ContextId::new();
         let agent_a = PrincipalId::new();
         let agent_b = PrincipalId::new();
@@ -4697,15 +4260,18 @@ mod tests {
             .unwrap();
 
         let mut store_b = BlockDocument::new(ctx, agent_b);
-        let payload = store_a.ops_since(&HashSet::new());
-        store_b.merge_ops(payload).unwrap();
+        store_b
+            .insert_from_snapshot(store_a.get_block_snapshot(&block_id).unwrap(), None)
+            .unwrap();
 
         store_a
             .set_task_status(&block_id, TaskStatus::Cancelled)
             .unwrap();
 
-        let payload = store_a.ops_since(&store_b.frontier());
-        store_b.merge_ops(payload).unwrap();
+        let header_a = *store_a.blocks.get(&block_id).unwrap().header();
+        store_b
+            .apply_ops(SyncPayload::from_updated_header(header_a))
+            .unwrap();
 
         let header_b = store_b.blocks.get(&block_id).unwrap().header();
         assert_eq!(header_b.task_status, TaskStatus::Cancelled);
@@ -4732,7 +4298,7 @@ mod tests {
     /// blocks via the real restore path, a fresh local insert must sort LAST.
     /// Fails today: a stale `next_tick` mints a mid-document order_key.
     #[test]
-    fn appends_after_merge_ops_sort_last() {
+    fn appends_after_apply_ops_sort_last() {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
 
@@ -4765,7 +4331,7 @@ mod tests {
             .map(|t| snap_for(ctx, foreign, (t - 10) as u64, t))
             .collect();
         store_b
-            .merge_ops(SyncPayload {
+            .apply_ops(SyncPayload {
                 block_ops: vec![],
                 new_blocks,
                 updated_headers: vec![],
@@ -4796,9 +4362,9 @@ mod tests {
 
     /// T3 — tick high-water restore. After merging new_blocks with max tick N,
     /// a fresh insert stamps tick N+1. Pins tick *semantics* separately from
-    /// T2's key ordering. Fails today: merge_ops never touches next_tick.
+    /// T2's key ordering. Fails today: apply_ops never touches next_tick.
     #[test]
-    fn merge_ops_restores_next_tick_high_water() {
+    fn apply_ops_restores_next_tick_high_water() {
         let ctx = ContextId::new();
         let prin = PrincipalId::new();
         let mut store = BlockDocument::new(ctx, prin);
@@ -4807,7 +4373,7 @@ mod tests {
         let new_blocks: Vec<BlockSnapshot> =
             (0..5).map(|t| snap_for(ctx, foreign, t as u64, t)).collect();
         store
-            .merge_ops(SyncPayload {
+            .apply_ops(SyncPayload {
                 block_ops: vec![],
                 new_blocks,
                 updated_headers: vec![],
@@ -4835,7 +4401,7 @@ mod tests {
     /// T19b (design-chameleon-batch1-f2-notation §16, §11.4) — `insert_from_snapshot`
     /// (the runtime single-snapshot insert that `materialize_committed` rides) must
     /// bump `next_tick` past a carried tick, exactly as `next_position` /
-    /// `merge_ops` / `fork` already do. Without it, a beat block inserted at tick 50
+    /// `apply_ops` / `fork` already do. Without it, a beat block inserted at tick 50
     /// leaves `next_tick` at 0, so the next ORDINARY conversation append stamps a
     /// low tick — and `calc_order_key`'s tick-derived path sorts the now-visible
     /// staff mid-document. Insert at tick 50; a subsequent `insert_block` must
@@ -4984,7 +4550,7 @@ mod tests {
         .build();
         let keyless_id = keyless.id;
         store
-            .merge_ops(SyncPayload {
+            .apply_ops(SyncPayload {
                 block_ops: vec![],
                 new_blocks: vec![keyless],
                 updated_headers: vec![],
@@ -5002,7 +4568,7 @@ mod tests {
     }
 
     /// T6 — seq lanes cover foreign principals after restore. from_snapshot /
-    /// merge_ops / fork each restore blocks authored by P != store principal
+    /// apply_ops / fork each restore blocks authored by P != store principal
     /// (one a tombstone). Fails today (API absent; own-principal guards).
     #[test]
     fn seq_lanes_cover_foreign_principals_after_restore() {
@@ -5051,13 +4617,13 @@ mod tests {
             "own-principal minting advances only the own lane"
         );
 
-        // (b) merge_ops seeds a fresh foreign lane.
+        // (b) apply_ops seeds a fresh foreign lane.
         let mut merged = BlockDocument::new(ContextId::new(), prin);
         let mctx = merged.context_id();
         let merge_blocks: Vec<BlockSnapshot> =
             (0..3).map(|t| snap_for(mctx, foreign, t as u64, t)).collect();
         merged
-            .merge_ops(SyncPayload {
+            .apply_ops(SyncPayload {
                 block_ops: vec![],
                 new_blocks: merge_blocks,
                 updated_headers: vec![],
@@ -5065,7 +4631,7 @@ mod tests {
                 updated_snapshots: vec![],
             })
             .unwrap();
-        assert_eq!(merged.next_seq_for(foreign), 3, "merge_ops must seed the foreign lane");
+        assert_eq!(merged.next_seq_for(foreign), 3, "apply_ops must seed the foreign lane");
 
         // (c) fork seeds the foreign lane from the LIVE blocks it copies.
         // Forks do not carry tombstones, so the deleted seq=3 does not travel —
@@ -5084,7 +4650,7 @@ mod tests {
     /// must keep its stored order and interleave with a subsequent `insert_block`.
     /// The old `format!("{:020}", order_seq)` fallback minted decimal keys that
     /// sort BELOW every 'V' canonical key (the latent PREPEND §2.3 killed in
-    /// merge_ops but left in from_snapshot): the key-less tail blocks would sort
+    /// apply_ops but left in from_snapshot): the key-less tail blocks would sort
     /// ahead of the canonical head blocks in `block_ids_ordered()`, and
     /// `normalize_timeline` would re-key them in that scrambled order. The
     /// successor-of-tail fallback keeps the key-less blocks after their canonical
