@@ -2291,6 +2291,26 @@ generations and skips the read.
 See "Control plane (kj): two gaps" for the shape. Recorded separately because
 the attempt is instructive: a `block_in_place` bridge is not the way around it.
 
+## The editor's terminator reconcile is two block-store calls (2026-09-20)
+
+`mirror_ops` (`kernel/src/editor.rs`) reads the block and then, conditionally,
+deletes one terminator at a fixed character offset. The two calls each take and
+release the block-store entry guard, so a writer that is not an editor session —
+`kj block append`, a model turn, another client — landing between them would put
+the delete on changed text. Editor sessions serialize through the registry and
+the equality guard makes a spurious fire unlikely, so this is a shape to close,
+not an observed loss. Found by kaibo.
+
+## `EditorCore::insert_at` round-trips through lossy text (2026-09-20)
+
+`insert_at` (`crates/kaijutsu-editor/src/lib.rs`) rebuilds the buffer from
+`self.text()`, which strips one trailing newline, so a paste into a block ending
+in a blank line leaves the buffer one newline short of the block. The kernel
+side no longer mistakes that for a doubled terminator, but the editor's own view
+is still wrong until the next hydrate. The contained fix is for `insert_at` to
+splice the rope rather than its normalized text; the larger one is the
+terminator byte-fidelity work in `docs/vi.md`.
+
 ## Testing & Tooling
 
 - A failed SSH integration assertion can also panic in russh 0.61.1
