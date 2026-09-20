@@ -32,8 +32,6 @@ impl Plugin for TimelinePlugin {
             (
                 // Version sync first
                 systems::sync_timeline_version,
-                // Block visibility updates
-                systems::update_block_visibility,
                 // Request processing
                 systems::process_cherry_pick_requests,
                 // Completion handlers

@@ -245,11 +245,18 @@ Amy: "queue those four after the lane lands." Reviewer resolution walks
 who reviews. Fork and `kj context create` from inside a context are
 covered; these are not:
 
-1. **`kj context move` needs authority.** Re-parenting rewrites
-   `forked_from`, so it moves accountability with it, and it is gated by
-   Operator alone. A lane could reparent itself under a root and change
-   its reviewer and its lineage root. Require the authority of the new parent's responsible
-   character or the reviewer's, as casting does.
+1. **`kj context move` needs authority.** It is gated by Operator alone and
+   ignores its `_caller` (`kj/context.rs`, `context_move`). The entry's
+   premise needs correcting first: `context_move` writes only the
+   `context_edges` structural table and never touches `ContextRow.forked_from`,
+   while `lineage_root` and `effective_approval_reviewer` (`kernel_db.rs`) walk
+   `forked_from` exclusively — so today a move changes tree and list display
+   and not who reviews. Amy decides: should `kj context move` start rewriting
+   `forked_from` to the new parent, so that an authority check on it protects
+   what reviewer resolution actually reads, or is the ask only to gate today's
+   structural-edge-only move? `kj context set` already shows both candidate
+   rules — a pure `--as` needs the target's effective reviewer or its
+   `director_id`, a routing change needs `lineage_root(target)`.
 2. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
    parentless context played by a model. The kernel must not guess a root
@@ -967,15 +974,6 @@ PreCall (`mcp/broker.rs`, `evaluate_planned` over its own plan of the
 command) and the hook path that raised the ask, on the running binary
 (`04538700`).
 
-## `kj context create --cast` has no test that info reports the cast (2026-09-10)
-
-On 2026-09-10 a context created with `--cast budget` resolved its model
-through the cast slot and reported a null cast in `kj context info --json`.
-The JSON keys are now `cast_id` and `cast_label`, read from the context row.
-`context_info_and_list_surface_the_cast_label` covers `kj context set --cast`
-only. Add the `kj context create --cast` case; if it passes, delete this
-entry.
-
 ## Optional rc reads collapse failures into missing-history text
 
 `assets/defaults/rc/lib/create/S16-handoff.kai` and `S17-predecessor.kai`
@@ -1450,10 +1448,6 @@ must agree and are set in different places).
 
 ## Binding review: unfixed items (2026-08-23)
 
-- **`binding_checked` is wired to one of three enforcement points.**
-  `check_facade` and `call_tool_inner` in `mcp/broker.rs` call `binding()`
-  directly, so a DB read error there surfaces as `FacadeDenied` or
-  `CapabilityDenied` instead of a storage fault.
 - **A sticky `name_map` may defeat the collision resolver on sequential
   grants.** Not re-verified; no related commit found.
 - **Narrowing a capability does not stop running kaish jobs.** The
@@ -1580,10 +1574,6 @@ Re-verified against the tree the same day:
   tiled rendering of the visible portion.
 - **Role-group borders still draw through Vello**, missed in the Vello→MSDF
   migration.
-- **Broker `register` over an existing instance id still drops the old pump
-  `JoinHandle`** instead of aborting it — confirmed:
-  `self.pump_handles.lock().await.insert(id.clone(), handle)`
-  (`mcp/broker.rs:729`) silently drops the prior handle on overwrite.
 - **Provider cache expiry is not a hydrate boundary** — a long-idle session
   carries messages the provider no longer has cached; nothing observes it.
 - **`ActiveSurface`/`FocusArea`/paired overlay queries** are threaded as
@@ -1663,13 +1653,6 @@ stale-context overwrite drop 115 backlog entries from this file on
 2026-06-29 (recovered from `3f8b54d3`) while `edit`'s hashline mode would have
 refused.
 
-## Dead plumbing from two features the conversation surface dropped
-
-`text::components::{KjTextEffects, rainbow_brush}` are kept under
-`#[allow(dead_code)]`, and `ui::timeline::systems::update_block_visibility`
-runs over a query nothing populates. Delete both. The features return only
-with a new design.
-
 ## Tool-pair atomicity at insert time remains unbuilt
 
 Conversation snapshots repair pairing, and `Provider::stream` refuses an
@@ -1690,13 +1673,6 @@ check refuses the next request, after those tools have run. Validate the
 incoming call batch before execution; the send-time check cannot prevent
 those duplicate side effects. The hydration lane's live-loop refusal test
 uses two calls to an unknown tool to exercise this safely.
-
-## Stream-start retries still include permanent failures
-
-`process_llm_stream` now stops immediately on `LlmError::InvalidRequest`.
-Other errors still receive the same retry policy, including `AuthError`
-and `Unavailable`. Classify the remaining variants before retrying; cover transient
-recovery and permanent refusal independently.
 
 ## Flaky: `test_ordering_stress_100_bisections` put a Middle block first, once (2026-08-17)
 
@@ -1923,13 +1899,20 @@ one trust boundary").
 
 ---
 
-## Two comments in `actor_plugin.rs` name a `periodic_reconnect` that does not exist
+## A panicked RPC actor is never respawned (2026-09-20)
 
-`crates/kaijutsu-app/src/connection/actor_plugin.rs` says an exited actor's
-resource is removed "so `periodic_reconnect` can spawn a fresh one". No such
-function exists; the actor's own state machine retries. If the actor's tokio
-task panics, nothing recovers short of an app restart. Correct the comments,
-and decide whether a panicked actor should be respawned.
+`spawn_local(actor.run())` (`kaijutsu-client/src/actor.rs:4173`) discards the
+`JoinHandle`, so nothing observes a `JoinError`. An ordinary connection loss
+is retried inside the actor's own `Cooldown` state; a panic unwinds, drops the
+broadcast senders, and `poll_connection_status` removes the `RpcActor`
+resource — which spawns nothing. The next actor comes only from
+`ActorPlugin::build`'s startup spawn or `view::sync::handle_context_switch`'s
+cache-miss branch, so a panic costs an app restart.
+
+Amy decides: should a panicked or terminal actor be respawned automatically,
+and on what trigger — a watcher for `RpcActor` absence, or a generalized
+cache-miss spawn? A catch would have to live where the spawn does, in
+`kaijutsu-client`.
 
 ---
 
@@ -1953,19 +1936,6 @@ Slice 1's guardrail (`context move` non-atomicity) is still open — same
 bug as the entry below.
 
 ---
-
-## Context lifecycle: `kj context move` still isn't atomic (2026-08-15)
-
-Two of three original edges are resolved (archive no longer cascades;
-archived contexts free their label) — see "Managing roots" above.
-**Still live**: `context_move` (`kaijutsu-kernel/src/kj/context.rs:1655`)
-deletes every existing structural parent edge, *then* calls `insert_edge`
-(where cycle detection lives), with no transaction around the pair —
-confirmed unchanged. A refused move (cycle detected) has already
-destroyed the old edge, leaving the context orphaned. Fix: one
-transaction, or check the cycle before deleting. Also still true: no
-`--detached` flag exists on `kj context create`, so a parentless context
-can only be produced via this bug's failure path, never deliberately.
 
 ## Live roster — push-on-attach is the remaining unwired half (2026-08-14)
 
@@ -2361,6 +2331,27 @@ down fallback depends on. Route `resolve`/`create`/`mkdir` through
 context for `Backend::Remote`, so a global search silently skips every other
 context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
 (`lib.rs:2871,2918`).
+
+## `TimelineVisibility` is now unused (2026-09-20)
+
+Deleting `update_block_visibility` left `TimelineVisibility`
+(`kaijutsu-app/src/ui/timeline/components.rs:169`) with a definition, a
+`register_type` call (`plugin.rs:19`), a re-export (`mod.rs:40`), and no
+reader or writer. The file's blanket `#![allow(dead_code)]` hides it. Delete
+the struct, its `Default`, its registration and its re-export, and correct
+`view/geometry.rs:73`, which still describes feeding
+`TimelineVisibility.created_at_version`.
+
+## The stream-start retry loop's use of `retry_disposition` has no test (2026-09-20)
+
+`retry_disposition` (`runtime/llm_stream.rs`) is pinned exhaustively per
+`LlmError` variant, but nothing drives the retry loop itself with a real
+`AuthError` or a transient error: `MockClient` (`llm/mod.rs`) cannot make
+`Provider::stream()` return an `Err(LlmError)`, so only the synchronous
+`validate_tool_pairing` path can produce one without a live provider — which
+is what `invalid_live_tool_pairing_fails_once_without_retry` already uses. An
+error-injection builder on `MockClient` would let that test's shape cover the
+permanent and transient cases, and would prove the attempt count.
 
 ## Testing & Tooling
 

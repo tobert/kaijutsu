@@ -1369,8 +1369,14 @@ fn poll_server_events(
 
 /// Drain connection status events from ActorHandle's broadcast channel.
 ///
-/// When the broadcast channel closes (actor exited), removes the `RpcActor`
-/// resource so `periodic_reconnect` can spawn a fresh one.
+/// An ordinary connection loss never closes this channel — the actor's own
+/// state machine retries through `Cooldown` with backoff. The channel closes
+/// only when the actor's task itself ends: `Terminal` state with every
+/// `ActorHandle` dropped, or a task panic. This system then removes the
+/// `RpcActor` resource, but spawns nothing in its place — the next actor
+/// comes from `ActorPlugin::build`'s startup spawn or
+/// `view::sync::handle_context_switch`'s cache-miss spawn, whichever runs
+/// next.
 fn poll_connection_status(
     mut commands: Commands,
     actor: Option<Res<RpcActor>>,
@@ -1416,7 +1422,8 @@ fn poll_connection_status(
                 break;
             }
             Err(broadcast::error::TryRecvError::Closed) => {
-                // Actor exited — remove resource so periodic_reconnect can spawn a new one
+                // The actor's task has ended (Terminal + dropped, or panicked).
+                // Drop the stale resource; nothing here spawns a replacement.
                 log::debug!(
                     "Actor status channel closed, removing RpcActor resource (gen {})",
                     actor.generation

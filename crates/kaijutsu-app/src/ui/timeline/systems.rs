@@ -28,48 +28,6 @@ pub fn sync_timeline_version(
 }
 
 // ============================================================================
-// BLOCK VISIBILITY
-// ============================================================================
-
-/// Update block visibility based on timeline position.
-///
-/// Blocks created after the viewing position are hidden or dimmed.
-/// This creates the visual "time travel" effect.
-///
-/// Note: This system only updates the TimelineVisibility component.
-///
-/// **Currently unconsumed**: the deleted per-block-cell path
-/// (`docs/conversation-surface.md`) applied this opacity to text color; the
-/// conversation surface (`view::surface`) never grew an equivalent, and
-/// nothing spawns `TimelineVisibility` any more either. Timeline dimming has
-/// had no live effect since `Surface` became the default renderer. Tracked
-/// in `docs/issues.md`.
-pub fn update_block_visibility(
-    timeline: Res<TimelineState>,
-    mut block_query: Query<&mut TimelineVisibility>,
-) {
-    if !timeline.is_changed() {
-        return;
-    }
-
-    for mut vis in block_query.iter_mut() {
-        let is_past = vis.created_at_version > timeline.viewing_version;
-        vis.is_past = is_past;
-
-        // Calculate opacity based on distance from viewing position
-        if timeline.is_live() {
-            vis.opacity = 1.0;
-        } else if is_past {
-            // Future blocks (relative to viewing position) are dimmed
-            vis.opacity = 0.3;
-        } else {
-            // Past and current blocks are fully visible
-            vis.opacity = 1.0;
-        }
-    }
-}
-
-// ============================================================================
 // CHERRY-PICK PROCESSING
 // ============================================================================
 
