@@ -1,178 +1,125 @@
 # kaijutsu-mcp
 
-MCP server exposing the Kaijutsu CRDT kernel to MCP clients.
+A stdio MCP bridge to a kaijutsu kernel. It connects over SSH with Cap'n
+Proto RPC and exposes a narrow tool surface: an MCP client such as Claude
+Code or Codex acts on the kernel mostly through one `shell` tool, which runs
+kaish — the same shell `kj` verbs run in. Every player, human or model, works
+inside one trust boundary; capabilities narrow focus, they are not a
+security control.
 
-## Usage
+## Running it
 
 ```bash
-# Run as stdio MCP server (for Codex, Claude Code, etc.)
-cargo run -p kaijutsu-mcp
-
-# With debug logging
-RUST_LOG=debug cargo run -p kaijutsu-mcp
+kaijutsu-mcp --connect
 ```
 
-### Claude Code Configuration
+With no `--connect`, the process serves an in-memory local store instead of
+a real kernel — useful for exercising the MCP protocol, not for real work.
+`--connect` flags, each with an environment-variable fallback a flag wins
+over:
 
-Add to `~/.claude/settings.json`:
+| Flag | Default | Purpose |
+|---|---|---|
+| `--host` | `localhost` | SSH host |
+| `--port` | `2222` | SSH port |
+| `--kernel` | `lobby` | Kernel ID to attach to |
+| `--context-name` | `default` | Context name to join within the kernel |
+| `--insecure` | off | Skip known_hosts verification (throwaway kernels only) |
+| `--key-fingerprint` | none | `SHA256:…` fingerprint selecting one SSH-agent identity (`KAIJUTSU_KEY_FINGERPRINT`) |
+| `--key-file` | none | Unencrypted private key file, read directly (`KAIJUTSU_KEY_FILE`) |
+| `--parent` | kernel's only root context | Context (label or id) new sessions are created under (`KAIJUTSU_PARENT`) |
+| `--hook-socket` | `$XDG_RUNTIME_DIR/kaijutsu/hook-{ppid}.sock` | Unix socket for hook events |
+
+Naming both `--key-fingerprint` and `--key-file` (after resolving their
+variables) is an error. Naming neither tries every key the SSH agent holds,
+landing as whichever principal owns the first one the server accepts — the
+process warns on startup, since this usually means the bridge is connecting
+as your own identity rather than a model character's. Give a character its
+own unencrypted key instead; see `docs/character.md`, "The bridge identity:
+a key per model character".
+
+### Claude Code and Codex configuration
+
+Add an entry to `~/.claude.json` (user scope) or a project's `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "kaijutsu": {
-      "command": "/path/to/kaijutsu-mcp"
-    }
+    "kaijutsu": { "command": "/path/to/kaijutsu-mcp", "args": ["--connect"] }
   }
 }
 ```
 
-### Codex Configuration
-
-Codex must forward its thread ID so the MCP process can correlate tools and
-hooks with the same session:
+Codex must also forward its thread ID so the process can correlate tools
+and hooks with the same session:
 
 ```toml
 [mcp_servers.kaijutsu]
 command = "/path/to/kaijutsu-mcp"
+args = ["--connect"]
 env_vars = ["CODEX_THREAD_ID", "XDG_RUNTIME_DIR"]
 ```
 
-`XDG_RUNTIME_DIR` is where the MCP listener creates its per-session hook
-socket; without it the MCP tool surface still works, but lifecycle events have
-no local transport.
-
-For lifecycle mirroring, merge the `hooks` object from
-`contrib/codex-hooks.json` into `~/.codex/hooks.json` and replace
-`/path/to/kaijutsu-mcp` with the installed binary. The native
-`kaijutsu-mcp hook codex` adapter reads Codex's hook JSON from stdin; no shell
-script or `jq` installation is needed. Codex requires project hook
-configurations to be trusted explicitly through `/hooks`.
-
-Claude Code uses the corresponding `kaijutsu-mcp hook claude` command shown
-in `contrib/claude-hooks.json`.
+`XDG_RUNTIME_DIR` is where the hook listener creates its per-session socket;
+without it the tool surface still works, but lifecycle events have no local
+transport.
 
 ## Tools
 
-### Document Management
+| Tool | Does |
+|---|---|
+| `shell` | Submit a kaish command in the current kernel context. Returns an operation receipt by default; `foreground: true` waits for completion (default timeout 300s, max 600s). Requires `--connect` and a registered session. |
+| `register_session` | Register this agent session and join a context. Must run before `shell`. Upserts on the session's label: attaches to an existing live context of that label, or creates a fresh one if the label names a concluded or archived context. |
+| `whoami` | This connection's identity: authenticated user, joined context id and label, agent session info. |
+| `list_kernel_tools` | List broker tools visible to the joined context (name, description, category, input schema). Requires `--connect`. |
+| `invoke_peer` | Call an action on another named RPC peer attached to the kernel (for example `kaijutsu-app`'s `switch_context`), for drift navigation. Requires `--connect`. |
 
-| Tool | Description |
-|------|-------------|
-| `doc_create` | Create a new document (conversation, code, text, or git) |
-| `doc_list` | List all documents with metadata and block counts |
-| `doc_delete` | Delete a document and all its blocks |
+`--connect` mode auto-registers a session context at startup so hook events
+land somewhere without a model calling `register_session` first; calling it
+manually still works and upserts on the same label.
 
-### Block Operations
+Example — running a `kj` verb through `shell`:
 
-| Tool | Description |
-|------|-------------|
-| `block_create` | Create a block with role, kind, and content |
-| `block_read` | Read block content with optional line numbers and range |
-| `block_append` | Append text to a block (streaming-friendly) |
-| `block_edit` | Line-based edit operations (insert, delete, replace) with CAS |
-| `block_list` | List blocks with optional filters (document, kind, status, role) |
-| `block_status` | Set block status (pending, running, done, error) |
-
-### Search
-
-| Tool | Description |
-|------|-------------|
-| `kernel_search` | Regex search across blocks with context lines |
-
-### Debug & Visualization
-
-| Tool | Description |
-|------|-------------|
-| `doc_tree` | Display conversation DAG as ASCII tree |
-| `block_inspect` | Dump CRDT internals (version, frontier, metadata) |
-| `block_history` | Show block version timeline and creation info |
-
-## Examples
-
-### Visualize Conversation Structure
-
-```
-mcp__kaijutsu__doc_tree(document_id: "lobby@main")
-```
-
-Output:
-```
-lobby@main (conversation, 6 blocks)
-server/0 [user/text] "write a haiku about haikus"
-block_create({) → ✓
-server/3 [model/text] "I've written a haiku about haikus!..."
-server/4 [user/text] "write me a poem about snow"
-server/5 [model/text] "Here's a poem about snow for you:"
-```
-
-Tool calls are collapsed by default. Use `expand_tools: true` to see the full DAG:
-
-```
-lobby@main (conversation, 6 blocks)
-server/0 [user/text] "write a haiku about haikus"
-server/1 [model/tool_call] "{"
-└─ server/2 [tool/tool_result] "{"block_id":"lobby:default/server/0"..."
-server/3 [model/text] "I've written a haiku about haikus!..."
-```
-
-### Inspect CRDT State
-
-```
-mcp__kaijutsu__block_inspect(block_id: "lobby@main/server/0")
-```
-
-Returns:
 ```json
-{
-  "block_id": "lobby@main/server/0",
-  "version": 6,
-  "frontier": [1264],
-  "content_length": 26,
-  "content_lines": 1,
-  "metadata": {
-    "role": "user",
-    "kind": "text",
-    "status": "done",
-    "created_at": 1769862548770,
-    "author": "server"
-  }
-}
+{"tool": "shell", "arguments": {"command": "kj context list"}}
 ```
 
-### Block History
+`shell` and the in-kernel `shell` tool return the identical JSON envelope —
+`stdout`, `stderr`, `exit_code`, `status`, `data`, `block_id`,
+`operation_id`, and more, with an unknown value written as `null`, never
+omitted. See `docs/shell-envelope.md` for the full field list and the status
+values (`done`, `error`, `rejected`, `running`, `waiting`, `timeout`,
+`stream_closed`).
 
-```
-mcp__kaijutsu__block_history(block_id: "lobby@main/server/3")
-```
+## Prompts and resources
 
-Output:
-```
-block: lobby@main/server/3
-────────────────────────────────────────
-created: 1769862548771ms (unix epoch) by server
-version: 6 (document version)
-content: 1 line, 223 bytes
-status: done
-```
+Three MCP prompts read a joined context's blocks directly, independent of
+`shell`:
 
-## Block Types
+| Prompt | Does |
+|---|---|
+| `analyze_document` | Structure, content, and activity summary for a context, given its id and a `focus` (`structure`, `content`, `activity`, or `all`). |
+| `search_context` | Regex search across a context's blocks (or every joined context), with matching lines and surrounding context. |
+| `editing_assistant` | A block's content, its parent block for context, and edit-type instructions (`refine`, `expand`, `summarize`, `fix`), given a block id. |
 
-| Kind | Role | Description |
-|------|------|-------------|
-| `text` | user/model/system | Plain text content |
-| `thinking` | model | Extended reasoning (collapsible) |
-| `tool_call` | model | Tool invocation with JSON input |
-| `tool_result` | tool | Tool response (child of tool_call) |
+`list_resources`/`read_resource` expose read-only URIs: `kaijutsu://docs`
+(all contexts), `kaijutsu://docs/{context_id}` (one context's metadata and
+block list), and `kaijutsu://blocks/{context_id}/{block_key}` (one block's
+content).
 
-## DAG Structure
+## The hook adapter
 
-Blocks form a DAG via `parent_id` links:
+`kaijutsu-mcp hook [claude|codex]` is a one-shot client: it reads one hook
+event as JSON on stdin, forwards it to this process's Unix socket listener,
+and prints the response. It fails open — a missing socket or unreachable
+listener exits 0 rather than blocking the host tool. The listener turns each
+event into kernel blocks. See `contrib/claude-hooks.json` and
+`contrib/codex-hooks.json` for the configurations that invoke it, and
+`docs/cc-peer.md` for the event shapes and the adapters' contract.
 
-```
-user prompt
-└─ model thinking
-└─ model tool_call
-   └─ tool result
-└─ model text response
-```
+## Deployment on zorak
 
-The `doc_tree` tool visualizes this structure for debugging.
+`~/bin/kaijutsu-mcp` is a symlink into `target/debug`; `cargo build -p
+kaijutsu-mcp` is the deploy, and every Claude Code session picks up the new
+binary on its next `/mcp` reconnect. See `docs/operating.md`, "The MCP
+binary".
