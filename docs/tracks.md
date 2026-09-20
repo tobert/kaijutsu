@@ -9,9 +9,8 @@ on top), `docs/midi.md` (network/drift clock design), `docs/midi-next.md`
 `docs/audio-daemon.md` (the hardware node that owns rendering today),
 `docs/shared-state.md` (the `/run` substrate a probe attachment writes).
 
-Open: the cold-start re-arm sweep (a kernel restart resets tracks to
-stopped, and cross-restart counter durability) — no `docs/issues.md` entry
-yet, so recorded here until one exists.
+Open: the cold-start re-arm sweep and cross-restart counter durability. See
+`docs/issues.md`, "Tracks do not re-arm after a kernel restart".
 
 ## The insight
 

@@ -112,224 +112,73 @@ preserve context/conversation separation. See `docs/conversation-session.md`.
 
 ### Turn execution and shell settlement
 
-The complete kaish/rc migration is planned in
-[Kaish integration and rc lifecycle](kaish-integration.md), including the
-caller inventory, implementation order, verification, and deletion criteria.
-Move contextual construction into runtime ownership and keep rc lifecycle
-orchestration distinct. Migrate every production entry path and relevant test;
-remove the old factory family and duplicate completion code after their final
-callers move. Clean adjacent comments and module docs with each change.
+`docs/kaish-integration.md` owns the caller inventory and its Migrated,
+Partial and Pending rows. `docs/resource-admission.md` owns the worker pool
+slices. The story of what landed is in `docs/devlog.md`, "Retiring duplicated
+state", and in git. Review evidence:
+`~/exomemory/kaijutsu/reviews/2026-09-17-execution/`. What stays open:
 
-Contextual construction now lives in `runtime/context_shell.rs`; every factory
-caller uses `EmbeddedKaish::for_context`, and the dispatcher factory family is
-deleted. Synthesis propagates block-source hydration errors before spending
-embedding work; store-level corruption reporting remains a separate issue below.
+Provenance and storage
+- **No durable per-edit audit record.** Writes carry their current performer
+  as live state only: `TextEdit`/`SyncPayload` and persisted snapshots do not
+  retain an edit actor.
+- **Boot skips a corrupt document with only a log line.** `load_one_from_db`
+  refuses with `CorruptSnapshot` or `CorruptOplog`; the bulk path
+  `load_from_db` logs and skips. Return the skipped contexts and their errors
+  so startup can report them.
+- **A failed document acceptance poisons that context until restart.**
+  Structured inspection from that context also refuses; inspect the operation
+  from a healthy context.
+- **Pair creation and receipt registration are separate writes.** A failure
+  between them leaves blocks without a receipt.
 
-Kaibo's identity review found remaining adapter policy/provenance gaps:
-- Adapter writes now carry their current performer; shared editor input keeps
-  its actor distinct from the opener used for shell reads. Mutation provenance
-  is still only live state: `TextEdit`/`SyncPayload` and persisted snapshots
-  do not retain an edit actor. A persisted mutation audit record remains
-  separate follow-up work.
-- File-tool edit/write and cached `MountBackend` writes still drop their
-  invoking performer. Carry the actor through `FileDocumentCache` replacement
-  and edit operations; keep file hydration distinct from later player input.
-- `BlockStore::load_one_from_db` now refuses a corrupt context with
-  `CorruptSnapshot` or `CorruptOplog`. The bulk boot path `load_from_db` still
-  logs and skips a corrupt document, so after boot it is absent with only a
-  log line as evidence (an explicit load then reports the error). Return the
-  skipped contexts and their errors to the caller so startup can surface them.
-Review evidence and disposition are under
-`~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
+Block tools
+- `block_search` reports byte offsets within the matched line and
+  `block_splice` takes whole-block character positions. A block-relative
+  character offset on `SearchMatch` (new fields) would let a client compose
+  them.
+- MCP `img_block` takes a CAS hash and does not compare the object's recorded
+  type with `ContentType::Image`.
+- `kj block append --text` can append to an Image block's CAS-hash content.
 
-Block-tool contracts still open after the adapter review: `block_search`
-reports byte offsets within the matched line while `block_splice` takes
-whole-block character positions. The tool descriptions now say so; a
-block-relative character offset on `SearchMatch` (new fields, leaving the byte
-fields alone) would let clients compose the two without converting.
-MCP `img_block` takes a CAS hash and does not compare the object's recorded
-type with `ContentType::Image`. `kj block append --text` can append to an Image
-block's CAS-hash content without checking that a hash remains.
-These are separate tool-contract
-follow-ups, not changes in VFS routing. See the 2026-09-18 `adapters-*` review.
+File cache
+- Generation metadata errors are swallowed, and comparison detects only an
+  increasing generation.
+- A dirty symlink buffer does not detect a changed target in the guarded-write
+  check. Preserve dirty work while fixing it.
+- Stale-read error branches remove cache entries; check that they preserve
+  editor pins.
 
+Settlement and lifetimes
+- **Non-shell MCP calls have no retained result-review owner.** A result-phase
+  Ask or escalation returns `GateUnavailable` before minting an ask.
+- **Abrupt worker-task destruction before capture has no live terminal
+  settlement.** Startup reports the interruption without replaying source.
+  The job/controller lifetime work is the Pending row in
+  `docs/kaish-integration.md`.
+- Host `Drop` is a cancellation signal without a wait; SIGTERM and SIGINT do
+  wait for the runtime pool.
+- The live retention copy of a terminal result is lost if the process dies
+  before SQLite accepts it. Retries are four per scan, so a long storage fault
+  accumulates retained results: `docs/resource-admission.md`, slice 5.
+- A session refusal settles before a separate redemption, so a retry can
+  re-emit the same pair's metadata and status updates. Startup suppresses old
+  denied pairs rather than settling them.
+- The four-item delivery cap counts deliveries, not provider requests. Model
+  spend needs its own admission count. A changed-performer completion keeps a
+  suppressed disposition; conversations already running need their own audit.
+- `jobs --json` does not expose the nested external process group under the
+  outer kaish job, so the receipt does not identify it. Parent-death cleanup
+  covers direct children; descendant trees after SIGKILL have no evidence.
 
-Rc orchestration and its path grammar now belong to `rc`; every lifecycle caller
-uses `rc::run` with `RcInvocation`. The old dispatcher lifecycle methods and
-unused-argument fixture adapter are deleted. Explicit `.kai` instruction
-loading replaces automatic Markdown handling, with invoking-performer
-authorship and migrated seeds.
-
-Shared command settlement and headless turn ownership remain separate changes.
-Keep connection/session subscriptions in the server and preserve JobManager's
-execution lifetime separately from durable receipts. The rc migration tests
-`$0`, symlinks, content fidelity, live companion reads, and rendered prompts.
-
-The companion-read audit also found wider cache work: generation metadata errors
-are swallowed, comparison only detects increasing generations, and dirty symlink
-buffers do not detect target changes for the guarded-write check. Clean symlink
-reads now refresh target content; preserve dirty work while fixing the remaining
-metadata/guard behavior in the file-cache audit. Also check stale-read error
-branches that remove cache entries without preserving editor pins.
-
-Command execution for interactive submissions and approval resume now lives in
-`runtime/command.rs`; server `shell_run.rs` is deleted. Result projections and
-shell-state persistence moved out of RPC too. Paused PostCall/OnError tests pin
-terminal publication after hooks, including a structured-kj SSH/RPC regression.
-Cwd/export changes now commit together and failed writes are returned.
-
-Interactive/approved settlement now retains raw execution and hook effects in
-`CommandOutcome`, projects blocks/receipts/jobs from it, and deletes
-`complete_operation_from_blocks`. Replacements clear obsolete metadata and have
-no physical exit. Real exits 2/3 are errors. Terminal outcomes are now retained before projection. Receipt commit verifies
-that record before terminal block publication; failed writes return errors.
-
-Structured RPC now uses the shared outcome/settlement owner; replacement data
-and metadata agree with the response. Authored calls register receipts and
-release the RPC while result approval waits. Quiet calls share execution,
-review, and projection without creating a transcript pair or ordinary receipt.
-Their review result remains inspectable through `kj ledger show`. Every ask in
-a sequence now retains its invocation and optional operation link.
-
-MCP shell commands now use the shared execution and settlement owner. Their
-result hooks run at actual completion, preserving read-only/writable invocation
-identity; the broker no longer applies PostCall to admission receipts. A kernel
-worker owns accepted tasks beyond caller-runtime and transport shutdown.
-Streaming RPC also honors every hook verdict. Startup recovers retained pending
-projections without rerunning commands or hooks, preserving edits made after
-terminal publication. Failed terminal-outcome writes now retain an immutable
-live owner and retry on the existing worker. Shutdown reports any results still
-not durable. `kj wait --operation` and result-review `kj ledger show` expose
-retention errors. Result-review ask creation, checkpoint and linkage now commit
-together; a failed checkpoint leaves no ask and becomes a terminal hook refusal.
-Dropped review waits and outer cancellation/panic recovery now share the first
-interrupted outcome in memory. Settlement uses the admitted receipt, so read
-faults cannot prevent handing capture to retention or completing the job.
-Terminal retention now closes linked pending/claimed result asks atomically;
-ask-update or audit-event failure retains the same result for retry. Existing
-decisions stay intact, and successful retry announces closure. Interactive,
-structured, tool and approval callers now retain admission receipts through
-preparation/refusal and execution entry. Linked approval receipt reads precede
-claiming the answer under the same DB guard; read faults defer the claim.
-Job results now preserve the captured outcome
-when projection fails; they agree with retained and committed receipts. The
-persistence error remains separate, and an unfinished operation still needs
-projection recovery even when its job has finished.
-The live retention copy cannot survive process loss before SQLite accepts it.
-Retries are bounded to four per scan and rotate past failures; a prolonged
-storage fault can still accumulate retained results as new work is admitted.
-Include that memory pressure in the execution admission audit.
-A failed document acceptance poisons that context until restart. Structured
-inspection from that context also refuses; inspect the target operation from a
-healthy context. The SSH fault regression exercises this distinction.
-Registered interrupted operations now settle their original blocks and receipts
-together. Receiptless writers use the atomic per-context orphan sweep.
-
-Interactive/approved result reviews now checkpoint execution and continue the
-same hook snapshot after approval. Their non-executable `hook_result` asks stay
-out of the execution/resume queue; cancellation, dropped waits, and restart
-retain execution and report interrupted review. Authored structured calls use
-this owner too, as do quiet, streaming, and MCP shell calls. Non-shell MCP
-calls still lack a retained result-review owner: result-phase Ask/escalation
-returns GateUnavailable before minting an ask.
-
-Async shell and claimed-approval completion delivery now reserve durable owners
-at admission/claim. Notification blocks and delivery markers commit together;
-startup reconstructs interrupted notices without replaying source or provider
-wakes. Periodic scans drain pending delivery without another ledger event. Kernel
-worker shutdown now cancels and drains accepted work through settlement, including
-paused hooks and retained review. Execution/state/hook panics settle before
-resuming the original unwind, preserving captured output and completed statement
-observations; a failed worker stops admission and reports an error from shutdown.
-Tool policy preparation now precedes durable admission; dropping that wait
-leaves no operation. Dropping the admitted caller before its job is ready cancels
-and settles through the retained worker. Abrupt worker-task destruction before
-capture still needs live terminal settlement; startup reports interruption
-without replaying source.
-SIGTERM/SIGINT now await the runtime worker before checkpointing and exiting;
-host Drop remains a cancellation signal without a wait. Streaming RPC now uses
-the same worker for preparation and execution; its adapter retains slot/history,
-interrupts and callbacks. Disconnect cancels while runtime retains settlement.
-Command cancellation also reaches block pairs without receipts. Structured kj now admits
-work to the kernel worker and owns its pending/result channels there; shutdown
-settles pre-call cancellation and retained result reviews.
-Interactive submissions now share kernel admission and shutdown ownership too,
-including draft revision consumption and acknowledged connection switches. Audit
-pair creation before receipt registration: those writes remain separate, so a
-failure between them can leave blocks without a receipt. Later preparation
-failures now settle the registered pair before returning or unwinding.
-
-Model streaming, identity resolution, conversation sessions, and interrupts now
-belong to kernel runtime modules. RPC translates startup errors but no longer
-owns those state fields. Accepted turns now run on the kernel worker; startup
-failures leave no interrupt. Normal exits, early failures, and panics share
-terminal-event cleanup; shutdown cancels and joins accepted work. Approval
-execution and delivery now use that worker too. Startup subscribes and snapshots
-old answers synchronously, reports failure to the host, and admits one owner.
-Shutdown cancels preparation and commands and joins settlement. Headless requests
-use direct runtime admission;
-per-turn leases own liveness and interrupts, including queued turns.
-
-Approval execution now validates context state and claims under one database
-lock. Read faults leave answers untouched; repeated delivery cannot overwrite
-completed output after reassignment. A rejected continuation admission cannot
-repeat an already written seed. Denied/cancelled pair failures now retain the
-answer, and model refusal notifications consume it atomically with their block.
-Claimed approvals now retain completion ownership through notification failures;
-source is never replayed to recover a message. Continue the live terminal-result
-audit for abrupt worker destruction and remaining job/controller lifetimes.
-Task construction now runs inside its worker task; a factory panic follows the
-same cancellation/drain path as a future panic. Regression coverage checks
-sibling command settlement before/after capture and queued shutdown cleanup.
-Session refusals settle before a separate redemption; a retry can re-emit the same pair's
-metadata/status updates. Startup also suppresses old denied pairs rather than
-settling them. Periodic scans now drain larger backlogs; the four-item cap still
-counts delivery, not provider requests. Separate delivery throughput from
-model-spend admission in the resource audit. Changed-performer completions retain
-a suppressed disposition; audit already running conversations separately.
-Kaibo review and disposition:
-`~/exomemory/kaijutsu/reviews/2026-09-17-execution/`.
-
-Contexts retain their history: `kj context remove` and its alias are deleted,
-and document deletion refuses registered contexts. Archive leaves accepted
-commands able to settle against their original blocks and receipts. Runtime
-entry points now carry context admission through preparation, and rc borrows
-the triggering request's proof. Archive and unresolved-ask cleanup are atomic,
-including nested transactions and retries; read failures are explicit.
-Interactive prompt preparation now shares the headless startup owner and owns
-its turn lease before submit rc or provider selection. Disconnect preserves
-accepted preparation; shutdown signals and joins rc cleanup before completing
-the cancelled turn. Admission proof and task ownership remain distinct.
-Both generic tool RPCs (`executeTool` and `callMcpTool`) are retired. Client
-execution uses retained shell submissions. Native broker fixtures preserve
-approval ownership and file-cache behavior without a generic wire escape
-hatch. Broker dispatch now requires an explicit cancellation token.
-
-The retained interactive receipt points to its outer kaish job. `jobs --json`
-does not expose the nested external process group under that outer job, so the
-isotest process checks pair a durable job attachment with an exact process
-match in the isolated PID namespace. Audit job-to-process observability with
-the job/controller lifetime work; do not claim the receipt currently identifies
-that process group. Linux parent-death cleanup covers direct spawned children;
-arbitrary descendant trees after SIGKILL need their own evidence.
-
-Inline rc now inherits its execution owner through `KjCaller`, and scheduled
-tick/rotate runs on the joined kernel runtime with the original admission proof.
-Cancellation preserves committed work and stops later unadmitted effects.
-Rc stops on run-record or projection faults and retains captured results for
-settlement retry without source replay.
-
-`kj wait` now joins an idle context: both event and polling paths require no
-accepted turns left in flight. It retains observed terminal details while
-waiting and uses paced polling after subscription termination. Audit the
-remaining context-level consumers: turn events carry a `TurnId`, but clients
-still clear context activity on a terminal event. Per-turn runtime leases and
-callback IDs fix identity, not these consumer semantics. Context waits still do
-not have durable per-turn outcomes: a failure before any model block plus a
-missed terminal event can time out as running. Stored event detail is only the
-latest observed outcome, not proof that every overlapping turn succeeded.
-The global ledger wake also re-reads an ask on unrelated changes; include
-fairness under continuous event traffic in the resource audit.
+`kj wait` and turn outcomes
+- Turn events carry a `TurnId`, but clients clear context activity on any
+  terminal event.
+- A context wait has no durable per-turn outcome: a failure before any model
+  block plus a missed terminal event can time out as running. Stored event
+  detail is the latest observed outcome only.
+- The global ledger wake re-reads an ask on unrelated changes:
+  `docs/resource-admission.md`, slice 6.
 
 ### Shared client recovery
 
@@ -664,17 +513,6 @@ protection, not the gate, and it throws its kernel away per run — a
 stop it drifting as setup commands change. Left alone here: that crate is
 another lane's this week.
 
-## isotest process tests cannot find a job's process group (2026-09-17)
-
-`contrib/isotest` passes `filesystem.rs` (8) and fails all 6 `isolation.rs`
-tests in `bg_pid` (`tests/common/mod.rs`): `jobs --json` lists the running
-`/usr/bin/sleep` job with no `pgids`, so the harness never learns the PID it
-signals. Until 2026-09-17 an unanswered gate ask hid this. The harness now
-allows its own setup commands in the root context (`HARNESS_ROOT_ALLOW`, Amy's
-choice over answering each ask). Either kaish's job JSON should carry the
-process group again, or the harness should read it from the durable operation
-receipt.
-
 ## Split admin grants between `root` and `director` (2026-09-16)
 
 `director` is banto's model seat and still carries the whole operator grant
@@ -683,10 +521,14 @@ now also holds. Decide which grants banto keeps (likely drive, fork, drift,
 operator) and which belong to roots only (likely `admin`, `config-write`,
 `system`). Amy chose the split on 2026-09-16 and left the grant list open.
 
-## Should `bassist` and `musician` merge? (Amy, 2026-09-16)
+## Merge `bassist` into `musician` (Amy, 2026-09-20)
 
-Two rc bundles with the same verb set (`create`, `fork`, `rotate`, `tick`).
-Compare their scripts and grants and decide. Not part of the bootstrap work.
+Amy: "bassist and musician will merge to musician. bassist was the prototype
+from chameleon.md." Both rc bundles have the verbs `create`, `fork`, `rotate`
+and `tick`; `bassist` alone has `create/S05-chair.{kai,md}`. Fold what
+`musician` still needs from the chair script, delete
+`assets/defaults/rc/bassist/`, and update `seed_scripts.rs`, `kj/rc.rs`,
+`rc/tests.rs`, `gate.toml` and `docs/chameleon.md` where they name it.
 
 ## Identity audit: what stays open (2026-09-15)
 
@@ -905,7 +747,14 @@ restructure this layer anyway.
 
 ## The app runs as Amy, so she cannot answer her own gated asks (2026-09-12)
 
-Verified live. A `shell_write` in the app that trips the `lfm2d-advisory`
+**Re-check on the live kernel before acting.** This predates "a root confirms
+itself" (`3d69e765`, 2026-09-15): `can_review` no longer requires
+`principal != actor`, and `a_root_actor_confirms_its_own_ask` in `kj/gate.rs`
+covers the path. If Amy's character is a root with no reviewer, the ask below
+may now be answerable. The open question is then whether the app still gets a
+distinct performer character for a clearer audit record.
+
+Verified live on 2026-09-12. A `shell_write` in the app that trips the `lfm2d-advisory`
 gate raises an ask whose requester, performer, and reviewer are all `amy`
 (the app authenticates as Amy). `AskDetail::can_review` requires
 `principal == reviewer && principal != actor`, so it returns false: the ask
@@ -1067,17 +916,6 @@ keys landed, or `follow` loses the row when the filtered section it is
 in becomes empty for one round. Reproduce under load with the wait
 removed before touching `follow`.
 
-## crossterm reads ESC followed by more bytes as Alt+char (2026-09-13)
-
-A pty probe that sends `\x1b:q\r` in one write never opens the `:` bar
-when the client happens to be mid-frame: crossterm parses `ESC :` landing
-in the same read as `Alt+:`, not as `Esc` then `:`. The pty probes send
-`Esc` alone first and wait a beat before the rest (`quit()` in
-`tests/terminal_fit.rs`). A real terminal never sends `Esc` and a key in
-one burst except on a paste, and bracketed paste already lands as its own
-event (`docs/tui.md`, "Compose"). Nothing to fix in the tui; recorded so
-nobody chases it as a bug again.
-
 ## A pty probe flakes under load: the scrolled place after a switch (2026-09-14)
 
 `a_scrolled_context_comes_back_scrolled_after_a_switch` in
@@ -1160,12 +998,14 @@ PreCall (`mcp/broker.rs`, `evaluate_planned` over its own plan of the
 command) and the hook path that raised the ask, on the running binary
 (`04538700`).
 
-## `kj context info --json` reports `resolved_cast: null` for a cast-slot model (2026-09-10)
+## `kj context create --cast` has no test that info reports the cast (2026-09-10)
 
-A context created with `--cast budget` resolved `deepseek-v4-pro`, and the
-kernel log says `via CastSlot { cast: "budget" }`, but `.resolved_cast` in
-the info JSON is `null`. `.resolved_model` is right, so `S00-stance.kai`
-tiers correctly; the cast field is the one lying.
+On 2026-09-10 a context created with `--cast budget` resolved its model
+through the cast slot and reported a null cast in `kj context info --json`.
+The JSON keys are now `cast_id` and `cast_label`, read from the context row.
+`context_info_and_list_surface_the_cast_label` covers `kj context set --cast`
+only. Add the `kj context create --cast` case; if it passes, delete this
+entry.
 
 ## Optional rc reads collapse failures into missing-history text
 
@@ -1565,13 +1405,6 @@ still missing:
   `Option<ContextId>`; that plus a way to raise a test ask is what a
   pixel-level check of the sheet needs.
 
-## `kaijutsu-kernel`'s broker_e2e test does not compile (2026-09-12)
-
-`crates/kaijutsu-kernel/tests/broker_e2e.rs:52` and `:1470` build a
-`ContextRow` without `director_id`, so `cargo test --workspace` fails to
-compile that target. Present before the approval surfaces landed (verified
-against a clean tree); two field initializers away from building.
-
 ## The tui and the app disagree on a few chords (2026-09-03)
 
 Survey against `docs/input.md`'s prefix table and `docs/tui.md` "Keys".
@@ -1687,24 +1520,17 @@ must agree and are set in different places).
 
 ## Binding review: unfixed items (2026-08-23)
 
-Re-verified against the current tree:
-
-- **The bind/unbind diff still omits everything under `"*"`.**
-  `binding_visible_tool_pairs` (`mcp/broker.rs:1107`) still iterates only
-  `candidate_instances()` with no `all_instances` check — `kj binding allow
-  "*"` still fires `ToolAdded` only for named instances. (Note: the sibling
-  read path, `list_visible_tools`, line 1470-1478, *did* get the
-  `all_instances` fix — only the diff-emission path is still bare.)
-- **`binding_checked` is still wired to one of three enforcement points.**
-  `check_facade` (`broker.rs:1441`) and `call_tool_inner` (`:1588`) still call
-  `binding()` directly, so a DB read error there surfaces as `FacadeDenied`/
+- **`binding_checked` is wired to one of three enforcement points.**
+  `check_facade` and `call_tool_inner` in `mcp/broker.rs` call `binding()`
+  directly, so a DB read error there surfaces as `FacadeDenied` or
   `CapabilityDenied` instead of a storage fault.
-- **Sticky `name_map` still defeats the collision resolver on sequential
-  grants** — unre-verified this pass, no related commit found.
-- **Background jobs are still not cleaned on narrowing** —
-  `kill_all_for_context` (`kj/context.rs:2003`) is still wired to context
-  removal only, not to a capability revoke. Killing on narrow would destroy
-  work, so this needs a decision, not just a patch.
+- **A sticky `name_map` may defeat the collision resolver on sequential
+  grants.** Not re-verified; no related commit found.
+- **Narrowing a capability does not stop running kaish jobs.** The
+  `kill_all_for_context` path this was filed against is gone; asynchronous
+  shell work runs as kaish jobs with durable receipts. Check what a
+  capability revoke does to a running job before deciding. Killing on narrow
+  would destroy work.
 
 ## The wire drops kaish's output line anchor (2026-08-23)
 
@@ -1814,9 +1640,9 @@ is human) is a real, undesigned option worth keeping in view.
 
 Full reports: `docs/audits/`. Re-verified against the current tree:
 
-- **`dirty_file_buffers.context_id` is written and never read** —
-  confirmed, only an `INSERT`/`ON CONFLICT UPDATE` (`kernel_db.rs:6337`), no
-  `SELECT` reads the column back. S.
+- **`dirty_file_buffers.context_id` is loaded and never used.**
+  `get_dirty_file_buffer` and `list_dirty_file_buffers` select it, and
+  `kj/swap.rs` reads only the path and the dirtied time. S.
 - **The MIDI ear still logs a WARN on every refused capture batch**
   (`kaijutsu-audio-runtime/src/runtime.rs:398`), not once per state change —
   confirmed unchanged. An expected idle state, not a fault. S.
@@ -1857,21 +1683,27 @@ Re-verified against the tree the same day:
   separate params through compose/interrupt/toggle systems (128 references) —
   a bundle component or resolver would collapse them.
 
-## File buffers: MCP tool removal still not done (2026-08-19/21)
+## File buffers: reduce the MCP file tools to kaish (low priority)
 
-Slices 1-3 of `docs/file-buffers.md` shipped. **Slice 4 was RULED 2026-08-21:
-remove the MCP file tools outright**, `grep` and `edit` included — Amy: *"It's
-ok if we don't have them for a short period while we finish the kaish
-upgrade."* **Not done**: `mcp/servers/file.rs` still registers `read`,
-`edit`, `write`, `glob`, `grep` as live tools, confirmed. `docs/file-buffers.md`
-itself still describes a *different* slice 4 ("remove `write` and `grep`; make
-`edit` hashline-only; add `create_file` if wanted") that does not match Amy's
-ruling as recorded here — flag this drift to whoever picks the slice up rather
-than trusting either account alone. **Slice 5** (`swapRecovered`/
-`diskChangedSinceLoad` on `EditorState`) is also still open, confirmed absent
-from `kaijutsu.capnp`. The "recovered swap has no push" half is superseded:
-`kj swap list/ack/discard` now exists (`kj/swap.rs`) and is the consumer
-`list_dirty_file_buffers` was missing.
+Slices 1-3 of `docs/file-buffers.md` shipped. `mcp/servers/file.rs` still
+registers `read`, `edit`, `write`, `glob` and `grep`. Amy, 2026-08-21: remove
+them outright, "It's ok if we don't have them for a short period while we
+finish the kaish upgrade." Amy, 2026-09-20: low priority, and "a focused
+session where we think through the reduction to kaish."
+
+Bring these to that session:
+
+- kaish emits a `line` anchor under `--json` (kaish `aafc0ee4`), and the wire
+  drops it: see "The wire drops kaish's output line anchor".
+- Hashline stays on our side. kaish has no hashline code; the kaish builtin
+  `edit` and the MCP tool `edit` are two mechanisms: see "`edit` still names
+  two different things on two surfaces".
+- `write` has no staleness guard: see "`write` has no staleness guard".
+- `docs/file-buffers.md` describes a different slice 4 (remove `write` and
+  `grep`, make `edit` hashline-only). Rewrite it from the session's outcome.
+
+Slice 5 (`swapRecovered`/`diskChangedSinceLoad` on `EditorState`) is also
+open; neither field is in `kaijutsu.capnp`.
 
 ## Opening a file that already has an editor session should announce it (2026-08-19)
 
@@ -2021,7 +1853,7 @@ parse-error traps triaged here were against 0.13/0.14 and kaish is now
 
 Still open: a `;`-separated command chain's `is_error` is still the last
 command's exit status verbatim (`env.is_error()`,
-`mcp/servers/shell.rs:635`), so a chain whose last command fails reports
+`runtime/command_result.rs`), so a chain whose last command fails reports
 `Error:` even when every earlier command succeeded, and the reverse (last
 command masks an earlier failure) also still reproduces. Decide what a
 multi-command chain's status should mean before filing this again.
@@ -2141,6 +1973,9 @@ add a kernel-now value to the index, or give `FileAttr` a `generation`
 
 ## The wire `FileAttr` carries no `generation`, so clients cannot do a conditional VFS fetch (2026-08-16)
 
+Adding it is also one of the two fixes for "The roster index has no kernel-now
+reference" above.
+
 Still true: `struct FileAttr` (`kaijutsu.capnp:1314-1321`) has
 size/kind/perm/mtimeSecs/mtimeNanos/nlink and no `generation`, though the
 kernel already stamps `FileAttr::generation` server-side
@@ -2155,6 +1990,10 @@ detect a change rather than getattr-then-maybe-read.
 
 ## Drift peer origins are stageable but not deliverable, and the wire can't name one (2026-08-17)
 
+This, "Ambient command center" and "Seats-at-the-table follow-ups" all wait on
+one missing piece: the wire cannot tie a principal to a peer. Build that once,
+for the first consumer that needs it.
+
 Still accurate and still unreachable in production (only tests construct
 `DriftOrigin::Peer`) — confirmed at
 `kaijutsu-server/src/rpc.rs:10839-10866`, `origin_ctx_bytes` reports a
@@ -2165,19 +2004,6 @@ like any delivery failure), just can't be delivered or displayed.
 `docs/drifting-dead-letters.md` slice 4) must give the wire an honest
 origin representation in the same change** — appending origin fields is
 ordinal-safe, do it then, not before.
-
-## `rc reseed` seeds from the BINARY, not the repo (2026-08-22)
-
-`assets/defaults/rc/` is the in-repo seed, but a reseed installs the
-defaults **embedded in the running binary**
-(`RC_SEED_DIR = include_dir!(...)`, `kaijutsu-kernel/src/seed_scripts.rs`
-— confirmed still `include_dir!`-embedded). Editing the repo file and
-reseeding reports `0 written` and changes nothing, because the live file
-already matches the binary's (stale) copy.
-
-Editing a shipped default therefore needs: edit → **rebuild** →
-`kaijutsu-server rc reseed --force`. Missing the rebuild looks exactly
-like a successful no-op.
 
 ## The rc lifecycle shell has a narrower tool set than the interactive one (2026-08-22)
 
@@ -2263,19 +2089,13 @@ one trust boundary").
 
 ---
 
-## Reconnect follow-ups from the auto-reconnect + backoff task (2026-08-14)
+## Two comments in `actor_plugin.rs` name a `periodic_reconnect` that does not exist
 
-Two gaps, both still present. **`SyncedInput` never resyncs after
-reconnect**, only after a fresh context join
-(`kaijutsu-app/src/view/sync.rs`'s `handle_block_events` still guards on
-`cached.input.is_none()`) — an `EditInput`/`SubmitInput` issued by a peer
-during an outage never backfills; `SyncedInput` has no
-`apply_sync_state`-equivalent the way `SyncedDocument` does. **The
-`periodic_reconnect` comment in `actor_plugin.rs:1242,1286` still
-describes a system that does not exist** — grepped, no such function; the
-actor's own FSM already retries indefinitely so this is dead code,
-harmless unless the actor's tokio task panics outright, in which case
-there is no recovery short of an app restart today.
+`crates/kaijutsu-app/src/connection/actor_plugin.rs` says an exited actor's
+resource is removed "so `periodic_reconnect` can spawn a fresh one". No such
+function exists; the actor's own state machine retries. If the actor's tokio
+task panics, nothing recovers short of an app restart. Correct the comments,
+and decide whether a panicked actor should be respawned.
 
 ---
 
@@ -2352,21 +2172,6 @@ drift on the dock. Cosmetic, pre-existing; fold into the tier-2 "unify RTT
 resize" cleanup.
 
 ---
-
-## Internal output limits and hook verdicts
-
-Rc retains the complete result kaish returned, including physical exit, raw
-bytes, structured data, and spill state. Its output blocks no longer discard
-a second 4 KiB tail, and ANSI projection is atomic with its ledger marker.
-Kaish can still expose remapped `3` through script `$?` when the internal
-4 MiB ceiling is exceeded. Recording the physical exit does not undo those
-control-flow decisions. Scripts needing larger artifacts should write them
-to files rather than print them as diagnostics.
-
-Editor reads explicitly refuse truncated output before splicing. They must
-not accept a successful physical exit as proof that the returned text is
-complete. Hook bodies intentionally classify spill code `3` as escalation;
-retain that protocol rather than treating it as an ordinary command exit.
 
 ## Summaries drift stronger than what they summarise (2026-08-11)
 
@@ -2608,8 +2413,9 @@ seconds — 16–32 bars" conflates durations (at 120 BPM in 4/4, that is
 
 ## Architecture & System Design
 
-- **`rpc.rs` is ~13,000 lines and growing.** Split the Cap'n Proto trait
-  impl by domain (`rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
+- **`rpc.rs` is one file of about 10,600 lines.** It shrinks as execution
+  moves into the kernel crate. Split the Cap'n Proto trait impl by domain
+  (`rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
 - **Reasoning-continuity guard, policy not built:** refuse `kj context set
   --model` across provider families when signed Thinking exists in history;
   allow the transition only at `fork`.
@@ -2659,17 +2465,14 @@ tested (`drive_refuses_an_archived_context` and siblings,
   `kj/cache.rs:138-141`) but not implemented. Refusals must be loud, with a
   way to insist (cold-cache is a cost signal, not a correctness one).
 
-## App: `kj drive` on a non-OODA-armed musician silently discards its ABC
+## Musician create cannot name its track; dock sparklines have no meaning yet
 
-`on_turn_completed` (`kaijutsu-server/src/beat.rs:2155-2172`) returns early
-with no log when `!ac.attachment.ooda_armed`, unlike the ephemeral/excluded
-guard right below it. Either crystallize driven turns regardless of the arm,
-or log loudly. Related: musician create-rc auto-attaches to a label-derived
-track before an explicit `--track` can move it (no `--track` passthrough on
-`context create`). The dock sparklines' data source is a placeholder
-(events/sec, running-block count); decide what they mean before polishing.
+The musician create rc attaches to a label-derived track before an explicit
+`--track` can move it: `kj context create` has no `--track` passthrough. The
+dock sparklines' data source is a placeholder (events/sec, running-block
+count); decide what they measure before polishing.
 
-## Control plane (kj): three real gaps
+## Control plane (kj): four gaps
 
 - **Six more dead local `--json` fields.** kaish owns `--json` and
   `KjBuiltin::execute` strips it before the per-verb parse, so a local
@@ -2689,9 +2492,10 @@ track before an explicit `--track` can move it (no `--track` passthrough on
 
 ## Index and ABC: two schema-shaped debts
 
-- **Synthesis and embedding tables lack `ON DELETE CASCADE`** in
-  `kernel_db.rs` (other tables have it); deletes are manual across three
-  tables. Do it at the next schema change.
+- **The synthesis tables lack `ON DELETE CASCADE`.** `synthesis`,
+  `synthesis_keywords` and `synthesis_top_blocks` live in
+  `crates/kaijutsu-index/src/metadata.rs`; deletes are manual across the
+  three. Do it at the next schema change.
 - **ABC MIDI pitch/velocity are unmasked.** The `kaijutsu-abc` MidiWriter
   leaves pitch/velocity unmasked (`midi.rs:970-995`), safe while the one
   caller uses velocity 80.
@@ -2709,6 +2513,13 @@ The horizon dive handler logs "not yet built" (`view/time_well/scene.rs:1293`)
 though `docs/horizon-dive.md` exists; pause gating persists `paused_at` and
 dims the card but no beat/OODA wakeup gate or turn-start refusal is wired.
 Stages 4 and 5 of the plan are open in the doc.
+
+## Tracks do not re-arm after a kernel restart
+
+A restart resets every track to stopped, and nothing re-arms the tracks that
+were playing. Tick counters also do not survive a restart. `docs/tracks.md`
+records the current behavior; the re-arm sweep and counter durability are
+unbuilt.
 
 ## Hyoushigi / Musician — open remainder
 
