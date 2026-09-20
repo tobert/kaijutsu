@@ -88,7 +88,8 @@ render-mode flip-flopping that made smoothing constants change mid-gesture.
 - Easing, if kept at all, is frame-rate independent: `1 − exp(−k·dt)`. Direct
   1:1 tracking during a gesture is acceptable and terminal-like; a short
   settle for keyboard jumps is fine.
-- **No momentum/inertia physics.** The do-not-build fence in issues.md stands.
+- **No momentum/inertia physics.** This is a standing decision, not tracked
+  as open work in `docs/issues.md`.
 - The render loop runs Continuous whenever the offset is moving **or** content
   is streaming while followed; reactive idle is for actually-idle.
 - Follow mode is sticky: leaving the tail is an explicit user act and so is

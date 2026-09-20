@@ -30,11 +30,12 @@ an orchestrator answers with `kj ledger allow <id>`. No new surface is needed,
 and `ask` already means exactly this in kaijutsu's vocabulary — *a durable row a
 gate leaves behind, waiting for a decision* (`docs/writing.md`, "Terms").
 
-What is broken is the **wait**, not the vocabulary: `gate_wait_timeout` is one
-process-wide 300 s (`kaijutsu-types/src/timeout.rs`), so an unattended coder
-dies five minutes into a gate and a later answer re-drives nothing. That is
-tracked in `docs/issues.md` ("An expired approval should become a tool error"),
-and it is the load-bearing fix for delegation — not a new concept.
+The wait used to be the broken part, but no longer is: `gate_wait_timeout` is
+still one process-wide 300 s (`kaijutsu-types/src/timeout.rs`), so an
+unattended coder still dies five minutes into a gate — but a later answer now
+redeems it. `approval-ledger::ask::find_redeemable` (`crates/kaijutsu-kernel/src/kj/gate.rs`)
+and delivery on the kernel worker (`docs/gate-resume.md`) mean a decision made
+after the timeout still resumes the turn.
 
 **Do not add a `kj ask` verb for this.** It would give `ask` a second meaning,
 which the writing guide forbids for exactly the reason it would bite here: two
@@ -119,8 +120,11 @@ an interactive one does — there may be no one connected when it asks.
 
 **Stop treating layers 1–2 as private to approvals.** Concretely:
 
-1. Widen `approvals.origin` past its `CHECK (origin IN ('hook', 'shell_gate',
-   'kj_verb'))` — that check is precisely where a form origin slots in.
+1. `approvals.origin` already widened past its old `CHECK (origin IN ('hook',
+   'shell_gate', 'kj_verb'))` — the column is a plain `TEXT NOT NULL` now, and
+   the `Origin` enum already carries four variants (`Hook`, `HookResult`,
+   `ShellGate`, `KjVerb`, `crates/approval-ledger/src/types.rs`) — that is
+   exactly where a form origin slots in.
 2. Let an ask carry a schema-shaped answer alongside `decided_option`, so free
    text and multi-select become expressible without touching layer 3.
 3. Project it onto the elicitation wire that already exists, so a connected
@@ -131,6 +135,10 @@ The per-ask wait budget then serves both kinds of ask instead of just gates,
 which is why that work should land first either way.
 
 ## What this brief does not decide
+
+`docs/issues.md` no longer carries a tracking entry for this question; this
+brief is the system of record for it until one of the three items below is
+decided.
 
 - Whether to build any of it. The `kj wait` + turn-tail path ("end the turn
   with the question, the orchestrator answers with `kj drive --prompt`") works

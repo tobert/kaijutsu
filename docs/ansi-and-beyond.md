@@ -147,7 +147,8 @@ appends through `edit_text`, which clears spans (live end-appends via
 `append_text` keep them — offsets stay valid). Under buffer-until-done
 ordering (spans land at completion, after all appends) replay is correct;
 if spans ever land *before* later appends (reproject-then-append), replay
-would drop them where live execution kept them. Tracked in issues.md.
+would drop them where live execution kept them. Not tracked elsewhere; watch
+for it if append ordering ever changes.
 
 ## Parsing: vte, scope, safety invariants
 

@@ -219,7 +219,10 @@ each scheduled step.
 one error that would misdirect the migration. `insert_block_as` is a
 *kernel-side* `BlockStore` method (`kernel/src/block_store.rs:1245`). There is
 **no block-authoring verb anywhere in `kaijutsu.capnp`'s `Kernel` interface**
-(ordinals @0–@105 enumerated; @79–@83 are retired stubs). The nearest
+(ordinals @0–@105 enumerated; @79–@83 are retired stubs as of this writing —
+`kaijutsu.capnp` has since been renumbered on a flag day, so the live retired
+stubs no longer sit at @79–@83; the substance below, that no authoring verb
+existed yet, still holds). The nearest
 reachable surface is the kernel MCP tool `block_create` via `executeTool @18`
 — and it is **not sufficient**: it hardcodes `after=None`, `Status::Done` and
 `ContentType::Plain`, and its `metadata` parameter is parsed and then never

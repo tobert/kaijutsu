@@ -187,7 +187,7 @@ the cast) are also not built — `kj context set` has no `--preset` flag, only
 `--cast`; a preset applies today only at fork/apply time
 (`crates/kaijutsu-kernel/src/kj/preset.rs`). And there is still no
 handler-level test harness for `handle_new_session` itself (a fake
-`KernelBridge` seam, tracked in docs/issues.md's ACP-delete-follow-ups entry)
+`KernelBridge` seam; not tracked in `docs/issues.md`)
 — `apply_client_cast_preset`'s wiring is covered indirectly by unit tests on
 its pure pieces (`client_config_id`, `parse_cast_config` in `bridge.rs`), not
 by an end-to-end `session/new` test.
@@ -205,8 +205,11 @@ transcript replay, size limits, and capability advertisement must agree.
 
 Two prototype compromises remain behind the otherwise working turn loop:
 
-- `TurnCompleted` has no turn id, so two simultaneous interactive turns in
-  one context can cross-wire their prompt responses.
+- `TurnCompleted` carries a `turn_id` on the wire (`kaijutsu.capnp`,
+  `onTurnCompleted`), but the adapter's prompt wait does not consume it —
+  it still matches on `context_id` + `TurnOrigin::Interactive`
+  (`crates/kaijutsu-acp/src/session.rs`), so two simultaneous interactive
+  turns in one context can still cross-wire their prompt responses.
 - prompt echo suppression is armed by timing before `submit_input` returns its
   block id; a sibling user block landing in that window can be swallowed.
 
@@ -392,11 +395,11 @@ sends no options, so every real ask gets the synthesized Allow/Deny pair
   and the trailing-edge sweep remain dormant defence-in-depth after the
   kernel FlowBus backpressure fix; remove them together only after real ACP
   flights show that neither fires.
-- **`TurnCompleted` has no turn id.** The prompt wait matches on
+- **`TurnCompleted`'s turn id goes unused.** The wire carries a `turn_id`
+  (`kaijutsu.capnp`, `onTurnCompleted`), but the prompt wait still matches on
   `context_id` + `TurnOrigin::Interactive`, which is correlation by ordering.
-  Two interactive turns racing in one context would confuse it. Already noted
-  P3 in issues.md ("no turnId/endedAt … revisit with the adapter") — the
-  adapter now says: yes, we want it.
+  Two interactive turns racing in one context would confuse it. Not tracked
+  in `issues.md` — the adapter should consume the id it already receives.
 - **Stable session controls remain incomplete.** `session/set_mode` and
   `session/set_config_option` are in the pinned v1 schema and unimplemented.
   Neither is advertised, so a conforming client will not call its setter yet.

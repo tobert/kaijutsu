@@ -555,9 +555,10 @@ the build settled:
   `text::diff::cursor_byte` is the single char-column → byte-offset step.
 - **Not verified in the running app** (headless only): word emphasis colors
   against the theme on screen, the fold indicator's readability, the cursor's
-  drawn position at a column (especially on a wrapped line), and that folding
-  visibly re-lays-out. The `docs/issues.md` diffstat-footer overlap entry is
-  still unretested and is the natural thing to check in the same sitting.
+  drawn position at a column (especially on a wrapped line), whether the
+  diffstat footer overlaps the fold indicator when both render at once, and
+  that folding visibly re-lays-out. All four are the natural things to check
+  in the same sitting.
 
 ### Post-ship review — slice 6 phase A (deepseek + gpt-5.6-sol, 2026-08-04)
 

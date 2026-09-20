@@ -137,8 +137,10 @@ The Bevy app accepts `--key-fingerprint <fingerprint>` to select one SSH-agent
 key, or `--key-file <path>` to select a private-key file. The selectors are
 mutually exclusive and do not fall back to another key. Its displayed identity
 and draft ownership come from the authenticated connection's `whoami` result.
-The app currently reviews asks through shell `kj ledger` commands; it has no
-dedicated ledger controls yet.
+The app has dedicated ledger controls: an ask sheet
+(`crates/kaijutsu-app/src/ui/ask_sheet.rs`) and a ledger ribbon
+(`crates/kaijutsu-app/src/ui/ledger_ribbon.rs`), alongside shell `kj ledger`
+commands.
 
 New ACP sessions select a kernel model performer at launch:
 

@@ -300,8 +300,10 @@ Merged to main:
 - **`kj cc send` is ledger-gated.** `kj ledger` answers the gate from any
   shell.
 
-Order from here: **kernel wiring of the inbox** (the listener exists; connect
-it as a drift/mailbox source, unlocks replies) → **truthful `from`** on the
+The inbox listener is bound at server startup (`kaijutsu-server/src/rpc.rs`),
+receive-and-log only, with no drift/mailbox consumer yet. Order from here:
+**kernel wiring of the inbox** (connect the bound listener as a drift/mailbox
+source, unlocks replies) → **truthful `from`** on the
 sender once the kernel is listening → **presence** at `/run/cc`, built as a
 *source* for the general live roster rather than a CC-specific store →
 **per-peer paths + principal stamping** → **hooks** for consent and

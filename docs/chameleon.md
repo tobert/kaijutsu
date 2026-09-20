@@ -86,7 +86,7 @@ Two drivers, switchable per track with `kj transport clock --track <t>`:
 |---|---|
 | Read it off the gear → `kj transport tempo --track <t> <bpm>` | system clock |
 | Record a few bars → `kj audio beats <file>` → set the measured BPM | Beat This! (ISMIR 2024) via the pure-Rust `beat-this` crate; models in `~/.local/share/kaijutsu/models/beat-this/`; verified live (120 BPM click → `bpm=120.0`) |
-| Live MIDI clock-in: rack → daemon's ear → estimator → RPC → `modeled` track | `kaijutsu_audio::clockin::ClockEstimator` (`crates/kaijutsu-audio/src/clockin.rs` — EMA tempo, phase-exact pulse counting, dropout recount, stall flags); the daemon's capture thread ships estimates (`kaijutsu-audio-runtime/src/runtime.rs`, `report_clock_estimate`); kernel `BeatRequest::ClockEstimate` (`kaijutsu-server/src/beat.rs:2425`, track resolved by the seat's attachment) → `ModeledClock::apply_estimate` (`clock.rs:154`) |
+| Live MIDI clock-in: rack → daemon's ear → estimator → RPC → `modeled` track | `kaijutsu_audio::clockin::ClockEstimator` (`crates/kaijutsu-audio/src/clockin.rs` — EMA tempo, phase-exact pulse counting, dropout recount, stall flags); the daemon's capture thread ships estimates (`kaijutsu-audio-runtime/src/runtime.rs`, `report_clock_estimate`); kernel `BeatRequest::ClockEstimate` (`crates/kaijutsu-kernel/src/hyoushigi/mod.rs:292`, track resolved by the seat's attachment) → `ModeledClock::apply_estimate` (`clock.rs:154`) |
 
 Live clock-in needs `kaijutsu-audiod` running on the box that owns the rack's
 USB, its capture context attached to a `modeled` track, and the master
@@ -127,7 +127,11 @@ A player's whole behavior is rc (`assets/defaults/rc/musician/`):
   at the player's next page-turn, never mid-phrase.
 
 Chairs are deeper bundles: `bassist` adds create/S05-chair.md — the voice
-(register, groove, note choices), injected into the system prompt. The chair
+(register, groove, note choices), injected into the system prompt. `bassist`
+was the prototype chair; Amy decided 2026-09-20 that it merges into
+`musician`, folding the chair script in and retiring `bassist` as a separate
+context type. The merge has not happened yet — see `docs/issues.md`, "Merge
+`bassist` into `musician` (Amy, 2026-09-20)". The chair
 names the *role*; who sits in it (which model) is a runtime choice. The
 original casting — a small local model on bass, Haiku drums, Sonnet keys, Opus
 booth, Fable vocals — is the design's first voice, not today's roster. ABC-only
@@ -216,7 +220,9 @@ players whose work is not quantized.
 ## Starting a jam
 
 1. Create the track and player: `kj context create --type bassist --name
-   <track>` (the create rc attaches it to the track, stopped).
+   <track>` (the create rc attaches it to the track, stopped). `bassist` is
+   slated to merge into `musician` (see the note above); this example still
+   names `bassist` because the merge has not shipped.
 2. Set the tempo: read it off the gear (or a rack's clock module) →
    `kj transport tempo --track <track> <bpm>`; verify with `kj audio beats`
    on a short recording if unsure. Upgrade to `kj transport clock --track

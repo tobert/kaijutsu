@@ -216,7 +216,9 @@ defer until Slice A is settled.
 - **Provider-side cache expiry as a hydrate trigger.** Anthropic
   prompt-cache TTL expiry isn't modeled today; once per-turn-hydrate
   is gone, long idles may carry messages the provider no longer caches.
-  Tracked in tech_debt.md (#10).
+  Tracked in `docs/issues.md`, "Older app and broker debt, carried out of
+  auto-memory (2026-09-08)" — "Provider cache expiry is not a hydrate
+  boundary". `tech_debt.md` does not exist in this repo.
 - **Eviction-as-destruction.** Once hydrate is rare, evicting an
   in-memory session means a re-hydrate on next touch. Leave LRU as-is
   in Slice A; revisit alongside Slice C.

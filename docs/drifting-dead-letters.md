@@ -5,14 +5,15 @@ instead of three. Written 2026-08-16 from a conversation with Amy; the code
 citations are from that day and should be re-checked before trusting a line
 number.
 
-**Status (2026-08-17):** slice 1 shipped (`e30a8deb`) and verified against
+**Status (2026-09-20):** slice 1 shipped (`e30a8deb`) and verified against
 HEAD. Slice 3's mechanism shipped in `drift.rs`/`kernel_db.rs` — durable
 staging/dead-letter blocks, rehydrate, `ensure_drift_queue_context` — with a
-real-restart test suite (`drift::tests::persistence::*`); it is **not yet
-wired into a running kernel** (no production code calls
-`attach_persistence`/`rehydrate_from_block_log` yet — see `docs/issues.md`
-for the exact three-call wiring gap and why it wasn't closed this session).
-Slice 3's own residual gap — `drain_dead_letter()` acking before the
+real-restart test suite (`drift::tests::persistence::*`), and is now **wired
+into a running kernel**: cold start calls `attach_persistence` and
+`rehydrate_from_block_log` next to the lost+found re-adoption code
+(`kaijutsu-server/src/rpc.rs`), attaching then rehydrating the drift queue
+before anything else can stage into it. Slice 3's own residual gap —
+`drain_dead_letter()` acking before the
 lost+found write — **shipped fixed, same day**: see slice 3's status note and
 the new "the drain ack path" subsection below.
 
@@ -189,10 +190,9 @@ content, proven by a test that restarts against a real database.
 level: `attach_persistence`, `rehydrate_from_block_log`,
 `ensure_drift_queue_context` in `drift.rs`, `WellKnownRole::DriftQueue` in
 `kernel_db.rs`, restart-against-a-real-database tests in
-`drift::tests::persistence`. **Not yet wired into a running kernel** — see
-`docs/issues.md` for the three-call wiring gap (belongs in
-`kaijutsu-server/src/rpc.rs`, next to the existing lost+found re-adoption
-code, outside this session's territory). Answers the "one context or two?"
+`drift::tests::persistence`. **Now wired into a running kernel**: cold start
+in `kaijutsu-server/src/rpc.rs`, next to the lost+found re-adoption code,
+attaches then rehydrates the drift queue. Answers the "one context or two?"
 open question below: **one** — a single new `drift-queue` well-known context
 (distinct from lost+found) holds both staged and dead-lettered records,
 distinguished by a `QueueSlot` tag on each block's content rather than by

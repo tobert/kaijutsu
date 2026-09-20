@@ -236,7 +236,10 @@ ingestion running. Record loss at each queue boundary, not only ring overwrite.
 No PCM input is opened by default in the first implementation. MIDI observation
 keeps its current broad subscription policy, excluding our own clients and
 known loopback sources. Per-source watch start/stop allows explicit changes.
-Retention defaults and budget eviction/admission policy remain review decisions;
+Retention defaults and budget eviction/admission policy settled into initial
+budgets (`HistoryLimits::default`, `crates/kaijutsu-audio-runtime/src/history.rs`:
+60 s retention, 1 MiB per source, 16 MiB per node, 64 sources, 64 KiB per
+message, 8 MiB keep budget); there is no config surface to change them yet.
 48 kHz stereo float32 consumes 384,000 bytes/second before metadata.
 
 SSH reconnect alone does not start a new hardware stream generation: local
@@ -500,9 +503,10 @@ timebase").
 
 ## Lifetime and ownership
 
-An advisory file lock permits one runtime per OS user on a machine, whether
-hosted by the app or daemon. Keep both under the same user to share that lock;
-different OS users must coordinate device ownership. The lock is released
+An advisory file lock permits one runtime per OS user on a machine. The app
+no longer hosts a runtime of its own — it depends only on `kaijutsu-audio`,
+not `kaijutsu-audio-runtime` — so `kaijutsu-audiod` is always the one holding
+the lock; different OS users must coordinate device ownership. The lock is released
 after worker shutdown, including the MIDI exchange worker. The lock file is
 left in place so another process cannot bypass a held lock by replacing it.
 

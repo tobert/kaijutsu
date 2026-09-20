@@ -987,18 +987,22 @@ Each slice is independently shippable and leaves the tree green.
    binds to `hajime` and mints nothing. (2026-09-16: `init` replaced
    `hajime` and anonymous auth; see "Bootstrap: the person creates
    themself".)
-3. **Attribution.** Create-time performer selection (`kj context create --as`)
-   is implemented separately; provider-output attribution remains open.
-   Turn-start resolution of `played_by` to the effective actor; provider-emitted blocks authored by it. This is the slice that
-   changes `BlockId` lanes, so it ships alone.
+3. **Attribution. Shipped.** Create-time performer selection
+   (`kj context create --as`) landed separately. Turn-start resolution of
+   `played_by` to the effective actor, and provider-emitted blocks authored
+   by it, is `turn_identity::resolve`
+   (`crates/kaijutsu-kernel/src/runtime/turn_identity.rs`), stamped at the
+   tool-call and tool-result sites in
+   `crates/kaijutsu-kernel/src/runtime/llm_stream.rs`. This was the slice
+   that changed `BlockId` lanes; it shipped alone.
    Tests: a model block's author is the character and differs from the
    requester; the prompt's author is still the requester; a tool call is
    actor-authored while its result stays `system`; appends use the inserted
    block's principal; `TurnFlow` still names the requester; approval
    redemption still uses the ask's original requester; the app's draft
-   owner is still the session principal; and the multi-producer beat path
-   routes a cell failure to its own producer, which no test covers today
-   (`beat.rs:2216`, `producer_ctx_for` at `:1481`).
+   owner is still the session principal; the multi-producer beat path
+   routing a cell failure to its own producer has no test covering it today
+   (`beat.rs:1464` `producer_ctx_for`).
 4. **Handoff context.** `handoff` type, `kj handoff note|tail`, hydration
    policy set at creation, `S16-handoff.kai` in the `coder` and `mcp` create
    bundles, `register_session` sets `played_by`. `characters.handoff_ctx`

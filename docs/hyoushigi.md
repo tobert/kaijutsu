@@ -725,9 +725,14 @@ fallback are exercised by their first user.
 >   same cue stream only to drive its own display — the app itself has no
 >   hardware I/O (`docs/audio-daemon.md`).
 >
-> **Not yet:** the UI timeline render + transport buttons/spacebar + a capnp
-> transport surface (today `kj transport` is the only surface); disarm-on-
-> archive and the cold-start re-attach sweep (restart resets to stopped;
+> **Not yet:** the UI timeline render + transport buttons/spacebar. The
+> capnp read/distribution surface has shipped: `listTracks`/`TrackInfo`
+> (`kaijutsu.capnp:2438,1269`) read track state, consumed by the app and
+> tui; `onRenderCue`/`onBeatSync` (`kaijutsu.capnp:873,882`) distribute
+> committed cells and beat sync, consumed by `kaijutsu-audiod`
+> (`kaijutsu-audio-runtime`) and the app's display. `kj transport` remains
+> the only surface for transport *control* (attach/detach/play/pause/…).
+> Still open: disarm-on-archive and the cold-start re-attach sweep (restart resets to stopped;
 > re-attach is manual, and arming is restart-safe by construction — playhead
 > and committed log rehydrate from the score context); a richer
 > `compute_basis` / section-placement policy (cells schedule a fixed phrase

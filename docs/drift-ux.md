@@ -139,12 +139,13 @@ consent hole it was reported as.
 
 ### 3. `push` and `pull` speak different address grammars (SHIPPED 46878b28)
 
-> Push resolves through `refs::resolve_context_arg` first and falls back to
-> the `DriftRouter` only for a context the db resolver excludes but the
-> router still holds — an archived context, which `kj context archive`
-> does not unregister. The fallback is pinned by
-> `drift_push_resolves_archived_context_via_router_fallback`. The text
-> below describes the pre-fix state.
+> Push resolves through `refs::resolve_context_arg` alone; there is no router
+> fallback. `KernelDb::resolve_context` already resolves a full UUID
+> regardless of `context_state`/`archived_at`, so the one case a fallback
+> used to catch — an archived context reachable by label only through the
+> still-registered `DriftRouter` handle — is refused outright by the state
+> check instead of being delivered through (`kj/drift.rs`). The text below
+> describes the pre-fix state.
 
 Two resolvers, same noun:
 
@@ -321,8 +322,9 @@ Three ways to actually fix it, and this is the real decision:
 
 **Slice 3 — one address grammar. SHIPPED 2026-08-12 (`46878b28`).** `push`
 resolves through `refs::resolve_context_arg` like everything else, so `.`,
-`.parent` chains and full UUIDs work on it; the router stays as a fallback.
-Structural refs are also the one address form immune to the label collisions
+`.parent` chains and full UUIDs work on it; there is no router fallback — an
+archived context reachable only by label is refused outright, not delivered
+through. Structural refs are also the one address form immune to the label collisions
 in gap #5 — a fork can reach its parent without naming anything.
 
 ### Should short ids exist at all? (Amy, 2026-08-12)

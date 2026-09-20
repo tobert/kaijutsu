@@ -59,10 +59,12 @@ is a documented trade, not an accident.) `ThemeReceived` itself only fires at
 connect — there is no live config push yet, so both apply-semantics above wait
 for a reconnect in practice.
 
-`view/palette.rs` keeps two jobs only: the **compiled-in defaults** that
-`ScenePalette::default()` mirrors (so the app renders correctly before the
-kernel answers), and cross-module **geometry contracts** (`WALL_APOTHEM`,
-`STATION_W_*`) that were never color. Scene modules must not define private
+`view/palette.rs` is gone; its two jobs split into two files. The
+**compiled-in defaults** that `ScenePalette::default()` mirrors (so the app
+renders correctly before the kernel answers) live in
+`view/scene_palette.rs`. The cross-module **geometry contracts**
+(`WALL_APOTHEM`, `STATION_W_*`) that were never color live in
+`view/scene_geometry.rs`. Scene modules must not define private
 color/brightness constants anymore — new color goes through `ScenePalette`.
 
 ## The tier ladder

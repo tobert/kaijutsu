@@ -18,6 +18,10 @@ One feed gets three things a set of per-change events cannot:
 
 ## Shape
 
+The method and struct shapes below hold; the ordinals are an early sketch and
+do not match `kaijutsu.capnp` (there `blockInserted` is `@1` and `getBlocks`
+is `@34`) — read `kaijutsu.capnp` for the live numbering.
+
 ```capnp
 interface ContextObserver {
   # One delivery carries an ordered batch of changes and the version they
@@ -254,5 +258,9 @@ and are renewed on reload, so they need no storage or wire migration.
 2. **`BlockId` is a Lamport timestamp** (`{contextId, principalId, seq}`) —
    multi-writer identity that a single sequencer does not need. A
    kernel-assigned UUIDv7 would do. Large blast radius; deliberately deferred.
-3. **`retired79 @79 ()` … `retired83 @83 ()`** are placeholder stubs from the KV
-   deletion. A flag day is when they could go, if we accept renumbering.
+3. **Renumbering already happened.** The KV-deletion stubs this question was
+   about are gone under those ordinals; the live retired stubs in
+   `kaijutsu.capnp` today are `retired0`–`retired1`, `retired3`,
+   `retired6`–`retired15`, `retired18`, `retired26`, `retired58`, and
+   `retired93`, spread across several interfaces. The flag day this question
+   asked for has already happened.

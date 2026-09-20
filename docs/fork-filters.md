@@ -183,7 +183,7 @@ still wins — it's an orthogonal column).
   `(preset_id, verb, arg_name, arg_value)`, repeatable args as multiple
   rows. **Verb-scoped from day one** so the concept generalizes without a
   migration — but this design only wires fork; "presets deeply,
-  everywhere" is its own design thread (issues.md).
+  everywhere" is its own open design thread, untracked elsewhere.
 
 ## Inheritance manifest
 
@@ -249,4 +249,4 @@ seam module is *first* in the build order.
 - `--pin` (unmute) — only if the include-invariant error gets hit with
   resurrect intent behind it.
 - `-5:` sugar for `end-5:`.
-- Presets-everywhere (issues.md design thread).
+- Presets-everywhere — open design thread, untracked elsewhere.

@@ -984,6 +984,16 @@ Renamed now, before Slice 5 migrates six `Latch` producers onto this surface
 and before the gate's own error strings copy the old name further — the same
 reasoning as retiring `latch`: rename once, into the vocabulary we keep.
 
+**Status, 2026-09-20: this slice did not ship as designed, and the plan
+below is superseded.** `gate-policy-tuning.md`, "Builtin tier: the verb
+class" later decided the opposite: every `Destroy` verb latches by its
+verb class, in the dispatcher, and keeps `KjResult::Latch` and `--confirm`
+as a permanent mechanism (`kj/mod.rs`), not something migrated per verb
+onto `run_gate`. `KjResult::Latch`, `--confirm`, and the capnp
+`hasLatch`/`latchCommand`/`latchTarget`/`latchMessage` fields all remain in
+the tree today. Read the rest of this section, including the vocabulary
+sweep and the wire-rename analysis, as the rejected plan, not live work.
+
 **Slice 5 — retire the six `Latch` producers, and retire the word with
 them.** `kj/workspace.rs`, `kj/doc.rs`, `kj/context.rs` (×2 —
 archive/remove and retag), `kj/preset.rs` each get a `GateSpec` builder

@@ -2,8 +2,11 @@
 
 Kaijutsu's coder is turning into a subagent: forked, briefed, driven, waited
 on. This file holds the lines that make a delegated lane report honestly, so
-they can be plugged into the coder system prompt (`/config/rc/coder/create/`)
-rather than retyped into every brief.
+they can be plugged into a coder system prompt rather than retyped into every
+brief. They are realized today in the bench A/B variant
+`contrib/bench/rc-variants/coder-driven/coder/create/`, not in the shipped
+default coder rc (`assets/defaults/rc/coder/`) — say so plainly rather than
+implying they ship by default.
 
 Two halves. The first is prompt text — plain imperative, one idea per
 sentence, the `guided` register. The second is the evidence, which is for us.

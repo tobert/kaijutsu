@@ -230,7 +230,7 @@ one.
 **Two rows have since been resolved.** The VFS row: 11 of its 14 Bs were
 retired unused, `read` was fixed, `write`/`create` remain (test-only). The
 gate+capability row: all 7 shipped 2026-09-01. The open count is **14**, not
-33, and what is left is the four validation methods, the four policy ones,
+33, and what is left is the three validation methods, the four policy ones,
 the three editor writes reaching the VFS, `invokePeer`, and the two test-only
 `Vfs` methods.
 

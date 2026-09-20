@@ -20,6 +20,14 @@ This supersedes the blocking wait that shipped in Slice 4.6
 (`gate-and-shell-split.md`), which was verified live holding 81.2s. Deleting
 it is the point, not a cost: see "What this deletes".
 
+**Status, 2026-09-20:** most of what "Still open" below narrates is live
+behavior, not pending work — read it as a description, not a TODO list. Two
+things are genuinely still open: Slice 5, deleting `timeout::gate` and its
+patient hold (`kaijutsu-types/src/timeout.rs`; still read by
+`mcp/servers/shell.rs` and `runtime/kj_builtin.rs`); and the live-failure and
+continuation-admission audit, which `docs/issues.md` still points back at
+this section by name.
+
 ## Captured result review (September 16)
 
 PostCall and OnError approval reviews work that already ran. Interactive and

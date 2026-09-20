@@ -29,12 +29,17 @@ owns clock and sink timing. Model integration should use those contracts.
 This review does not establish that `kj audio beats` participates in them;
 today it is a synchronous request/response analysis command.
 
-There is also an execution gap in the resolver seam itself:
-`Timeline::speculate` calls `resolve` synchronously while the beat scheduler
-holds the timeline lock. The current production adapter reads prepared CAS
-content. A slow model cannot be substituted directly without stalling that
-path. See `docs/issues.md`, "Anticipation and commitment — iteration order",
-for the proof and implementation work needed before that substitution.
+The resolver seam itself is nonblocking, not synchronous. `Resolver::resolve`
+(`crates/kaijutsu-hyoushigi/src/resolver.rs`) returns an owned `ResolveFuture`;
+its contract requires both the start call and each poll to be bounded and
+nonblocking. `Timeline::speculate` stores that future without awaiting it, and
+`poll_work` polls it with a no-op waker (`crates/kaijutsu-hyoushigi/src/engine.rs`).
+The production adapter's blocking CAS read runs on `spawn_blocking` behind a
+4-permit semaphore (`crates/kaijutsu-kernel/src/hyoushigi/resolver.rs`), off
+the beat thread. The rule this leaves in place: the start and each poll run on
+the beat path and must not block it. What is still open is admission and
+cancellation for slower work such as `kj audio beats` — see `docs/issues.md`,
+"Anticipation and commitment — iteration order".
 
 ## Current implementation
 
