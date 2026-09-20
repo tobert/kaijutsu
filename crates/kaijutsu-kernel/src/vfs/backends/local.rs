@@ -148,12 +148,14 @@ impl LocalBackend {
     ///
     /// Returns an error if the path escapes the root (via `..`).
     ///
-    /// The containment check runs on the blocking pool. The lexical `..`
-    /// rejection needs no I/O, but canonicalization is a chain of blocking
-    /// syscalls whose length depends on how many trailing components are
-    /// missing, so the whole chain goes over in one `spawn_blocking` rather
-    /// than one hop per component. Every VFS op pays that round trip: there
-    /// is no fast path, since even an already-canonical existing path
+    /// Canonicalization runs on the blocking pool. The lexical `..` rejection
+    /// and the containment comparison need no I/O and stay here, but
+    /// canonicalizing is a chain of blocking syscalls whose length depends on
+    /// how many trailing components are missing, so the whole chain goes over
+    /// in one `spawn_blocking` rather than one hop per component. Both
+    /// canonical paths come back from the same closure, so the comparison is
+    /// over values computed together. Every VFS op pays that round trip:
+    /// there is no fast path, since even an already-canonical existing path
     /// canonicalizes the path and the root to compare them.
     async fn resolve(&self, path: &Path) -> VfsResult<PathBuf> {
         // Strip leading slash if present

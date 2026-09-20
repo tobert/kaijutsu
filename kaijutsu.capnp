@@ -1345,11 +1345,14 @@ struct FileAttr {
   mtimeSecs @3 :UInt64;        # Seconds since UNIX epoch
   mtimeNanos @4 :UInt32;       # Nanoseconds
   nlink @5 :UInt32;
-  generation @6 :UInt64;       # Strictly-advancing content version — the
-                                # coherence primitive (kernel FileAttr::generation).
-                                # A client compares this, not mtimeSecs/mtimeNanos,
-                                # to detect an external edit; 0 means unknown /
-                                # never observed a write.
+  generation @6 :UInt64;       # Content version — the coherence primitive
+                                # (kernel FileAttr::generation). A client
+                                # compares this, not mtimeSecs/mtimeNanos, to
+                                # decide whether to re-read; 0 means unknown.
+                                # A host-backed file has no counter, so
+                                # LocalBackend derives it from mtime-nanos:
+                                # equal means unchanged, but a deliberately
+                                # rewound mtime moves it backwards.
 }
 
 struct DirEntry {
@@ -1426,8 +1429,8 @@ interface Vfs {
 
   # Thirteen methods retired: general filesystem access over this interface
   # was superseded by SFTP (`docs/sftp.md`), which is how every remote
-  # filesystem consumer reaches the VFS now. They had no caller. The four
-  # that remain are the ones the app actually uses.
+  # filesystem consumer reaches the VFS now. They had no caller. The ones
+  # that remain are the ones a client actually uses.
   retired0 @0 ();
   retired1 @1 ();
 

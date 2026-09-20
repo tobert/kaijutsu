@@ -334,7 +334,12 @@ pub(crate) struct BlockEventsForwarder {
     /// one per trailing push after the subscriber had already gone away.
     /// A fresh forwarder — built on every reconnect and every
     /// `resubscribe_blocks` re-scope — gets a fresh, unlatched flag, so an
-    /// earlier closure never silences a later, healthy subscription.
+    /// earlier closure never silences a later, healthy subscription. Note the
+    /// limit of that: the flag is never cleared, and
+    /// `ActorHandle::subscribe_events` adds a receiver to the same `event_tx`
+    /// without rebuilding the forwarder, so a subscriber attaching to a
+    /// latched forwarder would receive nothing. Every caller today
+    /// re-subscribes through a new actor or a re-scope.
     pub closed: std::sync::atomic::AtomicBool,
     /// Events this forwarder has dropped since `closed` latched. Counted
     /// whether or not the warning fired, so the total in that one warning

@@ -417,12 +417,14 @@ impl EditorSessions {
     ) -> Result<KeysOutcome, String> {
         let (close, commands) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+            let len_before = session.core.text().chars().count();
             let ops = session.core.apply_keys(keys);
             let buffer_after = session.core.text();
             mirror_ops(
                 &ops,
                 &session.target,
                 &session.terminator,
+                len_before,
                 &buffer_after,
                 blocks,
                 actor,
@@ -696,12 +698,14 @@ impl EditorSessions {
         actor: PrincipalId,
     ) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let len_before = session.core.text().chars().count();
         let ops = session.core.insert_at(text, offset);
         let buffer_after = session.core.text();
         mirror_ops(
             &ops,
             &session.target,
             &session.terminator,
+            len_before,
             &buffer_after,
             blocks,
             actor,
@@ -744,12 +748,14 @@ impl EditorSessions {
             return Ok(state);
         }
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
+        let len_before = session.core.text().chars().count();
         let ops = session.core.insert_at_cursor(text);
         let buffer_after = session.core.text();
         mirror_ops(
             &ops,
             &session.target,
             &session.terminator,
+            len_before,
             &buffer_after,
             blocks,
             actor,
@@ -915,12 +921,17 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
 /// end splices in front of the raw one and stacks a second (`"end\n"` plus
 /// `"X\n"` giving `"endX\n\n"`).
 ///
-/// So the ops go on verbatim and the boundary is settled once, against what
-/// the buffer now holds: the block should read `buffer` + `terminator`, and a
-/// block that instead carries one extra terminator loses it. Any other
-/// disagreement is left alone — two players on one block is a supported state
-/// (`docs/vi.md`), and rewriting the block to match this buffer would discard
-/// the other player's work.
+/// So the ops go on verbatim and the boundary is settled once afterwards, and
+/// only for an edit that could have doubled it: one that reached the end of
+/// the buffer and supplied a terminator of its own. Such a batch loses the
+/// extra terminator if the block now carries two. Every other disagreement is
+/// left alone. That matters twice over. Two players on one block is a
+/// supported state (`docs/vi.md`), so rewriting the block to match this buffer
+/// would discard the other player's work. And `buffer_after` is not always the
+/// block's content minus the terminator: `EditorCore::insert_at` rebuilds the
+/// buffer from its own normalized text, which drops one trailing newline, so a
+/// block ending in a blank line comes back one newline short. Reconciling on
+/// that alone would delete a newline the edit never touched.
 ///
 /// One rule, one place: `keys_checked` (typed keys, including Enter),
 /// `insert_at_cursor` (paste), and `insert_text` (`:r`'s fetch-then-insert)
@@ -929,12 +940,21 @@ fn mirror_ops(
     ops: &[kaijutsu_editor::EditOp],
     target: &EditorTarget,
     terminator: &str,
+    len_before: usize,
     buffer_after: &str,
     blocks: &SharedBlockStore,
     actor: PrincipalId,
     caller: &str,
 ) -> Result<(), String> {
+    let mut len = len_before;
+    let mut supplied_terminator_at_tail = false;
     for op in ops {
+        if !terminator.is_empty()
+            && op.offset + op.delete == len
+            && op.insert.ends_with(terminator)
+        {
+            supplied_terminator_at_tail = true;
+        }
         blocks
             .edit_text_as(
                 target.context_id,
@@ -945,8 +965,14 @@ fn mirror_ops(
                 Some(actor),
             )
             .map_err(|e| format!("{caller}: block mirror failed: {e}"))?;
+        len = len
+            .checked_sub(op.delete)
+            .ok_or_else(|| {
+                format!("{caller}: edit op deletes {} of {len} characters", op.delete)
+            })?
+            + op.insert.chars().count();
     }
-    if terminator.is_empty() || ops.is_empty() {
+    if !supplied_terminator_at_tail {
         return Ok(());
     }
     let expected = format!("{buffer_after}{terminator}");
@@ -1283,6 +1309,26 @@ mod session_tests {
             .insert_at_cursor(id, "X", &blocks, PrincipalId::system())
             .unwrap();
         assert_eq!(block_text(&blocks, &target).unwrap(), "endX\n");
+    }
+
+    #[tokio::test]
+    async fn a_paste_away_from_the_tail_keeps_a_trailing_blank_line() {
+        // The terminator reconcile must only fire for an edit that reached the
+        // end of the buffer and supplied a terminator of its own. A block
+        // already ending in a blank line keeps it when the paste lands
+        // elsewhere, even though `insert_at` round-trips through the buffer's
+        // lossy normalized text and drops one newline from its own view.
+        let (blocks, target) = seeded(b"hello\n\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        sessions
+            .insert_at_cursor(id, "X", &blocks, PrincipalId::system())
+            .unwrap();
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "Xhello\n\n",
+            "a paste at the head must not cost the block a trailing newline"
+        );
     }
 
     #[tokio::test]
