@@ -1,5 +1,12 @@
 # CRDT Position Review — 2026-08-09
 
+**Archived record.** The decision below was made and carried out: the text
+CRDT and its crate were removed on 2026-08-16, and the wire moved to the
+change feed (`docs/change-feed.md`). This paper is kept because code comments
+cite it for the reasoning. It does not describe current code; where it says
+"Decision: PENDING Amy", that was true when it was written. Current rule:
+`AGENTS.md`, "State and interfaces".
+
 Provenance: Amy asked *"how much are CRDTs really helping us... the kernel
 already mediates a lot... I just want to make sure it's really serving
 us."* Evidence dossier by kaibo (gemini explorer, cited file:line);

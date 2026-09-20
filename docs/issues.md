@@ -2360,8 +2360,6 @@ carry the mechanism; these are what none of them cover:
   bar math an escape hatch. Decide which RO builtins.
 - **Rotate chains pollute the director's tree** (`kj context list --tree`
   shows a 17-deep chain per song); no `--hide-archived` or chain folding.
-- Turn provenance collapses to `PrincipalId::system()`
-  (`hyoushigi/mod.rs:1215`); character slice 3 is the fix.
 
 ## VFS: `LocalBackend::resolve` blocks the tokio pool (found 2026-06-27)
 

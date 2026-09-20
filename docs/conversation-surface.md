@@ -4,8 +4,8 @@
 Status: shipped. All slices (0 through 5, decapitation) landed 2026-08-18 —
 the conversation surface (`view::surface`) is the sole conversation renderer;
 the legacy Bevy-UI per-block-cell path and its `ConversationRenderPath` flag
-are deleted. See `docs/devlog.md` for the arc; the "Migration slices" section
-below is the original plan and no longer describes live branches.*
+are deleted. See `docs/devlog.md`, "The conversation stops being a widget
+tree" for the arc.*
 
 ## The goal, stated as an invariant
 
@@ -97,26 +97,9 @@ render-mode flip-flopping that made smoothing constants change mid-gesture.
 
 ## Migration slices
 
-0. **Defect relief on the existing stack** (branch `scroll-relief`, in flight):
-   quantum removal, exponential ease, follow-streaming Continuous gate,
-   logical-rounding removal, follow-yank fix, log demotion. Makes today
-   livable; nothing here is thrown away by the rewrite (the doctrine above is
-   implemented first here).
-1. **Atlas + pipeline foundation, shadow mode.** Build the shared atlas manager
-   and the custom render pass (glyph instances + SDF quads). Render *one*
-   block's text through it, overlaid on the live app, scroll uniform wired.
-   Validates MSDF clarity, physical-pixel snapping, and 1-frame latency without
-   touching the existing view. Ship behind a debug toggle.
-2. **Geometry hand-off.** Wire `ConversationGeometry` to the extraction phase;
-   draw all visible plain-text blocks through the new pass; existing UI cells
-   for those blocks stop rendering (kept dormant behind the flag).
-3. **Rich content + chrome.** Borders/headers/pulse/selection as SDF
-   primitives; ABC/SVG/diff blocks as textured quads. Input hit-testing (block
-   focus, x/za targets) reads geometry, not UI nodes.
-4. **Decapitation.** Delete the UI-node path: band lifecycle, RTT, spacers,
-   container scrolling. `ConversationGeometry` + the surface are the view.
-
-Each slice ships with the app usable; the flag flips per-slice, not big-bang.
+Every slice landed by 2026-08-18, from defect relief on the old stack through
+deleting the UI-node path. `docs/devlog.md`, "The conversation stops being a
+widget tree" tells it; git has the per-slice detail.
 
 ## Failure modes to watch (gemini deliberation, kept verbatim in spirit)
 
