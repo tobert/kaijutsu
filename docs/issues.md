@@ -1756,17 +1756,6 @@ still pinning `TaskStatus` LWW order — decide whether that order needs
 pinning at all now that concurrent merge into a kernel document is
 structurally impossible.
 
-## Error stub polish: dedupe summary-vs-detail, cap wrapped height (2026-08-16)
-
-Both still open in the block's new home,
-`crates/kaijutsu-present/src/format.rs` (`format_error_block`/
-`format_error_stub`, ~184-246): (a) `format_error_stub` does not skip
-leading detail lines that duplicate the summary, so a stream error whose
-`detail` starts with `block.content` still renders the message twice; (b)
-`ERROR_STUB_DETAIL_LINES` caps by line count only, so one long line still
-wraps to more screen lines than the budget implies — add a char budget
-alongside it.
-
 ## vi input editor stopped repainting after a small in-place edit (found 2026-08-16, live on moltar)
 
 Amy was editing a typo ("rost" → "rest") in the compose-block vi input.

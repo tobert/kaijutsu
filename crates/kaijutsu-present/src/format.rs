@@ -184,6 +184,18 @@ fn format_drift_block(block: &BlockSnapshot, local_ctx: Option<ContextId>) -> St
 /// Number of detail lines shown in a collapsed Error block's stub preview.
 const ERROR_STUB_DETAIL_LINES: usize = 3;
 
+/// Terminal/column width this module assumes when it caps the stub's detail
+/// text — this module has no access to a client's real render width (see
+/// the module doc: "nothing here knows what draws it"). Used only to size
+/// `ERROR_STUB_DETAIL_CHARS`.
+const ASSUMED_COLUMN_WIDTH: usize = 80;
+
+/// Character budget for the stub's shown detail text, alongside
+/// `ERROR_STUB_DETAIL_LINES`. A line count alone doesn't cap on-screen
+/// height: a single line longer than `ASSUMED_COLUMN_WIDTH` characters
+/// still wraps into more rows than the line cap implies.
+const ERROR_STUB_DETAIL_CHARS: usize = ERROR_STUB_DETAIL_LINES * ASSUMED_COLUMN_WIDTH;
+
 /// Total line budget a collapsed Error stub can occupy: provenance line,
 /// summary line, up to `ERROR_STUB_DETAIL_LINES` detail lines, and a trailing
 /// "N more lines" hint. A client sizing a row before it has the text reads
@@ -216,7 +228,8 @@ fn format_error_block(block: &BlockSnapshot, resolve_parent: BlockLookup) -> Str
 }
 
 /// Build the capped stub: provenance, summary, first `ERROR_STUB_DETAIL_LINES`
-/// lines of detail, then a "N more lines" hint if detail was truncated.
+/// lines of detail (skipping any that lead by duplicating the summary), then
+/// a truncation hint if detail was cut by the line count or the char budget.
 fn format_error_stub(provenance: &str, summary: &str, detail: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(provenance);
@@ -230,9 +243,33 @@ fn format_error_stub(provenance: &str, summary: &str, detail: Option<&str>) -> S
     if lines.is_empty() {
         return out;
     }
+
+    // Skip leading detail lines that exactly duplicate the summary (trimmed
+    // equality, not a prefix match — a prefix match could eat a line that
+    // legitimately starts with the same words but says more).
+    let summary_trimmed = summary.trim();
+    let mut start = 0;
+    while start < lines.len() && lines[start].trim() == summary_trimmed {
+        start += 1;
+    }
+    let lines = &lines[start..];
+    if lines.is_empty() {
+        return out;
+    }
+
     let shown = lines.len().min(ERROR_STUB_DETAIL_LINES);
+    let mut shown_text = lines[..shown].join("\n");
+
+    // A line count alone doesn't cap on-screen height: a single line
+    // longer than ASSUMED_COLUMN_WIDTH still wraps past the row budget the
+    // line cap implies. Cap total characters too.
+    let char_truncated = shown_text.chars().count() > ERROR_STUB_DETAIL_CHARS;
+    if char_truncated {
+        shown_text = shown_text.chars().take(ERROR_STUB_DETAIL_CHARS).collect();
+        shown_text.push('\u{2026}');
+    }
     out.push('\n');
-    out.push_str(&lines[..shown].join("\n"));
+    out.push_str(&shown_text);
 
     let remaining = lines.len() - shown;
     if remaining > 0 {
@@ -240,6 +277,11 @@ fn format_error_stub(provenance: &str, summary: &str, detail: Option<&str>) -> S
         out.push_str(&format!(
             "\u{2026} {remaining} more line{} ({COLLAPSE_TOGGLE_KEY_HINT} to expand)",
             if remaining == 1 { "" } else { "s" }
+        ));
+    } else if char_truncated {
+        out.push('\n');
+        out.push_str(&format!(
+            "\u{2026} truncated ({COLLAPSE_TOGGLE_KEY_HINT} to expand)"
         ));
     }
     out
@@ -1447,6 +1489,55 @@ mod tests {
         let text = format_single_block(&error_block, None, &lookup);
         assert!(!text.contains("more line"));
         assert!(text.ends_with("line2"));
+    }
+
+    // ------------------------------------------------------------------
+    // format_error_stub — summary/detail dedupe, and the char budget
+    // alongside ERROR_STUB_DETAIL_LINES (docs/issues.md, "Error stub
+    // polish: dedupe summary-vs-detail, cap wrapped height").
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn error_stub_skips_leading_detail_line_that_exactly_duplicates_summary() {
+        let text = format_error_stub("prov", "boom: failed", Some("boom: failed\nreal detail"));
+        assert_eq!(text, "prov\nboom: failed\nreal detail");
+    }
+
+    #[test]
+    fn error_stub_keeps_leading_detail_line_that_only_shares_a_prefix_with_summary() {
+        // Conservative rule: a prefix match could eat a line that
+        // legitimately starts with the same words but says more.
+        let text = format_error_stub("prov", "boom", Some("boom: extra context\nreal detail"));
+        assert_eq!(text, "prov\nboom\nboom: extra context\nreal detail");
+    }
+
+    #[test]
+    fn error_stub_skips_only_leading_duplicates_not_one_later() {
+        // The second "boom" is not leading — it must stay.
+        let text = format_error_stub("prov", "boom", Some("boom\nreal detail\nboom"));
+        assert_eq!(text, "prov\nboom\nreal detail\nboom");
+    }
+
+    #[test]
+    fn error_stub_caps_one_long_line_by_char_budget() {
+        let long = "x".repeat(500);
+        let text = format_error_stub("prov", "summary", Some(&long));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "prov");
+        assert_eq!(lines[1], "summary");
+        assert_eq!(lines[2].chars().count(), ERROR_STUB_DETAIL_CHARS + 1);
+        assert!(lines[2].ends_with('\u{2026}'));
+        assert_eq!(lines[3], "\u{2026} truncated (c to expand)");
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn error_stub_short_lines_still_capped_by_line_count_not_chars() {
+        let text = format_error_stub("prov", "summary", Some("l1\nl2\nl3\nl4\nl5"));
+        assert_eq!(
+            text,
+            "prov\nsummary\nl1\nl2\nl3\n\u{2026} 2 more lines (c to expand)"
+        );
     }
 
     #[test]
