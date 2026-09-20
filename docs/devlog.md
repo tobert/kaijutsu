@@ -2922,3 +2922,63 @@ Credits: Claude Fable 5.1 led, Claude Opus and Claude Sonnet built the lanes,
 and kaibo's DeepSeek V4 Flash cast reviewed every slice. About 70 task runs
 across four arms, plus the reviews, took the DeepSeek balance from $60.07 to
 $56.21, roughly $0.02 to $0.05 per Terminal-Bench task.
+
+## Burning down the well-defined half (September 20)
+
+Amy wanted the bounded part of the backlog gone so the remaining list is
+decisions and design: "use a lot of sonnet subagents to burn down our issue
+log, focusing on the stuff that's well definable." Sixteen numbered items, three
+or four Sonnet lanes at a time, each with a file territory no sibling touched,
+the lead briefing, re-reading every citation, and committing path-scoped. It
+took a little over two hours and closed fourteen.
+
+The lanes were good and two of them were wrong in ways only a reader catches.
+One routed `kj cas get --out` through the VFS by bridging an async write out of
+a sync dispatcher with `block_in_place`, on the stated belief that every live
+kernel runs a multi-thread runtime. `ssh.rs` builds a current-thread runtime per
+session thread and runs rc lifecycles and kaish on it, so that bridge panics on
+any `--out` from an SSH session. It went back, and the real shape — make the two
+dispatchers async — is filed rather than landed at the end of a session. The
+other fixed the editor's doubled terminator by deciding per edit op whether a
+tail insert should absorb the block's trailing newline. That works for a paste
+and breaks for a typed Enter, because modalkit absorbs a pasted trailing newline
+into its rope's own terminator slot and a keystroke does not, and the op cannot
+tell you which happened. The lead wrote the invariant down as a test — the block
+always equals the buffer plus its terminator — watched it fail on the Enter case,
+and replaced the per-op guess with one reconcile after the batch, against what
+the buffer actually holds.
+
+That test is the transferable part. Three call sites had each been splicing
+buffer-relative offsets onto raw text that carries one extra character, and
+every attempt to be clever at that boundary was a guess about intent. Stating
+the relationship as an assertion found the case reasoning had missed in both
+directions: the lead's first analysis of the lane's fix was also wrong, and the
+test corrected it too.
+
+Two lanes wrote tests that pass for the wrong reason, both caught by running
+the mutation rather than trusting the green. A starvation test for
+`LocalBackend::resolve` raced a 40 ms deadline, so it was a load-sensitive
+flake and an unbounded version hung instead of failing, because the monopolized
+worker also drives the timer; counting how many times a second task gets polled
+is deadline-free and finishes in hundredths of a second. A pump-abort test slept
+a fixed 50 ms for an abort to take effect at its next poll. And one lane
+proposed pinning a hazard by scanning the crate's own source for a second call
+site — a hundred and twenty lines of hand-rolled string-literal stripping that
+pins text, not behavior. The documented invariant already implied the answer:
+one process makes one temporary state directory, so a second `prepare(None)`
+refuses.
+
+What the burn-down produced besides fixes is a better list. Nine new entries
+came out of the work itself: OpenAI mapping HTTP 402 to the `ApiError` the new
+retry classification retries while Claude maps it permanent; a provider comment
+promising an error the code panics instead of returning; a theme mirror test
+that only spot-checks fields, which turns out to be hiding an `fg` disagreement
+between the shipped file and the compiled default. And two entries were
+corrected rather than closed, because reading the code contradicted them —
+`kj context move` never touches `forked_from`, so the accountability hazard
+filed against it does not follow from the code as written. An entry that is
+wrong costs more than an entry that is open.
+
+Credits: Claude Opus 5 led, Claude Sonnet 5 ran twelve lanes, and kaibo's
+DeepSeek cast reviewed each batch and caught the stale comments and the
+provider-classification gap the lanes' own reading had missed.
