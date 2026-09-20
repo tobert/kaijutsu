@@ -12,7 +12,7 @@
 //! changed underneath it).
 //!
 //! ```text
-//! kj mcp list [--json]     # alias: status
+//! kj mcp list               # alias: status
 //! kj mcp reload            # re-read mcp.toml, reconcile
 //! kj mcp restart <name>    # stop one server, then reconcile so it comes back
 //! ```
@@ -41,11 +41,7 @@ enum McpCommand {
     /// Show every configured server (mcp.toml) alongside what's actually
     /// registered on the broker, with health.
     #[command(alias = "status")]
-    List {
-        /// Emit a JSON object instead of a labelled table
-        #[arg(long)]
-        json: bool,
-    },
+    List {},
     /// Re-read mcp.toml and reconcile: add newly-configured servers, remove
     /// ones no longer configured, refresh QoS policy on servers that stay
     /// running. Never reconnects an already-running server.
@@ -91,13 +87,13 @@ impl KjDispatcher {
         }
 
         match parsed.command {
-            McpCommand::List { json } => self.mcp_list(json).await,
+            McpCommand::List {} => self.mcp_list().await,
             McpCommand::Reload {} => self.mcp_reload().await,
             McpCommand::Restart { name } => self.mcp_restart(&name).await,
         }
     }
 
-    async fn mcp_list(&self, json: bool) -> KjResult {
+    async fn mcp_list(&self) -> KjResult {
         use crate::mcp::load_mcp_config_toml;
         use crate::vfs::VfsOps;
         use kaijutsu_types::paths;
@@ -219,24 +215,6 @@ impl KjDispatcher {
                 .collect(),
         );
 
-        if json {
-            let servers: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|(name, status, transport, health, last_failure)| {
-                    serde_json::json!({
-                        "name": name,
-                        "instance": external_instance_id(name).as_str(),
-                        "status": status,
-                        "transport": transport,
-                        "health": health.as_ref().map(health_json),
-                        "last_failure": last_failure,
-                    })
-                })
-                .collect();
-            let out = serde_json::json!({ "count": rows.len(), "servers": servers });
-            return KjResult::ok_with_data(out.to_string(), data);
-        }
-
         let mut lines = Vec::with_capacity(rows.len());
         for (name, status, transport, health, last_failure) in &rows {
             let health_str = match health {
@@ -328,15 +306,6 @@ impl KjDispatcher {
     }
 }
 
-/// JSON-friendly health projection for `--json`.
-fn health_json(h: &Health) -> serde_json::Value {
-    match h {
-        Health::Ready => serde_json::json!({"state": "ready"}),
-        Health::Degraded { reason } => serde_json::json!({"state": "degraded", "reason": reason}),
-        Health::Down { reason } => serde_json::json!({"state": "down", "reason": reason}),
-    }
-}
-
 // Verb class: kj/effect.rs
 impl Classify for McpArgs {
     fn effect(&self) -> Effect {
@@ -392,13 +361,11 @@ command = "/definitely/does/not/exist/mcp-server"
 
         // Nothing registered yet — mirrors the boot state before reconcile
         // has run for this entry.
-        let result = d.dispatch_mcp(&[s("list"), s("--json")], &caller).await;
+        let result = d.dispatch_mcp(&[s("list")], &caller).await;
         let KjResult::Ok { message, .. } = result else {
             panic!("expected Ok, got {result:?}");
         };
-        let v: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(v["servers"][0]["name"], "ghost");
-        assert_eq!(v["servers"][0]["status"], "failed");
+        assert!(message.contains("ghost — failed"), "got: {message}");
     }
 
     /// Defect 3: a structurally-invalid `[servers.X]` entry (bad transport,
@@ -422,21 +389,14 @@ url = "http://localhost:9"
         .await;
         let caller = test_helpers::test_caller();
 
-        let result = d.dispatch_mcp(&[s("list"), s("--json")], &caller).await;
+        let result = d.dispatch_mcp(&[s("list")], &caller).await;
         let KjResult::Ok { message, .. } = result else {
             panic!("expected Ok, got {result:?}");
         };
-        let v: serde_json::Value = serde_json::from_str(&message)
-            .unwrap_or_else(|e| panic!("expected JSON, got {e}: {message:?}"));
-        assert_eq!(v["servers"][0]["name"], "typo");
-        assert_eq!(v["servers"][0]["status"], "failed");
+        assert!(message.contains("typo — failed"), "got: {message}");
         assert!(
-            v["servers"][0]["last_failure"]
-                .as_str()
-                .expect("last_failure should be a string")
-                .contains("streemable_http"),
-            "expected the reason to name the bad transport, got {:?}",
-            v["servers"][0]["last_failure"]
+            message.contains("last failure:") && message.contains("streemable_http"),
+            "expected the reason to name the bad transport, got: {message}"
         );
     }
 
@@ -459,14 +419,12 @@ command = "/bin/true"
         let reload = d.dispatch_mcp(&[s("reload")], &caller).await;
         assert!(reload.is_ok(), "{reload:?}");
 
-        let result = d.dispatch_mcp(&[s("list"), s("--json")], &caller).await;
+        let result = d.dispatch_mcp(&[s("list")], &caller).await;
         let KjResult::Ok { message, .. } = result else {
             panic!("expected Ok, got {result:?}");
         };
-        let v: serde_json::Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(v["servers"][0]["name"], "brp");
-        assert_eq!(v["servers"][0]["status"], "failed");
-        assert!(v["servers"][0]["last_failure"].is_string());
+        assert!(message.contains("brp — failed"), "got: {message}");
+        assert!(message.contains("last failure:"), "got: {message}");
     }
 
     /// `/bin/true` cannot be restarted into a running server, so the verb

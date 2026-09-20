@@ -3,7 +3,6 @@
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_cas::ContentStore;
 use kaijutsu_types::{BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
-use serde::Serialize;
 
 use crate::block_tools::translate::{line_range_to_char_range, line_to_char_offset};
 use super::effect::{Classify, Effect};
@@ -77,9 +76,6 @@ enum BlockCommand {
         /// Filter by status: pending|running|waiting|done|error|draft
         #[arg(long)]
         status: Option<String>,
-        /// Emit a single JSON object instead of a table
-        #[arg(long)]
-        json: bool,
     },
     /// Inspect a single block's metadata.
     Inspect {
@@ -90,9 +86,6 @@ enum BlockCommand {
         /// already names its own context.
         #[arg(long, short = 'c')]
         context: Option<String>,
-        /// Emit a single JSON object instead of a labelled table
-        #[arg(long)]
-        json: bool,
     },
     /// Count blocks matching filters.
     Count {
@@ -330,13 +323,11 @@ impl KjDispatcher {
                 kind,
                 role,
                 status,
-                json,
-            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), json, caller),
+            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), caller),
             BlockCommand::Inspect {
                 block_id,
                 context,
-                json,
-            } => self.block_inspect(&block_id, context.as_deref(), json, caller),
+            } => self.block_inspect(&block_id, context.as_deref(), caller),
             BlockCommand::Count {
                 context,
                 kind,
@@ -513,7 +504,6 @@ impl KjDispatcher {
         kind_arg: Option<&str>,
         role_arg: Option<&str>,
         status_arg: Option<&str>,
-        json: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let ctx_id = {
@@ -560,40 +550,37 @@ impl KjDispatcher {
                 .collect(),
         );
 
-        if json {
-            let rows: Vec<BlockListRow> = filtered
-                .iter()
-                .map(|b| BlockListRow {
-                    block_id: b.id.to_key(),
-                    parent_id: b.parent_id.map(|id| id.to_key()),
-                    role: b.role.as_str().to_string(),
-                    kind: b.kind.as_str().to_string(),
-                    status: b.status.as_str().to_string(),
-                    content_length: b.content.len(),
-                })
-                .collect();
-            let out = serde_json::json!({
-                "context_id": ctx_id.to_hex(),
-                "count": rows.len(),
-                "total": snapshots.len(),
-                "blocks": rows,
-            });
-            return KjResult::ok_with_data(out.to_string(), id_array);
-        }
-
         if filtered.is_empty() {
-            return KjResult::ok_with_data("(no blocks)".to_string(), id_array);
+            let msg = if snapshots.is_empty() {
+                "(no blocks)".to_string()
+            } else {
+                format!("(no blocks match the filter — {} total)", snapshots.len())
+            };
+            return KjResult::ok_with_data(msg, id_array);
         }
-        let mut out = String::new();
+        // A filter that narrows the result must say so — a short listing and
+        // a filtered listing must not look identical (same disclosure rule
+        // `kj roster list` follows for hidden rows).
+        let mut out = if filtered.len() != snapshots.len() {
+            format!("{} of {} blocks matched the filter\n", filtered.len(), snapshots.len())
+        } else {
+            String::new()
+        };
         for b in &filtered {
-            out.push_str(&format!(
-                "{}  {}/{}  [{}]  {}\n",
+            let mut line = format!(
+                "{}  {}/{}  [{}]  {}",
                 short_key(&b.id),
                 b.role.as_str(),
                 b.kind.as_str(),
                 b.status.as_str(),
                 first_line_trunc(&b.content, 60),
-            ));
+            );
+            line.push_str(&format!("  len={}", b.content.len()));
+            if let Some(parent) = b.parent_id {
+                line.push_str(&format!("  parent={}", short_key(&parent)));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
         KjResult::ok_with_data(out, id_array)
     }
@@ -602,7 +589,6 @@ impl KjDispatcher {
         &self,
         id_str: &str,
         ctx_ref: Option<&str>,
-        json: bool,
         caller: &KjCaller,
     ) -> KjResult {
         // Round-trip with the keys `block list` emits: `BlockId::to_key()`
@@ -653,9 +639,6 @@ impl KjDispatcher {
             "edge_shown": snap.edge_shown,
         });
 
-        if json {
-            return KjResult::ok_with_data(record.to_string(), record);
-        }
         let parent = snap
             .parent_id
             .map(|i| i.to_key())
@@ -671,6 +654,21 @@ impl KjDispatcher {
             parent,
             snap.content.len(),
         );
+        if let Some(tool_name) = &snap.tool_name {
+            out.push_str(&format!("tool:      {tool_name}\n"));
+        }
+        if let Some(tool_call_id) = snap.tool_call_id {
+            out.push_str(&format!("tool_call: {}\n", tool_call_id.to_key()));
+        }
+        if snap.is_error {
+            out.push_str("error:     true\n");
+        }
+        if let Some(exit_code) = snap.exit_code {
+            out.push_str(&format!("exit_code: {exit_code}\n"));
+        }
+        if let Some(summary) = &snap.summary {
+            out.push_str(&format!("summary:   {summary}\n"));
+        }
         if let Some(edge_block) = snap.edge_block {
             out.push_str(&format!(
                 "edge:      {}{}\n",
@@ -1316,6 +1314,25 @@ impl KjDispatcher {
         };
         let ctx_id = block_id.context_id;
 
+        // A CAS-ref Asset block's `content` is the hash, not the payload —
+        // an Image block is the concrete case, but the mechanism is general
+        // to any CAS-ref block (`block_cas_hash`'s convention). Appending
+        // text would corrupt the reference; crashing (refusing) is preferred
+        // over corrupting the hash.
+        let snapshots = match self.blocks.non_draft_snapshots(ctx_id) {
+            Ok(s) => s,
+            Err(e) => return KjResult::Err(format!("kj block append: {e}")),
+        };
+        if let Some(snap) = snapshots.iter().find(|b| b.id == block_id)
+            && let Some(hash) = self.block_cas_hash(snap)
+        {
+            return KjResult::Err(format!(
+                "kj block append: '{id_str}' is a CAS-ref block (content is the hash {hash}, \
+                 e.g. an Image block) — appending text would corrupt the reference; create a \
+                 new block instead"
+            ));
+        }
+
         // append_text_as takes Option<PrincipalId>; pass the performer's, not
         // the requester's — a model turn's edits are authored by the actor
         // (docs/approval-identity.md, "Three identities").
@@ -1819,16 +1836,6 @@ fn parse_range_spec(spec: &str) -> Result<(usize, usize), String> {
     Ok((start, end))
 }
 
-#[derive(Serialize)]
-struct BlockListRow {
-    block_id: String,
-    parent_id: Option<String>,
-    role: String,
-    kind: String,
-    status: String,
-    content_length: usize,
-}
-
 /// Parse one optional `kj block list` filter.
 ///
 /// `None` means no filter; an unparseable value is an error naming what is
@@ -1990,7 +1997,7 @@ mod tests {
             assert!(!result.is_ok(), "{args:?}: {}", result.message());
             assert!(!result.message().contains("unfinished-secret"));
         }
-        let listed = d.dispatch(&[s("block"), s("list"), s("--json")], &caller).await;
+        let listed = d.dispatch(&[s("block"), s("list")], &caller).await;
         assert!(listed.is_ok(), "{}", listed.message());
         assert!(!listed.message().contains(&key));
         assert!(!listed.message().contains("unfinished-secret"));
@@ -2241,22 +2248,99 @@ mod tests {
     // ── Existing behavior preserved ───────────────────────────────────
 
     #[tokio::test]
-    async fn block_list_empty_context_json() {
+    async fn block_list_empty_context() {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context_with_doc(&d, Some("c"), principal);
         let c = caller_with_context(ctx);
 
-        let result = d.dispatch(&[s("block"), s("list"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("block"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());
+        assert_eq!(result.message(), "(no blocks)");
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v.as_array().map(|a| a.len()), Some(0));
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
+    }
 
-        let v: serde_json::Value =
-            serde_json::from_str(result.message()).expect("output must be JSON");
-        assert_eq!(v["count"], 0);
-        assert_eq!(v["total"], 0);
-        assert!(v["blocks"].is_array());
-        assert_eq!(v["blocks"].as_array().unwrap().len(), 0);
-        assert_eq!(v["context_id"], ctx.to_hex());
+    /// `parent`/`len` used to ride only the (now-deleted) `--json` envelope's
+    /// row objects; they show in the human listing now, same trailing-suffix
+    /// style as roster's `×N`.
+    #[tokio::test]
+    async fn block_list_shows_parent_and_length_in_human_output() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let parent = insert_text_block(&d, ctx, "root");
+        d.block_store()
+            .insert_block_as(
+                ctx,
+                Some(&parent),
+                None,
+                TypesRole::User,
+                BlockKind::Text,
+                "child text",
+                Status::Done,
+                ContentType::Plain,
+                None,
+            )
+            .expect("insert_block_as");
+
+        let result = d.dispatch(&[s("block"), s("list")], &c).await;
+        assert!(result.is_ok(), "list failed: {}", result.message());
+        let message = result.message();
+        assert!(
+            message.contains(&format!("parent={}", super::short_key(&parent))),
+            "child row must name its parent: {message}"
+        );
+        assert!(
+            message.contains("len=10"),
+            "child row must show its content length (10 for 'child text'): {message}"
+        );
+        assert!(
+            message.contains(&format!("len={}", "root".len())),
+            "root row must show its content length too: {message}"
+        );
+    }
+
+    /// A filter that narrows the result must say so — a short listing and a
+    /// filtered listing must not look identical (same disclosure rule
+    /// `kj roster list` follows for hidden rows). `total` used to ride only
+    /// the deleted `--json` envelope.
+    #[tokio::test]
+    async fn block_list_shows_total_when_a_filter_narrows_the_result() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        insert_text_block(&d, ctx, "one");
+        d.blocks
+            .insert_block_as(
+                ctx,
+                None,
+                None,
+                TypesRole::User,
+                BlockKind::Thinking,
+                "two",
+                Status::Done,
+                ContentType::Plain,
+                None,
+            )
+            .expect("insert_block_as");
+
+        let result = d
+            .dispatch(&[s("block"), s("list"), s("--kind"), s("text")], &c)
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(
+            result.message().contains("1 of 2"),
+            "a narrowed listing must disclose the unfiltered total: {}",
+            result.message()
+        );
     }
 
     #[tokio::test]
@@ -2399,7 +2483,7 @@ mod tests {
 
         let short = super::short_key(&with_edge);
         let result = d
-            .dispatch(&[s("block"), s("inspect"), s(&short), s("--json")], &c)
+            .dispatch(&[s("block"), s("inspect"), s(&short)], &c)
             .await;
         match result {
             crate::kj::KjResult::Ok { data: Some(v), .. } => {
@@ -2430,7 +2514,7 @@ mod tests {
         let short_no_edge = super::short_key(&no_edge);
 
         let result = d
-            .dispatch(&[s("block"), s("inspect"), s(&short_no_edge), s("--json")], &c)
+            .dispatch(&[s("block"), s("inspect"), s(&short_no_edge)], &c)
             .await;
         match result {
             crate::kj::KjResult::Ok { data: Some(v), .. } => {
@@ -2447,6 +2531,66 @@ mod tests {
             "a block with no edge must not print an edge line, got: {}",
             plain.message()
         );
+    }
+
+    /// `tool_name` used to ride only the (now-deleted) `--json` envelope's
+    /// record; it shows in the human `inspect` output now, alongside
+    /// `id`/`ctx`/etc.
+    #[tokio::test]
+    async fn block_inspect_shows_tool_name_in_human_output() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let call_id = d
+            .blocks
+            .insert_tool_call(ctx, None, None, "kj cas ls", serde_json::json!({}), None)
+            .expect("insert_tool_call");
+
+        let short = super::short_key(&call_id);
+        let result = d.dispatch(&[s("block"), s("inspect"), s(&short)], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(
+            result.message().contains("tool:      kj cas ls"),
+            "got: {}",
+            result.message()
+        );
+    }
+
+    /// `tool_call_id`/`exit_code`/`is_error`/`summary` used to ride only the
+    /// (now-deleted) `--json` envelope's record; they show in the human
+    /// `inspect` output now, alongside `id`/`ctx`/etc.
+    #[tokio::test]
+    async fn block_inspect_shows_result_metadata_in_human_output() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+
+        let call_id = d
+            .blocks
+            .insert_tool_call(ctx, None, None, "kj cas ls", serde_json::json!({}), None)
+            .expect("insert_tool_call");
+        let result_id = d
+            .blocks
+            .insert_tool_result(ctx, &call_id, Some(&call_id), "boom", true, Some(1), None)
+            .expect("insert_tool_result");
+        d.blocks
+            .set_summary(ctx, &result_id, "failed to list".to_string())
+            .expect("set_summary");
+
+        let short = super::short_key(&result_id);
+        let result = d.dispatch(&[s("block"), s("inspect"), s(&short)], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let message = result.message();
+        assert!(
+            message.contains(&format!("tool_call: {}", call_id.to_key())),
+            "got: {message}"
+        );
+        assert!(message.contains("error:     true"), "got: {message}");
+        assert!(message.contains("exit_code: 1"), "got: {message}");
+        assert!(message.contains("summary:   failed to list"), "got: {message}");
     }
 
     /// `kj block list` must populate `KjResult::Ok::data` with a JSON array
@@ -2499,10 +2643,9 @@ mod tests {
         let ctx = register_context_with_doc(&d, Some("c"), principal);
         let c = caller_with_context(ctx);
 
-        let result = d.dispatch(&[s("block"), s("ls"), s("--json")], &c).await;
+        let result = d.dispatch(&[s("block"), s("ls")], &c).await;
         assert!(result.is_ok(), "ls alias failed: {}", result.message());
-        let v: serde_json::Value = serde_json::from_str(result.message()).unwrap();
-        assert_eq!(v["count"], 0);
+        assert_eq!(result.message(), "(no blocks)");
     }
 
     // ── New: block read ────────────────────────────────────────────────
@@ -3739,17 +3882,27 @@ mod tests {
 
         let result = d
             .dispatch(
-                &[s("block"), s("list"), s("--status"), s("waiting"), s("--json")],
+                &[s("block"), s("list"), s("--status"), s("waiting")],
                 &c,
             )
             .await;
         assert!(result.is_ok(), "{}", result.message());
         let out = result.message();
-        assert!(out.contains(&bid.to_key()), "the waiting block is missing: {out}");
         assert!(
-            out.matches("\"block_id\"").count() == 1,
-            "exactly one block matches --status waiting: {out}"
+            out.contains(&super::short_key(&bid)),
+            "the waiting block is missing: {out}"
         );
+        match result {
+            KjResult::Ok { data: Some(v), .. } => {
+                let arr = v.as_array().expect("data must be array");
+                assert_eq!(
+                    arr,
+                    &[serde_json::Value::String(bid.to_key())],
+                    "exactly one block matches --status waiting: {arr:?}"
+                );
+            }
+            other => panic!("expected Ok with data, got {other:?}"),
+        }
     }
 
     /// Every name `--kind`'s help advertises must parse, for the same reason
@@ -4417,6 +4570,41 @@ mod tests {
             .find(|b| b.id == bid)
             .unwrap();
         assert_eq!(snap.content, "hello world", "content not appended");
+    }
+
+    /// An Image (or any CAS-ref Asset) block's `content` is the CAS hash,
+    /// not the payload — appending text to it would corrupt the reference.
+    /// Refuse it; crashing is preferred over corrupting the hash.
+    #[tokio::test]
+    async fn block_append_refuses_a_cas_ref_block() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let mut c = caller_with_context(ctx);
+        c.principal_id = principal;
+        let (bid, hash) = insert_cas_asset_block(&d, ctx, TEST_REAL_PNG, "image/png", None);
+
+        let result = d
+            .dispatch(
+                &[s("block"), s("append"), bid.to_key(), s("--text"), s("corrupt")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "append to a CAS-ref block must be refused");
+        assert!(
+            result.message().contains(&hash),
+            "refusal should name the CAS hash: {}",
+            result.message()
+        );
+
+        let snap = d
+            .block_store()
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == bid)
+            .unwrap();
+        assert_eq!(snap.content, hash, "content must be untouched");
     }
 
     #[tokio::test]

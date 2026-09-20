@@ -46,13 +46,9 @@ enum RosterCommand {
     /// List the current roster — who's around right now.
     #[command(alias = "ls")]
     List {
-        /// Emit a JSON array of row objects instead of a labelled table.
-        #[arg(long)]
-        json: bool,
         /// Include entities we positively know are NOT live. Off by default:
         /// the `recent` source carries one row per non-archived context, so
         /// this is usually a few live entities among hundreds of idle ones.
-        /// Applies to `--json` too.
         #[arg(long)]
         all: bool,
     },
@@ -80,7 +76,7 @@ impl KjDispatcher {
             RosterCommand::Status { text, availability } => {
                 self.roster_status(&text, availability.as_deref(), caller).await
             }
-            RosterCommand::List { json, all } => self.roster_list(json, all).await,
+            RosterCommand::List { all } => self.roster_list(all).await,
         }
     }
 
@@ -113,7 +109,7 @@ impl KjDispatcher {
         row.live != Some(false)
     }
 
-    async fn roster_list(&self, json: bool, all: bool) -> KjResult {
+    async fn roster_list(&self, all: bool) -> KjResult {
         if let KjResult::Err(e) = self.ensure_refreshed().await {
             return KjResult::Err(e);
         }
@@ -158,9 +154,6 @@ impl KjDispatcher {
         let hidden = total.saturating_sub(rows.len());
 
         let data = serde_json::Value::Array(rows.iter().map(row_to_json).collect());
-        if json {
-            return KjResult::ok_with_data(data.to_string(), data);
-        }
         if rows.is_empty() {
             let msg = if total == 0 {
                 "(nobody on the roster yet)".to_string()
@@ -463,7 +456,7 @@ mod tests {
         d.dispatch(&[s("roster"), s("status"), s("hi"), s("--availability"), s("idle")], &caller)
             .await;
 
-        let result = d.dispatch(&[s("roster"), s("list"), s("--json")], &caller).await;
+        let result = d.dispatch(&[s("roster"), s("list")], &caller).await;
         let KjResult::Ok { data: Some(serde_json::Value::Array(rows)), .. } = result else {
             panic!("expected a JSON array, got {result:?}");
         };
