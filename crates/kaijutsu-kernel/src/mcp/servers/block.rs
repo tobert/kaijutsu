@@ -12,8 +12,9 @@ use tokio_util::sync::CancellationToken;
 use crate::block_store::SharedBlockStore;
 // Block edits use character offsets; byte offsets would split multibyte text.
 use crate::block_tools::translate::{
-    content_with_line_numbers, extract_lines_with_numbers, line_count, line_range_to_char_range,
-    line_to_char_offset, splice_chars, validate_expected_text,
+    byte_to_char_offset, content_with_line_numbers, extract_lines_with_numbers, line_count,
+    line_range_to_char_range, line_to_byte_offset, line_to_char_offset, splice_chars,
+    validate_expected_text,
 };
 use kaijutsu_types::{BlockId, BlockKind, ContentType, Role, Status, KIND_NAMES, ROLE_NAMES, STATUS_NAMES};
 use kaijutsu_types::ContextId;
@@ -221,13 +222,21 @@ pub struct SearchMatch {
     /// The regex match's start, as a BYTE offset within `line`'s own text —
     /// not a block-relative offset, and not the CHARACTER offset
     /// `block_splice`'s `offset` and `block_edit`'s line-range CAS check
-    /// both use. A caller composing this into either editing tool must
-    /// convert it first: resolve `line` to a block-relative char offset with
-    /// `line_to_char_offset`, then add the char count of `content[..match_start]`.
+    /// both use. Kept for callers that already parse `line`'s text
+    /// themselves; a caller composing straight into `block_splice` should
+    /// use `block_char_start`/`block_char_end` instead of converting this.
     pub match_start: u32,
-    /// Same units and the same conversion as `match_start` (byte offset
-    /// within `line`, exclusive end).
+    /// Same units and the same caveat as `match_start` (byte offset within
+    /// `line`, exclusive end).
     pub match_end: u32,
+    /// The regex match's start as a block-relative CHARACTER offset — the
+    /// exact unit and origin `block_splice`'s `offset` takes. Feed this
+    /// straight in; no conversion needed.
+    pub block_char_start: usize,
+    /// The match's exclusive end in the same units. The difference between
+    /// the two is `block_splice`'s `delete_count` for replacing the match
+    /// in place.
+    pub block_char_end: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,14 +321,14 @@ impl McpServerLike for BlockToolsServer {
             tool_def::<BlockEditParams>(&self.instance_id, "block_edit", "Edit block content atomically with line operations")?,
             tool_def::<BlockSpliceParams>(&self.instance_id, "block_splice", "Character-based editing (for programmatic tools). offset/delete_count are whole-block CHARACTER positions, not the line-relative byte offsets block_search reports.")?,
             tool_def::<BlockReadParams>(&self.instance_id, "block_read", "Read block content with optional line numbers and range")?,
-            tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns. match_start/match_end are BYTE offsets within the matched line, not block-relative and not the CHARACTER offsets block_splice/block_edit take.")?,
+            tool_def::<BlockSearchParams>(&self.instance_id, "block_search", "Search within a block using regex or literal patterns. match_start/match_end are BYTE offsets within the matched line. block_char_start/block_char_end are the same match as whole-block CHARACTER offsets — feed these directly into block_splice's offset/delete_count.")?,
             tool_def::<BlockListParams>(&self.instance_id, "block_list", "List blocks with optional filters")?,
             tool_def::<BlockStatusParams>(&self.instance_id, "block_status", "Set block status: pending, running, waiting, done, or error")?,
             tool_def::<KernelSearchParams>(&self.instance_id, "kernel_search", "Search across all blocks using regex, with filters and context")?,
             tool_def::<SvgBlockParams>(&self.instance_id, "svg_block", "Append an SVG block to the current context. Renders as vector graphics inline.")?,
             tool_def::<AbcBlockParams>(&self.instance_id, "abc_block", "Append an ABC music notation block. Validates parse; renders as sheet music inline.")?,
             tool_def::<DiffBlockParams>(&self.instance_id, "diff_block", "Append a unified-diff block to the current context. Validates the diff parses strictly; renders as a diff view inline.")?,
-            tool_def::<ImgBlockParams>(&self.instance_id, "img_block", "Append an image block referencing content already in the CAS by hash.")?,
+            tool_def::<ImgBlockParams>(&self.instance_id, "img_block", "Append an image block referencing content already in the CAS by hash. Refuses a hash that is missing from the CAS or whose recorded type is not a raster image.")?,
             tool_def::<ImgBlockFromPathParams>(&self.instance_id, "img_block_from_path", "Read an image from the mounted filesystem, store it in the CAS, and append an image block.")?,
         ])
     }
@@ -543,6 +552,13 @@ impl McpServerLike for BlockToolsServer {
                         break;
                     }
 
+                    // The whole-block BYTE offset of this line's start, so a
+                    // match's line-relative byte range can be projected into
+                    // block-relative units below. Computed once per line,
+                    // not per match.
+                    let line_byte_start = line_to_byte_offset(content, line_num as u32)
+                        .map_err(|e| McpError::Protocol(format!("block_search: {e}")))?;
+
                     for cap in regex.find_iter(line) {
                         if search_matches.len() >= p.max_matches as usize {
                             break;
@@ -553,11 +569,23 @@ impl McpServerLike for BlockToolsServer {
 
                         let context_content = extract_lines_with_numbers(content, ctx_start, ctx_end);
 
+                        // Project the line-relative BYTE match range into a
+                        // whole-block CHARACTER range: multibyte text earlier
+                        // in the block (or earlier in this same line) makes
+                        // byte and char counts diverge, and `block_splice`
+                        // only accepts characters.
+                        let block_char_start =
+                            byte_to_char_offset(content, line_byte_start + cap.start());
+                        let block_char_end =
+                            byte_to_char_offset(content, line_byte_start + cap.end());
+
                         search_matches.push(SearchMatch {
                             line: line_num as u32,
                             content: context_content,
                             match_start: cap.start() as u32,
                             match_end: cap.end() as u32,
+                            block_char_start,
+                            block_char_end,
                         });
                     }
                 }
@@ -822,8 +850,39 @@ impl McpServerLike for BlockToolsServer {
                 let p: ImgBlockParams = serde_json::from_value(params.arguments)
                     .map_err(McpError::InvalidParams)?;
 
-                if p.hash.parse::<kaijutsu_cas::ContentHash>().is_err() {
-                    return Ok(from_exec_result(ExecResult::failure(1, format!("invalid hash: {}", p.hash))));
+                let hash = match p.hash.parse::<kaijutsu_cas::ContentHash>() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        return Ok(from_exec_result(ExecResult::failure(1, format!("invalid hash: {}", p.hash))));
+                    }
+                };
+
+                // A well-formed hash says nothing about what the CAS actually
+                // holds under it. Read back the type recorded at store time
+                // (`ContentStore::inspect`, the same lookup `kj cas info`
+                // uses) and refuse anything that is not a raster image
+                // rather than label arbitrary bytes `ContentType::Image`.
+                let reference = self
+                    .cas
+                    .inspect(&hash)
+                    .map_err(|e| McpError::Protocol(format!("CAS error: {e}")))?;
+                let reference = match reference {
+                    Some(r) => r,
+                    None => {
+                        return Ok(from_exec_result(ExecResult::failure(
+                            1,
+                            format!("not found in CAS: {}", p.hash),
+                        )));
+                    }
+                };
+                if ContentType::from_mime(&reference.mime_type) != ContentType::Image {
+                    return Ok(from_exec_result(ExecResult::failure(
+                        1,
+                        format!(
+                            "{} is recorded in the CAS as '{}', not an image",
+                            p.hash, reference.mime_type
+                        ),
+                    )));
                 }
 
                 let key = self.append_block(&tool_ctx, Role::Asset, &p.hash, ContentType::Image)?;
@@ -1451,6 +1510,27 @@ mod tests {
         assert_eq!(response["line_count"], 3);
     }
 
+    /// The tool definition is the only place `block_char_start`/
+    /// `block_char_end`'s existence and units reach a client — `SearchMatch`
+    /// carries no separate output schema (`KernelTool` has `input_schema`
+    /// only), so the description is what "the emitted schema shows the new
+    /// fields" means here.
+    #[tokio::test]
+    async fn block_search_tool_description_documents_the_new_char_offset_fields() {
+        let (_broker, ctx, _db, _store) = setup().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let server = BlockToolsServer::new(
+            _store,
+            Arc::new(FileStore::at_path(tmp.path().join("cas"))),
+            Arc::new(MountTable::new()),
+        );
+        let tools = server.list_tools(&ctx).await.unwrap();
+        let block_search = tools.iter().find(|t| t.name == "block_search").unwrap();
+        let desc = block_search.description.as_ref().unwrap();
+        assert!(desc.contains("block_char_start"), "description: {desc}");
+        assert!(desc.contains("block_char_end"), "description: {desc}");
+    }
+
     #[tokio::test]
     async fn test_block_search() {
         let (broker, ctx, _db, store) = setup().await;
@@ -1500,6 +1580,69 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
         assert_eq!(response["matches"], serde_json::json!([]));
         assert_eq!(response["total_matches"], 0);
+    }
+
+    /// `block_char_start`/`block_char_end` are block-relative even in plain
+    /// ASCII, where byte and char counts agree: a match on line 1 must not
+    /// report the same offset as `match_start` (which is line-relative and
+    /// reports 0 for a match at the start of its line).
+    #[tokio::test]
+    async fn block_search_char_offsets_are_block_relative_not_line_relative() {
+        let (broker, ctx, _db, store) = setup().await;
+        let block_id = store
+            .insert_block(ctx.context_id, None, None, Role::User, BlockKind::Text, "one\ntwo\nthree\n", Status::Done, ContentType::Plain)
+            .unwrap();
+
+        let res = call(&broker, &ctx, "block_search",
+            serde_json::json!({ "block_id": block_id.to_key(), "query": "two", "context_lines": 0 })).await;
+        assert!(!res.is_error, "search failed: {}", text_of(&res));
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        let matches = response["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+        assert_eq!(m["match_start"], 0, "line-relative: \"two\" starts its own line");
+        assert_eq!(m["match_end"], 3);
+        // Block-relative: "one\n" is 4 chars/bytes, so "two" starts at 4.
+        assert_eq!(m["block_char_start"], 4, "block-relative start must differ from the line-relative one");
+        assert_eq!(m["block_char_end"], 7);
+    }
+
+    /// Multibyte content before the matched line, and within it, must make
+    /// `block_char_start`/`block_char_end` diverge from a byte count over
+    /// the same text — the exact corruption class `block_edit`'s multibyte
+    /// tests below guard on the write side. "改善 first line\n" is 14 chars
+    /// but 18 bytes (改/善 are 3 bytes each); "café" is 4 chars but 5 bytes
+    /// (é is 2 bytes).
+    #[tokio::test]
+    async fn block_search_char_offsets_diverge_from_bytes_with_multibyte_content() {
+        let (broker, ctx, _db, store) = setup().await;
+        let content = "改善 first line\ncafé is here\n";
+        let block_id = insert_multibyte_block(&store, &ctx, content);
+
+        let res = call(&broker, &ctx, "block_search",
+            serde_json::json!({ "block_id": block_id.to_key(), "query": "café", "context_lines": 0 })).await;
+        assert!(!res.is_error, "search failed: {}", text_of(&res));
+        let response: serde_json::Value = serde_json::from_str(&text_of(&res)).unwrap();
+        let matches = response["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+
+        // Line-relative byte offsets are unaffected: "café" opens line 1.
+        assert_eq!(m["match_start"], 0);
+        assert_eq!(m["match_end"], 5, "'café' is 5 BYTES (é is 2)");
+
+        // Block-relative CHARACTER offsets: line 0 ("改善 first line\n")
+        // is 14 chars, so line 1 starts at char 14, not byte 18.
+        assert_eq!(m["block_char_start"], 14, "must be a CHAR offset, not the byte offset 18");
+        assert_eq!(m["block_char_end"], 18, "'café' is 4 CHARS, so end = 14 + 4");
+
+        // A client feeding this straight into block_splice must land on
+        // exactly "café", nothing more and nothing less.
+        assert_eq!(
+            content.chars().skip(14).take(4).collect::<String>(),
+            "café",
+            "block_char_start/end must bracket exactly the matched text"
+        );
     }
 
     /// `summary` is the kernel-derived line a settled Thinking block carries
@@ -2215,6 +2358,101 @@ mod tests {
         .await;
         assert!(res.is_error);
         assert!(text_of(&res).contains("invalid hash"), "got: {}", text_of(&res));
+    }
+
+    /// `img_block` takes a hash, not bytes, so a well-formed hash can still
+    /// point at anything already in the CAS. Storing `text/plain` under a
+    /// hash and asking `img_block` to label it `ContentType::Image` must be
+    /// refused, naming the recorded type it actually found.
+    #[tokio::test]
+    async fn img_block_refuses_a_cas_object_whose_recorded_type_is_not_an_image() {
+        let (_broker, ctx, _db, store) = setup().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
+        let hash = cas.store(b"just plain text, not an image", "text/plain").unwrap();
+        let before = store.block_snapshots(ctx.context_id).unwrap().len();
+
+        let server = BlockToolsServer::new(store.clone(), cas, Arc::new(MountTable::new()));
+        let result = server
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                    tool: "img_block".to_string(),
+                    arguments: serde_json::json!({ "hash": hash.to_string() }),
+                },
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "a text/plain object must be refused: {result:?}");
+        let msg = text_of(&result);
+        assert!(msg.contains("text/plain"), "must name what it found: {msg}");
+        assert_eq!(
+            store.block_snapshots(ctx.context_id).unwrap().len(),
+            before,
+            "a refused import appends no block"
+        );
+    }
+
+    /// The CAS-recorded-type check must also refuse a hash the CAS has
+    /// never seen at all, rather than silently treating "not found" as
+    /// "not an image" or, worse, appending a block that references nothing.
+    #[tokio::test]
+    async fn img_block_refuses_a_hash_absent_from_the_cas() {
+        let (_broker, ctx, _db, store) = setup().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
+        let absent = kaijutsu_cas::ContentHash::from_data(b"never stored");
+
+        let server = BlockToolsServer::new(store, cas, Arc::new(MountTable::new()));
+        let result = server
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                    tool: "img_block".to_string(),
+                    arguments: serde_json::json!({ "hash": absent.to_string() }),
+                },
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "an absent hash must be refused: {result:?}");
+        assert!(text_of(&result).contains("not found"), "got: {}", text_of(&result));
+    }
+
+    /// The refusal above must not be so broad that it refuses a real image
+    /// too: a hash recorded with an `image/png` type still works.
+    #[tokio::test]
+    async fn img_block_accepts_a_cas_object_recorded_as_an_image() {
+        let (_broker, ctx, _db, store) = setup().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Arc::new(FileStore::at_path(tmp.path().join("cas")));
+        let hash = cas.store(MOUNTED_PNG, "image/png").unwrap();
+
+        let server = BlockToolsServer::new(store.clone(), cas, Arc::new(MountTable::new()));
+        let result = server
+            .call_tool(
+                KernelCallParams {
+                    instance: InstanceId::new(BlockToolsServer::INSTANCE),
+                    tool: "img_block".to_string(),
+                    arguments: serde_json::json!({ "hash": hash.to_string() }),
+                },
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error, "a real image object must be accepted: {}", text_of(&result));
+        let response: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let block = kaijutsu_types::BlockId::from_key(response["block_id"].as_str().unwrap()).unwrap();
+        let snapshot = store.get_block_snapshot(ctx.context_id, &block).unwrap().unwrap();
+        assert_eq!(snapshot.content_type, ContentType::Image);
+        assert_eq!(snapshot.content, hash.to_string());
     }
 
     // ── block_edit × multibyte content (byte-vs-char offset regression) ──
