@@ -147,6 +147,14 @@ impl LocalBackend {
     /// Resolve a relative path to an absolute path within the root.
     ///
     /// Returns an error if the path escapes the root (via `..`).
+    ///
+    /// The containment check runs on the blocking pool. The lexical `..`
+    /// rejection needs no I/O, but canonicalization is a chain of blocking
+    /// syscalls whose length depends on how many trailing components are
+    /// missing, so the whole chain goes over in one `spawn_blocking` rather
+    /// than one hop per component. Every VFS op pays that round trip: there
+    /// is no fast path, since even an already-canonical existing path
+    /// canonicalizes the path and the root to compare them.
     async fn resolve(&self, path: &Path) -> VfsResult<PathBuf> {
         // Strip leading slash if present
         let path = path.strip_prefix("/").unwrap_or(path);
@@ -159,16 +167,19 @@ impl LocalBackend {
 
         // Join with root
         let full = self.root.join(path);
+        let root = self.root.clone();
 
-        // Canonicalize to resolve symlinks and ..
-        // For non-existent paths, we need to check parent
-        let canonical = Self::canonicalize_deepest_existing(&full);
+        let (canonical, canonical_root) = tokio::task::spawn_blocking(move || {
+            // Canonicalize to resolve symlinks and ..
+            // For non-existent paths, we need to check parent
+            let canonical = Self::canonicalize_deepest_existing(&full);
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            (canonical, canonical_root)
+        })
+        .await
+        .map_err(|e| VfsError::other(format!("resolve: blocking task join failed: {e}")))?;
 
         // Verify we haven't escaped the root
-        let canonical_root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
         if !canonical.starts_with(&canonical_root) {
             return Err(VfsError::path_escapes_root(format!(
                 "{} is not under {}",
@@ -198,16 +209,22 @@ impl LocalBackend {
         let full = self.root.join(path);
         let parent = full
             .parent()
-            .ok_or_else(|| VfsError::invalid_path("no parent"))?;
+            .ok_or_else(|| VfsError::invalid_path("no parent"))?
+            .to_path_buf();
         let filename = full
             .file_name()
-            .ok_or_else(|| VfsError::invalid_path("no filename"))?;
-        let resolved = Self::canonicalize_deepest_existing(parent).join(filename);
+            .ok_or_else(|| VfsError::invalid_path("no filename"))?
+            .to_os_string();
+        let root = self.root.clone();
 
-        let canonical_root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
+        let (resolved, canonical_root) = tokio::task::spawn_blocking(move || {
+            let resolved = Self::canonicalize_deepest_existing(&parent).join(&filename);
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            (resolved, canonical_root)
+        })
+        .await
+        .map_err(|e| VfsError::other(format!("resolve_nofollow: blocking task join failed: {e}")))?;
+
         if !resolved.starts_with(&canonical_root) {
             return Err(VfsError::path_escapes_root(format!(
                 "{} is not under {}",
@@ -392,8 +409,6 @@ impl VfsOps for LocalBackend {
     }
 
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
-        use std::os::unix::fs::OpenOptionsExt;
-
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
 
@@ -402,28 +417,32 @@ impl VfsOps for LocalBackend {
             fs::create_dir_all(parent).await.map_err(VfsError::from)?;
         }
 
-        // Create file with specified mode
-        let file = std::fs::OpenOptions::new()
+        // Create file with specified mode. `tokio::fs::OpenOptions` has a
+        // direct `mode()` (unix) and `create_new()`, so this needs no
+        // `spawn_blocking` of its own.
+        let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(mode)
             .open(&full_path)
+            .await
             .map_err(VfsError::from)?;
 
-        let meta = file.metadata().map_err(VfsError::from)?;
+        let meta = file.metadata().await.map_err(VfsError::from)?;
         Ok(Self::metadata_to_attr(&meta))
     }
 
     async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
-        use std::os::unix::fs::DirBuilderExt;
-
         self.check_writable()?;
         let full_path = self.resolve(path).await?;
 
-        std::fs::DirBuilder::new()
+        // `tokio::fs::DirBuilder` has a direct `mode()` (unix), so this
+        // needs no `spawn_blocking` of its own either.
+        fs::DirBuilder::new()
             .mode(mode)
             .recursive(true)
             .create(&full_path)
+            .await
             .map_err(VfsError::from)?;
 
         let meta = fs::metadata(&full_path).await.map_err(VfsError::from)?;
@@ -1309,5 +1328,66 @@ mod tests {
         assert!(backend.rename(Path::new(""), Path::new("f")).await.is_err());
         assert!(backend.rename(Path::new("f"), Path::new("/")).await.is_err());
         assert!(backend.rename(Path::new("f"), Path::new(".")).await.is_err());
+    }
+
+    /// `resolve` must yield its worker rather than run its canonicalize
+    /// syscalls inline. A resolve that canonicalizes inline has no await
+    /// point at all, so a loop of resolves on a one-worker runtime never
+    /// returns control to the scheduler and nothing else on that runtime is
+    /// ever polled.
+    ///
+    /// This is not a "resolve returns the right path" test; that passes
+    /// either way. The other task counts how many times it is polled while
+    /// the loop runs, so the assertion is a count and not a deadline: no
+    /// amount of machine load can turn a pass into a failure, and the test
+    /// always terminates.
+    ///
+    /// Goes red if `resolve`'s `spawn_blocking` is removed.
+    #[test]
+    fn resolve_does_not_starve_the_single_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let backend = LocalBackend::new(dir.path());
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let polls = rt.block_on(async {
+            let done = Arc::new(AtomicBool::new(false));
+            let polls = Arc::new(AtomicUsize::new(0));
+
+            let burst_done = Arc::clone(&done);
+            let burst = tokio::spawn(async move {
+                for _ in 0..2_000 {
+                    backend.resolve(Path::new("f")).await.unwrap();
+                }
+                burst_done.store(true, Ordering::Relaxed);
+            });
+
+            let counted = Arc::clone(&polls);
+            let watcher = tokio::spawn(async move {
+                while !done.load(Ordering::Relaxed) {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            burst.await.unwrap();
+            watcher.await.unwrap();
+            polls.load(Ordering::Relaxed)
+        });
+
+        assert!(
+            polls > 0,
+            "the second task was never polled while resolve() looped on the \
+             single worker: resolve is canonicalizing inline instead of on \
+             the blocking pool"
+        );
     }
 }
