@@ -285,7 +285,7 @@ pub struct SharedKernelState {
     /// acceptable for a task whose only cost on abrupt death is its own
     /// tokio task going away with the runtime; it would NOT be acceptable
     /// for anything that must flush. The WAL checkpoint has its own signal
-    /// handler (`ssh.rs`, `spawn_signal_checkpoint`) for that reason.
+    /// handler (`ssh.rs`, `spawn_signal_shutdown`) for that reason.
     pub shutdown: CancellationToken,
 }
 

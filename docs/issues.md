@@ -445,8 +445,6 @@ Smaller, from the same work:
   proc-macro crates), build the root image static, export the binaries from
   it, and delete the second Containerfile. Measure musl's allocator under load
   before a static kernel serves real work.
-- `crates/kaijutsu-server/src/rpc.rs` has a comment naming
-  `spawn_signal_checkpoint`; the function is `spawn_signal_shutdown`.
 
 ## The uncovered tier does not reach a `KjVerb` ask (2026-09-18)
 
