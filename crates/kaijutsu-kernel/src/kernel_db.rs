@@ -2519,12 +2519,18 @@ impl KernelDb {
     /// power loss or kernel panic can drop the most recent commits. The
     /// default `FULL` fsyncs every commit, and a streaming turn commits once
     /// per delta.
+    ///
+    /// `journal_size_limit` caps how large the `-wal` file is allowed to grow
+    /// before a checkpoint truncates it back down; SQLite's default is -1
+    /// (no limit), which lets the WAL's high-water mark become permanent disk
+    /// cost with no correctness benefit.
     fn init_connection(conn: &Connection) -> SqliteResult<()> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA journal_size_limit = 67108864;",
         )?;
         Ok(())
     }
@@ -9484,6 +9490,25 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, 1, "synchronous should be NORMAL (1), got {mode}");
+    }
+
+    // ── journal size limit ───────────────────────────────────────────────
+
+    /// `init_connection` must cap the WAL's high-water mark with
+    /// `journal_size_limit`, or SQLite's default of -1 (no limit) lets a busy
+    /// kernel's `-wal` file grow without bound and never shrink back down,
+    /// since a checkpoint only truncates a WAL larger than this limit.
+    #[test]
+    fn init_connection_sets_journal_size_limit() {
+        let db = KernelDb::temporary().unwrap();
+        let limit: i64 = db
+            .conn_for_ledger()
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            limit, 67_108_864,
+            "journal_size_limit should be 67108864 (64 MiB), got {limit}"
+        );
     }
 
     // ── WAL checkpoint ──────────────────────────────────────────────────

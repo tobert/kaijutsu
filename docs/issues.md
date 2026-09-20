@@ -1253,18 +1253,6 @@ embedding/classifier kind and shared endpoint ownership. This depends on
 the active kj verb-class lane because it changes the registry and backend
 administration. It does not block the synthesis service branch.
 
-## The WAL grows without bound and never shrinks (2026-09-01)
-
-`kernel.db-wal` measured at 719 MB holding zero live frames — SQLite behaving
-as documented: a WAL resets only when a checkpoint finds it larger than
-`journal_size_limit`, and the kernel never sets one (still true,
-`kernel_db.rs`, no `journal_size_limit` pragma found), so the limit is -1 and
-the high-water mark is permanent. Cost is disk, not correctness. Fix: set
-`PRAGMA journal_size_limit` at open next to `PRAGMA foreign_keys = ON`
-(`kernel_db.rs:1999`) — measure a normal day's high-water mark before picking
-a value. Do not switch to a timed `wal_checkpoint(TRUNCATE)` — it blocks
-writers where the limit does the same job for free.
-
 ## The terminal client — `kaijutsu-tui` follow-ups (first cut shipped 2026-09-02)
 
 Design: `docs/tui.md`. What the shipped skeleton left open, re-verified still
