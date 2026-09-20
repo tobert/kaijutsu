@@ -1148,40 +1148,43 @@ and `g`/`G` move.
 
 ### Images
 
+**Not built.** This section is design, not shipped behavior; see
+`docs/issues.md`, "The terminal client — `kaijutsu-tui` follow-ups".
+
 Blocks already carry everything the wire needs: `ContentType::Svg` is inline
 SVG text, `ContentType::Abc` is ABC notation, and a `ContentType::Image`
 block's text is a CAS hash whose real MIME type lives in CAS sidecar metadata
 (`kaijutsu-types/src/block.rs`, `ContentType`). Images are a client rendering
-lane; nothing new rides the wire.
+lane; nothing new would ride the wire.
 
-- **Symbolic on the wire, raster at the edge.** The kernel ships SVG, ABC, or
-  a CAS hash — never pixels it rendered itself. The TUI rasterizes with
-  resvg + tiny-skia (already workspace dependencies through the app) at a
-  pixel size derived from the terminal's cell size, so the receiver renders
-  the symbolic form at its own resolution — the same doctrine as
-  tempo-not-pulses (`docs/midi.md`, "The one timebase").
-- **Protocol ladder.** v1 emits the iTerm2 inline-image protocol (OSC 1337
-  `File=`, base64 PNG); wezterm and iTerm2 both speak it, which covers both
-  seats in use today. The fallback is unicode half-blocks (`▀` with fg/bg
-  colors), which renders in any true-color terminal. Kitty's graphics
-  protocol is a later rung for kitty/ghostty; sixel is not planned.
-- **Detection is in-band, never environment.** Over `ssh -t zorak
+- **Symbolic on the wire, raster at the edge.** The kernel would ship SVG,
+  ABC, or a CAS hash — never pixels it rendered itself. The TUI would
+  rasterize with resvg + tiny-skia (already workspace dependencies through
+  the app) at a pixel size derived from the terminal's cell size, so the
+  receiver renders the symbolic form at its own resolution — the same
+  doctrine as tempo-not-pulses (`docs/midi.md`, "The one timebase").
+- **Protocol ladder.** v1 would emit the iTerm2 inline-image protocol (OSC
+  1337 `File=`, base64 PNG); wezterm and iTerm2 both speak it, which covers
+  both seats in use today. The fallback would be unicode half-blocks (`▀`
+  with fg/bg colors), which renders in any true-color terminal. Kitty's
+  graphics protocol is a later rung for kitty/ghostty; sixel is not planned.
+- **Detection would be in-band, never environment.** Over `ssh -t zorak
   kaijutsu-tui` the process runs on zorak and `TERM_PROGRAM` does not
-  propagate. Cell pixel size comes from `TIOCGWINSZ` (ssh forwards the pixel
-  fields in pty-req and window-change), with a `CSI 16 t` query as the
-  fallback; protocol support is probed with terminal queries at startup. When
-  no protocol answers, half-blocks render.
-- **An image redraws like any other block.** The transcript is rebuilt every
-  frame from the mirror ("The owned screen"), so an image is emitted sized
-  in cell units wherever the block sits in that frame's window — no
-  write-once reservation, and a late edit or a resize redraws it exactly as
-  it would redraw text. There are no streaming images — a still-streaming
-  block renders as text until it completes.
-- **The presentation crate stays pure text.** Rasterization and protocol
-  emission live in the ratatui edge, beside the transcript printer. The
-  `ratatui-image` crate covers detection and encoding for every rung and is
-  worth an evaluation pass for those parts; emission stays in our printer
-  either way, because the printer owns the terminal writes.
+  propagate. Cell pixel size would come from `TIOCGWINSZ` (ssh forwards the
+  pixel fields in pty-req and window-change), with a `CSI 16 t` query as the
+  fallback; protocol support would be probed with terminal queries at
+  startup. When no protocol answers, half-blocks would render.
+- **An image would redraw like any other block.** The transcript is rebuilt
+  every frame from the mirror ("The owned screen"), so an image would be
+  emitted sized in cell units wherever the block sits in that frame's window
+  — no write-once reservation, and a late edit or a resize would redraw it
+  exactly as it would redraw text. There would be no streaming images — a
+  still-streaming block would render as text until it completes.
+- **The presentation crate would stay pure text.** Rasterization and
+  protocol emission would live in the ratatui edge, beside the transcript
+  printer. The `ratatui-image` crate covers detection and encoding for every
+  rung and is worth an evaluation pass for those parts; emission would stay
+  in our printer either way, because the printer owns the terminal writes.
 
 `Abc` blocks reach the staff through the same rasterizer, and need no new
 emitter: `engrave::engrave_to_svg` (`engrave/svg.rs`) already renders a tune

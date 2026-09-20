@@ -159,10 +159,12 @@ when that doc exists.
 - **VR wave verdict** (wave 3): declined for now — the hands metaphor in
   particular (see Presence). What survived the wave, now specified in
   prose: the patch bay's dive-scene UI grammar (open-center table,
-  breadcrumb ribbon, detail panel, inspection card at the wire — see
-  `patchbay.md`, minus the hand); LOD-as-interaction (a touched platform
-  blooming to full detail while the rest stays cheap — see `vfs.md`); and
-  the console-room scale finding, kept for a future VR return.
+  breadcrumb ribbon, detail panel, inspection card at the wire, minus the
+  hand); LOD-as-interaction (a touched platform blooming to full detail
+  while the rest stays cheap); and the console-room scale finding, kept for
+  a future VR return. The patch bay and VFS-library design docs that
+  specified these are retired along with their stations (Station inventory,
+  above); git history at commit `6edee46b` keeps them.
 
 ## Concepting process
 

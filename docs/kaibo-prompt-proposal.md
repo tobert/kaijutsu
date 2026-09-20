@@ -29,7 +29,7 @@ tool schemas, and actual messages also matter.
 | Local Kaibo source | `1063d74f83a47d22eb1d27791c85f427c8f8d11b` | Prompt composition, wrappers, loop recovery, shell description |
 | Installed CLI | `kaibo 0.4.0` | Available commands; not a claim about the running MCP build |
 | Running MCP prompt resource | Captured 2026-09-10; built-in framing reported | Exact rendered role text; server build revision not established |
-| [Explorer PR #183][pr183] | Head `078f9410ddda793213cbb730f419634f5176302b`, open when inspected | Proposed reader distinction and its wiring/tests |
+| [Explorer PR #183][pr183] | Head `078f9410ddda793213cbb730f419634f5176302b`, open when inspected; merged since as `98188b6` | Proposed reader distinction and its wiring/tests |
 | Kaijutsu drafts | `3deb6601`; [original text](https://github.com/tobert/kaijutsu/blob/3deb6601/docs/prompt-proposals.md) | Proposed base, coder, general purpose, briefing, and continuation contracts |
 | Kaijutsu source for review examples | `04538700b801dc3471cd5c2dec07ff8b5087e4fe` | Local source checks described below; no runtime test |
 

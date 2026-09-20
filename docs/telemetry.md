@@ -96,7 +96,6 @@ per model turn, without adding a character lookup to every tool call.
 | MCP tools | `mcp.{tool}` | `mcp.block_read` | 10% (default) |
 | LLM | Auto-named with `llm.*` fields | `prompt{llm.model, llm.provider}` | 100% |
 | Turn outcome | `turn.{op}`, `turn.*` fields | `turn.events_push{turn.stop_reason}` | 100% |
-| Document sync | `sync.{op}` | `sync.push_ops` | 1% |
 
 ### Server RPC
 
@@ -109,7 +108,7 @@ Sync methods use `span.entered()` guards.
 | Execution | `execute`, `shell_execute`, `prompt` |
 | Context | `create_context`, `join_context`, `list_contexts`, `get_context_id` |
 | Fork/Thread | `fork`, `thread`, `cherry_pick_block` |
-| Document / history | `push_ops`, `get_context_history`, `compact_context` |
+| Document / history | `get_context_history`, `compact_context` |
 | Drift | `drift_queue`, `drift_cancel` (push/pull/merge/flush moved into `kj` dispatch, `kaijutsu-kernel/src/kj/drift.rs`) |
 | MCP | `register_mcp`, `unregister_mcp`, `list_mcp_servers`, `list_mcp_resources`, `read_mcp_resource` |
 | LLM config | `configure_llm`, `get_llm_config`, `set_default_provider`, `set_default_model` |
@@ -123,7 +122,7 @@ Sync methods use `span.entered()` guards.
 | Subscriptions | `subscribe_blocks`, `subscribe_mcp_resources`, `subscribe_mcp_elicitations`, `subscribe_editor`, `subscribe_turn_events` |
 | Other | `set_attribution`, `get_command_history` |
 
-**Not instrumented:** VFS filesystem methods (~15 in `impl vfs::Server`) — high volume, low debugging value. Trivial stubs (`whoami`, `get_info`, `interrupt`, `complete`, `detach`).
+**Not instrumented:** VFS filesystem methods (~15 in `impl vfs::Server`) — high volume, low debugging value. `whoami` (trivial stub).
 
 ### Client RPC (46 methods)
 
@@ -216,7 +215,6 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 | `drift.*` | 100% | Cross-context operations |
 | `turn.*` | 100% | One span per turn ending — as rare as turns, and the whole story of how one ended |
 | `rpc.*` | 10% | High volume |
-| `sync.*` | 1% | Very high volume document-sync ops |
 | Errors | 100% | Always captured |
 | Other | 10% | Default |
 

@@ -108,9 +108,13 @@ summarized overview with dive-in.)*
 
 ### Engine mapping (Bevy 0.18)
 
-LOD tiers map 1:1 to instancing tiers (**still aspirational, not built** — the
-well today renders every context as a full `Mesh3d` card regardless of band;
-see the LOD/horizon gap in `docs/timewell.md` Stage 5):
+LOD tiers map 1:1 to instancing tiers (**still aspirational as an engine
+mechanism** — seated cards render as full `Mesh3d` entities with no per-band
+LOD step. The LOD/horizon *question* itself is resolved, not open:
+`docs/timewell.md`, Stage 5 says the ring collapse dissolved LOD between
+mouth and horizon — with at most twenty seated cards there is no mid-river
+left to chip down, and past the cutoff a context gets no card entity at all,
+only a count on the horizon's floor disc):
 
 | Tier | Representation | Bevy mechanism |
 |------|----------------|----------------|

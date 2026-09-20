@@ -216,6 +216,8 @@ fix wants building; see `issues.md`.
 
 ### Slice 1 — the recall block. Zero Rust.
 
+**Shipped** as `assets/defaults/rc/coder/create/S15-recall.kai`.
+
 Both memory trees are **already reachable from inside the running kernel**
 through the existing catch-all `LocalBackend::read_only("/")` mount
 (`kaijutsu-server/src/rpc.rs:1649`) — verified live on zorak. Reads on
@@ -380,8 +382,9 @@ wrong cost:
 - Search is RPC-only (`kaijutsu.capnp:1547`) — unreachable from `kj`, rc, or
   MCP. Slice 2 has to expose it regardless.
 
-**`context_type=assistant` as a resident seat.** Mechanically one rc
-namespace plus seeds, zero schema; ticks ride `VERB_TICK` on the beat
+**Giving `context_type=assistant` memory duties.** The seat itself already
+exists: `assets/defaults/rc/assistant/` ships `create` and `tick` scripts.
+What is open is putting memory work on it. Ticks ride `VERB_TICK` on the beat
 scheduler. Quiet-hours-at-tick is a legitimate *mechanism* — unlike the
 create-time probe — because the tick's own action is the thing being gated.
 Costs to carry: a fresh single-use kaish shell materializes **per tick**, and

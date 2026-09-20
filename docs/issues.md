@@ -1345,14 +1345,12 @@ true:
 The seat-digit disagreement between the picker and the status line, and
 the ask-card/ledger follow-ups, are their own entries below.
 
-## Telemetry span inventory needs a refresh (2026-09-12)
+## Telemetry method inventory has not had a full audit
 
-The character identity section in `docs/telemetry.md` describes current
-execution attribution, but the older method inventory still lists removed
-wire methods such as `push_ops` and claims no trace instrumentation for
-`get_info` and `interrupt`, which now extract RPC traces. Audit that inventory
-against the current schema and span callsites before using its counts or
-method lists to plan observability work.
+`docs/telemetry.md` no longer lists `push_ops` or the `sync.*` span and
+sampling rows, and `get_info`, `interrupt` and `complete` are no longer called
+uninstrumented. The rest of the method inventory and its counts have not been
+compared with `kaijutsu.capnp` and the `extract_rpc_trace` call sites.
 
 ## App draft edits need an ordered submission contract (2026-09-12)
 

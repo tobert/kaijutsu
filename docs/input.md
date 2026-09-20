@@ -3,9 +3,8 @@
 *Seeded 2026-07-16 from a full survey of the live code; the unification
 slices SHIPPED the same day and were verified in the running app (contexts,
 grabs, prefix chords, scene actions, clipboard paste). The keymap below is
-the as-built truth, modulo the items marked **deferred**. "The mess we
-started from" is kept as the record of why the architecture looks like
-this.*
+the as-built truth. "The mess we started from" is kept as the record of why
+the architecture looks like this.*
 
 ## The mess we started from: two regimes (historical, fixed same day)
 
