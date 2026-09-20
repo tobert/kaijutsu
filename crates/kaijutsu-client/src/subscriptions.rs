@@ -325,6 +325,21 @@ pub(crate) struct BlockEventsForwarder {
     /// is most of them — and an empty slot REFUSES loudly rather than
     /// pretending the device was silent.
     pub midi_exchange: std::sync::Arc<crate::midi_exchange::MidiExchangeSlot>,
+    /// Set once [`Self::forward`] first sees `event_tx` with no receivers.
+    /// Latched, not resampled: every push on this forwarder shares the one
+    /// `event_tx`, so "no receivers" is a single closed/open state for the
+    /// whole forwarder, not per event kind. Re-warning per event bought a
+    /// reader nothing — the 2026-09-18 benchmark saw ~15 identical "Event
+    /// channel closed, dropping BlockInserted event" lines in one ACP run,
+    /// one per trailing push after the subscriber had already gone away.
+    /// A fresh forwarder — built on every reconnect and every
+    /// `resubscribe_blocks` re-scope — gets a fresh, unlatched flag, so an
+    /// earlier closure never silences a later, healthy subscription.
+    pub closed: std::sync::atomic::AtomicBool,
+    /// Events this forwarder has dropped since `closed` latched. Counted
+    /// whether or not the warning fired, so the total in that one warning
+    /// stays honest even under concurrent pushes.
+    pub dropped_since_closed: std::sync::atomic::AtomicU64,
 }
 
 /// Build a `BlockEvents` callback client plus the receiver its pushes land
@@ -350,6 +365,8 @@ pub fn block_events_channel(
             midi_exchange,
             last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
             last_timing_seq: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            dropped_since_closed: std::sync::atomic::AtomicU64::new(0),
         },
     );
     (client, rx)
@@ -898,6 +915,37 @@ impl BlockEventsForwarder {
             );
         }
     }
+
+    /// Forward `event` on the shared channel, or note that it was dropped.
+    /// `kind` names the event for the one warning this can fire (`event`'s
+    /// own `Debug` is not used — it can carry a full `BlockSnapshot`, too
+    /// much for a log line).
+    ///
+    /// The first send that finds no receivers latches `closed` and warns,
+    /// naming how many pushes this forwarder has dropped so far. Every push
+    /// after that skips the send entirely — `closed` already answers the
+    /// question — and only increments the counter, so the fact reaches a
+    /// reader once instead of once per event. See `closed`'s doc comment for
+    /// why a forwarder-scoped latch is safe: a fresh forwarder replaces this
+    /// one on every reconnect and re-scope.
+    fn forward(&self, event: ServerEvent, kind: &str) {
+        use std::sync::atomic::Ordering;
+        if self.closed.load(Ordering::Relaxed) {
+            self.dropped_since_closed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.event_tx.send(event).is_err() {
+            self.closed.store(true, Ordering::Relaxed);
+            let dropped = self.dropped_since_closed.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                kind,
+                dropped,
+                "Event channel closed — no receivers; dropping this and every \
+                 further block event on this subscription (further drops are \
+                 counted, not logged one by one)"
+            );
+        }
+    }
 }
 
 #[allow(refining_impl_trait)]
@@ -930,9 +978,7 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let event = ServerEvent::BlockInserted { context_id, block };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockInserted event");
-        }
+        self.forward(event, "BlockInserted");
         Promise::ok(())
     }
 
@@ -967,9 +1013,7 @@ impl block_events::Server for BlockEventsForwarder {
             context_id,
             block_id,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockDeleted event");
-        }
+        self.forward(event, "BlockDeleted");
         Promise::ok(())
     }
 
@@ -1005,9 +1049,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             collapsed: params.get_collapsed(),
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockCollapsedChanged event");
-        }
+        self.forward(event, "BlockCollapsedChanged");
         Promise::ok(())
     }
 
@@ -1043,9 +1085,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             excluded: params.get_excluded(),
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockExcludedChanged event");
-        }
+        self.forward(event, "BlockExcludedChanged");
         Promise::ok(())
     }
 
@@ -1086,9 +1126,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             metadata,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockMetadataChanged event");
-        }
+        self.forward(event, "BlockMetadataChanged");
         Promise::ok(())
     }
 
@@ -1136,9 +1174,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             after_id,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockMoved event");
-        }
+        self.forward(event, "BlockMoved");
         Promise::ok(())
     }
 
@@ -1179,9 +1215,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             status,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockStatusChanged event");
-        }
+        self.forward(event, "BlockStatusChanged");
         Promise::ok(())
     }
 
@@ -1224,9 +1258,7 @@ impl block_events::Server for BlockEventsForwarder {
             block_id,
             output,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BlockOutputChanged event");
-        }
+        self.forward(event, "BlockOutputChanged");
         Promise::ok(())
     }
 
@@ -1261,9 +1293,7 @@ impl block_events::Server for BlockEventsForwarder {
         }
 
         let event = ServerEvent::ContextSwitched { context_id };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping ContextSwitched event");
-        }
+        self.forward(event, "ContextSwitched");
         Promise::ok(())
     }
 
@@ -1296,9 +1326,7 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let event = ServerEvent::RenderCue { context_id, cue };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping RenderCue event");
-        }
+        self.forward(event, "RenderCue");
         Promise::ok(())
     }
 
@@ -1332,9 +1360,7 @@ impl block_events::Server for BlockEventsForwarder {
         };
 
         let event = ServerEvent::BeatSync { context_id, beat_ref };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping BeatSync event");
-        }
+        self.forward(event, "BeatSync");
         Promise::ok(())
     }
 
@@ -1451,9 +1477,7 @@ impl block_events::Server for BlockEventsForwarder {
             delivered,
             capacity,
         };
-        if self.event_tx.send(event).is_err() {
-            tracing::warn!("Event channel closed, dropping SubscriptionTerminated event");
-        }
+        self.forward(event, "SubscriptionTerminated");
         Promise::ok(())
     }
 }
@@ -1982,6 +2006,141 @@ mod turn_events_tests {
                 rx.try_recv().is_err(),
                 "nothing may be published from a malformed push"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod block_forwarder_closed_channel_tests {
+    //! Pins `BlockEventsForwarder::forward`'s latch: a closed `event_tx`
+    //! (no receivers) must warn once and stop attempting further sends,
+    //! not warn — and try to send — once per callback. Before this fix,
+    //! every `on_block_*` callback independently logged "Event channel
+    //! closed, dropping <Kind> event" on a failed send, which is what let
+    //! ~15 identical lines through in one ACP run (2026-09-18 benchmark
+    //! notes): the run's receiver had already been dropped, and several
+    //! more block-events callbacks still arrived afterward.
+    //!
+    //! There is no log-capture harness in this crate (grep confirms no
+    //! `tracing-test`/`tracing_subscriber::fmt::TestWriter` dependency), so
+    //! this asserts the OBSERVABLE STATE the fix introduces — `closed`
+    //! latches after exactly the first drop, and `dropped_since_closed`
+    //! still counts every one of the follow-on pushes — rather than
+    //! inventing a logging harness. The warning text itself
+    //! ("Event channel closed — no receivers; dropping...") is verified by
+    //! reading `BlockEventsForwarder::forward`, not by a test assertion.
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    fn run_local<F: std::future::Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, f);
+    }
+
+    /// Build a forwarder whose `event_tx` already has zero receivers, and
+    /// keep an `Rc` to it (via `new_client_from_rc`) so the test can inspect
+    /// `closed`/`dropped_since_closed` after driving it through the real
+    /// capnp callback path — the same path the kernel drives over the wire.
+    fn closed_forwarder() -> (std::rc::Rc<BlockEventsForwarder>, block_events::Client) {
+        let (tx, rx) = broadcast::channel::<ServerEvent>(16);
+        drop(rx); // no receivers, from the start — the condition under test
+        let fwd = std::rc::Rc::new(BlockEventsForwarder {
+            event_tx: tx,
+            midi_exchange: crate::MidiExchangeSlot::new(),
+            last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
+            last_timing_seq: std::sync::atomic::AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            dropped_since_closed: AtomicU64::new(0),
+        });
+        let client: block_events::Client = capnp_rpc::new_client_from_rc(fwd.clone());
+        (fwd, client)
+    }
+
+    /// Five pushes into an already-receiver-less channel must latch `closed`
+    /// on the first one and count all five in `dropped_since_closed` — not
+    /// leave `closed` per-event-recomputed (which is indistinguishable from
+    /// today's bug: warn-and-try-send on every single push).
+    #[test]
+    fn closed_channel_latches_once_and_counts_every_drop() {
+        run_local(async {
+            let (fwd, client) = closed_forwarder();
+            let context = ContextId::new();
+
+            assert!(!fwd.closed.load(Ordering::Relaxed), "must start open");
+
+            for seq in 1..=5u64 {
+                let mut request = client.on_block_deleted_request();
+                {
+                    let mut params = request.get();
+                    params.set_sub_seq(seq);
+                    params.set_context_id(context.as_bytes());
+                    let mut id = params.reborrow().init_block_id();
+                    id.set_context_id(context.as_bytes());
+                    id.set_principal_id(kaijutsu_types::PrincipalId::new().as_bytes());
+                    id.set_seq(seq);
+                }
+                // The callback itself always succeeds — dropping the event
+                // downstream is not a wire failure, it is a local delivery
+                // fact this forwarder records rather than surfaces as an RPC
+                // error.
+                request
+                    .send()
+                    .promise
+                    .await
+                    .expect("callback delivered even with no local receivers");
+            }
+
+            assert!(
+                fwd.closed.load(Ordering::Relaxed),
+                "the first drop must latch closed"
+            );
+            assert_eq!(
+                fwd.dropped_since_closed.load(Ordering::Relaxed),
+                5,
+                "every one of the 5 pushes after closure must be counted, \
+                 not just the first one that triggered the (single) warning"
+            );
+        });
+    }
+
+    /// A forwarder that never loses its receiver never latches and never
+    /// counts a drop — the happy path must be untouched by the new
+    /// bookkeeping.
+    #[test]
+    fn open_channel_never_latches() {
+        run_local(async {
+            let (tx, mut rx) = broadcast::channel::<ServerEvent>(16);
+            let fwd = std::rc::Rc::new(BlockEventsForwarder {
+                event_tx: tx,
+                midi_exchange: crate::MidiExchangeSlot::new(),
+                last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
+                last_timing_seq: std::sync::atomic::AtomicU64::new(0),
+                closed: AtomicBool::new(false),
+                dropped_since_closed: AtomicU64::new(0),
+            });
+            let client: block_events::Client = capnp_rpc::new_client_from_rc(fwd.clone());
+            let context = ContextId::new();
+
+            let mut request = client.on_block_deleted_request();
+            {
+                let mut params = request.get();
+                params.set_sub_seq(1);
+                params.set_context_id(context.as_bytes());
+                let mut id = params.reborrow().init_block_id();
+                id.set_context_id(context.as_bytes());
+                id.set_principal_id(kaijutsu_types::PrincipalId::new().as_bytes());
+                id.set_seq(1);
+            }
+            request.send().promise.await.expect("callback delivered");
+
+            assert!(matches!(rx.try_recv(), Ok(ServerEvent::BlockDeleted { .. })));
+            assert!(!fwd.closed.load(Ordering::Relaxed));
+            assert_eq!(fwd.dropped_since_closed.load(Ordering::Relaxed), 0);
         });
     }
 }

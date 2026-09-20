@@ -69,6 +69,29 @@ fn json_result(value: serde_json::Value) -> KernelToolResult {
     KernelToolResult { is_error: false, content: vec![ToolContent::Json(value.clone())], structured: Some(value) }
 }
 
+/// `registry.get(id, context)` found nothing — but that collapses two very
+/// different situations onto one message: an id nobody ever created (a
+/// hallucinated or mistyped one), and an id that IS a real operation, just
+/// not in the caller's context. `shell_operations` rows are never deleted
+/// (no `DELETE FROM shell_operations` exists anywhere in this crate — a
+/// receipt is durable for as long as its kernel.db is), so a once-valid id
+/// cannot silently decay into "not found"; the only way this branch is
+/// reached for a real id is that it belongs to a different context. A
+/// second, context-agnostic lookup (`operation_for_retention`, already used
+/// by the retention path) tells the two apart for free.
+fn no_such_operation_message(registry: &crate::shell_operations::ShellOperationRegistry, id: &str) -> String {
+    match registry.operation_for_retention(id) {
+        Ok(_) => format!(
+            "shell operation {id} exists, but not in this context — an id from \
+             list_shell_operations only stays valid in the context it came from"
+        ),
+        Err(_) => format!(
+            "no shell operation {id} was ever created — check it came from a real \
+             list_shell_operations or shell submission in this context"
+        ),
+    }
+}
+
 fn page(text: &str, offset: usize) -> (&str, usize) {
     let mut start = offset.min(text.len());
     while !text.is_char_boundary(start) { start -= 1; }
@@ -114,7 +137,7 @@ impl McpServerLike for ShellOperationsServer {
             Self::TOOL_READ => {
                 let p: ReadOperationParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let entry = registry.get(&p.id, ctx.context_id).map_err(McpError::Protocol)?
-                    .ok_or_else(|| McpError::Protocol(format!("no shell operation {} in this context", p.id)))?;
+                    .ok_or_else(|| McpError::Protocol(no_such_operation_message(registry, &p.id)))?;
                 let block = dispatcher.block_store().get_block_snapshot(ctx.context_id, &entry.receipt.output_block_id)
                     .map_err(|e| McpError::Protocol(e.to_string()))?
                     .ok_or_else(|| McpError::Protocol("shell operation output block is missing".into()))?;
@@ -167,5 +190,105 @@ mod tests {
         assert_eq!(restored, input);
         assert_eq!(page("界x", 1), ("界x", 4));
         assert_eq!(page("界x", usize::MAX), ("", 4));
+    }
+
+    use crate::kj::test_helpers::{register_context, test_dispatcher_persistent};
+    use crate::mcp::CallContext;
+    use crate::mcp::InstancePolicy;
+    use kaijutsu_types::{PrincipalId, SessionId};
+    use std::sync::Arc;
+
+    /// A fresh broker with `ShellOperationsServer` registered, backed by a
+    /// real (temporary-db) dispatcher — the same shape `shell.rs`'s tests use
+    /// for its `ShellServer`. `read_shell_operation` and `list_shell_operations`
+    /// carry no facade requirement, so — unlike `shell.rs`'s tests — no
+    /// `set_binding` call is needed: an unbound context is permissive on a
+    /// bare broker that never touches `engage_unbound_deny` (see
+    /// `Broker::call_tool_inner`'s comment on that gate).
+    async fn wired() -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>) {
+        let d = Arc::new(test_dispatcher_persistent().await);
+        d.set_self_arc();
+        let broker = Arc::new(Broker::new());
+        broker.set_kj_dispatcher(&d).await;
+        broker
+            .register(
+                Arc::new(ShellOperationsServer::new(Arc::downgrade(&broker))),
+                InstancePolicy::default(),
+            )
+            .await
+            .unwrap();
+        (broker, d)
+    }
+
+    fn read_call(id: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellOperationsServer::INSTANCE),
+            tool: ShellOperationsServer::TOOL_READ.to_string(),
+            arguments: serde_json::json!({"id": id}),
+        }
+    }
+
+    /// `read_shell_operation` on an id nobody ever created, versus a real id
+    /// read from the wrong context, must produce DIFFERENT error text. Before
+    /// this fix both collapsed onto the identical "no shell operation <id> in
+    /// this context" message (2026-09-18 benchmark notes: two such failures
+    /// in one ACP run — the model recovered, but blind to which kind of
+    /// failure it had hit).
+    ///
+    /// This pins cross-context reuse, not "reaped after being valid": reading
+    /// `shell_operations.rs` (the registry) shows no `DELETE FROM
+    /// shell_operations` anywhere in the crate, so a once-valid id cannot
+    /// decay into "not found" the way the benchmark note guessed — the row is
+    /// durable for as long as its kernel.db. The one real, present-day cause
+    /// of the ambiguous message besides a truly invented id is a real id
+    /// from a *different* context, which is what this test drives.
+    #[tokio::test]
+    async fn unknown_id_and_cross_context_id_produce_different_errors() {
+        let (broker, d) = wired().await;
+        let kernel = d.kernel();
+        let principal = PrincipalId::new();
+        let context_a = register_context(&d, Some("shell-ops-a"), None, principal);
+        let context_b = register_context(&d, Some("shell-ops-b"), None, principal);
+        kernel.kernel_db().lock().update_context_review(context_a, Some(principal), Some(PrincipalId::new())).unwrap();
+        kernel.blocks().create_document(context_a, crate::DocumentKind::Conversation, None).unwrap();
+
+        let call_a = CallContext::new(principal, context_a, SessionId::new(), d.kernel_id());
+        let receipt = crate::runtime::tool_command::create_operation(kernel, &call_a, "echo real", None)
+            .expect("a real operation must be creatable in context A");
+
+        let call_b = CallContext::new(principal, context_b, SessionId::new(), d.kernel_id());
+
+        let never_created = uuid::Uuid::now_v7().to_string();
+        let never_created_err = broker
+            .call_tool(read_call(&never_created), &call_b, CancellationToken::new())
+            .await
+            .expect_err("an id nobody ever created must fail");
+        let cross_context_err = broker
+            .call_tool(read_call(&receipt.operation_id), &call_b, CancellationToken::new())
+            .await
+            .expect_err("reading context A's operation from context B must fail");
+
+        let never_created_msg = never_created_err.to_string();
+        let cross_context_msg = cross_context_err.to_string();
+        assert_ne!(
+            never_created_msg, cross_context_msg,
+            "an invented id and a real-id-wrong-context must not collapse onto \
+             the same message"
+        );
+        assert!(
+            !never_created_msg.contains("exists"),
+            "an id nobody created must not be told it exists somewhere: {never_created_msg}"
+        );
+        assert!(
+            cross_context_msg.contains("exists"),
+            "a real id read from the wrong context should say it exists elsewhere: {cross_context_msg}"
+        );
+
+        // The happy path is untouched: the SAME id, read from ITS OWN
+        // context, still succeeds.
+        broker
+            .call_tool(read_call(&receipt.operation_id), &call_a, CancellationToken::new())
+            .await
+            .expect("reading the operation from its own context must still succeed");
     }
 }

@@ -3249,6 +3249,8 @@ fn block_events_client_and_filter(
         midi_exchange,
         last_ordered_seq: std::sync::atomic::AtomicU64::new(0),
         last_timing_seq: std::sync::atomic::AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        dropped_since_closed: std::sync::atomic::AtomicU64::new(0),
     };
     let block_client: crate::kaijutsu_capnp::block_events::Client =
         capnp_rpc::new_client(block_fwd);
