@@ -94,7 +94,7 @@
     #[tokio::test]
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt() {
         use crate::vfs::VfsOps;
-        for context_type in ["default", "coder", "director", "mcp", "toolie", "musician", "bassist"] {
+        for context_type in ["default", "coder", "director", "mcp", "toolie", "musician"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let prefix = format!("/config/rc/{context_type}/create/");
@@ -132,6 +132,24 @@
             assert_eq!(prompt.message().contains(base), ["default", "coder", "director"].contains(&context_type),
                 "{context_type}: optional base composition changed");
         }
+    }
+
+    /// `bassist` merged into `musician` (docs/chameleon.md, "Players — a
+    /// context_type is an rc bundle"): the seed ships no `bassist` path at
+    /// all, and `musician`'s `create` bundle carries the folded chair voice.
+    #[test]
+    fn bassist_retired_musician_carries_the_folded_chair() {
+        let seeds = crate::seed_scripts::seed_files();
+        assert!(
+            seeds.iter().all(|(path, _)| !path.starts_with("/config/rc/bassist/")),
+            "bassist must ship no seed after the merge into musician"
+        );
+        let chair = crate::seed_scripts::seed_body("/config/rc/musician/create/S05-chair.md")
+            .expect("musician must carry the folded chair voice");
+        assert!(
+            chair.contains("low register"),
+            "the chair's register guidance must survive the fold: {chair}"
+        );
     }
 
     #[tokio::test]

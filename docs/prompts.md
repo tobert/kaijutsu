@@ -23,7 +23,7 @@ Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 ```
 
 The shared base is optional. Coder, default and director include it through
-ordinary relative symlinks. Musician, bassist, assistant, mcp, and toolie keep
+ordinary relative symlinks. Musician, assistant, mcp, and toolie keep
 their own role contracts. Director is the operator's seat: its stance names
 the character recorded in `played_by` (below) and `S06-kj-help.kai`
 composes `kj help` plus a selected set of eighteen top-level verb help pages

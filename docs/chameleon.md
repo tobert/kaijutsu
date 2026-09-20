@@ -53,7 +53,7 @@ when its rc attaches it: `kj transport attach` (no flags) targets the current
 context, derives the track from its label, and arms **stopped** + OODA-armed
 (no surprise token spend — `play` starts the clock). This used to be a kernel
 special-case on `context_type == "musician"`; now it is rc, so any role — a
-bassist, a lyricist in time with the music, a probe — is a beat participant
+chorus, a lyricist in time with the music, a probe — is a beat participant
 exactly when its `create/` rc attaches it. No kernel edit.
 
 ## Tempo — the clock story
@@ -126,17 +126,14 @@ A player's whole behavior is rc (`assets/defaults/rc/musician/`):
   natively by the time-well. Producer rc edits are horizon-latched: they land
   at the player's next page-turn, never mid-phrase.
 
-Chairs are deeper bundles: `bassist` adds create/S05-chair.md — the voice
-(register, groove, note choices), injected into the system prompt. `bassist`
-was the prototype chair; Amy decided 2026-09-20 that it merges into
-`musician`, folding the chair script in and retiring `bassist` as a separate
-context type. The merge has not happened yet — see `docs/issues.md`, "Merge
-`bassist` into `musician` (Amy, 2026-09-20)". The chair
-names the *role*; who sits in it (which model) is a runtime choice. The
+`musician`'s create bundle carries a chair: `create/S05-chair.md` is the
+voice (register, groove, note choices), injected into the system prompt. The
+chair names the *role*; who sits in it (which model) is a runtime choice. The
 original casting — a small local model on bass, Haiku drums, Sonnet keys, Opus
-booth, Fable vocals — is the design's first voice, not today's roster. ABC-only
-output (no tool calls) is the ideal player UX: the symbolic decisions made the
-player role exactly the shape small models are good at.
+booth, Fable vocals — is the design's first voice, not today's roster, which
+seeds one voice: bass. ABC-only output (no tool calls) is the ideal player
+UX: the symbolic decisions made the player role exactly the shape small
+models are good at.
 
 ## The score & the sound
 
@@ -219,10 +216,8 @@ players whose work is not quantized.
 
 ## Starting a jam
 
-1. Create the track and player: `kj context create --type bassist --name
-   <track>` (the create rc attaches it to the track, stopped). `bassist` is
-   slated to merge into `musician` (see the note above); this example still
-   names `bassist` because the merge has not shipped.
+1. Create the track and player: `kj context create --type musician --name
+   <track>` (the create rc attaches it to the track, stopped).
 2. Set the tempo: read it off the gear (or a rack's clock module) →
    `kj transport tempo --track <track> <bpm>`; verify with `kj audio beats`
    on a short recording if unsure. Upgrade to `kj transport clock --track

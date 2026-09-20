@@ -1492,7 +1492,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        // A fresh, unshipped context_type — `bassist`/`coder`/etc. all ship
+        // A fresh, unshipped context_type — `coder`/`musician`/etc. all ship
         // real seeded files under `create/` that would collide with this
         // test's "user-authored, no seed" setup.
         let target = "/config/rc/tmpuser/create/S05-chair.md";
