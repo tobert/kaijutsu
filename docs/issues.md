@@ -1931,9 +1931,9 @@ every descendant forever).
 construction, never swept by age; no such column exists yet), so there is
 still no `--detached` flag on `kj context create` and no enforcement of
 "anchors stay unused." Recommendation stands: build slice 2 (the anchor
-bit) before slice 3 (enforcement ruling) or slice 4 (`kj root` verbs).
-Slice 1's guardrail (`context move` non-atomicity) is still open — same
-bug as the entry below.
+bit) before slice 3 (enforcement) or slice 4 (`kj root` verbs). Slice 1's
+guardrail is in: `context_move` is one transaction, so a refused move no
+longer orphans the context.
 
 ---
 
@@ -2352,6 +2352,26 @@ the struct, its `Default`, its registration and its re-export, and correct
 is what `invalid_live_tool_pairing_fails_once_without_retry` already uses. An
 error-injection builder on `MockClient` would let that test's shape cover the
 permanent and transient cases, and would prove the attempt count.
+
+## OpenAI's 402 becomes a retried `ApiError` (2026-09-20)
+
+`llm/openai/mod.rs:255` maps HTTP 402 to `LlmError::ApiError("insufficient
+balance: ...")`, and `retry_disposition` (`runtime/llm_stream.rs`) classifies
+every `ApiError` as transient, so an exhausted balance spends the full backoff
+reproducing itself. Claude routes the same status through `400..=499 =>
+InvalidRequest` (`llm/claude/mod.rs:331`), so the two providers disagree. The
+catch-all `_` arm in both also lands a non-4xx/5xx status on `ApiError`, and a
+JSON-parse failure of a successful response does too
+(`openai/mod.rs:192`, `claude/mod.rs:246`). Decide whether 402 is a permanent
+variant or whether `ApiError` needs splitting, and make both providers agree.
+Found by kaibo reviewing the retry-classification commit.
+
+## A Claude provider comment promises an error it panics instead (2026-09-20)
+
+`llm/claude/mod.rs:85-89` says a reqwest client-builder failure surfaces as
+`LlmError::Unavailable`; the code `.expect()`s and panics
+(`claude/mod.rs:108-109`). Either return the error or say that a builder
+failure is unrecoverable at construction. Found by kaibo.
 
 ## Testing & Tooling
 

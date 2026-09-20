@@ -1485,7 +1485,7 @@ impl Broker {
         // indistinguishable `FacadeDenied` instead of a storage fault. This
         // also warms the in-memory binding cache `binding()` reads next
         // (same pattern as `dispatch_tool_via_broker_with_cancel` in
-        // `kernel.rs`, the third enforcement point).
+        // `kernel.rs`).
         self.binding_checked(context_id).await?;
         let binding = self.binding(context_id).await.unwrap_or_default();
         if !binding.allows(&super::binding::Capability::Facade(facade.to_string())) {
@@ -1671,7 +1671,8 @@ impl Broker {
         // `None` arm below and read as an ordinary unbound context. This
         // also warms the in-memory binding cache `self.binding()` reads
         // next (same pattern as `dispatch_tool_via_broker_with_cancel` in
-        // `kernel.rs`, the third enforcement point).
+        // `kernel.rs`). A context with no binding row is not cached, so an
+        // unbound context costs two reads, not one.
         self.binding_checked(&ctx.context_id).await?;
         let allowed = match self.binding(&ctx.context_id).await {
             Some(binding) => binding.allows_tool(&params.instance, &params.tool),
@@ -10988,7 +10989,6 @@ mod tests {
         (broker, ctx)
     }
 
-    /// Enforcement point 1 of 3 (see the module docs on `binding_checked`):
     /// `check_facade` must surface a real binding-fetch DB failure as
     /// `BindingUnavailable`, not silently collapse it to the ordinary
     /// `FacadeDenied` a legitimately-empty binding would produce.
@@ -11009,9 +11009,9 @@ mod tests {
         }
     }
 
-    /// Enforcement point 2 of 3: `call_tool` (via `call_tool_inner`) must
-    /// surface the same DB failure as `BindingUnavailable`, not
-    /// `CapabilityDenied`. `engage_unbound_deny()` mirrors a real kernel
+    /// `call_tool` (via `call_tool_inner`) must surface the same DB failure
+    /// as `BindingUnavailable`, not `CapabilityDenied`.
+    /// `engage_unbound_deny()` mirrors a real kernel
     /// (`Kernel::new` calls it) — that is the configuration under which the
     /// swallowed error previously read as a plain capability denial instead
     /// of a storage fault.

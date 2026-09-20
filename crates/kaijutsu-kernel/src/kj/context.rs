@@ -2064,11 +2064,10 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
         };
 
-        // Delete the old structural edges and insert the new one (with
-        // cycle detection) in one transaction: a refused move (cycle
-        // detected) must not have destroyed the old edge, leaving the
-        // context orphaned (`docs/issues.md`, "`kj context move` still
-        // isn't atomic").
+        // Delete the old structural edges and insert the new one in one
+        // transaction. Cycle detection lives inside `insert_edge`, so a
+        // refused move must roll the deletes back rather than leave the
+        // context with no structural parent.
         let old_parents = match db.structural_parents(ctx_id) {
             Ok(p) => p,
             Err(e) => return KjResult::Err(format!("kj context move: {e}")),
@@ -4204,11 +4203,9 @@ mod tests {
         assert_eq!(parents[0].context_id, b);
     }
 
-    /// A move that the cycle check refuses must not have touched the old
-    /// structural edge. `docs/issues.md`, "`kj context move` still isn't
-    /// atomic": the buggy sequence deletes every existing parent edge
-    /// *then* calls `insert_edge` (where cycle detection lives), so a
-    /// refused move orphaned the context.
+    /// A move that the cycle check refuses must leave the old structural
+    /// edge in place. Deleting the existing parent edges before the insert
+    /// that can refuse them is what orphans a context.
     #[tokio::test]
     async fn context_move_refused_for_cycle_leaves_original_edge_intact() {
         let d = test_dispatcher().await;
