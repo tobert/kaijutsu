@@ -293,6 +293,13 @@ impl EditorSessions {
     /// Open an editor on a *pre-resolved* target (resolve with
     /// [`resolve_editor_target`] first — the only async step). The block's
     /// current text becomes the initial buffer and the rollback checkpoint.
+    ///
+    /// Two players on one block is a supported state (`docs/vi.md`) — this
+    /// never refuses the open on that account. It only announces: when a
+    /// session is already bound to `target`, the returned state's `message`
+    /// names how many, the same status-line channel a bad `:s` regex uses, so
+    /// the caller can go back to the existing session or shut it down instead
+    /// of editing blind to it (Amy, 2026-08-19).
     pub fn open(
         &mut self,
         path: &str,
@@ -306,7 +313,14 @@ impl EditorSessions {
         // terminator aside so dirty/rollback compare against the normalized view.
         let terminator = if raw.ends_with('\n') { "\n" } else { "" }.to_string();
         let saved_content = core.text();
-        let state = state_of(&mut core, &saved_content);
+        let mut state = state_of(&mut core, &saved_content);
+        let existing = self.sessions.values().filter(|s| s.target == target).count();
+        if existing > 0 {
+            state.message = Some(format!(
+                "already open in {existing} other session{} — edits from every session merge live",
+                if existing == 1 { "" } else { "s" }
+            ));
+        }
         let id = EditorSessionId(self.next_id);
         self.next_id += 1;
         self.sessions.insert(
@@ -358,6 +372,13 @@ impl EditorSessions {
             .map(|(id, s)| (*id, s.path.clone()))
     }
 
+    /// The terminator this session set aside at open: the block's raw text is
+    /// this session's buffer text followed by it.
+    #[cfg(test)]
+    fn terminator_for_test(&self, id: EditorSessionId) -> String {
+        self.sessions[&id].terminator.clone()
+    }
+
     /// Feed keys to a session, mirror the produced edits onto the kernel block,
     /// and report the outcome. Every caller in this crate except
     /// `Kernel::editor_keys_checked` wants the unrestricted case — this is
@@ -397,18 +418,16 @@ impl EditorSessions {
         let (close, commands) = {
             let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
             let ops = session.core.apply_keys(keys);
-            for op in &ops {
-                blocks
-                    .edit_text_as(
-                        session.target.context_id,
-                        &session.target.block_id,
-                        op.offset,
-                        &op.insert,
-                        op.delete,
-                        Some(actor),
-                    )
-                    .map_err(|e| format!("editor keys: block mirror failed: {e}"))?;
-            }
+            let buffer_after = session.core.text();
+            mirror_ops(
+                &ops,
+                &session.target,
+                &session.terminator,
+                &buffer_after,
+                blocks,
+                actor,
+                "editor keys",
+            )?;
             (session.core.take_close(), session.core.take_commands())
         };
 
@@ -678,18 +697,16 @@ impl EditorSessions {
     ) -> Result<EditorState, String> {
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let ops = session.core.insert_at(text, offset);
-        for op in &ops {
-            blocks
-                .edit_text_as(
-                    session.target.context_id,
-                    &session.target.block_id,
-                    op.offset,
-                    &op.insert,
-                    op.delete,
-                    Some(actor),
-                )
-                .map_err(|e| format!("editor :r: block mirror failed: {e}"))?;
-        }
+        let buffer_after = session.core.text();
+        mirror_ops(
+            &ops,
+            &session.target,
+            &session.terminator,
+            &buffer_after,
+            blocks,
+            actor,
+            "editor :r",
+        )?;
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
@@ -728,18 +745,16 @@ impl EditorSessions {
         }
         let session = self.sessions.get_mut(&id).ok_or_else(|| no_session(id))?;
         let ops = session.core.insert_at_cursor(text);
-        for op in &ops {
-            blocks
-                .edit_text_as(
-                    session.target.context_id,
-                    &session.target.block_id,
-                    op.offset,
-                    &op.insert,
-                    op.delete,
-                    Some(actor),
-                )
-                .map_err(|e| format!("editor insert: block mirror failed: {e}"))?;
-        }
+        let buffer_after = session.core.text();
+        mirror_ops(
+            &ops,
+            &session.target,
+            &session.terminator,
+            &buffer_after,
+            blocks,
+            actor,
+            "editor insert",
+        )?;
         let saved = session.saved_content.clone();
         Ok(state_of(&mut session.core, &saved))
     }
@@ -888,6 +903,67 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
         // when a `:`-line errored, and it clears on the next keystroke batch.
         message: None,
     }
+}
+/// Mirror a batch of buffer edits onto the kernel block, then reconcile the
+/// terminator boundary.
+///
+/// The block's raw text is the buffer's text followed by the `terminator`
+/// (`"\n"` or `""`) the session set aside at open. `EditOp` offsets count the
+/// buffer, which does not include that character, so an edit reaching the end
+/// of the buffer cannot say whether it means to land before or after it. The
+/// case that matters: inserting text that ends in the terminator at the very
+/// end splices in front of the raw one and stacks a second (`"end\n"` plus
+/// `"X\n"` giving `"endX\n\n"`).
+///
+/// So the ops go on verbatim and the boundary is settled once, against what
+/// the buffer now holds: the block should read `buffer` + `terminator`, and a
+/// block that instead carries one extra terminator loses it. Any other
+/// disagreement is left alone — two players on one block is a supported state
+/// (`docs/vi.md`), and rewriting the block to match this buffer would discard
+/// the other player's work.
+///
+/// One rule, one place: `keys_checked` (typed keys, including Enter),
+/// `insert_at_cursor` (paste), and `insert_text` (`:r`'s fetch-then-insert)
+/// all call this instead of splicing ops onto the raw block themselves.
+fn mirror_ops(
+    ops: &[kaijutsu_editor::EditOp],
+    target: &EditorTarget,
+    terminator: &str,
+    buffer_after: &str,
+    blocks: &SharedBlockStore,
+    actor: PrincipalId,
+    caller: &str,
+) -> Result<(), String> {
+    for op in ops {
+        blocks
+            .edit_text_as(
+                target.context_id,
+                &target.block_id,
+                op.offset,
+                &op.insert,
+                op.delete,
+                Some(actor),
+            )
+            .map_err(|e| format!("{caller}: block mirror failed: {e}"))?;
+    }
+    if terminator.is_empty() || ops.is_empty() {
+        return Ok(());
+    }
+    let expected = format!("{buffer_after}{terminator}");
+    let actual = block_text(blocks, target)?;
+    if actual == format!("{expected}{terminator}") {
+        blocks
+            .edit_text_as(
+                target.context_id,
+                &target.block_id,
+                expected.chars().count(),
+                "",
+                terminator.chars().count(),
+                Some(actor),
+            )
+            .map_err(|e| format!("{caller}: terminator reconcile failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn no_session(id: EditorSessionId) -> String {
@@ -1130,6 +1206,101 @@ mod session_tests {
             block_text(&blocks, &target).unwrap(),
             "hello\n",
             "quit must restore content AND the trailing newline"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_ending_in_newline_at_the_tail_does_not_double_the_terminator() {
+        // A paste whose own text ends in `\n`, landing exactly at the end of a
+        // block that already ends in `\n`, must not stack a second terminator
+        // (docs/issues.md, "A paste ending in a newline at a newline-terminated
+        // block's end doubles the terminator").
+        let (blocks, target) = seeded(b"end\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        assert_eq!(st.text, "end");
+
+        sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap(); // cursor at true end
+        let st = sessions
+            .insert_at_cursor(id, "X\n", &blocks, PrincipalId::system())
+            .unwrap();
+        assert_eq!(st.text, "endX");
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "endX\n",
+            "the paste's own trailing newline becomes the terminator, not a second one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_block_always_equals_the_buffer_plus_its_terminator() {
+        // `mirror_ops` splices normalized offsets onto raw text, so the one
+        // invariant that keeps the two surfaces from drifting is
+        // `raw == core.text() + terminator`. Check it across the three tail
+        // cases: a paste that supplies its own terminator, a paste that does
+        // not, and a typed `Enter`.
+        for keys in ["X\n", "X"] {
+            let (blocks, target) = seeded(b"end\n").await;
+            let mut sessions = EditorSessions::new();
+            let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+            sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap();
+            let st = sessions
+                .insert_at_cursor(id, keys, &blocks, PrincipalId::system())
+                .unwrap();
+            let terminator = sessions.terminator_for_test(id);
+            assert_eq!(
+                block_text(&blocks, &target).unwrap(),
+                format!("{}{terminator}", st.text),
+                "paste {keys:?} left the block and the buffer disagreeing"
+            );
+        }
+
+        let (blocks, target) = seeded(b"end\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        let outcome = sessions
+            .keys(id, "A<CR><Esc>", &blocks, PrincipalId::system())
+            .unwrap();
+        let text = outcome.state().text.clone();
+        let terminator = sessions.terminator_for_test(id);
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            format!("{text}{terminator}"),
+            "a typed Enter left the block and the buffer disagreeing"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_with_no_trailing_newline_at_the_tail_keeps_the_terminator() {
+        // The other side of the same fix: an insert that does not supply its
+        // own terminator must not eat the block's existing one.
+        let (blocks, target) = seeded(b"end\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+
+        sessions.keys(id, "A", &blocks, PrincipalId::system()).unwrap();
+        sessions
+            .insert_at_cursor(id, "X", &blocks, PrincipalId::system())
+            .unwrap();
+        assert_eq!(block_text(&blocks, &target).unwrap(), "endX\n");
+    }
+
+    #[tokio::test]
+    async fn typed_enter_at_the_tail_adds_a_line() {
+        // A paste whose text ends in the terminator supplies the block's
+        // existing one; a typed Enter asks for a line break, so it grows the
+        // block. The two are different intents and the mirror must not
+        // conflate them.
+        let (blocks, target) = seeded(b"end\n").await;
+        let mut sessions = EditorSessions::new();
+        let (id, _) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        sessions
+            .keys(id, "AX<CR><Esc>", &blocks, PrincipalId::system())
+            .unwrap();
+        assert_eq!(
+            block_text(&blocks, &target).unwrap(),
+            "endX\n\n",
+            "a typed Enter at the tail breaks the line rather than reusing the terminator"
         );
     }
 
@@ -1550,6 +1721,25 @@ mod session_tests {
         assert!(
             c_info.opener.is_some(),
             "an opened-with-opener session reports one"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_on_a_path_with_an_existing_session_announces_it() {
+        // Amy, 2026-08-19: "like vim it should detect that and tell me, so I
+        // can go back to the other one or shut it down." The second open still
+        // succeeds — two players on one block is a supported state
+        // (docs/vi.md) — but it must tell the caller another session already
+        // holds the target.
+        let (blocks, target) = seeded(b"hello").await;
+        let mut sessions = EditorSessions::new();
+        let (_first, st1) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        assert!(st1.message.is_none(), "the first open has nothing to announce");
+
+        let (_second, st2) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        assert!(
+            st2.message.is_some(),
+            "opening a path that already has a session must announce it"
         );
     }
 }
