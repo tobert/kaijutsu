@@ -736,14 +736,22 @@ impl Broker {
         }
 
         // Spawn pump subscribed to this server's notification stream. Aborted
-        // on unregister (or when the broker is dropped).
+        // on unregister (or when the broker is dropped) — and here, on a
+        // re-`register` over the same id: a spawned task runs independently
+        // of its `JoinHandle`, so replacing the map entry without aborting
+        // the displaced handle first would leave the old pump still polling
+        // the old server's notification stream indefinitely (until whoever
+        // else holds that server's `Arc` drops it), rather than stopping the
+        // moment this id changes hands.
         let rx = server.notifications();
         let broker = Arc::clone(self);
         let id_for_pump = id.clone();
         let handle = tokio::spawn(async move {
             pump_loop(broker, id_for_pump, rx).await;
         });
-        self.pump_handles.lock().await.insert(id.clone(), handle);
+        if let Some(displaced) = self.pump_handles.lock().await.insert(id.clone(), handle) {
+            displaced.abort();
+        }
 
         // (D-55) Publish a kernel-level ToolsChanged so
         // `builtin.bindings`'s bridge task can turn this into a
@@ -1471,6 +1479,14 @@ impl Broker {
     /// context's binding positively grants it (an absent binding grants
     /// nothing). Facades never enter `call_tool`.
     pub async fn check_facade(&self, context_id: &ContextId, facade: &str) -> McpResult<()> {
+        // Surface a genuine binding-fetch failure (a real DB read error) as
+        // this call's own error instead of letting `binding()` collapse it
+        // to an empty (deny-all) binding, which read later as an
+        // indistinguishable `FacadeDenied` instead of a storage fault. This
+        // also warms the in-memory binding cache `binding()` reads next
+        // (same pattern as `dispatch_tool_via_broker_with_cancel` in
+        // `kernel.rs`, the third enforcement point).
+        self.binding_checked(context_id).await?;
         let binding = self.binding(context_id).await.unwrap_or_default();
         if !binding.allows(&super::binding::Capability::Facade(facade.to_string())) {
             return Err(McpError::FacadeDenied {
@@ -1650,6 +1666,13 @@ impl Broker {
         // always enforced (an empty binding denies). An *unbound* context is
         // refused only on a real kernel (`engage_unbound_deny`); bare-broker
         // unit tests that don't touch the gate leave it permissive.
+        // Surface a genuine binding-fetch failure (a real DB read error) as
+        // this call's own error instead of letting it collapse into the
+        // `None` arm below and read as an ordinary unbound context. This
+        // also warms the in-memory binding cache `self.binding()` reads
+        // next (same pattern as `dispatch_tool_via_broker_with_cancel` in
+        // `kernel.rs`, the third enforcement point).
+        self.binding_checked(&ctx.context_id).await?;
         let allowed = match self.binding(&ctx.context_id).await {
             Some(binding) => binding.allows_tool(&params.instance, &params.tool),
             None => !self
@@ -5006,6 +5029,84 @@ mod tests {
         assert!(
             matches!(err, McpError::InstanceNotFound(_)),
             "expected InstanceNotFound after unregister, got {err:?}"
+        );
+    }
+
+    /// `register` over an existing instance id must abort the displaced
+    /// pump task, not merely drop the `JoinHandle` and lose track of it — a
+    /// dropped `JoinHandle` does not stop a spawned task; the task keeps
+    /// running independently until it finishes or is explicitly aborted.
+    /// Observed via the first server's own notification channel: the pump
+    /// task owns the `broadcast::Receiver` side, so once that task is
+    /// actually torn down (not just forgotten), the receiver drops and
+    /// `Sender::send` on the displaced server's channel starts failing with
+    /// no receivers left. The test keeps its own `Arc` to the first
+    /// `MockServer` (mirroring real re-registration, where some other
+    /// holder of the old server's `Arc` can outlive the broker's swap), so
+    /// the channel does not self-close for an unrelated reason.
+    #[tokio::test]
+    async fn register_over_existing_id_aborts_the_displaced_pump() {
+        let (broker, store, ctx) = wired_broker().await;
+        bind(&broker, ctx, "dup").await;
+
+        let server1 = Arc::new(MockServer::new("dup").with_tool("x"));
+        let tx1 = server1.sender();
+        broker
+            .register_silently(server1.clone(), InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let server2 = Arc::new(MockServer::new("dup").with_tool("y"));
+        let tx2 = server2.sender();
+        broker
+            .register_silently(server2.clone(), InstancePolicy::default())
+            .await
+            .unwrap();
+
+        // `abort()` only requests cancellation; the aborted future (and the
+        // `rx` it owns) is actually dropped on its next poll. Poll for that
+        // rather than sleeping a fixed span, so a loaded machine does not
+        // turn this into a flake.
+        let mut send_result = Ok(0);
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            send_result = tx1.send(ServerNotification::Log {
+                level: LogLevel::Info,
+                message: "from the displaced server".into(),
+                tool: None,
+            });
+            if send_result.is_err() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            send_result.is_err(),
+            "the displaced server's pump should have been aborted, dropping \
+             its receiver — but tx1.send() still found a live receiver, \
+             meaning the old pump task is still running"
+        );
+
+        // Sanity: the second (current) registration's pump is alive and
+        // still routes notifications normally.
+        let _ = tx2.send(ServerNotification::Log {
+            level: LogLevel::Info,
+            message: "from the live server".into(),
+            tool: None,
+        });
+        for _ in 0..10 {
+            sleep(Duration::from_millis(20)).await;
+            if !notifications_in(&store, ctx).is_empty() {
+                break;
+            }
+        }
+        let notifs = notifications_in(&store, ctx);
+        assert!(
+            notifs
+                .iter()
+                .any(|n| n.detail.as_deref() == Some("from the live server")),
+            "expected the live (second) server's notification to be emitted, \
+             got {notifs:?}"
         );
     }
 
@@ -10821,6 +10922,123 @@ mod tests {
                 assert!(!reason.is_empty(), "reason must not be empty");
             }
             other => panic!("expected BindingUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Shared fixture for the two enforcement-point tests below: a real
+    /// `context_bindings` row whose detail table has been poisoned, so
+    /// `binding()` collapses the read failure to deny-all instead of
+    /// surfacing it. Mirrors `binding_checked_surfaces_a_real_db_failure`'s
+    /// setup exactly.
+    async fn broker_with_poisoned_binding_row() -> (Arc<Broker>, ContextId) {
+        use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
+        use kaijutsu_types::{now_millis, ConsentMode, ContextState, DocKind};
+
+        let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
+        let ctx = ContextId::new();
+        {
+            let mut db = kernel_db.lock();
+            let creator = PrincipalId::system();
+            let ws_id = db.get_or_create_default_workspace(creator).unwrap();
+            db.insert_document(&DocumentRow {
+                document_id: ctx,
+                workspace_id: ws_id,
+                doc_kind: DocKind::File,
+                language: None,
+                path: None,
+                created_at: now_millis() as i64,
+                created_by: creator,
+            })
+            .unwrap();
+            db.insert_context(&ContextRow {
+                context_id: ctx,
+                label: None,
+                provider: None,
+                model: None,
+                system_prompt: None,
+                consent_mode: ConsentMode::Collaborative,
+                context_state: ContextState::Live,
+                context_type: "default".to_string(),
+                created_at: now_millis() as i64,
+                created_by: creator,
+                forked_from: None,
+                fork_kind: None,
+                archived_at: None,
+                workspace_id: Some(ws_id),
+                preset_id: None,
+                concluded_at: None,
+                last_activity_at: None,
+                promoted_at: None,
+                demoted_at: None,
+                paused_at: None,
+                cast_id: None,
+                origin_host: None,
+                played_by: None,
+                reviewer_id: None,
+                director_id: None,
+            })
+            .unwrap();
+            db.upsert_context_binding(ctx, &ContextToolBinding::with_instances(vec![]))
+                .unwrap();
+            db.poison_context_binding_detail_table_for_test().unwrap();
+        }
+
+        let broker = Arc::new(Broker::new());
+        broker.set_db(kernel_db).await;
+        (broker, ctx)
+    }
+
+    /// Enforcement point 1 of 3 (see the module docs on `binding_checked`):
+    /// `check_facade` must surface a real binding-fetch DB failure as
+    /// `BindingUnavailable`, not silently collapse it to the ordinary
+    /// `FacadeDenied` a legitimately-empty binding would produce.
+    #[tokio::test]
+    async fn check_facade_surfaces_a_real_db_failure_not_facade_denied() {
+        let (broker, ctx) = broker_with_poisoned_binding_row().await;
+
+        let err = broker
+            .check_facade(&ctx, "shell")
+            .await
+            .expect_err("a dropped detail table must surface as an error, not a denial");
+        match err {
+            McpError::BindingUnavailable { context, .. } => assert_eq!(context, ctx),
+            other => panic!(
+                "expected BindingUnavailable (a storage fault), got {other:?} — a DB \
+                 read error must not read as an ordinary facade denial"
+            ),
+        }
+    }
+
+    /// Enforcement point 2 of 3: `call_tool` (via `call_tool_inner`) must
+    /// surface the same DB failure as `BindingUnavailable`, not
+    /// `CapabilityDenied`. `engage_unbound_deny()` mirrors a real kernel
+    /// (`Kernel::new` calls it) — that is the configuration under which the
+    /// swallowed error previously read as a plain capability denial instead
+    /// of a storage fault.
+    #[tokio::test]
+    async fn call_tool_surfaces_a_real_db_failure_not_capability_denied() {
+        let (broker, ctx) = broker_with_poisoned_binding_row().await;
+        broker.engage_unbound_deny();
+        let server = Arc::new(MockServer::new("svc").with_tool("t"));
+        broker
+            .register(server, InstancePolicy::default())
+            .await
+            .unwrap();
+
+        let err = broker
+            .call_tool(
+                params("svc", "t"),
+                &CallContext::system_for_context(ctx),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            McpError::BindingUnavailable { context, .. } => assert_eq!(context, ctx),
+            other => panic!(
+                "expected BindingUnavailable (a storage fault), got {other:?} — a DB \
+                 read error must not read as an ordinary capability denial"
+            ),
         }
     }
 
