@@ -677,6 +677,44 @@ fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
     }
 }
 
+/// Whether a stream-start failure is worth retrying under the bounded
+/// backoff, or a permanent refusal that repeating the same request cannot
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDisposition {
+    /// A provider-side hiccup — retry under the existing backoff.
+    Transient,
+    /// Retrying the identical request reproduces the identical refusal —
+    /// stop after one attempt and surface it.
+    Permanent,
+}
+
+/// Classify a stream-start `LlmError` as transient or permanent. Exhaustive
+/// over every `LlmError` variant on purpose: a new variant must be
+/// classified here before it compiles, rather than silently inheriting
+/// whatever the default arm would have done.
+fn retry_disposition(error: &LlmError) -> RetryDisposition {
+    match error {
+        // A malformed request rejects the same messages/opts every time.
+        LlmError::InvalidRequest(_) => RetryDisposition::Permanent,
+        // A bad or missing credential does not fix itself mid-turn.
+        LlmError::AuthError(_) => RetryDisposition::Permanent,
+        // Constructed today only for "no default provider/model
+        // configured" (`LlmRegistry::prompt`, llm/mod.rs) — a static
+        // configuration gap, not a provider outage, so retrying the same
+        // missing configuration cannot help.
+        LlmError::Unavailable(_) => RetryDisposition::Permanent,
+        // The provider is asking us to slow down; the existing backoff is
+        // exactly the right response.
+        LlmError::RateLimited(_) => RetryDisposition::Transient,
+        // Generic provider-side and network failures are ordinarily
+        // transient blips worth one more try.
+        LlmError::ApiError(_) => RetryDisposition::Transient,
+        LlmError::NetworkError(_) => RetryDisposition::Transient,
+        LlmError::CompletionError(_) => RetryDisposition::Transient,
+    }
+}
+
 /// How many times one turn answers an output-ceiling stop with a notice and
 /// another inference. Counted over the whole turn, not per run of consecutive
 /// stops. The turn then ends with the provider's own `max_tokens` reason.
@@ -943,6 +981,74 @@ mod consent_tests {
     #[test]
     fn autonomous_caps_at_one_hundred_iterations() {
         assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 100);
+    }
+}
+
+#[cfg(test)]
+mod retry_disposition_tests {
+    use super::*;
+
+    /// A bad or missing key will not start working mid-turn: exactly one
+    /// attempt, no backoff spent on it.
+    #[test]
+    fn auth_error_is_permanent() {
+        assert_eq!(
+            retry_disposition(&LlmError::AuthError("bad key".into())),
+            RetryDisposition::Permanent
+        );
+    }
+
+    /// Retrying an invalid request reproduces the same rejection.
+    #[test]
+    fn invalid_request_is_permanent() {
+        assert_eq!(
+            retry_disposition(&LlmError::InvalidRequest("bad shape".into())),
+            RetryDisposition::Permanent
+        );
+    }
+
+    /// As constructed today (`LlmRegistry::prompt`), `Unavailable` means no
+    /// default provider/model is configured — a static config gap, not an
+    /// outage that heals on retry.
+    #[test]
+    fn unavailable_is_permanent() {
+        assert_eq!(
+            retry_disposition(&LlmError::Unavailable("no default provider set".into())),
+            RetryDisposition::Permanent
+        );
+    }
+
+    /// A network blip is exactly what the bounded backoff exists for.
+    #[test]
+    fn network_error_is_transient() {
+        assert_eq!(
+            retry_disposition(&LlmError::NetworkError("connection reset".into())),
+            RetryDisposition::Transient
+        );
+    }
+
+    #[test]
+    fn rate_limited_is_transient() {
+        assert_eq!(
+            retry_disposition(&LlmError::RateLimited("slow down".into())),
+            RetryDisposition::Transient
+        );
+    }
+
+    #[test]
+    fn api_error_is_transient() {
+        assert_eq!(
+            retry_disposition(&LlmError::ApiError("500".into())),
+            RetryDisposition::Transient
+        );
+    }
+
+    #[test]
+    fn completion_error_is_transient() {
+        assert_eq!(
+            retry_disposition(&LlmError::CompletionError("malformed completion".into())),
+            RetryDisposition::Transient
+        );
     }
 }
 
@@ -2116,9 +2222,10 @@ async fn run_llm_stream(
             &default_tunables,
         );
 
-        // Invalid requests cannot recover by retrying the same history.
-        // Other startup failures keep the bounded backoff; mid-stream errors
-        // are not retried to avoid duplicate kernel blocks.
+        // `retry_disposition` decides which startup failures keep the
+        // bounded backoff and which are permanent refusals that stop after
+        // one attempt. Mid-stream errors are never retried, regardless of
+        // disposition, to avoid duplicate kernel blocks.
         let mut stream = {
             let mut attempt = 0u32;
             loop {
@@ -2151,7 +2258,8 @@ async fn run_llm_stream(
                         }
                         break s;
                     }
-                    Err(e) if attempt <= MAX_LLM_RETRIES && !matches!(&e, LlmError::InvalidRequest(_)) => {
+                    Err(e) if attempt <= MAX_LLM_RETRIES
+                        && retry_disposition(&e) == RetryDisposition::Transient => {
                         let delay_secs = attempt as u64;
                         tracing::warn!(
                             "LLM stream failed (attempt {}/{}): {}, retrying in {}s",
