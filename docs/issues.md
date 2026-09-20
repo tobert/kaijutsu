@@ -124,13 +124,6 @@ Provenance and storage
   between them leaves blocks without a receipt.
 
 Block tools
-- `block_search` reports byte offsets within the matched line and
-  `block_splice` takes whole-block character positions. A block-relative
-  character offset on `SearchMatch` (new fields) would let a client compose
-  them.
-- MCP `img_block` takes a CAS hash and does not compare the object's recorded
-  type with `ContentType::Image`.
-- `kj block append --text` can append to an Image block's CAS-hash content.
 
 File cache
 - Generation metadata errors are swallowed, and comparison detects only an
@@ -226,17 +219,11 @@ Read by the lead; each line re-checked before it went here.
   `kj backend`, and `kj alias` writes rebuild it, so a mid-scenario write
   replays consumed turns instead of panicking. `session_scenario.rs` survives
   by ordering; say so in the file, or hold the queues outside the provider.
-- **Nothing parses the committed fixtures at unit speed.** The mock's unit
-  test serializes the same type it reads. A ten-line test that
-  `serde_json::from_str`s `tests/mock_scripts/*.json` as `Vec<Vec<StreamEvent>>`
-  catches a shape drift before the e2e's 30 s timeout does.
 - **`kj handoff tail <other>` refuses a reader with no sheet** because the
   caller is resolved before the target is chosen (`kj/handoff.rs:250-253`).
   Resolve the caller only on the no-target branch.
 - Stale comments: `llm/mod.rs:470-476` says the mock refuses streaming;
   `kj/handoff.rs:17,274` point at a `READ_ONLY_TABLE` that no longer exists.
-- The scenario's `#[test]` count of one is load-bearing: the env var is set
-  and never restored. A `Drop` guard makes that structural.
 
 ## Accountability propagates at four more boundaries (Amy, 2026-09-15)
 
@@ -393,11 +380,6 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   (`kaijutsu-server/src/rpc.rs`, "Embedding service unavailable"; the endpoint
   comes from `seed_backends.rs`). In a sandbox that is most of the boot. Give
   the probe a short connect timeout or let a caller skip the semantic index.
-- **`read_shell_operation` cannot tell a dropped operation from an invented
-  id** (`mcp/servers/shell_operations.rs`, "no shell operation <id> in this
-  context"). Two such failures in one run; the model recovered.
-- **`kaijutsu_client::subscriptions` logs "Event channel closed, dropping
-  BlockInserted event"** about fifteen times per run over ACP.
 - **A process the model spawns can read the kernel's environment through
   `/proc/<pid>/environ`** when it runs as root, which is usual in task
   containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
@@ -419,19 +401,7 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   arms carry a consent mode at all. Decide per-context resolution or retire
   the field; see "Consent setting ownership" above for the constraints.
 
-## `SoloState::prepare(None)` shares one temp-directory registry per test binary (2026-09-18)
-
-`crates/kaijutsu-solo-acp/src/state.rs`'s `TEMP_STATE` is a process-wide
-`OnceLock<PathBuf>`, by design: one solo process only ever makes one
-temporary state directory, and `atexit` needs a single path to remove. Two
-`SoloState::prepare(None)` calls in the same *test binary*, though, share
-that one slot — only the first registers, and any of them calling
-`clean_up()`/`remove_temp_state()` removes whichever directory won that
-race, not necessarily its own. Found while adding `state::tests`; worked
-around there by giving the new tests a named `SoloState` (`named_state()`
-helper) instead of a temporary one, which sidesteps the registry entirely.
-Existing `state::tests` still uses `prepare(None)` once; a second test ever
-doing the same would need the same treatment.
+## Leftovers from the solo-acp state work (2026-09-18)
 
 Smaller, from the same work:
 
@@ -509,15 +479,6 @@ set (`assets/defaults/rc/director/create/S10-binding.kai`), which `root`
 now also holds. Decide which grants banto keeps (likely drive, fork, drift,
 operator) and which belong to roots only (likely `admin`, `config-write`,
 `system`). Amy chose the split on 2026-09-16 and left the grant list open.
-
-## Merge `bassist` into `musician` (Amy, 2026-09-20)
-
-Amy: "bassist and musician will merge to musician. bassist was the prototype
-from chameleon.md." Both rc bundles have the verbs `create`, `fork`, `rotate`
-and `tick`; `bassist` alone has `create/S05-chair.{kai,md}`. Fold what
-`musician` still needs from the chair script, delete
-`assets/defaults/rc/bassist/`, and update `seed_scripts.rs`, `kj/rc.rs`,
-`rc/tests.rs`, `gate.toml` and `docs/chameleon.md` where they name it.
 
 ## Identity audit: what stays open (2026-09-15)
 
@@ -756,16 +717,6 @@ configured for the app's context. Coordinate with the approval-identity
 work (commits dcb5fc8b, fd27b822). Probe ask `01a096d2-358d-…` was left
 pending by this check; it is fail-closed and will expire.
 
-## The scene palette still carries hues for retired stations (2026-09-12)
-
-`[scene]` in `theme.toml` (`kaijutsu-types::theme::SceneData`) keeps
-`wire`, `fsn_edge`, `fsn_vertex`, `fsn_seam`, the `etch` and `hardware`
-tiers, and the `pulse`, `chord_selected`, and `wire` gains, all of which
-belonged to the patch bay, tracker, and fsn stations deleted this day. The
-app-side `ScenePalette` no longer reads them. Removing them from the file
-contract is a kernel-owned change with a compiled-mirror test and a seeded
-default; do it in one pass with the next theme edit rather than now.
-
 ## BRP-injected input lands one request late (2026-09-12)
 
 A key sent with `brp_extras/send_keys`, or a state change through
@@ -915,14 +866,6 @@ so a renderer ends on a buffer missing the peer's edit until the next push.
 Not new with the paste slice; `editor_keys` has had the same window. Fix
 is to publish the state read under the lock before the database write, or
 re-read after it. Found by the kaibo review of the paste slice.
-
-## A paste ending in a newline at a newline-terminated block's end doubles the terminator (2026-09-14, inherited)
-
-`EditorCore` cannot tell `"hello"` from `"hello\n"` (`crates/kaijutsu-editor/
-src/lib.rs`, the terminator rule), so inserting `"X\n"` at the end of
-`"end\n"` gives `"endX\n\n"`. A typed `Enter` at the same spot does the same
-today; a paste makes it easy to hit, since a file's contents usually end in
-a newline. Found by the kaibo review of the paste slice.
 
 ## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
 
@@ -1602,18 +1545,6 @@ Bring these to that session:
 Slice 5 (`swapRecovered`/`diskChangedSinceLoad` on `EditorState`) is also
 open; neither field is in `kaijutsu.capnp`.
 
-## Opening a file that already has an editor session should announce it (2026-08-19)
-
-`EditorSessions::open` (`editor.rs:286`) still always creates a fresh session
-with no check for an existing one on the same path — confirmed;
-`sibling_bound` (used at quit, `editor.rs:744`) proves "is someone already on
-this file" is computable today, just not consulted at open time. Amy,
-2026-08-19: *"like vim it should detect that and tell me, so I can go back to
-the other one or shut it down."* Shape: announce rather than silently open a
-second view; let the player attach or explicitly discard (the other session
-may hold unsaved work). Not "refuse the second open" — two players on one
-block is a supported state (`docs/vi.md`).
-
 ## File documents should be created lazily, not on every read (2026-08-19, deferred)
 
 Every file the kernel reads still leaves a durable block-store document
@@ -1695,27 +1626,6 @@ explain it.
 
 ---
 
-## `blocks` still speaks a peer-sync vocabulary
-
-`BlockStore::frontier()` and `ops_since()` in
-`kaijutsu-kernel/src/blocks/block_store.rs` have no production caller; their
-doc comment says so. They serve two-store tests that model a peer catching up
-by diffing, which no longer happens. Delete both with those tests, keeping any
-assertion that covers oplog replay.
-
-`merge_ops` is live: the kernel uses it to replay the oplog on load and to
-apply its own single-operation payloads. Nothing merges. Rename it (for
-example `apply_ops`) across its call sites in `block_store.rs`, and run the
-kernel and server suites.
-
-## Remove the dated DTE cutover cleanup
-
-`purge_dte_cutover_oplog_rows` and the `DTE_CUTOVER_OPLOG_MIGRATION` marker in
-`kernel_db.rs` are one-time cleanup from 2026-08-16. Delete both once every
-live kernel has booted past that date.
-
----
-
 ## A `;` chain reports only its last command's status
 
 `is_error` for a `;`-separated chain is the last command's exit status
@@ -1778,23 +1688,6 @@ clock. Accepted for now (NTP-disciplined LAN, skew below display
 resolution); wrong the moment a client's clock isn't disciplined. Fix:
 add a kernel-now value to the index, or give `FileAttr` a `generation`
 (see the entry below) so a client can conditional-fetch instead.
-
----
-
-## The wire `FileAttr` carries no `generation`, so clients cannot do a conditional VFS fetch (2026-08-16)
-
-Adding it is also one of the two fixes for "The roster index has no kernel-now
-reference" above.
-
-Still true: `struct FileAttr` (`kaijutsu.capnp:1314-1321`) has
-size/kind/perm/mtimeSecs/mtimeNanos/nlink and no `generation`, though the
-kernel already stamps `FileAttr::generation` server-side
-(`vfs/types.rs:67`) and `Vfs.snapshot`'s `SnapshotNode` already carries
-one (`generation @6`; the next free ordinal on `FileAttr` is also `@6`).
-Fix: append `generation @6 :UInt64;`, set it in `set_file_attr`
-(`kaijutsu-server/src/rpc.rs:12158`), add `RpcClient::vfs_getattr`. Until
-then a poller (the app's roster feed) must re-read the whole file to
-detect a change rather than getattr-then-maybe-read.
 
 ---
 
@@ -2253,16 +2146,16 @@ count); decide what they measure before polishing.
 
 ## Control plane (kj): two gaps
 
-- **Six more dead local `--json` fields.** kaish owns `--json` and
-  `KjBuiltin::execute` strips it before the per-verb parse, so a local
-  `json: bool` can never be true in production. `doc`/`config`/`rc`/
-  `search`/`midi` lost theirs on 2026-09-08; `kj block` (`kj/block.rs`, four
-  subcommands), `kj roster` and `kj mcp list` still declare one. Same
-  treatment: delete the field and the branch, keep `.data`, move any fact
-  the branch alone showed into the human output.
-- **`--out` writes bypass the VFS.** `kj cas get` (`kj/cas.rs:148`) and
-  `kj block cat` (`kj/block.rs:1028,1155`) `std::fs::write` relative to the
-  server cwd, never through mounts.
+- **`--out` writes bypass the VFS.** `kj cas get` (`cas_get`), `kj block cat`
+  and `kj block original` `std::fs::write` relative to the server cwd, never
+  through mounts. The fix needs `dispatch_cas` and `dispatch_block` to become
+  `async fn`, because `VfsOps::write_all` is async and those dispatchers are
+  not: that is two `.await`s in `kj/mod.rs`'s dispatch match plus every test
+  that calls either dispatcher. Do not bridge it with `block_in_place` and
+  `Handle::block_on` instead — `kj` runs under the current-thread runtime each
+  SSH session thread builds (`kaijutsu-server/src/ssh.rs`, where rc lifecycles
+  re-enter kaish), and `block_in_place` panics there. Attempted and reverted
+  2026-09-20 for exactly that reason.
 
 ## Index and ABC: two schema-shaped debts
 
@@ -2305,14 +2198,6 @@ carry the mechanism; these are what none of them cover:
   bar math an escape hatch. Decide which RO builtins.
 - **Rotate chains pollute the director's tree** (`kj context list --tree`
   shows a 17-deep chain per song); no `--hide-archived` or chain folding.
-
-## VFS: `LocalBackend::resolve` blocks the tokio pool (found 2026-06-27)
-
-`resolve()` (`vfs/backends/local.rs:150`) is `async fn` but canonicalizes
-synchronously on every op with no `spawn_blocking`. Under a stalled host FS
-this starves the ambient pool, which is the path the SSH-in-when-the-app-is-
-down fallback depends on. Route `resolve`/`create`/`mkdir` through
-`spawn_blocking` or `tokio::fs`.
 
 ## kaijutsu-mcp Remote backend collapses multi-context ops to one context
 
@@ -2361,6 +2246,50 @@ Found by kaibo reviewing the retry-classification commit.
 `LlmError::Unavailable`; the code `.expect()`s and panics
 (`claude/mod.rs:108-109`). Either return the error or say that a builder
 failure is unrecoverable at construction. Found by kaibo.
+
+## `cargo test -p kaijutsu-solo-acp` fails 21 tests for a missing feature (2026-09-20)
+
+`solo_acp_stdio.rs` drives real turns through `BackendKind::Mock`, which
+exists only under the `test-mock` feature, so a plain
+`cargo test -p kaijutsu-solo-acp` fails 21 of 23 with
+`invalid value 'mock' for '--backend-kind'` rather than skipping them. Declare
+the target in `Cargo.toml` with `required-features = ["test-mock"]` so cargo
+leaves it alone without the feature, and say in the file which invocation runs
+it.
+
+## The theme mirror test only spot-checks fields (2026-09-20)
+
+`theme::tests::default_theme_toml_deserializes` (`kaijutsu-types/src/theme.rs`)
+`include_str!`s the shipped `assets/defaults/theme.toml` and asserts about a
+hand-picked dozen fields, so a key present on one side and absent on the other
+passes. Proven: removing three `SceneGainsData` fields from the struct while
+leaving them in the file produced no new failure. Compare key sets instead —
+round-trip both sides through `toml::Value` and diff.
+
+Two things the same test hides today:
+
+- **`fg` disagrees between the file and the default.** `theme.toml` says
+  `#ece8f7`; `ThemeData::default()` says `#d8d2ee`. `cargo test -p
+  kaijutsu-types` is red on this alone. Amy picks which one is the theme.
+- **An unknown `[scene]` key loads silently.** None of the scene structs carry
+  `#[serde(deny_unknown_fields)]`, which about twenty other config types in
+  this tree do, so an operator's file still naming a retired hue parses with no
+  word said. Adding the attribute would refuse a file that loads today, so it
+  is a decision: refuse, or read the file into `toml::Value` first and warn per
+  unknown key.
+
+## `vfs_getattr` does not reach the app (2026-09-20)
+
+`Vfs.getattr` and `KernelHandle::vfs_getattr` carry `FileAttr.generation` to a
+client now, but `ActorHandle` has no command for it, so
+`connection/roster.rs`'s poll still reads the whole index every time. Wiring is
+an `RpcCommand` variant and a `RpcActor::dispatch` arm, then the feed compares
+generations and skips the read.
+
+## `kj cas get --out` and `kj block cat --out` need async dispatchers (2026-09-20)
+
+See "Control plane (kj): two gaps" for the shape. Recorded separately because
+the attempt is instructive: a `block_in_place` bridge is not the way around it.
 
 ## Testing & Tooling
 
