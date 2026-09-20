@@ -26,7 +26,12 @@
 //! (`Provider::from_backend`'s `BackendKind::Mock` arm) — a second test in
 //! this file racing to set a different directory would be a real bug, not a
 //! style question, so the whole scenario stays one test rather than several
-//! that could interleave.
+//! that could interleave. `boot()` sets the variable through
+//! `MockScriptDirGuard`, which restores it when the scenario drops, so the
+//! mutation does not outlive the test. That narrows the leak; it does not
+//! license a second test. `set_var` and `var_os` race across threads, and
+//! libtest runs a binary's tests on separate threads in no particular
+//! order, so a second test touching this variable is the race above.
 //!
 //! ## What this does not cover
 //!
@@ -155,6 +160,47 @@ struct Scenario {
     /// ledger answers all run here, never inside banto's context — so none
     /// of it can be caught by a hook scoped to banto's context id.
     amy_home: ContextId,
+    /// Restores `KJ_MOCK_SCRIPT_DIR` when the scenario drops, so the
+    /// process-wide var `boot()` sets never outlives this one `#[test]`.
+    _mock_script_dir: MockScriptDirGuard,
+}
+
+/// Restores `KJ_MOCK_SCRIPT_DIR` to whatever it held before `boot()` set it,
+/// so the scenario's mutation ends with the scenario. The single-`#[test]`
+/// invariant in the module doc still stands: this guard makes the leak
+/// structural to fix, not safe to ignore.
+struct MockScriptDirGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl MockScriptDirGuard {
+    const VAR: &'static str = "KJ_MOCK_SCRIPT_DIR";
+
+    /// Set `KJ_MOCK_SCRIPT_DIR` to `dir`, remembering whatever it held
+    /// before.
+    ///
+    /// SAFETY: `std::env::set_var`/`var_os` race across threads that touch
+    /// the same variable concurrently. This binary's one `#[test]` is the
+    /// only caller, so there is no other thread to race with.
+    unsafe fn set(dir: &std::path::Path) -> Self {
+        let previous = std::env::var_os(Self::VAR);
+        unsafe {
+            std::env::set_var(Self::VAR, dir);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for MockScriptDirGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set()` — the same single-caller invariant.
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(Self::VAR, value),
+                None => std::env::remove_var(Self::VAR),
+            }
+        }
+    }
 }
 
 /// Boot a server with `KJ_MOCK_SCRIPT_DIR` pointed at this crate's
@@ -166,12 +212,12 @@ struct Scenario {
 async fn boot() -> Scenario {
     // SAFETY: this binary has exactly one #[test] (see the module doc) —
     // nothing else in this process reads or writes this variable.
-    unsafe {
-        std::env::set_var(
-            "KJ_MOCK_SCRIPT_DIR",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mock_scripts"),
-        );
-    }
+    let mock_script_dir = unsafe {
+        MockScriptDirGuard::set(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/mock_scripts"
+        )))
+    };
     // Banto nests `kj drive` inside a tool call. The kernel worker uses
     // spawn_kaish_thread to reserve enough stack for this rc recursion.
 
@@ -248,6 +294,7 @@ async fn boot() -> Scenario {
         amy_principal,
         kernel,
         amy_home,
+        _mock_script_dir: mock_script_dir,
     }
 }
 

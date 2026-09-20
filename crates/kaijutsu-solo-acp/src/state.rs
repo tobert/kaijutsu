@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use russh::keys::{PrivateKey, ssh_key};
 
 use kaijutsu_kernel::kernel_db::{BackendRow, CharacterRow, KernelDb};
@@ -86,12 +86,26 @@ impl SoloState {
                 // registry above, which covers every exit, and two owners
                 // would be one owner too many.
                 let root = temp.keep();
-                if TEMP_STATE.set(root.clone()).is_ok() {
-                    // SAFETY: registering a plain function once, before any
-                    // exit path can run. The hook touches only the statics
-                    // above.
-                    unsafe { libc::atexit(remove_temp_state_at_exit) };
+                // One process makes one temporary state directory, because
+                // the registry above holds one path and `atexit` needs it.
+                // A second one would return a directory nobody registered,
+                // and the first `clean_up()` to run would remove the
+                // registered directory rather than its own — so refuse
+                // instead, and leave nothing behind on the way out.
+                if let Err(registered) = TEMP_STATE.set(root.clone()) {
+                    let _ = fs::remove_dir_all(&registered);
+                    bail!(
+                        "a temporary state directory is already registered at {}; \
+                         a second one in the same process would share its removal",
+                        TEMP_STATE
+                            .get()
+                            .expect("set() failed, so the slot holds a path")
+                            .display()
+                    );
                 }
+                // SAFETY: registering a plain function once, before any exit
+                // path can run. The hook touches only the statics above.
+                unsafe { libc::atexit(remove_temp_state_at_exit) };
                 Ok(Self {
                     root,
                     temporary: true,
@@ -420,11 +434,29 @@ fn collect_overlay_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Res
 mod tests {
     use super::*;
 
+    /// The one `prepare(None)` test in this binary, deliberately: `TEMP_STATE`
+    /// holds one path for the whole process, so a second temporary state
+    /// directory would be unregistered and the first `clean_up()` to run
+    /// would remove the registered directory rather than its own. Both the
+    /// removal and that refusal are asserted here, in order, so no second
+    /// test has to race this one for the registration. A test that needs its
+    /// own temporary state uses `named_state()`.
     #[test]
     fn a_temporary_state_directory_goes_away_when_asked() {
         let mut state = SoloState::prepare(None).expect("prepare temp state");
         let path = state.root().to_path_buf();
         assert!(path.is_dir());
+
+        let second = SoloState::prepare(None);
+        let err = format!(
+            "{:#}",
+            second.err().expect("a second temporary state must be refused")
+        );
+        assert!(
+            err.contains("already registered"),
+            "the refusal should name the registered directory, got: {err}"
+        );
+
         state.clean_up().expect("clean up");
         assert!(!path.exists(), "{} should be gone", path.display());
     }
