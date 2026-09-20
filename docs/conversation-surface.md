@@ -146,3 +146,12 @@ currently mints two `Status::Error` blocks — ToolResult + child Error block)
 and gains a jump-to-latest-error action. Kernel-side truth is untouched:
 error blocks stay whole in the document and hydrate to the LLM as before
 (docs/memory.md doctrine — the operator and the model can always read them).
+
+## Text effects: the route when they return
+
+The glyph instance buffer (per-glyph document position, quad, UV, color) is
+the map of text and positions. Effects return as per-instance attributes plus
+glyph-shader work, not texture post-processing: rainbow is hue(document
+position, time); halo or glow widens the MSDF distance thresholds. Only
+cross-glyph effects (blur, distortion) need a texture: draw to an intermediate
+layer and composite with a post shader. Not built.

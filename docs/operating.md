@@ -60,6 +60,13 @@ Schema changes in `kaijutsu.capnp` are additive by convention (interface
 ordinals stay sequential, a retired method leaves a stub), so an old MCP
 process keeps working across a kernel deploy.
 
+Restart the kernel promptly after committing a change to a serialized struct
+(`SyncPayload`, `BlockSnapshot`, `StoreSnapshot`, `BlockHeader`, `TextEdit`,
+or anything reachable from them). A running process keeps writing the old
+shape, and the rows it writes before the restart are the ones that fail to
+decode. `SCHEMA` and `apply_additive_migrations` stay the mechanism; there is
+no migration framework.
+
 ## The MCP binary
 
 `~/bin/kaijutsu-mcp` is a symlink into `target/debug`. Never copy over it.

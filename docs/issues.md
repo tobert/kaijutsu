@@ -81,15 +81,6 @@ work history remain live state, not restart recovery or durable work provenance.
 A persistent write fault also holds later feedback behind the failed event.
 Measure and design recovery before promising durable admission or delivery.
 
-## Kaish positional suffix expansion
-
-The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than
-stripping the suffix or rejecting unsupported syntax. The rc migration exposed
-this as a failed companion-file read. Shipped scripts use `dirname "$0"` and
-`basename "$0" .kai` instead. Audit unsupported parameter expansion in kaish;
-keep it explicit rather than silently accepting a different expression.
-No upstream issue has been posted.
-
 ## Architecture cleanup plan
 
 Source review at `f7e46f8e`, September 16:
@@ -361,8 +352,6 @@ more readily than other agents". Open, most costly first:
 - **ACP `mcpServers` are ignored** with a warning
   (`crates/kaijutsu-acp/src/lib.rs`, `warn_ignored_mcp_servers`), which blocks
   MCPMark and any task that ships MCP servers.
-- **Observed once, not isolated:** an approval-resumed statement with a `>`
-  redirect left a 0-byte file while the output sat in a block.
 - **File tools:** `read` truncates a line at 2000 characters with no way to
   page within it; `grep` stops at 200 matches without saying how many remain
   (`mcp/servers/file.rs`).
@@ -458,11 +447,6 @@ Smaller, from the same work:
   before a static kernel serves real work.
 - `crates/kaijutsu-server/src/rpc.rs` has a comment naming
   `spawn_signal_checkpoint`; the function is `spawn_signal_shutdown`.
-- Harbor drives podman through `podman compose` and passes
-  `--project-directory`, which podman-compose does not accept; the local fix
-  is Docker Compose v2 as podman's compose provider
-  (`~/src/bench-work/harbor/NOTES.md`). Worth reporting upstream; ask Amy
-  first.
 
 ## The uncovered tier does not reach a `KjVerb` ask (2026-09-18)
 
@@ -667,9 +651,6 @@ message that knew where the player was looking"). Left:
   which shipped types should link it once it has been watched live; the
   ordinal and percentage experiments Amy named are further scripts against
   the same variables, not kernel work.
-- **Enter, not compose-start.** A long draft typed across a minute of
-  streaming may want the earlier point; the client knows both. Record
-  compose-start only if it turns out to matter.
 - **The notification lands after the message.** Hydration reads the user
   message, then "the player wrote the message above while looking at…".
   If a model reads the reference late, move the script's block before the
@@ -871,16 +852,6 @@ selection without overriding the user's color preference. The normal
 color-dependent PTY fixtures now remove inherited `NO_COLOR`; dedicated
 monochrome fixtures can set it explicitly. No upstream posting was made.
 
-## OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
-
-`present::links` detects the paths and URLs a hyperlink would target, with
-tests, but nothing emits one: ratatui 0.30.2 and ratatui-core 0.1.2 carry
-no hyperlink attribute on a `Style` or a `Span`, and the backend diffs
-cells — escape bytes smuggled into a cell's symbol would be miscounted as
-width and overwritten by the next diff. The exit is a ratatui feature that
-adds the attribute, or a custom backend that writes OSC 8 around a cell's
-own bytes; neither is built.
-
 ## transcript_plan clones every block per frame (2026-09-13)
 
 `render::transcript_plan` clones each block of the current context and
@@ -1076,22 +1047,6 @@ tool calls start Running, but `kj block status` can set Pending explicitly.
 Define what a copied Pending tool call means before adding queued execution to
 forks; the model's repaired wire pair does not change that durable status.
 
-## Living documents + project contexts (Amy, 2026-09-07)
-
-Amy: a per-character handoff log is right, but two more ideas surfaced and are
-not the handoff — a **living document** (whole-file rewrite, one current
-truth, history in git — the shape a *handoff* wants to avoid but a
-current-state document wants) and a **project context** (scoping by subject —
-kaibo, an OSS project — rather than by character; a character working across
-two projects has one handoff log today, the known cost of the per-character
-choice).
-
-**Undecided.** Design opinion to argue with: probably no new storage — a
-file, a declared attachment to a context/character/project, and rc injection
-(the same machinery `S15-recall.kai`/`S16-handoff.kai` already are), so the
-real design is the *pointer* (which contexts see which living documents) and
-the *injection budget*, not a new `DocKind`.
-
 ## The lfm2d gate escalates `kj handoff note` from the MCP shell (2026-09-07)
 
 `kj handoff note` and `kj context create --type coder` from an `mcp` seat
@@ -1134,15 +1089,6 @@ stores and reads the column verbatim. Where `nonexistent-zz` becomes
 `none` is not yet found. Same probe: the lfm2d advisory both auto-allowed
 the command (ask `…a5a5…`, `decided: auto_allow`) and escalated it as
 data-critical 0.539 (ask `…a5c1…`); two ledger rows for one statement.
-
-## Check the hook socket's PPID resolution on macOS (2026-09-05)
-
-`candidate_sockets`/`resolve_hook_socket` (`kaijutsu-mcp/src/main.rs`) derive
-the MCP's socket path from the parent process id; proved on Linux only. Amy's
-MacBook is a supported client and nobody has confirmed the PPID chain and
-`$XDG_RUNTIME_DIR` fallback under macOS's launchd-spawned shells and Claude
-Code's process model. Run a bridge session on the Mac with `RUST_LOG` on and
-read what the resolver picked.
 
 ## Character: two hand tasks for Amy (rollout in `docs/character.md`)
 
@@ -1601,14 +1547,6 @@ Claimed execution now has durable notification retry. Continue the live-failure
 and continuation-admission audit in docs/gate-resume.md,
 "Still open".
 
-## Asks vs forms — decision open (2026-08-22)
-
-`docs/asks-and-forms.md` is the full analysis (three-layer ledger, only the
-bottom shell-shaped; MCP elicitation has the right payload with no
-durability). Still true: *"Nothing is decided and no code is proposed"* — the
-brief's own next step is running delegated turns to see whether coders' actual
-questions are allow/deny in disguise.
-
 ## The app can stop taking the kernel-wide firehose (2026-08-22)
 
 `ActorHandle::watch_contexts` lets a block-event subscription name a *set* of
@@ -1618,21 +1556,6 @@ unchanged) and takes every context's block events. It could watch exactly the
 contexts it renders and re-issue as that set changes. Worth doing only if
 event volume shows up in a profile — the firehose is a known cost, not a known
 problem.
-
-## The escalation seat: a small model that prepares the ask (2026-08-21)
-
-Direction, not a spec (Amy: a small model reads `KJ_TOOL_PLAN` and the lfm2d
-signals, writes a description and a recommendation, and does not decide — a
-human still answers through `kj ledger`). What already exists: cast slots
-keyed by `context_type`, rc for stance/loadout, the ledger for a durable
-write target. What's still missing, confirmed unchanged: a hook body's
-stdout is captured and then ignored (`classify_kaish_hook_exit(exec.code,
-&exec.err, &fallback)`, `mcp/broker.rs:2667`, no stdout parameter) — `out`/
-`err` concatenate across every statement in the hook body and `data` reflects
-only the last one, so "JSON on stdout" needs a rule for which line before
-this is buildable. Replying inline (a seat relays a human's reply from its
-own conversation into a ledger decision, after checking the reply's principal
-is human) is a real, undesigned option worth keeping in view.
 
 ## Tech-debt audits, 2026-08-20 — what is still open
 
@@ -1754,21 +1677,12 @@ stale-context overwrite drop 115 backlog entries from this file on
 2026-06-29 (recovered from `3f8b54d3`) while `edit`'s hashline mode would have
 refused.
 
-## Two features silently lost when the legacy conversation path was deleted (2026-08-18)
+## Dead plumbing from two features the conversation surface dropped
 
-Both already self-documented as dead in code, still unfixed:
-
-- **Rainbow user-text effect** (`Theme::font_rainbow`, default on) — `text::
-  components::{KjTextEffects, rainbow_brush}` are kept `#[allow(dead_code)]`
-  as reference; the conversation surface (`view::surface::content`) has no
-  equivalent.
-- **Timeline dimming** — `ui::timeline::systems::update_block_visibility`
-  still runs over an empty query; nothing spawns `TimelineVisibility` any
-  more.
-
-Both need genuine design work to port (theme-driven color derivation and a
-visibility/opacity input both live at the wrong layer for the surface's
-entity-free pipeline), not a one-line fix.
+`text::components::{KjTextEffects, rainbow_brush}` are kept under
+`#[allow(dead_code)]`, and `ui::timeline::systems::update_block_visibility`
+runs over a query nothing populates. Delete both. The features return only
+with a new design.
 
 ## Tool-pair atomicity at insert time remains unbuilt
 
@@ -1819,42 +1733,21 @@ explain it.
 
 ---
 
-## Serialized-struct changes need a restart, not a migration framework (2026-08-16)
+## Remove the dated DTE cutover cleanup
 
-Rule, still uncoded anywhere but here: restart the kernel promptly after
-committing a change to a serialized struct (`SyncPayload`, `BlockSnapshot`,
-`StoreSnapshot`, `BlockHeader`, `TextEdit`, or anything reachable from
-them) — a running process is a version a commit does not reach, and the
-window before restart is what produces unreadable rows. `SCHEMA`/
-`apply_additive_migrations` stay the mechanism; do not build a migration
-framework for a once-in-a-project event.
-
-Open: `purge_dte_cutover_oplog_rows` and its `drop_dte_oplog_2026_08_16`
-marker (`kernel_db.rs:1801,3098`) are dated cleanup — delete both once
-every live kernel has booted past 2026-08-16. Nothing tracks that date;
-still present as of 2026-09-08.
-
-Not urgent, considered and dropped: a CI test decoding a corpus of
-recorded payload bytes from the previous release, to catch this class at
-commit time instead of at boot.
+`purge_dte_cutover_oplog_rows` and the `DTE_CUTOVER_OPLOG_MIGRATION` marker in
+`kernel_db.rs` are one-time cleanup from 2026-08-16. Delete both once every
+live kernel has booted past that date.
 
 ---
 
-## Triage of a real context's "37 failed tool calls" (2026-08-16)
+## A `;` chain reports only its last command's status
 
-Most of this triage shipped: the ×3 block-count inflation is fixed
-(`count_block_activity`, `kaijutsu-app/src/ui/dock.rs:2428`, dedupes a
-tool_result + its Error child); `method_missing`-style tool listing
-shipped as `builtin.tool_search` (`mcp/servers/tool_search.rs`); the kaish
-parse-error traps triaged here were against 0.13/0.14 and kaish is now
-0.17.1 (current traps live in the `gotcha_kaish` memory, not here).
-
-Still open: a `;`-separated command chain's `is_error` is still the last
-command's exit status verbatim (`env.is_error()`,
-`runtime/command_result.rs`), so a chain whose last command fails reports
-`Error:` even when every earlier command succeeded, and the reverse (last
-command masks an earlier failure) also still reproduces. Decide what a
-multi-command chain's status should mean before filing this again.
+`is_error` for a `;`-separated chain is the last command's exit status
+(`env.is_error()`, `runtime/command_result.rs`). A chain whose last command
+fails reports `Error:` when every earlier command succeeded, and a passing
+last command hides an earlier failure. Decide what a chain's status means
+before changing it.
 
 ---
 
@@ -1872,44 +1765,6 @@ rather than every write.
 
 ---
 
-## `kj rc render <context_type>` — let one context type assimilate another (Amy, 2026-08-16)
-
-Not built (`kj rc render` unrecognized anywhere in `kj/*.rs`). The design
-worth keeping if this gets picked up: **render, never run** — a context
-type's rc has real side effects (`kj binding allow`, `transport attach`),
-so this quotes source, it does not execute it. **Reframe to third
-person** — rc stance is second-person imperative
-(`musician/create/S00-stance.md`: "You're a musician here"), and handing
-that verbatim to another context's system prompt gives it instructions,
-not information; render must say "a musician is told…". Three parts worth
-surfacing separately: stance (the `.md` files), allow-set
-(`S10-binding.kai`), verb set (`ls /etc/rc/<type>/` — the free row, since
-it's literally the interaction protocol). Land the output via
-`kj block create --role system`, not an auto-inject, so assimilation
-doesn't silently cost a cache write and stays undo-able.
-
----
-
-## Hi-res wheel (v120) blocked at winit/sctk — slow drags are a compositor dead zone (2026-08-16)
-
-Root cause confirmed, not app-side: MX Master emits sub-detent v120 →
-sctk 0.19.2 has no `AxisValue120` handler (verified in the cargo cache) →
-winit 0.30.13 pins that sctk and has zero value120 references even on its
-own master branch, so the block is winit, not sctk or the compositor —
-switching KWin→Mutter would not fix it.
-
-**Lane PARKED by Amy's call** ("fix kaijutsu-app for what already works
-… experiment later with the HID++ device"). Carried forks exist and were
-protocol-verified live (`~/src/research/{client-toolkit,winit}`, branches
-`tobert/axis-value120-0.19` and `tobert/wayland-axis-value120-0.30`) but
-`[patch.crates-io]` was removed from `Cargo.toml` per the no-committed-
-path-deps rule; re-wire via the `tobert/*` GitHub forks when resumed. Root
-probe also found the Bolt receiver (046d:c548) runs on `hid-generic`, not
-`hid_logitech_dj` — hidpp never manages the mouse, a separate,
-possibly-upstreamable one-line kernel fix
-(`~/src/research/bolt-dj-bind-test.sh`). Do not re-add smoothing hacks
-meanwhile; pipeline stays fraction-ready.
-
 ## `docs/architecture/` needs re-certification, and two diagrams are missing (2026-08-16)
 
 The two deleted diagrams (`01-system-topology.svg`, `06-crate-deps.svg`)
@@ -1925,13 +1780,6 @@ as improved, not re-certified. And: `test_task_status_lww_tiebreak_order`
 still pinning `TaskStatus` LWW order — decide whether that order needs
 pinning at all now that concurrent merge into a kernel document is
 structurally impossible.
-
-## Catch-up seam: mark and jump to the read/unread boundary (2026-08-16)
-
-Proposal, not built: record where the reader last left the tail
-(app-local first; kernel roster/per-principal read state later), render a
-rule at that seam, bind a jump-to-seam chord. Pairs with sticky follow,
-which already knows the moment the user leaves the tail.
 
 ## Error stub polish: dedupe summary-vs-detail, cap wrapped height (2026-08-16)
 
@@ -2017,17 +1865,6 @@ running the command in a shell. And a create-path script under `set -e`
 should degrade rather than abort: a failed helper takes down the whole
 context create, and a context with no stance is worse than a stance that
 reads a little ragged.
-
-## The well's activity glow wants a derived signal (2026-08-15)
-
-Still disabled: `RingActivity`'s decay/ripple math is live and tested,
-but nothing calls `record` outside its own tests
-(`kaijutsu-app/src/view/time_well/activity.rs`, module doc confirms it).
-The old signal (kernel-wide token-stream events) is not coming back —
-Amy wants a kernel-side embedding-derived `(contextId, weight)` hint
-instead, riding the directive path (`onRenderCue`/`onBeatSync`), never
-batched. To re-enable: feed `RingActivity::record` from that signal and
-register an ingest system in `time_well/mod.rs`.
 
 ## `connection/drift.rs` still reads block events off the kernel-wide stream
 
@@ -2202,16 +2039,6 @@ Still open:
 - **No automatic reconnect** — `reconnect()` (`external.rs:468`) still has no
   caller; a dead server stays Down until `kj mcp reload`.
 
-## `kj backend` has no health check (re-filed 2026-08-11)
-
-Still true: no `doctor`/`check` verb exists in
-`crates/kaijutsu-kernel/src/kj/backend.rs` (verified absent). Wants
-something like `kj backend check <name>` (or `--check` on `kj backend
-list`) that probes a configured endpoint and reports reachability + model
-list.
-
----
-
 ## Ambient command center — trace packets, switchboard follow-ups (2026-08-10)
 
 Still unbuilt: the trace-packet/comet system (concepted, not built — no
@@ -2303,8 +2130,8 @@ history must not be quoted. Open:
 
 ## Cast follow-ups (seeded 2026-08-03)
 
-- No `kj fork --cast` (`kj/fork.rs` has only `--preset`).
-- No consumer of `cast_slots.loadout` outside the stored column.
+- Nothing reads `cast_slots.loadout`. Remove the column or give it a reader
+  in the capability redesign.
 - `available_models()` is hand-maintained per provider
   (`llm/mod.rs:899`) though a live Models API lookup exists for the context
   window (`llm/claude/models_api.rs`).
@@ -2414,12 +2241,8 @@ seconds — 16–32 bars" conflates durations (at 120 BPM in 4/4, that is
 - **`rpc.rs` is one file of about 10,600 lines.** It shrinks as execution
   moves into the kernel crate. Split the Cap'n Proto trait impl by domain
   (`rpc/vfs.rs`, `rpc/llm.rs`, `rpc/mcp.rs`).
-- **Reasoning-continuity guard, policy not built:** refuse `kj context set
-  --model` across provider families when signed Thinking exists in history;
-  allow the transition only at `fork`.
-- **Per-principal budgets and fair queuing** are deferred by name
-  (`mcp/servers/policy_admin.rs:12`); a broadened role loadout reaches a
-  live context only on re-create or restart.
+- A broadened role loadout reaches a live context only on re-create or
+  restart.
 
 ## Drift UX — cross-session ergonomics (2026-08-12)
 
@@ -2470,7 +2293,7 @@ The musician create rc attaches to a label-derived track before an explicit
 dock sparklines' data source is a placeholder (events/sec, running-block
 count); decide what they measure before polishing.
 
-## Control plane (kj): four gaps
+## Control plane (kj): two gaps
 
 - **Six more dead local `--json` fields.** kaish owns `--json` and
   `KjBuiltin::execute` strips it before the per-verb parse, so a local
@@ -2482,11 +2305,6 @@ count); decide what they measure before polishing.
 - **`--out` writes bypass the VFS.** `kj cas get` (`kj/cas.rs:148`) and
   `kj block cat` (`kj/block.rs:1028,1155`) `std::fs::write` relative to the
   server cwd, never through mounts.
-- **No `kj db tables|schema|dump`** for the "kernel has the answer but will
-  not tell you" case; `kj db` is backup/checkpoint only.
-- **`--type` exists on `context create` only, not on `fork`**, and
-  `context create --parent` copies zero blocks. Open question: should
-  `kj fork --type <T>` exist for "branch into a director/toolie".
 
 ## Index and ABC: two schema-shaped debts
 
@@ -2504,13 +2322,6 @@ The ABC v2.1 reference maps notation to `kaijutsu-abc` support status as of
 2026-05-25; 27 commits have touched the crate since, including the June 30
 conformance push. The crate's tests are truth; re-derive the matrix from
 them or drop the status columns.
-
-## Time well: two stubs (`docs/timewell.md`)
-
-The horizon dive handler logs "not yet built" (`view/time_well/scene.rs:1293`)
-though `docs/horizon-dive.md` exists; pause gating persists `paused_at` and
-dims the card but no beat/OODA wakeup gate or turn-start refusal is wired.
-Stages 4 and 5 of the plan are open in the doc.
 
 ## Tracks do not re-arm after a kernel restart
 
@@ -2547,12 +2358,6 @@ this starves the ambient pool, which is the path the SSH-in-when-the-app-is-
 down fallback depends on. Route `resolve`/`create`/`mkdir` through
 `spawn_blocking` or `tokio::fs`.
 
-## Archive-time summaries, written by a local model (Amy, 2026-08-03)
-
-Not built. Generate one small summary when a context archives (frozen input,
-no invalidation problem); good local-model work. Open: where it lives
-(handle field vs. a block), which model, whether conclude/demote get it too.
-
 ## kaijutsu-mcp Remote backend collapses multi-context ops to one context
 
 `context_ids()` (`kaijutsu-mcp/src/lib.rs:844`) returns only the joined
@@ -2571,15 +2376,6 @@ context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
 - `contrib/kaijutsu-runner.sh` rebuilds only `kaijutsu-app`; a wire change
   still needs `kaijutsu-server` and `kaijutsu-mcp` rebuilt by hand
   (`docs/operating.md`).
-
-## `ExecResult.output` cannot carry structured data past kaish's output limiter (found 2026-07-18)
-
-Still true on kaish 0.17.1: `materialize()` (`kaish-types/src/result.rs:504`)
-clears `.output` unconditionally even when `.out` never consumed it. `kj`
-works around it by writing only `.data`, bridged at `block_output_data`
-(`kaijutsu-server/src/rpc.rs`), regression-pinned in `kj_builtin.rs`. The
-clean fix is upstream: clear `.output` only inside the `if .out.is_empty()`
-branch.
 
 ## Conversation-view latent costs (surface slice 0, 2026-08-18)
 
@@ -2614,17 +2410,6 @@ debounce, `rich.rs`. Bounded (budgeted parsers), not free; nobody has
 measured a streamed diff on this path yet. Fix if it bites: a debounce
 scoped to `is_drawn()` blocks in `Running` status only.
 
-## Text effects on the surface: the instance buffer is the map (2026-08-18)
-
-Answered design question (Amy asked whether shader-driven colored text can
-come back): the glyph instance buffer (per-glyph doc position, quad, UV,
-color) already is the "map of text and positions" — effects return as
-per-instance attributes + glyph-shader work, not texture post-processing.
-Rainbow = hue(doc pos, time); halo/glow = widen MSDF distance thresholds.
-Cross-glyph effects (blur, distortion) are the one class needing a texture:
-draw to an intermediate layer, composite with a post shader if ever needed.
-Not built; this is the intended route when rainbow/halo return.
-
 ## ANSI rendering, pass 1: four corners left open (2026-08-19)
 
 Stage 3.2/3.3 (`StyleSpan` → parley ranged brushes → `PositionedGlyph`) is
@@ -2643,21 +2428,6 @@ shipped. Still open, all verified against current code:
   a re-shape within a frame or two.
 - **Backgrounds/underlines bake color into vertices** — `ShapeKey::
   baked_theme_epoch` exists for exactly this reason.
-
-## vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
-
-Upstream bug in `vte::Parser::advance_partial_utf8` (not `kaijutsu-ansi`):
-`strip(&[0xCD, 0xAE, 0x1B, 0xFF])` differs when fed as one chunk vs. two —
-chunked feed leaks an extra replacement character and silently drops the
-`0x1B` (ESC) that followed a resumed multi-byte codepoint. Narrow trigger
-(incomplete UTF-8 lead byte as the last byte of a `feed` call, continuation
-immediately followed by a control byte in the next) — exactly the shape of
-chunked kaish output mixing multibyte text and escapes. Pinned as a
-regression test asserting the *current* buggy divergence:
-`crates/kaijutsu-ansi/tests/vte_partial_utf8_regression.rs` — a `vte`
-upgrade that fixes it fails this test loudly. Not worked around in
-`kaijutsu-ansi` (would mean reimplementing vte's UTF-8 resumption). Fix:
-file upstream against `alacritty/vte`, or vendor-patch if needed sooner.
 
 ## Capability names and layout need a redesign sweep (Amy, 2026-08-20)
 
@@ -2707,3 +2477,71 @@ experiment" — treat `Editor` as provisional until that sweep.
 - **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);
   the mailbox notice block for a paused PostCall; wire-level interactive cancel
   (no wire cancel exists for durable interactive commands).
+
+## Waiting on upstream
+
+Each of these needs a change in another project before anything here can
+move. Re-check when that dependency's version changes.
+
+### Kaish positional suffix expansion
+
+The locked kaish 0.17.2 expands `${0%.kai}` to an empty value, rather than
+stripping the suffix or rejecting unsupported syntax. The rc migration exposed
+this as a failed companion-file read. Shipped scripts use `dirname "$0"` and
+`basename "$0" .kai` instead. Audit unsupported parameter expansion in kaish;
+keep it explicit rather than silently accepting a different expression.
+No upstream issue has been posted.
+
+### OSC 8 hyperlinks wait on a ratatui span attribute (2026-09-13)
+
+`present::links` detects the paths and URLs a hyperlink would target, with
+tests, but nothing emits one: ratatui 0.30.2 and ratatui-core 0.1.2 carry
+no hyperlink attribute on a `Style` or a `Span`, and the backend diffs
+cells — escape bytes smuggled into a cell's symbol would be miscounted as
+width and overwritten by the next diff. The exit is a ratatui feature that
+adds the attribute, or a custom backend that writes OSC 8 around a cell's
+own bytes; neither is built.
+
+### Hi-res wheel (v120) blocked at winit/sctk — slow drags are a compositor dead zone (2026-08-16)
+
+Root cause confirmed, not app-side: MX Master emits sub-detent v120 →
+sctk 0.19.2 has no `AxisValue120` handler (verified in the cargo cache) →
+winit 0.30.13 pins that sctk and has zero value120 references even on its
+own master branch, so the block is winit, not sctk or the compositor —
+switching KWin→Mutter would not fix it.
+
+**Lane PARKED by Amy's call** ("fix kaijutsu-app for what already works
+… experiment later with the HID++ device"). Carried forks exist and were
+protocol-verified live (`~/src/research/{client-toolkit,winit}`, branches
+`tobert/axis-value120-0.19` and `tobert/wayland-axis-value120-0.30`) but
+`[patch.crates-io]` was removed from `Cargo.toml` per the no-committed-
+path-deps rule; re-wire via the `tobert/*` GitHub forks when resumed. Root
+probe also found the Bolt receiver (046d:c548) runs on `hid-generic`, not
+`hid_logitech_dj` — hidpp never manages the mouse, a separate,
+possibly-upstreamable one-line kernel fix
+(`~/src/research/bolt-dj-bind-test.sh`). Do not re-add smoothing hacks
+meanwhile; pipeline stays fraction-ready.
+
+### `ExecResult.output` cannot carry structured data past kaish's output limiter (found 2026-07-18)
+
+Still true on kaish 0.17.1: `materialize()` (`kaish-types/src/result.rs:504`)
+clears `.output` unconditionally even when `.out` never consumed it. `kj`
+works around it by writing only `.data`, bridged at `block_output_data`
+(`kaijutsu-server/src/rpc.rs`), regression-pinned in `kj_builtin.rs`. The
+clean fix is upstream: clear `.output` only inside the `if .out.is_empty()`
+branch.
+
+### vte 0.15.0 drops a control byte after a chunked partial UTF-8 codepoint (2026-08-19)
+
+Upstream bug in `vte::Parser::advance_partial_utf8` (not `kaijutsu-ansi`):
+`strip(&[0xCD, 0xAE, 0x1B, 0xFF])` differs when fed as one chunk vs. two —
+chunked feed leaks an extra replacement character and silently drops the
+`0x1B` (ESC) that followed a resumed multi-byte codepoint. Narrow trigger
+(incomplete UTF-8 lead byte as the last byte of a `feed` call, continuation
+immediately followed by a control byte in the next) — exactly the shape of
+chunked kaish output mixing multibyte text and escapes. Pinned as a
+regression test asserting the *current* buggy divergence:
+`crates/kaijutsu-ansi/tests/vte_partial_utf8_regression.rs` — a `vte`
+upgrade that fixes it fails this test loudly. Not worked around in
+`kaijutsu-ansi` (would mean reimplementing vte's UTF-8 resumption). Fix:
+file upstream against `alacritty/vte`, or vendor-patch if needed sooner.
