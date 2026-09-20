@@ -19,8 +19,9 @@ or earn a core `kj` verb.
 Use the existing timeline, resolver, runtime, and CAS contracts before adding
 another mechanism. Read `docs/hyoushigi.md`, `docs/tracks.md`, and
 `docs/audio-inference.md` when changing their boundaries. Check implementation
-against design claims: the current resolver call is synchronous, so slow work
-must not be placed on the beat path. Track realignment in `docs/issues.md`,
+against design claims: a resolver's start and each poll run on the beat path
+and must return without blocking, so slow work belongs behind the resolver's
+own admission. Track realignment in `docs/issues.md`,
 "Anticipation and commitment — iteration order".
 
 ## Working together
