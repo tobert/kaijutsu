@@ -1,7 +1,7 @@
 //! e2e: **an approval executes**. A human answering `kj ledger allow <id>`
 //! on an ask that carries `exec_source` makes the kernel run that source —
 //! in the ask's context, as the ask's principal, in the ask's cwd — and fill
-//! the command/output block pair waiting on it. `docs/gate-shape-b.md`,
+//! the command/output block pair waiting on it. `docs/gate-resume.md`,
 //! "Slice 5: approval executes".
 //!
 //! Everything here is driven through real surfaces on a live server:
@@ -711,7 +711,7 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
 /// A model's own linked pair (`PairOwner::Turn`) gets the same seed a
 /// driver-authored pair does: its turn ended at the gate too, and the fill
 /// is an in-place edit its cached mailbox will not re-read on its own
-/// (`docs/gate-shape-b.md`, "The subscriber, in order").
+/// (`docs/gate-resume.md`, "The subscriber, in order").
 ///
 /// Falsified by treating every linked pair as told-nobody regardless of
 /// owner: no "It has run." seed would appear and a delegated turn would
@@ -1261,7 +1261,7 @@ fn an_allowed_ask_whose_cwd_is_gone_runs_nothing_and_names_the_directory() {
 
 /// An archived context runs nothing, even when the answer was given while it
 /// was still Live — the second of the two archived checks
-/// (`docs/gate-shape-b.md`, "Archived contexts are inert"). `kj ledger allow`
+/// (`docs/gate-resume.md`, "Archived contexts are inert"). `kj ledger allow`
 /// refuses an archived context's ask, so the archive has to land AFTER the
 /// answer, which is exactly the gap the second check exists for.
 ///

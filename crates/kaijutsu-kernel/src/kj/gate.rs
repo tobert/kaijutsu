@@ -12,7 +12,7 @@
 //! be redeemed by a new invocation.
 //!
 //! Gate outcomes keep current cwd selection distinct from an approval's
-//! captured directory, including a captured unset cwd. See `docs/gate-shape-b.md`
+//! captured directory, including a captured unset cwd. See `docs/gate-resume.md`
 //! and `docs/kaish-integration.md`.
 
 use crate::runtime::context_shell::ShellCwd;
@@ -2298,7 +2298,7 @@ mod tests {
 
     /// The whole point: an escalating shell ask records the value each free
     /// variable held in `context_env` at ask time, and the human-facing
-    /// description carries a NOTE naming it (`docs/gate-shape-b.md`) — so a human approving the ask and the
+    /// description carries a NOTE naming it (`docs/gate-resume.md`) — so a human approving the ask and the
     /// execution that later runs it never see different values.
     ///
     /// Falsified by making `build_ask` pass `env: vec![]` unconditionally

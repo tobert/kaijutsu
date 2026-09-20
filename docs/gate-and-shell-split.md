@@ -153,8 +153,9 @@ three-way distinction is real and live, but it lives in one `RefusalKind`
 carried by a single `McpError::Refused(Refusal)` — not as three separate
 `McpError` variants each carrying its own `by_hook: HookId`, which is what
 the code below still shows. `crates/kaijutsu-kernel/src/mcp/error.rs` and
-`kaijutsu-types/src/refusal.rs` are the code; `docs/gate-shape-b.md` is the
-build record. The reasoning that follows is still correct — read
+`kaijutsu-types/src/refusal.rs` are the code; `docs/gate-resume.md`, "The
+refusal contract and approval execution", is the build record. The
+reasoning that follows is still correct — read
 `Denied`/`GateUnavailable`/`GatePending` as `RefusalKind::{Denied,
 GateUnavailable, Pending}` as you go.
 
@@ -1367,8 +1368,9 @@ Additive. Test: `kj_tool_plan_clause_matches_the_shared_renderer`, which
 computes the expected string from the module and compares it inside the
 hook body, so the twin and the renderer cannot drift apart unnoticed.
 
-**`env`** (added on top of the surface above, `docs/gate-shape-b.md`'s free
-`${VAR}` snapshot): a top-level sibling of `statements`, an array of
+**`env`** (added on top of the surface above, `docs/gate-resume.md`'s "The
+ask carries its free variables" snapshot): a top-level sibling of
+`statements`, an array of
 `{"name":…,"value":…}` — one entry per free variable across every
 statement, statement-level and non-literal-heredoc free variables unioned
 together, `value` reading `null` for a name unset in `context_env` at fire

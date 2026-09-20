@@ -501,7 +501,7 @@ pub struct NewAsk {
     pub cwd: Option<String>,
     /// The text to run if this ask is allowed, verbatim. `None` grants no
     /// execution: a result-review owner continues its captured result, while
-    /// other callers collect the answer on retry. See `docs/gate-shape-b.md`.
+    /// other callers collect the answer on retry. See `docs/gate-resume.md`.
     pub exec_source: Option<String>,
     /// The separately supplied standard input replayed with `exec_source`.
     pub exec_stdin: Option<String>,
@@ -509,7 +509,7 @@ pub struct NewAsk {
     /// The value every free variable in `statements` held at ask time —
     /// `kj::env_snapshot::free_variable_values`'s output, ready to insert.
     /// Empty for an ask whose statements have no free variables, or whose
-    /// origin has none to compute (`docs/gate-shape-b.md`).
+    /// origin has none to compute (`docs/gate-resume.md`).
     pub env: Vec<NewAskEnv>,
 }
 

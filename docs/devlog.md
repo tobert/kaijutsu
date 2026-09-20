@@ -812,7 +812,8 @@ of=${DEV}` would have redeemed every future value. The hook gate plans a
 shell call the way the shell gate does now. And the hook feeding the scorer
 from Amy's terminal was shelling to whichever `kaish` was on the path, which
 the 0.17 bump had swapped underneath it. *"Let's use kaish as a library which
-mcp already does so there's no way to have version skew."* `docs/gate-shape-b.md`.
+mcp already does so there's no way to have version skew."* `docs/gate-resume.md`, "The refusal contract and approval
+execution".
 
 ## The name that had no home (September 5–8)
 

@@ -279,7 +279,7 @@ async fn prepare_while_running<T, E: std::fmt::Display>(
 /// Claim before preparation or execution. The redemption primary key grants
 /// one owner; a spent claim never authorizes replay. A crash before execution
 /// can lose the action. Startup does not resume approved source across restart.
-/// See `docs/gate-shape-b.md`.
+/// See `docs/gate-resume.md`.
 async fn act_on_executable_answer(
     kernel: &Arc<Kernel>,
     context_id: ContextId,

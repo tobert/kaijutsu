@@ -338,7 +338,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     -- `authorized_label` and NOT a statement's `rendered`: the first means
     -- different things per origin and the second is a rendering built for a
     -- human to read. NULL means this ask cannot be executed on approval and
-    -- its caller must retry instead. docs/gate-shape-b.md.
+    -- its caller must retry instead. docs/gate-resume.md.
     exec_source      TEXT,
     -- The separately supplied stdin replayed with exec_source.
     exec_stdin       TEXT,

@@ -162,7 +162,7 @@ pub enum CallError {
 
     /// A gate or a capability refused, and said why. A verdict, not a
     /// fault: the call reached a decision and the caller must not retry
-    /// blindly (`docs/error-chain.md`, `docs/gate-shape-b.md`). Kept out of
+    /// blindly (`docs/error-chain.md`, `docs/gate-resume.md`). Kept out of
     /// [`CallError::Rpc`] for the same reason as `Vfs` above — branch on
     /// `.kind` rather than matching prose, and an ask id (`.ask_id()`) is
     /// now a handle a caller can hold instead of regexing out of a message.

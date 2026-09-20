@@ -179,7 +179,8 @@ does not invent a fifth:
 ### The gate lane — SHIPPED 2026-09-01
 
 The gate+capability family is done, on all seven methods, and it did wait on
-no general design. `docs/gate-shape-b.md` is the record.
+no general design. `docs/gate-resume.md`, "The refusal contract and approval
+execution", is the record.
 
 The shared shape is `kaijutsu_types::Refusal` — `kind`, `reason`, `subject`,
 an optional `AskRef`, an optional `remedy` — declared once in

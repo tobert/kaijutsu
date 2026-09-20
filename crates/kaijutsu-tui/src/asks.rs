@@ -571,7 +571,7 @@ impl LedgerViewState {
 
 /// A context's label/type, defaulting to its short id and `"default"` when
 /// [`crate::app::App`] has no [`kaijutsu_client::ContextInfo`] for it (an
-/// ask can outlive the context it named — `docs/gate-shape-b.md`, "Archived
+/// ask can outlive the context it named — `docs/gate-resume.md`, "Archived
 /// contexts are inert").
 pub fn context_facts(app: &crate::app::App, ctx: kaijutsu_types::ContextId) -> (String, String) {
     match app.info(ctx) {

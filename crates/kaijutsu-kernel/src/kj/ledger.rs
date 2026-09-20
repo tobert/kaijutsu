@@ -784,7 +784,7 @@ impl KjDispatcher {
             Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
         };
         // The free-variable values an approval runs with, recorded on the
-        // ask at raise time (`docs/gate-shape-b.md`, "The ask carries its
+        // ask at raise time (`docs/gate-resume.md`, "The ask carries its
         // free variables") — always loaded, not gated on `--signals`, since
         // this is what execution reads, not an advisory extra.
         let env_rows = match approval_ledger::ask::load_ask_env(conn, request_id) {
@@ -1223,7 +1223,7 @@ impl KjDispatcher {
             // This is the first of two checks. The second runs at execution
             // time, because a context can be archived in the gap between an
             // answer and the run it authorizes, and a check here alone would
-            // not see that. `docs/gate-shape-b.md`, "Archived contexts are
+            // not see that. `docs/gate-resume.md`, "Archived contexts are
             // inert".
             match approval_ledger::ask::get_approval(conn, request_id) {
                 Ok(Some(row)) => {

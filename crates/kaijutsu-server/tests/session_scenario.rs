@@ -549,7 +549,7 @@ fn kaijutsu_session_scenario() {
         .await;
 
         // The approval EXECUTES — the statement really ran as banto, not
-        // just a recorded decision (`docs/gate-shape-b.md`, "Slice 5:
+        // just a recorded decision (`docs/gate-resume.md`, "Slice 5:
         // approval executes"): the ask's own linked output block fills in
         // with the command's real stdout.
         let output_block_id = ask

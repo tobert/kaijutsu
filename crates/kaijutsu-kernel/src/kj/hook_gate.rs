@@ -34,7 +34,7 @@
 //! is a kaish program. It is planned here exactly as
 //! [`crate::kj::shell_gate`] plans a direct submission, and the ask carries
 //! what that plan yields: the command as `exec_source`, so an approval runs
-//! it (`docs/gate-shape-b.md`); the planned statements, so the
+//! it (`docs/gate-resume.md`); the planned statements, so the
 //! gate snapshots the free variables' values; and the free and bound names
 //! on the statement, so the ledger refuses to remember an ALLOW rule for a
 //! command whose meaning depends on a `${VAR}`. Without that last part a

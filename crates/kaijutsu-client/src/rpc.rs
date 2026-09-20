@@ -4592,7 +4592,7 @@ fn vfs_error_kind_from_capnp(
     })
 }
 
-/// Read a gate/capability verdict off the wire (`docs/gate-shape-b.md`). A
+/// Read a gate/capability verdict off the wire (`docs/gate-resume.md`). A
 /// total match over both enums, so a new `RefusalKind` or `AskStatus`
 /// variant fails to compile here rather than silently reading as its
 /// neighbour.
@@ -4670,7 +4670,7 @@ pub enum RpcError {
     },
     /// A gate or a capability refused one of the seven gate-shape-B calls,
     /// and said why. A verdict, not a fault — branch on `.kind` rather than
-    /// reading this message (`docs/gate-shape-b.md`).
+    /// reading this message (`docs/gate-resume.md`).
     #[error("{0}")]
     Refused(kaijutsu_types::Refusal),
     #[error("{0}")]

@@ -362,7 +362,7 @@ the command ran anyway and printed its output. The check is load-bearing.
 The pin was in memory on the ruling above: an ask cannot outlive the
 process, so neither should its pin.
 
-**Reversed 2026-09-01** (`docs/gate-shape-b.md`, "The cwd moves onto the
+**Reversed 2026-09-01** (below, "The cwd moves onto the
 ask"). That ruling collided with the one two paragraphs up — a decided ask
 **is** never swept at boot — and the collision is reachable: a human answers
 `allow`, the kernel restarts before the caller retries, `take_pinned_cwd`
@@ -436,6 +436,554 @@ is redeemable.*
 - a **rule-decided** ask (`auto_reason` set) is an audit record, not an offer;
 - **learning a rule spends the answer it was learned from.**
 
+## The refusal contract and approval execution
+
+This part is the refusal and wire contract, and the record of how approval
+came to execute. Code comments cite its subsections by name, so keep the
+headings below as they are.
+
+### What this contract gives a refused caller
+
+`kj ledger allow <id>` — and the command runs. The kernel executes the source
+it stored, into the blocks already waiting on that ask.
+
+This contract gives a refused caller three things a bare transport exception
+does not: a **structured refusal** instead of a transport exception, an **ask
+id** it can hold rather than regex out of prose, and an **answer that
+executes** rather than a retry it has to reconstruct byte-for-byte.
+
+- What is wrong and why: `docs/issues.md`, "Gate wiring: one defect, three
+  symptoms".
+- Which idiom this family gets, and where the family stops:
+  `docs/error-chain.md`, "The one shared shape, and where it stops".
+- The gate's own doctrine: `docs/gate-and-shell-split.md`.
+
+**This grew into most of the durable-resume design "Rescoped" above deleted.**
+`docs/issues.md` split the work in two: this contract was structured refusals
+plus a retry keyed on the ask id, and the durable-resume design was approval
+alone being enough to run the work, detached from the original caller. The
+durable-resume design was held back because it "needs the environment
+captured at ask time and an answer for staleness." Both were settled on
+2026-09-01 — the cwd moves onto the ask, and environment stability is the
+caller's contract — so the retry half of this contract was dropped in favor
+of executing on approval.
+
+What is still not the durable-resume design: output lands in the blocks the
+original call already authored, not in a work item detached from any call,
+and nothing survives a restart. The subscriber is in memory.
+
+### The wire shape
+
+A verdict cannot ride the capnp error channel: `capnp::ErrorKind` is
+`Failed`, `Overloaded`, `Disconnected`, `Unimplemented`, and none of them
+means "denied". So a refusal rides the result.
+
+capnp rejects a union declared inline in a method's result list — both the
+named form (`-> (outcome :union { … })`) and the bare form are parse errors
+under capnp 1.5.0. Each of the seven methods therefore names a result struct:
+
+```capnp
+struct ShellExecuteOutcome {
+  union {
+    ok      @0 :BlockId;
+    refused @1 :Refusal;
+  }
+}
+```
+
+A union, not a sibling field. A caller that forgets to check a
+`hasRefusal()` flag reads a zeroed `BlockId` and believes it succeeded; a
+union makes the Rust match exhaustive, so the refusal cannot be skipped by
+inattention. This is the "keep it loud" constraint applied to the wire —
+never a success with a status field nobody reads.
+
+**Ordinals do not move.** Only the return *types* change, so the seven keep
+`@2 @7 @43 @45 @58 @87 @99` and no `retiredNN` stub is needed. Permitted
+under the flag-day rule: wire only, never storage.
+
+`Refusal`, `RefusalKind`, `AskRef` and `AskStatus` are defined once beside
+the other error types in `kaijutsu.capnp`, and mirrored in
+`kaijutsu-types/src/refusal.rs` for the Rust halves.
+
+**`AskStatus` is a second enum on purpose.** `approval-ledger` and
+`kaijutsu-types` are independent leaves — neither depends on the other — and
+making one depend on the other to share six variants is the more expensive
+mistake. A kernel test pins the correspondence, the way `Status` and its
+capnp ordinals are already pinned.
+
+### The type must survive every boundary, and there are five
+
+The VFS family proved the failure mode: fixing capnp bought nothing until the
+client's actor stopped re-flattening the result one hop later.
+
+```text
+McpError → capnp → RpcError → CallError → the app
+```
+
+**Every boundary that stringifies is a place the type dies.** A fix that
+stops at the wire is not a fix. `RpcError::Refused` and `CallError::Refused`
+are both required.
+
+### Three findings that change the build
+
+#### 1. A mandatory `HookId` forced the model's main shell path off the type
+
+`McpError::Denied`, `GatePending` and `GateUnavailable` each require a
+`by_hook: HookId`. The direct `shell_write` gate has no hook behind it, so it
+cannot construct any of them, and
+`crates/kaijutsu-kernel/src/mcp/servers/shell.rs:505` reports every
+non-allowed outcome as `McpError::Protocol` — a **fault** variant carrying a
+**verdict**, with the distinction left in the words:
+
+```rust
+return Err(McpError::Protocol(format!(
+    "{headline} [{}]: {} — nothing was run",
+    outcome.ask_description(),
+    outcome.reason
+)));
+```
+
+This is the path a model actually takes. The three-way split exists and this
+path cannot reach it.
+
+**The fix is to carry a `Refusal`, not a `HookId`.** `Refusal.subject` is
+empty when nothing has a name, so a hookless gate produces a true
+`GatePending` instead of a `Protocol` fault.
+
+#### 2. The ask id is born as prose
+
+`GateOutcome::ask_description()` (`kj/gate.rs:162`) is
+`format!("ask {} ({})", a.request_id, a.status)`, and every consumer carries
+that string forward. The typed `AskRef` already exists one line above it and
+is discarded at the first layer. Nothing downstream can recover the id
+without parsing — which is exactly what a test does today
+(`mcp/servers/shell.rs:1167`, taking the first whitespace-separated token of
+a `kj ledger list` line).
+
+#### 3. A decided ask outlives its cwd pin
+
+The collision between "the cwd pin lives in memory" and "a decided ask is
+never swept at boot" is narrated above, under "Rescoped: the kernel does not
+resume across a restart" ("**Reversed 2026-09-01**"). Two facts from the
+original finding are not told there and stay here: `mcp/servers/shell.rs:517`
+assigns the returned `None` straight to `pinned_cwd`, so the `if let
+Some(cwd)` validation below it never runs; and the guard at `shell.rs:552`
+only fires when a pin *exists* and fails to resolve — a *missing* pin falls
+through silently. The gap is narrow — the restored cwd usually equals the
+pinned one, since both are read from `context_shell.cwd` — but reachable
+whenever the context `cd`s between escalation and restart, which is the
+scenario the pin was built for.
+
+This is the finding that put the cwd fix in this contract rather than
+leaving it to the pin: "verify that context still matches the ask" cannot be
+done against a pin that only lives in memory. See "The cwd moves onto the
+ask", below.
+
+### What changes in redemption
+
+Today (`kj/gate.rs:526`, the one production call site): the caller re-sends
+the statement, the gate re-renders it, re-derives a digest per statement, and
+`find_redeemable` requires an exact **set** match of those digests against
+the ask's stored statements — plus label, context, principal, `status IN
+('allowed','denied')`, `auto_reason IS NULL`, and not already in
+`approval_redemptions`.
+
+Under Shape B the caller presents `request_id`. Everything in that predicate
+**except the digest set match** still has to hold. The digest comparison is
+replaced by a direct lookup, and the statement text to execute is read back
+from the ledger (`ask::load_ask_statements`), so there is one copy instead of
+two and nothing to reconcile.
+
+**Allow rules are a different mechanism and do not change.**
+`approval_rules` is keyed on `statement_digest` and served by
+`rules::redeem`; `find_redeemable` never touches it. Removing statement
+matching from single-use redemption leaves standing rules exactly as they
+are.
+
+**Exactly-once is already structural.** `approval_redemptions.request_id` is
+a `PRIMARY KEY` and `redeem_ask` decides on the `INSERT`'s row count rather
+than reading first. Presenting an id does not weaken it.
+
+### The cwd moves onto the ask
+
+**Settled and shipped:** the cwd is recorded on the `approvals` row instead
+of pinned in memory; see "Rescoped: the kernel does not resume across a
+restart", above, for the column and its `ALTER TABLE` mechanics. Redemption
+then verifies instead of shrugging:
+
+| ask's recorded cwd vs the context's live cwd | what happens |
+|---|---|
+| match | run there |
+| diverged | refuse, naming both directories |
+| the ask recorded none | run unpinned, as a caller with no context does today |
+
+The two alternatives were refusing on a lost pin — which leaves a human's
+approval permanently uncollectable — and sweeping decided-unredeemed asks at
+boot, which discards that approval outright. Both trade a silent wrong
+directory for a dead ask.
+
+This records a piece of the caller's environment durably: this contract is
+"the kernel executes the stored statement after verifying the context still
+matches the ask", and there is nothing to verify against if the ask does not
+carry what it was asked under. It is one column, not a claim protocol.
+
+### Slices: the wire and execution build
+
+1. **The shared types.** SHIPPED. `kaijutsu-types::refusal` and the capnp
+   declarations. No behavior change.
+2. **`McpError` carries a `Refusal`.** SHIPPED. The three gate variants
+   collapsed to `McpError::Refused(Refusal)` — the kind carries what the
+   variants did — and the hookless `shell_write` gate produces a real
+   verdict for the first time (finding 1). `settled_block_status()` reads
+   the kind and keeps its one mapping.
+
+   It also closed something not in the plan: `PhaseOutcome::Deny` carried a
+   reason the LLM-visible path discarded, which is why `docs/issues.md`'s
+   first hard receipt showed a broken hook as a bare "denied by hook
+   shell-escape-guard". Denials keep their reason now — a D-28 change, and
+   the one `docs/gate-and-shell-split.md` already argued for.
+3. **The wire.** Seven result structs, the server side, the client side,
+   `RpcError::Refused` → `CallError::Refused`. Two helpers carry a refusal
+   across: `set_refusal` on the server, `refusal_from_capnp` on the client,
+   both total matches so a new kind is a build error.
+4. **The consumers.** SHIPPED, and larger than expected. The client wrappers
+   kept their signatures, so app/mcp/acp needed no changes and their existing
+   error rendering picked up the structured `Display` — reason, ask id and
+   remedy — for free.
+
+   What did need work was **the model's own tool path**, a seventh
+   block-settling site that never reached `settled_block_status()`.
+   `llm_stream.rs` derived `final_status` from `is_error`, so a pending ask
+   settled its ToolCall/ToolResult pair `Error` and reached the model as
+   `"Execution error: …"`. That is the collapse this lane exists to remove,
+   on the surface where it costs the most: a model reads a crash, retries,
+   and mints another ask. `map_tool_dispatch_result` now returns the settled
+   status beside the error flag, because the two answer different questions —
+   `is_error` is the D-28 channel and is always true for a refusal; `status`
+   is what the blocks settle to and is `Waiting` for a pending one.
+
+   Each kind also carries a stable `ErrorPayload.code` (`gate.pending`,
+   `gate.denied`, `gate.unavailable`, `capability.*`), following
+   `tool.timeout`'s precedent, so a consumer branches on a code rather than
+   on prose.
+5. **Approval executes.** SHIPPED. The cwd and `exec_source` columns, the
+   block link, the free-variable snapshot, the executor branch in the
+   `ledger.changed` driver, and the split of `PENDING_REASON` into an
+   executes text and a retry text. The digest set match STAYS (below).
+
+   **Live for every shell origin.** The first live probe after deploy
+   showed the gap: with hooks installed, every production shell ask comes
+   through `hook_gate.rs`, which carried no source, no plan and no
+   variables, so approval executed for nothing and, worse, an ALLOW rule
+   remembered on `dd of=${DEV}` would have redeemed every future value of
+   `DEV`. The hook gate now plans a shell-shaped call the way the shell
+   gate plans a submission: the command rides as `exec_source`, the
+   planned statements feed the snapshot, and the free and bound names go
+   on the statement so the rule refusal fires. The RPC shell box's own
+   pair fills; the MCP `shell` path gets a pair authored and a wake. A
+   command that does not parse keeps the retry shape. The wire tests still
+   synthesize the link, because the harness installs no hook.
+
+### Slice 5: approval executes
+
+`kj ledger allow <id>` runs it. The caller checks its own blocks.
+
+**Approval triggers execution (Amy, 2026-09-01).** The answer runs the
+stored source and fills the command and output blocks already sitting
+`Waiting` on that ask. There is nothing for a caller to present, so the `ask`
+tool parameter and `kj ledger redeem <id>` from the earlier sketch are both
+gone.
+
+**Approval delivery owns execution as well as wakes.**
+`runtime/approval_resume.rs` subscribes to `ledger.changed` on the kernel worker.
+It claims executable answers before running source; other answers wake their
+caller to retry. The redemption primary key prevents a second execution, and a
+spent claim never permits restart replay. Preparation failures after the claim
+consume the approval without running its source.
+
+**What changed to make this available.** This document originally gave two
+reasons this was not on the table: the environment had to be captured at ask
+time, and staleness had no answer. Both are now settled — the cwd moves onto
+the ask (above), and the stability of the environment under an execution is
+the caller's contract ("What the ask must carry, and what it must not try
+to", below). What remains for the ask to carry is small and entirely
+durable: executable source, principal, context, cwd.
+
+**This is not the durable resume machinery deleted in August** — "Still
+open", below, tells the fuller version of that comparison.
+
+**It also closes the stranded pair.** A refused `submitInput` has already
+authored its command and output blocks, and they settle `Waiting` on the ask.
+Under a caller-presents-the-id shape, a retry authors a second pair and leaves
+the first waiting forever. Executing on approval fills in the pair that is
+already there, which is the behavior the `Waiting` status was introduced to
+describe.
+
+#### What must be built first
+
+- **An `exec_source` column on `approvals`, because no existing field is it.**
+  `approval_statements.rendered` is `render_for_review(ps)` — the plan's
+  rendering plus appended human-readable `NOTE:` lines about unquoted heredoc
+  delimiters (`kj/shell_gate.rs:125`, `:173`). Handing that to kaish would run
+  the notes. This document's own earlier finding says it outright: *"an
+  ask's statements carry `render_for_review(ps)` … not re-executable
+  source."*
+
+  There is a field that happens to hold executable text, and reaching for it
+  would be a mistake. `authorized_label` is the submitted source for a
+  `ShellGate` ask (`kj/shell_gate.rs:160`) and the **target session name**
+  for a `KjVerb` one (`kj/cc.rs:193`). Executing "whichever field is
+  executable for this origin" is an implicit per-origin rule that a fourth
+  origin would silently get wrong. Store the executable text in a column
+  whose only job is that.
+
+  `GateSpec` gains `exec_source: Option<String>`. `None` means this ask
+  cannot run on approval and the caller must retry — today's behavior,
+  preserved for any origin not wired to execute. It is not a silent fallback:
+  the refusal's `remedy` says which one the caller is getting.
+
+  The gate is all-or-nothing per submission, so the executable unit is the
+  whole submission, not the per-statement renderings.
+- **A free `${VAR}` means the approved text and the executed bytes can
+  differ.** Guarantee 3 already refuses to learn a RULE for such a statement.
+  The proposal was to refuse to execute one. **Instead (Amy): snapshot
+  the values onto the ask** — "The ask carries its free variables", below.
+
+#### The rest, settled
+
+- `approvals` gains `cwd` and `exec_source` through `ALTER TABLE ... ADD COLUMN`
+  guarded by `PRAGMA table_info`, following
+  `add_rc_runs_script_count_column_if_missing`. An added column rebuilds
+  nothing, so the FK-cascade hazard that table rebuilds carry does not apply.
+  This is the crate's second ALTER-TABLE step; the third is the point to
+  build the ladder its doc comment already names.
+- `cwd_pins`, `pin_cwd` and `take_pinned_cwd` are deleted with it.
+- `approval_redemptions.request_id` is a `PRIMARY KEY` and `redeem_ask`
+  decides on the `INSERT`'s row count, so exactly-once is already structural
+  and does not change.
+- **`find_redeemable`'s digest set match STAYS, and deleting it would have
+  been wrong.** It is only removable for an ask that redeems by id, and the
+  subscriber does not call `find_redeemable` at all — it looks a row up
+  directly. What still uses the matcher is the RETRY path, which is every
+  origin with `exec_source: None`.
+
+  Deleting it there would reopen a bug closed on 2026-08-23. `kj cc send`
+  renders the concrete message into its statement precisely so the digest
+  varies with it (`kj/cc.rs:138`); without the digest in the predicate,
+  `find_redeemable` matches on label + context + principal, and an approval
+  read for one message would redeem a send of any other message to the same
+  target. The matcher is not the duplication Shape B set out to remove — it
+  is the authorization key for callers that still retry.
+
+  It becomes deletable when every origin executes on approval, not before.
+- `PENDING_REASON` stops saying "run the same command again". It should say
+  what actually happens now: answer it, and the command runs.
+
+### The ask has to name its blocks, and the gate cannot
+
+An execution on approval fills the command and output blocks the original
+call already authored. That needs the ask to name them, and nothing in the
+gate path can: `shellExecute` creates the pair BEFORE gating, but reaches the
+gate through `broker().shell_pre_call_hooks`, which knows nothing about
+blocks.
+
+**The caller records the link after escalation.** `run_gate` returns
+the ask id, and `execute_shell_command` already holds both block ids, so it
+is the one scope where the three are together. `approvals` gains
+`command_block_id` and `output_block_id` (`BlockId::to_key()` form), written
+through `KernelDb::link_ask_blocks` so the ledger connection stays behind the
+kernel rather than being reached from the server.
+
+Best-effort and logged: the refusal is already correct and already returned,
+so a failed link degrades to the subscriber authoring fresh blocks, never to
+a failed call.
+
+**The MCP `shell_write` path links nothing** — it has no pair at gate time,
+and its ToolCall/ToolResult blocks are authored by the layer above it. An ask
+from that path carries `NULL`, and the subscriber authors into the ask's
+context instead.
+
+**Coverage.** `link_ask_blocks` is unit tested both ways, including that an
+unknown ask is an error rather than a silent no-op. The executor is covered
+by `kaijutsu-server/tests/gate_executes_wire.rs` over the real surfaces —
+`kj ledger allow|deny` answers from a second context — from both origins.
+The `shell_write` cases mint the ask over MCP and synthesize the block link,
+which isolates the subscriber from the gate. The `shell_box_*` cases drive
+the shipped path whole: `shellExecute` authors the pair, a PreCall `Ask`
+hook on `shell_write` refuses it with the command as `exec_source` (the
+hook gate plans a shell-shaped call the way `shell_gate` does) and the
+pair linked as `PairOwner::Session` — `execute_shell_command`'s own link
+call — and the allow fills that same pair with no second pair and no seed
+block, because a session-owned pair tells nobody; the deny settles it
+`Error`. Dropping the link call in `execute_shell_command` fails the allow
+case.
+
+### What the ask must carry, and what it must not try to
+
+**The stability of the environment under an execution is the caller's
+contract (Amy).** This is restated below, under "Still open" —
+`cargo build` pulls in whatever it pulls in at link and run time, and the
+ledger does not try to reproduce a world, so it does not snapshot one.
+
+This is what makes an approval executable at all. A CAS snapshot was
+considered and declined — the store exists, but a snapshot of a tree is not
+the environment (toolchain, network, link-time inputs), so it would buy
+confidence it cannot honor.
+
+**Not now, but the shape it would take:** a hook that takes a btrfs or
+container snapshot and steps it forward. Deliberately deferred — do not
+design around it.
+
+So the ask carries only what the *kernel* must know to run the thing at all:
+the executable source, the principal, the context, and the cwd. Everything
+else is the caller's.
+
+### The ask carries its free variables
+
+**Snapshot, do not refuse (Amy, 2026-09-02).** Approval captures the
+initial environment a contextual shell would read. `ContextShellInputs` supplies
+both construction and capture: selected cwd, durable exports, and host execution
+policy. HOME comes from the interpreter defaults, PWD from the selected initial
+cwd, and PATH from the kernel startup capture when Exec is granted. Durable
+exports override those values. Read-only shells never gain host execution from
+an environment value.
+
+`kj::env_snapshot` takes the union of statement and non-literal heredoc free
+variables, deduplicated in first-seen order. `approval_env` stores each value or
+explicit unset (`request_id, seq, name, value NULL-for-unset`). Before execution,
+the shared restore helper exports captured values and unsets captured absences.
+It validates all names and refuses duplicates before mutation; temporary overlay
+names cannot collide with any target. A restore failure prevents execution.
+
+Cwd and durable exports are read under one database lock. Storage faults refuse
+before recording an ask, including dry-run audit asks. The hook plan reader also
+reports a capture failure before running the classifier. Construction initializes
+kaish at the selected cwd, then validates that directory in its VFS namespace;
+there is no second database restore that can select a newer cwd.
+
+**Both consumers use the same input rules** (Amy: the classifier "should see
+the same data"). The broker's `KJ_TOOL_PLAN` includes `env: [{name, value|null}]`
+beside `statements`. Hook classification and ask creation are independent
+snapshots; intervening durable changes can affect the later one. The lfm2d scorer
+still does not substitute the environment into its clauses; see `docs/issues.md`.
+
+**The human sees the values on the ask's `description`, not on the
+statement rendering.** `approval_statements` is content-addressed and
+inserted once per digest, so a value baked into that row would show a later
+ask with different values the first ask's stale ones. The description is
+per-ask and already the line `kj ledger show` prints.
+
+**What it does not cover.** A command substitution runs a program and a
+clock reads the wall; neither is a variable, and neither appears as a free
+name. Those stay under the position that environment stability is the
+caller's contract.
+
+### The subscriber, in order
+
+Approval delivery runs on the kernel worker. `start_approval_delivery` installs
+one subscription and snapshots old answers before returning; unreadable backlog
+refuses host startup. Shutdown stops new delivery, cancels preparation and
+execution, and joins command settlement. A claimed action is never replayed.
+Cancelled preparation reports that no source ran; commands already running use
+the shared command cancellation and settlement path. Preparation unwinding
+settles only the claimed pair, or records a no-run error if no pair exists, then
+propagates the original panic. Shutdown retains delivery seeds for claimed work
+before joining, without starting another model turn.
+
+On each `ledger.changed` the driver re-reads the undelivered answers and,
+for each it has not acted on: resolves the context and refuses anything not
+Live; reads the whole approval row, because `exec_source` decides the branch
+and the answer summary does not carry it. No `exec_source`: the old wake,
+unchanged. A denial or cancellation with a linked pair: settle the pair
+`Error` with the reason on stderr, then redeem. A `Session` pair's blocks
+are its delivery. A `Turn` pair also gets a new seed saying that the action
+did not run, because its cached mailbox cannot observe the in-place edit. A
+terminal answer with no pair falls back to the wake. An allow: read liveness
+and the turn performer's assignment, then claim under the same database lock.
+Read faults leave the answer unclaimed for retry. Only the claim winner may
+settle a changed performer's pair or execute source. A repeated delivery cannot
+replace previously accepted output after reassignment. Then materialize a shell for the ask's principal and context under a synthetic
+session id, resolve or author the pair, move to the ask's cwd, restore the
+ask's env, run.
+
+**`link_ask_blocks` records who owns the pair, not just its ids.** A run
+into a `PairOwner::Session` pair — a connected session's own blocks, which
+it watches directly — tells nobody. A run into a pair whose turn ended at
+the gate — `PairOwner::Turn` (a model's own tool call) or one the driver
+authored fresh because the ask named none — gets a seed block naming the
+output; the seed also carries a turn request when no turn is in flight, and
+stands alone when one already is, because the fill is an in-place edit a
+running turn's cached mailbox will not re-read on its own `catch_up`. The
+same distinction applies when an allowed action cannot materialize a shell,
+restore its environment, or enter its recorded directory: a `Turn` receives
+an explicit no-run seed; a `Session` pair stays settled-only.
+
+Once a seed is durable, rejected turn admission does not repeat it on later
+ledger changes. The next manual drive can read the seed. An ordinary answer
+remains unredeemed until its caller retries; delivery does not grant a second
+execution claim.
+
+**What a crash costs.** The redemption row is claimed before the run, so a
+crash between the two loses the action: the ask reads redeemed, nothing
+ran. That is the chosen side; the other ordering runs an approved
+destructive action twice. Context liveness is checked before the claim under
+the same database lock; missing or archived contexts leave the answer unclaimed.
+A shell that will not materialize or a cwd that no longer resolves land in the same
+place by design: the approval is spent, the pair says why, the human asks
+again if they still want it.
+
+**Not gated on `turn_in_flight`.** A running turn is a reason not to spend
+a turn waking someone, not a reason not to run an approved action or to
+withhold a turn-owned pair's seed; only the turn request is skipped while
+one is already running.
+
+### Archived contexts are inert
+
+An archived context runs nothing and answers nothing. Two checks, because one
+is not enough:
+
+1. **On request.** `kj ledger allow`/`deny` and the other ask actions fail
+   when the ask's context is archived. A human cannot answer a question on
+   behalf of a dead context.
+2. **At execution time.** Whatever triggers the run checks again before
+   running. The gap between an answer and its execution is exactly where a
+   context can be archived, so the first check cannot stand alone.
+
+`ContextState::Archived` and `archived_at` both exist and are already read
+together (`kj/context.rs:1304`); the checks match that precedent rather than
+inventing a third reading. **The precedent is load-bearing:** `archive_context`
+stamps `archived_at` only and leaves `context_state` at `live`, so a check
+that read the state column alone never saw an archived context — which is
+what the gate-resume driver's original Live check did, found by the wire
+test for check 2. Both checks now read both halves.
+
+**Archiving should also sweep the ledger.** A context going archived leaves
+its unresolved asks answerable-in-principle and dead-in-fact. The existing
+`ApprovalStatus::Abandoned` and the boot sweep are the machinery to reuse —
+same shape as `abandon_unresolved_on_restart`, a different trigger and a
+reason naming the archive.
+
+### The receipts
+
+Moved to `docs/devlog.md`, "The answer that travelled as an error". The
+five asks from one probe, the broken control presented as a verdict, and
+the live one are the story this design was argued from.
+
+### Adjacent, not in scope
+
+Three string classifiers of the same family, none about the gate:
+
+- `is_disconnect_error` (`kaijutsu-client/src/actor.rs:1902`) — tears down a
+  connection on `msg.contains("Disconnected")`. Named as open in
+  `docs/error-chain.md`.
+- `is_retryable_label_conflict` (`kaijutsu-mcp/src/lib.rs:1904`) —
+  `CallError::Rpc(msg).contains("label conflict")`.
+- `is_session_lost_error` (`kaijutsu-app/src/view/editor/mod.rs:135`) —
+  `"no such session"`.
+
+Each is a typed error flattened to prose and grepped back. They belong to
+their own families and must not be folded into the refusal shape.
+
 ## Still open
 
 **Approval delivery runs on the kernel worker.**
@@ -502,7 +1050,7 @@ available. These dispositions do not claim that another model request ran.
 
 Shutdown stops delivery, cancels preparation and commands, and waits for command
 settlement. A spent claim never authorizes replay, including after a preparation
-failure. Restart does not resume approved source. See `docs/gate-shape-b.md`,
+failure. Restart does not resume approved source. See above,
 "Slice 5: approval executes", and `docs/kaish-integration.md`.
 
 **Why this is available now, and not a return to the durable resume
@@ -529,10 +1077,11 @@ Two supporting rulings make it possible:
   ask), and again at execution time, because a context can be archived in
   the gap between the two.
 
-**Not yet built.** `docs/gate-shape-b.md` carries the build record and the
-two things it needs first: the ledger must store the submission's
-executable source beside its human-readable review rendering (this
-document's own finding above — `render_for_review` is not re-executable —
-still holds and is exactly the gap to close), and whether to refuse
-executing a stored statement that carries a free `${VAR}` is an open
-question, not yet ruled.
+**Built above.** "Slice 5: approval executes" and "The ask carries its free
+variables" cover the two things this needed first: the ledger stores the
+submission's executable source in its own `exec_source` column, separate
+from `render_for_review`'s human-readable rendering (this document's own
+finding above — `render_for_review` is not re-executable — still holds and
+is exactly the gap that column closes), and whether to refuse executing a
+stored statement that carries a free `${VAR}` is now settled: snapshot the
+value onto the ask rather than refuse.

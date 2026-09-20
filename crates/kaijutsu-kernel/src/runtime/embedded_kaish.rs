@@ -572,7 +572,7 @@ impl EmbeddedKaish {
     /// `context_env` is seeded, and `unset` each name the ask recorded as
     /// absent. After this, a variable set since the human read the statement
     /// cannot change what runs. Rejects a name that is not a legal kaish
-    /// identifier before anything is executed. `docs/gate-shape-b.md`.
+    /// identifier before anything is executed. `docs/gate-resume.md`.
     pub async fn apply_ask_env(&self, rows: &[approval_ledger::types::AskEnvRow]) -> Result<()> {
         let values = rows.iter().map(|row| (row.name.clone(),
             row.value.clone().map(kaish_kernel::ast::Value::String))).collect();

@@ -1964,7 +1964,7 @@ impl KernelDb {
     /// (`kj::env_snapshot::free_variable_values`, captured at
     /// `kj::gate::build_ask` time), in the order it was captured. Empty for
     /// an ask with no free variables, an unknown ask, or an origin that
-    /// records no snapshot. `docs/gate-shape-b.md`.
+    /// records no snapshot. `docs/gate-resume.md`.
     pub fn ask_env(&self, request_id: &str) -> KernelDbResult<Vec<approval_ledger::types::AskEnvRow>> {
         Ok(approval_ledger::ask::load_ask_env(self.conn_for_ledger(), request_id)?)
     }
