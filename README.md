@@ -61,9 +61,8 @@ server and ssh keys exclusively to identify users.
 Kaijutsu is deliberately **not** a partition-tolerant peer-to-peer system. Contexts
 are multi-writer because many players share one kernel, not because replicas
 reconcile: there is one place that decides what happened, and recovery is asking it
-again rather than merging with a peer. Block text is a plain Rust `String`; there
-is no text CRDT anywhere in the system, and concurrent merge into a kernel
-document is structurally impossible.
+again rather than merging with a peer. Block text is a plain Rust `String`, and
+concurrent merge into a kernel document is structurally impossible.
 
 The stance behind all of it: kaijutsu is an instrument, not a harness. You play
 it, a model plays it, and if you hand someone a connected app they play it too —
@@ -80,12 +79,6 @@ kaijutsu. This can be inspected and visualized in the app or over MCP.
 
 **Kaijutsu is not released yet**. The kernel feels solid and reliable, and the UI
 is coming along.
-
-**Do not add a text CRDT for block content.** Streaming is 100% append and
-`push_str` is amortized O(1), while per-block merge metadata measured about 4x the
-size of the text it represented. A surface that genuinely needs concurrent text
-merge is a design conversation, not a patch. Reasoning and the ruling:
-[docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md).
 
 You may need my branch of kaish for this to build. Kaish will go back to
 cargo versions soon.
@@ -257,7 +250,6 @@ text rendering, theming, and the UI architecture.
 | Doc | Purpose |
 |-----|---------|
 | [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
-| [docs/crdt-position-2026-08.md](docs/crdt-position-2026-08.md) | Why block text is a plain `String` and not a CRDT |
 | [docs/architecture/](docs/architecture/) | Code-verified architecture map, per crate |
 | [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |

@@ -1733,6 +1733,19 @@ explain it.
 
 ---
 
+## `blocks` still speaks a peer-sync vocabulary
+
+`BlockStore::frontier()` and `ops_since()` in
+`kaijutsu-kernel/src/blocks/block_store.rs` have no production caller; their
+doc comment says so. They serve two-store tests that model a peer catching up
+by diffing, which no longer happens. Delete both with those tests, keeping any
+assertion that covers oplog replay.
+
+`merge_ops` is live: the kernel uses it to replay the oplog on load and to
+apply its own single-operation payloads. Nothing merges. Rename it (for
+example `apply_ops`) across its call sites in `block_store.rs`, and run the
+kernel and server suites.
+
 ## Remove the dated DTE cutover cleanup
 
 `purge_dte_cutover_oplog_rows` and the `DTE_CUTOVER_OPLOG_MIGRATION` marker in

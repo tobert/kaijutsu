@@ -208,7 +208,7 @@ impl RenderBlockStore {
     ///
     /// `Error` blocks default to collapsed on arrival (`view/format.rs`'s
     /// stub rendering) — the kernel's `collapsed` field has no per-kind
-    /// default and `collapsed_at` isn't on the wire (CRDT-internal only), so
+    /// default and `collapsed_at` isn't on the wire (kernel-internal only), so
     /// this is the one place to bake it in. It only applies the default when
     /// the incoming snapshot is still at the wire default (`collapsed ==
     /// false`); a caller that already resolved a snapshot to `true` is left
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn insert_from_snapshot_cannot_distinguish_explicit_false_from_wire_default() {
         // `collapsed_at` (which would disambiguate "explicitly set to
-        // false" from "never set") is CRDT-internal and not on the wire, so
+        // false" from "never set") is kernel-internal and not on the wire, so
         // this is a known limitation, not a design goal: an Error snapshot
         // that already carries `collapsed: false` is defaulted the same as
         // one that never touched the field.

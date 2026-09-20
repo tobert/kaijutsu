@@ -117,9 +117,9 @@ paths such as compose input, block queries, and the change feed remain RPC.
 Administration belongs in `kj`: config, rc, reset, and reload do not earn wire
 methods. Bootstrap config reads remain RPC. See `docs/change-feed.md`.
 
-Block text is a plain `String`; streaming appends with `push_str`. There is no
-text CRDT or concurrent merge into kernel documents. Do not reintroduce one
-without a design conversation. See `docs/crdt-position-2026-08.md`.
+Block text is a plain `String`; streaming appends with `push_str`. The kernel
+sequences every write, so nothing merges concurrent text into a document.
+Changing that needs a design conversation.
 
 A **context** is durable metadata and a kernel-sequenced block log, with edits
 and exclusions. A **conversation** is the live append-only message sequence
