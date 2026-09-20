@@ -402,8 +402,7 @@ pub struct SceneData {
 
 /// `[scene.hues]` — identity hues, hex sRGB. Brightness lives in the tiers;
 /// a hue's brightest channel should sit near full so tier math means what it
-/// says. (`wire` was stored pre-multiplied at 1.4 before this system; it is
-/// now normalized here with the 1.4 in `gains.wire`.)
+/// says.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SceneHuesData {
@@ -425,8 +424,6 @@ pub struct SceneHuesData {
     /// (`connection::ledger`). Pale cream, and allowed to sustain HDR — a
     /// question waiting on a player must read from across the room.
     pub ask: String,
-    /// Patch-bay chord wire (normalized; HDR gain in `gains.wire`).
-    pub wire: String,
     /// Circuit-board floor trace fabrics, one hue family per fabric.
     pub trace_crimson: String,
     pub trace_cyan: String,
@@ -437,16 +434,6 @@ pub struct SceneHuesData {
     pub wall_base: String,
     pub wall_mullion: String,
     pub dark_surface: String,
-    /// FSN landscape (`docs/scenes/vfs.md`, slice 0): prism wireframe edges —
-    /// neon violet (frame 45's edge-line hue, a distinct lane from
-    /// `neon`/`violet_*` so the landscape can be retuned independently of
-    /// the well/radiators).
-    pub fsn_edge: String,
-    /// FSN landscape: prism-top vertex points — magenta (frame 45).
-    pub fsn_vertex: String,
-    /// FSN landscape: quad-seam grid lines — a faint, dimmer violet than
-    /// `fsn_edge` (frame 45's "faint dotted boundaries").
-    pub fsn_seam: String,
 }
 
 impl Default for SceneHuesData {
@@ -462,7 +449,6 @@ impl Default for SceneHuesData {
             neon: "#ad95f3".into(),
             terrace: "#c4b3f9".into(),
             ask: "#fff5c2".into(),
-            wire: "#ff5f73".into(),
             trace_crimson: "#86424b".into(),
             trace_cyan: "#3f737e".into(),
             trace_green: "#598b6c".into(),
@@ -471,9 +457,6 @@ impl Default for SceneHuesData {
             wall_base: "#464556".into(),
             wall_mullion: "#383844".into(),
             dark_surface: "#1d1e26".into(),
-            fsn_edge: "#8a5cff".into(),
-            fsn_vertex: "#ff2fd0".into(),
-            fsn_seam: "#4a3568".into(),
         }
     }
 }
@@ -484,14 +467,10 @@ impl Default for SceneHuesData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SceneTiersData {
-    /// Engraved detail: guide rings, ticks.
-    pub etch: f32,
     /// Station markers at rest.
     pub marker: f32,
     /// Gold architectural trim (table rims, pylon caps).
     pub trim: f32,
-    /// Brass hardware.
-    pub hardware: f32,
     /// Ceiling for ANY decoration crest (>1.0 = soft bloom halo).
     pub crest: f32,
     /// Floor traces at rest.
@@ -507,10 +486,8 @@ pub struct SceneTiersData {
 impl Default for SceneTiersData {
     fn default() -> Self {
         Self {
-            etch: 0.28,
             marker: 0.42,
             trim: 0.50,
-            hardware: 0.55,
             crest: 1.25,
             trough_wiring: 0.55,
             trough_wall_trim: 0.60,
@@ -525,12 +502,6 @@ impl Default for SceneTiersData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SceneGainsData {
-    /// Patch-bay traffic packet peak.
-    pub pulse: f32,
-    /// Selected chord idle gain.
-    pub chord_selected: f32,
-    /// Chord wire resting HDR (hue is normalized in `hues.wire`).
-    pub wire: f32,
     /// Tracker marker beat thump.
     pub beat: f32,
     /// Tracker marker active lift.
@@ -546,9 +517,6 @@ pub struct SceneGainsData {
 impl Default for SceneGainsData {
     fn default() -> Self {
         Self {
-            pulse: 6.0,
-            chord_selected: 3.4,
-            wire: 1.4,
             beat: 2.8,
             active: 0.5,
             focus_lift: 0.35,

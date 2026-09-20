@@ -189,7 +189,6 @@ violet_thread = "#c476e1"  # information-violet: threads/content
 neon = "#ad95f3"           # the well's electric indigo-violet
 terrace = "#c4b3f9"        # terrace glyphs: paler tint of neon
 ask = "#fff5c2"            # a context with an approval ask pending
-wire = "#ff5f73"           # patch-bay chord (HDR gain in [scene.gains])
 trace_crimson = "#86424b"  # floor trace fabrics, one hue per fabric
 trace_cyan = "#3f737e"
 trace_green = "#598b6c"
@@ -198,15 +197,10 @@ table = "#32353f"          # structural near-blacks
 wall_base = "#464556"
 wall_mullion = "#383844"
 dark_surface = "#1d1e26"
-fsn_edge = "#8a5cff"       # fsn landscape: prism wireframe edges (frame 45)
-fsn_vertex = "#ff2fd0"     # fsn landscape: prism-top vertex points
-fsn_seam = "#4a3568"       # fsn landscape: faint quad-seam grid lines
 
 [scene.tiers]
-etch = 0.28          # engraved detail
 marker = 0.42        # station markers at rest
 trim = 0.50          # gold architectural trim
-hardware = 0.55      # brass hardware
 crest = 1.25         # ceiling for any decoration crest (>1.0 blooms softly)
 trough_wiring = 0.55 # floor traces at rest
 trough_wall_trim = 0.60
@@ -215,9 +209,6 @@ trough_subtle = 0.75 # the calmest breathers
 # invariant (tested): every trough × crest < 1.0
 
 [scene.gains]
-pulse = 6.0          # patch-bay traffic packet peak
-chord_selected = 3.4
-wire = 1.4           # chord wire resting HDR
 beat = 2.8           # tracker marker beat thump
 active = 0.5
 focus_lift = 0.35

@@ -74,10 +74,8 @@ LDR structure tiers (multiply an identity hue):
 | Tier | Default | Meaning |
 |---|---|---|
 | `surface` | ~0.01–0.02 (lift table) | near-black working surfaces; silhouettes, not brightness |
-| `etch` | 0.28 | engraved detail — guide rings, ticks |
 | `marker` | 0.42 | station markers at rest |
 | `trim` | 0.50 | gold architectural trim (table rims, pylon caps) |
-| `hardware` | 0.55 | brass sockets/pegs/jacks |
 
 Decoration glow (breathing/traveling, from the trace-glow discipline):
 
@@ -93,8 +91,6 @@ Live-signal gains (allowed to sustain HDR because they ARE the activity tell):
 
 | Gain | Default | Element |
 |---|---|---|
-| `pulse` | 6.0 | patch-bay traffic packet |
-| `chord_selected` | 3.4 | selected chord idle |
 | glyph `HDR_SCALE` | 3.0 (wgsl const) | terrace glyph emissive |
 | card rim gains | 1.6–3.5 (wgsl consts) | well card status rims |
 | `ASK_BRIGHTNESS` | 1.15 (switchboard const) | lamp with an approval ask pending (hue: `scene.hues.ask`) |
