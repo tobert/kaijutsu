@@ -1332,10 +1332,9 @@ when `kj::readonly::is_read_only_kj`
 pure Rust against the typed command — never re-derived from the JSON — and
 this field is the mechanical mirror of that decision onto the same-position
 command object. Additive: every field the surface already
-carried is unchanged. `assets/defaults/rc/lib/hooks/lfm2d.kai`'s exemption
-filter treats `kj_readonly == true` as a third exemption alongside
-`--help`/`kj ledger`, so a call built entirely of read-only `kj` commands
-skips scoring without a network round trip to the classifier. See
+carried is unchanged. `assets/defaults/rc/lib/hooks/lfm2d.kai` does not read
+it: a call built entirely of read-only `kj` commands is allowed by the
+evaluator and never reaches a hook. See
 `kj::readonly`'s module doc for the six conditions a command must meet to
 qualify. `kj ledger` is not in that table; it is exempt as a whole verb by
 `kj::readonly::is_gate_exempt_kj`, and the kernel enforces both exemptions
@@ -1347,9 +1346,9 @@ construction): a string on every command object — `allow`, `ask`, `deny` or
 (`kj::gate_policy::command_verdict`, `docs/gate-policy-tuning.md`), the
 same evaluator PreCall consulted for the call. `deny` never reaches a hook
 (PreCall refused the call). `assets/defaults/rc/lib/hooks/lfm2d.kai` reads
-it twice: an `ask`-tier clause exits 3 before the classifier runs, and
-`allow`-tier clauses are dropped from the scored set, so a mixed program's
-read clause is not re-scored by a classifier that escalates on reads. Test:
+it once: a statement holding an `ask`-tier command exits 3 before the
+classifier runs. Everything else is scored as the raw command, whole
+(`docs/gate-policy-tuning.md`, "Verdicts"). Test:
 `kj_tool_plan_carries_the_tier_per_command`.
 
 **`clause`** (added on top of the surface above, `broker.rs`'s

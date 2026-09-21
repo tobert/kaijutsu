@@ -1,14 +1,16 @@
 //! Read-only classification for a `kj` invocation reaching the shell.
 //!
-//! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores every
-//! `shell_write` clause through a classifier that over-escalates on ordinary
+//! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores a
+//! `shell_write` command through a classifier that over-escalates on ordinary
 //! reads. The escalation is not uniform: `kj block read <id>` scored
 //! `situation-normal` while `kj block list` scored `informative`, and anything
 //! but `informative` escalates, so a verb named `read` asked a human for
 //! permission to read. A declared class beats tuning: every `kj` verb declares
 //! its own effect (`kj/effect.rs`), and a call whose effect is
-//! [`Effect::Read`] skips the classifier entirely (`KJ_TOOL_PLAN`'s
-//! `kj_readonly` field, wired in `mcp/broker.rs`).
+//! [`Effect::Read`] is allowed by the gate policy evaluator, so a program made
+//! only of such calls never reaches a hook. A program that mixes one with
+//! other commands is scored whole. `KJ_TOOL_PLAN` carries the classification
+//! as `kj_readonly` (`mcp/broker.rs`) for hooks that want it.
 //!
 //! [`is_read_only_kj`] takes one [`PlannedCommand`] — kaish's own plan
 //! projection, never the raw argv text — and returns `true` only when every
@@ -49,15 +51,6 @@
 //! ~/.bashrc` must never classify as read-only, no matter how inert the
 //! command itself is. This module refuses one in condition 2, for every
 //! command it accepts.
-//!
-//! The hook's other two exemptions (`--help`, `kj ledger`) gate on a
-//! `has_redirect` field the hook reads
-//! from `KJ_TOOL_PLAN`'s `commands[].redirects`, which is kaish's structured
-//! field rather than a scan of clause text. One narrower case stays open by
-//! choice — the hook's fallback item, used only when `KJ_TOOL_PLAN` is
-//! unusable, cannot see redirects at all, and failing it closed would stop
-//! exempting the gate's own answer path. See that filter's comment in
-//! `assets/defaults/rc/lib/hooks/lfm2d.kai` for the trade.
 //!
 //! ## `kj ledger` is exempt as a verb, not as a set of reads
 //!

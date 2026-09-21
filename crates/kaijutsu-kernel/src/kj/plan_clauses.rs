@@ -8,9 +8,9 @@
 //! Two consumers share it:
 //!
 //! - `mcp/broker.rs` mirrors each command's clause onto the `KJ_TOOL_PLAN`
-//!   JSON twin as `commands[].clause`, so the rc hook body
-//!   (`assets/defaults/rc/lib/hooks/lfm2d.kai`) reads a field instead of
-//!   re-deriving the cut in `jq`.
+//!   JSON twin as `commands[].clause`, so a hook body reads a field instead
+//!   of re-deriving the cut in `jq`. The shipped lfm2d hook scores the raw
+//!   command whole and does not read it.
 //! - `kaijutsu-mcp`'s advisory scorer renders the same clauses for a Claude
 //!   Code `Bash` call.
 //!

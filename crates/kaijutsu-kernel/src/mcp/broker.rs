@@ -10621,6 +10621,141 @@ mod tests {
         );
     }
 
+    /// A loopback stand-in for lfm2d. Answers `/v1/cascade` with one clause
+    /// judged most severe and `/v1/models` with a three-label ladder, and
+    /// returns every request as `(request line, body)`.
+    async fn mock_lfm2d(requests: usize) -> (u16, tokio::task::JoinHandle<Vec<(String, String)>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, length) = loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "request ended before its headers did");
+                    raw.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..at]).to_ascii_lowercase();
+                        let length = head.lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        break (at + 4, length);
+                    }
+                };
+                while raw.len() < head_end + length {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "request ended before its body did");
+                    raw.extend_from_slice(&chunk[..n]);
+                }
+                let line = String::from_utf8_lossy(&raw).lines().next().unwrap_or_default().to_string();
+                let body = String::from_utf8_lossy(&raw[head_end..head_end + length]).to_string();
+                let reply = if line.contains("/v1/cascade") {
+                    r#"{"winner":{"index":0},"clauses":[{"index":0,"top_severity":"data-critical","severity_scores":{"data-critical":0.9}}],"models":[{"model_id":"mock_v1","weight_hash":"abc123"}]}"#
+                } else {
+                    r#"[{"id":"mock_v1","labels":["informative","situation-normal","data-critical"]}]"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                seen.push((line, body));
+            }
+            seen
+        });
+        (port, server)
+    }
+
+    /// docs/gate-policy-tuning.md, "Verdicts": a program that bundles an
+    /// allow-tier `kj` read with another command reaches the hook, and the
+    /// classifier receives the raw command whole, as one clause.
+    ///
+    /// Multi-thread runtime: curl's blocking request would starve the mock
+    /// server on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mixed_program_reaches_the_classifier_whole_in_the_real_lfm2d_hook() {
+        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-mixed").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let (port, server) = mock_lfm2d(2).await;
+        let ctx = lfm2d_context(
+            &kernel, &kj, "lfm2d-real-mixed", "escalate", &format!("http://127.0.0.1:{port}"),
+        ).await;
+        kj.kernel_db().lock().add_context_egress(ctx.context_id, "127.0.0.1").unwrap();
+
+        let command = "kj block list; wc -l /etc/hostname";
+        let err = broker
+            .call_tool(shell_write_call(command), &ctx, CancellationToken::new())
+            .await
+            .expect_err("the mock classifier judged the command most severe, so a human is asked");
+        assert!(err.is_refusal(RefusalKind::Pending), "expected Pending, got {err:?}");
+
+        let seen = server.await.unwrap();
+        let (line, body) = &seen[0];
+        assert!(line.starts_with("POST /v1/cascade"), "first request: {line}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "clauses": [command] }),
+            "the classifier must receive the raw command as one clause, nothing dropped"
+        );
+    }
+
+    /// The hook fails closed. In `escalate` mode a classifier it cannot reach
+    /// becomes an ask whose description names the failure.
+    #[tokio::test]
+    async fn an_unreachable_classifier_asks_in_the_real_lfm2d_hook() {
+        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-unreachable").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let ctx = lfm2d_context(
+            &kernel, &kj, "lfm2d-real-unreachable", "escalate",
+            "http://lfm2d-real-hook-test.invalid",
+        ).await;
+
+        let err = broker
+            .call_tool(shell_write_call("wc -l /etc/hostname"), &ctx, CancellationToken::new())
+            .await
+            .expect_err("a call the hook cannot score must not proceed in escalate mode");
+        assert!(err.is_refusal(RefusalKind::Pending), "expected Pending, got {err:?}");
+        let pending = kj.kernel_db().lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].description.contains("lfm2d cannot score this call")
+                && pending[0].description.contains("unreachable"),
+            "the ask must name the failure: {:?}",
+            pending[0].description
+        );
+    }
+
+    /// `log` mode observes only: the same unreachable classifier lets the
+    /// call proceed and raises no ask.
+    #[tokio::test]
+    async fn an_unreachable_classifier_proceeds_in_log_mode_in_the_real_lfm2d_hook() {
+        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-log").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let ctx = lfm2d_context(
+            &kernel, &kj, "lfm2d-real-log", "log", "http://lfm2d-real-hook-test.invalid",
+        ).await;
+
+        let result = broker
+            .call_tool(shell_write_call("wc -l /etc/hostname"), &ctx, CancellationToken::new())
+            .await
+            .expect("log mode never asks");
+        assert!(!result.is_error);
+        assert!(kj.kernel_db().lock().list_pending_asks().unwrap().is_empty());
+    }
+
     /// A file that does not parse is a fault: the call is refused as gate
     /// unavailable, not denied, and the message names the file and remedy.
     #[tokio::test]
