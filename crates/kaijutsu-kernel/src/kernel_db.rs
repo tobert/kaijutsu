@@ -6726,22 +6726,6 @@ impl KernelDb {
     // Phase 4A: Additional methods for kj commands
     // ========================================================================
 
-    /// Delete a structural edge between source and target.
-    ///
-    /// Used by `kj context move` to reparent a context.
-    pub fn delete_structural_edge(
-        &self,
-        source: ContextId,
-        target: ContextId,
-    ) -> KernelDbResult<bool> {
-        let deleted = self.conn.execute(
-            "DELETE FROM context_edges
-             WHERE source_id = ?1 AND target_id = ?2 AND kind = 'structural'",
-            params![blob_param(source.as_bytes()), blob_param(target.as_bytes())],
-        )?;
-        Ok(deleted > 0)
-    }
-
     /// Delete a single drift edge by its UUID.
     ///
     /// Companion to `kj drift edge rm` — `kj drift history` emits these

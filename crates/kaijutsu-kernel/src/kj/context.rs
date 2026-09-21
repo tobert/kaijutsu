@@ -174,15 +174,6 @@ enum ContextCommand {
         /// Ids and labels come from `kj context list`.
         context: Option<String>,
     },
-    /// Reparent a context under a new parent.
-    #[command(alias = "mv")]
-    Move {
-        /// Context to reparent. Ids and labels come from `kj context list`.
-        context: String,
-        /// New parent to fork the structural edge from. Ids and labels
-        /// come from `kj context list`.
-        new_parent: String,
-    },
     /// Rename a context — set its label (default: current). Refuses a label
     /// another context already holds; *moving* a label between contexts is
     /// `retag` (latched).
@@ -632,7 +623,6 @@ impl KjDispatcher {
             parsed.command,
             ContextCommand::Set { .. }
                 | ContextCommand::Unset { .. }
-                | ContextCommand::Move { .. }
                 | ContextCommand::Rename { .. }
                 | ContextCommand::Archive { .. }
                 | ContextCommand::Rotate { .. }
@@ -688,10 +678,6 @@ impl KjDispatcher {
                 self.context_unset(context.as_deref(), env.as_deref(), cast, caller)
             }
             ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
-            ContextCommand::Move {
-                context,
-                new_parent,
-            } => self.context_move(&context, &new_parent, caller).await,
             ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
             ContextCommand::Rotate { context } => self.context_rotate(context.as_deref(), caller).await,
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
@@ -2045,66 +2031,6 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj context move <ctx> <new-parent>` — reparent a context.
-    async fn context_move(
-        &self,
-        ctx_ref: &str,
-        new_parent_ref: &str,
-        _caller: &KjCaller,
-    ) -> KjResult {
-        // All DB work in a single lock scope, no await
-        let db = self.kernel_db().lock();
-
-        let ctx_id = match db.resolve_context(ctx_ref) {
-            Ok(id) => id,
-            Err(e) => return KjResult::Err(format!("kj context move: {e}")),
-        };
-        let new_parent_id = match db.resolve_context(new_parent_ref) {
-            Ok(id) => id,
-            Err(e) => return KjResult::Err(format!("kj context move: {e}")),
-        };
-
-        // Delete the old structural edges and insert the new one in one
-        // transaction. Cycle detection lives inside `insert_edge`, so a
-        // refused move must roll the deletes back rather than leave the
-        // context with no structural parent.
-        let old_parents = match db.structural_parents(ctx_id) {
-            Ok(p) => p,
-            Err(e) => return KjResult::Err(format!("kj context move: {e}")),
-        };
-        let moved = db.in_transaction(|db| {
-            for parent in &old_parents {
-                db.delete_structural_edge(parent.context_id, ctx_id)?;
-            }
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: new_parent_id,
-                target_id: ctx_id,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-        });
-        if let Err(e) = moved {
-            return KjResult::Err(format!("kj context move: {e}"));
-        }
-
-        let ctx_label = db
-            .get_context(ctx_id)
-            .ok()
-            .flatten()
-            .and_then(|r| r.label)
-            .unwrap_or_else(|| ctx_id.short());
-        let parent_label = db
-            .get_context(new_parent_id)
-            .ok()
-            .flatten()
-            .and_then(|r| r.label)
-            .unwrap_or_else(|| new_parent_id.short());
-
-        KjResult::ok(format!("moved '{}' under '{}'", ctx_label, parent_label))
-    }
-
     /// `kj context archive <ctx>` — retain one context outside the active set. `Destroy`-classed
     /// (`kj/effect.rs`); the dispatcher latches an unconfirmed call
     /// before this handler runs.
@@ -2609,7 +2535,6 @@ impl Classify for ContextCommand {
             | Self::Rotate { .. }
             | Self::Set { .. }
             | Self::Unset { .. }
-            | Self::Move { .. }
             | Self::Rename { .. }
             | Self::Conclude { .. }
             | Self::Promote { .. }
@@ -4161,102 +4086,6 @@ mod tests {
         let msg = result.message();
         assert!(msg.contains("child"), "output: {msg}");
         assert!(msg.contains("root"), "output: {msg}");
-    }
-
-    #[tokio::test]
-    async fn context_move_reparent() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let a = register_context(&d, Some("a"), None, principal);
-        let b = register_context(&d, Some("b"), None, principal);
-        let child = register_context(&d, Some("child"), Some(a), principal);
-
-        // Insert original structural edge a → child
-        {
-            let db = d.kernel_db().lock();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: a,
-                target_id: child,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .unwrap();
-        }
-
-        let c = caller_with_context(a);
-        let result = d
-            .dispatch(&[s("context"), s("move"), s("child"), s("b")], &c)
-            .await;
-        assert!(result.is_ok(), "move failed: {}", result.message());
-        assert!(
-            result.message().contains("moved"),
-            "msg: {}",
-            result.message()
-        );
-
-        // Verify new parent
-        let db = d.kernel_db().lock();
-        let parents = db.structural_parents(child).unwrap();
-        assert_eq!(parents.len(), 1);
-        assert_eq!(parents[0].context_id, b);
-    }
-
-    /// A move that the cycle check refuses must leave the old structural
-    /// edge in place. Deleting the existing parent edges before the insert
-    /// that can refuse them is what orphans a context.
-    #[tokio::test]
-    async fn context_move_refused_for_cycle_leaves_original_edge_intact() {
-        let d = test_dispatcher().await;
-        let principal = PrincipalId::new();
-        let root = register_context(&d, Some("root"), None, principal);
-        let mid = register_context(&d, Some("mid"), Some(root), principal);
-        let leaf = register_context(&d, Some("leaf"), Some(mid), principal);
-
-        // root → mid → leaf
-        {
-            let db = d.kernel_db().lock();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: root,
-                target_id: mid,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .unwrap();
-            db.insert_edge(&ContextEdgeRow {
-                edge_id: uuid::Uuid::now_v7(),
-                source_id: mid,
-                target_id: leaf,
-                kind: EdgeKind::Structural,
-                metadata: None,
-                created_at: kaijutsu_types::now_millis() as i64,
-            })
-            .unwrap();
-        }
-
-        // Move mid under its own descendant leaf — the cycle check must
-        // refuse this.
-        let c = caller_with_context(root);
-        let result = d
-            .dispatch(&[s("context"), s("move"), s("mid"), s("leaf")], &c)
-            .await;
-        assert!(
-            !result.is_ok(),
-            "expected the cycle to be refused, got: {}",
-            result.message()
-        );
-
-        let db = d.kernel_db().lock();
-        let parents = db.structural_parents(mid).unwrap();
-        assert_eq!(
-            parents.len(),
-            1,
-            "mid must keep exactly its original parent edge after a refused move"
-        );
-        assert_eq!(parents[0].context_id, root);
     }
 
     #[tokio::test]

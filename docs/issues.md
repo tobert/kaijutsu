@@ -225,26 +225,13 @@ Read by the lead; each line re-checked before it went here.
 - Stale comments: `llm/mod.rs:470-476` says the mock refuses streaming;
   `kj/handoff.rs:17,274` point at a `READ_ONLY_TABLE` that no longer exists.
 
-## Accountability propagates at four more boundaries (Amy, 2026-09-15)
+## Accountability at the handoff log (Amy, 2026-09-15)
 
-Amy: "queue those four after the lane lands." Reviewer resolution walks
-`forked_from`, so every path that mints or re-parents a context decides
-who reviews. Fork and `kj context create` from inside a context are
-covered; these are not:
+Reviewer resolution walks `forked_from`, so every path that mints a context
+decides who reviews. Fork and `kj context create` from inside a context are
+covered; nothing re-parents a context. This is not:
 
-1. **`kj context move` needs authority.** It is gated by Operator alone and
-   ignores its `_caller` (`kj/context.rs`, `context_move`). The entry's
-   premise needs correcting first: `context_move` writes only the
-   `context_edges` structural table and never touches `ContextRow.forked_from`,
-   while `lineage_root` and `effective_approval_reviewer` (`kernel_db.rs`) walk
-   `forked_from` exclusively — so today a move changes tree and list display
-   and not who reviews. Amy decides: should `kj context move` start rewriting
-   `forked_from` to the new parent, so that an authority check on it protects
-   what reviewer resolution actually reads, or is the ask only to gate today's
-   structural-edge-only move? `kj context set` already shows both candidate
-   rules — a pure `--as` needs the target's effective reviewer or its
-   `director_id`, a routing change needs `lineage_root(target)`.
-2. **Handoff logs are parentless.** `kj handoff note` mints the
+1. **Handoff logs are parentless.** `kj handoff note` mints the
    character's log with `forked_from: None` (`kj/handoff.rs`), a
    parentless context played by a model. The kernel must not guess a root
    (Amy, 2026-09-16), so it needs an explicit parent. Since the default
