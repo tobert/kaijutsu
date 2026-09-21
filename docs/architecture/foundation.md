@@ -116,9 +116,9 @@ mutation, so nothing ever needs concurrent-branch reconciliation. Block order is
 fractional indexing, metadata in `BlockHeader` is plain data, and text is a
 plain `String`.
 
-**Do not reintroduce a text CRDT for block content.** Streaming is 100% append
-and `push_str` is amortized O(1), while per-block merge metadata measured about
-4x the size of the text it represented (`docs/crdt-position-2026-08.md`).
+Streaming is 100% append and `push_str` is amortized O(1). Changing the text
+representation needs a design conversation; the measurements are in
+`docs/crdt-position-2026-08.md`.
 
 ### One storage impl: `BlockDocument`
 

@@ -107,7 +107,10 @@ It owns or wires together:
 
 The kernel owns the model turn loop (`runtime/llm_stream.rs`), conversation
 sessions, and interrupts (`runtime/turn_state.rs`). Interactive and headless
-callers share startup and the kernel worker. Each accepted turn owns its own
+callers share startup and the kernel worker, a pool of at most four threads
+behind a supervisor (`runtime/worker.rs`, `docs/resource-admission.md`); each
+thread is a current-thread runtime with a `LocalSet`, so a task stays on the
+thread that started it. Each accepted turn owns its own
 liveness and interrupt registration, survives submitter teardown, and cancels
 and settles during worker shutdown. `runtime/turn_request.rs` admits headless
 requests directly; its events report admission and outcomes.
@@ -177,9 +180,9 @@ fractional indexing. Block metadata in `BlockHeader` is plain data — the
 last-write-wins conflict-resolution machinery was deleted, because concurrent
 merge into a kernel document is structurally impossible.
 
-**Do not reintroduce a text CRDT for block content.** Streaming is 100% append
-and `push_str` is amortized O(1), while per-block merge metadata measured about
-4x the size of the text it represented (`docs/crdt-position-2026-08.md`).
+**Block text is a plain `String`, and the kernel sequences every write.**
+Streaming is 100% append and `push_str` is amortized O(1). Changing that needs
+a design conversation; the measurements are in `docs/crdt-position-2026-08.md`.
 
 ---
 

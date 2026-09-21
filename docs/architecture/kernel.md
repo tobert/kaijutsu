@@ -175,6 +175,12 @@ executing commands or hooks again. The remaining structured/streaming RPC and
 MCP callers still need this outcome owner. Initial retention failures and
 result-hook approval waits remain in the migration inventory.
 
+The kernel worker (`runtime/worker.rs`) runs commands, model turns, and
+approval delivery on a pool of `min(4, cores)` threads. Each is a current-thread
+runtime with a `LocalSet`; a supervisor thread hands each piece of top-level
+work to the thread with the fewest pieces assigned (`pick_thread`). Nothing
+keeps one context's work on one thread. See `docs/resource-admission.md`.
+
 `spawn_kaish_thread` in kernel `lib.rs` reserves a 16 MiB stack for dedicated
 threads that can enter kaish. Server `main.rs` configures the Tokio worker
 stack too. The requirement applies to any command that can re-enter rc through
