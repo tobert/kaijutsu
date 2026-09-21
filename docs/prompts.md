@@ -137,6 +137,12 @@ successor so you can read its Error blocks and remove it. The character that
 plays the context or its lineage root may rotate it. A root context rotates
 the same way.
 
+Rotation copies a pinned model, not a resolved one. A context with no
+`provider` and `model` of its own resolves the cast or the global default each
+time, and so does its successor. Pin one with
+`kj context set banto --model tenchi/qwen3.8-27b`; every later successor keeps
+it. A context made with `kj context create` starts unpinned.
+
 `ROTATED_FROM` names the predecessor. `S17-predecessor.kai` reads
 up to twelve text blocks with `kj wait --timeout 1 --max-blocks 12 --max-bytes
 400 --include text`, then emits a notification. This is a bounded excerpt,
