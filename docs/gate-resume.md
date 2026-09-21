@@ -1,14 +1,14 @@
 # The gate stops blocking
 
 **Read "Rescoped" first if you are here to build something.** This document
-is written oldest-first: the 2026-08-22 ruling below is what shipped, and the
-2026-08-23 ruling deleted its durable half. Everything about *not blocking the
+is written oldest-first: the 2026-08-22 guidance below is what shipped, and the
+2026-08-23 guidance deleted its durable half. Everything about *not blocking the
 wire* still holds. Anything promising that the kernel resumes an action across
 a restart does not.
 
-**Amy's ruling, 2026-08-22.** A gated tool call must not hold an RPC open
+**Amy's guidance, 2026-08-22.** A gated tool call must not hold an RPC open
 while a human thinks. The kernel tells the client it is waiting; the client
-may block locally; nothing blocks on the wire. The original ruling went
+may block locally; nothing blocks on the wire. The original guidance went
 further — when the answer lands, *the kernel performs the action itself* —
 and that half was reversed a day later.
 
@@ -97,12 +97,13 @@ Checked against the code on 2026-08-22, not recalled:
   and `BlockKind::Notification` is LLM-visible. Telling a model its ask
   resolved means authoring a block — no new channel.
 - **The error vocabulary is already right.** `GateUnavailable` is distinct
-  from `Denied` by Amy's 2026-08-17 ruling, and carries a reason the model
+  from `Denied` by Amy's 2026-08-17 guidance, and carries a reason the model
   reads in full — shipped 2026-09-01 as `RefusalKind::GateUnavailable` vs
   `RefusalKind::Denied`, both cases of one `McpError::Refused(Refusal)`
   rather than the separate `McpError` variants this was written against
-  (`docs/gate-and-shell-split.md`, Ruling 2's shipped-shape note). A third
-  state (`Pending`) joins them rather than replacing either.
+  (`docs/gate-and-shell-split.md`, "Amy's rulings, 2026-08-17", item 2's
+  shipped-shape note). A third state (`Pending`) joins them rather than
+  replacing either.
 
 **Verified absent:** `create_ask` does no deduplication — every call makes a
 fresh row. And no mechanism redeems an *answered ask*; rules key on
@@ -275,7 +276,7 @@ Prefer deleting a mechanism to generalizing it. With nothing blocking:
 `Slice 4.8`'s `AbandonOnDrop` goes too. It took the abandon signal from the
 wait being dropped, and there is no wait to drop.
 
-**Amy's ruling on what replaces it, 2026-08-22: nothing automatic.**
+**Amy on what replaces it, 2026-08-22: nothing automatic.**
 
 > *"I think abandoned asks are kinda difficult to determine consistently so
 > we let them go stale and maybe have a janitor pick it up someday. So maybe
@@ -294,7 +295,7 @@ guessing consistently is the part we cannot do.
 
 ## Rescoped: the kernel does not resume across a restart
 
-**Amy's ruling, 2026-08-23.** Everything above about *not blocking the wire*
+**Amy's guidance, 2026-08-23.** Everything above about *not blocking the wire*
 stands and is shipped. What is gone is the durable half — the `gate_actions`
 table, the claim protocol, boot recovery, and exactly-once across a crash.
 
@@ -359,11 +360,11 @@ to the current one. **`ExecuteOptions.cwd` alone does not fail closed** —
 proven by falsification: with the explicit `try_set_cwd` validation removed,
 the command ran anyway and printed its output. The check is load-bearing.
 
-The pin was in memory on the ruling above: an ask cannot outlive the
+The pin was in memory on the guidance above: an ask cannot outlive the
 process, so neither should its pin.
 
 **Reversed 2026-09-01** (below, "The cwd moves onto the
-ask"). That ruling collided with the one two paragraphs up — a decided ask
+ask"). That decision collided with the one two paragraphs up — a decided ask
 **is** never swept at boot — and the collision is reachable: a human answers
 `allow`, the kernel restarts before the caller retries, `take_pinned_cwd`
 returns `None` on the retry because `cwd_pins` did not survive the restart,
@@ -373,7 +374,7 @@ through on that `None` and the approved command runs wherever the context
 now sits — its own comment names this "the exact bug this pin exists to
 close."
 
-**Ruled and SHIPPED 2026-09-01: the cwd is recorded on the `approvals` row,
+**Decided and shipped 2026-09-01: the cwd is recorded on the `approvals` row,
 and `cwd_pins`, `pin_cwd` and `take_pinned_cwd` are deleted.** The column
 arrived through an `ALTER TABLE ... ADD COLUMN` guarded by `PRAGMA
 table_info`, the pattern `add_rc_runs_script_count_column_if_missing`
@@ -1057,7 +1058,7 @@ failure. Restart does not resume approved source. See above,
 machinery this document deleted above.** That machinery — the
 `gate_actions` table, the claim protocol, boot recovery — existed to survive
 a *kernel* restart between ask and answer, and its worst reachable outcome
-was an approved destructive action running twice. The subscriber ruled here
+was an approved destructive action running twice. The subscriber decided here
 adds nothing durable: it is in-memory, the same shape as the cwd pin before
 its own reversal above, so a kernel restart between the ask and the
 subscriber's run loses the subscription outright — and the pending-ask boot
@@ -1065,7 +1066,7 @@ sweep still means nothing survives a restart to be run twice. This is a
 narrower mechanism solving a narrower problem (a caller that will never
 retry, on a kernel that stayed up), not the design that was deleted.
 
-Two supporting rulings make it possible:
+Two supporting decisions make it possible:
 
 - **The stability of the environment under an execution is the caller's
   contract.** `cargo build` pulls in whatever it pulls in at link and run
