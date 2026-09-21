@@ -1958,7 +1958,18 @@ history must not be quoted. Open:
   `is_gate_exempt_kj`** (`assets/defaults/rc/lib/hooks/lfm2d.kai`,
   exemption 2) and reads the second word, so a root flag ahead of the verb
   defeats it; the evaluator already skips PreCall for an exempt program.
-  Delete the jq copy next time the hook is edited.
+  Amy, 2026-09-21: build the placement test, then delete all three jq
+  exemptions and the `contrib/lfm2d-ladder-check.kai` copy. Two of the test's
+  three cases run the shipped hook body (`mcp/broker.rs`, the
+  `..._real_lfm2d_hook...` tests): all-allow never reaches the hook, and an
+  ask-tier clause escalates before the classifier. The mixed-program case,
+  the one the deletion rests on, needs to read the `/v1/cascade` request body
+  from a loopback mock, and `runtime/curl_tool.rs` allows one host and refuses
+  loopback. Amy decides whether `curl_tool()` permits loopback under
+  `cfg(test)`. The exemptions stay until that case is green.
+- **The hook's `n_clauses -eq 0` exit cannot be reached.** The broker skips
+  hooks for an all-allow program using the same evaluator that stamps the
+  hook's tiers, so the allow-tier drop never empties the list.
 - **A kaish lexer rejection degrades the gate to the no-plan fallback**
   (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
   lexer bug is kaish's (`gotcha_kaish` in memory has the shape).

@@ -10492,6 +10492,135 @@ mod tests {
         assert!(!result.is_error);
     }
 
+    // ── The real lfm2d hook body (docs/gate-policy-tuning.md, "Slices",
+    // item 5, "First tuning pass") ──────────────────────────────────────
+    //
+    // `LFM2D_SEED` is the shipped file, not a copy, so these tests run the
+    // same body `S50-lfm2d.kai` installs, matching `SHELL_GUARD_SEED` above.
+
+    /// The literal `assets/defaults/rc/lib/hooks/lfm2d.kai` seed.
+    const LFM2D_SEED: &str = include_str!("../../../../assets/defaults/rc/lib/hooks/lfm2d.kai");
+
+    /// A registered context with a document (so `kj block create` inside the
+    /// hook has somewhere to write) and `LFM2D_MODE`/`LFM2D_URL` set as
+    /// durable env — the hook reads both fresh at fire time
+    /// (`S50-lfm2d.kai`'s own header), never hard-coded.
+    async fn lfm2d_context(
+        kernel: &crate::Kernel,
+        kj: &crate::kj::KjDispatcher,
+        name: &str,
+        mode: &str,
+        url: &str,
+    ) -> CallContext {
+        let ctx = approval_call_context(kj, name);
+        kernel
+            .blocks()
+            .create_document(ctx.context_id, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let db = kj.kernel_db();
+        db.lock().set_context_env(ctx.context_id, "LFM2D_MODE", mode).unwrap();
+        db.lock().set_context_env(ctx.context_id, "LFM2D_URL", url).unwrap();
+        ctx
+    }
+
+    /// Installs the real, unmodified hook body as the `lfm2d-advisory`
+    /// pre_call hook against `shell_write` — never a hand-built `HookEntry`
+    /// with an extracted approximation of its tiers.
+    async fn push_real_lfm2d_hook(broker: &Broker) {
+        broker.hooks().write().await.pre_call.entries.push(HookEntry {
+            id: hook_id("lfm2d-advisory"),
+            match_instance: None,
+            match_tool: Some(GlobPattern("shell_write".into())),
+            match_context: None,
+            match_principal: None,
+            action: HookAction::Invoke(HookBody::Kaish(LFM2D_SEED.into())),
+            priority: 0,
+            kaish_script_id: None,
+        });
+    }
+
+    /// docs/gate-policy-tuning.md, "Verdicts": a plan where every clause is
+    /// allow-tier reaches no hook at all. Broker PreCall's own gate policy
+    /// evaluator (`evaluate_phase_with_mode`) returns `no_hook_matched` on
+    /// `AskVerdict::Allow` *before* hook lookup runs — so the real,
+    /// unmodified lfm2d.kai installed here never sees the plan, and the
+    /// classifier is never contacted. `kj block list` is a Read verb,
+    /// builtin-allow with no `gate.toml` needed (`kj/effect.rs`).
+    ///
+    /// `an_allow_tier_program_skips_the_hooks` pins the same skip with a
+    /// synthetic `Ask` hook; this one wires the real lfm2d.kai. It does not
+    /// exercise lfm2d.kai's own `n_clauses -eq 0` branch: the broker's skip
+    /// and the hook's per-command tiers come from the same evaluator, so an
+    /// all-allow-tier program never reaches the hook.
+    #[tokio::test]
+    async fn an_all_allow_tier_plan_never_reaches_the_real_lfm2d_hook() {
+        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-all-allow").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let ctx = lfm2d_context(
+            &kernel, &kj, "lfm2d-real-all-allow", "escalate",
+            "http://lfm2d-real-hook-test.invalid",
+        ).await;
+
+        let result = broker
+            .call_tool(shell_write_call("kj block list"), &ctx, CancellationToken::new())
+            .await
+            .expect("an all-allow-tier plan must proceed without ever reaching the hook");
+        assert!(!result.is_error);
+        assert!(
+            kj.kernel_db().lock().list_pending_asks().unwrap().is_empty(),
+            "the classifier must never be asked about an all-allow-tier plan"
+        );
+        assert!(
+            !kernel.blocks().block_snapshots(ctx.context_id).unwrap_or_default().iter()
+                .any(|b| b.content.contains("lfm2d-advisory")),
+            "no lfm2d trace block means the hook body never ran"
+        );
+    }
+
+    /// docs/gate-policy-tuning.md, "Verdicts": an ask-tier clause is firm.
+    /// With the real, unmodified lfm2d.kai and `LFM2D_MODE=escalate`, an
+    /// ask-tier clause exits 3 before `kaish-tools curl`'s registration
+    /// check is even reached, so the classifier is never contacted — the
+    /// ask description is the hook's own "ask tier on: <clause>" line.
+    ///
+    /// Without the hook's ask-tier block the clause survives the allow-tier
+    /// drop, curl cannot reach `LFM2D_URL`, the hook skips with exit 0, and
+    /// the call proceeds — which `expect_err` below refuses.
+    #[tokio::test]
+    async fn an_ask_tier_clause_escalates_in_the_real_lfm2d_hook_before_the_classifier() {
+        let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "lfm2d-real-ask", "[global]\nask = [\"kj rc add\"]\n",
+        ).await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let ctx = lfm2d_context(
+            &kernel, &kj, "lfm2d-real-ask", "escalate",
+            "http://lfm2d-real-hook-test.invalid",
+        ).await;
+
+        let command = "kj rc add /config/rc/x --content y";
+        let err = broker
+            .call_tool(shell_write_call(command), &ctx, CancellationToken::new())
+            .await
+            .expect_err("an ask-tier clause must escalate, never proceed silently");
+        assert!(err.is_refusal(RefusalKind::Pending), "expected Pending, got {err:?}");
+        let pending = kj.kernel_db().lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one ask must be minted");
+        assert!(
+            pending[0].description.contains("ask tier on") && pending[0].description.contains(command),
+            "the ask description must be the hook's own \"ask tier on: <clause>\" line: {:?}",
+            pending[0].description
+        );
+        assert!(
+            !kernel.blocks().block_snapshots(ctx.context_id).unwrap_or_default().iter()
+                .any(|b| b.content.contains("lfm2d-advisory")),
+            "the classifier path (curl, or its own trace blocks) must never run once the ask tier fired"
+        );
+    }
+
     /// A file that does not parse is a fault: the call is refused as gate
     /// unavailable, not denied, and the message names the file and remedy.
     #[tokio::test]
