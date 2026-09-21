@@ -1986,21 +1986,43 @@ history must not be quoted. Open:
   `is_gate_exempt_kj`** (`assets/defaults/rc/lib/hooks/lfm2d.kai`,
   exemption 2) and reads the second word, so a root flag ahead of the verb
   defeats it; the evaluator already skips PreCall for an exempt program.
-  Amy, 2026-09-21: build the placement test, then delete all three jq
-  exemptions and the `contrib/lfm2d-ladder-check.kai` copy. Two of the test's
-  three cases run the shipped hook body (`mcp/broker.rs`, the
-  `..._real_lfm2d_hook...` tests): all-allow never reaches the hook, and an
-  ask-tier clause escalates before the classifier. The mixed-program case,
-  the one the deletion rests on, needs to read the `/v1/cascade` request body
-  from a loopback mock, and `runtime/curl_tool.rs` allows one host and refuses
-  loopback. Amy decides whether `curl_tool()` permits loopback under
-  `cfg(test)`. The exemptions stay until that case is green.
+  Amy, 2026-09-21: "anything that doesn't precisely match the allowlist
+  should go to the classifier whole, no modification. if a model bundles kj
+  with other stuff, it has to go through full classification." and "raw
+  command goes to the classifier. we'll dial in the classifier over time."
+  So the hook sends the raw `shell_write` command as one clause: the
+  per-command split, the allow-tier drop and all three jq exemptions go, with
+  the `contrib/lfm2d-ladder-check.kai` copy. The ask tier stays firm. Two
+  tests already run the shipped hook body (`mcp/broker.rs`, the
+  `..._real_lfm2d_hook...` tests); the mixed-program test reads the
+  `/v1/cascade` body from a loopback mock, which waits on per-context egress
+  (`docs/egress.md`). Known cost: the classifier reads a plain `kj` read as
+  risky, so a mixed program asks a human until the classifier improves.
 - **The hook's `n_clauses -eq 0` exit cannot be reached.** The broker skips
   hooks for an all-allow program using the same evaluator that stamps the
   hook's tiers, so the allow-tier drop never empties the list.
 - **A kaish lexer rejection degrades the gate to the no-plan fallback**
   (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
   lexer bug is kaish's (`gotcha_kaish` in memory has the shape).
+
+## Egress: what stays open (2026-09-21)
+
+`docs/egress.md` owns the rule: per-context rows, a reviewer-held list, refuse
+on a miss. Amy: "git and any builtin contacting outside resources should go
+through the same path over time so we can monitor/classify/constrain." Open:
+
+- **Only `curl` reads the list.** `git` and host programs run under
+  `ExternalExec::Allow` reach the network with no egress check.
+- **A miss is refused, never adjudicated.** Amy: "we may add a special network
+  classifier later but for now we'll rely on allowlist or yolo for curl." The
+  plan evaluator sees `curl <url>` as a command; an approval has no way to
+  reach the tool at connect time. Needs a design conversation.
+- **The classifier host is a constant in `runtime/curl_tool.rs`.** Every
+  context reaches it so the lfm2d hook works in a context with an empty list.
+  Moving it into rows needs rc to grant a host at creation without the context
+  holding authority over its own list.
+- **Nothing records a request.** Monitoring is part of the goal; no span or
+  ledger row names the host a context reached or was refused.
 
 ## Cast follow-ups (seeded 2026-08-03)
 
