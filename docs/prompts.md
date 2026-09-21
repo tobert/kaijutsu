@@ -117,6 +117,14 @@ kj context rotate banto
 kj context prompt banto
 ```
 
+A seat writes its handoff note before it stops; the shared base asks for it
+and the handoff block carries the command. Rotating a cold seat therefore
+needs no turn from it. In the TUI, `Ctrl+A r` prefills `kj context rotate `
+and follows the successor. Rotation never prompts: the successor runs
+`create` rc and waits for its first prompt. When the predecessor left no
+note, the successor still has the predecessor excerpt below, and a director
+may read the archived seat's blocks.
+
 `kj context rotate` creates a successor from the predecessor's own parent. It
 copies the type, cast, performer, director, reviewer override, model, system
 prompt, consent mode, workspace, env, and cwd, sets `ROTATED_FROM` to the

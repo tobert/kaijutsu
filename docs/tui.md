@@ -1198,12 +1198,33 @@ wiring, not new engraving. Lane in `docs/issues.md`.
 The prefix table in `docs/input.md`, "The prefix table", ports verbatim:
 `Ctrl+A 0–9`, `Ctrl+A Ctrl+A`, `a` (a literal `Ctrl+A` into the draft,
 screen's own `C-a a`), `q`, `"`, `w`, `'`, `A`, `n`/`p`, `d`, `h`, and the
-armed-prefix legend line. `q`, `'`, `A`, and `d` are chords the prefix
-already claims; the notice on the status line names what each will do —
-switch by prompt, rename, close-and-demote, detach — until this client
-builds them. `h` is not this client's yet either and has no notice of its
-own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Three
-chords are this client's own, with no app equivalent: `Ctrl+A v` opens the
+armed-prefix legend line. `'`, `A`, and `r` are the prefilled-`kj` prompt:
+each opens the `:` bar typed up to the verb's argument (`kj context switch `,
+`kj context rename `, `kj context rotate `), from any vi mode; `Enter` runs
+the line and `Esc` abandons it. A `:kj` line is pinned to the context it
+addressed, so the client moves on what the result says: a `switched_to`
+target, or the successor when the seat on screen is the one that rotated.
+Rotating another seat by label leaves the screen where it is.
+
+**The prefix pops over the ask card, the picker, and the ledger.** Amy,
+2026-09-21: "ctrl-a should pop over just about everything, including asks, bc
+I might want to pop over to look at something before answering." `Ctrl+A`
+and the key after it are never an overlay's keys, from any vi mode of the
+draft. A chord that goes somewhere else (a seat, the last context, the diff
+viewer, a prefilled prompt) takes the picker or ledger down first; the
+overlay's own chord (`Ctrl+A "`, `Ctrl+A l`) only closes it; arming, an
+unbound chord, and a not-built notice leave it up. The picker and ledger
+ignore every other Ctrl or Alt chord, so none is read as a bare letter —
+`Ctrl+A Ctrl+A` was once the picker's `a` `a`, an archive and its confirm.
+The full-screen editor is the one exception ("Editor and diff").
+
+`q` and `d`
+are chords the prefix already claims; the notice on the status line names
+what each will do — close-and-demote, detach — until this client builds
+them. `h` is not this client's yet either and has no notice of its
+own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Five
+chords are this client's own, with no app equivalent yet: `Ctrl+A r` rotates,
+`Ctrl+A v` opens the
 diff viewer, `Ctrl+A l` opens the ledger, `Ctrl+A ]` pastes the copy-mode
 yank buffer, and `Ctrl+A [` leaves the live tail without moving ("Copy mode
 (scroll, or `Ctrl+A [`)"). The legend takes the

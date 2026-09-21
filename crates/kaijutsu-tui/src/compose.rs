@@ -361,6 +361,22 @@ impl Compose {
         }
     }
 
+    /// Open the `:` bar with `body` (no `:` prefix) typed and the cursor
+    /// after it, from any vi mode. An open bar has its text replaced. The
+    /// returned ops are whatever leaving the mode did to the draft; mirror
+    /// them like any keystroke's.
+    pub fn open_command(&mut self, body: &str) -> Vec<EditOp> {
+        let mut ops = Vec::new();
+        if self.editor.command_line().is_none() {
+            if self.editor.mode().is_some() {
+                ops.extend(self.editor.apply_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            }
+            ops.extend(self.editor.apply_key_event(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)));
+        }
+        self.set_command_body(body);
+        ops
+    }
+
     /// Insert `text` at the cursor as one edit — `Ctrl+A ]`, the paste
     /// buffer. Text, not keystrokes: a normal-mode draft never reads it as
     /// commands, and one op keeps it one `edit_input`.
@@ -862,6 +878,32 @@ mod tests {
         compose.press(press(KeyCode::Char('a')));
         typed(&mut compose, "!");
         assert_eq!(compose.text(), "hello!");
+    }
+
+    /// A prefilled bar opens from insert mode with the text typed and the
+    /// cursor after it; the draft is untouched and `Enter` submits the line
+    /// with whatever the player added.
+    #[test]
+    fn open_command_prefills_the_bar_from_insert_mode() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        typed(&mut compose, "draft");
+        compose.open_command("kj context rename ");
+        assert_eq!(compose.command_line().as_deref(), Some(":kj context rename "));
+        assert_eq!(compose.text(), "draft", "the bar never touches the draft");
+        typed(&mut compose, "banto");
+        let action = compose.press(press(KeyCode::Enter));
+        assert_eq!(action.command.as_deref(), Some(":kj context rename banto"));
+    }
+
+    /// A prefill over an already open bar replaces what was typed there.
+    #[test]
+    fn open_command_replaces_an_open_bar() {
+        let mut compose = Compose::new();
+        compose.press(press(KeyCode::Char(':')));
+        typed(&mut compose, "kj fork");
+        compose.open_command("kj context rotate ");
+        assert_eq!(compose.command_line().as_deref(), Some(":kj context rotate "));
     }
 
     /// `Enter` submits the raw line, `:` prefix included, and never the

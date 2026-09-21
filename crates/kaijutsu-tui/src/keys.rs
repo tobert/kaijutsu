@@ -37,6 +37,11 @@ pub enum Intent {
     /// "The `:` line": the `Ctrl+Z` shell surface retired in favor of `:!`,
     /// so this is now a single-press suspend, not a toggle).
     Suspend,
+    /// `Ctrl+A r` / `A` / `'` — open the `:` bar typed up to the verb's
+    /// argument, cursor at the end (`docs/input.md`, "The prefilled-`kj`
+    /// prompt pattern"). The text is the bar's body, no `:` prefix. `Enter`
+    /// runs it and `Esc` abandons it.
+    PrefillKj(&'static str),
     /// A chord a later lane owns. The text names the chord's future meaning,
     /// so a key is never swallowed silently.
     NotYet(&'static str),
@@ -147,16 +152,13 @@ impl Keys {
                 KeyCode::Char(']') => Intent::Paste,
                 KeyCode::Char('n') => Intent::StepSeat(1),
                 KeyCode::Char('p') => Intent::StepSeat(-1),
+                KeyCode::Char('\'') => Intent::PrefillKj("kj context switch "),
+                KeyCode::Char('A') => Intent::PrefillKj("kj context rename "),
+                KeyCode::Char('r') => Intent::PrefillKj("kj context rotate "),
                 // The app already has these (`docs/input.md`, "The prefix
                 // table"); this lane has not built them, so the notice names
                 // what they will do rather than reading as a plain unbound
                 // key.
-                KeyCode::Char('\'') => {
-                    Intent::NotYet("Ctrl+A ' will switch by prompt; not built yet")
-                }
-                KeyCode::Char('A') => {
-                    Intent::NotYet("Ctrl+A A will rename the context; not built yet")
-                }
                 KeyCode::Char('q') => {
                     Intent::NotYet("Ctrl+A q will close and demote; not built yet")
                 }
@@ -281,6 +283,22 @@ mod tests {
         assert!(!keys.armed());
     }
 
+    /// The three prefilled-`kj` chords (`docs/input.md`, "The prefix
+    /// table"): each opens the `:` bar typed up to its argument.
+    #[test]
+    fn the_prompt_chords_prefill_the_colon_bar() {
+        for (c, body) in [
+            ('r', "kj context rotate "),
+            ('A', "kj context rename "),
+            ('\'', "kj context switch "),
+        ] {
+            let mut keys = Keys::new();
+            keys.interpret(ctrl('a'));
+            assert_eq!(keys.interpret(press(KeyCode::Char(c))), Intent::PrefillKj(body));
+            assert!(!keys.armed());
+        }
+    }
+
     #[test]
     fn ctrl_a_l_opens_the_ledger() {
         let mut keys = Keys::new();
@@ -364,8 +382,8 @@ mod tests {
         let mut keys = Keys::new();
         keys.interpret(ctrl('a'));
         assert_eq!(
-            keys.interpret(press(KeyCode::Char('\''))),
-            Intent::NotYet("Ctrl+A ' will switch by prompt; not built yet")
+            keys.interpret(press(KeyCode::Char('q'))),
+            Intent::NotYet("Ctrl+A q will close and demote; not built yet")
         );
     }
 

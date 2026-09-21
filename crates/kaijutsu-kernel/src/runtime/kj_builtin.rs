@@ -528,7 +528,15 @@ impl Tool for KjBuiltin {
             KjResult::Err(msg) => ExecResult::failure(1, msg),
             KjResult::Switch(new_id, msg) => {
                 match self.switch_context(new_id, ctx).await {
-                    Ok(()) => ExecResult::success(msg),
+                    // A pinned run (structured `kj`) cannot move its caller,
+                    // so the target rides in `.data` for the client to follow.
+                    Ok(()) => {
+                        let mut result = ExecResult::success(msg);
+                        result.data = Some(kaish_kernel::interpreter::json_to_value(
+                            serde_json::json!({"switched_to": new_id.to_hex()}),
+                        ));
+                        result
+                    }
                     Err(e) => ExecResult::failure(
                         1,
                         format!("context switch refused: {e}"),

@@ -360,13 +360,16 @@ pub fn ledger_key_to_action(key: KeyEvent, filtering: bool) -> LedgerAction {
     if key.kind == KeyEventKind::Release {
         return LedgerAction::Ignored;
     }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Every ledger key is bare; a Ctrl or Alt chord is never a decision.
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return LedgerAction::Ignored;
+    }
     if filtering {
         return match key.code {
             KeyCode::Esc => LedgerAction::CancelFilter,
             KeyCode::Enter => LedgerAction::CommitFilter,
             KeyCode::Backspace => LedgerAction::FilterBackspace,
-            KeyCode::Char(c) if !ctrl => LedgerAction::FilterInsert(c),
+            KeyCode::Char(c) => LedgerAction::FilterInsert(c),
             _ => LedgerAction::Ignored,
         };
     }
@@ -780,6 +783,18 @@ mod tests {
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('d'))), Some(AskDecision::Deny));
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('v'))), Some(AskDecision::ViewLedger));
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('x'))), None);
+    }
+
+    /// `Ctrl+A` is the prefix and `Ctrl+D` is a vi scroll; neither answers
+    /// the selected ask.
+    #[test]
+    fn a_ctrl_chord_is_never_a_ledger_decision() {
+        for c in ['a', 'd', 'A'] {
+            let chord = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            assert_eq!(ledger_key_to_action(chord, false), LedgerAction::Ignored);
+            let alt = KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+            assert_eq!(ledger_key_to_action(alt, false), LedgerAction::Ignored);
+        }
     }
 
     #[test]

@@ -121,6 +121,7 @@ list.
 | `Ctrl+A w` | Synonym for `"` — the well | — |
 | `Ctrl+A '` | Switch-by-prompt: prefilled-`kj` prompt, `kj context switch ` (see pattern below) | select |
 | `Ctrl+A A` | Rename current context: prefilled-`kj` prompt, `kj context rename ` (verb added 2026-07-16; label-stealing stays `retag`'s latched job) | title |
+| `Ctrl+A r` | Rotate the current context: prefilled-`kj` prompt, `kj context rotate `; `Enter` rotates the context on screen, or type a label first. The client follows the successor. No handoff note is written and no model turn starts (`docs/prompts.md`, "Rotating a context"). TUI only; the app port is open in `docs/issues.md` | (repurposed; screen's wrap) |
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
@@ -130,9 +131,8 @@ list.
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
 user can type and hit enter — we might use that pattern elsewhere"): summon
 the shell surface with a command line already typed up to the argument,
-cursor at end; Enter runs it, Esc abandons it. `Ctrl+A A` and `Ctrl+A '`
-are the first two users; any verb that needs one free-text argument can
-ride it.
+cursor at end; Enter runs it, Esc abandons it. `Ctrl+A A`, `Ctrl+A '`, and
+`Ctrl+A r` use it; any verb that needs one free-text argument can ride it.
 
 ## Escape — two meanings total
 

@@ -674,7 +674,9 @@ async fn event_loop(
                             }
                         }
                         let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
-                        if app.picker.is_some() {
+                        // The prefix is never the picker's key
+                        // ([`Keys::claims`]); `act` runs the chord over it.
+                        if app.picker.is_some() && !keys.claims(&key) {
                             handle_picker_key(bridge, app, key, &mut wires.feeds).await?;
                         } else {
                             let width = terminal.size()?.width;
@@ -1206,9 +1208,10 @@ async fn act(
         act_full_screen(bridge, app, key).await?;
         return Ok(Acted::Continue);
     }
-    // The ledger view captures every key while open — its j/k/Esc keys are
-    // never compose text or a `Ctrl+A` chord (`docs/tui.md`, "The ledger").
-    if app.ledger_view.is_some() {
+    // The ledger view captures its own keys while open — j/k/Esc are never
+    // compose text. The `Ctrl+A` prefix pops over it, as it does over the
+    // picker and the ask card (`docs/tui.md`, "Keys").
+    if app.ledger_view.is_some() && !keys.claims(&key) {
         handle_ledger_key(bridge, app, key).await;
         return Ok(Acted::Continue);
     }
@@ -1249,13 +1252,29 @@ async fn act(
         keys.interpret(key)
     };
 
+    if app.picker.is_some() || app.ledger_view.is_some() {
+        match chord_over_overlay(&intent, app.picker.is_some(), app.ledger_view.is_some()) {
+            OverOverlay::Keep => {}
+            OverOverlay::Hold => return Ok(Acted::Continue),
+            OverOverlay::Close => {
+                app.picker = None;
+                app.ledger_view = None;
+                return Ok(Acted::Continue);
+            }
+            OverOverlay::CloseAndRun => {
+                app.picker = None;
+                app.ledger_view = None;
+            }
+        }
+    }
+
     match intent {
         Intent::Ignored | Intent::LegendChanged => {}
         Intent::Interrupt => {
             interrupt_ctrl_c(bridge, app, interrupt_ladder).await;
         }
         Intent::InputKey(key) => match tail_key(app, &key, width) {
-            TailKey::Draft => compose_key(bridge, app, key).await?,
+            TailKey::Draft => compose_key(bridge, app, key, feeds).await?,
             // The tail is already on screen; there is nothing below it.
             TailKey::Nothing => {}
             TailKey::LeaveTail(step) => leave_tail(app, width, step),
@@ -1303,6 +1322,13 @@ async fn act(
             }
             None => app.note("no context to read"),
         },
+        Intent::PrefillKj(body) => match app.current {
+            Some(ctx) => {
+                let ops = app.compose.open_command(body);
+                mirror_ops(bridge, app, ctx, &ops).await;
+            }
+            None => app.note("no context attached"),
+        },
         Intent::NotYet(message) => app.note(message),
         Intent::Unbound(code) => {
             app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
@@ -1316,7 +1342,7 @@ async fn act(
                 // synthesized bare `Tab`: `keys.rs` only routes an
                 // unmodified `Tab` here today, and a future modifier should
                 // reach compose rather than be dropped on the floor.
-                compose_key(bridge, app, key).await?;
+                compose_key(bridge, app, key, feeds).await?;
             }
         }
         Intent::TogglePicker => app.open_picker(kaijutsu_types::now_millis()),
@@ -1626,6 +1652,7 @@ async fn compose_key(
     bridge: &KernelBridge,
     app: &mut App,
     key: crossterm::event::KeyEvent,
+    feeds: &mut Feeds,
 ) -> Result<()> {
     let Some(ctx) = app.current else {
         app.note("no context attached");
@@ -1634,7 +1661,7 @@ async fn compose_key(
     let action = app.compose.press(key);
     mirror_ops(bridge, app, ctx, &action.ops).await;
     if let Some(line) = action.command {
-        handle_colon_line(bridge, app, ctx, line).await;
+        handle_colon_line(bridge, app, ctx, line, feeds).await;
         return Ok(());
     }
     if action.submit {
@@ -1664,20 +1691,84 @@ async fn compose_key(
     Ok(())
 }
 
+/// What a prefix chord does to the picker or ledger it fired over.
+#[derive(Debug, PartialEq, Eq)]
+enum OverOverlay {
+    /// The overlay stays and the intent runs: arming, a notice.
+    Keep,
+    /// The overlay stays and the intent is dropped: it was draft text.
+    Hold,
+    /// The chord is the overlay's own toggle: it comes down, nothing else.
+    Close,
+    /// The chord goes somewhere else: the overlay comes down first.
+    CloseAndRun,
+}
+
+/// The prefix pops over the picker and the ledger (`docs/tui.md`, "Keys").
+/// A chord that leaves for another surface takes the overlay down on the way;
+/// one that only changes the legend or posts a notice leaves it up.
+fn chord_over_overlay(intent: &Intent, picker: bool, ledger: bool) -> OverOverlay {
+    match intent {
+        Intent::Ignored | Intent::LegendChanged | Intent::NotYet(_) | Intent::Unbound(_)
+        | Intent::Interrupt | Intent::Suspend => OverOverlay::Keep,
+        Intent::InputKey(_) | Intent::Tab | Intent::Paste => OverOverlay::Hold,
+        Intent::TogglePicker if picker => OverOverlay::Close,
+        Intent::OpenLedger if ledger => OverOverlay::Close,
+        _ => OverOverlay::CloseAndRun,
+    }
+}
+
+/// Where a `kj` result moves this client. A structured run is pinned to the
+/// context it addressed, so the verb names the move in its data: `switched_to`
+/// (`kj context switch`, `kj fork`), or `rotated_from` with `context_id` when
+/// the seat on screen is the one that rotated. An id that does not parse is
+/// an error, never a stay.
+fn follow_target(data: Option<&serde_json::Value>, current: ContextId) -> Result<Option<ContextId>, String> {
+    let Some(data) = data else { return Ok(None) };
+    let id_at = |key: &str| -> Result<Option<ContextId>, String> {
+        match data.get(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| format!("`{key}` is not a string"))
+                .and_then(|hex| ContextId::parse(hex).map_err(|e| format!("`{key}` {hex:?}: {e}")))
+                .map(Some),
+        }
+    };
+    if let Some(target) = id_at("switched_to")? {
+        return Ok((target != current).then_some(target));
+    }
+    if id_at("rotated_from")? == Some(current) {
+        return id_at("context_id")?.map(Some).ok_or_else(|| "rotate result names no successor".to_string());
+    }
+    Ok(None)
+}
+
 /// Dispatch one submitted `:` line (`docs/tui.md`, "The `:` line"). The tui
 /// parses it itself (`cmdline::parse`) — the core's own `:w`/`:q` ex-command
 /// dialect answers the alternate-screen editor, not this bar.
-async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId, line: String) {
+async fn handle_colon_line(bridge: &KernelBridge, app: &mut App, ctx: ContextId, line: String, feeds: &mut Feeds) {
     match cmdline::parse(&line) {
         ColonVerb::Kj(argv) => match bridge.execute_kj(ctx, argv).await {
             Ok(result) if result.latch.is_some() => {
                 app.note(result.latch.map(|l| l.message).unwrap_or_default());
             }
             Ok(result) => {
-                app.note(result.stdout.lines().next().unwrap_or("done").to_string());
                 // Any kj verb may have changed the roster (fork, promote,
                 // archive); the picker and the rank should not wait a tick.
                 app.roster_changed = true;
+                let said = result.stdout.lines().next().unwrap_or("done").to_string();
+                match follow_target(result.data.as_ref(), ctx) {
+                    Ok(Some(id)) => {
+                        switch_seat(bridge, app, id, feeds).await;
+                        // A failed switch left its own notice; keep it.
+                        if app.current == Some(id) {
+                            app.note(said);
+                        }
+                    }
+                    Ok(None) => app.note(said),
+                    Err(e) => app.note(format!("{said}; cannot follow: {e}")),
+                }
             }
             Err(e) => app.note(format!(":kj failed: {e:#}")),
         },
@@ -2727,6 +2818,49 @@ mod tests {
         ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
     };
     use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+
+    /// Arming keeps the overlay, a seat switch takes it down, and an
+    /// overlay's own chord only closes it.
+    #[test]
+    fn a_chord_over_an_overlay_closes_it_only_when_it_leaves() {
+        assert_eq!(chord_over_overlay(&Intent::LegendChanged, true, false), OverOverlay::Keep);
+        assert_eq!(chord_over_overlay(&Intent::SwitchSeat(2), true, false), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::LastContext, false, true), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, true, false), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::TogglePicker, false, true), OverOverlay::CloseAndRun);
+        assert_eq!(chord_over_overlay(&Intent::OpenLedger, false, true), OverOverlay::Close);
+        assert_eq!(chord_over_overlay(&Intent::Paste, true, false), OverOverlay::Hold);
+        assert_eq!(chord_over_overlay(&Intent::Unbound(crossterm::event::KeyCode::Char('x')), true, false), OverOverlay::Keep);
+    }
+
+    /// Rotating the seat on screen follows its successor; rotating another
+    /// seat by label leaves the screen where it is.
+    #[test]
+    fn a_rotate_result_follows_only_the_seat_on_screen() {
+        let (here, successor, elsewhere) = (ContextId::new(), ContextId::new(), ContextId::new());
+        let data = serde_json::json!({"context_id": successor.to_hex(), "rotated_from": here.to_hex()});
+        assert_eq!(follow_target(Some(&data), here), Ok(Some(successor)));
+        assert_eq!(follow_target(Some(&data), elsewhere), Ok(None));
+    }
+
+    #[test]
+    fn a_switch_result_follows_its_target() {
+        let (here, there) = (ContextId::new(), ContextId::new());
+        let data = serde_json::json!({"switched_to": there.to_hex()});
+        assert_eq!(follow_target(Some(&data), here), Ok(Some(there)));
+    }
+
+    /// A record that merely mentions a context id (`kj context info`) moves
+    /// nothing, and an id that does not parse is an error, never a stay.
+    #[test]
+    fn other_results_stay_and_a_bad_id_is_an_error() {
+        let here = ContextId::new();
+        let info = serde_json::json!({"context_id": ContextId::new().to_hex(), "label": "x"});
+        assert_eq!(follow_target(Some(&info), here), Ok(None));
+        assert_eq!(follow_target(None, here), Ok(None));
+        let bad = serde_json::json!({"switched_to": "not-an-id"});
+        assert!(follow_target(Some(&bad), here).is_err());
+    }
 
     /// Watch a context with an empty mirror — what `watch_context` leaves
     /// behind, without a kernel to hydrate from.

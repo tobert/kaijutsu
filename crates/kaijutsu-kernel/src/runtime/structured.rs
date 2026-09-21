@@ -315,4 +315,26 @@ mod tests {
         assert_eq!(stored_performer, performer.as_bytes());
     }
 
+    /// A structured run stays pinned to its addressed context, so a switch
+    /// names its target in `data` for the client to act on.
+    #[tokio::test]
+    async fn a_pinned_switch_names_its_target_in_data() {
+        let dispatcher = Arc::new(crate::kj::test_helpers::test_dispatcher_persistent().await);
+        dispatcher.set_self_arc();
+        let kernel = dispatcher.kernel();
+        kernel.broker().set_kj_dispatcher(&dispatcher).await;
+        let who = PrincipalId::new();
+        let context = crate::kj::test_helpers::register_context(&dispatcher, Some("here"), None, who);
+        let target = crate::kj::test_helpers::register_context(&dispatcher, Some("there"), None, who);
+        kernel.blocks().create_document(context, crate::block_store::DocumentKind::Conversation, None).unwrap();
+        // The switch saves the source's cwd, which must exist in this VFS.
+        kernel.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: context, cwd: Some("/".into()), updated_at: 0 }).unwrap();
+        let argv: Vec<String> = ["context", "switch", "there"].into_iter().map(str::to_owned).collect();
+        let reply = execute_kj(kernel, ShellIdentity { requester: who, performer: who, reviewer: None,
+            context, session: kaijutsu_types::SessionId::new() }, &argv, false).await.unwrap().unwrap();
+        assert_eq!(reply.exit_code, 0, "{}", reply.stderr);
+        assert_eq!(reply.data, Some(serde_json::json!({"switched_to": target.to_hex()})));
+    }
+
 }

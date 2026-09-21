@@ -1564,6 +1564,148 @@ fn seat_of(session: &TuiSession, label: &str) -> usize {
     seat_digit(rows.last().expect("a status row"), label).expect("the seat was just seen")
 }
 
+/// `Ctrl+A r` opens the `:` bar typed up to `kj context rotate `; `Enter`
+/// rotates the seat on screen and the client follows the successor, which
+/// shows as the predecessor's draft leaving the compose line
+/// (`docs/input.md`, "The prefix table").
+#[test]
+fn ctrl_a_r_rotates_the_seat_and_follows_its_successor() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send("ipredecessor-draft\x1b");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "predecessor-draft")),
+        "the draft never drew: {}",
+        session.dump("draft")
+    );
+    session.send("\x01r");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, ":kj context rotate")),
+        "the bar was not prefilled: {}",
+        session.dump("after Ctrl+A r")
+    );
+    session.send("\r");
+    let followed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen_contains_str(screen, "rotated") && !screen_contains_str(screen, "predecessor-draft")
+    });
+    assert!(followed, "the client did not follow the successor: {}", session.dump("after rotate"));
+}
+
+/// `Ctrl+A '` prefills `kj context switch `; the structured run is pinned,
+/// so the client follows the target the result names.
+#[test]
+fn ctrl_a_quote_switches_by_prompt() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    fork_and_seat(&session, "elsewhere");
+    session.send("ihome-draft\x1b");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "home-draft")),
+        "the draft never drew: {}",
+        session.dump("draft")
+    );
+    session.send("\x01'");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, ":kj context switch")),
+        "the bar was not prefilled: {}",
+        session.dump("after Ctrl+A '")
+    );
+    session.send("elsewhere\r");
+    let followed = session.wait_until(Duration::from_secs(20), |screen| {
+        screen_contains_str(screen, "switched to") && !screen_contains_str(screen, "home-draft")
+    });
+    assert!(followed, "the client did not follow the switch: {}", session.dump("after switch"));
+}
+
+/// The draft on screen names the seat: each seat here carries its own, so a
+/// switch shows as one draft leaving and the other arriving.
+fn seat_with_two_drafts(session: &TuiSession) -> usize {
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    let seat = fork_and_seat(session, "elsewhere");
+    session.send("ihome-draft\x1b");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "home-draft")),
+        "the draft never drew: {}",
+        session.dump("draft")
+    );
+    // `Esc` on its own, so the next byte is not read as `Alt+<byte>`.
+    std::thread::sleep(Duration::from_millis(200));
+    seat
+}
+
+fn assert_left_home(session: &TuiSession, what: &str) {
+    let left = session.wait_until(Duration::from_secs(15), |screen| {
+        !screen_contains_str(screen, "home-draft") && screen_contains(screen, '\u{276f}')
+    });
+    assert!(left, "{what}: {}", session.dump(what));
+}
+
+/// `Ctrl+A <digit>` from compose's normal mode, mid-draft: the prefix is
+/// never the draft's key, whatever vi mode the draft is in.
+#[test]
+fn the_prefix_switches_seats_from_normal_mode_mid_draft() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    let seat = seat_with_two_drafts(&session);
+
+    session.send("\x01");
+    assert!(
+        session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "Ctrl+A:")),
+        "the prefix never armed from normal mode: {}",
+        session.dump("armed")
+    );
+    session.send(&format!("{seat}"));
+    assert_left_home(&session, "the chord did not switch from normal mode");
+}
+
+/// The prefix pops over the open picker: `Ctrl+A` is never the picker's `a`
+/// (archive), and `Ctrl+A <digit>` takes the picker down and switches.
+#[test]
+fn the_prefix_pops_over_the_open_picker() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    let seat = seat_with_two_drafts(&session);
+
+    session.send("\x01\"");
+    assert!(
+        session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "ACTIVE")),
+        "the picker never opened: {}",
+        session.dump("picker")
+    );
+    session.send("\x01");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send(&format!("{seat}"));
+    assert_left_home(&session, "the chord did not switch over the picker");
+    let rows = session.screen_text().join("\n");
+    assert!(!rows.contains("ACTIVE"), "the picker stayed up: {}", session.dump("picker"));
+    assert!(!rows.contains("archive"), "a chord reached the picker as a verb: {}", session.dump("picker"));
+}
+
+/// The prefix pops over the open ledger the same way.
+#[test]
+fn the_prefix_pops_over_the_open_ledger() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    let seat = seat_with_two_drafts(&session);
+
+    session.send("\x01l");
+    std::thread::sleep(Duration::from_millis(1500));
+    session.send("\x01");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send(&format!("{seat}"));
+    assert_left_home(&session, "the chord did not switch over the ledger");
+}
+
 /// Fork a context named `label` and wait until the status line seats it —
 /// the proof that the kernel made it and this client has ranked it, before
 /// a chord addresses it by seat.

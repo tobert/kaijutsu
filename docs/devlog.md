@@ -2982,3 +2982,40 @@ wrong costs more than an entry that is open.
 Credits: Claude Opus 5 led, Claude Sonnet 5 ran twelve lanes, and kaibo's
 DeepSeek cast reviewed each batch and caught the stale comments and the
 provider-classification gap the lanes' own reading had missed.
+
+## The morning rotation (September 21)
+
+Amy's morning is a sweep through terminal tabs: read what the night left, close
+the cold seats, start fresh ones from the handoff. She never wakes a cold seat,
+because its cache is gone and the wake-up buys nothing. Kaijutsu had the parts
+— `kj context rotate`, the handoff tail, the predecessor excerpt — and no
+gesture. `Ctrl+A r` is the gesture, and it is a prefilled `:kj context rotate `
+rather than a direct action because a rotation archives a seat.
+
+The decisions are Amy's. The chord writes no handoff note and starts no turn:
+a seat writes its note before it stops, the shared base now says so plainly,
+and a seat that forgot is not woken to fix it. The successor waits for her
+first prompt. Only a director reads back through earlier seats; other types
+work from the brief and their own handoff, which the rc links already
+enforced, since `S17-predecessor` is linked into `director` alone.
+
+Building the chord showed that the TUI had never followed any `kj` result. A
+`:kj` line runs pinned to the context it addressed, so `kj context switch`
+reported success and moved nothing. `KjResult::Switch` now names its target
+in the result data as `switched_to`, and the client follows that, or the
+successor of a rotate whose `rotated_from` is the seat on screen. One rule
+serves `Ctrl+A '`, `Ctrl+A r`, and a typed line. The legend outgrew a hundred
+columns and became tiers.
+
+The first morning on the new build found what the overlays had been doing
+with the prefix. The picker and the ledger took every key and never looked at
+modifiers, so `Ctrl+A` arrived as a bare `a`: archive in the picker, allow
+once in the ledger, and `Ctrl+A Ctrl+A` — the last-context reflex — confirmed
+the archive latch. A stale `gate.toml` the upgrade had just broken is what
+refused it. Amy's rule replaced the patch: the prefix pops over nearly
+everything, asks included, because she may want to look at something before
+answering. `Keys::claims` already said which keys are the prefix's; the
+overlays now ask it first. The full-screen editor keeps its bypass until its
+session has a rule for a seat switch.
+
+Credits: Claude Fable 5.1.

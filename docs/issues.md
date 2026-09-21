@@ -256,6 +256,32 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   in downtime; keep it simple.
 - A model rotating its own seat from inside a live turn archives the
   context that turn is still writing to. Untested.
+- `Ctrl+A r` (rotate by prefilled prompt, client follows the successor) is
+  TUI only. The app has the prefilled-`kj` pattern but no rotate chord and no
+  follow on a rotate result (`docs/input.md`, "The prefix table").
+- A pinned structured `kj context switch` still runs the builtin's
+  `switch_context`: it validates and saves the addressed context's cwd in a
+  throwaway shell, so a context whose cwd has gone missing refuses a switch
+  that would never have moved that shell
+  (`runtime/kj_builtin.rs`, `KjResult::Switch`). The client follows
+  `switched_to` from the result data instead.
+- An upgrade can land a kernel on a `gate.toml` the new binary rejects, and
+  then every gated shell submission is refused. On moltar 2026-09-21 the host
+  file was the older shipped default, naming `[context_type.explorer]` after
+  the type became `toolie`. `rc reseed` does not look at `/config/kernel`, and
+  nothing at boot says the gate is unusable; the refusal shows only per call
+  in the log. Reseed also never removes a retired bucket: the host still
+  has `/config/rc/bassist`.
+- The prefix does not pop over the full-screen editor or diff viewer: every
+  key goes to `editor_keys`, so `Ctrl+A` is vim's increment (`docs/tui.md`,
+  "Keys bypass the prefix"). The app's table puts the prefix above vi, with
+  `Ctrl+A a` as the literal. Lifting the bypass needs a rule for what a seat
+  switch does to an open editor session. Amy's 2026-09-21 report that
+  `Ctrl+A` failed after `Esc` "mid-prompt" does not reproduce in compose's
+  normal mode (`the_prefix_switches_seats_from_normal_mode_mid_draft`); the
+  editor is the unconfirmed candidate.
+- Whether seats write their handoff note before stopping is prompt guidance
+  (`S00-base.md`), unmeasured. Tune it from what the morning rotation finds.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
   is flaky under the parallel test runner and passes single-threaded.
 - `mcp::broker::tests::tool_call_spans_keep_requester_actor_and_reviewer_distinct`

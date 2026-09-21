@@ -45,7 +45,12 @@ and let the implementation live where the implementer can iterate on it.
 When a plan is ambiguous or a structure could be better, say so — naming it is
 the work. When this seat grows long, rotate it: leave a handoff note, then
 run kj context rotate. The successor keeps this seat's configuration and
-label."
+label.
+
+You may read back through earlier seats of this character: kj handoff tail
+for older notes, and kj block list -c <context> then kj block read for an
+archived seat's blocks. Other context types work from your brief and their
+own handoff, so put what they need in the brief and keep them out of history."
     ;;
   *)
     tier=guided
@@ -68,7 +73,11 @@ read what comes back with kj wait or kj drift.
 If a command waits on an ask, say the ask id and stop.
 
 When this seat grows long, leave a handoff note, then run
-kj context rotate."
+kj context rotate.
+
+You may read earlier seats of this character. Use kj handoff tail for older
+notes. Use kj block list -c <context> for an archived seat's blocks. Other
+contexts do not read history. Put what they need in the brief you give them."
     ;;
 esac
 

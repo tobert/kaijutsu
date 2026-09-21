@@ -372,10 +372,17 @@ pub fn status_line(model: &StatusModel, width: u16, palette: &Palette) -> Line<'
 /// pending. `docs/input.md`, "The prefix table" — the chords this client
 /// answers today, in that table's order.
 pub fn legend_line(width: u16, palette: &Palette) -> Line<'static> {
-    let full = "Ctrl+A: 0-9 seat · n/p next/prev · Ctrl+A last · \" picker · l ledger · [ copy · ] paste · Esc cancel";
-    let short = "Ctrl+A: 0-9 seat · Ctrl+A last · \" picker";
+    // Widest first; the first tier that fits wins, and the last is the floor.
+    let tiers = [
+        "Ctrl+A: 0-9 seat · n/p step · Ctrl+A last · \" picker · ' switch · A rename · r rotate · l ledger · [ copy · ] paste · Esc cancel",
+        "Ctrl+A: 0-9 · n/p · ^A last · \" pick · ' switch · A name · r rotate · l ledger · [ copy · ] paste",
+        "Ctrl+A: 0-9 seat · Ctrl+A last · \" picker",
+    ];
     let width = usize::from(width.max(1));
-    let text = if full.chars().count() <= width { full } else { short };
+    let text = tiers
+        .iter()
+        .find(|tier| tier.chars().count() <= width)
+        .unwrap_or(&tiers[tiers.len() - 1]);
     Line::from(Span::styled(text.to_string(), palette.warning()))
 }
 
@@ -735,7 +742,10 @@ mod tests {
         let narrow = text(&legend_line(50, &palette));
         assert!(wide.contains("ledger"));
         assert!(wide.contains("[ copy"), "got {wide:?}");
+        assert!(wide.contains("r rotate"), "got {wide:?}");
         assert!(!narrow.contains("ledger"));
+        let full = text(&legend_line(200, &palette));
+        assert!(full.contains("Esc cancel"), "got {full:?}");
         assert!(narrow.chars().count() <= 50);
     }
 }

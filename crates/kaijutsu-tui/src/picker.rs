@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use kaijutsu_client::{ContextInfo, ServerEvent, TrackInfo};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, Role, Status};
 use kaijutsu_viz::layout::{Band, ContextLifecycle, assign_ring_seats};
@@ -527,6 +527,13 @@ impl PickerModel {
         if key.kind == KeyEventKind::Release {
             return Outcome::None;
         }
+        // Every key here is a bare letter. A Ctrl or Alt chord is someone
+        // reaching for another surface (`Ctrl+A Ctrl+A` is the last-context
+        // toggle), so it is never a verb and never confirms a latch.
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            self.pending_confirm = None;
+            return Outcome::None;
+        }
 
         if self.filter_editing {
             match key.code {
@@ -975,6 +982,22 @@ mod tests {
             outcome,
             Outcome::Placement { context_id: a.id, argv: vec!["context".into(), "promote".into(), a.id.to_hex()] }
         );
+    }
+
+    /// `Ctrl+A` reaches the open picker as `a` with CONTROL held. It is not
+    /// the archive verb, and `Ctrl+A Ctrl+A` must never confirm the latch.
+    #[test]
+    fn a_ctrl_chord_is_never_a_placement_verb() {
+        let mut a = ctx("kaijutsu");
+        a.promoted_at = Some(1_000);
+        let mut model = PickerModel::build(std::slice::from_ref(&a), &[], &no_activity(), &empty_tails(), 0);
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::CONTROL);
+        assert_eq!(model.handle_key(ctrl_a), Outcome::None);
+        assert_eq!(model.handle_key(ctrl_a), Outcome::None);
+        // A pending latch does not survive one either.
+        assert!(matches!(model.handle_key(press(KeyCode::Char('a'))), Outcome::Placement { .. }));
+        assert_eq!(model.handle_key(ctrl_a), Outcome::None);
+        assert_eq!(model.pending_confirm, None);
     }
 
     #[test]
