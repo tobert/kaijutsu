@@ -69,6 +69,11 @@ pub enum KernelDbError {
     #[error("invalid env key: {0}")]
     InvalidEnvKey(String),
 
+    /// A `context_egress` host is not a bare DNS name, a loopback literal,
+    /// or `*` — refused at the durable write, `docs/egress.md`, "The rule".
+    #[error("invalid egress host: {0}")]
+    InvalidEgressHost(String),
+
     /// Structural edge would create a cycle.
     #[error("cycle detected: adding this edge would create a cycle")]
     CycleDetected,
@@ -930,6 +935,16 @@ CREATE TABLE IF NOT EXISTS context_env (
     PRIMARY KEY (context_id, key)
 );
 CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
+
+-- Which hosts a context's shell may reach over the network. `docs/egress.md`
+-- owns the rule; an empty list reaches nothing but the built-in classifier
+-- host `runtime/curl_tool.rs` keeps outside the rows.
+CREATE TABLE IF NOT EXISTS context_egress (
+    context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
+    host       TEXT NOT NULL,
+    PRIMARY KEY (context_id, host)
+);
+CREATE INDEX IF NOT EXISTS idx_ctx_egress ON context_egress(context_id);
 
 -- ── Hooks (hook persistence follow-up) ──────────────────────────
 -- Global match-action hook entries. One row per entry; load ordered by
@@ -1845,6 +1860,43 @@ fn validate_env_key(key: &str) -> KernelDbResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Validate and normalize a `context_egress` host (`docs/egress.md`, "The
+/// rule"): a bare DNS name, a loopback literal (`localhost`, `127.0.0.1`,
+/// `::1`, or any IP address that parses as loopback), or exactly `*` for
+/// every host. No scheme, path, port, whitespace, or wildcard other than
+/// the single literal `*`. Lowercases the result, so storage and lookup
+/// never disagree on case.
+pub(crate) fn validate_egress_host(host: &str) -> KernelDbResult<String> {
+    let bad = || {
+        KernelDbError::InvalidEgressHost(format!(
+            "egress host {host:?} is not valid — use a bare DNS name (example: \"crates.io\"), \
+             a loopback literal (\"localhost\", \"127.0.0.1\", \"::1\"), or \"*\" for every host; \
+             no scheme, path, port, whitespace, or wildcard other than \"*\""
+        ))
+    };
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace()) {
+        return Err(bad());
+    }
+    if host == "*" {
+        return Ok(host.to_string());
+    }
+    let lower = host.to_ascii_lowercase();
+    // An IP literal is accepted only as a loopback address — any other
+    // address is not a form this table understands today.
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        return if ip.is_loopback() { Ok(ip.to_string()) } else { Err(bad()) };
+    }
+    if lower == "localhost" {
+        return Ok(lower);
+    }
+    // A bare DNS name: no scheme separator, no path, no port, and no
+    // wildcard other than the literal `*` already handled above.
+    if lower.contains("://") || lower.contains('/') || lower.contains(':') || lower.contains('*') {
+        return Err(bad());
+    }
+    Ok(lower)
 }
 
 /// Map constraint violations to typed errors.
@@ -3789,8 +3841,8 @@ impl KernelDb {
     }
 
     /// Atomically create a forked context: the document row, the context row,
-    /// and the shell + env + capability-binding config copied from `source`,
-    /// all in ONE transaction.
+    /// and the shell + env + egress + capability-binding config copied from
+    /// `source`, all in ONE transaction.
     ///
     /// This folds `insert_context_with_document` + `fork_context_config` into a
     /// single all-or-nothing write. Calling them separately left a gap: the
@@ -3809,6 +3861,7 @@ impl KernelDb {
     ) -> KernelDbResult<()> {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
+        let egress = self.list_context_egress(source)?;
         let binding = self.get_context_binding(source)?;
 
         let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
@@ -3837,6 +3890,9 @@ impl KernelDb {
         }
         for var in &env {
             Self::write_context_env(&tx, row.context_id, &var.key, &var.value)?;
+        }
+        for host in &egress {
+            Self::write_context_egress(&tx, row.context_id, host)?;
         }
         if let Some(binding) = binding {
             Self::write_binding(&tx, row.context_id, &binding)?;
@@ -5987,6 +6043,61 @@ impl KernelDb {
     }
 
     // ========================================================================
+    // Context egress (docs/egress.md)
+    // ========================================================================
+
+    /// Add one host against `conn` (a `Connection` or an open `Transaction`).
+    /// Shared by `add_context_egress` and the fork copy paths. Idempotent —
+    /// adding an already-present host is a no-op, not a conflict.
+    fn write_context_egress(conn: &Connection, context_id: ContextId, host: &str) -> KernelDbResult<()> {
+        let host = validate_egress_host(host)?;
+        conn.execute(
+            "INSERT INTO context_egress (context_id, host)
+             VALUES (?1, ?2)
+             ON CONFLICT(context_id, host) DO NOTHING",
+            params![blob_param(context_id.as_bytes()), host],
+        )?;
+        Ok(())
+    }
+
+    /// Add a host to a context's egress list (idempotent).
+    pub fn add_context_egress(&self, context_id: ContextId, host: &str) -> KernelDbResult<()> {
+        Self::write_context_egress(&self.conn, context_id, host)
+    }
+
+    /// Remove a host from a context's egress list. Returns true if it existed.
+    /// Validates and normalizes `host` first, so `--egress-deny LOCALHOST`
+    /// removes the `localhost` row it actually stored.
+    pub fn remove_context_egress(&self, context_id: ContextId, host: &str) -> KernelDbResult<bool> {
+        let host = validate_egress_host(host)?;
+        let deleted = self.conn.execute(
+            "DELETE FROM context_egress WHERE context_id = ?1 AND host = ?2",
+            params![blob_param(context_id.as_bytes()), host],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// List a context's egress hosts, sorted.
+    pub fn list_context_egress(&self, context_id: ContextId) -> KernelDbResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT host FROM context_egress WHERE context_id = ?1 ORDER BY host",
+        )?;
+        let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Copy all egress hosts from source to target. Returns count copied.
+    pub fn copy_context_egress(&self, source: ContextId, target: ContextId) -> KernelDbResult<u64> {
+        let hosts = self.list_context_egress(source)?;
+        for host in &hosts {
+            self.add_context_egress(target, host)?;
+        }
+        Ok(hosts.len() as u64)
+    }
+
+    // ========================================================================
     // Claude cache breakpoints (per-context policy)
     // ========================================================================
 
@@ -6608,12 +6719,12 @@ impl KernelDb {
     // Context Config Fork + Workspace Query
     // ========================================================================
 
-    /// Copy shell config + env vars + capability binding from source context
-    /// to target. Called during all fork operations. The binding copy makes
-    /// permissions follow the fork — under deny-by-default a fork would
-    /// otherwise start with no loadout and be locked out.
+    /// Copy shell config + env vars + egress hosts + capability binding from
+    /// source context to target. Called during all fork operations. The
+    /// binding copy makes permissions follow the fork — under deny-by-default
+    /// a fork would otherwise start with no loadout and be locked out.
     ///
-    /// Atomic: the three copies land in ONE transaction. A fork that fails
+    /// Atomic: the four copies land in ONE transaction. A fork that fails
     /// partway must leave NO partial config behind — a half-copied loadout
     /// would lock the fork out (or grant a stale subset), and the caller has
     /// already committed the context row, so a silent partial here would
@@ -6622,6 +6733,7 @@ impl KernelDb {
     pub fn fork_context_config(&mut self, source: ContextId, target: ContextId) -> KernelDbResult<()> {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
+        let egress = self.list_context_egress(source)?;
         let binding = self.get_context_binding(source)?;
 
         let tx = self.conn.transaction()?;
@@ -6637,6 +6749,9 @@ impl KernelDb {
         }
         for var in &env {
             Self::write_context_env(&tx, target, &var.key, &var.value)?;
+        }
+        for host in &egress {
+            Self::write_context_egress(&tx, target, host)?;
         }
         if let Some(binding) = binding {
             Self::write_binding(&tx, target, &binding)?;
@@ -12196,6 +12311,124 @@ mod tests {
             params![blob_param(ctx.context_id.as_bytes())]).unwrap();
         let vars = db.get_context_env(ctx.context_id).unwrap();
         assert!(vars.is_empty());
+    }
+
+    // ── Context egress (docs/egress.md) ─────────────────────────────
+
+    #[test]
+    fn context_egress_add_list_remove_round_trip() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("egress-crud"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        assert!(db.list_context_egress(ctx.context_id).unwrap().is_empty());
+
+        db.add_context_egress(ctx.context_id, "crates.io").unwrap();
+        db.add_context_egress(ctx.context_id, "127.0.0.1").unwrap();
+        // Adding the same host twice is idempotent, not a conflict.
+        db.add_context_egress(ctx.context_id, "crates.io").unwrap();
+
+        let hosts = db.list_context_egress(ctx.context_id).unwrap();
+        assert_eq!(hosts, vec!["127.0.0.1".to_string(), "crates.io".to_string()]);
+
+        assert!(db.remove_context_egress(ctx.context_id, "crates.io").unwrap());
+        // Already gone — a second removal reports nothing to remove.
+        assert!(!db.remove_context_egress(ctx.context_id, "crates.io").unwrap());
+        assert!(!db.remove_context_egress(ctx.context_id, "never-added.example").unwrap());
+
+        let hosts = db.list_context_egress(ctx.context_id).unwrap();
+        assert_eq!(hosts, vec!["127.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn context_egress_copy() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("egress-src"));
+        let tgt = make_context_row(Some("egress-tgt"));
+        insert_context_with_doc(&db, &src, ws_id);
+        insert_context_with_doc(&db, &tgt, ws_id);
+
+        db.add_context_egress(src.context_id, "crates.io").unwrap();
+        db.add_context_egress(src.context_id, "127.0.0.1").unwrap();
+
+        let count = db.copy_context_egress(src.context_id, tgt.context_id).unwrap();
+        assert_eq!(count, 2);
+
+        let hosts = db.list_context_egress(tgt.context_id).unwrap();
+        assert_eq!(hosts, vec!["127.0.0.1".to_string(), "crates.io".to_string()]);
+    }
+
+    #[test]
+    fn context_egress_cascade_delete() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("egress-cascade"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        db.add_context_egress(ctx.context_id, "crates.io").unwrap();
+        db.conn.execute("DELETE FROM contexts WHERE context_id = ?1",
+            params![blob_param(ctx.context_id.as_bytes())]).unwrap();
+        assert!(db.list_context_egress(ctx.context_id).unwrap().is_empty());
+    }
+
+    /// `add_context_egress`/`remove_context_egress` reject a bad host the
+    /// same way `set_context_env` rejects a bad key — refused at the durable
+    /// write, not just at the kj surface.
+    #[test]
+    fn context_egress_add_rejects_an_invalid_host() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let ctx = make_context_row(Some("egress-invalid"));
+        insert_context_with_doc(&db, &ctx, ws_id);
+
+        let err = db.add_context_egress(ctx.context_id, "https://x").unwrap_err();
+        assert!(matches!(err, KernelDbError::InvalidEgressHost(_)), "{err}");
+        assert!(
+            db.list_context_egress(ctx.context_id).unwrap().is_empty(),
+            "a rejected host must not land a partial row"
+        );
+    }
+
+    /// A `kernel.db` created before `context_egress` existed still gets the
+    /// table on open — `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` runs on every
+    /// open, so a pre-existing file gains it without a dedicated migration.
+    /// Mirrors `open_migrates_the_ledger_schema_and_reopen_is_idempotent`:
+    /// build a real DB, then simulate "before this table existed" by
+    /// dropping it, closing the connection, and reopening the same file.
+    #[test]
+    fn context_egress_table_appears_on_a_db_opened_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.conn.execute_batch("DROP TABLE context_egress;").unwrap();
+        }
+        // Drop closed the connection; re-open the same file.
+        let db = KernelDb::open(&path).unwrap();
+        // A DB with no context_egress rows opens cleanly and the table is
+        // queryable — this would fail with "no such table" before open()
+        // ran the current SCHEMA against it.
+        assert!(db.list_context_egress(ContextId::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_egress_host_accepts_dns_names_loopback_literals_and_star() {
+        assert_eq!(validate_egress_host("crates.io").unwrap(), "crates.io");
+        assert_eq!(validate_egress_host("LOCALHOST").unwrap(), "localhost");
+        assert_eq!(validate_egress_host("127.0.0.1").unwrap(), "127.0.0.1");
+        assert_eq!(validate_egress_host("::1").unwrap(), "::1");
+        assert_eq!(validate_egress_host("0:0:0:0:0:0:0:1").unwrap(), "::1");
+        assert_eq!(validate_egress_host("*").unwrap(), "*");
+    }
+
+    #[test]
+    fn validate_egress_host_rejects_scheme_path_port_wildcard_empty_and_space() {
+        for bad in ["https://x", "x/path", "x:443", "*.x.io", "", "x y"] {
+            let err = validate_egress_host(bad).unwrap_err();
+            assert!(matches!(err, KernelDbError::InvalidEgressHost(_)), "{bad}: {err}");
+        }
     }
 
     // ── Claude cache breakpoints ──────────────────────────────────────

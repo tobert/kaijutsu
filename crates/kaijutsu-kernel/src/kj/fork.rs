@@ -2855,6 +2855,8 @@ mod tests {
             .unwrap();
             db.set_context_env(source, "RUST_LOG", "debug").unwrap();
             db.set_context_env(source, "EDITOR", "vim").unwrap();
+            db.add_context_egress(source, "crates.io").unwrap();
+            db.add_context_egress(source, "127.0.0.1").unwrap();
         }
 
         let c = caller_with_context(source);
@@ -2871,6 +2873,11 @@ mod tests {
         assert_eq!(shell.cwd, Some("/home/user/project".into()));
         let env = db.get_context_env(child.context_id).unwrap();
         assert_eq!(env.len(), 2);
+        // The fork copies the parent's egress rows too (docs/egress.md,
+        // "Who changes the list") — a child starts with what its parent
+        // had and no more.
+        let egress = db.list_context_egress(child.context_id).unwrap();
+        assert_eq!(egress, vec!["127.0.0.1".to_string(), "crates.io".to_string()]);
     }
 
     #[tokio::test]

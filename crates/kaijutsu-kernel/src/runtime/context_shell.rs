@@ -52,6 +52,10 @@ pub(crate) struct ContextShellInputs {
     pub cwd: Option<std::path::PathBuf>,
     pub exports: Vec<crate::kernel_db::ContextEnvRow>,
     pub external_exec: super::embedded_kaish::ExternalExec,
+    /// The context's `context_egress` rows (`docs/egress.md`), handed to
+    /// `curl_tool` so the shell's `curl` reaches only what this context's
+    /// list names.
+    pub egress_hosts: Vec<String>,
 }
 
 impl ContextShellInputs {
@@ -71,7 +75,9 @@ impl ContextShellInputs {
         super::shell_state::validate_cwd(cwd.as_deref()).map_err(anyhow::Error::msg)?;
         let exports = db.get_context_env(context)
             .map_err(|error| anyhow::anyhow!("read context_env for {context}: {error}"))?;
-        Ok(Self { cwd, exports, external_exec })
+        let egress_hosts = db.list_context_egress(context)
+            .map_err(|error| anyhow::anyhow!("read context_egress for {context}: {error}"))?;
+        Ok(Self { cwd, exports, external_exec, egress_hosts })
     }
 
     pub fn environment(&self) -> std::collections::HashMap<String, String> {
@@ -132,6 +138,12 @@ impl EmbeddedKaish {
         let kj_dispatcher = dispatcher.self_arc().ok_or_else(|| {
             anyhow::anyhow!("context shell requires a registered kj dispatcher")
         })?;
+        // Loaded before `configure_tools` so the closure can move the
+        // context's egress rows straight into `curl_tool` — the shell reads
+        // them once, when it is built (`docs/egress.md`, "Who changes the
+        // list").
+        let inputs = ContextShellInputs::load(dispatcher.kernel(), context_id, read_only, cwd.clone()).await?;
+        let egress_hosts = inputs.egress_hosts.clone();
         let configure_tools =
             move |scm: SessionContextMap,
                   _sid: SessionId,
@@ -160,10 +172,9 @@ impl EmbeddedKaish {
                 ));
                 // The read-only interpreter replaces curl with an explicit
                 // refusal after tool registration.
-                tools.register(crate::runtime::curl_tool::curl_tool());
+                tools.register(crate::runtime::curl_tool::curl_tool(&egress_hosts));
             };
 
-        let inputs = ContextShellInputs::load(dispatcher.kernel(), context_id, read_only, cwd.clone()).await?;
         let kaish = if read_only {
             EmbeddedKaish::with_identity_read_only(
                 name,
@@ -871,6 +882,73 @@ mod tests {
             "bar",
             "durable context_env FOO should seed the materialized shell",
         );
+    }
+
+    /// `docs/egress.md`, "The rule": a context with an empty egress list
+    /// reaches nothing, loopback included; after `--egress-allow 127.0.0.1`
+    /// the same context's shell reaches a local mock server. Driven through
+    /// a real context shell (`EmbeddedKaish::for_context`), not by calling
+    /// `curl_tool` directly, so the wiring in `configure_tools` is what gets
+    /// exercised. The shell reads the rows when it is built, so granting the
+    /// host requires a fresh shell for the second command — matching "a
+    /// running `curl` keeps the list it started with".
+    ///
+    /// Multi-thread runtime, deliberately: `kaish-tools-curl`'s ureq backend
+    /// runs its blocking HTTP call directly on a current-thread runtime
+    /// (`block_in_place_compat`), which would starve the `tokio::spawn`'d
+    /// mock server below on the same executor and hang until `curl`'s own
+    /// timeout fired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_curl_reaches_loopback_only_after_the_context_grants_it() {
+        use tokio::io::AsyncWriteExt;
+
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("curl-egress"), None, principal);
+        let identity = ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+
+        // Empty list: refused before any connection opens — the mock server
+        // never sees a request for this call.
+        let kaish = EmbeddedKaish::for_context(
+            &d, "curl-egress-empty", identity, ShellPolicy::Agent, ShellCwd::Context,
+            None, Arc::new(NoopBlockSource),
+        ).await.unwrap();
+        let refused = kaish
+            .execute_with_options(&format!("curl {url}"), ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(!refused.ok(), "an empty egress list must refuse a loopback host: {}", refused.err);
+
+        // Grant loopback, then rebuild the shell to pick up the change.
+        d.kernel_db().lock().add_context_egress(ctx, "127.0.0.1").unwrap();
+        let kaish = EmbeddedKaish::for_context(
+            &d, "curl-egress-granted", identity, ShellPolicy::Agent, ShellCwd::Context,
+            None, Arc::new(NoopBlockSource),
+        ).await.unwrap();
+        let allowed = kaish
+            .execute_with_options(&format!("curl {url}"), ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(allowed.ok(), "granting 127.0.0.1 must let curl reach the mock server: {}", allowed.err);
+        assert_eq!(allowed.text_out(), "ok");
+
+        server.await.unwrap();
     }
 
     /// Transient scope is isolated across invocations of a shared context.

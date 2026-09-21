@@ -65,6 +65,7 @@ impl From<ContextConfigArgs> for ContextConfig {
             type_spec: a.type_,
             cast_spec: a.cast,
             review: None,
+            egress: None,
         }
     }
 }
@@ -152,6 +153,15 @@ enum ContextCommand {
         /// Existing live character directing this work
         #[arg(long, value_name = "CHARACTER")]
         director: Option<String>,
+        /// Add a host this context's curl may reach: a DNS name, a loopback
+        /// literal (localhost, 127.0.0.1, or the IPv6 loopback address), or
+        /// * for every host. Repeat the flag for more than one
+        #[arg(long, value_name = "HOST")]
+        egress_allow: Vec<String>,
+        /// Remove a host from this context's egress list. Repeat the flag
+        /// for more than one
+        #[arg(long, value_name = "HOST")]
+        egress_deny: Vec<String>,
         #[command(flatten)]
         config: ContextConfigArgs,
     },
@@ -287,6 +297,7 @@ struct ContextConfig {
     /// [`KjDispatcher::resolve_context_config`] before any mutation.
     cast_spec: Option<String>,
     review: Option<ReviewAssignment>,
+    egress: Option<EgressAssignment>,
 }
 
 struct ReviewAssignment {
@@ -295,6 +306,17 @@ struct ReviewAssignment {
     director: Option<kaijutsu_types::PrincipalId>,
     caller_actor: kaijutsu_types::PrincipalId,
     routing_changed: bool,
+    authority: AssignAuthority,
+}
+
+/// A validated, authority-checked `--egress-allow`/`--egress-deny` change,
+/// applied inside [`KjDispatcher::apply_context_config`]'s transaction. Hosts
+/// are already normalized (`kernel_db::validate_egress_host`) by the time
+/// this is built.
+struct EgressAssignment {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    caller_actor: kaijutsu_types::PrincipalId,
     authority: AssignAuthority,
 }
 
@@ -573,6 +595,33 @@ impl KjDispatcher {
                     changes.push(format!("type={t}"));
                 }
 
+                if let Some(egress) = &cfg.egress {
+                    let current = db.get_context(target_id)?
+                        .ok_or_else(|| crate::kernel_db::KernelDbError::Validation("context disappeared before egress change".into()))?;
+                    let authority_holds = match &egress.authority {
+                        AssignAuthority::LineageRoot => {
+                            matches!(db.lineage_root(target_id), Ok(root) if root == egress.caller_actor)
+                        }
+                        AssignAuthority::EffectiveReviewer(expected_reviewer) => {
+                            let review_actor = current.played_by.unwrap_or(egress.caller_actor);
+                            let current_reviewer = db.effective_approval_reviewer(target_id, review_actor)?.reviewer();
+                            egress.caller_actor == *expected_reviewer && current_reviewer == *expected_reviewer
+                        }
+                        AssignAuthority::Directs => current.director_id == Some(egress.caller_actor),
+                    };
+                    if !authority_holds {
+                        return Err(crate::kernel_db::KernelDbError::Validation("egress assignment authority changed before commit".into()));
+                    }
+                    for host in &egress.allow {
+                        db.add_context_egress(target_id, host)?;
+                        changes.push(format!("egress-allow {host}"));
+                    }
+                    for host in &egress.deny {
+                        db.remove_context_egress(target_id, host)?;
+                        changes.push(format!("egress-deny {host}"));
+                    }
+                }
+
                 Ok((changes, model_for_drift))
             });
             applied.map_err(|e| e.to_string())?
@@ -671,8 +720,8 @@ impl KjDispatcher {
             ContextCommand::Rebind { context } => {
                 self.context_rebind(context.as_deref(), caller).await
             }
-            ContextCommand::Set { context, character, reviewer, clear_reviewer, director, config } => {
-                self.context_set(context.as_deref(), character.as_deref(), reviewer.as_deref(), clear_reviewer, director.as_deref(), config.into(), caller).await
+            ContextCommand::Set { context, character, reviewer, clear_reviewer, director, egress_allow, egress_deny, config } => {
+                self.context_set(context.as_deref(), character.as_deref(), reviewer.as_deref(), clear_reviewer, director.as_deref(), &egress_allow, &egress_deny, config.into(), caller).await
             }
             ContextCommand::Unset { context, env, cast } => {
                 self.context_unset(context.as_deref(), env.as_deref(), cast, caller)
@@ -744,6 +793,7 @@ impl KjDispatcher {
             trace_id,
             shell,
             env_vars,
+            egress_hosts,
             usage,
             workspace_paths,
             workspace_label,
@@ -791,6 +841,13 @@ impl KjDispatcher {
             // Env vars
             let env_vars = db.get_context_env(target_id).unwrap_or_default();
 
+            // Egress hosts (docs/egress.md). A read failure is an error, never
+            // "none": an empty list claims this context reaches nothing.
+            let egress_hosts = match db.list_context_egress(target_id) {
+                Ok(hosts) => hosts,
+                Err(e) => return KjResult::Err(format!("kj context info: {e}")),
+            };
+
             // Token usage — a SNAPSHOT of the last completed LLM call ("how
             // full is this context right now"), not a running total; see
             // `ContextUsageRow`. `None` for a context that has never
@@ -829,6 +886,7 @@ impl KjDispatcher {
                 trace_id,
                 shell,
                 env_vars,
+                egress_hosts,
                 usage,
                 workspace_paths,
                 workspace_label,
@@ -927,6 +985,18 @@ impl KjDispatcher {
             info.push_str("\nEnv:");
             for v in &env_vars {
                 info.push_str(&format!("\n  {}={}", v.key, v.value));
+            }
+        }
+
+        // Always shown, unlike Env above — an explicit "none" tells the
+        // reader this context reaches nothing rather than leaving them to
+        // wonder whether the field was simply omitted (`docs/egress.md`).
+        if egress_hosts.is_empty() {
+            info.push_str("\nEgress:  none");
+        } else {
+            info.push_str("\nEgress:");
+            for h in &egress_hosts {
+                info.push_str(&format!("\n  {h}"));
             }
         }
 
@@ -1035,6 +1105,10 @@ impl KjDispatcher {
             "env": env_vars.iter()
                 .map(|v| (v.key.clone(), serde_json::Value::String(v.value.clone())))
                 .collect::<serde_json::Map<_, _>>(),
+            // `docs/egress.md` — the hosts this context's curl may reach.
+            // Always present (an empty array is the honest "none", never
+            // omitted).
+            "egress": egress_hosts,
             // `null` when this context has never completed an LLM call —
             // honest absence, not a fabricated zero. `context_window` /
             // `context_used_pct` are resolved kernel-side (never derived
@@ -1699,12 +1773,13 @@ impl KjDispatcher {
     }
 
     /// Whether `caller` may assign `performer` as `target_id`'s performer
-    /// via `kj context set <ctx> --as <character>`. Called only once the
-    /// outer `context_set` has already established that `caller` is not
-    /// the target's lineage root and that this is a pure `--as` (no
-    /// `--reviewer`/`--director`/`--clear-reviewer` in the same call — that
-    /// routing-change case is gated separately, above, and unaffected by
-    /// this rule).
+    /// via `kj context set <ctx> --as <character>` — or, sharing the same
+    /// rule, widen `target_id`'s own egress list via `--egress-allow`.
+    /// Called only once the outer `context_set` has already established
+    /// that `caller` is not the target's lineage root, and (for `--as`) that
+    /// this is a pure `--as` with no `--reviewer`/`--director`/
+    /// `--clear-reviewer` in the same call — that routing-change case is
+    /// gated separately, above, and unaffected by this rule.
     ///
     /// Allowed when EITHER `caller` is `target_id`'s currently resolved
     /// effective reviewer — recomputed for the context's existing
@@ -1715,16 +1790,18 @@ impl KjDispatcher {
     /// what makes the cast character accountable to the caller in that
     /// context, so no relation between the two sheets is consulted.
     /// Neither branch grants review authority over the context — only who
-    /// may name its performer.
+    /// may name its performer or widen its egress list.
     ///
     /// Returns which rule matched, tagged for
     /// [`Self::apply_context_config`]'s commit-time re-check to redo the
     /// SAME rule under its transaction lock rather than assume the
-    /// reviewer path.
+    /// reviewer path. `action` names the refused act in the error message
+    /// (`"assign a performer"`, `"change this context's egress list"`).
     async fn caller_may_assign_performer(
         &self,
         target_id: ContextId,
         caller: kaijutsu_types::PrincipalId,
+        action: &str,
     ) -> Result<AssignAuthority, String> {
         let (director_id, current_played_by) = {
             let db = self.kernel_db().lock();
@@ -1747,7 +1824,7 @@ impl KjDispatcher {
         if director_id == Some(caller) {
             return Ok(AssignAuthority::Directs);
         }
-        Err("only the context's lineage root, its effective reviewer, or its director may assign a performer".into())
+        Err(format!("only the context's lineage root, its effective reviewer, or its director may {action}"))
     }
 
     /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
@@ -1758,6 +1835,8 @@ impl KjDispatcher {
         reviewer: Option<&str>,
         clear_reviewer: bool,
         director: Option<&str>,
+        egress_allow: &[String],
+        egress_deny: &[String],
         mut cfg: ContextConfig,
         caller: &KjCaller,
     ) -> KjResult {
@@ -1821,7 +1900,7 @@ impl KjDispatcher {
             let authority_record = if is_lineage_root {
                 AssignAuthority::LineageRoot
             } else {
-                match self.caller_may_assign_performer(target_id, caller.actor_id).await {
+                match self.caller_may_assign_performer(target_id, caller.actor_id, "assign a performer").await {
                     Ok(record) => record,
                     Err(error) => return KjResult::Err(format!("kj context set: {error}")),
                 }
@@ -1856,6 +1935,39 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj context set: {error}"));
             }
             cfg.review = Some(assignment);
+        }
+
+        // `--egress-allow`/`--egress-deny` need the same authority as
+        // `--as`: the target's lineage root, its effective reviewer, or its
+        // director (`docs/egress.md`, "Who changes the list"). Independent
+        // of the review-assignment block above — an egress change never
+        // touches performer/reviewer/director routing.
+        if !egress_allow.is_empty() || !egress_deny.is_empty() {
+            let mut allow = Vec::with_capacity(egress_allow.len());
+            for host in egress_allow {
+                match crate::kernel_db::validate_egress_host(host) {
+                    Ok(normalized) => allow.push(normalized),
+                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
+                }
+            }
+            let mut deny = Vec::with_capacity(egress_deny.len());
+            for host in egress_deny {
+                match crate::kernel_db::validate_egress_host(host) {
+                    Ok(normalized) => deny.push(normalized),
+                    Err(e) => return KjResult::Err(format!("kj context set: {e}")),
+                }
+            }
+            let lineage_root = self.kernel_db().lock().lineage_root(target_id);
+            let is_lineage_root = matches!(lineage_root, Ok(root) if root == caller.actor_id);
+            let authority_record = if is_lineage_root {
+                AssignAuthority::LineageRoot
+            } else {
+                match self.caller_may_assign_performer(target_id, caller.actor_id, "change this context's egress list").await {
+                    Ok(record) => record,
+                    Err(error) => return KjResult::Err(format!("kj context set: {error}")),
+                }
+            };
+            cfg.egress = Some(EgressAssignment { allow, deny, caller_actor: caller.actor_id, authority: authority_record });
         }
 
         match self
@@ -2549,7 +2661,7 @@ impl Classify for ContextCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert_new_context_checked, AssignAuthority, ContextConfig, ReviewAssignment};
+    use super::{insert_new_context_checked, AssignAuthority, ContextConfig, EgressAssignment, ReviewAssignment};
     use crate::kernel_db::ContextEdgeRow;
     #[allow(unused_imports)]
     use crate::kj::KjResult;
@@ -2849,6 +2961,118 @@ mod tests {
         assert_eq!(row.director_id, Some(lead));
     }
 
+    /// `docs/egress.md`, "Who changes the list": the caller must hold the
+    /// same authority a performer assignment needs. A context's own
+    /// model-played performer cannot widen its own egress list; the
+    /// context's effective reviewer and its lineage root both can.
+    #[tokio::test]
+    async fn context_set_egress_allow_requires_the_same_authority_as_a_performer_assignment() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let amy = crate::kj::KjCaller {
+            principal_id: amy_id,
+            actor_id: amy_id,
+            reviewer_id: None,
+            context_id: None,
+            session_id: kaijutsu_types::SessionId::new(),
+            confirmed: false,
+            rc_depth: 0,
+            privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let coder = PrincipalId::new();
+        let lead = PrincipalId::new();
+        for (principal_id, name) in [(coder, "coder"), (lead, "lead")] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+        }
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("egress-authority"), amy.actor_id);
+        let amy = crate::kj::KjCaller { context_id: Some(context), ..amy };
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("coder"), s("--reviewer"), s("lead")], &amy).await;
+        assert!(set.is_ok(), "{}", set.message());
+
+        // The played-by character cannot widen its own egress list.
+        let coder_call = amy.clone().with_actor(coder, Some(lead));
+        let refused = d.dispatch(&[s("context"), s("set"), s("."), s("--egress-allow"), s("crates.io")], &coder_call).await;
+        assert!(!refused.is_ok());
+        assert!(refused.message().contains("may change this context's egress list"), "{}", refused.message());
+        assert!(d.kernel_db().lock().list_context_egress(context).unwrap().is_empty());
+
+        // The context's effective reviewer (lead) may.
+        let lead_call = amy.clone().with_actor(lead, None);
+        let allowed = d.dispatch(&[s("context"), s("set"), s("."), s("--egress-allow"), s("crates.io")], &lead_call).await;
+        assert!(allowed.is_ok(), "{}", allowed.message());
+        assert_eq!(d.kernel_db().lock().list_context_egress(context).unwrap(), vec!["crates.io".to_string()]);
+
+        // The lineage root (amy) may too.
+        let allowed = d.dispatch(&[s("context"), s("set"), s("."), s("--egress-allow"), s("example.org")], &amy).await;
+        assert!(allowed.is_ok(), "{}", allowed.message());
+        assert_eq!(
+            d.kernel_db().lock().list_context_egress(context).unwrap(),
+            vec!["crates.io".to_string(), "example.org".to_string()],
+        );
+    }
+
+    /// The directing character may widen a context it directs, the same
+    /// authority `--as` grants it (`a_director_may_cast_a_live_character_into_a_context_it_directs`).
+    #[tokio::test]
+    async fn context_set_egress_allow_is_permitted_for_the_directing_character() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let director = PrincipalId::new();
+        d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: director, name: "banto".into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("egress-directed"), amy_id);
+        d.kernel_db().lock().update_context_review_assignment(context, None, None, Some(director)).unwrap();
+        let director_caller = crate::kj::KjCaller {
+            principal_id: director, actor_id: director, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let result = d.dispatch(&[s("context"), s("set"), s("."), s("--egress-allow"), s("crates.io")], &director_caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert_eq!(d.kernel_db().lock().list_context_egress(context).unwrap(), vec!["crates.io".to_string()]);
+    }
+
+    /// Mirrors `final_assignment_rejects_reviewer_revoked_after_precheck`:
+    /// `apply_context_config`'s transaction re-checks the egress authority
+    /// under its own lock rather than trusting the precheck, so a revoke
+    /// racing the write is refused instead of landing.
+    #[tokio::test]
+    async fn final_egress_assignment_rejects_authority_revoked_after_precheck() {
+        let d = test_dispatcher().await;
+        let amy = test_reviewer_principal();
+        let lead = PrincipalId::new();
+        let coder = PrincipalId::new();
+        let root = crate::kj::test_helpers::register_root_context(&d);
+        let context = register_context(&d, Some("stale-egress-reviewer"), Some(root), amy);
+        {
+            let db = d.kernel_db().lock();
+            for (principal_id, name) in [(lead, "lead"), (coder, "coder")] {
+                db.insert_character(&crate::kernel_db::CharacterRow { principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root: false }).unwrap();
+            }
+            db.update_context_review_assignment(context, None, None, Some(lead)).unwrap();
+            db.grant_approval_delegation(lead, lead, amy).unwrap();
+        }
+        let expected = d.kernel().resolve_context_review(context).await.unwrap();
+        assert_eq!(expected.reviewer.principal_id, lead);
+        d.kernel_db().lock().revoke_approval_delegation(lead, amy).unwrap();
+        let cfg = ContextConfig {
+            egress: Some(EgressAssignment {
+                allow: vec!["crates.io".to_string()],
+                deny: vec![],
+                caller_actor: lead,
+                authority: AssignAuthority::EffectiveReviewer(lead),
+            }),
+            ..Default::default()
+        };
+        let error = d.apply_context_config(context, &cfg, None, None).await.unwrap_err();
+        assert!(error.contains("authority changed"), "{error}");
+        assert!(d.kernel_db().lock().list_context_egress(context).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn context_create_basic() {
         let d = test_dispatcher().await;
@@ -3113,6 +3337,50 @@ mod tests {
         assert!(help.contains("responsible above the new context reviews it"));
         let set = d.dispatch(&[s("context"), s("set"), s("."), s("--as"), s("banto")], &test_caller()).await;
         assert!(!set.is_ok(), "unknown context or character is refused");
+    }
+
+    /// `kj context set --help` publishes the two egress flags with a plain
+    /// description of what they take (`docs/writing.md`).
+    #[tokio::test]
+    async fn context_set_help_describes_egress_flags() {
+        let d = test_dispatcher().await;
+        let result = d.dispatch(&[s("context"), s("set"), s("--help")], &test_caller()).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let help = result.message();
+        println!("{help}");
+        assert!(help.contains("--egress-allow <HOST>"), "{help}");
+        assert!(help.contains("--egress-deny <HOST>"), "{help}");
+        assert!(help.contains("loopback literal"), "{help}");
+    }
+
+    /// `kj context info` shows the egress list — an explicit "none" when
+    /// empty, then the granted hosts after `--egress-allow`. The caller
+    /// must be the context's lineage root to grant it, so this runs as
+    /// `amy`, `register_rooted_context`'s root character.
+    #[tokio::test]
+    async fn context_info_shows_the_egress_list() {
+        let d = test_dispatcher().await;
+        let amy_id = test_reviewer_principal();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("egress-info"), amy_id);
+        let caller = crate::kj::KjCaller {
+            principal_id: amy_id, actor_id: amy_id, reviewer_id: None, context_id: Some(context),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let result = d.dispatch(&[s("context"), s("info")], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("Egress:  none"), "{}", result.message());
+        let KjResult::Ok { data: Some(data), .. } = &result else { panic!("context info has data") };
+        assert_eq!(data["egress"], serde_json::json!([]));
+
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--egress-allow"), s("crates.io")], &caller).await;
+        assert!(set.is_ok(), "{}", set.message());
+        let result = d.dispatch(&[s("context"), s("info")], &caller).await;
+        assert!(result.is_ok(), "{}", result.message());
+        assert!(result.message().contains("Egress:\n  crates.io"), "{}", result.message());
+        let KjResult::Ok { data: Some(data), .. } = &result else { panic!("context info has data") };
+        assert_eq!(data["egress"], serde_json::json!(["crates.io"]));
     }
 
     /// amy (a root) plays her root context; banto plays a `default` seat
@@ -5629,6 +5897,29 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
         assert_eq!(env[0].value, "debug");
+    }
+
+    /// `kj context create` has no `--egress-allow`/`--egress-deny` of its
+    /// own — a freshly created context's egress list starts empty
+    /// (`docs/egress.md`, "Who changes the list": "`kj context create`
+    /// starts with an empty list").
+    #[tokio::test]
+    async fn context_create_starts_with_an_empty_egress_list() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("egress-create-parent"), None, principal);
+
+        let c = caller_with_context(parent);
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("egress-create-kid")], &c)
+            .await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+
+        let id = {
+            let db = d.kernel_db().lock();
+            db.resolve_context("egress-create-kid").expect("kid should exist")
+        };
+        assert!(d.kernel_db().lock().list_context_egress(id).unwrap().is_empty());
     }
 
     #[tokio::test]
