@@ -280,7 +280,7 @@ pub fn build_shell_dock_glyphs(
                 if !validation.valid && !validation.incomplete {
                     theme.block_tool_error
                 } else {
-                    theme.block_user
+                    theme.fg
                 }
             };
 

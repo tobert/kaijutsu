@@ -543,7 +543,7 @@ pub fn divider_instance(
     theme: &Theme,
 ) -> ChromeInstance {
     let color = match role {
-        Role::User => theme.block_user,
+        Role::User => theme.fg,
         Role::Model => theme.block_assistant,
         Role::System => theme.fg_dim,
         Role::Tool | Role::Asset => theme.block_tool_call,
@@ -1174,7 +1174,7 @@ mod tests {
         let rect = [0.0, 0.0, 800.0, 20.0];
         assert_eq!(
             divider_instance(Role::User, rect, None, &theme).color,
-            color_to_rgba8(theme.block_user),
+            color_to_rgba8(theme.fg),
         );
         assert_eq!(
             divider_instance(Role::Model, rect, None, &theme).color,

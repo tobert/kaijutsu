@@ -1827,7 +1827,8 @@ not the live one `docs/color.md` sells.
 Remaining work: a config-changed server event (or subscription) that
 re-fires `ThemeReceived` on theme writes; the app-side repaint already works
 once `Theme` is replaced. Also open: `ThemeData` (the TOML wire format) has
-no fields for block text colors (`block_user`/`block_assistant`/…), so no
+no fields for block text colors (`block_assistant`/`block_thinking`/…; user
+text follows `fg`), so no
 theme file can change conversation text colors; `Theme` derives neither
 `Reflect` nor registers with BRP, so it cannot be poked remotely for testing.
 

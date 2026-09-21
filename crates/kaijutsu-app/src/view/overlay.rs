@@ -383,10 +383,10 @@ pub fn build_overlay_glyphs(
                 if !validation.valid && !validation.incomplete {
                     theme.block_tool_error
                 } else {
-                    theme.block_user
+                    theme.fg
                 }
             } else {
-                theme.block_user
+                theme.fg
             };
 
             let (layout, text_offset) = sync_compose_text_glyphs(

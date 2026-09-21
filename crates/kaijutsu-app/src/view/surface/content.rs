@@ -1087,7 +1087,7 @@ mod tests {
 
         // Repaint the role this block draws in, and bump the document version
         // so the sweep genuinely re-derives everything.
-        app.world_mut().resource_mut::<Theme>().block_user = Color::srgb(1.0, 0.0, 1.0);
+        app.world_mut().resource_mut::<Theme>().fg = Color::srgb(1.0, 0.0, 1.0);
         edit_block(&mut app, ids[0], "hello");
         app.update();
 

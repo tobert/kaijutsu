@@ -161,8 +161,6 @@ pub struct Theme {
     // ═══════════════════════════════════════════════════════════════════════
     // Block text colors (per-block-type for semantic distinction)
     // ═══════════════════════════════════════════════════════════════════════
-    /// User message text color (soft white)
-    pub block_user: Color,
     /// Assistant message text color (light blue)
     pub block_assistant: Color,
     /// Thinking block text color (dim gray for de-emphasis)
@@ -524,7 +522,7 @@ impl Theme {
     /// color nobody notices is wrong.
     pub fn color_for(&self, tone: BlockTone) -> Color {
         match tone {
-            BlockTone::User => self.block_user,
+            BlockTone::User => self.fg,
             BlockTone::Assistant => self.block_assistant,
             BlockTone::Thinking => self.block_thinking,
             BlockTone::ToolCall => self.block_tool_call,
@@ -584,7 +582,6 @@ impl Default for Theme {
             row_result: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
 
             // Block text colors
-            block_user: Color::srgb(0.847, 0.824, 0.933), // #d8d2ee main fg
             block_assistant: Color::srgb(0.643, 0.529, 1.000), // #a487ff violet
             block_thinking: Color::srgb(0.435, 0.396, 0.573), // #6f6592 dim
             block_tool_call: Color::srgb(0.910, 0.706, 0.369), // #e8b45e gold
@@ -1061,7 +1058,7 @@ mod tests {
         let t = Theme::default();
         for tone in BlockTone::all() {
             let expected = match tone {
-                BlockTone::User => t.block_user,
+                BlockTone::User => t.fg,
                 BlockTone::Assistant => t.block_assistant,
                 BlockTone::Thinking => t.block_thinking,
                 BlockTone::ToolCall => t.block_tool_call,
@@ -1100,7 +1097,7 @@ mod tests {
             kaijutsu_types::Role::User,
             None,
         );
-        assert_eq!(t.block_color(&block), t.block_user);
+        assert_eq!(t.block_color(&block), t.fg);
     }
 
     #[test]

@@ -1737,7 +1737,7 @@ fn shape_role_label(
     }
 
     let color = match role {
-        Role::User => theme.block_user,
+        Role::User => theme.fg,
         Role::Model => theme.block_assistant,
         Role::System => theme.fg_dim,
         Role::Tool | Role::Asset => theme.block_tool_call,
@@ -2954,7 +2954,7 @@ mod tests {
             "an untouched theme must not bump the epoch",
         );
 
-        app.world_mut().resource_mut::<Theme>().block_user = Color::srgb(0.1, 0.2, 0.3);
+        app.world_mut().resource_mut::<Theme>().fg = Color::srgb(0.1, 0.2, 0.3);
         app.update();
         assert_eq!(app.world().resource::<SurfaceThemeEpoch>().get(), first + 1);
         app.update();
