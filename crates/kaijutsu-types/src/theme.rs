@@ -237,7 +237,7 @@ impl Default for ThemeData {
             // contrib/themes/tokyo-night.toml)
             bg: "#131020".into(),
             panel_bg: "#131020f2".into(),
-            fg: "#d8d2ee".into(),
+            fg: "#ece8f7".into(),
             fg_dim: "#6f6592".into(),
             accent: "#a487ff".into(),
             accent2: "#ffcf7d".into(),
@@ -391,7 +391,7 @@ impl Default for ThemeData {
 /// `[scene]` — the 3D scene lane. Every sub-table is `serde(default)` so a
 /// partial `[scene]` section overrides only what it names.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SceneData {
     pub hues: SceneHuesData,
     pub tiers: SceneTiersData,
@@ -404,7 +404,7 @@ pub struct SceneData {
 /// a hue's brightest channel should sit near full so tier math means what it
 /// says.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SceneHuesData {
     /// Room clear color (the octagon's void).
     pub bg: String,
@@ -465,7 +465,7 @@ impl Default for SceneHuesData {
 /// LDR structure tiers + the decoration-glow band. Invariant the app tests:
 /// every trough × `crest` < 1.0 (decoration never sustains HDR).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SceneTiersData {
     /// Station markers at rest.
     pub marker: f32,
@@ -500,7 +500,7 @@ impl Default for SceneTiersData {
 /// `[scene.gains]` — live-signal HDR gains. These are allowed to sustain
 /// >1.0 because they ARE the live-activity tell (docs/color.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SceneGainsData {
     /// Tracker marker beat thump.
     pub beat: f32,
@@ -532,7 +532,7 @@ impl Default for SceneGainsData {
 /// on purpose: 1.0 is the HDR-tell boundary, a contract rather than a style
 /// knob.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScenePostData {
     pub bloom_intensity: f32,
     pub bloom_low_frequency_boost: f32,
@@ -566,7 +566,7 @@ impl Default for ScenePostData {
 /// intensity/range are in Bevy's photometric units against the room's own
 /// large world scale, a first-guess tuned live over BRP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SceneLightingData {
     /// Light only the chamber shell instead of the all-unlit room.
     pub lit_chamber: bool,
@@ -678,6 +678,20 @@ mod tests {
             "unnamed keys keep defaults"
         );
         assert_eq!(td.scene.tiers.crest, 1.25, "untouched tables keep defaults");
+    }
+
+    #[test]
+    fn unknown_scene_key_is_refused() {
+        let base = DEFAULT_THEME_TOML.split("\n[scene.hues]").next().unwrap();
+        for table in ["scene", "scene.hues", "scene.tiers", "scene.gains", "scene.post", "scene.lighting"] {
+            let toml_src = format!("{base}\n[{table}]\nretired_key = 1\n");
+            let err = toml::from_str::<ThemeData>(&toml_src)
+                .expect_err(&format!("an unknown [{table}] key must not load"));
+            assert!(
+                err.to_string().contains("retired_key"),
+                "[{table}] error names the key: {err}"
+            );
+        }
     }
 
     #[test]

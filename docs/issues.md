@@ -1781,20 +1781,16 @@ one trust boundary").
 
 ---
 
-## A panicked RPC actor is never respawned (2026-09-20)
+## `poll_connection_status` has an arm that cannot fire (2026-09-21)
 
-`spawn_local(actor.run())` (`kaijutsu-client/src/actor.rs:4173`) discards the
-`JoinHandle`, so nothing observes a `JoinError`. An ordinary connection loss
-is retried inside the actor's own `Cooldown` state; a panic unwinds, drops the
-broadcast senders, and `poll_connection_status` removes the `RpcActor`
-resource — which spawns nothing. The next actor comes only from
-`ActorPlugin::build`'s startup spawn or `view::sync::handle_context_switch`'s
-cache-miss branch, so a panic costs an app restart.
-
-Amy decides: should a panicked or terminal actor be respawned automatically,
-and on what trigger — a watcher for `RpcActor` absence, or a generalized
-cache-miss spawn? A catch would have to live where the spawn does, in
-`kaijutsu-client`.
+`poll_connection_status` (`kaijutsu-app/src/connection/actor_plugin.rs`) removes
+the `RpcActor` resource when the status broadcast reports `Closed`. The receiver
+comes from `actor.handle.subscribe_status()`, and `ActorHandle` holds its own
+`status_tx`, so the channel stays open for as long as the resource exists. A
+panicked actor now publishes `Terminal` through `supervise_actor`
+(`kaijutsu-client/src/actor.rs`) and is not respawned; the app shows it as
+`last_error`. Delete the arm's body, or decide what removes a `Terminal`
+actor's resource.
 
 ---
 
@@ -2265,18 +2261,6 @@ hand-picked dozen fields, so a key present on one side and absent on the other
 passes. Proven: removing three `SceneGainsData` fields from the struct while
 leaving them in the file produced no new failure. Compare key sets instead —
 round-trip both sides through `toml::Value` and diff.
-
-Two things the same test hides today:
-
-- **`fg` disagrees between the file and the default.** `theme.toml` says
-  `#ece8f7`; `ThemeData::default()` says `#d8d2ee`. `cargo test -p
-  kaijutsu-types` is red on this alone. Amy picks which one is the theme.
-- **An unknown `[scene]` key loads silently.** None of the scene structs carry
-  `#[serde(deny_unknown_fields)]`, which about twenty other config types in
-  this tree do, so an operator's file still naming a retired hue parses with no
-  word said. Adding the attribute would refuse a file that loads today, so it
-  is a decision: refuse, or read the file into `toml::Value` first and warn per
-  unknown key.
 
 ## `vfs_getattr` does not reach the app (2026-09-20)
 

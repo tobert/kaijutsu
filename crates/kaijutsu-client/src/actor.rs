@@ -4109,6 +4109,38 @@ fn system_now_ms() -> u64 {
 // Public spawn function
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Run the actor's task and publish `Terminal` if it panics.
+///
+/// A panicked actor is not respawned. `ActorHandle` holds its own status
+/// senders, so the channels stay open after the task dies; without this the
+/// last published level (often `Connected`) would stand forever.
+async fn supervise_actor<F>(
+    run: F,
+    status_tx: broadcast::Sender<ConnectionStatus>,
+    status_watch_tx: watch::Sender<ConnectionStatus>,
+) where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    let Err(join_error) = tokio::task::spawn_local(run).await else {
+        return;
+    };
+    let detail = match join_error.try_into_panic() {
+        Ok(payload) => match payload.downcast_ref::<&str>() {
+            Some(msg) => (*msg).to_string(),
+            None => match payload.downcast_ref::<String>() {
+                Some(msg) => msg.clone(),
+                None => "non-string panic payload".to_string(),
+            },
+        },
+        Err(join_error) => join_error.to_string(),
+    };
+    let reason = format!("RPC actor panicked and is not respawned: {detail}");
+    log::error!("{reason}");
+    let status = ConnectionStatus::Terminal { reason };
+    let _ = status_watch_tx.send(status.clone());
+    let _ = status_tx.send(status);
+}
+
 /// Spawn an RPC actor in the current `LocalSet` context.
 ///
 /// `instance` is a per-actor stable UUID — the server uses
@@ -4158,6 +4190,7 @@ pub fn spawn_actor(
     // `event_tx`: a reconnect to the same kernel must not lose the offset.
     let clock = crate::KernelClockHandle::new();
 
+    let status_watch_tx_supervisor = status_watch_tx.clone();
     let actor = RpcActor::new(
         config,
         context_id,
@@ -4172,7 +4205,11 @@ pub fn spawn_actor(
         ledger_tx.clone(),
         clock.clone(),
     );
-    tokio::task::spawn_local(actor.run());
+    tokio::task::spawn_local(supervise_actor(
+        actor.run(),
+        status_tx.clone(),
+        status_watch_tx_supervisor,
+    ));
 
     ActorHandle {
         tx,
@@ -4193,6 +4230,45 @@ pub fn spawn_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in the actor's task reaches both status channels as
+    /// `Terminal`, naming the panic.
+    #[tokio::test]
+    async fn supervised_actor_panic_publishes_terminal() {
+        let (status_tx, mut status_rx) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
+        let (watch_tx, watch_rx) = watch::channel(ConnectionStatus::Idle);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(supervise_actor(
+                async { panic!("actor fell over") },
+                status_tx,
+                watch_tx,
+            ))
+            .await;
+
+        let ConnectionStatus::Terminal { reason } = watch_rx.borrow().clone() else {
+            panic!("level is {:?}, expected Terminal", watch_rx.borrow());
+        };
+        assert!(reason.contains("panicked"), "reason: {reason}");
+        assert!(reason.contains("actor fell over"), "reason: {reason}");
+        assert!(matches!(
+            status_rx.try_recv(),
+            Ok(ConnectionStatus::Terminal { .. })
+        ));
+    }
+
+    /// An actor task that returns normally publishes nothing of its own.
+    #[tokio::test]
+    async fn supervised_actor_clean_exit_publishes_nothing() {
+        let (status_tx, mut status_rx) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
+        let (watch_tx, watch_rx) = watch::channel(ConnectionStatus::Idle);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(supervise_actor(async {}, status_tx, watch_tx))
+            .await;
+        assert!(matches!(*watch_rx.borrow(), ConnectionStatus::Idle));
+        assert!(status_rx.try_recv().is_err());
+    }
 
     /// A kernel-wide client's filter stays empty regardless of a joined
     /// context or extra watches — an unscoped client's delivery is already
