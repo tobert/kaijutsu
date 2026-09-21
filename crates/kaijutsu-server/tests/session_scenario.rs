@@ -16,11 +16,6 @@
 //! character responsible above banto's seat; a final turn signs off, closing the continuation
 //! window; amy rotates banto's seat and reads the successor's instructions.
 //!
-//! **This scenario currently fails at the performer-assignment step** — see
-//! "What this does not cover" below for the confirmed reason: it is a real
-//! gap in `kj fork`, not a test-shape problem, and stays red on purpose
-//! rather than being papered over.
-//!
 //! This binary has exactly one `#[test]` function. `KJ_MOCK_SCRIPT_DIR` is
 //! process-wide state read once when the mock backend is constructed
 //! (`Provider::from_backend`'s `BackendKind::Mock` arm) — a second test in
