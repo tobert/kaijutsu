@@ -1690,6 +1690,39 @@ fn the_prefix_pops_over_the_open_picker() {
     assert!(!rows.contains("archive"), "a chord reached the picker as a verb: {}", session.dump("picker"));
 }
 
+/// The prefix pops over the full-screen editor: a seat chord shows the other
+/// context's conversation, the editor stays with the context it was opened
+/// in, and `Ctrl+A Ctrl+A` lands back in it (`docs/tui.md`, "Editor and
+/// diff").
+#[test]
+fn the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+    let seat = seat_with_two_drafts(&session);
+
+    session.send(":!vi /config/rc/lib/create/S00-base.md\r");
+    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S00-base.md") && !screen_contains(screen, '\u{276f}');
+    assert!(session.wait_until(Duration::from_secs(15), in_editor), "vi never opened: {}", session.dump("vi"));
+
+    session.send("\x01");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send(&format!("{seat}"));
+    let away = session.wait_until(Duration::from_secs(15), |screen| {
+        screen_contains(screen, '\u{276f}') && !screen_contains_str(screen, "home-draft")
+    });
+    assert!(away, "the chord did not leave the editor: {}", session.dump("away"));
+
+    session.send("\x01");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\x01");
+    assert!(
+        session.wait_until(Duration::from_secs(15), in_editor),
+        "coming back did not restore the editor: {}",
+        session.dump("back")
+    );
+}
+
 /// The prefix pops over the open ledger the same way.
 #[test]
 fn the_prefix_pops_over_the_open_ledger() {

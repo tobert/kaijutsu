@@ -1201,10 +1201,9 @@ async fn act(
     width: u16,
 ) -> Result<Acted> {
     // The editor is the sanctioned raw key reader (`docs/input.md`): while a
-    // vi surface has the screen every key belongs to it, so the `Ctrl+A`
-    // prefix and the `Ctrl+C` double-tap are bypassed here rather than being
-    // taught to stand aside.
-    if editor::route_key(app) == editor::KeyRoute::FullScreen {
+    // vi surface has the screen every key belongs to it, `Ctrl+C` included,
+    // except the `Ctrl+A` prefix and its chord ([`Keys::claims`]).
+    if editor::route_key(app, keys.claims(&key)) == editor::KeyRoute::FullScreen {
         act_full_screen(bridge, app, key).await?;
         return Ok(Acted::Continue);
     }
@@ -1251,6 +1250,28 @@ async fn act(
     } else {
         keys.interpret(key)
     };
+
+    // Over a full-screen surface the prefix moves between seats and hands
+    // vim its own `Ctrl+A`; the surface stays with its context
+    // (`App::switch_to`). Nothing else is drawn there to act on.
+    if app.screen.is_full_screen() {
+        match chord_over_full_screen(&intent) {
+            OverFullScreen::Run => {}
+            OverFullScreen::ToSurface(key) => {
+                act_full_screen(bridge, app, key).await?;
+                return Ok(Acted::Continue);
+            }
+            OverFullScreen::Hold => {
+                app.note("only seat chords and Ctrl+A a work over a full-screen surface");
+                return Ok(Acted::Continue);
+            }
+        }
+    }
+
+    // Opt-in (`RUST_LOG=kaijutsu_tui::keys=trace`): it records every
+    // keystroke, draft text included, so it never rides a broader filter.
+    tracing::trace!(target: "kaijutsu_tui::keys", code = ?key.code, modifiers = ?key.modifiers,
+        kind = ?key.kind, armed = keys.armed(), ?intent, "key");
 
     if app.picker.is_some() || app.ledger_view.is_some() {
         match chord_over_overlay(&intent, app.picker.is_some(), app.ledger_view.is_some()) {
@@ -1522,7 +1543,7 @@ fn paste_target(app: &App) -> PasteTarget {
         }
         return PasteTarget::Editor(screen.session);
     }
-    if editor::route_key(app) == editor::KeyRoute::FullScreen {
+    if editor::route_key(app, false) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
     if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card.is_some() {
@@ -1689,6 +1710,26 @@ async fn compose_key(
         }
     }
     Ok(())
+}
+
+/// What a prefix chord does over the full-screen editor or diff viewer.
+#[derive(Debug, PartialEq, Eq)]
+enum OverFullScreen {
+    /// Arming, and the chords that move between seats.
+    Run,
+    /// `Ctrl+A a`: the literal `Ctrl+A` belongs to the surface, not the draft.
+    ToSurface(crossterm::event::KeyEvent),
+    /// A chord for a surface that is not drawn here.
+    Hold,
+}
+
+fn chord_over_full_screen(intent: &Intent) -> OverFullScreen {
+    match intent {
+        Intent::Ignored | Intent::LegendChanged | Intent::SwitchSeat(_) | Intent::StepSeat(_)
+        | Intent::LastContext => OverFullScreen::Run,
+        Intent::InputKey(key) => OverFullScreen::ToSurface(*key),
+        _ => OverFullScreen::Hold,
+    }
 }
 
 /// What a prefix chord does to the picker or ledger it fired over.
@@ -2818,6 +2859,20 @@ mod tests {
         ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
     };
     use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+
+    #[test]
+    fn over_a_full_screen_surface_the_prefix_moves_seats_and_feeds_vim() {
+        let literal = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(chord_over_full_screen(&Intent::LegendChanged), OverFullScreen::Run);
+        assert_eq!(chord_over_full_screen(&Intent::SwitchSeat(3)), OverFullScreen::Run);
+        assert_eq!(chord_over_full_screen(&Intent::LastContext), OverFullScreen::Run);
+        assert_eq!(chord_over_full_screen(&Intent::InputKey(literal)), OverFullScreen::ToSurface(literal));
+        assert_eq!(chord_over_full_screen(&Intent::TogglePicker), OverFullScreen::Hold);
+        assert_eq!(chord_over_full_screen(&Intent::PrefillKj("kj context rotate ")), OverFullScreen::Hold);
+    }
 
     /// Arming keeps the overlay, a seat switch takes it down, and an
     /// overlay's own chord only closes it.

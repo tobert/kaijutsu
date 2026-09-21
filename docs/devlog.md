@@ -3015,7 +3015,11 @@ the archive latch. A stale `gate.toml` the upgrade had just broken is what
 refused it. Amy's rule replaced the patch: the prefix pops over nearly
 everything, asks included, because she may want to look at something before
 answering. `Keys::claims` already said which keys are the prefix's; the
-overlays now ask it first. The full-screen editor keeps its bypass until its
-session has a rule for a seat switch.
+overlays now ask it first. The full-screen editor lost its bypass the same
+day, once Amy gave its session a rule for a seat switch: the editor stays with
+the context it was opened in, the view moves, and coming back lands in it.
+`App::switch_to` parks the screen per context, and `Ctrl+A a` is how vim gets
+its increment. Her report that the prefix failed from the inline draft did not
+reproduce in a pty, so the key path gained an opt-in trace instead of a guess.
 
 Credits: Claude Fable 5.1.

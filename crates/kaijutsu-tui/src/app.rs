@@ -181,6 +181,10 @@ pub struct App {
     /// on it, which is what makes
     /// the editor the sanctioned raw key reader.
     pub screen: crate::editor::ScreenMode,
+    /// The full-screen surface each other context was left in. A seat switch
+    /// parks [`Self::screen`] under the context it belongs to and restores
+    /// whatever the target was left in ([`Self::switch_to`]).
+    pub parked_screens: HashMap<ContextId, crate::editor::ScreenMode>,
     /// Which context each pending ask belongs to
     /// (`kaijutsu_client::AskInfo::context_id`), kept current by
     /// [`Self::note_ask`]/[`Self::forget_asks_not_in`] from the same poll
@@ -254,6 +258,7 @@ impl App {
             submitted_draft: None,
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Conversation,
+            parked_screens: HashMap::new(),
             ask_owners: HashMap::new(),
             ask_card: None,
             ledger_view: None,
@@ -361,6 +366,15 @@ impl App {
         if self.current == Some(id) {
             return;
         }
+        // The surface belongs to the context it was opened in: it stays
+        // there, and the target shows whatever it was left in.
+        let leaving = std::mem::take(&mut self.screen);
+        if let Some(old) = self.current
+            && leaving.is_full_screen()
+        {
+            self.parked_screens.insert(old, leaving);
+        }
+        self.screen = self.parked_screens.remove(&id).unwrap_or_default();
         self.previous = self.current;
         self.current = Some(id);
         if let Some(view) = self.views.get_mut(&id) {

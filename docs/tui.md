@@ -1120,9 +1120,22 @@ range to the kernel's `EditorState` and to the capnp struct is step 1 of
 `docs/vi.md`'s "Selection rects", and it is what unblocks both renderers at
 once.
 
-**Keys bypass the prefix.** While the alternate screen is up every key goes to
-`editor_keys` verbatim, so `Ctrl+A` is vim's increment and `Ctrl+C` is vim's
-interrupt — the editor is the sanctioned raw reader (`docs/input.md`). The
+**Every key but the prefix goes to vim.** While the alternate screen is up a
+key goes to `editor_keys` verbatim, so `Ctrl+C` is vim's interrupt — the
+editor is the sanctioned raw reader (`docs/input.md`). The `Ctrl+A` prefix
+and the key after it are the exception: `Ctrl+A <digit>`, `n`/`p`, and
+`Ctrl+A Ctrl+A` move between seats, and `Ctrl+A a` sends vim its own
+`Ctrl+A`, the increment. Other chords are held with a notice, since their
+surfaces are not drawn here. The diff viewer follows the same rule.
+
+**A full-screen surface stays with its context.** Amy, 2026-09-21: "it should
+just switch and leave the editor where it is, and move my view to what I
+select. If I go back to the context with the editor, I'm back where I left
+the editor." A seat switch parks the editor or diff viewer under the context
+it was opened in and shows the target as it was left; returning restores it.
+A parked editor session still takes its state pushes, and one closed while
+parked leaves the conversation. A terminal connection loss drops every
+parked surface. The
 notation `kaijutsu-editor`'s `parse_keys` accepts is a literal char, `<Esc>`,
 `<CR>`, `<BS>`, `<Tab>`, a space, and `<C-x>`; an arrow, a function key and a
 literal `<` have no token, and are refused rather than sent and silently
@@ -1216,7 +1229,8 @@ overlay's own chord (`Ctrl+A "`, `Ctrl+A l`) only closes it; arming, an
 unbound chord, and a not-built notice leave it up. The picker and ledger
 ignore every other Ctrl or Alt chord, so none is read as a bare letter —
 `Ctrl+A Ctrl+A` was once the picker's `a` `a`, an archive and its confirm.
-The full-screen editor is the one exception ("Editor and diff").
+Over the full-screen editor the prefix moves between seats and nothing else
+("Editor and diff").
 
 `q` and `d`
 are chords the prefix already claims; the notice on the status line names

@@ -272,14 +272,16 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   nothing at boot says the gate is unusable; the refusal shows only per call
   in the log. Reseed also never removes a retired bucket: the host still
   has `/config/rc/bassist`.
-- The prefix does not pop over the full-screen editor or diff viewer: every
-  key goes to `editor_keys`, so `Ctrl+A` is vim's increment (`docs/tui.md`,
-  "Keys bypass the prefix"). The app's table puts the prefix above vi, with
-  `Ctrl+A a` as the literal. Lifting the bypass needs a rule for what a seat
-  switch does to an open editor session. Amy's 2026-09-21 report that
-  `Ctrl+A` failed after `Esc` "mid-prompt" does not reproduce in compose's
-  normal mode (`the_prefix_switches_seats_from_normal_mode_mid_draft`); the
-  editor is the unconfirmed candidate.
+- Amy's 2026-09-21 report that `Ctrl+A` failed from the inline draft after
+  `Esc` does not reproduce: `the_prefix_switches_seats_from_normal_mode_mid_draft`
+  passes, and every path from the draft reaches `Keys::interpret`. A pty
+  cannot stand in for her terminal and mux. `RUST_LOG=kaijutsu_tui::keys=trace`
+  records each key and the intent it became in
+  `~/.local/state/kaijutsu-tui/tui.log`; run with it and read the log at the
+  next occurrence.
+- Over a full-screen surface only seat chords and `Ctrl+A a` act; the
+  picker, ledger, and prefilled prompts are held because nothing draws them
+  there. The hold notice is only visible after leaving the surface.
 - Whether seats write their handoff note before stopping is prompt guidance
   (`S00-base.md`), unmeasured. Tune it from what the morning rotation finds.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`

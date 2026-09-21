@@ -46,8 +46,8 @@ pub enum ScreenMode {
 
 impl ScreenMode {
     /// Whether a full-screen surface has the screen. The key path
-    /// early-returns on this, which is what bypasses the `Ctrl+A` prefix and
-    /// `Ctrl+C` while a vi surface is live.
+    /// early-returns on this for every key the `Ctrl+A` prefix does not
+    /// claim, `Ctrl+C` included ([`route_key`]).
     pub fn is_full_screen(&self) -> bool {
         !matches!(self, ScreenMode::Conversation)
     }
@@ -330,18 +330,18 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
 /// Where a key goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRoute {
-    /// The full-screen surface takes it, whole. The `Ctrl+A` prefix and the
-    /// `Ctrl+C` double-tap never see it — the editor is the sanctioned raw
-    /// key reader (`docs/input.md`), so `Ctrl+A` there is vim's increment
-    /// and `Ctrl+C` is vim's interrupt.
+    /// The full-screen surface takes it, whole. The `Ctrl+C` double-tap
+    /// never sees it — the editor is the sanctioned raw key reader
+    /// (`docs/input.md`), so `Ctrl+C` there is vim's interrupt. Only a key
+    /// the `Ctrl+A` prefix claims goes the other way.
     FullScreen,
     /// The prefix machine and the compose line.
     Prefix,
 }
 
 /// Which way this client's next key goes.
-pub fn route_key(app: &crate::app::App) -> KeyRoute {
-    if app.screen.is_full_screen() {
+pub fn route_key(app: &crate::app::App, claimed: bool) -> KeyRoute {
+    if app.screen.is_full_screen() && !claimed {
         KeyRoute::FullScreen
     } else {
         KeyRoute::Prefix
@@ -367,25 +367,31 @@ pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEven
     use kaijutsu_client::ServerEvent;
     match event {
         ServerEvent::EditorStateChanged { state } => {
-            let Some(screen) = app.screen.editor_mut() else {
-                return false;
-            };
-            if screen.session != state.session {
-                return false;
+            if let Some(screen) = app.screen.editor_mut()
+                && screen.session == state.session
+            {
+                screen.state = state.clone();
+                return true;
             }
-            screen.state = state.clone();
-            true
+            // A session parked under another context keeps its state
+            // current; nothing on screen changed.
+            for parked in app.parked_screens.values_mut() {
+                if let Some(screen) = parked.editor_mut()
+                    && screen.session == state.session
+                {
+                    screen.state = state.clone();
+                }
+            }
+            false
         }
         ServerEvent::EditorClosed { session_id } => {
-            if !app
-                .screen
-                .editor()
-                .is_some_and(|s| s.session == *session_id)
-            {
-                return false;
+            if app.screen.editor().is_some_and(|s| s.session == *session_id) {
+                app.screen = ScreenMode::Conversation;
+                return true;
             }
-            app.screen = ScreenMode::Conversation;
-            true
+            app.parked_screens
+                .retain(|_, parked| !parked.editor().is_some_and(|s| s.session == *session_id));
+            false
         }
         _ => false,
     }
@@ -404,6 +410,7 @@ pub fn leave_on_disconnect(
         return false;
     }
     app.screen = ScreenMode::Conversation;
+    app.parked_screens.clear();
     app.note("kernel connection ended; left the editor");
     true
 }
@@ -801,25 +808,69 @@ mod tests {
         assert_eq!(app.notice(), Some("editor session lost"));
     }
 
+    // ── parking across a seat switch ────────────────────────────────────────
+
+    /// A seat switch leaves the editor where it is: the other context shows
+    /// its conversation, and coming back lands in the same session.
+    #[test]
+    fn a_seat_switch_parks_the_editor_and_the_way_back_restores_it() {
+        let (home, away) = (kaijutsu_types::ContextId::new(), kaijutsu_types::ContextId::new());
+        let mut app = app_with_editor();
+        app.current = Some(home);
+        app.switch_to(away);
+        assert!(!app.screen.is_full_screen(), "the other context shows its conversation");
+        app.switch_to(home);
+        assert_eq!(app.screen.editor().map(|e| e.session), Some(7));
+    }
+
+    /// The push channel is kernel-wide, so a parked session keeps its state
+    /// current and a close while parked leaves nothing to come back to.
+    #[test]
+    fn a_parked_session_still_takes_its_pushes() {
+        let (home, away) = (kaijutsu_types::ContextId::new(), kaijutsu_types::ContextId::new());
+        let mut app = app_with_editor();
+        app.current = Some(home);
+        app.switch_to(away);
+        let mut changed = state("edited\n", 3);
+        changed.session = 7;
+        assert!(!apply_push(&mut app, &ServerEvent::EditorStateChanged { state: changed }), "off screen: no frame");
+        app.switch_to(home);
+        assert_eq!(app.screen.editor().map(|e| e.state.cursor), Some(3));
+
+        app.switch_to(away);
+        apply_push(&mut app, &ServerEvent::EditorClosed { session_id: 7 });
+        app.switch_to(home);
+        assert!(!app.screen.is_full_screen(), "the session closed while parked");
+    }
+
+    /// The prefix is above the full-screen surface: `Ctrl+A` and the key
+    /// after it are never vim's. `Ctrl+A a` is how vim gets its increment.
+    #[test]
+    fn a_claimed_key_is_the_prefixs_even_over_the_editor() {
+        let app = app_with_editor();
+        assert_eq!(route_key(&app, false), KeyRoute::FullScreen);
+        assert_eq!(route_key(&app, true), KeyRoute::Prefix);
+    }
+
     // ── the key bypass ──────────────────────────────────────────────────────
 
     #[test]
     fn a_full_screen_surface_takes_every_key_before_the_prefix() {
         let app = app_with_editor();
-        assert_eq!(route_key(&app), KeyRoute::FullScreen);
+        assert_eq!(route_key(&app, false), KeyRoute::FullScreen);
         let mut conversation = crate::app::App::new("amy");
-        assert_eq!(route_key(&conversation), KeyRoute::Prefix);
+        assert_eq!(route_key(&conversation, false), KeyRoute::Prefix);
         conversation.screen = ScreenMode::Editor(screen("x", 0));
-        assert_eq!(route_key(&conversation), KeyRoute::FullScreen);
+        assert_eq!(route_key(&conversation, false), KeyRoute::FullScreen);
     }
 
-    /// `Ctrl+A` in the editor is vim's increment, not the screen prefix, and
-    /// `Ctrl+C` is vim's interrupt, not the quit double-tap. Both reach the
-    /// kernel as notation because the route above bypasses the prefix machine.
+    /// `Ctrl+C` in the editor is vim's interrupt, not the quit double-tap,
+    /// and vim's increment arrives as `Ctrl+A a`. Both reach the kernel as
+    /// notation.
     #[test]
     fn ctrl_a_and_ctrl_c_reach_the_kernel_while_the_editor_is_live() {
         let app = app_with_editor();
-        assert_eq!(route_key(&app), KeyRoute::FullScreen);
+        assert_eq!(route_key(&app, false), KeyRoute::FullScreen);
         for (c, want) in [('a', "<C-a>"), ('c', "<C-c>")] {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             assert_eq!(key_notation(&key).as_deref(), Some(want));
