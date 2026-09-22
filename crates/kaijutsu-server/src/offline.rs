@@ -50,11 +50,20 @@ impl KernelLock {
         // of this call.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            return Err(format!(
-                "{} is held by another kaijutsu-server or kj — stop the service, or wait for \
-                 the other kj, then try again",
-                path.display()
-            ));
+            let error = std::io::Error::last_os_error();
+            // EWOULDBLOCK (== EAGAIN on Linux) is `flock`'s documented signal
+            // for "already held, and LOCK_NB refused to wait" — every other
+            // errno is a real failure (permissions, no space, a dead mount)
+            // that contention's fixed text would misreport.
+            return Err(if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                format!(
+                    "{} is held by another kaijutsu-server or kj — stop the service, or wait \
+                     for the other kj, then try again",
+                    path.display()
+                )
+            } else {
+                format!("flock {}: {error}", path.display())
+            });
         }
         Ok(Self { _file: file, path })
     }
@@ -85,6 +94,23 @@ pub struct KjRunArgs {
     pub argv: Vec<String>,
 }
 
+/// `kj ledger allow|deny` offline would record a durable answer that nothing
+/// delivers: `run_kj` boots no approval-delivery worker
+/// (`Kernel::start_approval_delivery` is a serving-path step), so the answer
+/// sits undelivered until the next serving boot, where
+/// `approval_resume::recover_unpublished_pairs` retires the ask without ever
+/// running the approved statement. Refuse before boot, the way the running
+/// kernel refuses nothing — asks are answered on the running kernel over
+/// SSH, never offline.
+const LEDGER_ANSWER_REFUSAL: &str =
+    "kj ledger allow/deny needs a running kernel — asks are answered on the running kernel \
+     over SSH; start the service and answer there.";
+
+fn refuses_ledger_answer(argv: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("ledger")
+        && matches!(argv.get(1).map(String::as_str), Some("allow") | Some("deny"))
+}
+
 /// Run one `kj` verb against a stopped kernel: take the data-directory lock,
 /// boot the same kernel the service boots (minus serving), dispatch, print,
 /// settle, and report an exit code — `docs/server-cli.md`.
@@ -105,6 +131,11 @@ pub async fn run_kj(args: KjRunArgs) -> ExitCode {
     let confirmed = kaijutsu_kernel::kj::parse::has_flag(&args.argv, &["--confirm"]);
     let mut argv = args.argv;
     kaijutsu_kernel::kj::parse::strip_flag(&mut argv, &["--confirm"]);
+
+    if refuses_ledger_answer(&argv) {
+        eprintln!("kj: {LEDGER_ANSWER_REFUSAL}");
+        return ExitCode::FAILURE;
+    }
 
     let shared = match crate::rpc::create_shared_kernel(
         args.config_dir.as_deref(),
@@ -132,8 +163,13 @@ pub async fn run_kj(args: KjRunArgs) -> ExitCode {
         }
     };
 
-    settle(&shared).await;
-    exit
+    match settle(&shared).await {
+        Ok(()) => exit,
+        Err(e) => {
+            eprintln!("kj: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Resolve `--as`/`--context` to a [`KjCaller`]: a live root character, its
@@ -156,6 +192,9 @@ fn resolve_caller(
                 })?;
             if !row.root {
                 return Err(format!("'{name}' is not a root character"));
+            }
+            if row.retired_at.is_some() {
+                return Err(format!("'{name}' is retired"));
             }
             row
         }
@@ -214,6 +253,17 @@ fn resolve_caller(
     Ok(caller)
 }
 
+/// Print `value` as compact JSON. `serde_json::Value`'s own `Display`
+/// happens to serialize too, but going through `to_string` explicitly is
+/// what keeps a bare `Value::String` printing as a quoted JSON string
+/// (`"bob"`) rather than depending on that coincidence.
+fn print_json(value: serde_json::Value) {
+    match serde_json::to_string(&value) {
+        Ok(encoded) => println!("{encoded}"),
+        Err(e) => eprintln!("kj: could not encode --json output: {e}"),
+    }
+}
+
 /// Dispatch one verb and print its result: the message to stdout, or with
 /// `--json`, the structured data. Errors go to stderr.
 async fn dispatch_and_report(
@@ -225,7 +275,7 @@ async fn dispatch_and_report(
     match shared.kj_dispatcher.dispatch(argv, caller).await {
         KjResult::Ok { message, data, .. } => {
             if json {
-                println!("{}", data.unwrap_or(serde_json::Value::Null));
+                print_json(data.unwrap_or(serde_json::Value::Null));
             } else {
                 println!("{message}");
             }
@@ -233,7 +283,7 @@ async fn dispatch_and_report(
         }
         KjResult::Switch(context_id, message) => {
             if json {
-                println!("{}", serde_json::json!({ "switched_to": context_id.to_hex() }));
+                print_json(serde_json::json!({ "switched_to": context_id.to_hex() }));
             } else {
                 println!("{message}");
             }
@@ -257,14 +307,38 @@ async fn dispatch_and_report(
     }
 }
 
-/// Stop admission and await settlement, the same steps
-/// `ssh.rs::spawn_signal_shutdown` takes on SIGTERM: a verb that admits a
-/// model turn (`kj drive`) holds this until the turn ends.
-async fn settle(shared: &SharedKernel) {
-    shared.shutdown.cancel();
-    if let Err(e) = shared.kernel.shutdown_runtime_worker().await {
-        log::error!("kj: settling the kernel after the verb: {e}");
+/// Wait until no turn is admitted anywhere on this kernel.
+///
+/// `shutdown_runtime_worker` cancels the runtime pool's token
+/// (`Kernel::stop_runtime_worker`), and an admitted turn treats that
+/// cancellation as a hard interrupt (`runtime/turn_request.rs`). Calling it
+/// while a turn is still in flight would cut that turn short instead of
+/// letting it conclude — so a verb that admits one, such as `kj drive`,
+/// must not reach `shutdown_runtime_worker` until every admitted turn on
+/// this kernel has finished on its own.
+async fn await_turns_drained(shared: &SharedKernel) {
+    if shared.kernel.turns_in_flight().is_empty() {
+        return;
     }
+    log::info!("kj: waiting for the admitted turn to finish before settling the kernel");
+    while !shared.kernel.turns_in_flight().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Stop admission, wait for every admitted turn to finish, and settle: the
+/// same join `ssh.rs::spawn_signal_shutdown` performs on SIGTERM, plus the
+/// wait above. A verb that admits a model turn (`kj drive`) holds this until
+/// the turn ends — that is the offline command's whole "holds until the turn
+/// ends" promise, not just the wire admission the verb itself returns after.
+async fn settle(shared: &SharedKernel) -> Result<(), String> {
+    shared.shutdown.cancel();
+    await_turns_drained(shared).await;
+    let result = shared
+        .kernel
+        .shutdown_runtime_worker()
+        .await
+        .map_err(|e| format!("settling the kernel after the verb: {e}"));
     match shared.kernel_db.lock().checkpoint() {
         Ok((busy, _, _)) if busy != 0 => {
             log::warn!("kj: wal_checkpoint(TRUNCATE) busy; WAL left for next open");
@@ -272,4 +346,5 @@ async fn settle(shared: &SharedKernel) {
         Ok(_) => {}
         Err(e) => log::warn!("kj: wal_checkpoint failed: {e}"),
     }
+    result
 }

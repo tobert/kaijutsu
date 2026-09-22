@@ -57,7 +57,7 @@ fn stderr(out: &Output) -> String {
 /// `--config-root <dir> rc reseed` writes under `<dir>/rc`, resolved the
 /// same way the server itself would resolve `/config/rc` from that root —
 /// and must NOT also seed the default XDG location, which is the bug this
-/// pins: `cmd_rc` used to ignore the parsed global flags entirely.
+/// pins: `cmd_rc_reseed` used to ignore the parsed global flags entirely.
 #[test]
 fn config_root_flag_targets_its_own_rc_tree_not_the_default() {
     let xdg = Xdg::new();

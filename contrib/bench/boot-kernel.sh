@@ -102,7 +102,7 @@ echo "== init: root character $REVIEWER"
 "$SERVER_BIN" init --as "$REVIEWER" --key "$KEY_FILE.pub"
 
 # Name the rc tree explicitly. `rc reseed` also resolves `--config-root` now
-# (crates/kaijutsu-server/src/main.rs, `cmd_rc`), but `--dir` says which tree
+# (crates/kaijutsu-server/src/main.rs, `cmd_rc_reseed`), but `--dir` says which tree
 # was written without depending on that resolution, and this script has a tree
 # in hand either way.
 echo "== rc reseed into $CONFIG_ROOT/rc"

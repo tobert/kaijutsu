@@ -45,9 +45,12 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Flags every subcommand shares: where the `/config` trees and read-write
+/// Flags every subcommand accepts, but only the serving default, `rc reseed`,
+/// and `kj` actually read: where the `/config` trees and read-write
 /// workspaces come from, and the port the serving default binds. May appear
-/// before or after a subcommand name.
+/// before or after a subcommand name. The direct-database commands (`init`,
+/// `add-key`, `list-keys`, `list-characters`, `migrate-keyring`) always read
+/// the default XDG paths and ignore these.
 #[derive(Args)]
 struct PathArgs {
     /// Where the /config trees live. Each tree is a subdirectory unless
@@ -608,7 +611,21 @@ fn cmd_list_characters() -> ExitCode {
 /// `kaijutsu_server::migrate_keyring`). Opens both databases read-write at
 /// their default paths — run this with the service stopped. A no-op,
 /// reported as such, when `auth.db` has already been melted.
+///
+/// Unlike `init`, `add-key`, `list-keys`, and `list-characters` — the direct-
+/// database lockout tools, which stay lock-free so they still work when the
+/// kernel refuses to boot — this writes `kernel.db` read-write, so it takes
+/// the same `KernelLock` `kj` and the service take, refusing at once if
+/// either already holds it.
 fn cmd_migrate_keyring() -> ExitCode {
+    let data_dir = kernel_data_dir();
+    let _lock = match kaijutsu_server::offline::KernelLock::acquire(&data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("migrate-keyring: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let auth_db = match AuthDb::open(AuthDb::default_path()) {
         Ok(db) => db,
         Err(e) => {

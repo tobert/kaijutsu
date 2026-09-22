@@ -2,6 +2,7 @@
 //! `kj` verb against a stopped kernel — the real compiled binary against a
 //! temporary `$HOME`, with no server running.
 
+mod common;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -179,4 +180,134 @@ fn as_is_required_when_several_roots_exist() {
 
     let disambiguated = home.run(&["kj", "--as", "amy", "--", "character", "list"]);
     assert!(disambiguated.status.success(), "--as amy must resolve the caller: {}", stderr(&disambiguated));
+}
+
+/// `kj drive` returns once the turn is admitted (`kj/drive.rs`), but the
+/// offline runner's `settle` must not reach `shutdown_runtime_worker` — which
+/// hard-interrupts every admitted turn (`runtime/turn_request.rs`) — until
+/// the turn itself has finished. A mock backend replays a canned response as
+/// a well-formed text stream with no script directory needed, so the turn
+/// completes on its own and leaves a done model block behind.
+#[test]
+fn drive_offline_holds_the_command_until_the_turn_completes() {
+    let home = Home::new();
+    home.bootstrap("amy");
+    common::seed_mock_backend_with_model(&home.kernel_dir(), "mock-model");
+
+    let bob = home.run(&["kj", "--", "character", "create", "bob"]);
+    assert!(bob.status.success(), "{}", stderr(&bob));
+
+    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+
+    let drive = home.run(&["kj", "--", "drive", "lane", "--prompt", "hi"]);
+    assert!(drive.status.success(), "kj drive failed: {}", stderr(&drive));
+
+    let list = home.run(&["kj", "--", "block", "list", "-c", "lane"]);
+    assert!(list.status.success(), "kj block list failed: {}", stderr(&list));
+    let out = stdout(&list);
+    assert!(
+        out.contains("model/") && out.contains("[done]"),
+        "kj drive must hold the command until the turn ends, leaving a done model block: {out}"
+    );
+}
+
+/// `kj ledger allow|deny` would record a durable answer with no delivery
+/// worker running to act on it offline, and the next serving boot retires
+/// the ask unexecuted (`approval_resume.rs`, `recover_unpublished_pairs`).
+/// Both are refused before the kernel ever boots — on a fresh, unbootstrapped
+/// `$HOME` so a database appearing at all would be the failure.
+#[test]
+fn ledger_allow_and_deny_are_refused_before_boot() {
+    let home = Home::new();
+
+    for verb in ["allow", "deny"] {
+        let out = home.run(&["kj", "--", "ledger", verb, "01a0-does-not-exist"]);
+        assert!(!out.status.success(), "kj ledger {verb} must refuse offline");
+        let message = stderr(&out);
+        assert!(
+            message.contains("running kernel") && message.contains("SSH"),
+            "kj ledger {verb} must say asks are answered on the running kernel over SSH: {message}"
+        );
+    }
+    assert!(
+        !home.kernel_db_path().exists(),
+        "a refused ledger answer must never open kernel.db: {}",
+        home.kernel_db_path().display()
+    );
+}
+
+/// `--as <name>` must refuse a retired root by name: `character retire`
+/// stamps `retired_at`, and a retired character's own turn is over, not just
+/// its context work.
+#[test]
+fn as_refuses_a_retired_root_by_name() {
+    let home = Home::new();
+    home.bootstrap("amy");
+
+    let carol = home.run(&["kj", "--", "character", "create", "carol", "--root"]);
+    assert!(carol.status.success(), "{}", stderr(&carol));
+
+    let retire = home.run(&["kj", "--as", "amy", "--", "character", "retire", "carol", "--confirm"]);
+    assert!(retire.status.success(), "kj character retire failed: {}", stderr(&retire));
+
+    let out = home.run(&["kj", "--as", "carol", "--", "character", "list"]);
+    assert!(!out.status.success(), "--as must refuse a retired root");
+    assert!(stderr(&out).contains("retired"), "{}", stderr(&out));
+}
+
+/// `--as <name>` must refuse a name that resolves to a live but non-root
+/// character, the same way it refuses one that does not exist.
+#[test]
+fn as_refuses_a_non_root_character() {
+    let home = Home::new();
+    home.bootstrap("amy");
+
+    let bob = home.run(&["kj", "--", "character", "create", "bob"]);
+    assert!(bob.status.success(), "{}", stderr(&bob));
+
+    let out = home.run(&["kj", "--as", "bob", "--", "character", "list"]);
+    assert!(!out.status.success(), "--as must refuse a non-root character");
+    assert!(stderr(&out).contains("not a root character"), "{}", stderr(&out));
+}
+
+/// A second `kj` invocation started right after the first exits must succeed:
+/// the lock is released and the WAL is checkpointed before the process
+/// exits, not sometime later.
+#[test]
+fn a_second_kj_invocation_right_after_the_first_succeeds() {
+    let home = Home::new();
+    home.bootstrap("amy");
+
+    let first = home.run(&["kj", "--", "character", "create", "bob"]);
+    assert!(first.status.success(), "first kj invocation failed: {}", stderr(&first));
+
+    let second = home.run(&["kj", "--", "character", "list"]);
+    assert!(
+        second.status.success(),
+        "a second kj right after the first must succeed (lock/WAL not released?): {}",
+        stderr(&second)
+    );
+    assert!(stdout(&second).contains("bob"), "{}", stdout(&second));
+}
+
+/// A Destroy verb dispatched with no `--confirm` hits `kj`'s own confirmation
+/// gate (`KjResult::Latch`), not the approval ledger, and exits 2 — the same
+/// code the kaish `kj` builtin uses for the same case.
+#[test]
+fn a_destroy_verb_without_confirm_exits_2() {
+    let home = Home::new();
+    home.bootstrap("amy");
+
+    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder"]);
+    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+
+    let archive = home.run(&["kj", "--", "context", "archive", "lane"]);
+    assert_eq!(
+        archive.status.code(),
+        Some(2),
+        "a Destroy verb with no --confirm must exit 2: {}",
+        stderr(&archive)
+    );
+    assert!(stderr(&archive).contains("--confirm"), "{}", stderr(&archive));
 }
