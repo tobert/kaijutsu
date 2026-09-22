@@ -75,14 +75,14 @@ fn resolve_context_label_reports_concluded_state() {
     });
 }
 
-/// Start a second `SshServer` on a fresh ephemeral port, pointed at the same
-/// on-disk `state_dir` as an existing one. The prior server is left running
-/// but is never contacted again — functionally equivalent to a kernel
-/// restart from the new server's perspective, since `create_shared_kernel`
+/// Stop `first` and start a second `SshServer` on a fresh ephemeral port
+/// over the same on-disk `state_dir`: a kernel restart. `create_shared_kernel`
 /// builds every in-memory structure (the DriftRouter chief among them) from
 /// scratch on every call, while KernelDb/BlockStore reopen the same durable
-/// files.
-async fn simulate_kernel_restart(state_dir: std::path::PathBuf) -> std::net::SocketAddr {
+/// files. The first server must be gone first: one kernel per data directory
+/// (`docs/server-cli.md`).
+async fn simulate_kernel_restart(first: StateDirServer, state_dir: std::path::PathBuf) -> std::net::SocketAddr {
+    first.stop().await;
     start_server_with_state_dir(state_dir).await
 }
 
@@ -97,8 +97,9 @@ fn list_contexts_recovers_live_context_after_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().to_path_buf();
 
+        let server = start_state_dir_server(state_dir.clone()).await;
         let (context_id, label) = {
-            let addr = start_server_with_state_dir(state_dir.clone()).await;
+            let addr = server.addr;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let label = "restart-recovery-test".to_string();
@@ -106,7 +107,7 @@ fn list_contexts_recovers_live_context_after_restart() {
             (context_id, label)
         };
 
-        let addr2 = simulate_kernel_restart(state_dir).await;
+        let addr2 = simulate_kernel_restart(server, state_dir).await;
         let client2 = connect_client(addr2).await;
         let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();
 
@@ -135,8 +136,9 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().to_path_buf();
 
+        let server = start_state_dir_server(state_dir.clone()).await;
         let (context_id, label) = {
-            let addr = start_server_with_state_dir(state_dir.clone()).await;
+            let addr = server.addr;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let label = "restart-heal-archived-test".to_string();
@@ -149,7 +151,7 @@ fn join_context_heals_registry_for_an_archived_context_after_restart() {
             (context_id, label)
         };
 
-        let addr2 = simulate_kernel_restart(state_dir).await;
+        let addr2 = simulate_kernel_restart(server, state_dir).await;
         let client2 = connect_client(addr2).await;
         let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();
 
@@ -213,8 +215,9 @@ fn join_context_heals_an_archived_context_whose_label_a_live_context_holds() {
         let state_dir = tmp.path().to_path_buf();
         let label = "restart-heal-reused-label-test".to_string();
 
+        let server = start_state_dir_server(state_dir.clone()).await;
         let (archived_id, live_id) = {
-            let addr = start_server_with_state_dir(state_dir.clone()).await;
+            let addr = server.addr;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let archived_id = create_context(&kernel, &label).await.unwrap();
@@ -226,7 +229,7 @@ fn join_context_heals_an_archived_context_whose_label_a_live_context_holds() {
             (archived_id, live_id)
         };
 
-        let addr2 = simulate_kernel_restart(state_dir).await;
+        let addr2 = simulate_kernel_restart(server, state_dir).await;
         let client2 = connect_client(addr2).await;
         let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();
 

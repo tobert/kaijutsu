@@ -579,6 +579,15 @@ impl SshServer {
             ..Default::default()
         };
 
+        // One kernel per data directory (`docs/server-cli.md`): held for the
+        // life of this function, which returns only at server shutdown.
+        // `kaijutsu-server kj` takes the same lock before it boots, so the
+        // two never run rc and own the worker pool over one `kernel.db` at
+        // once.
+        let data_dir = crate::offline::resolve_data_dir(self.config.data_dir.as_deref());
+        let _kernel_lock = crate::offline::KernelLock::acquire(&data_dir)
+            .map_err(std::io::Error::other)?;
+
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
         let shared_kernel = crate::rpc::create_shared_kernel(

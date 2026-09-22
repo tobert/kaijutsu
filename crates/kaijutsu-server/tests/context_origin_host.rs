@@ -204,8 +204,9 @@ fn origin_host_survives_a_kernel_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().to_path_buf();
 
+        let server = start_state_dir_server(state_dir.clone()).await;
         let context_id = {
-            let addr = start_server_with_state_dir(state_dir.clone()).await;
+            let addr = server.addr;
             let client = connect_client(addr).await;
             let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
             let context_id = create_context(&kernel, "origin-host-restart-test").await.unwrap();
@@ -213,6 +214,7 @@ fn origin_host_survives_a_kernel_restart() {
             context_id
         };
 
+        server.stop().await;
         let addr2 = start_server_with_state_dir(state_dir).await;
         let client2 = connect_client(addr2).await;
         let (kernel2, _kernel_id2) = client2.bind_kernel().await.unwrap();

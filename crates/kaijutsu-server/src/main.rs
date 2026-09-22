@@ -1,122 +1,164 @@
 //! Kaijutsu server binary
 //!
-//! SSH + Cap'n Proto RPC server for kaijutsu.
-//!
-//! ## Usage
-//!
-//! ```bash
-//! # Run the server (default)
-//! kaijutsu-server [port]
-//!
-//! # Key management — auth.db is a keyring: it binds a fingerprint to a
-//! # principal id and carries no name (docs/character.md, "auth.db is a
-//! # keyring"). `kj character create <name>` mints the principal id first.
-//! kaijutsu-server add-key <pubkey-file> --as <character> [--rebind]
-//! kaijutsu-server list-keys
-//!
-//! # Lockout recovery — reads kernel.db read-only, works with the service
-//! # stopped, needs no connection or authentication.
-//! kaijutsu-server list-characters
-//!
-//! # One-time upgrade of a pre-melt auth.db: harvest its usernames into
-//! # kernel.db as characters, then drop the columns that held them. Run
-//! # once, deliberately, with the service stopped. No-op if already melted.
-//! kaijutsu-server migrate-keyring
-//!
-//! # rc scripts (no running kernel needed)
-//! kaijutsu-server rc reseed [--force] [--dir <path>]
-//!
-//! `rc reseed` installs anything absent and NAMES anything present that
-//! differs from its embedded default, leaving it alone; `--force` overwrites
-//! those instead.
-//! ```
+//! SSH + Cap'n Proto RPC server for kaijutsu. `kaijutsu-server --help` and
+//! `kaijutsu-server kj --help` are the published reference; `docs/server-cli.md`
+//! explains the offline `kj` runner in full.
 
-use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::{Args, Parser, Subcommand};
 use kaijutsu_kernel::kernel_db::KernelDb;
 use kaijutsu_server::config_mounts::ConfigMounts;
 use kaijutsu_server::constants::DEFAULT_SSH_PORT;
+use kaijutsu_server::offline::{KjRunArgs, run_kj};
 use kaijutsu_server::rpc::kernel_data_dir;
 use kaijutsu_server::{AuthDb, SshServer, SshServerConfig};
 use russh::keys::ssh_key::{self, HashAlg};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-fn print_usage() {
-    eprintln!(
-        r#"kaijutsu-server - SSH + Cap'n Proto server for kaijutsu
-
-USAGE:
-    kaijutsu-server [OPTIONS] [COMMAND]
-
-COMMANDS:
-    (default)                       Run the SSH server. Refuses to start
-                                    until init has created a root character.
-    init --as <name> --key <file>   Create the kernel's root character and
-                                    bind its public key. Run once, with the
-                                    service stopped, before the first start.
-    add-key <file> --as <name>      Bind a public key to an existing character.
-                                    Refuses an already-bound fingerprint; pass
-                                    --rebind to move it instead.
-    list-keys                       List every bound fingerprint.
-    list-characters                 List characters from kernel.db, read-only.
-                                    Works with the service stopped — the
-                                    lockout-recovery path.
-    migrate-keyring                 One-time upgrade of a pre-melt auth.db:
-                                    harvest its usernames into kernel.db as
-                                    characters, then drop the columns that
-                                    held them. No-op if already melted.
-    rc reseed [--force] [--dir D]   Install embedded rc scripts into the rc tree.
-                                    Names any script that differs from its
-                                    default and leaves it alone; --force
-                                    overwrites those.
-
-OPTIONS:
-    --config-root <DIR>           Where the /config trees live
-                                  (default: ~/.config/kaijutsu/config).
-                                  Each tree is a subdirectory unless declared.
-    --mount <TREE>=<DIR>          Point one tree elsewhere, e.g.
-                                  --mount /config/rc=./assets/defaults/rc.
-                                  Beats <config-root>/mounts.toml.
-    --rw-mount <DIR>              Mount a host directory read-write at the
-                                  same path in the kernel, so file tools may
-                                  write there. Repeatable. This is a
-                                  workspace, not a /config tree.
-    --port <PORT>                 SSH port (default: {port})
-    --as <NAME>                   add-key: the character to bind the key to.
-    --rebind                      add-key: move an already-bound key instead
-                                  of refusing.
-    --help, -h                    Show this help
-
-EXAMPLES:
-    kaijutsu-server                                    # Run server on port {port}
-    kaijutsu-server --port 2222                        # Run server on port 2222
-    kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub   # before the first start
-    kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind
-    kaijutsu-server list-keys
-    kaijutsu-server list-characters
-    kaijutsu-server migrate-keyring                    # one-time, pre-melt auth.db only
-    kaijutsu-server rc reseed                          # install anything missing, name what differs
-    kaijutsu-server rc reseed --force                  # also overwrite what differs
-    kaijutsu-server rc reseed --dir ./rc                # seed a directory of your choosing
-
-DATABASES:
-    Keys are stored in:       {auth_db_path}
-    Characters live in:       {kernel_db_path}
-"#,
-        port = DEFAULT_SSH_PORT,
-        auth_db_path = AuthDb::default_path().display(),
-        kernel_db_path = default_kernel_db_path().display(),
-    );
+#[derive(Parser)]
+#[command(
+    name = "kaijutsu-server",
+    about = "SSH + Cap'n Proto server for kaijutsu",
+    long_about = "With no subcommand, runs the SSH server. It refuses to start until \
+        `init` has created a root character.",
+    after_help = "EXAMPLES:\n    \
+        kaijutsu-server                                              run on the default port\n    \
+        kaijutsu-server --port 2222                                  run on port 2222\n    \
+        kaijutsu-server init --as amy --key ~/.ssh/id_ed25519.pub    before the first start\n    \
+        kaijutsu-server add-key ~/.ssh/id_ed25519.pub --as amy --rebind\n    \
+        kaijutsu-server list-keys\n    \
+        kaijutsu-server list-characters\n    \
+        kaijutsu-server rc reseed                                    install anything missing\n    \
+        kaijutsu-server kj -- character create bob --root\n    \
+        kaijutsu-server kj --as amy -- context create banto --type director --as banto\n\n\
+        DATABASES:\n    \
+        Keys live in <data-home>/kaijutsu/auth.db\n    \
+        Characters live in <data-home>/kaijutsu/kernel/kernel.db\n    \
+        <data-home> is $XDG_DATA_HOME, or ~/.local/share when unset."
+)]
+struct Cli {
+    #[command(flatten)]
+    paths: PathArgs,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-/// The default `kernel.db` path — same default the running server's own
-/// bootstrap uses (`kaijutsu_server::rpc::kernel_data_dir`), so `add-key
-/// --as` and `list-characters` resolve a name against the exact file a live
-/// server would.
-fn default_kernel_db_path() -> PathBuf {
-    kernel_data_dir().join("kernel.db")
+/// Flags every subcommand shares: where the `/config` trees and read-write
+/// workspaces come from, and the port the serving default binds. May appear
+/// before or after a subcommand name.
+#[derive(Args)]
+struct PathArgs {
+    /// Where the /config trees live. Each tree is a subdirectory unless
+    /// pointed elsewhere by --mount or <config-root>/mounts.toml. Default:
+    /// $XDG_CONFIG_HOME/kaijutsu/config, or ~/.config/kaijutsu/config when
+    /// XDG_CONFIG_HOME is unset.
+    #[arg(long, global = true, value_name = "DIR")]
+    config_root: Option<PathBuf>,
+
+    /// Point one /config tree at a host directory, e.g.
+    /// --mount /config/rc=./assets/defaults/rc. Repeatable. Beats
+    /// <config-root>/mounts.toml for that tree.
+    #[arg(long, global = true, value_name = "TREE=DIR")]
+    mount: Vec<String>,
+
+    /// Mount a host directory read-write at the same path in the kernel, so
+    /// file tools may write there. Repeatable. This is a workspace, not a
+    /// /config tree.
+    #[arg(long, global = true, value_name = "DIR")]
+    rw_mount: Vec<PathBuf>,
+
+    /// SSH port for the serving default.
+    #[arg(long, global = true, default_value_t = DEFAULT_SSH_PORT)]
+    port: u16,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create the kernel's root character and bind its public key. Run once,
+    /// with the service stopped, before the first start.
+    Init {
+        /// The character to make root. Becomes a new character, or an
+        /// existing live one made root, keeping its principal id.
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: Option<String>,
+        /// The public key file to bind, in OpenSSH format.
+        #[arg(long, value_name = "FILE")]
+        key: Option<String>,
+    },
+    /// Bind a public key to an existing character. Never mints one — its
+    /// principal id must already exist (`kj character create <name>`).
+    AddKey {
+        /// The public key file to bind, in OpenSSH format.
+        pubkey_file: String,
+        /// The character to bind the key to.
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: String,
+        /// Move an already-bound key to this character instead of refusing.
+        #[arg(long)]
+        rebind: bool,
+    },
+    /// List every bound fingerprint.
+    ListKeys,
+    /// List characters from kernel.db, read-only. Works with the service
+    /// stopped — the lockout-recovery path.
+    ListCharacters,
+    /// One-time upgrade of a pre-melt auth.db: harvest its usernames into
+    /// kernel.db as characters, then drop the columns that held them. Run
+    /// once, with the service stopped. No-op if already melted.
+    MigrateKeyring,
+    /// rc scripts. No running kernel needed.
+    Rc {
+        #[command(subcommand)]
+        command: RcCommand,
+    },
+    /// Run one kj verb against a stopped kernel: boots the same kernel the
+    /// service boots, minus serving, dispatches the verb as the named root
+    /// character, prints the result, settles the kernel, and exits. A verb
+    /// that admits a model turn (`kj drive`) holds the command until the
+    /// turn ends.
+    Kj(KjCliArgs),
+}
+
+#[derive(Subcommand)]
+enum RcCommand {
+    /// Install the embedded rc scripts into the rc tree. Installs anything
+    /// absent and names anything present that differs from its embedded
+    /// default, leaving it alone; --force overwrites those instead.
+    Reseed {
+        /// Also overwrite files that differ from their embedded default.
+        #[arg(long, short = 'f')]
+        force: bool,
+        /// Seed this directory instead of the /config/rc tree the path
+        /// flags would otherwise resolve.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Args)]
+struct KjCliArgs {
+    /// The root character to act as. Required and refused with the full
+    /// list when more than one live root character exists; omit when there
+    /// is exactly one.
+    #[arg(long = "as", value_name = "NAME")]
+    as_character: Option<String>,
+
+    /// Run the verb from another context instead of the caller's root
+    /// context — '.', a label, or a hex id prefix, the way `kj` resolves a
+    /// context reference anywhere else.
+    #[arg(long, value_name = "CONTEXT")]
+    context: Option<String>,
+
+    /// Print the result's structured data as JSON instead of its message.
+    #[arg(long)]
+    json: bool,
+
+    /// The kj verb and its arguments, exactly as at a kj prompt — for
+    /// example `character create bob --root`. Must follow `--`.
+    #[arg(last = true, required = true, value_name = "ARGV")]
+    argv: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -125,7 +167,8 @@ fn main() -> ExitCode {
     // runs on this runtime (`run_server` → `SshServer::run` →
     // `create_shared_kernel`, `rpc.rs`) — the same class of overflow
     // `spawn_kaish_thread`'s dedicated threads exist to avoid. Size every
-    // worker thread the same way.
+    // worker thread the same way. `kj` boots the same way boot does, on
+    // this same runtime.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("kaijutsu-server-worker")
         .thread_stack_size(kaijutsu_kernel::KAISH_RC_THREAD_STACK)
@@ -151,122 +194,55 @@ async fn async_main() -> ExitCode {
         None
     };
 
-    let args: Vec<String> = env::args().collect();
+    let cli = Cli::parse();
+    let PathArgs { config_root, mount, rw_mount, port } = cli.paths;
 
-    // Parse command
-    if args.len() < 2 {
-        return run_server(DEFAULT_SSH_PORT, ServerPaths::default()).await;
-    }
-
-    // Server-shaped flags may appear in any order and are consumed before the
-    // subcommand match, so `--mount X=Y --port 2222` and `--port 2222 --mount
-    // X=Y` mean the same thing.
-    let (args, server_paths) = match ServerPaths::take_from(&args) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
+    match cli.command {
+        None => run_server(port, config_root, mount, rw_mount).await,
+        Some(Command::Init { as_name, key }) => cmd_init(as_name, key),
+        Some(Command::AddKey { pubkey_file, as_name, rebind }) => {
+            cmd_add_key(pubkey_file, as_name, rebind)
         }
-    };
-    if args.len() < 2 {
-        return run_server(DEFAULT_SSH_PORT, server_paths).await;
-    }
-
-    match args[1].as_str() {
-        "--help" | "-h" => {
-            print_usage();
-            ExitCode::SUCCESS
+        Some(Command::ListKeys) => cmd_list_keys(),
+        Some(Command::ListCharacters) => cmd_list_characters(),
+        Some(Command::MigrateKeyring) => cmd_migrate_keyring(),
+        Some(Command::Rc { command: RcCommand::Reseed { force, dir } }) => {
+            cmd_rc_reseed(force, dir, config_root, &mount)
         }
-        "--port" => {
-            let port = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_SSH_PORT);
-            run_server(port, server_paths).await
-        }
-        "init" => cmd_init(&args[2..]),
-        "add-key" => cmd_add_key(&args[2..]),
-        "list-keys" => cmd_list_keys(),
-        "list-characters" => cmd_list_characters(),
-        "migrate-keyring" => cmd_migrate_keyring(),
-        "rc" => cmd_rc(&args[2..], server_paths),
-        arg => {
-            // Try parsing as port number for backwards compatibility
-            if let Ok(port) = arg.parse::<u16>() {
-                return run_server(port, server_paths).await;
-            }
-            eprintln!("Unknown command: {}", arg);
-            print_usage();
-            ExitCode::FAILURE
-        }
+        Some(Command::Kj(args)) => cmd_kj(args, config_root, &mount, rw_mount).await,
     }
 }
 
-/// The path half of the command line: where every `/config` tree comes from
-/// (`--config-root` / `--mount`, `docs/config-namespace.md`) and which host
-/// directories the kernel mounts read-write (`--rw-mount`, `docs/mounts.md`).
-#[derive(Debug, Default)]
-struct ServerPaths {
-    root: Option<PathBuf>,
-    mounts: Vec<String>,
-    rw_mounts: Vec<PathBuf>,
+/// The default `kernel.db` path — same default the running server's own
+/// bootstrap uses (`kaijutsu_server::rpc::kernel_data_dir`), so `add-key
+/// --as` and `list-characters` resolve a name against the exact file a live
+/// server would.
+fn default_kernel_db_path() -> PathBuf {
+    kernel_data_dir().join("kernel.db")
 }
 
-impl ServerPaths {
-    /// Consume the path flags from `argv`, returning what is left plus what
-    /// was found. Flags are removed so the subcommand match below sees only
-    /// its own arguments.
-    fn take_from(args: &[String]) -> Result<(Vec<String>, Self), String> {
-        let mut out = Vec::with_capacity(args.len());
-        let mut me = Self::default();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--config-root" => {
-                    let v = args
-                        .get(i + 1)
-                        .ok_or("--config-root needs a directory")?;
-                    me.root = Some(PathBuf::from(v));
-                    i += 2;
-                }
-                "--mount" => {
-                    let v = args.get(i + 1).ok_or("--mount needs <tree>=<dir>")?;
-                    me.mounts.push(v.clone());
-                    i += 2;
-                }
-                "--rw-mount" => {
-                    let v = args.get(i + 1).ok_or("--rw-mount needs a directory")?;
-                    me.rw_mounts.push(PathBuf::from(v));
-                    i += 2;
-                }
-                other => {
-                    out.push(other.to_string());
-                    i += 1;
-                }
-            }
-        }
-        Ok((out, me))
+/// Resolve the mount registry the path flags describe: `--config-root`
+/// (falling back to the XDG default), then `<config-root>/mounts.toml`, then
+/// `--mount` flags, each beating the last.
+fn into_mounts(config_root: Option<PathBuf>, mount: &[String]) -> Result<ConfigMounts, String> {
+    let mut mounts = ConfigMounts::new(config_root.unwrap_or_else(ConfigMounts::default_root));
+    mounts.load_declarations()?;
+    for arg in mount {
+        mounts.set_from_arg(arg)?;
     }
-
-    /// Resolve to a registry: the root, then `mounts.toml` inside it, then the
-    /// `--mount` flags, each beating the last.
-    fn into_mounts(self) -> Result<ConfigMounts, String> {
-        let mut mounts =
-            ConfigMounts::new(self.root.unwrap_or_else(ConfigMounts::default_root));
-        mounts.load_declarations()?;
-        for arg in &self.mounts {
-            mounts.set_from_arg(arg)?;
-        }
-        Ok(mounts)
-    }
+    Ok(mounts)
 }
 
-async fn run_server(port: u16, mut paths: ServerPaths) -> ExitCode {
-    let rw_mounts = std::mem::take(&mut paths.rw_mounts);
+async fn run_server(
+    port: u16,
+    config_root: Option<PathBuf>,
+    mount: Vec<String>,
+    rw_mount: Vec<PathBuf>,
+) -> ExitCode {
     // Resolve the config mounts BEFORE announcing a start. A bad declaration
     // is a refusal to boot, and saying "Starting..." first would report a
     // server that came up and died rather than one that never began.
-    let mounts = match paths.into_mounts() {
+    let mounts = match into_mounts(config_root, &mount) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("config mounts: {e}");
@@ -277,7 +253,7 @@ async fn run_server(port: u16, mut paths: ServerPaths) -> ExitCode {
     tracing::info!("Starting kaijutsu server on SSH port {}...", port);
     let mut config = SshServerConfig::production(port);
     config.config_mounts = mounts;
-    config.rw_mounts = rw_mounts;
+    config.rw_mounts = rw_mount;
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {
@@ -294,42 +270,17 @@ async fn run_server(port: u16, mut paths: ServerPaths) -> ExitCode {
 /// capability, and nothing to approve. That is the point — it is what you run
 /// before starting the kernel, and it cannot be blocked by the kernel it is
 /// about to configure.
-fn cmd_rc(args: &[String], server_paths: ServerPaths) -> ExitCode {
-    let Some(sub) = args.first().map(String::as_str) else {
-        eprintln!("Usage: kaijutsu-server rc reseed [--force] [--dir <path>]");
-        return ExitCode::FAILURE;
-    };
-    if sub != "reseed" {
-        eprintln!("Unknown rc subcommand: {sub}");
-        eprintln!("Usage: kaijutsu-server rc reseed [--force] [--dir <path>]");
-        return ExitCode::FAILURE;
-    }
-
-    let mut force = false;
-    let mut dir: Option<PathBuf> = None;
-    let mut rest = args[1..].iter();
-    while let Some(a) = rest.next() {
-        match a.as_str() {
-            "--force" | "-f" => force = true,
-            "--dir" => match rest.next() {
-                Some(d) => dir = Some(PathBuf::from(d)),
-                None => {
-                    eprintln!("--dir needs a path");
-                    return ExitCode::FAILURE;
-                }
-            },
-            other => {
-                eprintln!("Unknown option: {other}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
+fn cmd_rc_reseed(
+    force: bool,
+    dir: Option<PathBuf>,
+    config_root: Option<PathBuf>,
+    mount: &[String],
+) -> ExitCode {
     // Without `--dir`, reseed the rc tree the server itself would mount from
     // `--config-root`/`--mount` (`docs/config-namespace.md`).
     let root = match dir {
         Some(dir) => dir,
-        None => match server_paths.into_mounts() {
+        None => match into_mounts(config_root, mount) {
             Ok(mounts) => mounts.host_dir(kaijutsu_types::paths::RC_ROOT),
             Err(e) => {
                 eprintln!("config mounts: {e}");
@@ -370,36 +321,13 @@ fn cmd_rc(args: &[String], server_paths: ServerPaths) -> ExitCode {
 
 const INIT_USAGE: &str = "Usage: kaijutsu-server init --as <name> --key <pubkey-file>";
 
-/// Parse `init --as <name> --key <pubkey-file>`.
-fn parse_init_args(args: &[String]) -> Result<(String, String), String> {
-    let mut name = None;
-    let mut key_file = None;
-    let mut i = 0;
-    while i < args.len() {
-        let slot = match args[i].as_str() {
-            "--as" => &mut name,
-            "--key" => &mut key_file,
-            other => return Err(format!("Unknown option: {other}\n{INIT_USAGE}")),
-        };
-        let Some(value) = args.get(i + 1) else {
-            return Err(format!("{} requires a value\n{INIT_USAGE}", args[i]));
-        };
-        *slot = Some(value.clone());
-        i += 2;
-    }
-    match (name, key_file) {
-        (Some(name), Some(key_file)) => Ok((name, key_file)),
-        _ => Err(INIT_USAGE.to_string()),
-    }
-}
-
 /// Create the kernel's root character and bind its key
 /// (`kaijutsu_server::init`). Run with the service stopped.
-fn cmd_init(args: &[String]) -> ExitCode {
-    let (name, key_file) = match parse_init_args(args) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!("{e}");
+fn cmd_init(as_name: Option<String>, key: Option<String>) -> ExitCode {
+    let (name, key_file) = match (as_name, key) {
+        (Some(name), Some(key_file)) => (name, key_file),
+        _ => {
+            eprintln!("{INIT_USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -455,60 +383,13 @@ fn cmd_init(args: &[String]) -> ExitCode {
     }
 }
 
-/// Parsed `add-key` arguments.
-struct AddKeyArgs {
-    key_file: String,
-    character: String,
-    rebind: bool,
-}
-
-fn parse_add_key_args(args: &[String]) -> Result<AddKeyArgs, String> {
-    if args.is_empty() {
-        return Err("Usage: kaijutsu-server add-key <pubkey-file> --as <character> [--rebind]".to_string());
-    }
-    let key_file = args[0].clone();
-    let mut character: Option<String> = None;
-    let mut rebind = false;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--as" => {
-                if i + 1 < args.len() {
-                    character = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    return Err("--as requires a character name".to_string());
-                }
-            }
-            "--rebind" => {
-                rebind = true;
-                i += 1;
-            }
-            other => return Err(format!("Unknown option: {other}")),
-        }
-    }
-
-    let character = character
-        .ok_or_else(|| "--as <character> is required — `kaijutsu-server list-characters` to see who exists".to_string())?;
-    Ok(AddKeyArgs { key_file, character, rebind })
-}
-
 /// Bind a public key to an existing character. Never mints: the character's
 /// principal id must already exist in `kernel.db` (`kj character create
 /// <name>`), and this only writes `auth.db`
 /// (`docs/character.md`, "Adding a key binds; it never mints").
-fn cmd_add_key(args: &[String]) -> ExitCode {
-    let parsed = match parse_add_key_args(args) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+fn cmd_add_key(key_file: String, character: String, rebind: bool) -> ExitCode {
     // Expand path (handle ~)
-    let key_path: PathBuf = shellexpand::tilde(&parsed.key_file).as_ref().into();
+    let key_path: PathBuf = shellexpand::tilde(&key_file).as_ref().into();
 
     // Read and parse the key
     let key_data = match std::fs::read_to_string(&key_path) {
@@ -544,12 +425,12 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let character = match kdb.get_character_by_name(&parsed.character) {
+    let character = match kdb.get_character_by_name(&character) {
         Ok(Some(row)) => row,
         Ok(None) => {
             eprintln!(
                 "No character named '{}' — `kaijutsu-server list-characters` to see who exists",
-                parsed.character
+                character
             );
             return ExitCode::FAILURE;
         }
@@ -578,7 +459,7 @@ fn cmd_add_key(args: &[String]) -> ExitCode {
     };
 
     if let Some(existing) = existing {
-        if !parsed.rebind {
+        if !rebind {
             // Never a silent move — name the current binding and point at
             // the escape hatch (`docs/character.md`, "`add-key` never
             // rebinds silently").
@@ -758,6 +639,33 @@ fn cmd_migrate_keyring() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Run one `kj` verb against a stopped kernel (`docs/server-cli.md`).
+async fn cmd_kj(
+    args: KjCliArgs,
+    config_root: Option<PathBuf>,
+    mount: &[String],
+    rw_mount: Vec<PathBuf>,
+) -> ExitCode {
+    let config_mounts = match into_mounts(config_root, mount) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config mounts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    run_kj(KjRunArgs {
+        config_dir: None,
+        config_mounts,
+        data_dir: None,
+        rw_mounts: rw_mount,
+        as_character: args.as_character,
+        context: args.context,
+        json: args.json,
+        argv: args.argv,
+    })
+    .await
 }
 
 /// Extract comment from an OpenSSH public key line

@@ -16,6 +16,13 @@ kaijutsu-telemetry.workspace = true
 kaijutsu-abc.workspace = true
 kaish-kernel.workspace = true
 toml.workspace = true
+clap.workspace = true
+
+# `KernelLock` (offline.rs) takes an exclusive `flock` on the data
+# directory. `libc` is already a direct dependency of several other crates
+# in this workspace (kaijutsu-cas, kaijutsu-client, kaijutsu-tui, …), so this
+# adds no new crate to the tree.
+libc = "0.2"
 
 # Audio render seam (docs/pcm.md) — AudioRef/AudioFormatHint on the wire.
 kaijutsu-audio.workspace = true

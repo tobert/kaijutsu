@@ -10,6 +10,7 @@ pub mod constants;
 pub mod context_feed;
 pub mod init;
 pub mod migrate_keyring;
+pub mod offline;
 pub mod rpc;
 pub mod sftp;
 pub mod share;

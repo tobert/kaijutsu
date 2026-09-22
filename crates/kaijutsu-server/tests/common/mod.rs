@@ -255,6 +255,32 @@ pub async fn start_server_with_mock_llm_model(default_model: &str) -> SocketAddr
 /// artifact dir should survive on failure.
 #[allow(dead_code)]
 pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> SocketAddr {
+    start_state_dir_server(state_dir).await.addr
+}
+
+/// A server running on a caller-supplied state directory, with the task that
+/// runs it. One kernel per data directory (`docs/server-cli.md`): a test
+/// that boots again over the same directory stops this one first, which
+/// releases its lock.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub struct StateDirServer {
+    pub addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StateDirServer {
+    /// Stop the server and wait until its task is gone.
+    #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+/// [`start_server_with_state_dir`], handing back the running server so the
+/// caller can stop it.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub async fn start_state_dir_server(state_dir: std::path::PathBuf) -> StateDirServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -293,7 +319,7 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
     config.data_dir = Some(state_dir);
     config.auth_db_path = Some(auth_db_path);
 
-    tokio::task::spawn_local(async move {
+    let task = tokio::task::spawn_local(async move {
         let server = SshServer::new(config);
         if let Err(e) = server.run_on_listener(listener).await {
             log::error!("Server error: {}", e);
@@ -301,7 +327,7 @@ pub async fn start_server_with_state_dir(state_dir: std::path::PathBuf) -> Socke
     });
 
     tokio::task::yield_now().await;
-    addr
+    StateDirServer { addr, task }
 }
 
 /// Start a plain ephemeral server (like `start_server`), but also hand back
