@@ -115,8 +115,12 @@ enum ContextCommand {
         #[arg(long, short = 'n')]
         name: Option<String>,
         /// Parent context to fork the structural edge from
-        #[arg(long, short = 'p')]
+        #[arg(long, short = 'p', conflicts_with = "top")]
         parent: Option<String>,
+        /// Place the new context under the caller's lineage root instead of
+        /// its current context
+        #[arg(long)]
+        top: bool,
         /// Existing live character performing model work. The character
         /// responsible above the new context reviews it unless explicitly
         /// delegated
@@ -704,12 +708,14 @@ impl KjDispatcher {
                 label,
                 name,
                 parent,
+                top,
                 character,
                 config,
             } => {
                 self.context_create(
                     name.or(label).as_deref(),
                     parent.as_deref(),
+                    top,
                     character.as_deref(),
                     config.into(),
                     caller,
@@ -1381,6 +1387,7 @@ impl KjDispatcher {
         &self,
         label: Option<&str>,
         parent: Option<&str>,
+        top: bool,
         character: Option<&str>,
         mut cfg: ContextConfig,
         caller: &KjCaller,
@@ -1396,12 +1403,36 @@ impl KjDispatcher {
             }
         };
 
-        // Resolve --parent (default to root when absent / unresolvable-as-none).
-        let parent_id = {
+        // Resolve the parent: `--top` walks from the caller's current
+        // context to its lineage root (`docs/fork-and-create.md`, "Where a
+        // created context sits"); otherwise `--parent` names it explicitly,
+        // or it defaults to the caller's current context. Neither `--top`
+        // nor the default has anything to walk from when the caller has no
+        // current context, and a bare `--parent`-less create refuses rather
+        // than minting a stray root context — only `ensure_root_contexts`
+        // does that, at boot.
+        let parent_id = if top {
+            let current = match caller.require_context() {
+                Ok(id) => id,
+                Err(e) => return e,
+            };
+            let db = self.kernel_db().lock();
+            match db.lineage_root_context(current) {
+                Ok(id) => Some(id),
+                Err(e) => return KjResult::Err(format!("kj context create --top: {e}")),
+            }
+        } else {
             let db = self.kernel_db().lock();
             match super::refs::resolve_context_arg(parent, caller, &db) {
                 Ok(id) => Some(id),
-                Err(_) if parent.is_none() => None, // Default to root if no current context
+                Err(_) if parent.is_none() => {
+                    return KjResult::Err(
+                        "kj context create: no current context and no --parent given; \
+                         name one with --parent <context>, or --top for the caller's \
+                         lineage root"
+                            .to_string(),
+                    );
+                }
                 Err(e) => return KjResult::Err(format!("kj context create: {e}")),
             }
         };
@@ -3107,6 +3138,108 @@ mod tests {
         );
     }
 
+    /// With neither `--parent` nor `--top`, a created context's parent is
+    /// the caller's own current context (`docs/fork-and-create.md`, "Where
+    /// a created context sits").
+    #[tokio::test]
+    async fn context_create_defaults_parent_to_the_callers_current_context() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("default-parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("default-child")], &c)
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("default-child").unwrap().unwrap();
+        assert_eq!(child.forked_from, Some(parent));
+    }
+
+    /// `--top` places the new context directly under the caller's lineage
+    /// root — the first parentless ancestor of its current context — not
+    /// the current context itself.
+    #[tokio::test]
+    async fn context_create_top_lands_under_the_lineage_root() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let root = register_context(&d, Some("top-root"), None, principal);
+        let middle = register_context(&d, Some("top-middle"), Some(root), principal);
+        let leaf = register_context(&d, Some("top-leaf"), Some(middle), principal);
+        let c = caller_with_context(leaf);
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("top-child"), s("--top")], &c)
+            .await;
+        assert!(result.is_ok(), "{}", result.message());
+
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("top-child").unwrap().unwrap();
+        assert_eq!(
+            child.forked_from,
+            Some(root),
+            "--top must land under the lineage root, not the current context"
+        );
+    }
+
+    /// `--parent` and `--top` name the same thing two ways; clap refuses
+    /// both together rather than picking a winner.
+    #[tokio::test]
+    async fn context_create_parent_and_top_conflict() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("conflict-parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        let result = d
+            .dispatch(
+                &[
+                    s("context"),
+                    s("create"),
+                    s("conflict-child"),
+                    s("--parent"),
+                    s("conflict-parent"),
+                    s("--top"),
+                ],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "--parent and --top must conflict");
+        assert!(
+            result.message().contains("cannot be used with"),
+            "{}",
+            result.message()
+        );
+    }
+
+    /// A create with no current context and no `--parent`/`--top` refuses
+    /// instead of minting a stray root context — only `ensure_root_contexts`
+    /// does that, at boot.
+    #[tokio::test]
+    async fn context_create_refuses_with_no_context_and_no_parent() {
+        let d = test_dispatcher().await;
+        let caller = crate::kj::KjCaller {
+            context_id: None,
+            ..test_caller()
+        };
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("orphan")], &caller)
+            .await;
+        assert!(!result.is_ok(), "a parentless create must refuse");
+        assert!(
+            result.message().contains("--parent"),
+            "the refusal must name --parent: {}",
+            result.message()
+        );
+        assert!(
+            d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_context_create_reports_the_committed_context() {
         let d = test_dispatcher().await;
@@ -3790,8 +3923,9 @@ mod tests {
     #[tokio::test]
     async fn context_create_as_refuses_unknown_or_retired_without_mutation() {
         let d = test_dispatcher().await;
-        let mut caller = test_caller();
-        caller.context_id = None;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("as-refuses-parent"), None, principal);
+        let caller = caller_with_context(parent);
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: PrincipalId::new(), name: s("retired"), created_at: 1,
             retired_at: Some(2), handoff_ctx: None, root_ctx: None, root: false,
@@ -3913,7 +4047,8 @@ mod tests {
     async fn context_create_without_as_keeps_performer_unset() {
         let d = test_dispatcher().await;
         let mut caller = test_caller();
-        caller.context_id = None;
+        let parent = register_context(&d, Some("unset-performer-parent"), None, caller.principal_id);
+        caller.context_id = Some(parent);
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: caller.principal_id, name: s("requester"), created_at: 1,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
@@ -3933,12 +4068,14 @@ mod tests {
     async fn context_create_records_only_a_character_as_director() {
         let d = test_dispatcher().await;
         let mut characterless = test_caller();
-        characterless.context_id = None;
+        let characterless_parent = register_context(&d, Some("no-sheet-parent"), None, characterless.principal_id);
+        characterless.context_id = Some(characterless_parent);
         let result = d.dispatch(&[s("context"), s("create"), s("no-sheet")], &characterless).await;
         assert!(result.is_ok(), "{}", result.message());
 
         let mut character = test_caller();
-        character.context_id = None;
+        let character_parent = register_context(&d, Some("with-sheet-parent"), None, character.principal_id);
+        character.context_id = Some(character_parent);
         d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
             principal_id: character.actor_id, name: s("lead"), created_at: 1,
             retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
@@ -6470,7 +6607,6 @@ mod rebind_tests {
     //! saving, and aborting would destroy the Error blocks that explain the
     //! failure), so this verb has to be able to fix the result afterwards.
 
-    use crate::kj::KjCaller;
     use crate::kj::test_helpers::*;
     use kaijutsu_types::PrincipalId;
 
@@ -6616,13 +6752,9 @@ mod rebind_tests {
     #[tokio::test]
     async fn create_reports_a_context_its_rc_left_unbound() {
         let d = test_dispatcher().await;
-        // An unjoined caller: `create` without `--parent` then resolves the
-        // parent to None rather than the caller's fake context id (which would
-        // trip the `forked_from` foreign key).
-        let caller = KjCaller {
-            context_id: None,
-            ..test_caller()
-        };
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("unbound-parent"), None, principal);
+        let caller = caller_with_context(parent);
         // No rc scripts are installed here, so nothing binds the new context.
         let result = d
             .dispatch(&[s("context"), s("create"), s("fresh")], &caller)

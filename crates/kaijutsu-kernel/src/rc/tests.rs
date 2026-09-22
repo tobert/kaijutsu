@@ -105,7 +105,7 @@
                 expected.push(String::from_utf8(data).unwrap());
             }
             assert!(!expected.is_empty(), "{context_type} must exercise companion data");
-            let mut caller = unjoined_caller();
+            let mut caller = console_caller(&d);
             caller.actor_id = PrincipalId::new();
             d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
                 principal_id: caller.actor_id, name: "amy".into(), created_at: 0,
@@ -270,7 +270,7 @@
     #[tokio::test]
     async fn unknown_lifecycle_verb_is_an_error() {
         let d = test_dispatcher().await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let context = register_context(&d, Some("unknown-verb"), None, caller.principal_id);
         let admission = admit(&d, context);
         let result = crate::rc::run(
@@ -286,19 +286,22 @@
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Caller with no joined context — `kj context create` without
-    /// `--parent` resolves to `None` rather than the test caller's fake
-    /// id, avoiding a FK violation on the forked_from column.
-    /// Privileged so these rc-lifecycle tests can `kj context create` (now
-    /// Operator-gated) as the trusted bootstrap/control plane would. The
-    /// `context_id: None` models dispatching before a context is joined.
-    fn unjoined_caller() -> KjCaller {
+    /// Caller joined to a fresh parentless "console" context, registered
+    /// directly in the db (`register_context`) — the boot-time shape
+    /// `ensure_root_contexts` produces, not something `kj context create`
+    /// itself can mint: a create needs a parent, and only boot makes a
+    /// parentless context. `kj context create` from here lands as this
+    /// context's child. Privileged so these rc-lifecycle tests can `kj
+    /// context create` (now Operator-gated) as the trusted bootstrap/control
+    /// plane would.
+    fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
+        let console = register_context(d, None, None, principal_id);
         KjCaller {
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,
-            context_id: None,
+            context_id: Some(console),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
@@ -342,7 +345,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-prompt.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'You are a test context. Be terse.'"#).await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-md", "--type", "test"]), &caller)
             .await;
@@ -383,7 +386,7 @@
             .await
             .expect("create rc symlink");
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-link", "--type", "test"]), &caller)
             .await;
@@ -417,7 +420,7 @@
             .await
             .expect("create broken rc symlink");
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-broken-link", "--type", "test"]),
@@ -458,7 +461,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-kai", "--type", "test"]), &caller)
             .await;
@@ -481,7 +484,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-echo.kai", "echo \"hello from rc\"").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-echo", "--type", "test"]),
@@ -675,7 +678,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-echo-type.kai", "echo \"type=$KJ_CONTEXT_TYPE\"").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-type", "--type", "test"]), &caller)
             .await;
@@ -716,7 +719,7 @@
         install_rc_script_file(&d, "/config/rc/test/create/S00-color.kai", // A literal ESC byte in the script source — the classic
             // `[ OK ]`-in-green boot line, in miniature.
             "echo \"[ \u{1b}[32mOK\u{1b}[0m ] booted\"").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-color", "--type", "test"]), &caller)
             .await;
@@ -774,7 +777,7 @@
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-tick", "--type", "test"]), &caller)
             .await;
@@ -821,7 +824,7 @@
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-novars", "--type", "test"]), &caller)
             .await;
@@ -858,7 +861,7 @@
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"the beat goes on\"")
         .await;
 
-        let owner = unjoined_caller();
+        let owner = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-owned-kai", "--type", "test"]),
@@ -868,7 +871,7 @@
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-owned-kai");
 
-        let visitor = unjoined_caller();
+        let visitor = console_caller(&d);
         assert_ne!(
             owner.principal_id, visitor.principal_id,
             "fixture must use two distinct principals or the assertion is vacuous"
@@ -907,7 +910,7 @@
         install_rc_script_file(&d, "/config/rc/child/create/S00-noop.kai", "true")
         .await;
 
-        let mut caller = unjoined_caller();
+        let mut caller = console_caller(&d);
         let lead = PrincipalId::new();
         let coder = PrincipalId::new();
         for (principal_id, name) in [
@@ -969,7 +972,7 @@
         install_rc_script_file(&d, "/config/rc/test/tick/S01-fail.kai", "exit 3")
         .await;
 
-        let owner = unjoined_caller();
+        let owner = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-owned-fail", "--type", "test"]),
@@ -979,7 +982,7 @@
         assert!(result.is_ok(), "create failed: {}", result.message());
         let new_id = lookup_context_id(&d, "ctx-owned-fail");
 
-        let visitor = unjoined_caller();
+        let visitor = console_caller(&d);
         assert_ne!(owner.principal_id, visitor.principal_id);
 
         let admission = admit(&d, new_id);
@@ -1104,7 +1107,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-silent.kai", "true").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-silent", "--type", "test"]),
@@ -1130,7 +1133,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-echo.kai", "echo MODEL_MUST_NOT_SEE_THIS").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-hidden", "--type", "test"]),
@@ -1184,7 +1187,7 @@
         // timeout to exit 124 with a "timed out" message in stderr.
         install_rc_script_file(&d, "/config/rc/test/create/S00-slow.kai", "sleep 10").await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let started = std::time::Instant::now();
         let result = d
             .dispatch(
@@ -1250,7 +1253,7 @@
         // Script asserts overlay vars are populated and that `kj` is
         // callable. Exit 0 → no error block; non-zero → error block.
         install_rc_script_file(&d, "/config/rc/test/create/S00-introspect.kai", "[[ -n \"$KJ_CONTEXT\" ]] && [[ -n \"$KJ_VERB\" ]] && kj context list").await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-kj", "--type", "test"]),
@@ -1286,7 +1289,7 @@
             .mkdir(std::path::Path::new("/config/rc/nonexistent"), 0o755)
             .await
             .expect("an rc bucket with no verbs");
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-empty", "--type", "nonexistent"]),
@@ -1321,7 +1324,7 @@
         install_rc_script_file(&d, "/config/rc/counted/create/S00-one.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'first'"#).await;
         install_rc_script_file(&d, "/config/rc/counted/create/S10-two.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'second'"#).await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-counted", "--type", "counted"]),
@@ -1355,7 +1358,7 @@
         vfs.mkdir(std::path::Path::new("/config/rc/nothinghere/create"), 0o755)
             .await
             .expect("an empty create verb");
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-zero", "--type", "nothinghere"]),
@@ -1384,7 +1387,7 @@
         // installer, named so it is data rather than a script.
         install_rc_script_file(&d, "/config/rc/stray/create/guard.hook.kai", "exit 0").await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-stray", "--type", "stray"]),
@@ -1419,7 +1422,7 @@
         install_rc_script_file(&d, "/config/rc/inert/create/S00-real.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'the real script'"#).await;
         install_rc_script_file(&d, "/config/rc/inert/create/README.txt", "notes").await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-inert", "--type", "inert"]),
@@ -1447,7 +1450,7 @@
         install_rc_script_file(&d, "/config/rc/test/create/S00-fail.kai", "exit 17").await;
         install_rc_script_file(&d, "/config/rc/test/create/S10-after.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'ran-after-failure'"#).await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-mixed", "--type", "test"]), &caller)
             .await;
@@ -1534,7 +1537,7 @@
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'would-run'"#).await;
-        let mut caller = unjoined_caller();
+        let mut caller = console_caller(&d);
         caller.rc_depth = MAX_RC_DEPTH; // simulate already-deep invocation
 
         // Construct a fresh context manually via the dispatch path.
@@ -1765,7 +1768,7 @@ esac
         install_rc_script_file(&d, "/config/rc/test/fork/S00-fork.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'FORK-MARKER'"#).await;
         install_rc_script_file(&d, "/config/rc/test/drift/S00-drift.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'DRIFT-MARKER'"#).await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let r = d
             .dispatch(
                 &argv(&["context", "create", "parent", "--type", "test"]),
@@ -1865,7 +1868,7 @@ esac
 "#).await;
 
         // Parent context, typed "test" so the fork hook above fires.
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let r = d
             .dispatch(
                 &argv(&["context", "create", "parent", "--type", "test"]),
@@ -1944,7 +1947,7 @@ esac
 [[ -z "$KJ_PARENT_BLOCK_COUNT" ]] || exit 99
 "#).await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let r = d
             .dispatch(
                 &argv(&["context", "create", "solo", "--type", "test"]),
@@ -1970,7 +1973,7 @@ esac
         install_rc_script_file(&d, "/config/rc/test/fork/S00-only-fork.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'FORK-MARKER'"#).await;
 
         // Step 1: create parent (CREATE-MARKER appears in parent).
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         d.dispatch(&argv(&["context", "create", "parent", "--type", "test"]), &caller)
             .await;
         let parent_id = lookup_context_id(&d, "parent");
@@ -2184,7 +2187,7 @@ esac
         install_rc_script_file(&d, "/config/rc/test/create/S00-slow.kai", "sleep 1 && echo never-reached")
         .await;
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-default-kills", "--type", "test"]), &caller)
             .await;
@@ -2276,7 +2279,7 @@ esac
         // and the coder stance/binding/datetime scripts all call `kj`.
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let r = d
             .dispatch(
                 &argv(&["context", "create", "c1", "--type", "coder"]),
@@ -2343,7 +2346,7 @@ esac
         for context_type in ["coder", "director", "mcp", "default"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
-            let caller = unjoined_caller();
+            let caller = console_caller(&d);
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
@@ -2372,7 +2375,7 @@ esac
         for context_type in ["musician", "toolie"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
-            let caller = unjoined_caller();
+            let caller = console_caller(&d);
             let label = format!("c-{context_type}");
             let r = d
                 .dispatch(
@@ -2399,7 +2402,7 @@ esac
     async fn coder_fork_reseeds_datetime_notification() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let r = d
             .dispatch(
                 &argv(&["context", "create", "parent", "--type", "coder"]),
@@ -2466,7 +2469,7 @@ esac
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-fail.kai", "exit 9")
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-run-fail", "--type", "test"]),
@@ -2499,7 +2502,7 @@ esac
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true")
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-run-ok", "--type", "test"]),
@@ -2527,7 +2530,7 @@ esac
         .await;
         install_rc_script_file(&d, "/config/rc/test/create/S10-second.kai", "exit 5")
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-run-scripts", "--type", "test"]),
@@ -2571,7 +2574,7 @@ esac
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'would-run'"#)
         .await;
-        let mut caller = unjoined_caller();
+        let mut caller = console_caller(&d);
         caller.rc_depth = MAX_RC_DEPTH;
 
         let result = d
@@ -2605,7 +2608,7 @@ esac
             "not an rc script — just here to make the directory exist",
         )
         .await;
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(
                 &argv(&["context", "create", "ctx-run-empty", "--type", "emptytype"]),
@@ -2637,7 +2640,7 @@ esac
             )
             .await;
         }
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-order", "--type", "test"]), &caller)
             .await;
@@ -2689,7 +2692,7 @@ esac
             .await
             .expect("create rc symlink");
 
-        let caller = unjoined_caller();
+        let caller = console_caller(&d);
         let result = d
             .dispatch(&argv(&["context", "create", "ctx-link-id", "--type", "test"]), &caller)
             .await;
@@ -2751,7 +2754,7 @@ esac
                 let r = d
                     .dispatch(
                         &argv(&["context", "create", "wired-create", "--type", "test"]),
-                        &unjoined_caller(),
+                        &console_caller(&d),
                     )
                     .await;
                 assert!(r.is_ok(), "create failed: {}", r.message());
@@ -2773,7 +2776,7 @@ esac
             VERB_ATTACH => {
                 let target = register_context(&d, Some("wired-attach"), None, principal);
                 set_context_type(&d, target, "test");
-                let r = d.dispatch(&argv(&["attach", "wired-attach"]), &unjoined_caller()).await;
+                let r = d.dispatch(&argv(&["attach", "wired-attach"]), &console_caller(&d)).await;
                 assert!(matches!(r, crate::KjResult::Switch(..)), "attach failed: {}", r.message());
                 target
             }

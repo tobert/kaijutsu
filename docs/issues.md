@@ -940,21 +940,6 @@ prompt. Decide which side owns the block; a test that drives `request_turn`
 with a missing performer and counts `Status::Error` blocks pins it. Found by
 kaibo (DeepSeek) reviewing the performer-first change, 2026-09-22.
 
-## `kj fork --as` clones a template; `kj context create --as` casts a character
-
-`kj fork --as <AS_TEMPLATE>` clones a template context subtree
-(`kj/fork.rs`, `as_template`), while `kj context create --as <CHARACTER>` and
-`kj context set --as <CHARACTER>` cast a performer. A director told to "fork
-a coder --as coder" gets a template lookup, and a plain `kj fork` copies the
-parent's performer and context type (`fork_copies_played_by_from_source`,
-`inherit_parent_context_type`), so a fork from banto's seat is another
-director played by banto, never a coder. The director stance now says
-`kj context create <label> --type coder --as coder`. Decide whether `fork`
-gains `--type` and a character `--as` with the template flag renamed, or the
-stance and `docs/character.md` step 2 ("forks lanes ... each played by a
-coder character") change to say create. Found 2026-09-22 while making banto
-drive a coder.
-
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 
 From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`

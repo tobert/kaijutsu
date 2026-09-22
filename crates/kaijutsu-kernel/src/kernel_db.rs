@@ -2169,16 +2169,15 @@ impl KernelDb {
         }
     }
 
-    /// The root character at the top of `context_id`'s `forked_from`
-    /// chain: the responsible character of the parentless context the
-    /// chain ends at. It holds routing authority over every context in
-    /// that lineage (`docs/approval-identity.md`). A top with no
-    /// responsible character, a non-root, or a retired root refuses, and
-    /// a broken chain is the same corruption the reviewer walk refuses.
-    pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
+    /// Walk `forked_from` from `context_id` up to the first parentless
+    /// ancestor and return its row — the shared climb behind `lineage_root`
+    /// (character authority) and `lineage_root_context` (the context id
+    /// `--top` hangs a new context off of). A broken chain (a cycle, or a
+    /// parent pointer to a missing row) refuses rather than guessing.
+    fn lineage_top_row(&self, context_id: ContextId) -> KernelDbResult<ContextRow> {
         let mut current = context_id;
         let mut visited = HashSet::new();
-        let top = loop {
+        loop {
             if !visited.insert(current) {
                 return Err(KernelDbError::Validation(format!(
                     "context {} is its own ancestor; the context forest has a cycle",
@@ -2191,9 +2190,19 @@ impl KernelDb {
             )))?;
             match row.forked_from {
                 Some(parent) => current = parent,
-                None => break row,
+                None => return Ok(row),
             }
-        };
+        }
+    }
+
+    /// The root character at the top of `context_id`'s `forked_from`
+    /// chain: the responsible character of the parentless context the
+    /// chain ends at. It holds routing authority over every context in
+    /// that lineage (`docs/approval-identity.md`). A top with no
+    /// responsible character, a non-root, or a retired root refuses, and
+    /// a broken chain is the same corruption the reviewer walk refuses.
+    pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
+        let top = self.lineage_top_row(context_id)?;
         let responsible = top.played_by.or(top.director_id).ok_or_else(|| KernelDbError::Validation(format!(
             "context {} tops a lineage with no responsible character, so no root holds authority over it",
             top.context_id.short()
@@ -2213,6 +2222,14 @@ impl KernelDb {
                 top.context_id.short()
             ))),
         }
+    }
+
+    /// The context id at the top of `context_id`'s `forked_from` chain —
+    /// the root context `kj context create --top` places a new context
+    /// under. Unlike `lineage_root`, this names the top context itself and
+    /// requires nothing of its responsible character.
+    pub fn lineage_root_context(&self, context_id: ContextId) -> KernelDbResult<ContextId> {
+        Ok(self.lineage_top_row(context_id)?.context_id)
     }
 
     /// Walk the context forest from `context_id` up `forked_from` and
@@ -4651,36 +4668,6 @@ impl KernelDb {
         )?;
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
-            let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(25)?;
-            Ok((ctx, depth))
-        })?;
-        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
-    }
-
-    /// Snapshot a subtree rooted at `root_id` via structural edges.
-    /// Returns `(ContextRow, depth)`.
-    pub fn subtree_snapshot(&self, root_id: ContextId) -> KernelDbResult<Vec<(ContextRow, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE subtree(ctx_id, depth) AS (
-                SELECT ?1, 0
-                UNION ALL
-                SELECT e.target_id, subtree.depth + 1
-                FROM subtree
-                JOIN context_edges e ON e.source_id = subtree.ctx_id AND e.kind = 'structural'
-            )
-            SELECT c.context_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
-                   c.created_at, c.created_by, c.forked_from, c.fork_kind,
-                   c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
-                   c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
-                   c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id, subtree.depth
-            FROM subtree
-            JOIN contexts c ON c.context_id = subtree.ctx_id
-            ORDER BY subtree.depth, c.created_at",
-        )?;
-
-        let rows = stmt.query_map(params![blob_param(root_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
             let depth: i64 = row.get(25)?;
             Ok((ctx, depth))
@@ -8625,9 +8612,10 @@ mod tests {
             fork_kind_from_sql(Some("filtered".into())).unwrap(),
             Some(ForkKind::Filtered)
         );
-        // A retired ('shallow') or corrupt value must ERROR, never silently
-        // degrade to None — that would erase fork provenance.
+        // A retired ('shallow', 'subtree') or corrupt value must ERROR, never
+        // silently degrade to None — that would erase fork provenance.
         assert!(fork_kind_from_sql(Some("shallow".into())).is_err());
+        assert!(fork_kind_from_sql(Some("subtree".into())).is_err());
         assert!(fork_kind_from_sql(Some("garbage".into())).is_err());
     }
 
@@ -9005,7 +8993,7 @@ mod tests {
     }
 
     /// `list_active_contexts`/`list_all_contexts`/`structural_parents`/
-    /// `structural_children`/`context_dag`/`fork_lineage`/`subtree_snapshot`/
+    /// `structural_children`/`context_dag`/`fork_lineage`/
     /// `find_context_by_label` all share the same `contexts` column list —
     /// this exercises the two CTE-based reads (`context_dag`, whose SELECT
     /// appends `origin_host` BEFORE the extra `depth` column) to catch a
@@ -9903,41 +9891,6 @@ mod tests {
         assert_eq!(lineage[1].1, 1);
         assert_eq!(lineage[2].0.context_id, root.context_id);
         assert_eq!(lineage[2].1, 2);
-    }
-
-    // ── 6. Subtree snapshot ────────────────────────────────────────────
-
-    #[test]
-    fn subtree_snapshot() {
-        let db = KernelDb::temporary().unwrap();
-        let ws_id = setup_test_db(&db);
-
-        let parent = make_context_row(Some("template"));
-        insert_context_with_doc(&db, &parent, ws_id);
-
-        let c1 = make_context_row(Some("child1"));
-        insert_context_with_doc(&db, &c1, ws_id);
-        db.insert_edge(&make_edge(
-            parent.context_id,
-            c1.context_id,
-            EdgeKind::Structural,
-        ))
-        .unwrap();
-
-        let c2 = make_context_row(Some("child2"));
-        insert_context_with_doc(&db, &c2, ws_id);
-        db.insert_edge(&make_edge(
-            parent.context_id,
-            c2.context_id,
-            EdgeKind::Structural,
-        ))
-        .unwrap();
-
-        let snapshot = db.subtree_snapshot(parent.context_id).unwrap();
-        assert_eq!(snapshot.len(), 3);
-        assert_eq!(snapshot[0].1, 0); // parent at depth 0
-        assert_eq!(snapshot[1].1, 1); // child at depth 1
-        assert_eq!(snapshot[2].1, 1); // child at depth 1
     }
 
     // ── 7. Structural edge unique ──────────────────────────────────────
@@ -10917,6 +10870,40 @@ mod tests {
         assert!(db.lineage_root(root.context_id).unwrap_err().to_string().contains("retired"));
 
         assert!(matches!(db.lineage_root(ContextId::new()).unwrap_err(), KernelDbError::NotFound(_)));
+    }
+
+    /// `lineage_root_context` names the top context itself — the structural
+    /// root `kj context create --top` hangs a new context off of — and,
+    /// unlike `lineage_root`, asks nothing of the responsible character
+    /// there: a parentless context with no performer, an unretired
+    /// non-root, or nobody at all still names a top.
+    #[test]
+    fn lineage_root_context_names_the_top_regardless_of_its_character() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [banto, coder] = seed_characters(&db, &["banto", "coder"])[..] else { unreachable!() };
+
+        let mut seat = make_context_row(Some("unrooted-seat"));
+        seat.played_by = Some(banto);
+        insert_context_with_doc(&db, &seat, ws_id);
+        let mut lane = make_context_row(Some("unrooted-lane"));
+        lane.forked_from = Some(seat.context_id);
+        lane.played_by = Some(coder);
+        insert_context_with_doc(&db, &lane, ws_id);
+        // `lineage_root` refuses this same lineage (banto is not a root
+        // character); `lineage_root_context` still names the top.
+        assert!(db.lineage_root(lane.context_id).is_err());
+        assert_eq!(db.lineage_root_context(lane.context_id).unwrap(), seat.context_id);
+        assert_eq!(db.lineage_root_context(seat.context_id).unwrap(), seat.context_id, "a root names itself");
+
+        let bare = make_context_row(Some("nobody-top"));
+        insert_context_with_doc(&db, &bare, ws_id);
+        assert_eq!(db.lineage_root_context(bare.context_id).unwrap(), bare.context_id);
+
+        assert!(matches!(
+            db.lineage_root_context(ContextId::new()).unwrap_err(),
+            KernelDbError::NotFound(_)
+        ));
     }
 
     /// A retired responsible character on an ancestor refuses, naming it,

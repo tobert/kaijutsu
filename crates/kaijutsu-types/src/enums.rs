@@ -27,8 +27,6 @@ pub enum ForkKind {
     Filtered,
     /// Fork from a compaction boundary.
     Compact,
-    /// Fork of a subtree (subset of parent's blocks).
-    Subtree,
 }
 
 impl ForkKind {
@@ -37,7 +35,6 @@ impl ForkKind {
             Self::Full => "full",
             Self::Filtered => "filtered",
             Self::Compact => "compact",
-            Self::Subtree => "subtree",
         }
     }
 }
@@ -239,12 +236,7 @@ mod tests {
 
     #[test]
     fn fork_kind_as_str_roundtrip() {
-        for kind in [
-            ForkKind::Full,
-            ForkKind::Filtered,
-            ForkKind::Compact,
-            ForkKind::Subtree,
-        ] {
+        for kind in [ForkKind::Full, ForkKind::Filtered, ForkKind::Compact] {
             let s = kind.as_str();
             let parsed = ForkKind::from_str(s).unwrap();
             assert_eq!(kind, parsed);
@@ -262,13 +254,14 @@ mod tests {
         // No silent fallback — an unknown kind must fail to parse so the codec
         // layer can crash rather than erase provenance.
         assert!(ForkKind::from_str("shallow").is_err(), "retired variant must not parse");
+        assert!(ForkKind::from_str("subtree").is_err(), "retired variant must not parse");
         assert!(ForkKind::from_str("bogus").is_err());
     }
 
     #[test]
     fn fork_kind_display() {
         assert_eq!(format!("{}", ForkKind::Full), "full");
-        assert_eq!(format!("{}", ForkKind::Subtree), "subtree");
+        assert_eq!(format!("{}", ForkKind::Compact), "compact");
     }
 
     #[test]
@@ -282,12 +275,7 @@ mod tests {
 
     #[test]
     fn fork_kind_cbor_roundtrip() {
-        for kind in [
-            ForkKind::Full,
-            ForkKind::Filtered,
-            ForkKind::Compact,
-            ForkKind::Subtree,
-        ] {
+        for kind in [ForkKind::Full, ForkKind::Filtered, ForkKind::Compact] {
             let bytes = crate::codec::encode(&kind).unwrap();
             let parsed: ForkKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);

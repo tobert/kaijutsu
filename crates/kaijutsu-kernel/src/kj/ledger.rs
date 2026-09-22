@@ -3750,16 +3750,20 @@ mod tests {
 
     // ── `kj ledger runs` ────────────────────────────────────────────────
 
-    /// A privileged caller with no joined context — `kj context create`
-    /// without `--parent` resolves `context_id: None` to no FK lookup,
-    /// unlike `test_caller()`'s fake unregistered context id (which trips
-    /// the `forked_from` FK). Mirrors `lifecycle::tests::unjoined_caller`.
-    fn unjoined_caller() -> KjCaller {
+    /// A privileged caller joined to a fresh parentless "console" context,
+    /// registered directly in the db (`register_context`) — the boot-time
+    /// shape `ensure_root_contexts` produces, not something `kj context
+    /// create` itself can mint: a create needs a parent, and only boot
+    /// makes a parentless context. `kj context create` from here lands as
+    /// this context's child. Mirrors `rc::tests::console_caller`.
+    fn console_caller(d: &KjDispatcher) -> KjCaller {
+        let principal_id = kaijutsu_types::PrincipalId::new();
+        let console = register_context(d, None, None, principal_id);
         KjCaller {
-            principal_id: kaijutsu_types::PrincipalId::new(),
+            principal_id,
             actor_id: kaijutsu_types::PrincipalId::new(),
             reviewer_id: None,
-            context_id: None,
+            context_id: Some(console),
             session_id: kaijutsu_types::SessionId::new(),
             confirmed: false,
             rc_depth: 0,
@@ -3791,7 +3795,7 @@ mod tests {
         use crate::kj::test_helpers::install_rc_script_file;
 
         let d = test_dispatcher().await;
-        let c = unjoined_caller();
+        let c = console_caller(&d);
         install_rc_script_file(&d, "/config/rc/ledgertest/create/S00-noop.kai", "true").await;
 
         let created = d
@@ -3823,7 +3827,7 @@ mod tests {
         use crate::kj::test_helpers::install_rc_script_file;
 
         let d = test_dispatcher().await;
-        let c = unjoined_caller();
+        let c = console_caller(&d);
         install_rc_script_file(&d, "/config/rc/ledgertest2/create/S00-hello.kai", "echo hi").await;
 
         let created = d
@@ -3871,7 +3875,7 @@ mod tests {
         use crate::kj::test_helpers::install_rc_script_file;
 
         let d = test_dispatcher().await;
-        let c = unjoined_caller();
+        let c = console_caller(&d);
         install_rc_script_file(&d, "/config/rc/ledgertest3/create/S00-hello.kai", "echo hi").await;
 
         let created = d
@@ -3909,7 +3913,7 @@ mod tests {
         use approval_ledger::{rc_runs, types::RcOutcome};
 
         let d = test_dispatcher().await;
-        let c = unjoined_caller();
+        let c = console_caller(&d);
 
         // A run that stopped part-way cannot be produced by a lifecycle that
         // finishes, so drive the same writer calls the lifecycle makes and
@@ -3956,7 +3960,7 @@ mod tests {
             assert!(rc_runs::finish_settled_run(conn, &run, RcOutcome::Failed).is_err());
             run
         };
-        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &unjoined_caller()).await;
+        let shown = d.dispatch(&[s("ledger"), s("runs"), s(&run_id)], &console_caller(&d)).await;
         assert!(shown.is_ok(), "{shown:?}");
         assert!(shown.message().contains("settlement pending"), "{}", shown.message());
         let KjResult::Ok { data: Some(data), .. } = shown else { panic!("run detail must be structured"); };

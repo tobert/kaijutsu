@@ -39,7 +39,7 @@ feature: that's the producer's horizon-latch edit channel) vs `window`
 
 `kj fork --compact` chooses its own retained instruction blocks and latest
 complete turn, then adds a continuation summary. It uses the filtered copy
-mechanism but rejects `--include`, `--exclude`, `--preset`, and `--as`; see
+mechanism but rejects `--include`, `--exclude`, and `--preset`; see
 `docs/prompts.md`, "Compact forks". A filtered copy preserves a block parent
 or tool-call link only when its referenced block survives the selection.
 
@@ -235,8 +235,8 @@ seam module is *first* in the build order.
 ## Retired / superseded
 
 - `--shallow` / `--depth N` — retired; spelled `--include end-N:` (no
-  users besides us, no migrations). `--compact` (distill-seed) and `--as`
-  (subtree template) are orthogonal and untouched.
+  users besides us, no migrations). `--compact` (distill-seed) is
+  orthogonal and untouched.
 - The `--keep none|window|last:N` proposal from earlier in the design
   session — superseded by presets + ranges.
 - The `KJ_PARENT_HYDRATION_MARKER` read surface — already dissolved by

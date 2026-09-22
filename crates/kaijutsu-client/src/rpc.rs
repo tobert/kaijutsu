@@ -397,7 +397,7 @@ pub struct ContextInfo {
     pub created_at: u64,
     /// Long-running OTel trace ID for this context (16 bytes, or zeros if unavailable).
     pub trace_id: [u8; 16],
-    /// How this context was forked (e.g. "full", "shallow", "compact", "subtree").
+    /// How this context was forked (e.g. "full", "filtered", "compact").
     pub fork_kind: Option<String>,
     /// rc bucket / mode bundle that drives lifecycle-script dispatch (e.g.
     /// "default", "coder"). Empty on the wire is normalized to "default".

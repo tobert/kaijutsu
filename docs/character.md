@@ -128,7 +128,7 @@ Two things follow, and they are the ones to check a change against:
   created from: `forked_from` on the context row, set by `kj fork` and by
   `kj context create` run from inside a context. The character responsible
   for a context is its performer, or its director when no performer is
-  set. So a coder lane banto forks is accountable to that banto seat, not
+  set. So a coder lane banto creates is accountable to that banto seat, not
   to "banto" in general, and two bantos never collide. There is no
   `accountable_to` on the character sheet; Amy: "accountable_to is a
   relation at runtime, so if banto forks a coder, that coder is accountable
@@ -196,9 +196,8 @@ prompts, banto directs lanes, and the lanes are contexts.
    hand. She attaches the tui to `banto` and types; the draft is hers, submit
    authors a user block as amy, and the turn runs with banto as actor and amy
    as reviewer.
-2. banto plans and forks lanes with filters, each played by a coder character
-   forked from banto's seat, each with a label, a territory, and a worktree under
-   `~/src/wt/`.
+2. banto creates lanes with `kj context create --type coder --as coder`,
+   each with a label, a territory, and a worktree under `~/src/wt/`.
 3. Lanes run as driven turns. banto drives and waits. A lane's gated
    statement walks the chain to banto; banto's own, such as a commit, walks to
    amy. Static allow tiers pass the routine ones; the rest reach Amy's asks

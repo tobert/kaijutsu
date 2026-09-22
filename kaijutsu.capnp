@@ -1052,7 +1052,7 @@ struct ContextHandleInfo {
   model @4 :Text;
   createdAt @5 :UInt64;
   traceId @6 :Data;               # 16-byte OTel trace ID for context-scoped tracing
-  forkKind @7 :Text;              # "full"/"shallow"/"compact"/"subtree" or empty
+  forkKind @7 :Text;              # "full"/"filtered"/"compact" or empty
   archivedAt @8 :UInt64;          # 0 = active, else Unix millis when archived
   keywords @9 :List(Text);        # Synthesis keywords (empty if not yet synthesized)
   topBlockPreview @10 :Text;      # Preview of most representative block (empty if none)
