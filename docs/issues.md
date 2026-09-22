@@ -2017,11 +2017,10 @@ through the same path over time so we can monitor/classify/constrain." Open:
   classifier later but for now we'll rely on allowlist or yolo for curl." The
   plan evaluator sees `curl <url>` as a command; an approval has no way to
   reach the tool at connect time. Needs a design conversation.
-- **The classifier URL moves to `gate.toml`.** Amy, 2026-09-21: "the lfm2d
-  host should be in the main kaijutsu config, not hard coded", and chose
-  `[classifier] url` in `gate.toml`. Until it lands the host is a constant in
-  `runtime/curl_tool.rs` and `lib/create/S50-lfm2d.kai` writes `LFM2D_URL`
-  into each context's env.
+- **A context created before this change still carries an unused
+  `LFM2D_URL` env row.** `lib/create/S50-lfm2d.kai` no longer writes it, and
+  the hook body reads `KJ_GATE_CLASSIFIER_URL` instead, so the leftover row
+  is inert — nothing reads it — but nothing clears it either.
 - **Nothing records a request.** Monitoring is part of the goal; no span or
   ledger row names the host a context reached or was refused.
 

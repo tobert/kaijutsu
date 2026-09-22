@@ -6,15 +6,19 @@
 #
 # lfm2d-advisory pre_call hook body (installed by S50-lfm2d.kai as
 # hook_id lfm2d-advisory, match_tool shell_write). Runs in a snapshot of
-# the calling context's durable env (LFM2D_MODE, LFM2D_URL) plus the
-# per-call KJ_HOOK_*/KJ_TOOL_* vars broker.rs's run_kaish_hook sets. A
-# pre_call hook exits 0 to proceed, 3 to ask a human, and any other
-# non-zero to deny (PhaseOutcome::Deny). This hook uses 0 and 3 only: it
-# never denies, in any mode. It fails closed: in `escalate` mode a call it
-# cannot score (no URL, no curl tool, classifier unreachable or unreadable,
-# ledger write refused) exits 3, so a human decides and the ask names the
-# failure. `log` mode observes only, so there the same failure writes a trace
-# and the call proceeds.
+# the calling context's durable env (LFM2D_MODE) plus the per-call
+# KJ_HOOK_*/KJ_TOOL_*/KJ_GATE_CLASSIFIER_URL vars broker.rs's
+# run_kaish_hook sets. KJ_GATE_CLASSIFIER_URL carries [classifier] url from
+# /config/kernel/gate.toml (docs/egress.md, "The classifier host") -- the
+# same host every context's egress rule opens beyond its own rows, so this
+# hook reaches it from an empty-list context too. A pre_call hook exits 0
+# to proceed, 3 to ask a human, and any other non-zero to deny
+# (PhaseOutcome::Deny). This hook uses 0 and 3 only: it never denies, in
+# any mode. It fails closed: in `escalate` mode a call it cannot score (no
+# classifier configured, no curl tool, classifier unreachable or
+# unreadable, ledger write refused) exits 3, so a human decides and the ask
+# names the failure. `log` mode observes only, so there the same failure
+# writes a trace and the call proceeds.
 #
 # lfm2d's /v1/cascade ranks command-shaped clauses by severity and is wrong
 # in both directions on real shell text (docs/issues.md, "lfm2d risk scoring
@@ -31,14 +35,14 @@ case "$LFM2D_MODE" in
   *) exit 0 ;;
 esac
 
-if test -z "${LFM2D_URL:-}"; then
+if test -z "${KJ_GATE_CLASSIFIER_URL:-}"; then
   case "$LFM2D_MODE" in
     escalate)
-      echo "lfm2d cannot score this call: LFM2D_URL unset" >&2
+      echo "lfm2d cannot score this call: no classifier configured ([classifier] url in /config/kernel/gate.toml is unset)" >&2
       exit 3
       ;;
   esac
-  kj block create --kind trace --content "lfm2d-advisory: LFM2D_URL unset; skipping"
+  kj block create --kind trace --content "lfm2d-advisory: no classifier configured ([classifier] url in /config/kernel/gate.toml is unset); skipping"
   exit 0
 fi
 
@@ -104,8 +108,8 @@ clauses_json="$(jq -cn --arg c $cmd_text '[$c]')"
 # -- score the clauses. Never -L (CU8: egress is checked on the initial
 # URL only); a non-2xx prints its body and exits 0 -- check the body, not
 # the curl exit code, for that case.
-cascade_url="${LFM2D_URL}/v1/cascade"
-models_url="${LFM2D_URL}/v1/models"
+cascade_url="${KJ_GATE_CLASSIFIER_URL}/v1/cascade"
+models_url="${KJ_GATE_CLASSIFIER_URL}/v1/models"
 payload="$(jq -cn --argjson clauses $clauses_json '{clauses: $clauses}')"
 resp="$(curl -X POST -H 'content-type: application/json' -d $payload --max-time 15 $cascade_url)"
 curl_rc=$?

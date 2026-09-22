@@ -4,9 +4,13 @@
 # that scores its shell, the same composition S45 in this directory uses.
 # Two things:
 #
-#   1. Export durable env: LFM2D_MODE, LFM2D_URL. The hook body below
-#      reads both at fire time; neither is hard-coded into the hook body
-#      itself, so a mode or host change is one `kj context set` away.
+#   1. Export durable env: LFM2D_MODE. The hook body below reads it at
+#      fire time; a mode change is one `kj context set` away. The
+#      classifier host is not per-context env: it comes from
+#      `[classifier] url` in `/config/kernel/gate.toml`, the same host
+#      every context's egress rule opens beyond its own rows
+#      (docs/egress.md, "The classifier host"), handed to the hook as
+#      KJ_GATE_CLASSIFIER_URL.
 #
 #      Three modes. `escalate` (the default) asks a human for any verdict
 #      that is not `allow`. `log` writes the signals and always proceeds --
@@ -24,7 +28,6 @@
 # stale the next time the daemon's checkpoint changes, silently.
 
 kj context set . --env LFM2D_MODE=escalate
-kj context set . --env LFM2D_URL=http://lfm2d-1.taila4abc.ts.net:8088
 kj context set . --env LFM2D_BENIGN_LABEL=informative
 
 # The hook body lives at `/config/rc/lib/hooks/lfm2d.kai`, outside any verb

@@ -25,11 +25,12 @@ context_egress(context_id BLOB, host TEXT, PRIMARY KEY (context_id, host))
 | Form | Meaning |
 |---|---|
 | a DNS name, `crates.io` | that exact name; no subdomain matching |
-| a loopback literal, `localhost`, `127.0.0.1`, `::1` | that loopback address |
+| a loopback literal, `localhost`, `127.0.0.1`, `::1` | every loopback address |
 | `*` | every host, loopback included |
 
 A DNS name that resolves to a loopback or link-local address is refused unless
-the list also holds a loopback literal (or `*`). `kaish-tools-curl` checks each
+the list also holds a loopback literal (or `*`). One loopback literal opens
+all of loopback; the list cannot grant `127.0.0.1` and withhold `::1`. `kaish-tools-curl` checks each
 resolved address before it connects, so a name cannot stand in for an address
 the list did not grant.
 
@@ -42,10 +43,14 @@ the test context's list.
 
 The lfm2d pre-call hook runs in a snapshot of the calling context's shell and
 calls the classifier with `curl`. A context with an empty list must still be
-gated, so `runtime/curl_tool.rs` keeps one built-in host, the classifier's,
-that every context reaches. It is the only host the code names. Moving it into
-the rows needs a way for rc to grant it at context creation without giving the
-context authority over its own list; see `docs/issues.md`.
+gated, so every context reaches one host beyond its own rows: the host of
+`[classifier] url` in `/config/kernel/gate.toml`. No host is named in code.
+With no `[classifier]` section nothing is added, the hook cannot reach a
+classifier, and it fails closed: in `escalate` mode the call becomes an ask
+that names the failure (`docs/gate-policy-tuning.md`, "Verdicts").
+
+The kernel hands the hook the same URL, so the hook and the egress rule read
+one value.
 
 ## Who changes the list
 

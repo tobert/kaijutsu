@@ -671,9 +671,13 @@ on `kj ledger list`/`show` makes the attached rows visible.
 
 The score comes from a per-`context_type` rc script, not kernel code, per
 the design this paragraph always argued for: `assets/defaults/rc/coder/
-create/S50-lfm2d.kai` exports `LFM2D_MODE=escalate` / `LFM2D_URL` as durable
-env and installs a `pre_call` hook (`hook_id lfm2d-advisory`, `match_tool
-shell_write`) that scores the command through `/v1/cascade`, reads the
+create/S50-lfm2d.kai` exports `LFM2D_MODE=escalate` as durable env and
+installs a `pre_call` hook (`hook_id lfm2d-advisory`, `match_tool
+shell_write`) that scores the command through `/v1/cascade` at the host
+`[classifier] url` in `/config/kernel/gate.toml` names — handed to the hook
+as `KJ_GATE_CLASSIFIER_URL`, the one host every context reaches beyond its
+own egress rows (`docs/egress.md`, "The classifier host"); no host is
+per-context env or hard-coded. It reads the
 severity ladder from `/v1/models` at fire time (never a hard-coded label —
 lfm2d's checkpoints change their label vocabulary between releases), and
 degrades to a `Trace` block plus `exit 0` whenever the scorer is
@@ -1388,6 +1392,18 @@ body that wants to say something different, or count differently, when it
 is being measured rather than obeyed. See "Dry-run mode" below. Test:
 `kj_hook_mode_says_dryrun_only_in_a_dry_run`, one hook body run through
 both modes with opposite outcomes.
+
+**`KJ_GATE_CLASSIFIER_URL`** (`broker.rs::run_kaish_hook`): `[classifier]
+url` from `/config/kernel/gate.toml`, present only when that section is
+set — `docs/egress.md`, "The classifier host", the one host every context
+reaches beyond its own `context_egress` rows. `assets/defaults/rc/lib/
+hooks/lfm2d.kai` reads it in place of a per-context env var, so every
+seat's hook reaches the same classifier with no host named in code. Reuses
+the `GateConfig` PreCall's own gate-policy fast path already loaded for
+this call (`evaluate_phase_with_mode`) when that path ran; a hook call
+outside it (a different tool, a different phase, or an unparseable
+program) loads it fresh, once, and that same load also feeds `KJ_TOOL_PLAN`'s
+`tier` field below — never a third read of the file for one call.
 
 **The three `rpc.rs` shell paths take the hook path — PreCall today; PostCall/OnError are filed in `docs/issues.md`.** `Broker` gains two
 public methods (`shell_pre_call_hooks`/`shell_post_call_hooks`,

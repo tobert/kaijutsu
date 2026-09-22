@@ -31,6 +31,15 @@
 #
 #   [context_type.coder]
 #   uncovered = "allow"   # sandboxed benchmark kernels only
+#
+# [classifier] url is the one host every context reaches beyond its own
+# egress rows (docs/egress.md, "The classifier host"): the lfm2d pre-call
+# hook's target. http or https, a host, no userinfo, no query or fragment;
+# a trailing slash is stripped. Absent means no classifier is reachable —
+# the hook fails closed.
+
+[classifier]
+url = "http://lfm2d-1.taila4abc.ts.net:8088"
 
 [global]
 allow = [

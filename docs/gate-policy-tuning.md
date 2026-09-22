@@ -246,7 +246,18 @@ allow = [
   "kj context create",   # an mcp seat spins up coders; recoverable: archive it
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
+
+[classifier]
+url = "http://lfm2d-1.taila4abc.ts.net:8088"
 ```
+
+**`[classifier] url`** is the one host every context reaches beyond its own
+`context_egress` rows (`docs/egress.md`, "The classifier host"): the lfm2d
+pre-call hook's target. `http` or `https`, a host, no userinfo, no query or
+fragment; a trailing slash is stripped so the hook can append a path
+directly. Absent means no classifier is reachable and the hook fails
+closed. The kernel hands the same URL to the hook (`KJ_GATE_CLASSIFIER_URL`)
+and to the egress rule (`runtime/curl_tool.rs`), so the two read one value.
 
 Unknown sections or verdict words fail the load loudly, naming the section
 and key (a TOML syntax error names the line) —

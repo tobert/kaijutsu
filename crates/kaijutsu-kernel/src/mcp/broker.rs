@@ -1964,6 +1964,12 @@ impl Broker {
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
         }
+        // The gate config this call's fast path loads below, kept for
+        // `run_kaish_hook` to reuse for `KJ_GATE_CLASSIFIER_URL` and
+        // `KJ_TOOL_PLAN`'s tier stamping when the call escalates to the
+        // hooks — one load instead of a second one per hook body
+        // (`docs/egress.md`, "The classifier host").
+        let mut early_gate_config: Option<crate::kj::gate_policy::GateConfig> = None;
         // The gate policy runs before any hook (`kj/gate_policy.rs`,
         // `docs/gate-policy-tuning.md`): a shell program it allows outright
         // — every statement a `kj ledger` call, read-only `kj`, or an
@@ -2014,7 +2020,9 @@ impl Broker {
                         ask: None,
                     }));
                 }
-                approval_ledger::types::AskVerdict::Escalate => {}
+                approval_ledger::types::AskVerdict::Escalate => {
+                    early_gate_config = Some(config.clone());
+                }
             }
         }
 
@@ -2211,7 +2219,10 @@ impl Broker {
                     HookBody::Kaish(script) => {
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
-                            .run_kaish_hook(mode, phase, &script, params, ctx, &payload, cancel)
+                            .run_kaish_hook(
+                                mode, phase, &script, params, ctx, &payload, cancel,
+                                early_gate_config.as_ref(),
+                            )
                             .await?;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
@@ -2254,7 +2265,10 @@ impl Broker {
                         }
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
-                            .run_kaish_hook(mode, phase, &body, params, ctx, &payload, cancel)
+                            .run_kaish_hook(
+                                mode, phase, &body, params, ctx, &payload, cancel,
+                                early_gate_config.as_ref(),
+                            )
                             .await?;
                         if let Some(eval) = self
                             .resolve_kaish_hook_outcome_in_mode(
@@ -2611,11 +2625,13 @@ impl Broker {
     /// `KJ_HOOK_TOOL`, `KJ_PRINCIPAL`, `KJ_CONTEXT`, `KJ_TOOL_ARGS`
     /// (JSON of the call params). `KJ_HOOK_MODE` is present, with the value
     /// `dryrun`, only when the phase is being evaluated in dry run.
-    /// Phase-specific overlays:
-    /// `KJ_TOOL_RESULT` (PostCall — JSON of the produced result, real or
-    /// short-circuited synthetic) and `KJ_TOOL_ERROR` (OnError — JSON of
-    /// the failure that triggered the phase). OnNotification carries its
-    /// payload in `KJ_TOOL_ARGS` already; no extra var is added.
+    /// `KJ_GATE_CLASSIFIER_URL` is present with `[classifier] url` from
+    /// `gate.toml`, only when that section is set (`docs/egress.md`, "The
+    /// classifier host"). Phase-specific overlays: `KJ_TOOL_RESULT`
+    /// (PostCall — JSON of the produced result, real or short-circuited
+    /// synthetic) and `KJ_TOOL_ERROR` (OnError — JSON of the failure that
+    /// triggered the phase). OnNotification carries its payload in
+    /// `KJ_TOOL_ARGS` already; no extra var is added.
     async fn run_kaish_hook(
         &self,
         mode: PhaseMode,
@@ -2625,6 +2641,14 @@ impl Broker {
         ctx: &CallContext,
         payload: &PhasePayload<'_>,
         cancel: &CancellationToken,
+        // The gate config PreCall's own fast path already loaded for this
+        // call, when it ran (`evaluate_phase_with_mode`, `phase == PreCall`
+        // on `shell`/`shell_write`) — reused below instead of a second
+        // `load_config` for `KJ_GATE_CLASSIFIER_URL` and `KJ_TOOL_PLAN`'s
+        // tier stamping. `None` when this hook call did not go through that
+        // path (a different tool, a different phase, or an unparseable
+        // program): this function loads it itself, once.
+        preloaded_gate_config: Option<&crate::kj::gate_policy::GateConfig>,
     ) -> McpResult<KaishHookOutcome> {
         use std::collections::HashMap;
 
@@ -2721,6 +2745,33 @@ impl Broker {
             kaish_kernel::ast::Value::String(args_json),
         );
 
+        // The gate config for `KJ_GATE_CLASSIFIER_URL` below and for
+        // `KJ_TOOL_PLAN`'s `tier` field further down — one load, reused by
+        // both, preferring what PreCall's own fast path already loaded for
+        // this call (see `preloaded_gate_config`'s doc comment).
+        let gate_config_load: crate::kj::gate_policy::GateConfigLoad = match preloaded_gate_config {
+            Some(config) => Ok(config.clone()),
+            None => crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await,
+        };
+
+        // `KJ_GATE_CLASSIFIER_URL` (`docs/egress.md`, "The classifier
+        // host"): `[classifier] url` from `gate.toml`, present only when
+        // that section is set. A hook body reads this instead of a
+        // per-context env var, so every seat's lfm2d hook reaches the same
+        // classifier — no host is named in code. Absent on an unreadable or
+        // unparseable `gate.toml` too: that fault is already the gate's own
+        // refusal for every gated shell submission, and a hook body that
+        // needs the classifier fails closed on its own when the var is
+        // unset (`assets/defaults/rc/lib/hooks/lfm2d.kai`).
+        if let Ok(config) = &gate_config_load
+            && let Some(classifier) = config.classifier()
+        {
+            vars.insert(
+                "KJ_GATE_CLASSIFIER_URL".into(),
+                kaish_kernel::ast::Value::String(classifier.url().to_string()),
+            );
+        }
+
         // `KJ_HOOK_MODE` (docs/gate-and-shell-split.md, "Dry-run mode"):
         // present with the value `dryrun` when nothing this body decides
         // will be honored, and ABSENT otherwise. A body that never reads it
@@ -2796,13 +2847,11 @@ impl Broker {
                         // evaluator PreCall consulted for this call. A file
                         // PreCall already refused on never reaches a hook;
                         // one that fails between the two stamps `score`
-                        // everywhere and says so.
-                        let gate_config = crate::kj::gate_policy::load_config(
-                            dispatcher.kernel().vfs(),
-                        )
-                        .await;
-                        let gate_config = match gate_config {
-                            Ok(config) => config,
+                        // everywhere and says so. Reuses `gate_config_load`,
+                        // computed above for `KJ_GATE_CLASSIFIER_URL` —
+                        // never a second read of the same file.
+                        let gate_config = match &gate_config_load {
+                            Ok(config) => config.clone(),
                             Err(e) => {
                                 tracing::error!(
                                     target: "kaijutsu::hooks",
@@ -10502,15 +10551,16 @@ mod tests {
     const LFM2D_SEED: &str = include_str!("../../../../assets/defaults/rc/lib/hooks/lfm2d.kai");
 
     /// A registered context with a document (so `kj block create` inside the
-    /// hook has somewhere to write) and `LFM2D_MODE`/`LFM2D_URL` set as
-    /// durable env — the hook reads both fresh at fire time
-    /// (`S50-lfm2d.kai`'s own header), never hard-coded.
+    /// hook has somewhere to write) and `LFM2D_MODE` set as durable env —
+    /// the hook reads it fresh at fire time (`S50-lfm2d.kai`'s own header),
+    /// never hard-coded. The classifier host is not per-context: callers
+    /// that need one build their broker with `wired_kaish_broker_with_gate_toml`
+    /// and a `[classifier]` section instead.
     async fn lfm2d_context(
         kernel: &crate::Kernel,
         kj: &crate::kj::KjDispatcher,
         name: &str,
         mode: &str,
-        url: &str,
     ) -> CallContext {
         let ctx = approval_call_context(kj, name);
         kernel
@@ -10519,7 +10569,6 @@ mod tests {
             .unwrap();
         let db = kj.kernel_db();
         db.lock().set_context_env(ctx.context_id, "LFM2D_MODE", mode).unwrap();
-        db.lock().set_context_env(ctx.context_id, "LFM2D_URL", url).unwrap();
         ctx
     }
 
@@ -10545,7 +10594,9 @@ mod tests {
     /// `AskVerdict::Allow` *before* hook lookup runs — so the real,
     /// unmodified lfm2d.kai installed here never sees the plan, and the
     /// classifier is never contacted. `kj block list` is a Read verb,
-    /// builtin-allow with no `gate.toml` needed (`kj/effect.rs`).
+    /// builtin-allow whether or not `gate.toml` covers it (`kj/effect.rs`);
+    /// the `[classifier]` section here only satisfies `KJ_GATE_CLASSIFIER_URL`
+    /// for the hook this test proves never fires.
     ///
     /// `an_allow_tier_program_skips_the_hooks` pins the same skip with a
     /// synthetic `Ask` hook; this one wires the real lfm2d.kai. It does not
@@ -10554,14 +10605,14 @@ mod tests {
     /// all-allow-tier program never reaches the hook.
     #[tokio::test]
     async fn an_all_allow_tier_plan_never_reaches_the_real_lfm2d_hook() {
-        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-all-allow").await;
+        let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "lfm2d-real-all-allow",
+            "[classifier]\nurl = \"http://lfm2d-real-hook-test.invalid\"\n",
+        ).await;
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_real_lfm2d_hook(&broker).await;
-        let ctx = lfm2d_context(
-            &kernel, &kj, "lfm2d-real-all-allow", "escalate",
-            "http://lfm2d-real-hook-test.invalid",
-        ).await;
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-all-allow", "escalate").await;
 
         let result = broker
             .call_tool(shell_write_call("kj block list"), &ctx, CancellationToken::new())
@@ -10586,20 +10637,19 @@ mod tests {
     /// ask description is the hook's own "ask tier on: <clause>" line.
     ///
     /// Without the hook's ask-tier block the clause survives the allow-tier
-    /// drop, curl cannot reach `LFM2D_URL`, the hook skips with exit 0, and
-    /// the call proceeds — which `expect_err` below refuses.
+    /// drop, curl cannot reach the classifier, the hook skips with exit 0,
+    /// and the call proceeds — which `expect_err` below refuses.
     #[tokio::test]
     async fn an_ask_tier_clause_escalates_in_the_real_lfm2d_hook_before_the_classifier() {
         let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
-            "lfm2d-real-ask", "[global]\nask = [\"kj rc add\"]\n",
+            "lfm2d-real-ask",
+            "[classifier]\nurl = \"http://lfm2d-real-hook-test.invalid\"\n\n\
+             [global]\nask = [\"kj rc add\"]\n",
         ).await;
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_real_lfm2d_hook(&broker).await;
-        let ctx = lfm2d_context(
-            &kernel, &kj, "lfm2d-real-ask", "escalate",
-            "http://lfm2d-real-hook-test.invalid",
-        ).await;
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-ask", "escalate").await;
 
         let command = "kj rc add /config/rc/x --content y";
         let err = broker
@@ -10676,19 +10726,23 @@ mod tests {
     /// allow-tier `kj` read with another command reaches the hook, and the
     /// classifier receives the raw command whole, as one clause.
     ///
+    /// The context's own egress list stays empty: `docs/egress.md`, "The
+    /// classifier host" opens a loopback classifier host for every context
+    /// beyond its own rows, so no `add_context_egress` row is needed here.
+    ///
     /// Multi-thread runtime: curl's blocking request would starve the mock
     /// server on a current-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_mixed_program_reaches_the_classifier_whole_in_the_real_lfm2d_hook() {
-        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-mixed").await;
+        let (port, server) = mock_lfm2d(2).await;
+        let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "lfm2d-real-mixed",
+            &format!("[classifier]\nurl = \"http://127.0.0.1:{port}\"\n"),
+        ).await;
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_real_lfm2d_hook(&broker).await;
-        let (port, server) = mock_lfm2d(2).await;
-        let ctx = lfm2d_context(
-            &kernel, &kj, "lfm2d-real-mixed", "escalate", &format!("http://127.0.0.1:{port}"),
-        ).await;
-        kj.kernel_db().lock().add_context_egress(ctx.context_id, "127.0.0.1").unwrap();
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-mixed", "escalate").await;
 
         let command = "kj block list; wc -l /etc/hostname";
         let err = broker
@@ -10697,7 +10751,10 @@ mod tests {
             .expect_err("the mock classifier judged the command most severe, so a human is asked");
         assert!(err.is_refusal(RefusalKind::Pending), "expected Pending, got {err:?}");
 
-        let seen = server.await.unwrap();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(20), server)
+            .await
+            .expect("the hook never contacted the mock classifier")
+            .unwrap();
         let (line, body) = &seen[0];
         assert!(line.starts_with("POST /v1/cascade"), "first request: {line}");
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -10712,14 +10769,14 @@ mod tests {
     /// becomes an ask whose description names the failure.
     #[tokio::test]
     async fn an_unreachable_classifier_asks_in_the_real_lfm2d_hook() {
-        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-unreachable").await;
+        let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "lfm2d-real-unreachable",
+            "[classifier]\nurl = \"http://lfm2d-real-hook-test.invalid\"\n",
+        ).await;
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_real_lfm2d_hook(&broker).await;
-        let ctx = lfm2d_context(
-            &kernel, &kj, "lfm2d-real-unreachable", "escalate",
-            "http://lfm2d-real-hook-test.invalid",
-        ).await;
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-unreachable", "escalate").await;
 
         let err = broker
             .call_tool(shell_write_call("wc -l /etc/hostname"), &ctx, CancellationToken::new())
@@ -10740,13 +10797,14 @@ mod tests {
     /// call proceed and raises no ask.
     #[tokio::test]
     async fn an_unreachable_classifier_proceeds_in_log_mode_in_the_real_lfm2d_hook() {
-        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-log").await;
+        let (broker, kernel, kj, _dir) = wired_kaish_broker_with_gate_toml(
+            "lfm2d-real-log",
+            "[classifier]\nurl = \"http://lfm2d-real-hook-test.invalid\"\n",
+        ).await;
         let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
         broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
         push_real_lfm2d_hook(&broker).await;
-        let ctx = lfm2d_context(
-            &kernel, &kj, "lfm2d-real-log", "log", "http://lfm2d-real-hook-test.invalid",
-        ).await;
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-log", "log").await;
 
         let result = broker
             .call_tool(shell_write_call("wc -l /etc/hostname"), &ctx, CancellationToken::new())
@@ -10754,6 +10812,34 @@ mod tests {
             .expect("log mode never asks");
         assert!(!result.is_error);
         assert!(kj.kernel_db().lock().list_pending_asks().unwrap().is_empty());
+    }
+
+    /// With no `[classifier]` section at all — an absent `gate.toml`, the
+    /// same empty-config shape every other hook-pipeline test in this
+    /// module runs in — the hook cannot reach a classifier and fails
+    /// closed in `escalate` mode before `curl` runs, and the ask names
+    /// `gate.toml` as the fix.
+    #[tokio::test]
+    async fn no_classifier_section_asks_in_the_real_lfm2d_hook_naming_gate_toml() {
+        let (broker, kernel, kj) = wired_kaish_broker("lfm2d-real-no-classifier").await;
+        let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+        broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+        push_real_lfm2d_hook(&broker).await;
+        let ctx = lfm2d_context(&kernel, &kj, "lfm2d-real-no-classifier", "escalate").await;
+
+        let err = broker
+            .call_tool(shell_write_call("wc -l /etc/hostname"), &ctx, CancellationToken::new())
+            .await
+            .expect_err("a call the hook cannot score must not proceed in escalate mode");
+        assert!(err.is_refusal(RefusalKind::Pending), "expected Pending, got {err:?}");
+        let pending = kj.kernel_db().lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].description.contains("no classifier configured")
+                && pending[0].description.contains("gate.toml"),
+            "the ask must name gate.toml as the fix: {:?}",
+            pending[0].description
+        );
     }
 
     /// A file that does not parse is a fault: the call is refused as gate

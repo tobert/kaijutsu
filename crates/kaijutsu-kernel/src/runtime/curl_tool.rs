@@ -7,11 +7,6 @@
 
 use kaish_tools_curl::{AllowAll, AllowByList, CurlConfig, CurlTool, Limits};
 
-/// The classifier host every context reaches regardless of its own egress
-/// list — `docs/egress.md`, "The classifier host". A context with an empty
-/// list must still be able to call the lfm2d pre-call hook.
-const ALLOWED_HOST: &str = "lfm2d-1.taila4abc.ts.net";
-
 /// Per-request wall-clock ceiling, in seconds. Kept below
 /// `TimeoutPolicy::hook_body_timeout` (15s, `kaijutsu-types/src/timeout.rs`)
 /// so a slow request fails as a curl timeout (exit 28) inside the hook
@@ -20,18 +15,23 @@ const ALLOWED_HOST: &str = "lfm2d-1.taila4abc.ts.net";
 const MAX_TIME_SECS: f64 = 10.0;
 
 /// Build the `curl` tool a context's shell registers, gated by `hosts` — the
-/// context's `context_egress` rows (`docs/egress.md`, "The rule").
+/// context's `context_egress` rows (`docs/egress.md`, "The rule") — plus
+/// `classifier_host`, the host of `[classifier] url` in `gate.toml`
+/// (`docs/egress.md`, "The classifier host"). A context with an empty list
+/// must still be able to call the lfm2d pre-call hook, so `classifier_host`
+/// opens beyond whatever `hosts` names, when one is configured.
 ///
 /// `*` present grants every host, loopback included. Otherwise the
-/// allowlist is [`ALLOWED_HOST`] plus `hosts`, and loopback addresses open
-/// only when `hosts` names a loopback literal (`localhost`, `127.0.0.1`,
-/// `::1`) — a DNS name that happens to resolve to loopback stays refused,
-/// matching `docs/egress.md`'s "A DNS name that resolves to a loopback ...
-/// address is refused unless the list also holds a loopback literal"
-/// paragraph. `-k`/`--insecure` stays refused
-/// (`CurlConfig::default().insecure_permitted()` is `false` and this
-/// function does not turn it on).
-pub fn curl_tool(hosts: &[String]) -> CurlTool {
+/// allowlist is `hosts` plus `classifier_host`, and loopback addresses open
+/// only when `hosts` or `classifier_host` is itself a loopback literal
+/// (`localhost`, `127.0.0.1`, `::1`) — a DNS name that happens to resolve to
+/// loopback stays refused, matching `docs/egress.md`'s "A DNS name that
+/// resolves to a loopback ... address is refused unless the list also holds
+/// a loopback literal" paragraph. A loopback classifier host therefore opens
+/// loopback for every context, not only the classifier's own address.
+/// `-k`/`--insecure` stays refused (`CurlConfig::default().insecure_permitted()`
+/// is `false` and this function does not turn it on).
+pub fn curl_tool(hosts: &[String], classifier_host: Option<&str>) -> CurlTool {
     let limits = Limits {
         max_time: MAX_TIME_SECS,
         ..Limits::default()
@@ -43,9 +43,14 @@ pub fn curl_tool(hosts: &[String]) -> CurlTool {
                 .with_allow_egress(AllowAll),
         );
     }
-    let allow_loopback = hosts.iter().any(|h| is_loopback_literal(h));
-    let mut allowed = vec![ALLOWED_HOST.to_string()];
-    allowed.extend(hosts.iter().cloned());
+    let mut allow_loopback = hosts.iter().any(|h| is_loopback_literal(h));
+    let mut allowed: Vec<String> = hosts.to_vec();
+    if let Some(host) = classifier_host {
+        if is_loopback_literal(host) {
+            allow_loopback = true;
+        }
+        allowed.push(host.to_string());
+    }
     kaish_tools_curl::tool(
         CurlConfig::default()
             .with_limits(limits)
@@ -95,7 +100,7 @@ mod tests {
     #[test]
     fn curl_tool_registers_under_the_name_curl() {
         let mut registry = kaish_kernel::ToolRegistry::new();
-        registry.register(curl_tool(&[]));
+        registry.register(curl_tool(&[], None));
         assert!(
             registry.contains("curl"),
             "curl_tool() must register under the name \"curl\" — got: {:?}",
@@ -106,15 +111,17 @@ mod tests {
     /// Build a throwaway `EmbeddedKaish` with only `curl_tool()` wired in —
     /// enough to run kaish source against it without pulling in the full
     /// `KjDispatcher` machinery `context_shell.rs` uses in production.
-    /// `hosts` stands in for the calling context's `context_egress` rows.
-    async fn embedded_with_curl(name: &str, hosts: &[&str]) -> EmbeddedKaish {
+    /// `hosts` stands in for the calling context's `context_egress` rows;
+    /// `classifier` stands in for `[classifier] url`'s host in `gate.toml`.
+    async fn embedded_with_curl(name: &str, hosts: &[&str], classifier: Option<&str>) -> EmbeddedKaish {
         let principal = PrincipalId::system();
         let blocks = shared_block_store(principal);
         let kernel = Arc::new(KaijutsuKernel::new_ephemeral(name).await);
         let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let classifier = classifier.map(str::to_string);
         let configure_tools =
             move |_scm, _sid: SessionId, tools: &mut kaish_kernel::ToolRegistry| {
-                tools.register(curl_tool(&hosts));
+                tools.register(curl_tool(&hosts, classifier.as_deref()));
             };
         EmbeddedKaish::with_identity(
             name,
@@ -141,7 +148,7 @@ mod tests {
     /// the crate directly).
     #[tokio::test]
     async fn curl_is_refused_for_a_host_outside_the_allowlist() {
-        let kaish = embedded_with_curl("test-curl-egress-denied", &[]).await;
+        let kaish = embedded_with_curl("test-curl-egress-denied", &[], None).await;
         let r = kaish
             .execute_with_options("curl https://example.com/", ExecuteOptions::default())
             .await
@@ -155,11 +162,40 @@ mod tests {
         );
     }
 
+    /// `docs/egress.md`, "The classifier host": the classifier host opens
+    /// beyond an empty egress list, but it does not open every host — a
+    /// different, non-allowlisted host stays refused exactly as it would
+    /// with no classifier configured at all.
+    #[tokio::test]
+    async fn a_configured_classifier_host_does_not_open_a_different_host() {
+        let kaish = embedded_with_curl(
+            "test-curl-classifier-scoped",
+            &[],
+            Some("lfm2d-1.taila4abc.ts.net"),
+        )
+        .await;
+        let r = kaish
+            .execute_with_options("curl https://example.com/", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            !r.ok(),
+            "a host other than the configured classifier must still be refused: {}",
+            r.err
+        );
+        assert_eq!(r.code, 7, "CouldNotConnect's exit code: {}", r.err);
+        assert!(
+            r.err.contains("egress allowlist"),
+            "refusal must name the policy that stopped it: {}",
+            r.err
+        );
+    }
+
     /// `-k` is a parse-time refusal: `insecure_permitted` is never turned on
     /// in our config, so the flag is rejected before egress is consulted.
     ///
-    /// **The host here is deliberate.** `example.com` is NOT
-    /// [`ALLOWED_HOST`] — it is the same non-allowlisted host
+    /// **The host here is deliberate.** `example.com` is not allowlisted —
+    /// it is the same non-allowlisted host
     /// `curl_is_refused_for_a_host_outside_the_allowlist` uses to assert the
     /// egress refusal. Same URL, two different refusal reasons, so this test
     /// passes only while flag parsing runs BEFORE the allowlist: if that
@@ -169,7 +205,7 @@ mod tests {
     /// do not "simplify" this to an allowlisted host.
     #[tokio::test]
     async fn insecure_flag_is_refused() {
-        let kaish = embedded_with_curl("test-curl-insecure-refused", &[]).await;
+        let kaish = embedded_with_curl("test-curl-insecure-refused", &[], None).await;
         let r = kaish
             .execute_with_options("curl -k https://example.com/", ExecuteOptions::default())
             .await
