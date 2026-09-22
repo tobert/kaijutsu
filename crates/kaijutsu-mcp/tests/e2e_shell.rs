@@ -410,7 +410,7 @@ fn shell_sequential_commands() {
 /// MCP connection, with execution and result recovery crossing SSH to the kernel.
 #[test]
 fn published_shell_retains_broker_output() {
-    use rmcp::{ServiceExt, model::{CallToolRequestParams, ClientInfo}};
+    use rmcp::{ServiceExt, model::{CallToolRequestParams, ClientConfig}};
 
     run_local(async {
         let addr = start_server().await;
@@ -421,7 +421,7 @@ fn published_shell_retains_broker_output() {
         let server = tokio::task::spawn_local(async move {
             mcp.serve(server_io).await.unwrap().waiting().await.unwrap();
         });
-        let client = ClientInfo::default().serve(client_io).await.unwrap();
+        let client = ClientConfig::default().serve(client_io).await.unwrap();
         let tools = client.list_all_tools().await.unwrap();
         let shell = tools.iter().find(|tool| tool.name == "shell").expect("published shell");
         assert!(shell.input_schema["properties"].get("command").is_some());

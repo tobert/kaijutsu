@@ -66,7 +66,7 @@ use rmcp::{
         ProtocolVersion,
         // Server types
         ServerCapabilities,
-        ServerInfo,
+        ServerConfig,
     },
     prompt, prompt_handler, prompt_router,
     schemars::JsonSchema,
@@ -2519,8 +2519,8 @@ impl ServerHandler for KaijutsuMcp {
     // `enable_logging` is deprecated by SEP-2577 — see the import-site
     // comment above; kept for now so `logging/setLevel` keeps working.
     #[allow(deprecated)]
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
@@ -2532,8 +2532,8 @@ impl ServerHandler for KaijutsuMcp {
         )
         // Advertise the newest protocol this rmcp knows, not `ProtocolVersion::
         // default()` (= `LATEST` = `V_2025_11_25`, which is NOT the newest known
-        // version — `KNOWN_VERSIONS` tops out at `V_2026_07_28` in both 3.0.1 and
-        // 3.1.2). This value is the *fallback* a client lands on when it asks for
+        // version — `KNOWN_VERSIONS` tops out at `V_2026_07_28` in rmcp 3.4).
+        // This value is the *fallback* a client lands on when it asks for
         // a version rmcp doesn't know; leaving it at the default would drop such
         // a client two steps, past a version we fully support. Bump deliberately
         // when rmcp learns a newer version.

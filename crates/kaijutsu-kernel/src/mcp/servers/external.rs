@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use parking_lot::RwLock as PlRwLock;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ContentBlock,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
     ElicitRequestParams, ElicitResult, ElicitationAction, ProgressNotificationParam,
     ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, ResourceContents,
     SubscribeRequestParams, UnsubscribeRequestParams,
@@ -89,7 +89,7 @@ pub struct McpServerConfig {
 /// FlowBus references.
 #[derive(Clone)]
 struct BrokerClientHandler {
-    info: ClientInfo,
+    info: ClientConfig,
     tx: broadcast::Sender<ServerNotification>,
 }
 
@@ -102,11 +102,11 @@ impl BrokerClientHandler {
     // rmcp actually removes the API.
     #[allow(deprecated)]
     fn new(tx: broadcast::Sender<ServerNotification>) -> Self {
-        let mut info = ClientInfo::default();
+        let mut info = ClientConfig::default();
         // Advertise the newest protocol this rmcp knows, not `ProtocolVersion::
         // default()`. `default()` is `LATEST`, which is *not* the newest known
         // version — rmcp pins `LATEST = V_2025_11_25` while `KNOWN_VERSIONS`
-        // tops out at `V_2026_07_28` (true in both 3.0.1 and 3.1.2). Taking the
+        // tops out at `V_2026_07_28` (rmcp 3.4). Taking the
         // default silently negotiated every external server (kaibo, bevy_brp)
         // down to 2025-11-25 and dropped the version-gated fields with it.
         // Bump this deliberately when rmcp learns a newer version.
@@ -136,7 +136,7 @@ fn rmcp_level_to_log_level(level: LoggingLevel) -> LogLevel {
 }
 
 impl ClientHandler for BrokerClientHandler {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         self.info.clone()
     }
 
@@ -947,7 +947,7 @@ mod tests {
         }
     }
 
-    /// Pins the client half of the 2026-07-28 fix. `ClientInfo::default()`
+    /// Pins the client half of the 2026-07-28 fix. `ClientConfig::default()`
     /// takes `ProtocolVersion::default()`, which is `LATEST` — and rmcp pins
     /// `LATEST = V_2025_11_25` while `KNOWN_VERSIONS` tops out at
     /// `V_2026_07_28`. Taking the default silently negotiated every external
