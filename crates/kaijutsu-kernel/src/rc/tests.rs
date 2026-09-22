@@ -286,15 +286,13 @@
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Caller joined to a fresh parentless "console" context, registered
-    /// directly in the db (`register_context`) — the boot-time shape
-    /// `ensure_root_contexts` produces, not something `kj context create`
-    /// itself can mint: a create needs a parent, and only boot makes a
-    /// parentless context. `kj context create` from here lands as this
-    /// context's child. Privileged so these rc-lifecycle tests can `kj
-    /// context create` (now Operator-gated) as the trusted bootstrap/control
-    /// plane would.
-    fn console_caller(d: &KjDispatcher) -> KjCaller {
+    /// A privileged caller joined to a fresh parentless console context,
+    /// registered directly in the db the way boot's `ensure_root_contexts`
+    /// registers a root console. `kj context create` needs a parent, so a
+    /// create from this caller lands as the console's child. Privileged so
+    /// these rc-lifecycle tests can `kj context create` (Operator-gated) as
+    /// the trusted control plane would.
+fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = PrincipalId::new();
         let console = register_context(d, None, None, principal_id);
         KjCaller {

@@ -940,6 +940,45 @@ prompt. Decide which side owns the block; a test that drives `request_turn`
 with a missing performer and counts `Status::Error` blocks pins it. Found by
 kaibo (DeepSeek) reviewing the performer-first change, 2026-09-22.
 
+## `decision_span_keeps_the_ask_and_deciding_actor_separate` flakes under thread contention
+
+`kj/ledger.rs`, the test installs a custom `tracing::Dispatch` with
+`.with_subscriber(...)` for one future; run multi-threaded beside other
+ledger and context tests it panicked twice at "decision span", and passed
+in isolation and under `--test-threads=1`. Global or thread-local tracing
+state races with the other tests' subscribers. Seen 2026-09-22 by a lane
+running the kernel suite under host load.
+
+## Restart tests stop the server task, not the first kernel
+
+`tests/common/mod.rs` `StateDirServer::stop` aborts the `spawn_local` task
+and awaits it, which releases the data-directory lock, but the first
+kernel lives on: the editor reconciler thread (`rpc.rs`, spawned in
+`ssh.rs` after the kernel) owns an `Arc<ServerRegistry>`, and the beat
+scheduler thread owns an `Arc<Kernel>`, so `SharedKernelState::drop`
+never runs and the runtime pool, roster loop, SQLite connection, and beat
+thread of the first kernel stay live while the second boots over the same
+files. The restart tests in `context_label_resolve.rs` and
+`context_origin_host.rs` therefore still run two kernels in one process.
+A fix takes the kernel handle through `run_on_listener_with_kernel_sink`
+and runs the settle steps in `stop()`; the two OS threads still cannot be
+joined in-process. Found by kaibo (DeepSeek) reviewing 730a9ed8, 2026-09-22.
+
+## Parentless contexts outside the root consoles
+
+`kj context create` and `kj fork` always name a parent (fe187fe5), but
+these paths still insert `forked_from: None` rows: `kj context scratch`
+(`kj/context.rs`, `context_scratch`), the handoff log (`kj/handoff.rs`,
+already filed under "Handoff logs are parentless"), the beat's score
+context (`kaijutsu-server/src/beat.rs`), the cold-start document bootstrap
+(`kaijutsu-server/src/rpc.rs`, `bootstrap_discovered_context`), the drift
+queue and lost+found (`drift.rs`, `kj/drift.rs`, via
+`insert_well_known_context`). Each is its own tree in the forest with no
+root character above it, so a reviewer walk from inside one ends at nobody.
+Decide per path: parent it under the caller's lineage root, or state that
+it is a registry-owned well-known context that never hosts a gated turn.
+Found by kaibo (DeepSeek) reviewing fe187fe5, 2026-09-22.
+
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 
 From an `mcp` seat with `[context_type.mcp] allow = ["kj context create"]`

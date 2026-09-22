@@ -3751,17 +3751,19 @@ mod tests {
     // ── `kj ledger runs` ────────────────────────────────────────────────
 
     /// A privileged caller joined to a fresh parentless "console" context,
-    /// registered directly in the db (`register_context`) — the boot-time
-    /// shape `ensure_root_contexts` produces, not something `kj context
-    /// create` itself can mint: a create needs a parent, and only boot
-    /// makes a parentless context. `kj context create` from here lands as
-    /// this context's child. Mirrors `rc::tests::console_caller`.
+    /// registered directly in the db (`register_context`) the way boot's
+    /// `ensure_root_contexts` does — not something `kj context create`
+    /// itself can mint, since a create needs a parent. Boot is not the only
+    /// path that mints a parentless context: `kj context scratch`, handoff
+    /// logs, the score context, the drift queue, and lost+found do too.
+    /// `kj context create` from here lands as this context's child. Mirrors
+    /// `rc::tests::console_caller`.
     fn console_caller(d: &KjDispatcher) -> KjCaller {
         let principal_id = kaijutsu_types::PrincipalId::new();
         let console = register_context(d, None, None, principal_id);
         KjCaller {
             principal_id,
-            actor_id: kaijutsu_types::PrincipalId::new(),
+            actor_id: principal_id,
             reviewer_id: None,
             context_id: Some(console),
             session_id: kaijutsu_types::SessionId::new(),

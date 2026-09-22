@@ -270,7 +270,7 @@ Running or Waiting become Error, as in other fork paths. Pending blocks remain
 Pending; queued execution is not transferred to the child.
 
 Compact mode has its own retention policy. It rejects `--include`, `--exclude`,
-`--preset`, and `--as`; use a filtered or subtree fork for those selections.
+and `--preset`; use a filtered fork for those selections.
 `--prompt` adds a new instruction and requests a child turn after initialization.
 
 ## The submit verb

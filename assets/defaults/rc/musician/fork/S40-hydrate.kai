@@ -6,7 +6,7 @@
 #
 # The two fork strategies differ by KV-cache intent, not by copy cost (copying
 # blocks is cheap):
-#  • THIN fork (`kj fork --shallow` / `--compact` / `--as`) — reuse/reduce: keep
+#  • THIN fork (`kj fork --include end-N:` / `--compact`) — reuse/reduce: keep
 #    the cached prefix small and save tokens for a long-running iterating player.
 #    The child's log is lean, so re-anchoring the window at its current tail
 #    (mirror of create — the marker defaults to the tail) is cheap and CORRECT:
@@ -24,7 +24,7 @@
 #    clone and wants it windowed runs `kj context hydrate --window N` by hand.
 # See docs/chameleon.md, "Players are rc programs" + the hydration marker.
 #
-# KJ_FORK_INFO is {"kind":"full|shallow|compact|subtree","parent":"<hex>"}. Match
+# KJ_FORK_INFO is {"kind":"full|filtered|compact","parent":"<hex>"}. Match
 # the kind field precisely. Runs privileged in the fork lifecycle, so it clears
 # the Operator gate `kj context hydrate` requires.
 set -e

@@ -659,11 +659,14 @@ impl KjDispatcher {
         };
 
         // Mutating or destroying an *existing* context is operator authority.
-        // `create`/`scratch` are deliberately ungated: minting a context is the
-        // bootstrap entry point (a fresh, unjoined session must be able to make
-        // its first context), and the new context's loadout is assigned by its
-        // rc `create` lifecycle, not the caller's. Read/navigation verbs
-        // (list/info/current/switch/log) stay ungated too.
+        // `create`/`scratch` are deliberately ungated: minting a context takes
+        // no authority over an existing one to run, and the new context's
+        // loadout is assigned by its rc `create` lifecycle, not the caller's.
+        // `scratch` alone is the bootstrap entry point — it needs no parent,
+        // so a fresh, unjoined session can still make its first context;
+        // `create` needs one (`--parent`, `--top`, or the caller's current
+        // context). Read/navigation verbs (list/info/current/switch/log) stay
+        // ungated too.
         //
         // `rebind` is ungated on that same argument, and must stay that way: it
         // re-runs the rc lifecycle that assigns loadouts, so it grants exactly
@@ -1409,16 +1412,42 @@ impl KjDispatcher {
         // or it defaults to the caller's current context. Neither `--top`
         // nor the default has anything to walk from when the caller has no
         // current context, and a bare `--parent`-less create refuses rather
-        // than minting a stray root context — only `ensure_root_contexts`
-        // does that, at boot.
+        // than minting a stray root context — create never mints a
+        // parentless row; boot's `ensure_root_contexts`, `kj context
+        // scratch`, and a few other internal paths do.
         let parent_id = if top {
             let current = match caller.require_context() {
                 Ok(id) => id,
                 Err(e) => return e,
             };
             let db = self.kernel_db().lock();
-            match db.lineage_root_context(current) {
-                Ok(id) => Some(id),
+            let top_id = match db.lineage_root_context(current) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context create --top: {e}")),
+            };
+            // `lineage_root_context` stops at the first parentless row,
+            // which is only guaranteed to be a root context when the
+            // lineage was built under one. A scratch, handoff, or score
+            // context is also parentless, and hanging a new context off
+            // one of those is not what `--top` promises.
+            match db.get_context(top_id) {
+                Ok(Some(row)) if row.context_type == super::character::ROOT_CONTEXT_TYPE => {
+                    Some(top_id)
+                }
+                Ok(Some(row)) => {
+                    return KjResult::Err(format!(
+                        "kj context create --top: lineage top {} is a '{}' context, not a \
+                         root context; use --parent to place it explicitly",
+                        top_id.short(),
+                        row.context_type
+                    ));
+                }
+                Ok(None) => {
+                    return KjResult::Err(format!(
+                        "kj context create --top: lineage top {} is missing",
+                        top_id.short()
+                    ));
+                }
                 Err(e) => return KjResult::Err(format!("kj context create --top: {e}")),
             }
         } else {
@@ -3166,6 +3195,10 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let root = register_context(&d, Some("top-root"), None, principal);
+        d.kernel_db()
+            .lock()
+            .update_context_type(root, crate::kj::character::ROOT_CONTEXT_TYPE)
+            .unwrap();
         let middle = register_context(&d, Some("top-middle"), Some(root), principal);
         let leaf = register_context(&d, Some("top-leaf"), Some(middle), principal);
         let c = caller_with_context(leaf);
@@ -3236,6 +3269,86 @@ mod tests {
         );
         assert!(
             d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
+    }
+
+    /// `--top` refuses when the caller's lineage tops out at a parentless
+    /// context that is not root-typed — a scratch, handoff, or score
+    /// context should not silently become the hang-off point for `--top`.
+    #[tokio::test]
+    async fn context_create_top_refuses_under_a_non_root_lineage_top() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        // `register_context` defaults context_type to "default"; leave it
+        // untouched so `top` is parentless but not root-typed.
+        let top = register_context(&d, Some("non-root-top"), None, principal);
+        let leaf = register_context(&d, Some("non-root-leaf"), Some(top), principal);
+        let c = caller_with_context(leaf);
+
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("should-not-exist"), s("--top")],
+                &c,
+            )
+            .await;
+        assert!(!result.is_ok(), "--top must refuse under a non-root lineage top");
+        assert!(
+            result.message().contains(&top.short()),
+            "the refusal must name the top context: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("--parent"),
+            "the refusal must point at --parent: {}",
+            result.message()
+        );
+        assert!(
+            d.kernel_db().lock().find_context_by_label("should-not-exist").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
+    }
+
+    /// `--top` needs a current context to walk from, the same as any other
+    /// caller going through `require_context`.
+    #[tokio::test]
+    async fn context_create_top_refuses_with_no_current_context() {
+        let d = test_dispatcher().await;
+        let caller = crate::kj::KjCaller {
+            context_id: None,
+            ..test_caller()
+        };
+
+        let result = d
+            .dispatch(&[s("context"), s("create"), s("orphan-top"), s("--top")], &caller)
+            .await;
+        assert!(!result.is_ok(), "--top with no current context must refuse");
+        assert!(
+            d.kernel_db().lock().find_context_by_label("orphan-top").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
+    }
+
+    /// An empty `--parent ""` is treated as `.` (current) by
+    /// `resolve_context_arg`, so it only refuses when the caller also has
+    /// no current context to resolve to.
+    #[tokio::test]
+    async fn context_create_refuses_with_empty_parent_and_no_current_context() {
+        let d = test_dispatcher().await;
+        let caller = crate::kj::KjCaller {
+            context_id: None,
+            ..test_caller()
+        };
+
+        let result = d
+            .dispatch(
+                &[s("context"), s("create"), s("empty-parent"), s("--parent"), s("")],
+                &caller,
+            )
+            .await;
+        assert!(!result.is_ok(), "--parent \"\" with no current context must refuse");
+        assert!(
+            d.kernel_db().lock().find_context_by_label("empty-parent").unwrap().is_none(),
             "a refused create must not commit a context"
         );
     }

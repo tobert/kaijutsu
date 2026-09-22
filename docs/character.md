@@ -133,9 +133,10 @@ Two things follow, and they are the ones to check a change against:
   `accountable_to` on the character sheet; Amy: "accountable_to is a
   relation at runtime, so if banto forks a coder, that coder is accountable
   to the precise banto that forked it, not any banto."
-- **A root context has no `forked_from`.** A context created over the wire
-  with no parent, or `ROOT`, is a root of the forest. Its responsible
-  character is a root character.
+- **A root context has no `forked_from`.** A root character's console is a
+  root of the forest, and `kj context create` always names a parent
+  (`docs/fork-and-create.md`, "Where a created context sits"). Its
+  responsible character is a root character.
 - **A root character has no model.** The sheet carries a `root` flag set at
   create; a root has no cast and turn identity refuses it as a performer. A
   root is a place with hands on it: Amy fools around there, and during

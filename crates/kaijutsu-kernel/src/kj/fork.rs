@@ -1334,8 +1334,9 @@ impl KjDispatcher {
 
 /// Copy the parent's `context_type` onto the freshly-forked child so the
 /// child's fork-side rc lifecycle dispatches against the parent's type.
-/// All four fork variants commit their child with `context_type='default'`
-/// at insert time, so this is a post-commit fixup.
+/// All three fork variants (full, filtered, compact) commit their child
+/// with `context_type='default'` at insert time, so this is a post-commit
+/// fixup.
 ///
 /// On any error (parent missing, update fails) we leave the child as
 /// 'default' and log — failure here would corrupt fewer guarantees than
@@ -1379,7 +1380,7 @@ fn inherit_parent_context_type(
 // Verb class: kj/effect.rs
 impl Classify for ForkArgs {
     fn effect(&self) -> Effect {
-        // Every fork variant (full/compact/subtree) creates a new context,
+        // Every fork variant (full/filtered/compact) creates a new context,
         // copies or distills its document, and writes the kernel DB.
         Effect::Write
     }

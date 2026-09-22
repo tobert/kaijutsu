@@ -32,7 +32,7 @@ pub struct CardData {
     /// Model badge text, "provider/model" (or just one side if the other is
     /// empty; empty string if both are).
     pub model_badge: String,
-    /// Fork badge ("full"/"shallow"/"compact"/"subtree"), absent if not a fork.
+    /// Fork badge ("full"/"filtered"/"compact"), absent if not a fork.
     pub fork_badge: Option<String>,
     /// Synthesis keywords (may be empty).
     pub keywords: Vec<String>,
@@ -632,10 +632,10 @@ mod tests {
         info.fork_kind = Some(String::new());
         assert_eq!(card_from(&info, Band::Active, None).fork_badge, None);
 
-        info.fork_kind = Some("subtree".to_string());
+        info.fork_kind = Some("filtered".to_string());
         assert_eq!(
             card_from(&info, Band::Active, None).fork_badge,
-            Some("subtree".to_string())
+            Some("filtered".to_string())
         );
     }
 

@@ -2687,6 +2687,7 @@ impl KernelDb {
         Self::migrate_doc_kind_file_collapse(conn)?;
         Self::migrate_archived_context_state(conn)?;
         Self::migrate_label_index_live_only(conn)?;
+        Self::migrate_subtree_fork_kind_clear(conn)?;
         Self::drop_doc_snapshots_content_column(conn)?;
         // Review has no configured default; the lineage root holds that
         // authority (`docs/approval-identity.md`).
@@ -3161,6 +3162,24 @@ impl KernelDb {
               WHERE archived_at IS NOT NULL AND context_state <> 'archived'",
             [],
         )?;
+        Ok(())
+    }
+
+    /// Clear the retired `subtree` fork kind from stored rows. The
+    /// template-subtree fork variant is gone from `ForkKind`
+    /// (`docs/fork-and-create.md`), and `fork_kind_from_sql` treats any
+    /// unrecognized value as corruption rather than degrading silently —
+    /// so a row a deleted template-subtree fork left behind must lose the
+    /// tag before `get_context` (or any other reader) can read it back.
+    ///
+    /// Idempotent by construction — after the first run the `WHERE` clause
+    /// matches zero rows — so this needs no `kernel_migrations` marker and
+    /// is safe on every `open()`.
+    fn migrate_subtree_fork_kind_clear(conn: &Connection) -> KernelDbResult<()> {
+        let cleared = conn.execute("UPDATE contexts SET fork_kind = NULL WHERE fork_kind = 'subtree'", [])?;
+        if cleared > 0 {
+            info!(cleared, "cleared retired 'subtree' fork_kind from stored contexts");
+        }
         Ok(())
     }
 
@@ -8619,6 +8638,37 @@ mod tests {
         assert!(fork_kind_from_sql(Some("garbage".into())).is_err());
     }
 
+    /// A row a deleted template-subtree fork left behind with
+    /// `fork_kind = 'subtree'` must not survive a reopen —
+    /// `fork_kind_from_sql` treats any unrecognized value as corruption, so
+    /// `open()` clears the retired tag on every open before any reader can
+    /// trip over it.
+    #[test]
+    fn open_normalizes_a_stored_subtree_fork_kind_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kernel.db");
+        let context_id;
+        {
+            let db = KernelDb::open(&db_path).unwrap();
+            let ws_id = setup_test_db(&db);
+            let row = make_context_row(Some("old-subtree-fork"));
+            context_id = row.context_id;
+            insert_context_with_doc(&db, &row, ws_id);
+            db.conn
+                .execute(
+                    "UPDATE contexts SET fork_kind = 'subtree' WHERE context_id = ?1",
+                    params![blob_param(context_id.as_bytes())],
+                )
+                .unwrap();
+        }
+        // Drop closed the connection; re-open the same file. Without the
+        // migration this read fails: `get_context` runs `fork_kind_from_sql`
+        // over the stored 'subtree' value and errors.
+        let db = KernelDb::open(&db_path).unwrap();
+        let loaded = db.get_context(context_id).unwrap().unwrap();
+        assert_eq!(loaded.fork_kind, None);
+    }
+
     fn insert_test_preset(db: &KernelDb, label: &str) -> PresetId {
         let pid = PresetId::new();
         db.insert_preset(&PresetRow {
@@ -10904,6 +10954,65 @@ mod tests {
             db.lineage_root_context(ContextId::new()).unwrap_err(),
             KernelDbError::NotFound(_)
         ));
+    }
+
+    /// A `forked_from` cycle is not a chain to walk forever — it is
+    /// corruption, and the walk stops with a named error instead of
+    /// looping. `insert_context` refuses a `forked_from` that does not yet
+    /// exist, so both rows land first and the cycle is wired up afterward,
+    /// directly.
+    #[test]
+    fn lineage_root_context_refuses_a_forked_from_cycle() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let a = make_context_row(Some("cycle-a"));
+        let b = make_context_row(Some("cycle-b"));
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
+        db.conn
+            .execute(
+                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                params![blob_param(b.context_id.as_bytes()), blob_param(a.context_id.as_bytes())],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                params![blob_param(a.context_id.as_bytes()), blob_param(b.context_id.as_bytes())],
+            )
+            .unwrap();
+
+        let error = db.lineage_root_context(a.context_id).unwrap_err();
+        assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
+        assert!(error.to_string().contains("cycle"), "{error}");
+    }
+
+    /// A `forked_from` pointer to a row that is not there is corruption, not
+    /// a reason to keep walking. The FK normally prevents it, so reaching
+    /// this branch means turning the key off first, the way
+    /// `effective_approval_reviewer_walks_through_archived_and_refuses_a_missing_ancestor`
+    /// does.
+    #[test]
+    fn lineage_root_context_refuses_a_dangling_forked_from() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+
+        let lane = make_context_row(Some("dangling-lane"));
+        insert_context_with_doc(&db, &lane, ws_id);
+
+        let missing_parent = ContextId::new();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        db.conn
+            .execute(
+                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                params![blob_param(missing_parent.as_bytes()), blob_param(lane.context_id.as_bytes())],
+            )
+            .unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let error = db.lineage_root_context(lane.context_id).unwrap_err();
+        assert!(matches!(error, KernelDbError::NotFound(_)), "{error}");
     }
 
     /// A retired responsible character on an ancestor refuses, naming it,

@@ -17,8 +17,8 @@ Two verbs mint context rows, and each means one thing.
   director makes a coder: `kj context create <label> --type coder --as coder`.
 
 `--as` therefore means one thing across `kj`: the character who performs.
-The template-subtree fork that used the same flag is deleted; nothing in
-`assets/`, `contrib/`, or `docs/` used it.
+The template-subtree fork that used the same flag is deleted; no rc script
+or contrib tool ran it, and the prose that named it is corrected.
 
 ## Where a created context sits
 
@@ -26,16 +26,22 @@ A created context is a child of the caller's current context by default;
 that is what makes it accountable to the seat that made it
 (`docs/character.md`, "Roots and rotation"). `--parent <ctx>` places it
 under another context. `--top` places it directly under the caller's
-lineage root, the root context at the top of the caller's own tree, so a
-context that should not hang off a busy seat still hangs off a root. Only a
-root context has no parent, and only boot creates those
-(`ensure_root_contexts`). A create with no current context and no `--parent`
-refuses and names `--parent`.
+lineage root, the root-typed context at the top of the caller's own tree,
+so a context that should not hang off a busy seat still hangs off a root;
+from a lineage whose top is not a root context, such as a scratch context,
+`--top` refuses and names `--parent`. A create with no current context and
+no `--parent` refuses and names `--parent`.
+
+`kj context create` and `kj fork` never mint a parentless row. Root
+consoles come from `ensure_root_contexts` at boot and from
+`kj character create --root`. `kj context scratch`, the handoff log, the
+beat's score context, the drift queue, lost+found, and the cold-start
+document bootstrap still insert parentless rows of their own; those are
+listed in `docs/issues.md`, "Parentless contexts outside the root consoles".
 
 `--parent` and `--top` conflict. `--top` walks `forked_from` from the
-caller's context to the first parentless ancestor; `KernelDb::lineage_root`
-already performs that walk to find the root character, so extend or sibling
-it to return the context id rather than adding a second walk.
+caller's context to the first parentless ancestor through
+`KernelDb::lineage_root_context`, the walk `lineage_root` shares.
 
 ## Implementation
 
