@@ -1886,6 +1886,31 @@ docs/ as of this sweep.
 
 ## MCP 2026-07-28 adoption — two slices shipped, three items open (2026-08-11)
 
+Claude Code cannot list kaijutsu-mcp's tools on rmcp 3.1.2 (2026-09-22).
+Its MCP log: the version probe hard-closes the server ("rmcp-class pre-init
+hard close; respawning pinned legacy"); the respawn negotiates 2025-11-25;
+then tools, resources, and prompts lists fail with "request _meta is missing
+or has malformed required fields: io.modelcontextprotocol/protocolVersion,
+io.modelcontextprotocol/clientCapabilities". A hand-driven stdio
+`initialize` + `tools/list` succeeds. rmcp 3.2.0 lists "keep initialize on
+legacy protocol versions (#1228)"; 3.4.0 is current. Amy: "let's plan to get
+on latest rmcp" and "fully adopt the latest spec where we can". Plan:
+
+1. Capture Claude Code's exact stdio traffic (a tee wrapper around the
+   binary) and pin it as a failing kaijutsu-mcp test: probe, then legacy
+   `initialize`, then each list call.
+2. `cargo update -p rmcp` to 3.4.0; fix the build in `kaijutsu-mcp` and the
+   kernel broker (`mcp/servers/external.rs`); re-read both hand-pinned
+   `V_2026_07_28` comments against the new `KNOWN_VERSIONS`. The test goes
+   green; `/mcp` lists tools in a real Claude Code session.
+3. Serve the 2026-07-28 inline lifecycle (SEP-2575 `server/discover`,
+   per-request `_meta`) instead of forcing clients to the legacy respawn.
+   Consider 3.3.0's `ServerHandler::negotiate_initialize`.
+4. The open items below, in order of payoff: `structuredContent` +
+   `outputSchema` on `shell`; tasks (SEP-2663) for long calls; reconnect;
+   elicitation 1b. Drop deprecated roots/logging once kaibo and bevy_brp no
+   longer need them.
+
 Shipped since filing: **elicitation slice 1a** — `create_elicitation`
 (`mcp/servers/external.rs:200`) now emits `ServerNotification::Elicitation`
 instead of rmcp's silent auto-decline. **`on_progress`** (`external.rs:167`)
