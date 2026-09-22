@@ -532,9 +532,8 @@ impl HookListener {
         }
 
         // Everything from here to the response is on the source agent's hook
-        // critical path. Claude Code uses `tiers::HOOK_PATH`, held below its
-        // five-second ceiling. Every Codex event uses the tighter
-        // `tiers::CODEX_HOOK_PATH`, which also fits its shortest hard ceiling.
+        // critical path, bounded by `tiers::HOOK_PATH`, which fits under every
+        // host's ceiling.
         //
         // Not hypothetical headroom. Every RPC on this path carries the
         // request tier, and authoring a tool pair is three of them
@@ -560,12 +559,7 @@ impl HookListener {
             self.process_event(&event).await
         };
 
-        let budget = if event.source == "codex" {
-            tiers::CODEX_HOOK_PATH
-        } else {
-            tiers::HOOK_PATH
-        };
-        let response = with_hook_budget(budget, &event.event, hook_work).await;
+        let response = with_hook_budget(tiers::HOOK_PATH, &event.event, hook_work).await;
 
         let json = serde_json::to_string(&response).unwrap_or_default();
         writer.write_all(json.as_bytes()).await?;

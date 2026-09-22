@@ -73,27 +73,35 @@ pub mod tiers {
     /// this event defaults to one second and may be raised only to three.
     pub const CODEX_SESSION_END_DEADLINE: Duration = Duration::from_secs(3);
 
-    /// Our own budget for everything on the CC hook critical path, held
-    /// strictly under [`CC_HOOK_DEADLINE`] so **we** answer first.
+    /// The tightest hook ceiling of any host we serve. Every hook budget
+    /// nests under it, so one ladder fits Claude Code and Codex alike.
+    pub const HOST_HOOK_DEADLINE: Duration = CODEX_SESSION_END_DEADLINE;
+
+    /// The listener's budget for everything on the hook critical path, held
+    /// under [`HOOK_CLIENT`] so **we** answer first.
     ///
-    /// The distinction matters. If CC's deadline expires while we are still
-    /// working, CC kills the hook: the user sees a hook timeout, and our side
-    /// carries on doing work whose result nobody will read. If our budget
-    /// expires first we return a permissive response with a note, which is
-    /// the behaviour the hook path already commits to elsewhere — the mirror
-    /// is ambient, and its slowness must not block the user's action any more
-    /// than its failure does.
+    /// The distinction matters. If the host's deadline expires while we are
+    /// still working, the host kills the hook: the user sees a hook timeout,
+    /// and our side carries on doing work whose result nobody will read. If
+    /// our budget expires first we return a permissive response with a note,
+    /// which is the behaviour the hook path already commits to elsewhere —
+    /// the mirror is ambient, and its slowness must not block the user's
+    /// action any more than its failure does.
     ///
     /// This is not hypothetical headroom. `AuthorBlocks` queues FIFO in the
     /// doc task behind a resync whose fetch is bounded at the *request* tier,
-    /// so a hook arriving mid-resync could wait far past CC's patience. The
-    /// budget converts that from "CC kills us" into "we degrade and say so".
-    pub const HOOK_PATH: Duration = Duration::from_secs(4);
+    /// so a hook arriving mid-resync could wait far past the host's patience.
+    /// The budget converts that from "the host kills us" into "we degrade and
+    /// say so".
+    pub const HOOK_PATH: Duration = Duration::from_millis(2500);
 
-    /// Kaijutsu's reply budget for Codex hooks. Kept inside the shortest host
-    /// ceiling (`SessionEnd`) and used for every event for consistent,
-    /// quick-failing behavior.
-    pub const CODEX_HOOK_PATH: Duration = Duration::from_millis(2500);
+    /// The hook client's whole deadline: socket resolution, send, and the
+    /// listener's reply. On expiry the client exits 0 with no response. It
+    /// sits between [`HOOK_PATH`] and [`HOST_HOOK_DEADLINE`]: a listener that
+    /// is alive but slow still gets to send its degraded response, and a
+    /// listener that is wedged costs this much instead of a hook error in
+    /// every session.
+    pub const HOOK_CLIENT: Duration = Duration::from_millis(2800);
 }
 
 /// The peer-invocation ladder — one logical deadline enforced at three hops.
@@ -479,42 +487,27 @@ mod tests {
         );
     }
 
-    /// We must give up before Claude Code does, so the user gets our
-    /// degraded-but-deliberate answer instead of CC's kill. Same
-    /// caller-fires-first rule as the peer ladder, against an external peer
-    /// whose deadline we do not control.
+    /// The hook ladder: the listener's budget plus one ping round fits the
+    /// client's deadline, and the client's fits the tightest host ceiling,
+    /// each with a probe of headroom so the inner hop answers first. Same
+    /// caller-fires-first rule as the peer ladder, against external hosts
+    /// whose deadlines we do not control.
     #[test]
-    fn hook_path_budget_expires_before_claude_code_gives_up() {
+    fn hook_ladder_nests_under_every_host_deadline() {
         assert!(
-            tiers::HOOK_PATH < tiers::CC_HOOK_DEADLINE,
-            "our hook budget ({:?}) must fire before CC's ({:?}), or CC kills \
-             the hook while we are still working and the work is wasted",
-            tiers::HOOK_PATH,
-            tiers::CC_HOOK_DEADLINE
+            tiers::HOOK_PATH + tiers::PROBE <= tiers::HOOK_CLIENT,
+            "client deadline {:?} leaves no room for a ping plus the listener's {:?}",
+            tiers::HOOK_CLIENT,
+            tiers::HOOK_PATH
         );
-    }
-
-    /// The margin has to be usable, not nominal: a budget one millisecond
-    /// under CC's leaves no room to build and write the degraded response
-    /// before CC's own deadline lands. A full probe-tier of headroom is the
-    /// floor.
-    #[test]
-    fn hook_path_budget_leaves_room_to_answer() {
-        let margin = tiers::CC_HOOK_DEADLINE - tiers::HOOK_PATH;
-        assert!(
-            margin >= tiers::PROBE,
-            "only {margin:?} of headroom to serialize and write the response"
-        );
-    }
-
-    #[test]
-    fn codex_session_end_budget_expires_before_codex_gives_up() {
-        let margin = tiers::CODEX_SESSION_END_DEADLINE
-            - tiers::CODEX_HOOK_PATH;
-        assert!(
-            tiers::CODEX_HOOK_PATH < tiers::CODEX_SESSION_END_DEADLINE
-        );
-        assert!(margin >= tiers::PROBE);
+        for host in [tiers::CC_HOOK_DEADLINE, tiers::CODEX_SESSION_END_DEADLINE] {
+            assert!(tiers::HOST_HOOK_DEADLINE <= host, "{host:?} is tighter than HOST_HOOK_DEADLINE");
+            assert!(
+                tiers::HOOK_CLIENT + tiers::PROBE <= host,
+                "client deadline {:?} is too close to the host's {host:?}",
+                tiers::HOOK_CLIENT
+            );
+        }
     }
 
     /// The gate ladder's whole point: the hop closest to the caller fires

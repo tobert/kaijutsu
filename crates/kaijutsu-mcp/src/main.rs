@@ -33,6 +33,7 @@ use kaijutsu_mcp::hook_listener::{
     HookListener, PING_TIMEOUT, candidate_sockets, default_socket_path, resolve_hook_socket,
     send_hook_event, sweep_stale_sockets,
 };
+use kaijutsu_types::timeout::tiers;
 
 /// MCP server exposing the kaijutsu kernel.
 #[derive(Parser, Debug)]
@@ -395,8 +396,9 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 /// One-shot hook client: reads stdin, sends to socket, prints response.
-/// Fail-open: exits 0 if socket is unreachable, or if anything about the
-/// input/resolution is ambiguous.
+/// Fail-open: exits 0 if socket is unreachable, if the listener does not
+/// answer within `tiers::HOOK_CLIENT`, or if
+/// anything about the input/resolution is ambiguous.
 async fn run_hook_client(args: HookArgs) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
@@ -438,22 +440,37 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
     // PPID-derived default is the explicit candidate: it is the same
     // derivation the flag would carry, and it must outrank a session-id
     // match on every call, not only when routing falls through.
+    // One deadline covers resolution, send, and reply, held under the host's
+    // hook timeout: a listener that answers the ping and then stalls must
+    // cost this much, not a hook error in every session.
+    let deadline = tiers::HOOK_CLIENT;
     let explicit = args.socket.clone().or_else(default_socket_path);
-    let candidates = candidate_sockets(explicit.clone());
-    let Some(socket_path) = resolve_hook_socket(
-        candidates,
-        explicit.as_deref(),
-        event_session_id.as_deref(),
-        PING_TIMEOUT,
-    )
-    .await
-    else {
-        tracing::debug!("No hook socket resolved, failing open");
-        return Ok(());
+    let delivered = tokio::time::timeout(deadline, async {
+        let candidates = candidate_sockets(explicit.clone());
+        let socket_path = resolve_hook_socket(
+            candidates,
+            explicit.as_deref(),
+            event_session_id.as_deref(),
+            PING_TIMEOUT,
+        )
+        .await?;
+        Some((send_hook_event(&socket_path, &compact).await, socket_path))
+    })
+    .await;
+    let (sent, socket_path) = match delivered {
+        Ok(Some(delivered)) => delivered,
+        Ok(None) => {
+            tracing::debug!("No hook socket resolved, failing open");
+            return Ok(());
+        }
+        Err(_) => {
+            eprintln!("kaijutsu: hook listener did not answer within {deadline:?}; not blocking");
+            return Ok(());
+        }
     };
 
-    // Send to socket — fail open on any error
-    match send_hook_event(&socket_path, &compact).await {
+    // Fail open on any send error
+    match sent {
         Ok(Some(response)) => {
             let response = response.trim();
             if !response.is_empty() {
