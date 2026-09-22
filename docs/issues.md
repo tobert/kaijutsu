@@ -327,6 +327,14 @@ more readily than other agents". Open, most costly first:
   model gets plain text with no partial output. A foreground default for the
   coder type has to move with a larger `call_timeout` and partial output on
   timeout.
+  Evidence 2026-09-22, qwen3.8-flash in both seats: banto and a coder each
+  called `read_shell_operation` with operation ids they made up (three
+  "no shell operation ... was ever created" errors in one 130 s coder turn),
+  and the coder lane a director made with `kj context create` started with
+  no working directory ("glob: this context has no working directory set"),
+  so its first command ran in `/home/atobey`. Banto's `kj wait <lane>
+  --timeout 240` through the `shell` tool hit that tool's 120 s ceiling
+  ("Tool 'shell' timed out after 120.0s") and had to re-poll.
 - **Any text with no tool call ends the turn** (`runtime/llm_stream.rs`, "no
   tool calls this iteration"). There is no completion command, no check of
   unfinished plan items and no continuation nudge. Direction from Amy: "a done
@@ -919,6 +927,33 @@ memory control nice cannot give; macOS has no cgroup and marks a process
 background with `setpriority(PRIO_DARWIN_PROCESS, …)` / `PRIO_DARWIN_BG`,
 what `taskpolicy -b` does. Start with nice 10 for exec-granting seats and
 measure before adding a second mechanism.
+
+## A queued startup failure records two error blocks
+
+`spawn_admitted_turn` (`runtime/llm_stream.rs`) inserts a pre-stream error
+block for identity, review, provider, tool-definition, and system-prompt
+failures and returns `Err`; `queue_startup` (`runtime/turn_request.rs`) then
+calls `report_failure`, which inserts a second block ("turn failed to run for
+this context: ...") under the requester. Both `request_turn` and
+`prompt::submit` go through the queue, so one refusal shows twice after the
+prompt. Decide which side owns the block; a test that drives `request_turn`
+with a missing performer and counts `Status::Error` blocks pins it. Found by
+kaibo (DeepSeek) reviewing the performer-first change, 2026-09-22.
+
+## `kj fork --as` clones a template; `kj context create --as` casts a character
+
+`kj fork --as <AS_TEMPLATE>` clones a template context subtree
+(`kj/fork.rs`, `as_template`), while `kj context create --as <CHARACTER>` and
+`kj context set --as <CHARACTER>` cast a performer. A director told to "fork
+a coder --as coder" gets a template lookup, and a plain `kj fork` copies the
+parent's performer and context type (`fork_copies_played_by_from_source`,
+`inherit_parent_context_type`), so a fork from banto's seat is another
+director played by banto, never a coder. The director stance now says
+`kj context create <label> --type coder --as coder`. Decide whether `fork`
+gains `--type` and a character `--as` with the template flag renamed, or the
+stance and `docs/character.md` step 2 ("forks lanes ... each played by a
+coder character") change to say create. Found 2026-09-22 while making banto
+drive a coder.
 
 ## A `--env KEY=VALUE` argument drops `kj context create` out of its allow tier (2026-09-10)
 

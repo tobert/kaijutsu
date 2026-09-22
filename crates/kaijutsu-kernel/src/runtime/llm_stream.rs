@@ -326,15 +326,15 @@ pub(super) async fn spawn_admitted_turn(
             .ok_or_else(|| format!("No such context: {context_id}"))?;
         (row.played_by, row.director_id)
     };
-    let review = kernel_arc
-        .resolve_context_review(context_id)
-        .await?;
-    let identity = {
+    let identity = async {
+        super::turn_identity::require_performer(actor)?;
+        let review = kernel_arc.resolve_context_review(context_id).await?;
         let db = kernel_db.lock();
         super::turn_identity::resolve(&db, actor, review.reviewer.principal_id)
-    };
-    let identity = match identity {
-        Ok(identity) => identity,
+            .map(|identity| (identity, review))
+    }.await;
+    let (identity, review) = match identity {
+        Ok(resolved) => resolved,
         Err(detail) => {
             insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
             return Err(detail);
@@ -6821,6 +6821,32 @@ mod lifetime_tests {
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
         assert!(events.try_recv().is_none());
+    }
+
+    /// A context with a director but no performer names the missing
+    /// performer, not the reviewer walk that cannot start without one, and
+    /// the transcript carries the same text.
+    #[tokio::test]
+    async fn a_context_without_a_performer_names_the_missing_performer() {
+        let (kernel, context, after, call) = fixture(Some(MockClient::new(""))).await;
+        let director = PrincipalId::new();
+        {
+            let db = kernel.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: director, name: "banto".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            db.update_context_review_assignment(context, None, None, Some(director)).unwrap();
+        }
+        let error = spawn_admitted_turn(&kernel, context, None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None, kernel.turns().begin(context),
+            kernel.admit_context(context).unwrap()).await.unwrap_err();
+        assert!(error.contains("No performer assigned"), "{error}");
+        assert!(!error.contains("no reviewer"), "{error}");
+        let recorded = kernel.blocks().block_snapshots(context).unwrap().into_iter()
+            .any(|block| block.status == Status::Error && block.content.contains("No performer assigned"));
+        assert!(recorded, "the refusal is recorded in the transcript");
+        assert!(!kernel.turn_in_flight(context));
     }
 
     #[tokio::test]

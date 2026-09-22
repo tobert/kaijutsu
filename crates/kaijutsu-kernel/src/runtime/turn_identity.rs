@@ -9,14 +9,21 @@ pub(crate) struct TurnIdentity {
     pub reviewer: PrincipalId,
 }
 
+/// The performer is checked before the reviewer resolves: the reviewer walk
+/// starts above the performer, so with none set it fails with a message
+/// about the reviewer, which is not the repair the caller needs.
+pub(crate) fn require_performer(actor: Option<PrincipalId>) -> Result<PrincipalId, String> {
+    actor.ok_or_else(||
+        "No performer assigned. Use 'kj context set . --as <character>' before starting a model turn.".to_string()
+    )
+}
+
 pub(crate) fn resolve(
     db: &KernelDb,
     actor: Option<PrincipalId>,
     reviewer: PrincipalId,
 ) -> Result<TurnIdentity, String> {
-    let actor = actor.ok_or_else(||
-        "No performer assigned. Use 'kj context set . --as <character>' before starting a model turn.".to_string()
-    )?;
+    let actor = require_performer(actor)?;
     if actor == reviewer {
         return Err("The performer cannot review its own work. Ask the default review authority to assign a different reviewer with 'kj context set . --reviewer <character>'.".to_string());
     }

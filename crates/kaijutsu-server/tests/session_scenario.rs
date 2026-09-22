@@ -233,30 +233,34 @@ async fn boot() -> Scenario {
     }
 
     // `gate.toml`'s shipped default (`assets/defaults/gate.toml`) allow-lists
-    // "kj handoff note" globally but has no `[context_type.director]` tier,
-    // so banto's own `fork`/`context set`/`drive`/`wait`/`handoff signoff`
-    // tool calls would each raise their own ask (`Uncovered` falls to `ask`,
-    // `crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc) — the
-    // "static allow tiers pass the routine ones" step of `docs/character.md`,
-    // "A session, inside kaijutsu" step 3. This adds that tier so the
-    // orchestration itself runs unattended; the plain `echo` statement later
-    // in the script names no `kj` verb and so is never covered by any tier,
-    // staying the one statement this scenario actually gates.
+    // "kj handoff note" globally and gives `[context_type.director]` create,
+    // fork, and drive, but banto's own `context set`/`wait`/`handoff signoff`
+    // /`drift push` tool calls would each raise their own ask (`Uncovered`
+    // falls to `ask`, `crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s
+    // module doc) — the "static allow tiers pass the routine ones" step of
+    // `docs/character.md`, "A session, inside kaijutsu" step 3. This widens
+    // that tier so the orchestration itself runs unattended. The plain `echo`
+    // statement later in the script names no `kj` verb and so is never
+    // covered by any tier, staying the one statement this scenario gates.
     let gate_toml_path = config
         .config_mounts
         .host_dir(kaijutsu_types::paths::CONFIG_ROOT)
         .join("gate.toml");
     std::fs::create_dir_all(gate_toml_path.parent().expect("gate.toml has a parent dir"))
         .expect("create /config/kernel dir");
+    let shipped = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/defaults/gate.toml"
+    ))
+    .expect("read shipped gate.toml");
+    let director_tier = "[context_type.director]\nallow = [\n";
+    assert_eq!(shipped.matches(director_tier).count(), 1, "the shipped gate.toml carries one director allow tier");
     std::fs::write(
         &gate_toml_path,
-        format!(
-            "{}\n[context_type.director]\nallow = [\n  \"kj fork\",\n  \"kj context set\",\n  \"kj drive\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n]\n",
-            std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../assets/defaults/gate.toml"
-            ))
-            .expect("read shipped gate.toml")
+        shipped.replacen(
+            director_tier,
+            "[context_type.director]\nallow = [\n  \"kj context set\",\n  \"kj wait\",\n  \"kj handoff signoff\",\n  \"kj drift push\",\n",
+            1,
         ),
     )
     .expect("write scenario gate.toml");

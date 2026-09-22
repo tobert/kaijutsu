@@ -247,6 +247,13 @@ allow = [
   "kj drive",            # runs a turn on a context this seat can already reach
 ]
 
+[context_type.director]
+allow = [
+  "kj context create",   # a director creates its lanes, `--type coder --as coder`
+  "kj fork",             # a fork copies this seat's own performer and type
+  "kj drive",            # runs a turn on a lane this seat directs
+]
+
 [classifier]
 url = "http://lfm2d-1.taila4abc.ts.net:8088"
 ```

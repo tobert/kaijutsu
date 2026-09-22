@@ -1781,6 +1781,34 @@ uncovered = "allow"
         assert_eq!(first_verdict("python3 build.py", &cfg, None), PolicyVerdict::Uncovered);
     }
 
+    /// A director's routine lane work runs without an ask: it creates a
+    /// coder and drives it (`docs/character.md`, "A session, inside
+    /// kaijutsu", step 3). Repair of a running lane, such as recasting its
+    /// performer, still meets the director's reviewer.
+    #[test]
+    fn the_shipped_default_lets_a_director_create_and_drive_a_lane() {
+        let cfg = config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        for source in [
+            "kj context create count-kj-rs --type coder --as coder",
+            "kj fork --name lane --prompt \"count the files\"",
+            "kj drive count-kj-rs --prompt \"count the files\"",
+        ] {
+            let v = first_verdict(source, &cfg, Some("director"));
+            let keys = allow_keys(&v);
+            assert_eq!(keys.len(), 1, "{source}: {v:?}");
+            assert_eq!(keys[0].0, Layer::ContextTypeConfig("director".to_string()), "{source}: {v:?}");
+            assert_eq!(
+                first_verdict(source, &cfg, Some("coder")),
+                PolicyVerdict::Uncovered,
+                "{source} is the director's work, not a coder's"
+            );
+        }
+        assert_eq!(
+            first_verdict("kj context set count-kj-rs --as coder", &cfg, Some("director")),
+            PolicyVerdict::Uncovered
+        );
+    }
+
     /// Absent is today's behavior, and the shipped default leaves it absent.
     #[test]
     fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
