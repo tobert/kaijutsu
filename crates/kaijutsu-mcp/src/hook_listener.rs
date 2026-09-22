@@ -2023,7 +2023,6 @@ mod tests {
         let shared_context_id = Arc::new(Mutex::new(Some(context_id)));
         let (change, _change_rx) = tokio::sync::watch::channel(0u64);
         let remote = crate::RemoteState {
-            kernel_id: kaijutsu_types::KernelId::new(),
             actor,
             change,
             joined: Arc::new(tokio::sync::RwLock::new(None)),

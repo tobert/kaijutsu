@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -28,7 +29,7 @@ use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_client::KeySource;
-use kaijutsu_mcp::KaijutsuMcp;
+use kaijutsu_mcp::{KaijutsuMcp, StartupGate};
 use kaijutsu_mcp::hook_listener::{
     HookListener, PING_TIMEOUT, candidate_sockets, default_socket_path, resolve_hook_socket,
     send_hook_event, sweep_stale_sockets,
@@ -196,17 +197,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // Cap'n Proto RPC requires LocalSet for !Send types
     let local_set = tokio::task::LocalSet::new();
     local_set.run_until(async {
-        // `Some(base)` only when register_session_auto below succeeds *and*
-        // the session id wasn't known yet — that's the one case where the
-        // label needs stabilizing once a hook event tells us the session id
-        // (HookListener::remote, `stabilize_context_label`). `base` is the
-        // repo-only prefix (`auto_register_base`), NOT the timestamped
-        // label used for the initial join — the stable label is
-        // `{base}-{sid8}`, deterministic across MCP relaunches within the
-        // same hosting-agent session.
-        let mut pending_label_base: Option<String> = None;
-
-        let mcp = if args.connect {
+        let (mcp, gate) = if args.connect {
             let ssh_dir = dirs::home_dir().map(|home| home.join(".ssh"));
             if let Some(warning) = personal_key_warning(&key_source, ssh_dir.as_deref()) {
                 tracing::warn!("{warning}");
@@ -218,6 +209,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 kernel = %args.kernel,
                 "Connecting via SSH"
             );
+            let gate = StartupGate::pending();
             let mcp = KaijutsuMcp::connect(
                 &args.host,
                 args.port,
@@ -226,149 +218,32 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 detected_agent_name,
                 key_source.clone(),
                 args.insecure,
-            ).await?
+            )
             .with_parent(args.parent.clone().or_else(|| {
                 std::env::var("KAIJUTSU_PARENT").ok().filter(|value| !value.trim().is_empty())
-            }));
-
-            // Auto-register a session context so hook events land somewhere
-            // without requiring a model to call register_session first.
-            // Best-effort: on failure we log and keep serving — the tool
-            // can still be called manually.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let unix_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            // No session-id suffix here even when detection reported one.
-            // Claude detection scrapes the newest transcript file, and at MCP
-            // spawn time the CURRENT session's transcript may not exist yet —
-            // that id can belong to a previous session (observed live). Codex
-            // supplies its thread id directly, but uses the same stabilization
-            // path. The first hook event that carries a session_id (any event
-            // type — not just session.start, which never fires again on a
-            // same-session MCP relaunch) carries the true id;
-            // `stabilize_context_label` does the fixup.
-            let label = auto_register_label(&cwd, unix_secs, agent_label);
-            // The actor connects in the background, so the first attempt can
-            // race it ("not ready: connecting"). Retry briefly with backoff;
-            // exhaustion stays fail-open (the tool can be called manually).
-            let mut result = String::new();
-            let mut success = false;
-            for delay_ms in [0u64, 250, 500, 1000, 2000, 4000] {
-                if delay_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
-                result = mcp.register_session_auto(Some(label.clone()), None).await;
-                success = serde_json::from_str::<serde_json::Value>(&result)
-                    .ok()
-                    .map(|v| {
-                        v.get("success").and_then(|b| b.as_bool()).unwrap_or(false)
-                            || v.get("already_registered")
-                                .and_then(|b| b.as_bool())
-                                .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if success {
-                    break;
-                }
-            }
-            if success {
-                pending_label_base = Some(auto_register_base(&cwd, agent_label));
-                tracing::info!(label = %label, "Auto-registered MCP session");
-            } else {
-                tracing::warn!(
-                    response = %result,
-                    "Auto-register failed — continuing without a joined context; \
-                     register_session can still be called manually",
-                );
-            }
-
-            mcp
+            }))
+            .with_startup_gate(gate.clone());
+            (mcp, Some(gate))
         } else {
             tracing::info!("Starting with in-memory store");
-            KaijutsuMcp::new()
+            (KaijutsuMcp::new(), None)
         };
 
-        // Start hook socket listener as a background task
-        let socket_path = args.hook_socket.or_else(default_socket_path);
-        let Some(socket_path) = socket_path else {
-            tracing::warn!("$XDG_RUNTIME_DIR not set — hook socket disabled. Set --hook-socket explicitly to enable.");
-            // Continue without hook socket — MCP server still works
-            let service = mcp
-                .serve(stdio())
-                .await
-                .inspect_err(|e| {
-                    tracing::error!("MCP server error: {:?}", e);
-                })?;
-            tracing::info!("kaijutsu-mcp server ready (no hook socket)");
-            service.waiting().await?;
-            tracing::info!("kaijutsu-mcp server shutting down");
-            return Ok(());
-        };
+        let socket_path = args.hook_socket.clone().or_else(default_socket_path);
+        let owns_socket = Arc::new(AtomicBool::new(false));
 
-        // Sweep other processes' abandoned sockets before binding ours —
-        // an unclean exit leaves the socket special file behind forever
-        // (nothing unlinks it), and they accumulate in the runtime dir.
-        if let Some(dir) = socket_path.parent() {
-            let removed = sweep_stale_sockets(dir, &socket_path).await;
-            tracing::info!(removed, dir = %dir.display(), "Stale hook socket sweep complete");
-        }
+        // Registration and the hook socket run behind the MCP handshake, never
+        // before it: a host gives a stdio server a short window to answer its
+        // first message, and neither a kernel that is down nor a hook socket
+        // a predecessor still holds may spend it. Tool calls wait on `gate`.
+        let startup = tokio::task::spawn_local(start_behind_handshake(
+            mcp.clone(),
+            gate,
+            agent_label,
+            socket_path.clone(),
+            Arc::clone(&owns_socket),
+        ));
 
-        // Bind the socket SYNCHRONOUSLY, before spawning the accept loop —
-        // `bind_socket` refuses (rather than silently steals) a path a live
-        // listener still owns, and this process must know whether that
-        // refusal happened before it decides, on exit, whether the path is
-        // its own to unlink. A bound-then-spawned accept loop would let
-        // main.rs find out about a bind failure only via a log line, with
-        // no way to gate the exit-time cleanup on it.
-        let bound_socket = match HookListener::bind_socket(&socket_path).await {
-            Ok(unix_listener) => Some(unix_listener),
-            Err(e) => {
-                tracing::error!(
-                    path = %socket_path.display(),
-                    "Failed to bind hook socket: {e} — continuing without a hook socket \
-                     rather than share another listener's endpoint"
-                );
-                None
-            }
-        };
-        // Only this branch means WE bound the path — the one condition
-        // under which cleanup on exit may unlink it.
-        let owns_socket = bound_socket.is_some();
-
-        if let Some(unix_listener) = bound_socket {
-            let listener = match mcp.backend() {
-                kaijutsu_mcp::Backend::Local(store) => {
-                    // Local mode: hooks write to the same in-memory store
-                    let doc_ids = store.list_ids();
-                    let ctx_id = doc_ids.first()
-                        .copied()
-                        .unwrap_or_else(kaijutsu_types::ContextId::new);
-                    Arc::new(HookListener::local(store.clone(), ctx_id))
-                }
-                kaijutsu_mcp::Backend::Remote(remote) => {
-                    // shared_context_id is updated by register_session when a context is joined
-                    Arc::new(HookListener::remote_with_agent(
-                        remote.clone(),
-                        Arc::clone(&remote.shared_context_id),
-                        Arc::clone(mcp.session_id_arc()),
-                        Arc::clone(mcp.agent_name_arc()),
-                        pending_label_base.clone(),
-                    ))
-                }
-            };
-
-            tokio::spawn(async move {
-                if let Err(e) = listener.serve(unix_listener).await {
-                    tracing::error!("Hook listener error: {e}");
-                }
-            });
-
-            tracing::info!(socket = %socket_path.display(), "Hook socket started");
-        }
-
-        // Create and serve the MCP server
         let service = mcp
             .serve(stdio())
             .await
@@ -380,19 +255,157 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
         // Wait for the service to complete
         service.waiting().await?;
+        startup.abort();
 
         // Cleanup socket on exit — ONLY if this process is the one that
-        // bound it. Unlinking unconditionally (the old behavior) deletes
-        // whatever now lives at this shared PPID-derived path, including a
-        // successor process's live socket if one bound it after we lost our
-        // own liveness check race — see `HookListener::bind_socket`.
-        if owns_socket {
-            let _ = tokio::fs::remove_file(&socket_path).await;
+        // bound it. Unlinking unconditionally deletes whatever now lives at
+        // this shared PPID-derived path, including a successor process's live
+        // socket if one bound it after we lost our own liveness check race —
+        // see `HookListener::bind_socket`.
+        if owns_socket.load(Ordering::SeqCst)
+            && let Some(socket_path) = &socket_path
+        {
+            let _ = tokio::fs::remove_file(socket_path).await;
         }
 
         tracing::info!("kaijutsu-mcp server shutting down");
         Ok(())
     }).await
+}
+
+/// Startup work that runs after the MCP server is already answering: session
+/// auto-registration (remote only), then the hook socket. Settles `gate` once
+/// registration is done, whether it succeeded or not.
+async fn start_behind_handshake(
+    mcp: KaijutsuMcp,
+    gate: Option<StartupGate>,
+    agent_label: &'static str,
+    socket_path: Option<PathBuf>,
+    owns_socket: Arc<AtomicBool>,
+) {
+    // `Some(base)` only when register_session_auto below succeeds *and*
+    // the session id wasn't known yet — that's the one case where the
+    // label needs stabilizing once a hook event tells us the session id
+    // (HookListener::remote, `stabilize_context_label`). `base` is the
+    // repo-only prefix (`auto_register_base`), NOT the timestamped
+    // label used for the initial join — the stable label is
+    // `{base}-{sid8}`, deterministic across MCP relaunches within the
+    // same hosting-agent session.
+    let mut pending_label_base: Option<String> = None;
+
+    if let Some(gate) = gate {
+        // Auto-register a session context so hook events land somewhere
+        // without requiring a model to call register_session first.
+        // Best-effort: on failure we log and keep serving — the tool
+        // can still be called manually.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // No session-id suffix here even when detection reported one.
+        // Claude detection scrapes the newest transcript file, and at MCP
+        // spawn time the CURRENT session's transcript may not exist yet —
+        // that id can belong to a previous session (observed live). Codex
+        // supplies its thread id directly, but uses the same stabilization
+        // path. The first hook event that carries a session_id (any event
+        // type — not just session.start, which never fires again on a
+        // same-session MCP relaunch) carries the true id;
+        // `stabilize_context_label` does the fixup.
+        let label = auto_register_label(&cwd, unix_secs, agent_label);
+        // The actor connects on the first command, so the first attempt can
+        // race it ("not ready: connecting"). Retry briefly with backoff;
+        // exhaustion stays fail-open (the tool can be called manually).
+        let mut result = String::new();
+        let mut success = false;
+        for delay_ms in [0u64, 250, 500, 1000, 2000, 4000] {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            result = mcp.register_session_auto(Some(label.clone()), None).await;
+            success = serde_json::from_str::<serde_json::Value>(&result)
+                .ok()
+                .map(|v| {
+                    v.get("success").and_then(|b| b.as_bool()).unwrap_or(false)
+                        || v.get("already_registered")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if success {
+                break;
+            }
+        }
+        if success {
+            pending_label_base = Some(auto_register_base(&cwd, agent_label));
+            tracing::info!(label = %label, "Auto-registered MCP session");
+        } else {
+            tracing::warn!(
+                response = %result,
+                "Auto-register failed — continuing without a joined context; \
+                 register_session can still be called manually",
+            );
+        }
+        gate.settle();
+    }
+
+    let Some(socket_path) = socket_path else {
+        tracing::warn!("$XDG_RUNTIME_DIR not set — hook socket disabled. Set --hook-socket explicitly to enable.");
+        return;
+    };
+
+    // Sweep other processes' abandoned sockets before binding ours —
+    // an unclean exit leaves the socket special file behind forever
+    // (nothing unlinks it), and they accumulate in the runtime dir.
+    if let Some(dir) = socket_path.parent() {
+        let removed = sweep_stale_sockets(dir, &socket_path).await;
+        tracing::info!(removed, dir = %dir.display(), "Stale hook socket sweep complete");
+    }
+
+    // `bind_socket` refuses (rather than silently steals) a path a live
+    // listener still owns; `owns_socket` records whether this process bound
+    // it, the one condition under which cleanup on exit may unlink it.
+    let unix_listener = match HookListener::bind_socket(&socket_path).await {
+        Ok(unix_listener) => unix_listener,
+        Err(e) => {
+            tracing::error!(
+                path = %socket_path.display(),
+                "Failed to bind hook socket: {e} — continuing without a hook socket \
+                 rather than share another listener's endpoint"
+            );
+            return;
+        }
+    };
+    owns_socket.store(true, Ordering::SeqCst);
+
+    let listener = match mcp.backend() {
+        kaijutsu_mcp::Backend::Local(store) => {
+            // Local mode: hooks write to the same in-memory store
+            let doc_ids = store.list_ids();
+            let ctx_id = doc_ids.first()
+                .copied()
+                .unwrap_or_else(kaijutsu_types::ContextId::new);
+            Arc::new(HookListener::local(store.clone(), ctx_id))
+        }
+        kaijutsu_mcp::Backend::Remote(remote) => {
+            // shared_context_id is updated by register_session when a context is joined
+            Arc::new(HookListener::remote_with_agent(
+                remote.clone(),
+                Arc::clone(&remote.shared_context_id),
+                Arc::clone(mcp.session_id_arc()),
+                Arc::clone(mcp.agent_name_arc()),
+                pending_label_base,
+            ))
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = listener.serve(unix_listener).await {
+            tracing::error!("Hook listener error: {e}");
+        }
+    });
+
+    tracing::info!(socket = %socket_path.display(), "Hook socket started");
 }
 
 /// One-shot hook client: reads stdin, sends to socket, prints response.

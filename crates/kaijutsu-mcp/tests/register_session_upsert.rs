@@ -88,8 +88,6 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
         insecure: true,
     };
     KaijutsuMcp::connect_with_config(config, "e2e-test", Some("e2e-session"))
-        .await
-        .expect("MCP connect failed")
 }
 
 /// Register a session, retrying while the freshly-spawned actor is still

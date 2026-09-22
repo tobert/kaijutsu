@@ -85,8 +85,6 @@ async fn connect_mcp(addr: SocketAddr) -> KaijutsuMcp {
         insecure: true,
     };
     KaijutsuMcp::connect_with_config(config, "hook-e2e-test", None)
-        .await
-        .expect("MCP connect failed")
 }
 
 /// Auto-register with retry — the freshly-spawned actor needs a moment to

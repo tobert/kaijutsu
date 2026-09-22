@@ -1,12 +1,15 @@
 //! The request shapes Claude Code sends when it connects, as raw JSON-RPC
 //! lines over the server's stdio transport.
 //!
-//! Claude Code first probes with the 2026-07-28 inline lifecycle
-//! (`server/discover`, per-request `_meta`). A server that closes on the
-//! probe is respawned on the legacy `initialize` handshake, and a server
-//! that then rejects list calls leaves the session with no tools. Both
-//! happened to kaijutsu-mcp on rmcp 3.1.2, and neither the typed rmcp
-//! client in `e2e_shell.rs` nor a hand-driven `initialize` saw it.
+//! Claude Code 2.1.278 writes a 2026-07-28 `server/discover` probe and, without
+//! waiting for its answer, a legacy `initialize` on the same connection, then
+//! lists tools, prompts, and resources with no `_meta`
+//! (`claude_codes_pipelined_discover_then_initialize_lists_everything`,
+//! recorded from a live `/mcp`). On rmcp 3.1.2 and
+//! 3.4.0 the discover opener locks the session into the inline lifecycle, so
+//! every legacy list call fails its `_meta` check and the session has no
+//! kaijutsu tools. The typed rmcp client in `e2e_shell.rs` and one flow per
+//! connection never showed this.
 
 use std::time::Duration;
 
@@ -55,7 +58,7 @@ async fn exchange(lines: &[Value]) -> Vec<Value> {
             responses.push(value);
         }
     }
-    responses.sort_by_key(|r| r["id"].as_i64());
+    responses.sort_by_key(|r| r["id"].to_string());
     responses
 }
 
@@ -64,6 +67,48 @@ fn assert_result(response: &Value, key: &str) {
         response.get("error").is_none() && response["result"].get(key).is_some(),
         "expected result.{key}, got {response:#}"
     );
+}
+
+/// Claude Code's connect, byte-for-byte in method, id, and params shape.
+///
+/// Ignored: rmcp 3.4.0 locks the session to the inline lifecycle on a
+/// discover opener, which modelcontextprotocol/rust-sdk#1248 fixes and no
+/// release carries yet. Claude Code sends this pipelined sequence only when
+/// its discover probe times out, and `tests/mcp_startup.rs` holds startup
+/// work behind the handshake so ours does not. Remove the ignore once an rmcp
+/// release passes it.
+#[tokio::test]
+#[ignore = "needs rmcp with rust-sdk#1248 (discover opener stays bootstrap-neutral)"]
+async fn claude_codes_pipelined_discover_then_initialize_lists_everything() {
+    let client_info = json!({
+        "name": "claude-code", "title": "Claude Code", "version": "2.1.278",
+        "description": "Anthropic's agentic coding tool", "websiteUrl": "https://claude.com/claude-code",
+    });
+    let capabilities = json!({ "roots": { "listChanged": true }, "elicitation": {} });
+    let responses = exchange(&[
+        json!({
+            "jsonrpc": "2.0", "id": "server-discover-probe-1", "method": "server/discover",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": client_info,
+                "io.modelcontextprotocol/clientCapabilities": capabilities,
+            } },
+        }),
+        json!({
+            "method": "initialize", "jsonrpc": "2.0", "id": 0,
+            "params": { "protocolVersion": "2025-11-25", "capabilities": capabilities, "clientInfo": client_info },
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "method": "tools/list", "jsonrpc": "2.0", "id": 1 }),
+        json!({ "method": "prompts/list", "jsonrpc": "2.0", "id": 2 }),
+        json!({ "method": "resources/list", "jsonrpc": "2.0", "id": 3 }),
+    ])
+    .await;
+    let by_id = |id: Value| responses.iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("no response for {id}"));
+    assert_eq!(by_id(json!(0))["result"]["protocolVersion"], "2025-11-25", "{:#}", by_id(json!(0)));
+    assert_result(by_id(json!(1)), "tools");
+    assert_result(by_id(json!(2)), "prompts");
+    assert_result(by_id(json!(3)), "resources");
 }
 
 #[tokio::test]

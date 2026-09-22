@@ -85,7 +85,7 @@ use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{
     ActorHandle, CallError, KeySource, PeerConfig, PeerInvocation, ServerEvent, SshConfig,
-    TurnCompletedStopReason, connect_ssh, spawn_actor,
+    TurnCompletedStopReason, spawn_actor,
 };
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
@@ -331,13 +331,11 @@ fn shell_output_schema() -> std::sync::Arc<rmcp::model::JsonObject> {
 /// The `ActorHandle` is `Send+Sync` and wraps the `!Send` Cap'n Proto
 /// types in a `spawn_local` task with auto-reconnect.
 ///
-/// Context joining is deferred — `connect()` establishes the SSH connection
-/// and spawns the actor, but does not join a context. Call `register_session`
-/// to create and join a context, which populates the store.
+/// Context joining is deferred — `connect()` spawns the actor, which
+/// connects in the background, but does not join a context. Call
+/// `register_session` to create and join a context, which populates the store.
 #[derive(Clone)]
 pub struct RemoteState {
-    /// Kernel ID we connected to
-    pub kernel_id: kaijutsu_types::KernelId,
     /// Send+Sync actor handle for RPC operations
     pub actor: ActorHandle,
     /// Wake signal: a monotonic generation counter the pulse task bumps
@@ -654,6 +652,43 @@ impl Default for McpServerState {
     }
 }
 
+/// Holds tool calls while startup work that runs behind the MCP handshake
+/// (session registration) is still in flight.
+///
+/// The server answers MCP from its first message; a tool call that arrives
+/// before registration settles waits here, up to [`STARTUP_WAIT`], then runs
+/// against whatever state startup reached and reports its own error.
+#[derive(Clone)]
+pub struct StartupGate(Arc<watch::Sender<bool>>);
+
+/// How long a tool call waits for [`StartupGate`] before running anyway.
+/// Handshake tier: startup is one registration round trip when the kernel
+/// is up, and a call should not hang for long when it is down.
+pub const STARTUP_WAIT: std::time::Duration = kaijutsu_types::timeout::tiers::HANDSHAKE;
+
+impl StartupGate {
+    /// A gate that is already open.
+    pub fn open() -> Self {
+        Self(Arc::new(watch::channel(true).0))
+    }
+
+    /// A gate that holds calls until [`Self::settle`].
+    pub fn pending() -> Self {
+        Self(Arc::new(watch::channel(false).0))
+    }
+
+    /// Release every waiting and future call.
+    pub fn settle(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Wait for [`Self::settle`], up to `limit`. Returns whether it settled.
+    pub async fn settled_within(&self, limit: std::time::Duration) -> bool {
+        let mut rx = self.0.subscribe();
+        tokio::time::timeout(limit, rx.wait_for(|settled| *settled)).await.is_ok()
+    }
+}
+
 /// MCP server exposing the kaijutsu kernel.
 #[derive(Clone)]
 pub struct KaijutsuMcp {
@@ -678,6 +713,8 @@ pub struct KaijutsuMcp {
     /// id. `None` chooses the kernel's only live root context
     /// (`kaijutsu_client::choose_parent`).
     parent: Option<String>,
+    /// Holds tool calls until startup registration settles.
+    startup: StartupGate,
 }
 
 impl std::fmt::Debug for KaijutsuMcp {
@@ -706,6 +743,7 @@ impl KaijutsuMcp {
             context_name: "local".to_string(),
             agent_name: Arc::new(Mutex::new(None)),
             parent: None,
+            startup: StartupGate::open(),
         }
     }
 
@@ -715,7 +753,7 @@ impl KaijutsuMcp {
         Self::with_store(shared_block_store(principal))
     }
 
-    /// Connect to a running kaijutsu-server via SSH.
+    /// Build an MCP server backed by a kaijutsu-server reached over SSH.
     ///
     /// `key_source` selects how the connection authenticates: the default
     /// `KeySource::Agent` tries every key the SSH agent holds, landing as
@@ -728,9 +766,11 @@ impl KaijutsuMcp {
     /// mints a fresh host key at every boot, and learning those by trust on
     /// first use writes the operator's real `~/.ssh/known_hosts`.
     ///
-    /// Establishes the SSH connection and spawns the actor, but does NOT
-    /// join a context. Call `register_session` to create and join a context.
-    pub async fn connect(
+    /// Touches no network: the actor connects in the background on its first
+    /// command and reconnects on its own, so the MCP server answers whether
+    /// or not the kernel is up. Does NOT join a context — call
+    /// `register_session` for that.
+    pub fn connect(
         host: &str,
         port: u16,
         context_name: &str,
@@ -738,7 +778,7 @@ impl KaijutsuMcp {
         agent_name: Option<&str>,
         key_source: KeySource,
         insecure: bool,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Self {
         let config = SshConfig {
             host: host.to_string(),
             port,
@@ -747,41 +787,26 @@ impl KaijutsuMcp {
             insecure,
             ..SshConfig::default()
         };
-        let mut server = Self::connect_with_config(config, context_name, session_id).await?;
+        let mut server = Self::connect_with_config(config, context_name, session_id);
         server.agent_name = Arc::new(Mutex::new(agent_name.map(String::from)));
-        Ok(server)
+        server
     }
 
-    /// Connect using an explicit [`SshConfig`].
+    /// Build a remote-backed server from an explicit [`SshConfig`].
     ///
     /// This is the seam `connect` delegates to. It exists so callers (and the
     /// e2e test harness) can point the full MCP machinery — actor, store,
     /// background sync listener, poll path — at a server reachable only with a
     /// non-default config (e.g. an ephemeral test server using
     /// `KeySource::ephemeral()` + `insecure`). Must be called within a
-    /// `LocalSet`. Like `connect`, it establishes the connection and spawns the
-    /// actor but does NOT join a context — call `register_session` for that.
-    pub async fn connect_with_config(
+    /// `LocalSet`. Like `connect`, it spawns the actor without waiting for it
+    /// and does NOT join a context.
+    pub fn connect_with_config(
         config: SshConfig,
         context_name: &str,
         cc_session_id: Option<&str>,
-    ) -> Result<Self, anyhow::Error> {
-        tracing::debug!(?config, "Connecting via SSH");
-
-        let client = connect_ssh(config.clone()).await?;
-        let (_kernel, kernel_id_typed) = client.bind_kernel().await?;
-
-        tracing::info!(
-            kernel = %kernel_id_typed,
-            context_label = %context_name,
-            "Connected to server (no context joined yet)"
-        );
-
-        // Drop the eagerly-built client+kernel; the actor builds its own
-        // connection via its FSM. The eager bind_kernel above served as a
-        // permission probe (auth, kernel reachable) before we commit to
-        // spawning. The 50ms re-handshake by the actor is acceptable.
-        drop(client);
+    ) -> Self {
+        tracing::debug!(?config, "Spawning RPC actor");
 
         // Spawn actor with no context — it will join via register_session.
         // scope_blocks_to_context = true: the MCP is single-context, and its
@@ -790,13 +815,12 @@ impl KaijutsuMcp {
         // subscription to the joined context cuts that volume to zero.
         let actor = spawn_actor(config, None, mcp_peer_instance().to_string(), true);
 
-        tracing::info!("RPC actor spawned, persistent connection ready");
+        tracing::info!(context_label = %context_name, "RPC actor spawned; it connects on first use");
 
         let shared_context_id = Arc::new(Mutex::new(None));
 
-        Ok(Self {
+        Self {
             backend: Backend::Remote(RemoteState {
-                kernel_id: kernel_id_typed,
                 actor,
                 // `change` wakes the shell completion poll early on each
                 // server event for the joined context (once register_session
@@ -815,7 +839,14 @@ impl KaijutsuMcp {
                 cc_session_id.map(|_| "claude-code".to_string()),
             )),
             parent: None,
-        })
+            startup: StartupGate::open(),
+        }
+    }
+
+    /// Hold tool calls on `gate` until the caller settles it.
+    pub fn with_startup_gate(mut self, gate: StartupGate) -> Self {
+        self.startup = gate;
+        self
     }
 
     /// Name the context `register_session` creates its context under.
@@ -2516,6 +2547,20 @@ impl KaijutsuMcp {
 #[tool_handler]
 #[prompt_handler]
 impl ServerHandler for KaijutsuMcp {
+    /// Every tool call waits for startup registration (`StartupGate`), then
+    /// dispatches through the tool router as `#[tool_handler]` would.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if !self.startup.settled_within(STARTUP_WAIT).await {
+            tracing::warn!(tool = %request.name, "startup has not settled; running the call anyway");
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     // `enable_logging` is deprecated by SEP-2577 — see the import-site
     // comment above; kept for now so `logging/setLevel` keeps working.
     #[allow(deprecated)]
