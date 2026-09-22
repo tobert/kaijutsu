@@ -2005,6 +2005,18 @@ history must not be quoted. Open:
   (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
   lexer bug is kaish's (`gotcha_kaish` in memory has the shape).
 
+## The worker pool dropped a queued task's settlement once (2026-09-22)
+
+`runtime::worker::tests::a_factory_panic_during_shutdown_still_drains_accepted_work`
+failed once in a full `cargo test -p kaijutsu-kernel` run and passed three
+times alone. The third task's `finished` sender was dropped without the task
+running: `settled.await` failed with "factory failure must not discard queued
+settlement" (`runtime/worker.rs`), and no panic from the task's own asserts
+was printed. Same pool (2d829c9d) and the same class of cross-thread
+placement as the ignored same-context ordering test. Queued work that
+vanishes at shutdown loses a settlement, so treat it as a bug until a run
+shows otherwise.
+
 ## Egress: what stays open (2026-09-21)
 
 `docs/egress.md` owns the rule: per-context rows, a reviewer-held list, refuse

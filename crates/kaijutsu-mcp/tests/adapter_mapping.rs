@@ -232,3 +232,30 @@ fn codex_native_adapter_emits_single_line_json() {
     assert_eq!(ev.source, "codex");
     assert_eq!(ev.event, "tool.after");
 }
+
+/// A hook context on an event that ends a turn becomes feedback the host
+/// acts on: Claude Code started another turn for each Stop hook that carried
+/// a mirror error, and the new turn's Stop fired the hook again
+/// (docs/issues.md, "A stopped kernel makes the Claude Code Stop hook
+/// re-invoke the session"). Context goes only to events that feed it to the
+/// model alongside work already in flight.
+#[test]
+fn hook_context_reaches_only_events_that_take_additional_context() {
+    use kaijutsu_mcp::hook_types::HookResponse;
+    let response = HookResponse::allow_with_context("kaijutsu-mcp mirror error: connection refused");
+    for source in [HookSource::Claude, HookSource::Codex] {
+        for event in ["Stop", "SubagentStop", "SessionEnd", "PreCompact", "PostCompact"] {
+            assert_eq!(
+                source.response(event, &response),
+                None,
+                "{source:?} {event} must print nothing: context there can start another turn"
+            );
+        }
+        for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart"] {
+            assert!(
+                source.response(event, &response).is_some(),
+                "{source:?} {event} takes additionalContext and should still carry it"
+            );
+        }
+    }
+}

@@ -58,7 +58,19 @@ impl HookSource {
         })
     }
 
+    /// The native stdout for `response`, or `None` to print nothing.
+    ///
+    /// Context goes only to events that feed it to the model beside work
+    /// already in flight. On `Stop` and `SubagentStop` the host treats
+    /// `additionalContext` as feedback and keeps the turn going, so a mirror
+    /// error there starts another turn whose own end fires the hook again.
     pub fn response(self, native_event: &str, response: &HookResponse) -> Option<String> {
+        if !matches!(
+            native_event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "UserPromptSubmit" | "SessionStart"
+        ) {
+            return None;
+        }
         response.context.as_ref().and_then(|context| serde_json::to_string(&serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": native_event,
