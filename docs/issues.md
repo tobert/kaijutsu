@@ -210,6 +210,40 @@ Keep the architecture overview's current implementation separate from the
 planned destination in `docs/kaish-integration.md`; update server ownership,
 lifecycle callers, and diagrams when the code moves.
 
+## What banto driving one cleanup to a coder showed (2026-09-22)
+
+Banto (director, qwen3.8-flash) created a coder lane and drove the
+TimelineVisibility cleanup. The coder's edits were right; the path around them
+stalled. Ask rows: `kj ledger list --history --origin shell_gate --since`
+covering 2026-09-22. Open, most costly first:
+
+- **An ask to a model reviewer notifies nobody.** The coder's asks went to
+  banto, whose turn had ended; nothing woke it, and the coder spun to the
+  50-iteration cap. Design direction to discuss: a model reviewer passes the
+  ask up the walk with its opinion attached rather than holding it.
+- **One inert statement escalates a whole program.** Banto ran
+  `kj ledger allow <id>; echo "allow_exit=$?"`. The ledger answer has a
+  builtin allow; `echo` has no builtin key, so the program escalated and the
+  answer became an ask to banto's own reviewer. Banto was already the coder's
+  assigned reviewer; nothing else stood in the way. The director stance now says to run the answer
+  as a command of its own. Whether `echo`/`printf` without a redirect earn a
+  builtin key is open.
+- **lfm2d escalates a coder's `cargo check` and `git diff`.** Scored
+  situation-normal, escalated anyway; `2>/dev/null` on a read also became an
+  ask. Tune through `docs/gate-policy-tuning.md`, as for `kj handoff note`.
+- **Offline `kj` takes 44 s to boot.** Inferred, unprofiled:
+  `BlockStore::load_from_db` decodes every document snapshot serially under
+  the `KernelDb` mutex. Profile before changing it.
+- **Approval resume and completion notices write before reserving.**
+  `runtime/approval_resume.rs` and `runtime/completion_notice.rs` write blocks
+  ahead of a runtime reservation, against rule 1 of
+  `docs/resource-admission.md`.
+- **Approval delivery holds a top-level reservation for the process
+  lifetime.** Harmless at `ADMISSION_CAPACITY` 64; slice 4's occupant
+  exemption removes it.
+- **kaish bare `echo` prints nothing.** POSIX prints a newline. Upstream kaish
+  issue; Amy decides whether and how it is posted.
+
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
 Read by the lead; each line re-checked before it went here.
