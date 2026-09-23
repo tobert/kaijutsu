@@ -21,10 +21,16 @@ scripts. So a `searcher` type needs **no kernel edit, no registration, no restar
   the value only selects which rc scripts run (default `"default"`).
   ✓ `kaijutsu-kernel/src/kj/context.rs:1129`
   (`cfg.type_spec.take().unwrap_or_else(|| "default".to_string())` — no validation).
-- **A missing rc dir is fine.** The lifecycle loader treats an absent
-  `/config/rc/<type>/<verb>/` as "no scripts", not an error — so `searcher` exists as
-  a type the moment its `create/` dir does.
+- **A missing rc dir is fine for most verbs.** The lifecycle loader treats an
+  absent `/config/rc/<type>/<verb>/` as "no scripts", not an error.
   ✓ `kaijutsu-kernel/src/rc/mod.rs` `load_scripts` (NotFound → empty).
+  **`create` is the exception:** `kj context create --type searcher` refuses
+  before committing a row unless `/config/rc/searcher/create/` already holds
+  at least one `.kai` script — an empty or missing `create` bucket would
+  commit a context with no loadout. `searcher` needs its first `create`
+  script (at minimum `S10-binding.kai`) in place before the type can be used;
+  `fork`/`attach`/`drift`/etc. can stay unwritten until there is work for them.
+  ✓ `kaijutsu-kernel/src/kj/context.rs` (`create_bucket_has_candidates`).
 - **Script shape.** Executable filenames must be `SXX-name.kai` (lexical order =
   sort order). Markdown is ordinary data; scripts use `kj block create` for
   instructions. Symlinks compose shared scripts and companion data from `lib/`.

@@ -43,6 +43,18 @@ with test-driven development and an explicit warning that a context fork does
 not isolate file edits. The existing model-name branch selection is a policy,
 not a measured ranking of model capability.
 
+`kj context create --type <type>` refuses before committing a row when
+`<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
+runnable `.kai` script — naming the type, the expected bucket path, and `rc
+reseed` as the fix. A missing or empty bucket for any other verb (`fork`,
+`attach`, `drift`, `tick`, `rotate`, `submit`) stays a legitimate no-op: a
+type with no work to do at that verb is ordinary, and rc runs zero scripts
+without error. Rebinding a context whose loadout is missing (`kj context
+rebind`, boot's root-character repair, `kj context rotate`'s successor) runs
+the same `create` lifecycle and reports through `has_usable_loadout` after the
+fact instead, since those paths repair or replace a context that already
+exists rather than deciding whether to create one.
+
 Edit shipped defaults under `assets/defaults/rc/`, then use
 `kaijutsu-server rc reseed` to materialize them when deploying. Every rc lifecycle
 snapshots current executable bodies. Scripts create durable `(System, Text)` blocks;

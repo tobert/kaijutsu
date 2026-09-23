@@ -773,6 +773,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn rc_lifecycle_with_vars_seeds_kai_env() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
         let caller = console_caller(&d);
@@ -820,6 +821,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn rc_lifecycle_without_vars_leaves_heartbeat_empty() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"tick=$TICK phrase=$PHRASE tempo=$TEMPO\"")
         .await;
         let caller = console_caller(&d);
@@ -856,6 +858,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn rc_kai_trace_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/tick/S00-report.kai", "echo \"the beat goes on\"")
         .await;
 
@@ -963,6 +966,7 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
     async fn rc_failure_block_is_authored_by_context_owner_not_caller() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/tick/S00-broken.zzz", "this extension has no handler")
         .await;
         // `.zzz` is filtered out by the loader; use a `.kai` that exits nonzero
@@ -1268,17 +1272,15 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    /// `context_type = "nonexistent"` has an rc bucket (`/config/rc/nonexistent/`,
-    /// which `context create` requires) but no `create/` verb directory under
-    /// `test_dispatcher()`'s host-backed `LocalBackend` mount. `dispatch`'s own `Ok` and an empty
-    /// context alone don't distinguish "load_scripts correctly saw zero
-    /// scripts" from "load_scripts errored and `context.rs` swallowed it"
-    /// (`context create` logs-and-continues on an rc-lifecycle `Err`, per the
-    /// comment at its call site) — both leave the same block-free context and
-    /// the same `Ok` dispatch result. The run row's typed outcome is what
-    /// actually tells them apart, so assert on it directly.
+    /// `context_type = "nonexistent"` has an rc bucket (`/config/rc/nonexistent/`)
+    /// but no `create/` verb directory at all under `test_dispatcher()`'s
+    /// host-backed `LocalBackend` mount. A type whose create bucket is
+    /// missing would bind no loadout, so `context create` refuses before
+    /// committing a row — an absent-directory create bucket and an empty one
+    /// (`context_create_refuses_an_empty_create_directory`) are the same
+    /// shape from here.
     #[tokio::test]
-    async fn rc_no_scripts_for_type_is_noop() {
+    async fn context_create_refuses_a_type_with_no_create_directory() {
         use crate::vfs::VfsOps;
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
@@ -1294,21 +1296,29 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                 &caller,
             )
             .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let new_id = lookup_context_id(&d, "ctx-empty");
-        let kinds = block_kinds_in(&d, new_id);
         assert!(
-            kinds.is_empty(),
-            "no scripts should leave context block-free, got: {kinds:?}"
+            !result.is_ok(),
+            "a type with no create directory must refuse: {}",
+            result.message()
         );
-
-        let run = find_run_for_context(&d, new_id, "create").expect("run row");
-        assert!(run.finished_at.is_some());
-        assert_eq!(
-            run.outcome,
-            Some(RcOutcome::Ok),
-            "a genuinely absent rc directory is zero scripts, not a failed run"
+        assert!(
+            result.message().contains("nonexistent"),
+            "the refusal must name the rejected type: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("/config/rc/nonexistent/create"),
+            "the refusal must name the expected bucket path: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("rc reseed"),
+            "the refusal must name the fix: {}",
+            result.message()
+        );
+        assert!(
+            d.kernel_db().lock().find_context_by_label("ctx-empty").unwrap().is_none(),
+            "a refused create must not commit a context"
         );
     }
 
@@ -1341,11 +1351,13 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    /// A verb with no scripts records a count of zero rather than leaving it
-    /// unset: zero-of-zero is a complete run, and only a run that failed
-    /// before the script list loaded should read as having no count at all.
+    /// A `create` verb directory that exists but holds zero scripts is the
+    /// same "would commit an inert context" shape as no directory at all
+    /// (`context_create_refuses_a_type_with_no_create_directory`): `context
+    /// create` refuses before committing a row rather than running an empty
+    /// lifecycle and reporting a zero-of-zero "complete" run.
     #[tokio::test]
-    async fn rc_empty_verb_records_zero_script_count() {
+    async fn context_create_refuses_an_empty_create_directory() {
         use crate::vfs::VfsOps;
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
@@ -1363,11 +1375,20 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
                 &caller,
             )
             .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-
-        let new_id = lookup_context_id(&d, "ctx-zero");
-        let run = find_run_for_context(&d, new_id, "create").expect("run row");
-        assert_eq!(run.script_count, Some(0));
+        assert!(
+            !result.is_ok(),
+            "an empty create bucket must refuse: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("/config/rc/nothinghere/create"),
+            "the refusal must name the expected bucket path: {}",
+            result.message()
+        );
+        assert!(
+            d.kernel_db().lock().find_context_by_label("ctx-zero").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
     }
 
     /// A noncanonical .kai filename fails discovery before any script runs.
@@ -1763,6 +1784,7 @@ esac
     async fn rc_drift_compact_fork_does_not_double_fire() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/fork/S00-fork.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'FORK-MARKER'"#).await;
         install_rc_script_file(&d, "/config/rc/test/drift/S00-drift.kai", r#"kj block create --role system --kind text --content-type text/markdown --content 'DRIFT-MARKER'"#).await;
 
@@ -1776,14 +1798,13 @@ esac
         assert!(r.is_ok(), "create parent failed: {}", r.message());
         let parent_id = lookup_context_id(&d, "parent");
 
-        // `kj context create` writes the KernelDb context+document but
-        // doesn't seed a BlockStore document unless the rc create
-        // lifecycle inserted blocks. With no `create` script for
-        // `test`, the BlockStore doc isn't created — seed it explicitly
-        // so insert_block_as has somewhere to land.
-        d.block_store()
-            .create_document(parent_id, crate::DocumentKind::Conversation, None)
-            .unwrap();
+        // The no-op `create` script above already made `rc::run` seed the
+        // BlockStore document before it ran — tolerate that here rather
+        // than requiring this call to be the one that creates it.
+        match d.block_store().create_document(parent_id, crate::DocumentKind::Conversation, None) {
+            Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
+            Err(e) => panic!("could not seed the parent document: {e}"),
+        }
 
         // Insert a block so --compact has something to distill (otherwise
         // the distillation path errors out before reaching rc).
@@ -1849,6 +1870,7 @@ esac
         // fork-marker block by the time this rc hook fires.
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
+        install_rc_script_file(&d, "/config/rc/test/create/S00-noop.kai", "true").await;
         install_rc_script_file(&d, "/config/rc/test/fork/S00-assert-parent-count.kai", // Three explicit assertions, each with a distinct exit code
             // so a regression points at the right one:
             //   exit 1 — env var missing
@@ -1876,12 +1898,13 @@ esac
         assert!(r.is_ok(), "create parent failed: {}", r.message());
         let parent_id = lookup_context_id(&d, "parent");
 
-        // `kj context create` writes KernelDb but doesn't seed the
-        // BlockStore unless an rc-on-create script does. Seed it
-        // explicitly so we can insert exactly the count we want.
-        d.block_store()
-            .create_document(parent_id, crate::DocumentKind::Conversation, None)
-            .unwrap();
+        // The no-op `create` script above already made `rc::run` seed the
+        // BlockStore document before it ran — tolerate that here rather
+        // than requiring this call to be the one that creates it.
+        match d.block_store().create_document(parent_id, crate::DocumentKind::Conversation, None) {
+            Ok(()) | Err(crate::block_store::BlockStoreError::DocumentAlreadyExists(_)) => {}
+            Err(e) => panic!("could not seed the parent document: {e}"),
+        }
 
         // Seed exactly 3 blocks. The rc script's case match pins this.
         for content in ["a", "b", "c"] {
@@ -2589,15 +2612,15 @@ esac
         assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Failed));
     }
 
-    /// A verb whose directory EXISTS but has no `.kai` scripts in it
-    /// still leaves a finished `Ok` run — the empty case is legitimate, not
-    /// a gap in the log. Distinct from `rc_no_scripts_for_type_is_noop`,
-    /// which covers a type with no rc directory at all: this one installs a
-    /// non-script file so the directory is real and non-empty, exercising
+    /// A `create` directory that EXISTS but has no `.kai` scripts in it —
+    /// only a non-script file, so the directory is real and non-empty — is
+    /// the same "would commit an inert context" shape as an empty or missing
+    /// directory: `context create` refuses before committing a row. Exercises
     /// "readdir succeeds, nothing matches `.kai`" rather than "readdir
-    /// reports the directory missing."
+    /// reports the directory missing"
+    /// (`context_create_refuses_a_type_with_no_create_directory`).
     #[tokio::test]
-    async fn a_verb_with_no_scripts_still_finishes_as_ok() {
+    async fn context_create_refuses_a_create_directory_with_no_kai_scripts() {
         let d = std::sync::Arc::new(test_dispatcher().await);
         d.set_self_arc();
         install_rc_script_file(
@@ -2613,12 +2636,20 @@ esac
                 &caller,
             )
             .await;
-        assert!(result.is_ok(), "create failed: {}", result.message());
-        let new_id = lookup_context_id(&d, "ctx-run-empty");
-
-        let run = find_run_for_context(&d, new_id, "create").expect("run row");
-        assert!(run.finished_at.is_some());
-        assert_eq!(run.outcome, Some(approval_ledger::types::RcOutcome::Ok));
+        assert!(
+            !result.is_ok(),
+            "a create bucket with no .kai scripts must refuse: {}",
+            result.message()
+        );
+        assert!(
+            result.message().contains("/config/rc/emptytype/create"),
+            "the refusal must name the expected bucket path: {}",
+            result.message()
+        );
+        assert!(
+            d.kernel_db().lock().find_context_by_label("ctx-run-empty").unwrap().is_none(),
+            "a refused create must not commit a context"
+        );
     }
 
     /// Scripts run in lexical filename order regardless of creation order,

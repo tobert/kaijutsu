@@ -447,6 +447,40 @@ async fn load_scripts(
     }
     Ok(scripts)
 }
+
+/// Whether `(context_type, "create")`'s rc bucket lists at least one
+/// candidate script: an entry that is a file or a symlink whose name ends in
+/// `.kai`. This is `load_scripts`' first pass — name-filtering only, before
+/// canonical-name validation or content reads — so a bucket holding an
+/// invalid script name or a dangling symlink still counts as populated here;
+/// that is a discovery failure for `load_scripts` to report against the
+/// committed context, not an empty bucket. A missing directory reads as
+/// empty, the same as `load_scripts`.
+///
+/// `kj context create` calls this before committing a context row: a type
+/// whose `create` bucket is missing or holds no candidate script would bind
+/// no loadout and be committed inert (deny-by-default). Other verbs keep
+/// `load_scripts`' "missing directory is zero scripts, not a failure" rule —
+/// an empty `attach` or `fork` bucket is a legitimate shape for a type that
+/// has no work to do at that verb.
+pub async fn create_bucket_has_candidates(
+    dispatcher: &KjDispatcher,
+    context_type: &str,
+) -> Result<bool, String> {
+    use crate::vfs::{VfsError, VfsOps};
+
+    let dir = paths::rc_dir(context_type, VERB_CREATE);
+    let vfs = dispatcher.kernel().vfs();
+    let entries = match vfs.readdir(std::path::Path::new(&dir)).await {
+        Ok(e) => e,
+        Err(VfsError::NotFound(_)) | Err(VfsError::NoMountPoint(_)) => return Ok(false),
+        Err(e) => return Err(format!("rc lifecycle: readdir {dir}: {e}")),
+    };
+    Ok(entries
+        .into_iter()
+        .any(|e| (e.kind.is_file() || e.kind.is_symlink()) && e.name.ends_with(".kai")))
+}
+
 async fn run_kai_script(
     dispatcher: &KjDispatcher,
     invocation: &RcInvocation<'_>,

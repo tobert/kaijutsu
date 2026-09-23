@@ -1480,6 +1480,33 @@ impl KjDispatcher {
             return KjResult::Err(format!("kj context create: {e}"));
         }
 
+        // Refuse a type whose `create` bucket is missing or holds no
+        // candidate script, also before any mutation. `load_scripts` reads
+        // an absent directory as zero scripts, not a failure — legitimate
+        // for verbs a type has no work at, but `create` is the lifecycle
+        // that binds a context's loadout. Left unchecked, this type would
+        // commit a context whose create lifecycle runs nothing: an inert
+        // row (deny-by-default, no loadout) with no error to explain it.
+        match crate::rc::create_bucket_has_candidates(self, &context_type).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return KjResult::Err(format!(
+                    "kj context create: context type '{context_type}' has no rc create \
+                     scripts at {}; a context of this type would be committed inert \
+                     (deny-by-default, no loadout) with no create lifecycle to bind one. \
+                     Add a script there, or run `kaijutsu-server rc reseed` to restore the \
+                     shipped bucket.",
+                    kaijutsu_types::paths::rc_dir(&context_type, crate::rc::VERB_CREATE),
+                ));
+            }
+            Err(e) => {
+                return KjResult::Err(format!(
+                    "kj context create: could not check the '{context_type}' create bucket \
+                     for scripts: {e}"
+                ));
+            }
+        }
+
         // The beat is no longer a Rust special-case here: arming a musician is an
         // rc step (`musician/create/S20-arm.kai` runs `kj transport arm`), so a
         // context_type is a beat participant exactly when its `create/` rc arms it
