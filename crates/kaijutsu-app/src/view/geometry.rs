@@ -70,14 +70,9 @@ pub struct GeomRow {
     pub indent_level: u32,
     /// Document version when this row was first created.
     ///
-    /// Currently write-only: it fed `TimelineVisibility.created_at_version`
-    /// seeding in the deleted per-block-cell path (block-cell entities
-    /// carried the timeline-dimming component; a respawned/scrolled-back-
-    /// into-view block reused this to avoid being mis-classified as new).
-    /// The conversation surface never grew an equivalent — timeline dimming
-    /// has had no live reader since `Surface` became the default; see
-    /// `docs/issues.md`. Kept because it costs nothing to carry and is what
-    /// a reimplementation would read from first.
+    /// Write-only outside this module's tests: nothing dims blocks by
+    /// timeline position. Kept because it costs nothing to carry and is what
+    /// a timeline-dimming implementation would read first.
     #[allow(dead_code)]
     pub created_at_version: u64,
 }

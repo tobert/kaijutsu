@@ -36,6 +36,4 @@ pub use plugin::TimelinePlugin;
 // Re-export key types (components are used internally by systems)
 // Some aren't consumed externally yet but will be when RPC integration completes
 #[allow(unused_imports)]
-pub use components::{
-    CherryPickRequest, CherryPickResult, TimelineState, TimelineViewMode, TimelineVisibility,
-};
+pub use components::{CherryPickRequest, CherryPickResult, TimelineState, TimelineViewMode};

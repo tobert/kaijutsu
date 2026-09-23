@@ -15,8 +15,7 @@ impl Plugin for TimelinePlugin {
     fn build(&self, app: &mut App) {
         // Register types for BRP reflection
         app.register_type::<TimelineState>()
-            .register_type::<TimelineViewMode>()
-            .register_type::<TimelineVisibility>();
+            .register_type::<TimelineViewMode>();
 
         // Initialize resources
         app.init_resource::<TimelineState>();

@@ -2347,16 +2347,6 @@ context for `Backend::Remote`, so a global search silently skips every other
 context; resource/prompt handlers hardcode `kind: "Conversation"` for Remote
 (`lib.rs:2871,2918`).
 
-## `TimelineVisibility` is now unused (2026-09-20)
-
-Deleting `update_block_visibility` left `TimelineVisibility`
-(`kaijutsu-app/src/ui/timeline/components.rs:169`) with a definition, a
-`register_type` call (`plugin.rs:19`), a re-export (`mod.rs:40`), and no
-reader or writer. The file's blanket `#![allow(dead_code)]` hides it. Delete
-the struct, its `Default`, its registration and its re-export, and correct
-`view/geometry.rs:73`, which still describes feeding
-`TimelineVisibility.created_at_version`.
-
 ## The stream-start retry loop's use of `retry_disposition` has no test (2026-09-20)
 
 `retry_disposition` (`runtime/llm_stream.rs`) is pinned exhaustively per

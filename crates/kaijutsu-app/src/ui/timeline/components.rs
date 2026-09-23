@@ -155,32 +155,3 @@ pub struct CherryPickResult {
     /// Error message if failed.
     pub error: Option<String>,
 }
-
-// ============================================================================
-// BLOCK VISUAL STATE
-// ============================================================================
-
-/// Visual modifier for blocks based on timeline position.
-///
-/// Blocks in the "past" (before viewing position) appear dimmed.
-/// Blocks at or after viewing position appear normal.
-#[derive(Component, Debug, Clone, Reflect)]
-#[reflect(Component)]
-pub struct TimelineVisibility {
-    /// The version when this block was created.
-    pub created_at_version: u64,
-    /// Current opacity (0.0 = hidden, 1.0 = fully visible).
-    pub opacity: f32,
-    /// Whether this block is in the "past" relative to viewing position.
-    pub is_past: bool,
-}
-
-impl Default for TimelineVisibility {
-    fn default() -> Self {
-        Self {
-            created_at_version: 0,
-            opacity: 1.0,
-            is_past: false,
-        }
-    }
-}
