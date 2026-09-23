@@ -182,7 +182,15 @@ fn main() -> ExitCode {
 }
 
 async fn async_main() -> ExitCode {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Parsed before the logging filter: `kj` (`docs/server-cli.md`) boots the
+    // same kernel the serving default boots, but its whole point is one
+    // verb's answer on stdout, not a running service's narration — so it
+    // defaults quieter (`kaijutsu_server::offline::default_log_directive`)
+    // unless the operator set RUST_LOG explicitly.
+    let cli = Cli::parse();
+    let is_kj = matches!(cli.command, Some(Command::Kj(_)));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(kaijutsu_server::offline::default_log_directive(is_kj)));
 
     let registry = tracing_subscriber::registry()
         .with(filter)
@@ -197,7 +205,6 @@ async fn async_main() -> ExitCode {
         None
     };
 
-    let cli = Cli::parse();
     let PathArgs { config_root, mount, rw_mount, port } = cli.paths;
 
     match cli.command {

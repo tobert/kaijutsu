@@ -501,7 +501,7 @@ impl Tool for KjBuiltin {
                 ephemeral,
                 data,
             } => {
-                let mut result = ExecResult::success(message);
+                let mut result = ExecResult::success(with_trailing_newline(message));
                 result.content_type = if content_type != ContentType::Plain {
                     Some(content_type.as_mime().to_string())
                 } else {
@@ -531,7 +531,7 @@ impl Tool for KjBuiltin {
                     // A pinned run (structured `kj`) cannot move its caller,
                     // so the target rides in `.data` for the client to follow.
                     Ok(()) => {
-                        let mut result = ExecResult::success(msg);
+                        let mut result = ExecResult::success(with_trailing_newline(msg));
                         result.data = Some(kaish_kernel::interpreter::json_to_value(
                             serde_json::json!({"switched_to": new_id.to_hex()}),
                         ));
@@ -571,6 +571,21 @@ impl Tool for KjBuiltin {
 /// guard — the exact failure mode this function exists to close. (Depth is a
 /// footgun guard under shared trust, not security — see `KjCaller::privileged`
 /// for the field that must NOT come from a scope var.)
+/// Make `message` end with exactly one trailing newline, the way an
+/// ordinary command's own stdout does — mirroring kaish's own `echo` builtin
+/// (empty output stays empty; anything else gets exactly one `\n`).
+///
+/// kaish concatenates consecutive top-level statement outputs raw, with no
+/// separator of its own: each command supplies its own trailing newline. A
+/// `kj` result that did not was the live bug behind `kj ledger cancel A;
+/// echo; kj ledger cancel B` rendering as one run-together line.
+fn with_trailing_newline(mut message: String) -> String {
+    if !message.is_empty() && !message.ends_with('\n') {
+        message.push('\n');
+    }
+    message
+}
+
 fn rc_depth_from_scope(scope: &kaish_kernel::interpreter::Scope) -> Result<u8, String> {
     let Some(value) = scope.get("KJ_RC_DEPTH") else {
         return Ok(0);
@@ -1578,6 +1593,45 @@ mod tests {
         assert!(
             stdout.contains(&unlabeled.short()),
             "unlabeled context short id missing: {stdout}"
+        );
+    }
+
+    /// Live bug: `kj ledger cancel A; echo; kj ledger cancel B` rendered as
+    /// `cancelled ask A; nothing rancancelled ask B; nothing ran` — no
+    /// newline between the two `kj` results. kaish concatenates consecutive
+    /// statement outputs raw with no separator by design (see
+    /// `push_stdout_of`'s doc comment in kaish-kernel's `kernel.rs`, pinned
+    /// rev — "a trailing newline only appears when a command emits its own,
+    /// as `echo` does"), so `kj` must supply its own trailing newline the
+    /// same way `echo` does, or two results in one statement list run
+    /// together on the same line.
+    #[tokio::test]
+    async fn each_kj_result_ends_with_a_newline_like_an_ordinary_command() {
+        let dispatcher = Arc::new(test_dispatcher().await);
+        dispatcher.set_self_arc();
+
+        let principal = PrincipalId::new();
+        let ctx = {
+            let c = register_context(&dispatcher, Some("solo"), None, principal);
+            dispatcher
+                .block_store()
+                .create_document(c, kaijutsu_types::DocKind::Conversation, None)
+                .expect("create_document");
+            c
+        };
+
+        let kaish = embedded_with_kj(dispatcher, ctx).await;
+
+        let res = kaish
+            .execute_with_options("kj block count; kj block count", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+        assert!(res.ok(), "kj block count exit != 0: {res:?}");
+        assert_eq!(
+            res.text_out(),
+            "0\n0\n",
+            "two kj results in one statement list must not run together: {:?}",
+            res.text_out()
         );
     }
 

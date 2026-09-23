@@ -139,6 +139,23 @@ pub fn build_request(
     }
 }
 
+/// Process-global set of `(backend, model, knob, value)` tuples that have
+/// already warned about a dropped, inert tunable. A live endpoint sends the
+/// same tuple on every request — without this, `resolve_effort` logged the
+/// identical warning 58 times in 15 minutes against one backend/model pair.
+static WARNED_INERT_TUNABLE_DROPS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String, String, String)>>,
+> = std::sync::OnceLock::new();
+
+/// Whether this `(backend, model, knob, value)` tuple should warn — true the
+/// first time it is seen this process, false on every later call. The drop
+/// itself is unconditional; only the logging is deduplicated.
+fn should_warn_effort_dropped(backend: &str, model: &str, knob: &str, value: &str) -> bool {
+    let set = WARNED_INERT_TUNABLE_DROPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let key = (backend.to_string(), model.to_string(), knob.to_string(), value.to_string());
+    set.lock().expect("dedupe mutex poisoned").insert(key)
+}
+
 /// Resolve `effort` into the `(reasoning_effort, thinking)` wire pair for
 /// one of the three dialects `build_request` distinguishes. Free function so
 /// each branch — and its inert-tunable warning — is directly unit-testable.
@@ -160,14 +177,25 @@ fn resolve_effort(
         return (effort.map(str::to_string), None);
     }
     if let Some(e) = effort {
-        tracing::warn!(
-            backend = backend_label,
-            model = %model,
-            knob = "effort",
-            value = %e,
-            "effort has no sink on a non-hosted, non-DeepSeek OpenAI-compatible \
-             endpoint; dropped"
-        );
+        if should_warn_effort_dropped(backend_label, model, "effort", e) {
+            tracing::warn!(
+                backend = backend_label,
+                model = %model,
+                knob = "effort",
+                value = %e,
+                "effort has no sink on a non-hosted, non-DeepSeek OpenAI-compatible \
+                 endpoint; dropped"
+            );
+        } else {
+            tracing::debug!(
+                backend = backend_label,
+                model = %model,
+                knob = "effort",
+                value = %e,
+                "effort has no sink on a non-hosted, non-DeepSeek OpenAI-compatible \
+                 endpoint; dropped (already warned this process)"
+            );
+        }
     }
     (None, None)
 }
@@ -756,6 +784,24 @@ mod tests {
                 "gpt",
             );
             assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
+        }
+
+        #[test]
+        fn effort_drop_warns_once_per_backend_model_knob_value_then_stays_quiet() {
+            // Regression for the live 58-times-in-15-minutes noise: the same
+            // (backend, model, knob, value) tuple must warn exactly once per
+            // process, then answer false forever after.
+            assert!(should_warn_effort_dropped("alibaba", "qwen3.8-flash", "effort", "xhigh"));
+            assert!(!should_warn_effort_dropped("alibaba", "qwen3.8-flash", "effort", "xhigh"));
+            assert!(!should_warn_effort_dropped("alibaba", "qwen3.8-flash", "effort", "xhigh"));
+        }
+
+        #[test]
+        fn effort_drop_warns_again_for_a_different_value() {
+            // A changed knob value is new information — it must not be
+            // swallowed by a dedupe keyed only on backend+model.
+            assert!(should_warn_effort_dropped("lemonade", "model-a", "effort", "low"));
+            assert!(should_warn_effort_dropped("lemonade", "model-a", "effort", "high"));
         }
 
         #[test]

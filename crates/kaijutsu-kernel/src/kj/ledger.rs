@@ -214,7 +214,7 @@ fn parse_verb_arg(s: &str) -> Result<String, String> {
 /// Garbage is rejected loudly — CLAUDE.md's stance against
 /// silent fallbacks applies just as much to a mistyped flag as to
 /// anything else; `--since 5x` must be an error, never "no filter".
-fn parse_since_duration_ms(s: &str) -> Result<i64, String> {
+pub(crate) fn parse_since_duration_ms(s: &str) -> Result<i64, String> {
     let bad = || {
         format!(
             "kj ledger: invalid --since {s:?} — use an integer followed by m/h/d, e.g. 30m, 2h, 7d"

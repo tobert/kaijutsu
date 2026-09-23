@@ -348,3 +348,25 @@ async fn settle(shared: &SharedKernel) -> Result<(), String> {
     }
     result
 }
+
+/// The `RUST_LOG` directive `kaijutsu-server` falls back to when the
+/// operator did not set one. `kj` boots the same kernel the serving default
+/// boots, but its whole point is one verb's answer on stdout — the serving
+/// default's `info` boot narration (every backend, the drift queue, every
+/// recovered context) buries that answer in noise. Every other subcommand
+/// keeps `info`. `kj`'s own errors always print (`eprintln!`, not
+/// `tracing`), so a quieter default never hides a real failure.
+pub fn default_log_directive(is_kj_subcommand: bool) -> &'static str {
+    if is_kj_subcommand { "warn" } else { "info" }
+}
+
+#[cfg(test)]
+mod default_log_directive_tests {
+    use super::default_log_directive;
+
+    #[test]
+    fn kj_defaults_to_warn_everything_else_defaults_to_info() {
+        assert_eq!(default_log_directive(true), "warn");
+        assert_eq!(default_log_directive(false), "info");
+    }
+}

@@ -19,6 +19,32 @@ use super::{KjCaller, KjDispatcher, KjResult};
 /// Maximum interval between state reads while no turn event arrives.
 const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Parse `--timeout <duration>` into whole seconds: a bare integer (`120`)
+/// or an explicit `s` suffix (`90s`) for compatibility, or `kj ledger list
+/// --since`'s own integer+unit grammar (`20m`, `2h`, `7d`) reused rather than
+/// duplicated — see [`super::ledger::parse_since_duration_ms`].
+fn parse_timeout_seconds(s: &str) -> Result<u64, String> {
+    let bad = || {
+        format!(
+            "kj wait: invalid --timeout {s:?} — use an integer number of seconds, an integer \
+             followed by s, or by m/h/d, e.g. 90, 90s, 20m, 2h, 7d"
+        )
+    };
+    if s.is_empty() {
+        return Err(bad());
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<u64>().map_err(|_| bad());
+    }
+    if let Some(digits) = s.strip_suffix('s') {
+        return digits.parse::<u64>().map_err(|_| bad()).and_then(|n| {
+            if n == 0 { Err(bad()) } else { Ok(n) }
+        });
+    }
+    let ms = super::ledger::parse_since_duration_ms(s).map_err(|_| bad())?;
+    Ok((ms / 1000) as u64)
+}
+
 /// What a tail entry may carry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum TailFilter {
@@ -66,9 +92,11 @@ pub(crate) struct WaitArgs {
     /// `kj wait` to read newly added blocks.
     #[arg(long)]
     since: Option<String>,
-    /// Stop waiting after this many seconds and report status `running` with
-    /// the current observations. The timeout does not cancel work.
-    #[arg(long, default_value_t = 120)]
+    /// Stop waiting after this long and report status `running` with the
+    /// current observations, without canceling the work. Bare seconds
+    /// (`120`), an explicit `s` (`90s`), or `kj ledger list --since`'s
+    /// integer+unit grammar (`20m`, `2h`, `7d`).
+    #[arg(long, default_value_t = 120, value_parser = parse_timeout_seconds)]
     timeout: u64,
     /// Keep at most this many blocks in the tail, newest kept.
     #[arg(long, default_value_t = 20)]
@@ -444,6 +472,32 @@ impl Classify for WaitArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_accepts_bare_seconds_explicit_s_and_the_ledger_since_grammar() {
+        assert_eq!(parse_timeout_seconds("120"), Ok(120));
+        assert_eq!(parse_timeout_seconds("90s"), Ok(90));
+        assert_eq!(parse_timeout_seconds("20m"), Ok(1200));
+        assert_eq!(parse_timeout_seconds("2h"), Ok(7200));
+        assert_eq!(parse_timeout_seconds("7d"), Ok(604800));
+    }
+
+    #[test]
+    fn timeout_rejects_garbage_loudly() {
+        assert!(parse_timeout_seconds("").is_err());
+        assert!(parse_timeout_seconds("0s").is_err());
+        assert!(parse_timeout_seconds("5x").is_err());
+        assert!(parse_timeout_seconds("-1").is_err());
+    }
+
+    /// The actual live bug: `kj wait --timeout 20m` used to be refused with
+    /// "invalid digit found in string" because the clap field was a bare
+    /// `u64`.
+    #[test]
+    fn wait_args_parses_a_ledger_style_timeout() {
+        let parsed = WaitArgs::try_parse_from(["--timeout", "20m"]).expect("20m must parse");
+        assert_eq!(parsed.timeout, 1200);
+    }
 
     #[test]
     fn wait_accepts_one_explicit_work_handle() {
