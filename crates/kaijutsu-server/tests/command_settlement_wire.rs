@@ -41,34 +41,69 @@ fn interactive_submission_uses_its_addressed_context() {
     });
 }
 
-/// Two submissions to one context, both in flight before either is prepared,
-/// must land their command/output pairs in submission order. Under the worker
-/// pool the two preparations run on different threads at once, so the order is
-/// whichever thread reaches `start_shell_operation` first. This test decides
-/// whether `pick_thread` hashes the context; see `docs/resource-admission.md`,
-/// "Same-context order across transports".
+/// Arrival order between two concurrent submissions to one context is not a
+/// promise: there is no context affinity, so the two preparations can run on
+/// different worker threads and land in either order
+/// (`docs/resource-admission.md`, "No context affinity"). What IS promised is
+/// pairing — each output block names its own command block as parent, never
+/// the other submission's — and that each pair is written atomically: the
+/// command and its output share one insert version, the context's mutation
+/// version captured inside the same write. This replaces the same-named test
+/// that asserted order instead (kept `#[ignore]`d while order was believed to
+/// be the claim); see the doc's history there.
 #[test]
-#[ignore = "the worker pool runs two same-context submissions on different threads, so their pair order is a race; affinity is out of scope for slice 1"]
-fn two_in_flight_submissions_to_one_context_keep_their_pair_order() {
+fn two_in_flight_submissions_to_one_context_each_pair_its_own_command_atomically() {
     run_local(async {
         let (addr, kernel) = start_server_with_kernel_handle().await;
         let client = connect_client(addr).await;
         let (kj, _) = client.bind_kernel().await.unwrap();
-        let context = create_context(&kj, "same-context-order").await.unwrap();
-        kj.join_context(context, "same-context-order").await.unwrap();
-        // One connection, both requests on the wire before either is answered:
-        // the server reads them in order, so submission order is the send order.
+        let context = create_context(&kj, "same-context-pairing").await.unwrap();
+        kj.join_context(context, "same-context-pairing").await.unwrap();
+        let mut events = kernel.kernel.block_flows().subscribe("block.*");
+        // One connection, both requests on the wire before either is answered.
         let (first, second) = futures::join!(
             kj.shell_submit("echo first", context, true),
             kj.shell_submit("echo second", context, true),
         );
         let first = first.unwrap().command_block_id;
         let second = second.unwrap().command_block_id;
-        let blocks = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
-        let position = |id| blocks.iter().position(|block| block.id == id)
-            .unwrap_or_else(|| panic!("submission {id} left no command block"));
-        assert!(position(first) < position(second),
-            "two submissions to one context must keep their pair order: {first} landed after {second}");
+        assert_ne!(first, second, "two submissions must mint distinct command blocks");
+
+        // Collect this context's Inserted events until both pairs (command +
+        // output, four blocks) have landed, keyed by block id so the check
+        // does not depend on which pair arrives first.
+        let mut seen: std::collections::HashMap<
+            kaijutsu_types::BlockId, (u64, Option<kaijutsu_types::BlockId>),
+        > = std::collections::HashMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seen.len() < 4 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv()).await
+                .expect("both submissions' pairs must be inserted").unwrap();
+            if let kaijutsu_kernel::flows::BlockFlow::Inserted { context_id, block, version, .. } = event.payload {
+                if context_id == context {
+                    seen.insert(block.id, (version, block.tool_call_id));
+                }
+            }
+        }
+
+        let output_of = |command: kaijutsu_types::BlockId| {
+            seen.iter()
+                .find(|(id, (_, parent))| **id != first && **id != second && *parent == Some(command))
+                .map(|(id, (version, _))| (*id, *version))
+                .unwrap_or_else(|| panic!("command {command} left no output block naming it as parent"))
+        };
+        let (first_output, first_output_version) = output_of(first);
+        let (second_output, second_output_version) = output_of(second);
+        assert_ne!(first_output, second_output, "each submission's output must be its own block");
+
+        let (first_command_version, _) = seen[&first];
+        let (second_command_version, _) = seen[&second];
+        assert_eq!(first_command_version, first_output_version,
+            "the first submission's command and output must share one insert version (written atomically)");
+        assert_eq!(second_command_version, second_output_version,
+            "the second submission's command and output must share one insert version (written atomically)");
+
         kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
@@ -499,5 +534,70 @@ fn structured_kj_replacements_preserve_data_and_clear_execution_metadata() {
                 }
             }
         }
+    });
+}
+
+/// Slice 2 (`docs/resource-admission.md`): with the worker pool fully
+/// admitted, shell, structured `kj`, streaming, prompt, and draft submission
+/// are each refused — and none of them leaves a block, a shell-operation
+/// receipt, or a block-flow event behind, and a pending draft is untouched.
+/// Each of these callers reserves before its own durable write (rule 1), so
+/// the refusal happens before anything is created, not after.
+#[test]
+fn pool_full_refuses_shell_structured_streaming_prompt_and_draft_submission() {
+    run_local(async {
+        let (addr, kernel) = start_server_with_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "pool-full-refusals").await.unwrap();
+        kj.join_context(context, "pool-full-refusals").await.unwrap();
+
+        // A draft, typed before the pool fills, that a refused submission
+        // must leave exactly as it was.
+        kj.edit_input(context, 0, "typed while the pool is full", 0).await.unwrap();
+        let before = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        let draft_before = before.iter().find(|block| block.status == Status::Draft).cloned()
+            .expect("a draft exists before any submission is attempted");
+
+        let mut block_events = kernel.kernel.block_flows().subscribe("block.*");
+
+        // Exhausts every worker thread and the pool's one unit of headroom
+        // beyond thread count — `Kernel::fill_runtime_pool_for_test` is the
+        // cross-crate equivalent of `kj::test_helpers::park_runtime_pool`.
+        let releases = kernel.kernel.fill_runtime_pool_for_test().await;
+        assert!(kernel.kernel.reserve_runtime_slot().is_err(),
+            "the pool must be fully admitted for this test to mean anything");
+
+        let shell = kj.shell_submit("echo pool-full-shell", context, true).await;
+        assert!(shell.is_err(), "shell submission must be refused while the pool is full: {shell:?}");
+
+        let structured = kj.execute_kj(context, &["context".into(), "current".into()]).await;
+        assert!(structured.is_err(), "structured kj must be refused while the pool is full: {structured:?}");
+
+        let streaming = kj.execute("echo pool-full-stream").await;
+        assert!(streaming.is_err(), "streaming submission must be refused while the pool is full: {streaming:?}");
+
+        let prompt = kj.prompt("pool-full prompt", None, context).await;
+        assert!(prompt.is_err(), "prompt submission must be refused while the pool is full: {prompt:?}");
+
+        let draft_submit = kj.submit_input(context, false).await;
+        assert!(draft_submit.is_err(), "draft submission must be refused while the pool is full: {draft_submit:?}");
+
+        drop(releases);
+
+        // No block, receipt, or event escaped any of the five refusals.
+        let after = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
+        assert_eq!(before.len(), after.len(),
+            "a refused submission must leave no block behind: {before:#?} vs {after:#?}");
+        let draft_after = after.iter().find(|block| block.status == Status::Draft)
+            .expect("the draft must still be there, unconsumed");
+        assert_eq!(draft_after.id, draft_before.id, "a refused draft submission must not replace the draft block");
+        assert_eq!(draft_after.content, draft_before.content, "a refused draft submission must not touch the draft");
+        assert!(kernel.kernel.shell_operations().list_for_context(context).unwrap().is_empty(),
+            "a refused shell or structured submission must leave no receipt");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), block_events.recv()).await.is_err(),
+            "none of the five refusals may publish a block event");
+
+        kernel.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }

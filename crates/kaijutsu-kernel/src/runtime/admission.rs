@@ -45,13 +45,22 @@ impl Kernel {
 
     /// Accept and queue one context request on the existing runtime worker.
     /// The task carries admission through preparation; shutdown owns cancellation.
+    ///
+    /// Reserves a worker-pool slot before minting the `ContextAdmission`
+    /// (`docs/resource-admission.md`, rule 1: a reservation precedes even the
+    /// admission mint, not only a block write) — shell, structured `kj`, and
+    /// streaming submission all route through here, so fixing the order once
+    /// covers all three.
     pub(crate) fn spawn_context_task<F, W>(&self, context: ContextId, work: W) -> Result<(), String>
     where F: std::future::Future<Output = ()> + 'static,
         W: FnOnce(ContextAdmission, tokio_util::sync::CancellationToken) -> F + Send + 'static,
     {
-        let db = self.kernel_db().lock();
-        let admission = ContextAdmission::acquire(&db, context)?;
-        self.spawn_runtime_task(move |stop| work(admission, stop))
+        let slot = self.reserve_runtime_slot()?;
+        let admission = {
+            let db = self.kernel_db().lock();
+            ContextAdmission::acquire(&db, context)?
+        };
+        slot.spawn(move |stop| work(admission, stop))
     }
 }
 

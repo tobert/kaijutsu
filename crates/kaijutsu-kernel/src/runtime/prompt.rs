@@ -13,10 +13,16 @@ pub enum PromptSource {
 
 /// Persist input before preparation. Accepted work owns its turn before the
 /// first await and survives caller disconnect; the reply reports startup only.
+///
+/// Reserves a worker-pool slot before minting the `ContextAdmission`, before
+/// the user block is inserted, and before a draft is consumed
+/// (`docs/resource-admission.md`, rule 1) — a refused prompt or draft
+/// submission leaves no block and no consumed draft.
 pub async fn submit(
     kernel: &Arc<Kernel>, context: ContextId, principal: PrincipalId,
     session: SessionId, source: PromptSource,
 ) -> Result<BlockId, String> {
+    let slot = kernel.reserve_runtime_slot()?;
     let (admission, lease, turn_live) = {
         let db = kernel.kernel_db().lock();
         let admission = ContextAdmission::acquire(&db, context)?;
@@ -59,6 +65,6 @@ pub async fn submit(
             principal_id: principal, model, continuation_epoch: None, score: None,
         },
         origin: crate::flows::TurnOrigin::Interactive, tool_ctx, session, submit,
-    }, None)?.await.map_err(|_| "turn preparation stopped before replying".to_string())??;
+    }, None, slot)?.await.map_err(|_| "turn preparation stopped before replying".to_string())??;
     Ok(after_block_id)
 }

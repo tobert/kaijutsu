@@ -33,6 +33,10 @@ pub mod streaming;
 pub(crate) mod editor_read;
 pub(crate) mod tool_command;
 pub(crate) mod worker;
+/// The worker pool's reservation, public so `beat::fire_lifecycle`
+/// (`kaijutsu-server`) can hold one across its own admission read; see
+/// `docs/resource-admission.md`.
+pub use worker::RuntimeSlot;
 pub mod command_result;
 pub mod command_outcome;
 mod result_review;

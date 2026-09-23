@@ -9,14 +9,21 @@ use super::admission::ContextAdmission;
 /// Queue an already accepted lifecycle with its captured transport variables.
 /// Archive cannot revoke its admission. The runtime signals cancellation and
 /// joins rc cleanup on shutdown; the clock thread never waits for execution.
+///
+/// `slot` is reserved by the caller before `admit_context` — the beat
+/// scheduler's `fire_lifecycle` — so admission for a clock-thread lifecycle
+/// trigger is ordered ahead of its `ContextAdmission` mint like every other
+/// caller's (`docs/resource-admission.md`, rule 1). The reservation was
+/// already taken and never waits, so `submit` itself still returns
+/// immediately for the clock thread (rule 2/6).
 pub fn submit(
     dispatcher: Arc<KjDispatcher>,
     admission: ContextAdmission,
+    slot: crate::runtime::RuntimeSlot,
     verb: &'static str,
     vars: HashMap<String, String>,
 ) -> Result<(), String> {
-    let kernel = dispatcher.kernel().clone();
-    kernel.spawn_runtime_task(move |stop| async move {
+    slot.spawn(move |stop| async move {
         let context = admission.context();
         // The clock invokes lifecycle policy as the system performer; it does
         // not impersonate the character assigned to the target context.
@@ -62,7 +69,8 @@ mod tests {
         }).unwrap();
         ready.await.unwrap();
         let admission = kernel.admit_context(context).unwrap();
-        submit(dispatcher.clone(), admission, "tick", HashMap::from([("KJ_TICK".into(), "42".into())])).unwrap();
+        let slot = kernel.reserve_runtime_slot().unwrap();
+        submit(dispatcher.clone(), admission, slot, "tick", HashMap::from([("KJ_TICK".into(), "42".into())])).unwrap();
         kernel.kernel_db().lock().archive_context(context).unwrap();
         release.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {

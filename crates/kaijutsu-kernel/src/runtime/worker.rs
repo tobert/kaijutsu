@@ -21,6 +21,13 @@ pub(crate) fn default_pool_threads() -> usize {
     std::thread::available_parallelism().map(|count| count.get()).unwrap_or(1).min(4)
 }
 
+/// Top-level reservations the pool holds at once, running or queued. It bounds
+/// accepted work, not parallelism, so it does not follow the thread count: a
+/// streaming turn holds its reservation for its whole run, and the approval
+/// delivery task holds one for the process lifetime. Slice 4 of
+/// `docs/resource-admission.md` makes it a configured value.
+pub(crate) const ADMISSION_CAPACITY: usize = 64;
+
 /// One pool thread's work channel and the count of work assigned to it.
 /// The count rises when work is sent and falls when the task finishes, so
 /// [`pick_thread`] reads assigned work rather than only started work.
@@ -182,6 +189,51 @@ fn dispatch(threads: &[PoolThread], work: Work) {
     }
 }
 
+/// One reservation, taken before a caller writes anything durable
+/// (`docs/resource-admission.md`, rule 1). Local re-entry (rule 3) needs no
+/// reservation and carries the parent thread's handle instead; a top-level
+/// caller carries an [`tokio::sync::mpsc::OwnedPermit`] that stays alive for
+/// the admitted task's whole run, so capacity is released on completion, not
+/// on dequeue — a submission still queued for its thread when the pool is
+/// "full" must count against the limit exactly like one already running.
+///
+/// The permit is never sent through its channel; it is simply held and
+/// dropped. The channel exists only as a bounded counter reachable from
+/// `try_reserve_owned()`, matching the doc's own naming for this mechanism.
+enum RuntimeSlotInner {
+    Local(ThreadHandle),
+    Reserved { permit: tokio::sync::mpsc::OwnedPermit<()>, queue: tokio::sync::mpsc::UnboundedSender<Work> },
+}
+
+/// A held place in the runtime pool, reserved before its caller's durable
+/// write and spent afterward with [`RuntimeSlot::spawn`]. The type is public
+/// so a caller in another crate (the beat scheduler) can hold one across its
+/// own write and hand it to the kaijutsu-kernel call that spends it; its
+/// construction and spending stay crate-private.
+pub struct RuntimeSlot(RuntimeSlotInner);
+
+impl RuntimeSlot {
+    /// Spend the reservation on `work`. Local re-entry sends directly to the
+    /// owning thread; a top-level reservation moves its permit into the task
+    /// so it drops — releasing capacity — only when the task finishes.
+    pub(crate) fn spawn<F, W>(self, work: W) -> Result<(), String>
+    where F: Future<Output = ()> + 'static, W: FnOnce(CancellationToken) -> F + Send + 'static {
+        match self.0 {
+            RuntimeSlotInner::Local(thread) => {
+                let work: Work = Box::new(move |stop| Box::pin(async move { work(stop).await }));
+                thread.send(work)
+            }
+            RuntimeSlotInner::Reserved { permit, queue } => {
+                let work: Work = Box::new(move |stop| Box::pin(async move {
+                    let _reservation = permit;
+                    work(stop).await;
+                }));
+                queue.send(work).map_err(|_| "runtime worker stopped before accepting work".to_string())
+            }
+        }
+    }
+}
+
 /// Receive submitted work and hand each piece to a thread. The supervisor runs
 /// on its own thread so a task that blocks its thread cannot stall dispatch for
 /// the rest of the pool.
@@ -226,6 +278,16 @@ fn run_supervisor(
 
 pub(crate) struct RuntimePool {
     queue: tokio::sync::mpsc::UnboundedSender<Work>,
+    /// The bounded admission channel `reserve()` takes a permit from, sized
+    /// [`ADMISSION_CAPACITY`]. Never sent through — see [`RuntimeSlotInner`] —
+    /// so its only job is the counting `try_reserve_owned()` gives us.
+    admission: tokio::sync::mpsc::Sender<()>,
+    /// Kept alive so `admission`'s reservations never see the channel as
+    /// closed. Never read: nothing is ever sent, so there is nothing to
+    /// receive.
+    #[allow(dead_code)]
+    admission_receiver: tokio::sync::mpsc::Receiver<()>,
+    admission_capacity: usize,
     shutdown: CancellationToken,
     worker_threads: usize,
     /// Every thread the pool owns, the supervisor included, so [`Self::join`]
@@ -240,7 +302,9 @@ impl RuntimePool {
     /// a task failure on any thread cancels it for all of them.
     pub(crate) fn start(threads: usize, shutdown: CancellationToken) -> Result<Self, String> {
         let threads = threads.max(1);
+        let admission_capacity = ADMISSION_CAPACITY;
         let (queue, receiver) = tokio::sync::mpsc::unbounded_channel::<Work>();
+        let (admission, admission_receiver) = tokio::sync::mpsc::channel::<()>(admission_capacity);
         let mut pool: Vec<PoolThread> = Vec::with_capacity(threads);
         let mut ids = Vec::with_capacity(threads + 1);
         for index in 0..threads {
@@ -264,23 +328,37 @@ impl RuntimePool {
             tokio::task::spawn_blocking(move || supervisor.join().map_err(|_| "runtime worker supervisor panicked".to_string())?)
                 .await.map_err(|error| format!("runtime worker join failed: {error}"))?
         }.boxed().shared();
-        Ok(Self { queue, shutdown, worker_threads: threads, threads: ids, joined })
+        Ok(Self { queue, admission, admission_receiver, admission_capacity, shutdown, worker_threads: threads, threads: ids, joined })
     }
 
     pub(crate) fn worker_threads(&self) -> usize { self.worker_threads }
 
+    /// Take one reservation, before the caller writes anything durable
+    /// (`docs/resource-admission.md`, rule 1). Local re-entry (rule 3) needs
+    /// none: work submitted from a pool thread runs on that same thread, so a
+    /// task waiting for its child never waits on a slot the pool gave to
+    /// someone else. A refusal here is immediate — never a wait (rule 2).
+    pub(crate) fn reserve(&self) -> Result<RuntimeSlot, String> {
+        if self.shutdown.is_cancelled() { return Err("runtime worker is shut down".into()); }
+        match current_pool_thread() {
+            Some(thread) => Ok(RuntimeSlot(RuntimeSlotInner::Local(thread))),
+            None => {
+                let permit = self.admission.clone().try_reserve_owned().map_err(|_| format!(
+                    "kernel runtime worker is at capacity ({} admitted reservations already running or \
+                     queued); refused — the limit is generous today and not yet configurable, see \
+                     docs/resource-admission.md",
+                    self.admission_capacity,
+                ))?;
+                Ok(RuntimeSlot(RuntimeSlotInner::Reserved { permit, queue: self.queue.clone() }))
+            }
+        }
+    }
+
+    /// Reserve and spend a slot in one call, for callers with no durable
+    /// write of their own to order ahead of the reservation.
     pub(crate) fn submit<F, W>(&self, work: W) -> Result<(), String>
     where F: Future<Output = ()> + 'static, W: FnOnce(CancellationToken) -> F + Send + 'static {
-        if self.shutdown.is_cancelled() { return Err("runtime worker is shut down".into()); }
-        // Construct the future inside its task so a factory panic reaches the
-        // JoinSet failure path and cannot unwind the supervisor or its siblings.
-        let work: Work = Box::new(move |stop| Box::pin(async move { work(stop).await }));
-        // Nested work runs on the thread that asked for it, so a task waiting
-        // for its child waits only on its own thread.
-        match current_pool_thread() {
-            Some(thread) => thread.send(work),
-            None => self.queue.send(work).map_err(|_| "runtime worker stopped before accepting work".into()),
-        }
+        self.reserve()?.spawn(work)
     }
 
     pub(crate) fn stop(&self) { self.shutdown.cancel(); }
@@ -333,6 +411,22 @@ mod tests {
         }).unwrap();
         let thread = tokio::time::timeout(WAIT, running).await.expect("the pool must run submitted work").unwrap();
         (thread, release)
+    }
+
+    /// Admission bounds accepted work, not parallelism: a one-thread pool
+    /// still admits [`super::ADMISSION_CAPACITY`] held reservations, and
+    /// refuses the next one immediately.
+    #[tokio::test]
+    async fn admission_capacity_does_not_follow_the_thread_count() {
+        let kernel = crate::Kernel::new_ephemeral_with_threads("pool-admission", 1).await;
+        let held: Vec<_> = (0..super::ADMISSION_CAPACITY)
+            .map(|index| kernel.reserve_runtime_slot().unwrap_or_else(|error| panic!("reservation {index}: {error}")))
+            .collect();
+        let refused = kernel.reserve_runtime_slot().err().expect("one past capacity must be refused");
+        assert!(refused.contains("at capacity (64 "), "{refused}");
+        drop(held);
+        assert!(kernel.reserve_runtime_slot().is_ok(), "dropped reservations must free admission");
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     /// Submit a chain of `depth` nested tasks, each from inside the task above

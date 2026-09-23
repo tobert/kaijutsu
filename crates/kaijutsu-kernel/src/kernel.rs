@@ -465,6 +465,53 @@ impl Kernel {
         self.runtime_pool.as_ref().map_err(Clone::clone)?.submit(work)
     }
 
+    /// Reserve a place in the worker pool before writing anything durable
+    /// (`docs/resource-admission.md`, rule 1): a caller that must create an
+    /// input block, consume a draft, register a receipt, or mint a
+    /// `ContextAdmission` ahead of its own admitted work takes this first, does
+    /// the write, then spends the held [`crate::runtime::RuntimeSlot`] with
+    /// [`crate::runtime::RuntimeSlot::spawn`]. `pub` so the beat scheduler
+    /// (`kaijutsu-server`) can hold one across `fire_lifecycle`'s own
+    /// admission read and hand it to `runtime::rc_lifecycle::submit`. A
+    /// refusal is immediate — this never waits.
+    pub fn reserve_runtime_slot(&self) -> Result<crate::runtime::RuntimeSlot, String> {
+        self.runtime_pool.as_ref().map_err(Clone::clone)?.reserve()
+    }
+
+    /// Exhaust the worker pool's admission for a test: every thread occupied
+    /// and no reservation left, so a top-level submission attempted
+    /// afterward is refused immediately. `pub` (behind `test-util`, like
+    /// [`crate::kernel_db::KernelDb::temporary`]) so an integration test in
+    /// another crate (`kaijutsu-server`) can reach it — `kj::test_helpers`
+    /// is `pub(crate)` and stops at this crate's boundary. Send or drop the
+    /// returned releases to free the pool. See `docs/resource-admission.md`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn fill_runtime_pool_for_test(&self) -> Vec<std::sync::mpsc::Sender<()>> {
+        let mut releases = Vec::new();
+        for _ in 0..self.runtime_threads() {
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            self.spawn_runtime_task(move |_| async move {
+                entered.send(()).unwrap();
+                let _ = held.recv();
+            }).expect("the worker pool must accept a parking task");
+            ready.await.expect("a parking task must reach its thread");
+            releases.push(release);
+        }
+        // Every thread is occupied, so each further reservation sits queued
+        // behind one. Queue them until admission refuses; the count left
+        // depends on long-lived occupants such as approval delivery, so the
+        // loop reads the refusal rather than computing it.
+        loop {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            if self.spawn_runtime_task(move |_| async move { let _ = held.recv(); }).is_err() {
+                break;
+            }
+            releases.push(release);
+        }
+        releases
+    }
+
     /// Threads in the worker pool, or zero when the pool failed to start.
     /// A test that must hold the pool busy parks one task on each thread;
     /// production code never chooses work by thread.

@@ -129,6 +129,16 @@ impl KjDispatcher {
             ));
         };
 
+        // Reserve before the seed block write below (`docs/resource-admission.md`,
+        // rule 1: "kj drive (seed block)" is a named hazard — a refused drive
+        // must leave no seed block). Held through `request_turn_with_slot`,
+        // which also mints this turn's `ContextAdmission` from it, so a
+        // second, possibly-failing reservation is never needed.
+        let slot = match self.kernel().reserve_runtime_slot() {
+            Ok(slot) => slot,
+            Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
+        };
+
         // A prompt becomes a durable User/Text block authored by the caller.
         // Without one, anchor at the existing tail. The model reads the log;
         // event content is an observation, not another copy to insert.
@@ -157,11 +167,11 @@ impl KjDispatcher {
             None => tail,
         };
 
-        let (turn_id, work_id) = match self.kernel().request_turn(crate::runtime::turn_request::TurnRequest {
+        let (turn_id, work_id) = match self.kernel().request_turn_with_slot(crate::runtime::turn_request::TurnRequest {
             score,
             context_id: target, after_block_id: after, content: seed,
             principal_id: caller.principal_id, model: None, continuation_epoch: None,
-        }) {
+        }, slot) {
             Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
             Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),

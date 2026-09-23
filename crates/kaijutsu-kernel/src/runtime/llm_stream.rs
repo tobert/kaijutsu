@@ -6362,6 +6362,7 @@ mod lifetime_tests {
                 .ok_or("automatic continuation found another accepted turn")?,
             None => kernel.turns().begin(context_id),
         };
+        let slot = kernel.reserve_runtime_slot()?;
         crate::runtime::turn_request::queue_startup(kernel, crate::runtime::turn_request::StartupRequest {
             admission: context_admission, lease,
             request: crate::runtime::turn_request::TurnRequest {
@@ -6370,7 +6371,7 @@ mod lifetime_tests {
                 continuation_epoch, score: None,
             },
             origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None,
-        }, None)?.await.map_err(|_| "turn preparation stopped before replying".to_string())?
+        }, None, slot)?.await.map_err(|_| "turn preparation stopped before replying".to_string())?
     }
 
     use super::*;
@@ -6657,9 +6658,9 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
-    async fn score_reservation_is_cancelled_when_runtime_admission_is_closed() {
+    async fn score_is_never_placed_when_runtime_admission_is_closed() {
         use super::super::turn_request::TurnRequest;
-        use kaijutsu_hyoushigi::{Disposition, Fallback, TickClock};
+        use kaijutsu_hyoushigi::{Fallback, TickClock};
         use kaijutsu_types::{Tick, TrackId};
         let (kernel, context, after, call) = fixture(None).await;
         let track = TrackId::new("closed-runtime").unwrap();
@@ -6671,7 +6672,7 @@ mod lifetime_tests {
             score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
         }).is_err());
         assert_eq!(timeline.lock().future_len(), 0);
-        assert_eq!(timeline.lock().statuses()[0].disposition, Some(Disposition::Cancelled));
+        assert!(timeline.lock().statuses().is_empty(), "a refused reservation must place nothing on the timeline");
         assert!(!kernel.turn_in_flight(context));
     }
 

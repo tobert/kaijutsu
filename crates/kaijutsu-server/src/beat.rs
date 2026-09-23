@@ -2035,6 +2035,19 @@ impl BeatScheduler {
         let Some(dispatcher) = self.dispatcher.clone() else {
             return;
         };
+        // Reserve before `admit_context` mints its `ContextAdmission`
+        // (`docs/resource-admission.md`, rule 1: `beat::fire_lifecycle`'s
+        // work is a named hazard). `reserve_runtime_slot` never waits, so
+        // this stays synchronous for the clock thread (rule 2/6); a refusal
+        // is logged and the tick is skipped, same as any other refused
+        // admission here.
+        let slot = match self.kernel.reserve_runtime_slot() {
+            Ok(slot) => slot,
+            Err(error) => {
+                log::warn!("beat: {verb} lifecycle worker was at capacity for context {ctx}: {error}");
+                return;
+            }
+        };
         let admission = match self.kernel.admit_context(ctx) {
             Ok(admission) => admission,
             Err(error) => {
@@ -2043,7 +2056,7 @@ impl BeatScheduler {
             }
         };
         let vars = self.transport_env(ctx);
-        if let Err(error) = kaijutsu_kernel::runtime::rc_lifecycle::submit(dispatcher, admission, verb, vars) {
+        if let Err(error) = kaijutsu_kernel::runtime::rc_lifecycle::submit(dispatcher, admission, slot, verb, vars) {
             log::warn!("beat: accepted {verb} lifecycle for context {ctx} could not start: {error}");
         }
     }
@@ -4127,6 +4140,29 @@ mod tests {
                 wait_for_lifecycle_marker(&kernel, ctx, &format!("{verb}-fired")).await;
                 kernel.shutdown_runtime_worker().await.unwrap();
             }
+        });
+    }
+
+    /// `fire_lifecycle` reserves before `admit_context`
+    /// (`docs/resource-admission.md`, rule 1). With the pool fully admitted
+    /// (`Kernel::fill_runtime_pool_for_test`), that reservation is refused —
+    /// and it never waits (rule 2/6): `fire_tick` is an ordinary synchronous
+    /// call, so returning at all, with no block published, is the proof.
+    #[test]
+    fn fire_lifecycle_returns_while_the_worker_pool_is_full() {
+        run_lifecycle_test(|| async {
+            let (scheduler, kernel, ctx) = lifecycle_scheduler("tick",
+                "kj block create --role system --kind text --content must-not-run-pool-full").await;
+            let before = kernel.blocks().block_snapshots(ctx).unwrap().len();
+            let releases = kernel.fill_runtime_pool_for_test().await;
+            assert!(kernel.reserve_runtime_slot().is_err(),
+                "the pool must be fully admitted for this test to mean anything");
+            scheduler.fire_tick(ctx);
+            assert_eq!(kernel.blocks().block_snapshots(ctx).unwrap().len(), before,
+                "a refused lifecycle trigger must leave no block behind; fire_tick returned \
+                 before any rc work could run, so no wait is needed to observe that");
+            drop(releases);
+            kernel.shutdown_runtime_worker().await.unwrap();
         });
     }
 

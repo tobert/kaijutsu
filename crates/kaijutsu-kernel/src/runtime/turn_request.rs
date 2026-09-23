@@ -31,7 +31,24 @@ impl Kernel {
     /// Admit headless work before publishing its Requested event. Subscriber
     /// presence never determines execution. The lease covers startup and queuing
     /// as well as inference, so an immediate `kj wait` sees accepted work.
+    ///
+    /// Reserves its own worker-pool slot first (`docs/resource-admission.md`,
+    /// rule 1: before it mints the `ContextAdmission`). A caller that must
+    /// write something durable of its own — `kj drive`'s seed block — before
+    /// this admission mint reserves earlier and calls
+    /// [`Self::request_turn_with_slot`] instead, so the reservation still
+    /// precedes that write.
     pub fn request_turn(self: &Arc<Self>, request: TurnRequest) -> Result<TurnAdmission, String> {
+        let slot = self.reserve_runtime_slot()?;
+        self.request_turn_with_slot(request, slot)
+    }
+
+    /// [`Self::request_turn`] with a reservation the caller already holds —
+    /// taken before a durable write of the caller's own that must also
+    /// precede this call's `ContextAdmission` mint. See `docs/resource-admission.md`.
+    pub(crate) fn request_turn_with_slot(
+        self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
+    ) -> Result<TurnAdmission, String> {
         let (admission, mut lease) = {
             let db = self.kernel_db().lock();
             let admission = super::admission::ContextAdmission::acquire(&db, request.context_id)?;
@@ -54,7 +71,7 @@ impl Kernel {
         let admitted = queue_startup(self, StartupRequest {
             admission, lease, request: accepted, origin: TurnOrigin::Autonomous,
             tool_ctx: None, session: SessionId::new(), submit: None,
-        }, Some(ready));
+        }, Some(ready), slot);
         if let Err(error) = admitted {
             if let Some((id, timeline)) = score { timeline.lock().cancel(id); }
             return Err(error);
@@ -86,11 +103,12 @@ pub(crate) struct StartupRequest {
 pub(crate) fn queue_startup(
     kernel: &Arc<Kernel>, accepted: StartupRequest,
     ready: Option<tokio::sync::oneshot::Receiver<()>>,
+    slot: crate::runtime::RuntimeSlot,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
     let (reply, result) = tokio::sync::oneshot::channel();
     let host = kernel.clone();
     let span = tracing::Span::current();
-    kernel.spawn_runtime_task(move |stop| async move {
+    slot.spawn(move |stop| async move {
         let StartupRequest { admission, lease, request, origin, tool_ctx, session, submit } = accepted;
         let turn_id = lease.id();
         let interrupt = lease.interrupt();
@@ -280,6 +298,7 @@ mod tests {
             AuthAction::Insert { table_name: "rc_runs" } => Authorization::Deny,
             _ => Authorization::Allow,
         })).unwrap();
+        let slot = kernel.reserve_runtime_slot().unwrap();
         let result = queue_startup(&kernel, StartupRequest {
             admission, lease,
             request: TurnRequest { context_id: context, after_block_id: input, content: String::new(),
@@ -287,7 +306,7 @@ mod tests {
             origin: TurnOrigin::Interactive, tool_ctx: None, session: caller.session_id,
             submit: Some((crate::rc::SubmitInfo { input_block: input, edge_block: None,
                 edge_shown: None, log_tail: None, turn_live: false }, caller)),
-        }, None).unwrap().await.unwrap();
+        }, None, slot).unwrap().await.unwrap();
         kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 
         let error = result.expect_err("submit rc admission fault must stop startup");

@@ -1,8 +1,11 @@
 # Resource admission for the kernel worker
 
-Status: slice 1 is built (`runtime/worker.rs`, `RuntimePool`): the pool, the
-supervisor, `pick_thread`, local re-entry, eager start and whole-pool shutdown,
-with an unbounded queue and no running limit. Slices 2 to 6 are planned.
+Status: slices 1 and 2 are built (`runtime/worker.rs`, `RuntimePool`): the
+pool, the supervisor, `pick_thread`, local re-entry, eager start and
+whole-pool shutdown, and now a bounded reservation ahead of every top-level
+submission, with the reserve-first call sites listed under "Known hazards"
+moved. There is still no per-thread running limit — slice 4 owns that, along
+with configured limits and refusal shapes. Slices 3 to 6 are planned.
 
 The kernel worker runs every prompt turn, `kj drive`, shell command, structured
 `kj` call, MCP shell call, rc lifecycle run, approval resume, and scheduled
@@ -40,14 +43,25 @@ written. **Admission** is the existing `ContextAdmission` proof
 - **A pool of worker threads.** Each thread is what the single worker is today:
   a current-thread runtime with a `LocalSet`, started with the kaish thread
   stack. Task futures stay on the thread that started them.
-- **One bounded submission queue.** `Kernel::spawn_runtime_task` takes an owned
-  slot with `try_reserve_owned()` and sends the work through that slot. A full
-  queue is the refusal. The caller holds the slot while it writes its input, so
-  rule 1 needs no second mechanism.
-- **The supervisor dispatches.** It receives from the queue and hands each
-  piece of work to the thread with the fewest running tasks, while that thread
-  is under its running limit. Thread choice lives in one function,
-  `pick_thread`.
+- **One bounded admission, held for the admitted task's whole run.**
+  `Kernel::reserve_runtime_slot` takes an `OwnedPermit` with `try_reserve_owned()`
+  on a bounded counting channel and returns it as a `RuntimeSlot`; `spawn`
+  moves the permit into the task, so it is dropped — freeing the slot — only
+  when the task finishes, not when it is merely dispatched to a thread. A full
+  admission is the refusal, and it is immediate: nothing here awaits a permit.
+  `Kernel::spawn_runtime_task` reserves and spawns in one call, for a caller
+  with no durable write of its own to order ahead of the reservation. The
+  caller holds the slot across its own write when it has one, so rule 1 needs
+  no second mechanism. Capacity is `ADMISSION_CAPACITY`, 64 today, and does
+  not follow the thread count: it bounds accepted work, not parallelism. A
+  streaming turn holds its reservation for its whole run and approval
+  delivery holds one for the process lifetime, so a capacity near the thread
+  count would refuse a player's prompt while four turns stream. Slice 4 makes
+  it a configured value.
+- **The supervisor dispatches.** A separate, unbounded relay from
+  `reserve`/`spawn` to the chosen thread's own channel; capacity above governs
+  admission, not this hand-off. It hands each piece of work to the thread with
+  the fewest running tasks. Thread choice lives in one function, `pick_thread`.
 - **Re-entry stays local.** A thread-local holds the current worker thread's
   own work sender. When it is set, `spawn_runtime_task` sends to that thread
   and skips the bounded queue. It does not call the free `spawn_local`: that
@@ -68,11 +82,13 @@ written. **Admission** is the existing `ContextAdmission` proof
   `interactive::prepare` awaits `EmbeddedKaish::for_context` before
   `start_shell_operation`, and on two threads those preparations run in
   parallel. A caller that awaits each reply before sending the next is
-  unaffected. The test is
-  `two_in_flight_submissions_to_one_context_keep_their_pair_order`
-  (`kaijutsu-server/tests/command_settlement_wire.rs`), ignored while the
-  order is not a promise. If it becomes one, `pick_thread` hashes the context
-  to a thread and nothing else changes.
+  unaffected. Order is not a promise; pairing is: each output block names its
+  own command block as parent, and each pair is written atomically (one
+  insert version, captured inside the document guard). The test is
+  `two_in_flight_submissions_to_one_context_each_pair_its_own_command_atomically`
+  (`kaijutsu-server/tests/command_settlement_wire.rs`). If context order ever
+  becomes a promise, `pick_thread` hashes the context to a thread and nothing
+  else changes.
 - **Refusal is a fault, not a `Refusal`.** RPC returns a capnp `Overloaded`
   error; the MCP shell tool returns a `Rejected` shell envelope a model can
   read and retry; `kj` returns an error naming the limit. `Refusal` stays
@@ -89,10 +105,17 @@ is a bound on model spend, which needs its own count of provider requests.
 
 ## Known hazards
 
-- **Callers that write before asking.** `prompt::submit` (user block or draft),
-  `kj drive` (seed block), and the background MCP shell tool
-  (`create_operation`) create durable state before they reach the worker.
-  Each moves its reservation ahead of that write.
+- **Callers that write before asking — fixed.** `prompt::submit` (user block
+  or draft), `kj drive` (seed block), and the background MCP shell tool
+  (`create_operation`) used to create durable state before they reached the
+  worker; each now reserves first. `kj drive` holds its reservation through
+  `Kernel::request_turn_with_slot`, so the same reservation that precedes its
+  seed-block write also covers `request_turn`'s own `ContextAdmission` mint —
+  a second, possibly-failing reservation is never taken for one logical
+  admission. Approval delivery and completion delivery (`approval_resume.rs`,
+  `completion_notice.rs`) still write their seed block or notice before
+  calling `request_turn`, which only reserves for its own admission mint;
+  covering their writes too is out of this slice.
 - **Blocking re-entry paths**, all of which must reach `spawn_runtime_task` on
   a worker thread for rule 3 to hold: the editor read from `kj editor keys`;
   a foreground tool call inside a turn; `Broker::emit_notification_block` from
@@ -114,9 +137,11 @@ is a bound on model spend, which needs its own count of provider requests.
   synchronous step on the caller's thread and then awaits a reply, so one
   caller's submissions stay ordered. `start_shell_operation` and
   `consume_draft` run inside the task after an await, so two transports
-  submitting to one context can land their block pairs in either order. Each
-  pair is still written atomically under the document guard. The slice 1
-  ordering test decides whether `pick_thread` hashes the context.
+  submitting to one context can land their block pairs in either order. Order
+  is not promised; each pair is still written atomically under the document
+  guard, and each output names its own command as parent — see "No context
+  affinity" above. `pick_thread` would need to hash the context for order to
+  become a promise; nothing here requires that.
 - **One blocking pool per worker runtime.** `spawn_blocking` work now has N
   pools of tokio's default size, so its ceiling is N times higher.
 - **Work outside the count.** `tokio::spawn` tasks started from a worker task
@@ -136,13 +161,23 @@ is a bound on model spend, which needs its own count of provider requests.
    A test that needs the pool to hold work back parks every thread
    (`kj::test_helpers::park_runtime_pool`); parking one no longer holds
    anything.
-2. **The bounded queue and reserve-first call sites.** `try_reserve_owned` in
-   the funnel; move the reservation ahead of the writes listed above and ahead
-   of `beat::fire_lifecycle`'s work. Test through a stood-up kernel and its
-   client: with the pool full, shell, structured `kj`, streaming, prompt and
-   draft submission are each refused, and blocks, receipts, rc runs, flow
-   events and the draft revision are unchanged. The clock-thread call returns
-   while the pool is still full.
+2. **Built.** The bounded queue and reserve-first call sites. `try_reserve_owned`
+   in the funnel (`RuntimePool::reserve`, returning a `RuntimeSlot` that
+   `Kernel::reserve_runtime_slot` exposes); the reservation moved ahead of the
+   writes listed above and ahead of `beat::fire_lifecycle`'s work.
+   `Kernel::spawn_context_task` (the shared admission point behind shell,
+   structured `kj`, and streaming submission) and `Kernel::request_turn` also
+   reserve ahead of their own `ContextAdmission` mint, so every caller through
+   those funnels is covered without a change at each call site. Tested through
+   a stood-up kernel and its client: with the pool full, shell, structured
+   `kj`, streaming, prompt and draft submission are each refused, and blocks,
+   receipts, rc runs, flow events and the draft revision are unchanged. The
+   clock-thread call returns while the pool is still full.
+   `Kernel::fill_runtime_pool_for_test` (behind the `test-util` feature) is
+   the cross-crate equivalent of `kj::test_helpers::park_runtime_pool` for a
+   `kaijutsu-server` integration test: it parks every thread, then queues
+   parked tasks until admission refuses, so admission is fully exhausted, not
+   merely busy.
 3. **One task from startup through inference.** Remove the second spawn in
    `llm_stream::spawn_admitted_turn`.
 4. **Refusal shapes and config.** `Overloaded`, the `Rejected` envelope, `kj`
