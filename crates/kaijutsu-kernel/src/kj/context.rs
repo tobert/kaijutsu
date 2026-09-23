@@ -1727,23 +1727,7 @@ impl KjDispatcher {
             }
         }
 
-        if let Err(e) = crate::rc::run(
-            self,
-            crate::rc::RcInvocation {
-                parent: row.forked_from,
-                ..crate::rc::RcInvocation::new("create", &admission, &caller.cancel)
-            },
-            caller,
-        )
-            .await
-        {
-            return KjResult::Err(format!("kj context rebind: rc create lifecycle: {e}"));
-        }
-
-        // Individual script failures land as Error blocks rather than an Err
-        // from the lifecycle, so the read-back is what actually says whether the
-        // repair took.
-        match self.has_usable_loadout(target_id) {
+        match self.rebind_loadout(target_id, row.forked_from, &admission, caller).await {
             Ok(true) => KjResult::ok(format!(
                 "rebound context {} — the rc create lifecycle assigned it a loadout",
                 target_id.short()
@@ -1754,12 +1738,46 @@ impl KjDispatcher {
                  Error blocks for the reason.",
                 target_id.short()
             )),
-            Err(e) => KjResult::Err(format!(
-                "kj context rebind: lifecycle ran, but reading context {}'s loadout back \
-                 failed, so the repair is unconfirmed: {e}",
-                target_id.short()
-            )),
+            Err(e) => KjResult::Err(format!("kj context rebind: {e}")),
         }
+    }
+
+    /// Re-run the rc `create` lifecycle against a context with no usable
+    /// loadout, then report whether it has one afterward. Shared by `kj
+    /// context rebind` and boot's `ensure_root_contexts`
+    /// (`crate::kj::character`), which repair the same missing-loadout state
+    /// through the same path — a rebind grants exactly what the `create`
+    /// lifecycle would have granted, never something the caller picks.
+    ///
+    /// Individual script failures land as Error blocks rather than an `Err`
+    /// from the lifecycle, so the read-back after `rc::run` is what actually
+    /// says whether the repair took — an `Ok(false)` here means the lifecycle
+    /// ran to completion and still bound nothing, not that it failed to run.
+    pub(crate) async fn rebind_loadout(
+        &self,
+        context_id: ContextId,
+        forked_from: Option<ContextId>,
+        admission: &crate::runtime::admission::ContextAdmission,
+        caller: &KjCaller,
+    ) -> Result<bool, String> {
+        crate::rc::run(
+            self,
+            crate::rc::RcInvocation {
+                parent: forked_from,
+                ..crate::rc::RcInvocation::new("create", admission, &caller.cancel)
+            },
+            caller,
+        )
+        .await
+        .map_err(|e| format!("rc create lifecycle: {e}"))?;
+
+        self.has_usable_loadout(context_id).map_err(|e| {
+            format!(
+                "lifecycle ran, but reading context {}'s loadout back failed, so the \
+                 repair is unconfirmed: {e}",
+                context_id.short()
+            )
+        })
     }
 
     /// `kj context scratch` — get-or-create the well-known "scratch"

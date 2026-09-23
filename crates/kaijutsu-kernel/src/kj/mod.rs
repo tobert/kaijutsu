@@ -1222,6 +1222,16 @@ pub(crate) mod test_helpers {
         test_dispatcher().await
     }
 
+    /// A dispatcher whose seeded rc tree has no `root` bucket at all — as
+    /// if the host rc tree never had one. For boot-refusal tests: a live
+    /// root character's `create` lifecycle has no scripts to run
+    /// (`load_scripts` reads the absent directory as zero scripts, not a
+    /// failure), so it binds nothing, and the boot-refusal path must say so
+    /// loudly rather than serve an inert root.
+    pub async fn test_dispatcher_no_root_bucket() -> KjDispatcher {
+        test_dispatcher_configured_ex(kaijutsu_types::TimeoutPolicy::default(), Some("root")).await
+    }
+
     /// Occupy every worker-pool thread with a task that blocks its thread, so
     /// work submitted afterwards stays queued and unstarted. Use this wherever
     /// a test needs the pool to hold a submission back; one parked task is not
@@ -1244,6 +1254,19 @@ pub(crate) mod test_helpers {
 
     async fn test_dispatcher_configured(
         policy: kaijutsu_types::TimeoutPolicy,
+    ) -> KjDispatcher {
+        test_dispatcher_configured_ex(policy, None).await
+    }
+
+    /// Like [`test_dispatcher_configured`], but when `strip_rc_bucket` names
+    /// a top-level rc bucket (e.g. `"root"`), that bucket's directory is
+    /// removed from the seeded rc tree before it is mounted — as if the host
+    /// rc tree never had it. For boot-refusal tests
+    /// (`ensure_root_contexts` and root-character creation must refuse
+    /// loudly, never leave an inert root behind).
+    async fn test_dispatcher_configured_ex(
+        policy: kaijutsu_types::TimeoutPolicy,
+        strip_rc_bucket: Option<&str>,
     ) -> KjDispatcher {
         let drift = shared_drift_router();
         let kernel_db = Arc::new(parking_lot::Mutex::new(
@@ -1277,6 +1300,10 @@ pub(crate) mod test_helpers {
         std::fs::create_dir_all(&kernel_data).expect("create kernel data dir");
         std::fs::create_dir_all(&rc_tmp).expect("create rc test dir");
         seed_test_rc(&rc_tmp, false);
+        if let Some(bucket) = strip_rc_bucket {
+            std::fs::remove_dir_all(rc_tmp.join(bucket))
+                .expect("remove rc bucket for test");
+        }
         let kernel = Arc::new(
             Kernel::new("test", &kernel_data, blocks.clone(), kernel_db.clone())
                 .await

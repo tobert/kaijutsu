@@ -216,19 +216,24 @@ impl KjDispatcher {
         )
     }
 
-    /// Create the root context of each live root character that has none.
-    /// The kernel calls this at start. Returns the contexts it created.
+    /// Create the root context of each live root character that has none,
+    /// and rebind loudly (`docs/character.md`) any that already has one but
+    /// no usable loadout — e.g. a context created before its rc bucket
+    /// existed. Every new context parents under a root, so an inert root
+    /// deadlocks the whole tree beneath it: rebind needs a shell, a shell
+    /// needs a loadout. The kernel calls this at start; a character it
+    /// cannot repair fails boot rather than serve from a deadlock. Returns
+    /// the contexts it created (not the ones it rebound).
     pub async fn ensure_root_contexts(&self, requester: PrincipalId) -> Result<Vec<ContextId>, String> {
-        let missing: Vec<PrincipalId> = self
+        let live_roots: Vec<CharacterRow> = self
             .kernel_db()
             .lock()
             .list_characters(false)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .filter(|row| row.root && row.root_ctx.is_none())
-            .map(|row| row.principal_id)
+            .filter(|row| row.root)
             .collect();
-        let mut created = Vec::with_capacity(missing.len());
+        let mut created = Vec::new();
         let startup_caller = KjCaller {
             principal_id: requester,
             actor_id: requester,
@@ -240,10 +245,81 @@ impl KjDispatcher {
             privileged: false,
             cancel: tokio_util::sync::CancellationToken::new(),
         };
-        for principal in missing {
-            created.push(self.ensure_root_context(principal, &startup_caller).await?);
+        for row in live_roots {
+            match row.root_ctx {
+                None => created.push(self.ensure_root_context(row.principal_id, &startup_caller).await?),
+                Some(ctx) => self.rebind_root_context_if_unbound(&row, ctx, &startup_caller).await?,
+            }
         }
         Ok(created)
+    }
+
+    /// A root character's root context already exists — verify it still has
+    /// a usable loadout, and rebind it (the same repair `kj context rebind`
+    /// performs) when it does not. Warns loudly rather than repairing
+    /// silently: a silent repair would hide exactly the gap ("the host rc
+    /// tree lacked the `root` bucket when this context was created") that
+    /// deadlocked boot in the first place. Refuses when the context still
+    /// has no usable loadout afterward — serving with an inert root context
+    /// is worse than not serving, since every new context forks beneath it.
+    async fn rebind_root_context_if_unbound(
+        &self,
+        character: &CharacterRow,
+        ctx: ContextId,
+        caller: &KjCaller,
+    ) -> Result<(), String> {
+        match self.has_usable_loadout(ctx) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(format!(
+                    "root character '{}' ({}) root context {}: could not read its loadout \
+                     at boot, so there is no way to tell a repair from a re-run: {e}",
+                    character.name,
+                    character.principal_id.short(),
+                    ctx.short()
+                ));
+            }
+        }
+
+        tracing::warn!(
+            character = %character.name,
+            character_id = %character.principal_id.short(),
+            context = %ctx.short(),
+            context_type = ROOT_CONTEXT_TYPE,
+            "root context has no usable loadout at boot — rebinding via the rc create lifecycle",
+        );
+
+        let (row, admission) = {
+            let db = self.kernel_db().lock();
+            let row = db.get_context(ctx).map_err(|e| e.to_string())?.ok_or_else(|| {
+                format!(
+                    "root character '{}' root context {} not found",
+                    character.name,
+                    ctx.short()
+                )
+            })?;
+            let admission = crate::runtime::admission::ContextAdmission::acquire(&db, ctx)
+                .map_err(|e| e.to_string())?;
+            (row, admission)
+        };
+        let rc_caller = root_lifecycle_caller(caller, character.principal_id, ctx);
+        let outcome = self.rebind_loadout(ctx, row.forked_from, &admission, &rc_caller).await;
+        if matches!(outcome, Ok(true)) {
+            return Ok(());
+        }
+        let detail = match &outcome {
+            Err(e) => format!(": {e}"),
+            _ => String::new(),
+        };
+        Err(format!(
+            "root character '{}' root context {} (type '{ROOT_CONTEXT_TYPE}') still has no \
+             usable loadout after rebinding at boot{detail}. Expected rc bucket \
+             /config/rc/{ROOT_CONTEXT_TYPE}/create — restore it (e.g. `kaijutsu-server rc \
+             reseed`) and restart.",
+            character.name,
+            ctx.short()
+        ))
     }
 
     /// Return a live root character's root context, creating it when the
@@ -317,7 +393,34 @@ impl KjDispatcher {
         )
             .await
             .map_err(|e| format!("root context '{name}' rc create lifecycle: {e}"))?;
-        Ok(new_id)
+
+        // A script failure lands as an Error block, not an `Err` above — the
+        // lifecycle can "succeed" while binding nothing, e.g. an rc tree with
+        // no `root` bucket at all (`load_scripts` reads an absent directory as
+        // zero scripts, never a failure). Leaving that context behind inert
+        // would deadlock every context forked beneath it (deny-by-default, and
+        // every new context parents under a root). The row and its
+        // `root_ctx` pointer stay committed on this Err — the character
+        // already has a name for the context, and the next boot's
+        // `ensure_root_contexts` rebind pass is the retry path once the
+        // bucket exists, the same way `kj context rebind` repairs any other
+        // unbound context.
+        match self.has_usable_loadout(new_id) {
+            Ok(true) => Ok(new_id),
+            Ok(false) => Err(format!(
+                "root context '{name}' ({}) was created but its rc create lifecycle bound \
+                 no loadout — it would be inert, and it parents every context forked from \
+                 this character. Expected rc bucket /config/rc/{ROOT_CONTEXT_TYPE}/create; \
+                 restore it (e.g. `kaijutsu-server rc reseed`) — the committed context is \
+                 left in place for the next boot's rebind to repair.",
+                new_id.short()
+            )),
+            Err(e) => Err(format!(
+                "root context '{name}' ({}) was created, but reading its loadout back to \
+                 confirm the rc create lifecycle bound one failed: {e}",
+                new_id.short()
+            )),
+        }
     }
 
     /// `list` → an array of full-id strings by default
@@ -561,6 +664,21 @@ mod tests {
 
     fn s(x: &str) -> String {
         x.to_string()
+    }
+
+    /// `test_dispatcher()` alone cannot actually bind anything: `.kai`
+    /// scripts reach the `kj` builtin only through `self_arc`
+    /// (`EmbeddedKaish::for_context` refuses without it), and `kj binding
+    /// allow` persists only through the broker's db handle, which
+    /// `test_dispatcher()` leaves unset. Any test that needs a root
+    /// context's rc `create` lifecycle to really bind something — not just
+    /// run without hard-erroring — needs both wired first, the same way
+    /// `context::rebind_tests` does for `kj context rebind`.
+    async fn rc_capable_dispatcher() -> std::sync::Arc<super::super::KjDispatcher> {
+        let d = std::sync::Arc::new(super::super::test_helpers::test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        d
     }
 
     #[test]
@@ -834,13 +952,18 @@ mod tests {
     /// sheet. `tests/rc_role_bindings.rs` checks that its rc bundle binds it.
     #[tokio::test]
     async fn create_root_makes_its_root_context() {
-        let d = super::super::test_helpers::test_dispatcher().await;
+        let d = rc_capable_dispatcher().await;
         let caller = test_caller();
         let created = d.dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller).await;
         assert!(matches!(created, KjResult::Ok { .. }), "{created:?}");
 
         let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
         let root_ctx = sheet.root_ctx.expect("a root character records its root context");
+        assert_eq!(
+            d.has_usable_loadout(root_ctx),
+            Ok(true),
+            "creation refuses loudly rather than leaving an inert root behind"
+        );
         let row = d.kernel_db().lock().get_context(root_ctx).unwrap().unwrap();
         assert_eq!(row.label.as_deref(), Some("sovereign"));
         assert_eq!(row.context_type, "root");
@@ -878,7 +1001,7 @@ mod tests {
     /// context is played by a root.
     #[tokio::test]
     async fn set_root_makes_the_root_context_and_no_root_refuses_while_live() {
-        let d = super::super::test_helpers::test_dispatcher().await;
+        let d = rc_capable_dispatcher().await;
         let caller = test_caller();
         d.dispatch(&[s("character"), s("create"), s("laptop")], &caller).await;
         let set = d.dispatch(&[s("character"), s("set"), s("laptop"), s("--root")], &caller).await;
@@ -897,7 +1020,7 @@ mod tests {
     /// root character, and a second pass creates nothing.
     #[tokio::test]
     async fn ensure_root_contexts_fills_missing_and_is_idempotent() {
-        let d = super::super::test_helpers::test_dispatcher().await;
+        let d = rc_capable_dispatcher().await;
         let keeper = PrincipalId::new();
         let retired = PrincipalId::new();
         {
@@ -918,15 +1041,133 @@ mod tests {
         live_roots.sort_by_key(|id| id.to_hex());
         assert_eq!(created, live_roots, "only the live roots get contexts");
         assert_eq!(d.kernel_db().lock().get_character(retired).unwrap().unwrap().root_ctx, None);
+        for ctx in &live_roots {
+            assert_eq!(
+                d.has_usable_loadout(*ctx),
+                Ok(true),
+                "a freshly created root context must be usable, not left inert"
+            );
+        }
 
+        // A second pass finds every live root already bound — nothing to
+        // create, nothing to rebind.
         assert!(d.ensure_root_contexts(PrincipalId::system()).await.unwrap().is_empty());
+    }
+
+    /// The morning's live scenario: a root character's root context already
+    /// exists but has no binding (a wiped row, or a create that ran before
+    /// its rc bucket existed). Boot rebinds it loudly, the same repair `kj
+    /// context rebind` performs — it must never leave it inert, since every
+    /// new context parents under a root.
+    #[tokio::test]
+    async fn boot_rebinds_a_root_context_with_no_binding() {
+        let d = rc_capable_dispatcher().await;
+        let character = PrincipalId::new();
+        {
+            let db = d.kernel_db().lock();
+            db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: character, name: "keeper".into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: true,
+            }).unwrap();
+        }
+        let ctx = super::super::test_helpers::register_context(&d, Some("keeper"), None, character);
+        {
+            let db = d.kernel_db().lock();
+            db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
+            db.update_played_by(ctx, Some(character)).expect("update_played_by");
+            db.set_character_root_ctx(character, Some(ctx)).expect("set_character_root_ctx");
+            db.delete_context_binding(ctx).expect("delete the binding row");
+        }
+        assert_eq!(d.has_usable_loadout(ctx), Ok(false), "precondition: no binding");
+
+        let created = d.ensure_root_contexts(PrincipalId::system()).await.unwrap();
+        assert!(
+            !created.contains(&ctx),
+            "the context already existed — this is a rebind, not a create: {created:?}"
+        );
+        assert_eq!(
+            d.has_usable_loadout(ctx),
+            Ok(true),
+            "boot must rebind an existing-but-unbound root context, not leave it inert"
+        );
+    }
+
+    /// With no `root` rc bucket in the host rc tree, boot cannot bind any
+    /// root character's root context. `ensure_root_contexts` refuses
+    /// loudly, naming the rc bucket it expected and the fix — never
+    /// `kaijutsu-server kj -- context rebind`, since the offline CLI boots
+    /// the same kernel and would hit the same refusal.
+    #[tokio::test]
+    async fn ensure_root_contexts_refuses_with_no_root_bucket() {
+        let d = std::sync::Arc::new(
+            super::super::test_helpers::test_dispatcher_no_root_bucket().await,
+        );
+        d.set_self_arc();
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+
+        // Every live root character already has a root context — this
+        // exercises the rebind-refusal path (an existing-but-unbound
+        // context with no bucket to repair from), distinct from first
+        // creation (`create_root_with_no_root_bucket_errors_loudly`).
+        // `amy` (the reviewer fixture `test_dispatcher` seeds) also starts
+        // with `root_ctx: None`, so she needs one too, or `ensure_root_contexts`
+        // would hit the creation path for her instead.
+        let amy = super::super::test_helpers::test_reviewer_principal();
+        let ctx = super::super::test_helpers::register_context(&d, Some("amy"), None, amy);
+        {
+            let db = d.kernel_db().lock();
+            db.update_context_type(ctx, super::ROOT_CONTEXT_TYPE).expect("update_context_type");
+            db.update_played_by(ctx, Some(amy)).expect("update_played_by");
+            db.set_character_root_ctx(amy, Some(ctx)).expect("set_character_root_ctx");
+            db.delete_context_binding(ctx).expect("delete the binding row");
+        }
+
+        let err = d
+            .ensure_root_contexts(PrincipalId::system())
+            .await
+            .expect_err("no root bucket to rebind from — boot must refuse rather than serve");
+        assert!(err.contains("/config/rc/root/create"), "{err}");
+        assert!(err.contains("rc reseed"), "{err}");
+        assert!(!err.contains("context rebind"), "{err}");
+    }
+
+    /// Creating a new root character with no `root` rc bucket must not
+    /// leave an inert root behind silently. The character and context rows
+    /// stay committed (the next boot's rebind is the retry path once the
+    /// bucket exists), but the call itself errors loudly.
+    #[tokio::test]
+    async fn create_root_with_no_root_bucket_errors_loudly() {
+        let d = std::sync::Arc::new(
+            super::super::test_helpers::test_dispatcher_no_root_bucket().await,
+        );
+        d.set_self_arc();
+        d.kernel().broker().set_db(d.kernel_db().clone()).await;
+        let caller = test_caller();
+
+        let result = d
+            .dispatch(&[s("character"), s("create"), s("sovereign"), s("--root")], &caller)
+            .await;
+        let KjResult::Err(message) = result else { panic!("expected Err, got {result:?}") };
+        assert!(message.contains("/config/rc/root/create"), "{message}");
+        assert!(message.contains("rc reseed"), "{message}");
+
+        let sheet = d.kernel_db().lock().get_character_by_name("sovereign").unwrap().unwrap();
+        assert!(sheet.root, "the character row stays committed as a root");
+        let root_ctx = sheet
+            .root_ctx
+            .expect("the committed context row is left for the next boot's rebind to repair");
+        assert_eq!(
+            d.has_usable_loadout(root_ctx),
+            Ok(false),
+            "still inert — nothing in this rc tree could have bound it"
+        );
     }
 
     /// `set --root` and `set --no-root` round-trip, and `set` with neither
     /// is a usage error rather than a silent no-op.
     #[tokio::test]
     async fn set_root_and_no_root_round_trip() {
-        let d = super::super::test_helpers::test_dispatcher().await;
+        let d = rc_capable_dispatcher().await;
         let caller = test_caller();
         d.dispatch(&[s("character"), s("create"), s("worker")], &caller).await;
 

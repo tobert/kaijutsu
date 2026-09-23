@@ -597,7 +597,14 @@ principal id. Running the same `init` again changes nothing.
 
 **The server refuses to start without a live root character**, and the
 error names `init`. At start it creates the root context of each live root
-character that has none.
+character that has none, and rebinds — loudly, with a warning naming the
+character and context — one that already exists but has no usable loadout,
+the same repair `kj context rebind` performs. A character it cannot bind,
+newly created or already existing, fails the start rather than serve an
+inert root: the message names the context, its type `root`, the rc bucket
+it expected (`/config/rc/root/create`), and the fix
+(`kaijutsu-server rc reseed`). Every context parents under a root, so an
+inert one would deadlock the whole tree beneath it.
 
 **A root context is a model-less admin console.** Its type is `root`, its
 label is the character's name, the character plays it, and it has no parent.
