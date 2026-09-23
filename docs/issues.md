@@ -241,6 +241,16 @@ covering 2026-09-22. Open, most costly first:
 - **Approval delivery holds a top-level reservation for the process
   lifetime.** Harmless at `ADMISSION_CAPACITY` 64; slice 4's occupant
   exemption removes it.
+- **A shutdown between a caller's write and its spawn strands the write**
+  (kaibo, 2026-09-23). `reserve` checks the shutdown token once; the
+  supervisor closes the queue on shutdown, so `RuntimeSlot::spawn` fails after
+  `prompt::submit` inserted its block or consumed the draft, or after
+  `kj drive` wrote its seed. `ToolCommand::execute` settles its receipt on
+  that failure; these two do not. Shutdown-only, so no live harm yet.
+- **`RuntimeSlot::Local` is not pinned to its thread.** Spent on another
+  thread, it would send work to the originating thread's channel and skip
+  admission. No caller does that today; a `!Send` marker or a thread check in
+  `spawn` would make it impossible.
 - **kaish bare `echo` prints nothing.** POSIX prints a newline. Upstream kaish
   issue; Amy decides whether and how it is posted.
 

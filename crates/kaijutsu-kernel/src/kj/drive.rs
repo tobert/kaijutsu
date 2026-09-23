@@ -89,34 +89,49 @@ impl KjDispatcher {
             }
         };
 
+        // Reserve, then admit, before the seed block write below
+        // (`docs/resource-admission.md`, rule 1): a refused drive leaves no
+        // seed, and archive cannot refuse the turn after the seed lands.
+        let slot = match self.kernel().reserve_runtime_slot() {
+            Ok(slot) => slot,
+            Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
+        };
+
         // Only Live contexts accept turns. Check archived_at first because it
         // is authoritative; concluded and archived work must be forked to resume.
-        {
+        let admission = {
             let db = self.kernel_db().lock();
-            if let Ok(Some(row)) = db.get_context(target) {
-                let refusal = if row.archived_at.is_some() {
-                    Some("archived — archived contexts are retained work; fork it to continue")
-                } else {
-                    match row.context_state {
-                        kaijutsu_types::ContextState::Live => None,
-                        kaijutsu_types::ContextState::Staging => Some(
-                            "staging — post-fork curation blocks LLM invocation; \
-                             finish curating first",
-                        ),
-                        kaijutsu_types::ContextState::Concluded => {
-                            Some("concluded — fork it to continue the work")
-                        }
-                        kaijutsu_types::ContextState::Archived => Some(
-                            "archived — archived contexts are retained work; fork it to continue",
-                        ),
+            let row = match db.get_context(target) {
+                Ok(Some(row)) => row,
+                Ok(None) => return KjResult::Err(format!("kj drive: context {} not found", target.short())),
+                Err(e) => return KjResult::Err(format!("kj drive: could not read context {}: {e}", target.short())),
+            };
+            let refusal = if row.archived_at.is_some() {
+                Some("archived — archived contexts are retained work; fork it to continue")
+            } else {
+                match row.context_state {
+                    kaijutsu_types::ContextState::Live => None,
+                    kaijutsu_types::ContextState::Staging => Some(
+                        "staging — post-fork curation blocks LLM invocation; \
+                         finish curating first",
+                    ),
+                    kaijutsu_types::ContextState::Concluded => {
+                        Some("concluded — fork it to continue the work")
                     }
-                };
-                if let Some(why) = refusal {
-                    let name = row.label.clone().unwrap_or_else(|| target.short());
-                    return KjResult::Err(format!("kj drive: context '{name}' is {why}"));
+                    kaijutsu_types::ContextState::Archived => Some(
+                        "archived — archived contexts are retained work; fork it to continue",
+                    ),
                 }
+            };
+            if let Some(why) = refusal {
+                let name = row.label.clone().unwrap_or_else(|| target.short());
+                return KjResult::Err(format!("kj drive: context '{name}' is {why}"));
             }
-        }
+            match crate::runtime::admission::ContextAdmission::acquire(&db, target) {
+                Ok(admission) => admission,
+                Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
+            }
+        };
 
         // A context with no blocks has nothing to anchor a turn after — there's
         // no document/history to act on. Crash loudly rather than publish a
@@ -127,16 +142,6 @@ impl KjDispatcher {
                  there is nothing to drive",
                 target.to_hex()
             ));
-        };
-
-        // Reserve before the seed block write below (`docs/resource-admission.md`,
-        // rule 1: "kj drive (seed block)" is a named hazard — a refused drive
-        // must leave no seed block). Held through `request_turn_with_slot`,
-        // which also mints this turn's `ContextAdmission` from it, so a
-        // second, possibly-failing reservation is never needed.
-        let slot = match self.kernel().reserve_runtime_slot() {
-            Ok(slot) => slot,
-            Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),
         };
 
         // A prompt becomes a durable User/Text block authored by the caller.
@@ -167,11 +172,11 @@ impl KjDispatcher {
             None => tail,
         };
 
-        let (turn_id, work_id) = match self.kernel().request_turn_with_slot(crate::runtime::turn_request::TurnRequest {
+        let (turn_id, work_id) = match self.kernel().request_turn_admitted(crate::runtime::turn_request::TurnRequest {
             score,
             context_id: target, after_block_id: after, content: seed,
             principal_id: caller.principal_id, model: None, continuation_epoch: None,
-        }, slot) {
+        }, slot, admission) {
             Ok(crate::runtime::turn_request::TurnAdmission::Accepted { turn_id, work_id }) => (turn_id, work_id),
             Ok(crate::runtime::turn_request::TurnAdmission::AlreadyActive) => unreachable!("explicit drive admits a turn"),
             Err(error) => return KjResult::Err(format!("kj drive: turn was not admitted: {error}")),

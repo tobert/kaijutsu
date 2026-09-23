@@ -53,11 +53,12 @@ written. **Admission** is the existing `ContextAdmission` proof
   with no durable write of its own to order ahead of the reservation. The
   caller holds the slot across its own write when it has one, so rule 1 needs
   no second mechanism. Capacity is `ADMISSION_CAPACITY`, 64 today, and does
-  not follow the thread count: it bounds accepted work, not parallelism. A
-  streaming turn holds its reservation for its whole run and approval
-  delivery holds one for the process lifetime, so a capacity near the thread
-  count would refuse a player's prompt while four turns stream. Slice 4 makes
-  it a configured value.
+  not follow the thread count: it bounds accepted work, not parallelism.
+  Approval delivery holds one reservation for the process lifetime. A turn's
+  reservation covers startup only until slice 3: `spawn_admitted_turn` queues
+  the stream as local re-entry, which takes no permit, so the cap bounds turn
+  startups, not running streams. Slice 4 makes the capacity a configured
+  value.
 - **The supervisor dispatches.** A separate, unbounded relay from
   `reserve`/`spawn` to the chosen thread's own channel; capacity above governs
   admission, not this hand-off. It hands each piece of work to the thread with
@@ -108,11 +109,12 @@ is a bound on model spend, which needs its own count of provider requests.
 - **Callers that write before asking — fixed.** `prompt::submit` (user block
   or draft), `kj drive` (seed block), and the background MCP shell tool
   (`create_operation`) used to create durable state before they reached the
-  worker; each now reserves first. `kj drive` holds its reservation through
-  `Kernel::request_turn_with_slot`, so the same reservation that precedes its
-  seed-block write also covers `request_turn`'s own `ContextAdmission` mint —
-  a second, possibly-failing reservation is never taken for one logical
-  admission. Approval delivery and completion delivery (`approval_resume.rs`,
+  worker; each now reserves first. The MCP shell tool reserves before its
+  admission mint and before the gate writes an ask; a pending call drops the
+  slot unspent. `kj drive` reserves and admits before its seed-block write and
+  hands both to `Kernel::request_turn_admitted`, so archive cannot refuse the
+  turn after the seed lands. A pool shut down between a caller's write and
+  its spawn still strands that write; see `docs/issues.md`. Approval delivery and completion delivery (`approval_resume.rs`,
   `completion_notice.rs`) still write their seed block or notice before
   calling `request_turn`, which only reserves for its own admission mint;
   covering their writes too is out of this slice.

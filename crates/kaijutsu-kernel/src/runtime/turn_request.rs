@@ -32,34 +32,35 @@ impl Kernel {
     /// presence never determines execution. The lease covers startup and queuing
     /// as well as inference, so an immediate `kj wait` sees accepted work.
     ///
-    /// Reserves its own worker-pool slot first (`docs/resource-admission.md`,
-    /// rule 1: before it mints the `ContextAdmission`). A caller that must
-    /// write something durable of its own — `kj drive`'s seed block — before
-    /// this admission mint reserves earlier and calls
-    /// [`Self::request_turn_with_slot`] instead, so the reservation still
-    /// precedes that write.
+    /// Reserves a worker-pool slot, then mints the `ContextAdmission`
+    /// (`docs/resource-admission.md`, rule 1). A caller that writes something
+    /// durable of its own first — `kj drive`'s seed block — reserves and
+    /// admits before that write and calls [`Self::request_turn_admitted`].
     pub fn request_turn(self: &Arc<Self>, request: TurnRequest) -> Result<TurnAdmission, String> {
         let slot = self.reserve_runtime_slot()?;
-        self.request_turn_with_slot(request, slot)
+        let admission = self.admit_context(request.context_id)?;
+        self.request_turn_admitted(request, slot, admission)
     }
 
-    /// [`Self::request_turn`] with a reservation the caller already holds —
-    /// taken before a durable write of the caller's own that must also
-    /// precede this call's `ContextAdmission` mint. See `docs/resource-admission.md`.
-    pub(crate) fn request_turn_with_slot(
+    /// [`Self::request_turn`] with the reservation and admission the caller
+    /// already holds, both taken before the caller's own durable write, so
+    /// archive cannot refuse the turn after that write lands.
+    pub(crate) fn request_turn_admitted(
         self: &Arc<Self>, request: TurnRequest, slot: crate::runtime::RuntimeSlot,
+        admission: super::admission::ContextAdmission,
     ) -> Result<TurnAdmission, String> {
-        let (admission, mut lease) = {
-            let db = self.kernel_db().lock();
-            let admission = super::admission::ContextAdmission::acquire(&db, request.context_id)?;
-            let lease = match request.continuation_epoch {
+        assert_eq!(admission.context(), request.context_id, "admission belongs to its request");
+        // The lease begins under the database guard, as the admission mint
+        // does in `prompt::submit`, so both stay ordered against archive.
+        let mut lease = {
+            let _db = self.kernel_db().lock();
+            match request.continuation_epoch {
                 Some(_) => match self.turns().begin_if_idle(request.context_id) {
                     Some(lease) => lease,
                     None => return Ok(TurnAdmission::AlreadyActive),
                 },
                 None => self.turns().begin(request.context_id),
-            };
-            (admission, lease)
+            }
         };
         let turn_id = lease.id();
         let score = request.score.as_ref().map(|intent|
