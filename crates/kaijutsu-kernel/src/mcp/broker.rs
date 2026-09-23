@@ -4744,6 +4744,7 @@ mod tests {
         let kaish = EmbeddedKaish::new("dropped-admitted-tool", kernel.blocks().clone(), kernel.clone(), None).unwrap();
         kaish.set_context_id(context);
         let call = ToolCommand {
+            slot: kernel.reserve_runtime_slot().unwrap(),
             admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: kernel.broker().clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),
@@ -4787,6 +4788,7 @@ mod tests {
         kaish.set_context_id(context);
         let mut events = kernel.block_flows().subscribe("block.*");
         let call = ToolCommand {
+            slot: kernel.reserve_runtime_slot().unwrap(),
             admission: kernel.admit_context(context).unwrap(),
             kernel: kernel.clone(), broker: broker.clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),

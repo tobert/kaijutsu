@@ -239,6 +239,11 @@ impl McpServerLike for ShellServer {
                 reason: "kj dispatcher not wired (Broker::set_kj_dispatcher)".to_string(),
             })?;
 
+        // Reserve before the admission mint, the gate's ask, and the pending
+        // path's receipt (`docs/resource-admission.md`, rule 1). A pending
+        // call drops the slot unspent: it runs nothing until an answer
+        // executes it.
+        let slot = dispatcher.kernel().reserve_runtime_slot().map_err(McpError::Protocol)?;
         let admission = dispatcher.kernel().admit_context(ctx.context_id).map_err(McpError::Protocol)?;
 
         // Writable submissions pass the source-program gate. Read-only shells
@@ -344,7 +349,7 @@ impl McpServerLike for ShellServer {
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
         crate::runtime::tool_command::ToolCommand {
-            admission,
+            slot, admission,
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
             code: parsed.command, stdin: parsed.stdin, foreground: parsed.foreground, read_only: self.read_only,
         }.execute(cancel).await
@@ -1650,6 +1655,37 @@ mod tests {
         assert!(d.kernel().shell_operations().cancel(&id, context).await.unwrap());
         wait_for_operation(&d, context, &id).await;
         assert_eq!(progress.expect("running jobs expose completed statement output"), b"first\n");
+    }
+
+    /// A full worker pool refuses a gated `shell_write` before the gate
+    /// writes its ask or the pending path registers a receipt
+    /// (`docs/resource-admission.md`, rule 1). Background calls once
+    /// returned Waiting with no reservation at all; foreground calls were
+    /// refused after the ask was already durable and redeemable.
+    #[tokio::test]
+    async fn full_pool_refuses_gated_shell_write_before_any_ask_or_receipt() {
+        for foreground in [true, false] {
+            let (broker, d) = wired().await;
+            let principal = PrincipalId::new();
+            let context = crate::kj::test_helpers::register_rooted_context(&d, Some("pool-full-gate"), principal);
+            d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+            let mut binding = ContextToolBinding::new();
+            binding.grant(Capability::Facade("shell_write".into()));
+            broker.set_binding(context, binding).await.unwrap();
+            let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+            let releases = d.kernel().fill_runtime_pool_for_test().await;
+            let mut params = call_write("echo nobody-answers");
+            params.arguments["foreground"] = serde_json::json!(foreground);
+            let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
+            drop(releases);
+            let asks = d.kernel_db().lock().list_pending_asks().unwrap();
+            d.kernel().shutdown_runtime_worker().await.unwrap();
+            let error = result.expect_err("a full pool must refuse, not wait on an ask");
+            assert!(error.to_string().contains("at capacity"), "foreground={foreground}: {error}");
+            assert!(asks.is_empty(), "foreground={foreground}: a refused call left an ask: {asks:?}");
+            assert!(d.kernel().shell_operations().list_for_context(context).unwrap().is_empty(),
+                "foreground={foreground}: a refused call left a receipt");
+        }
     }
 
     #[tokio::test]

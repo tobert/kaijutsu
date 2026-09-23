@@ -29,6 +29,9 @@ pub(crate) fn create_operation(
 }
 
 pub(crate) struct ToolCommand {
+    /// Reserved by the caller before `admission` was minted and before any
+    /// gate ask (`docs/resource-admission.md`, rule 1).
+    pub slot: crate::runtime::RuntimeSlot,
     pub admission: super::admission::ContextAdmission,
     pub kernel: Arc<crate::Kernel>,
     pub broker: Arc<Broker>,
@@ -45,12 +48,6 @@ impl ToolCommand {
     pub(crate) async fn execute(self, cancel: CancellationToken) -> McpResult<KernelToolResult> {
         debug_assert_eq!(self.admission.context(), self.call.context_id);
         let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
-        // Reserve before `create_operation`'s receipt/pair write below
-        // (`docs/resource-admission.md`, rule 1: the background MCP shell
-        // tool's `create_operation` path is a named hazard). A call already
-        // running inside a turn (nested) takes no reservation here — rule 3 —
-        // so this costs foreground calls nothing extra.
-        let slot = self.kernel.reserve_runtime_slot().map_err(McpError::Protocol)?;
         let receipt = if self.foreground { None } else {
             Some(create_operation(&self.kernel, &self.call, &self.code, None).map_err(McpError::Protocol)?)
         };
@@ -64,6 +61,7 @@ impl ToolCommand {
         let cancel_guard = task_cancel.clone().drop_guard();
         let span = tracing::Span::current();
         let hook_depth = crate::mcp::broker::current_hook_depth();
+        let slot = self.slot;
         let started = slot.spawn(move |shutdown| crate::mcp::broker::inherit_hook_depth(hook_depth, async move {
                 let _admission = self.admission;
                 let stop_command = task_cancel.clone();
