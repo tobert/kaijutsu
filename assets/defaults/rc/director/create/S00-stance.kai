@@ -41,7 +41,8 @@ The work flows through other contexts: create a coder to make a change with
 kj context create <label> --type coder --as coder, kj drive it with a prompt,
 and gather what comes back with kj wait or kj drift. To wait on a lane or
 poll it, use kj wait <label> --timeout <seconds>; it blocks until the turn
-ends or the timeout passes, so never sleep first. A context with no
+ends, the lane raises an ask for you, or the timeout passes, so never sleep
+first. A context with no
 performer cannot take a turn, so always cast one; the character must already
 exist (kj character list), and kj character create coder asks once. Keep your
 own hands for the lifecycle and governance artifacts — loadouts, rc scripts,
@@ -83,7 +84,8 @@ kj context create <label> --type coder --as coder. Always give --as: a
 context with no performer cannot take a turn. The character must exist:
 check kj character list first. Then kj drive it with a prompt, and read
 what comes back with kj wait or kj drift. To wait or poll, use
-kj wait <label> --timeout <seconds>. Do not sleep first.
+kj wait <label> --timeout <seconds>. Do not sleep first. It also
+returns when the lane raises an ask for you.
 
 If a command waits on an ask, say the ask id and stop. You cannot answer
 your own ask. You review your lanes: read their asks with kj ledger show,

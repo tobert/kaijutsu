@@ -249,7 +249,10 @@ when no model is automatically resumed.
 and evidence that a turn ran. A terminal event cannot finish the wait while
 another turn remains. Events supply the latest observed terminal detail;
 quiet polling uses the block log and live turn registry if events are lost.
-A terminated subscription switches to paced state polling.
+A terminated subscription switches to paced state polling. A pending ask in
+the target context whose stored reviewer is the waiter ends the wait first,
+with status `ask`, the ask's id and description, and the `kj ledger` commands
+that answer it: the lane is blocked on the waiter.
 
 Select a shell operation with `--operation <id>`, an ask with `--ask <id>`,
 or a native kaish job with `--job <integer>` (optionally selecting a context).

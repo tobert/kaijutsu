@@ -217,10 +217,12 @@ TimelineVisibility cleanup. The coder's edits were right; the path around them
 stalled. Ask rows: `kj ledger list --history --origin shell_gate --since`
 covering 2026-09-22. Open, most costly first:
 
-- **An ask to a model reviewer notifies nobody.** The coder's asks went to
-  banto, whose turn had ended; nothing woke it, and the coder spun to the
-  50-iteration cap. Design direction to discuss: a model reviewer passes the
-  ask up the walk with its opinion attached rather than holding it.
+- **An ask to an idle model reviewer notifies nobody.** The coder's asks
+  went to banto; nothing woke it, and the coder spun to the 50-iteration cap.
+  A reviewer blocked in `kj wait <lane>` now returns on the lane's ask for it;
+  a reviewer whose turn has ended still hears nothing. Design direction to
+  discuss: a model reviewer passes the ask up the walk with its opinion
+  attached rather than holding it.
 - **One inert statement escalates a whole program.** Banto ran
   `kj ledger allow <id>; echo "allow_exit=$?"`. The ledger answer has a
   builtin allow; `echo` has no builtin key, so the program escalated and the

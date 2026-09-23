@@ -4,7 +4,9 @@
 //! left in flight. Terminal events wake the reader and supply outcome details;
 //! the turn registry owns liveness. Subscribe before reading the block log so
 //! a completion between those operations cannot be missed. Quiet polling reads
-//! the log and liveness again when events are lost.
+//! the log and liveness again when events are lost. A pending ask in the
+//! context whose reviewer is the waiter ends a context wait first: the
+//! context is blocked on the waiter.
 //!
 //! The tail is a window over the durable log. `--since` advances a caller-owned
 //! cursor; readers do not consume one another's results.
@@ -72,7 +74,8 @@ impl TailFilter {
 #[derive(Parser, Debug)]
 #[command(
     name = "wait",
-    about = "Wait for a context to finish its accepted turns, a shell operation, an ask decision, or a kaish job.",
+    about = "Wait for a context to finish its accepted turns, a shell operation, an ask decision, or a kaish job. \
+             A context wait also returns, with status `ask`, when that context holds a pending ask you review.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -240,6 +243,10 @@ impl KjDispatcher {
         // subscription taken second would park until the timeout on a turn that
         // was already over.
         let mut sub = self.kernel().turn_flows().subscribe("turn.*");
+        // An ask the waiter reviews ends the wait: the lane is blocked on the
+        // waiter itself. Subscribed before the first read for the same reason.
+        let mut ledger = self.kernel().ledger_flows().subscribe("ledger.changed");
+        let mut ledger_open = true;
 
         let since_key = parsed.since.clone();
         let started = std::time::Instant::now();
@@ -284,6 +291,12 @@ impl KjDispatcher {
             // between a tool result landing and the next model block is a
             // live LLM round trip during which nothing is `Running` even
             // though the turn is very much still going.
+            match self.pending_ask_for(target, caller.actor_id) {
+                Ok(Some(ask)) => return self.ask_report(target, &blocks, since_idx, &parsed, ask, started),
+                Ok(None) => {}
+                Err(e) => return KjResult::Err(format!("kj wait: {e}")),
+            }
+
             let in_flight = self.kernel().turn_in_flight(target);
             if !in_flight && let Some((status, detail, output)) = &terminal {
                 return self.wait_report(target, &blocks, since_idx, &parsed, status,
@@ -308,10 +321,16 @@ impl KjDispatcher {
                 tokio::time::sleep(remaining.min(QUIET)).await;
                 continue;
             }
-            let msg = match tokio::time::timeout(remaining.min(QUIET), sub.recv()).await {
-                Ok(Some(msg)) => msg,
-                Ok(None) => { bus_open = false; continue; }
-                Err(_) => continue,
+            let msg = tokio::select! {
+                msg = tokio::time::timeout(remaining.min(QUIET), sub.recv()) => match msg {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => { bus_open = false; continue; }
+                    Err(_) => continue,
+                },
+                event = ledger.recv_event(), if ledger_open => {
+                    if event.is_none() { ledger_open = false; }
+                    continue;
+                }
             };
             terminal = match msg.payload {
                 crate::flows::TurnFlow::Completed { context_id, output_block_id, reason, .. }
@@ -387,6 +406,36 @@ impl KjDispatcher {
                     }
                 }
             }
+        }
+    }
+
+    /// The oldest pending ask in `context` whose stored reviewer is `reviewer`.
+    fn pending_ask_for(
+        &self, context: kaijutsu_types::ContextId, reviewer: kaijutsu_types::PrincipalId,
+    ) -> Result<Option<approval_ledger::types::ApprovalRow>, String> {
+        let asks = self.kernel_db().lock().list_pending_asks().map_err(|e| e.to_string())?;
+        Ok(asks.into_iter()
+            .filter(|row| row.context_id == context.as_bytes()
+                && row.reviewer_id.as_deref() == Some(reviewer.as_bytes().as_slice()))
+            .min_by_key(|row| row.created_at))
+    }
+
+    /// A context wait that ended on an ask the waiter reviews: the usual
+    /// report plus the ask and the two commands that act on it.
+    fn ask_report(
+        &self, target: kaijutsu_types::ContextId, blocks: &[BlockSnapshot], since_idx: Option<usize>,
+        parsed: &WaitArgs, ask: approval_ledger::types::ApprovalRow, started: std::time::Instant,
+    ) -> KjResult {
+        let id = ask.request_id.clone();
+        let description = ask.description.lines().next().unwrap_or("").to_string();
+        let report = self.wait_report(target, blocks, since_idx, parsed, "ask",
+            Some(format!("{id}: {description}")), None, "ledger", started);
+        let KjResult::Ok { message, content_type, ephemeral, data } = report else { return report };
+        let mut data = data.expect("wait_report always carries data");
+        data["ask"] = serde_json::json!({ "request_id": id, "description": ask.description });
+        KjResult::Ok {
+            message: format!("{message}\nask for you: kj ledger show {id}, then kj ledger allow {id} or kj ledger deny {id}"),
+            content_type, ephemeral, data: Some(data),
         }
     }
 
@@ -888,6 +937,56 @@ mod tests {
         let data = data_of(&result);
         assert_eq!(data["status"], "completed");
         assert_eq!(data["resolved_by"], "log");
+    }
+
+    /// A pending ask in `ctx` performed by `actor` and reviewed by `reviewer`.
+    fn pending_ask(d: &KjDispatcher, ctx: ContextId, actor: PrincipalId, reviewer: PrincipalId) -> String {
+        let db = d.kernel_db().lock();
+        approval_ledger::ask::create_ask(db.conn_for_ledger(), &approval_ledger::types::NewAsk {
+            context_id: ctx.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+            origin: approval_ledger::types::Origin::ShellGate, instance: None, tool: None,
+            hook_id: None, description: "shell_write: cargo check".into(), statements: vec![],
+            authorized_label: None, rc_run_id: None, expires_at: None, options: vec![],
+            signals: vec![], cwd: None, exec_source: None, exec_stdin: None,
+            continuation_epoch: None, env: vec![],
+        }).unwrap()
+    }
+
+    /// A director waiting on its lane learns of the lane's ask for it at
+    /// once, instead of waiting out the timeout while the lane is blocked.
+    #[tokio::test]
+    async fn an_ask_for_the_waiter_ends_a_context_wait() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("lane"), None, principal);
+        seed(&d, ctx, principal, &[(Role::User, BlockKind::Text, Status::Done, "do the cleanup")]);
+        let c = caller_with_context(ctx);
+        let request_id = pending_ask(&d, ctx, PrincipalId::new(), c.actor_id);
+
+        let r = d.dispatch(&[s("wait"), s("--timeout"), s("5")], &c).await;
+        let data = data_of(&r);
+        assert_eq!(data["status"], "ask", "{}", r.message());
+        assert_eq!(data["resolved_by"], "ledger");
+        assert_eq!(data["ask"]["request_id"], request_id);
+        assert_eq!(data["ask"]["description"], "shell_write: cargo check");
+        assert!(r.message().contains(&format!("kj ledger show {request_id}")), "{}", r.message());
+    }
+
+    /// An ask the waiter cannot answer does not end its wait.
+    #[tokio::test]
+    async fn an_ask_for_another_reviewer_does_not_end_a_context_wait() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("lane"), None, principal);
+        seed(&d, ctx, principal, &[(Role::User, BlockKind::Text, Status::Done, "do the cleanup")]);
+        let c = caller_with_context(ctx);
+        pending_ask(&d, ctx, PrincipalId::new(), PrincipalId::new());
+
+        let r = d.dispatch(&[s("wait"), s("--timeout"), s("1")], &c).await;
+        let data = data_of(&r);
+        assert_eq!(data["status"], "running");
+        assert_eq!(data["resolved_by"], "timeout");
     }
 
     #[tokio::test]
