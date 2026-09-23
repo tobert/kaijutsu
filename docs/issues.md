@@ -346,14 +346,13 @@ deepseek-v4-flash. Evidence, event logs and the code audit:
 `contrib/bench/README.md`. Amy's observation that prompted it: contexts "stop
 more readily than other agents". Open, most costly first:
 
-- **An approved command's output never reaches the model.** On an ask the tool
-  result says nothing was run; after approval the same ACP tool call completes
-  with the real output, but the model only gets the notice built in
-  `runtime/approval_resume.rs` ("It has run"), with no output. The next
-  inference still believed it was blocked and spent about twenty calls looking
-  for its own result: 35 inferences and 1.09M input tokens against 9 and 173K
-  for the same task with the commands allowed. Fold the settled output into
-  the notice, or make the settled pair visible to the next hydration.
+- **Does an approved command's output reach the model now?** In the
+  benchmark the notice said only "It has run", and the next inference still
+  believed it was blocked: 35 inferences and 1.09M input tokens against 9 and
+  173K with the commands allowed. The notice now names the command, its exit
+  and elapsed time, the filled output block, and a success's last line or a
+  failure's last 20 error lines (`executed_turn_seed`, 2026-09-23). Rerun the
+  benchmark task to see whether the spiral is gone; delete this entry if so.
 - **A turn can end before its ask is offered.** A mock turn raised an ask and
   ended about 70 ms later; the ask-to-decision round trip measured 337 ms. The
   ask stayed pending, the command never ran, and the ACP client saw no

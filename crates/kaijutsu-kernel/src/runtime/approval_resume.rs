@@ -223,6 +223,139 @@ fn no_shell_turn_seed(
     )
 }
 
+/// Tell a model that its approved command ran, and what came of it, in as few
+/// tokens as act on it. The full output is already in the tool result edited
+/// in place; this names that block and repeats only what the outcome needs: a
+/// success's last line, or a failure's last lines of its error stream.
+fn executed_turn_seed(who: &str, source: &str, envelope: &kaijutsu_types::shell_envelope::ShellEnvelope, output_block_id: &BlockId) -> String {
+    use kaijutsu_types::shell_envelope::ShellStatus;
+    const TAIL_LINES: usize = 20;
+    const LINE_CHARS: usize = 300;
+    let mut lines = source.lines();
+    let command = match (lines.next().unwrap_or(""), lines.next()) {
+        (first, Some(_)) => format!("{first} …"),
+        (first, None) => first.to_string(),
+    };
+    let block = output_block_id.to_key();
+    let capped = if envelope.did_spill == Some(true) { " · output was capped" } else { "" };
+    let Some(exit) = envelope.exit_code else {
+        let reason = envelope.error.as_deref().unwrap_or("no reason recorded");
+        return if envelope.status == ShellStatus::Rejected {
+            format!("{who} approved: {command}\nit did not run: rejected: {reason} (block {block})")
+        } else {
+            format!("{who} approved and ran: {command}\nno exit code ({:?}): {reason} (block {block})", envelope.status)
+        };
+    };
+    let secs = envelope.elapsed_ms.unwrap_or(0) / 1000;
+    let elapsed = if secs < 60 { format!("{secs}s") } else { format!("{}m{:02}s", secs / 60, secs % 60) };
+    let plural = |n: usize, word: &str| if n == 1 { format!("{n} {word} line") } else { format!("{n} {word} lines") };
+    if exit == 0 {
+        let total = envelope.stdout.lines().count() + envelope.stderr.lines().count();
+        let lines = if total == 1 { "1 line".to_string() } else { format!("{total} lines") };
+        let mut seed = format!("{who} approved and ran: {command}\nexit 0 in {elapsed} · {lines} in your tool result (block {block}){capped}");
+        let last = |text: &str| text.lines().rev().map(str::trim).find(|line| !line.is_empty()).map(str::to_owned);
+        if let Some(line) = last(&envelope.stdout).or_else(|| last(&envelope.stderr)) {
+            seed.push_str("\nlast line: ");
+            seed.push_str(&line.chars().take(LINE_CHARS).collect::<String>());
+        }
+        return seed;
+    }
+    let (name, stream) = if envelope.stderr.trim().is_empty() { ("stdout", &envelope.stdout) } else { ("stderr", &envelope.stderr) };
+    let all: Vec<&str> = stream.lines().collect();
+    if all.is_empty() {
+        return format!("{who} approved and ran: {command}\nexit {exit} in {elapsed} · no output (block {block}){capped}");
+    }
+    let tail = &all[all.len().saturating_sub(TAIL_LINES)..];
+    let count = if all.len() > tail.len() {
+        format!("last {} of {} {name} lines", tail.len(), all.len())
+    } else {
+        plural(all.len(), name)
+    };
+    let mut seed = format!("{who} approved and ran: {command}\nexit {exit} in {elapsed} · {count} (all in block {block}){capped}:");
+    for line in tail {
+        seed.push('\n');
+        seed.push_str(&line.chars().take(LINE_CHARS).collect::<String>());
+    }
+    seed
+}
+
+#[cfg(test)]
+mod executed_turn_seed_tests {
+    use super::*;
+    use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+
+    fn envelope(status: ShellStatus, exit: Option<i64>, stdout: &str, stderr: &str, elapsed_ms: u64) -> ShellEnvelope {
+        let mut envelope = ShellEnvelope::new(status);
+        envelope.exit_code = exit;
+        envelope.stdout = stdout.into();
+        envelope.stderr = stderr.into();
+        envelope.elapsed_ms = Some(elapsed_ms);
+        envelope.did_spill = Some(false);
+        envelope
+    }
+
+    fn block() -> BlockId { BlockId::new(ContextId::new(), PrincipalId::new(), 7) }
+
+    #[test]
+    fn a_success_names_the_command_exit_and_last_line_only() {
+        let progress: String = (0..83).map(|i| format!("    Checking crate{i} v0.1.0\n")).collect();
+        let stderr = format!("{progress}    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 51s\n");
+        let output = block();
+        let seed = executed_turn_seed("amy", "cargo check -p kaijutsu-app",
+            &envelope(ShellStatus::Done, Some(0), "", &stderr, 171_000), &output);
+        assert_eq!(seed, format!(
+            "amy approved and ran: cargo check -p kaijutsu-app\n\
+             exit 0 in 2m51s · 84 lines in your tool result (block {})\n\
+             last line: Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 51s",
+            output.to_key()));
+        assert!(!seed.contains("crate40"), "a success must not repeat its progress output");
+    }
+
+    #[test]
+    fn a_failure_carries_the_last_twenty_lines_of_stderr() {
+        let stderr: String = (1..=23).map(|i| format!("err line {i}\n")).collect();
+        let output = block();
+        let seed = executed_turn_seed("amy", "cargo check -p kaijutsu-types",
+            &envelope(ShellStatus::Error, Some(101), "ignored stdout\n", &stderr, 4_200), &output);
+        let expected_tail: String = (4..=23).map(|i| format!("\nerr line {i}")).collect();
+        assert_eq!(seed, format!(
+            "amy approved and ran: cargo check -p kaijutsu-types\n\
+             exit 101 in 4s · last 20 of 23 stderr lines (all in block {}):{expected_tail}",
+            output.to_key()));
+    }
+
+    #[test]
+    fn a_failure_with_empty_stderr_tails_stdout_and_short_output_is_whole() {
+        let seed = executed_turn_seed("amy", "false-ish", &envelope(ShellStatus::Error, Some(1), "only this\n", "", 12), &block());
+        assert!(seed.contains("exit 1 in 0s · 1 stdout line (all in block "), "{seed}");
+        assert!(seed.ends_with("):\nonly this"), "{seed}");
+    }
+
+    #[test]
+    fn a_rejected_or_codeless_outcome_is_one_line_with_its_reason() {
+        let mut rejected = envelope(ShellStatus::Rejected, None, "", "", 0);
+        rejected.error = Some("parse error at 1:5".into());
+        let seed = executed_turn_seed("amy", "echo (", &rejected, &block());
+        assert!(seed.starts_with("amy approved: echo (\nit did not run: rejected: parse error at 1:5 (block "), "{seed}");
+    }
+
+    #[test]
+    fn a_spilled_capture_says_the_output_was_capped() {
+        let mut spilled = envelope(ShellStatus::Error, Some(2), "", "boom\n", 1_000);
+        spilled.did_spill = Some(true);
+        let seed = executed_turn_seed("amy", "make", &spilled, &block());
+        assert!(seed.contains("output was capped"), "{seed}");
+    }
+
+    #[test]
+    fn the_header_takes_the_first_line_of_a_multiline_source() {
+        let seed = executed_turn_seed("amy", "cargo fmt --check\ncargo test", &envelope(ShellStatus::Done, Some(0), "", "", 0), &block());
+        assert!(seed.starts_with("amy approved and ran: cargo fmt --check …\n"), "{seed}");
+        assert!(seed.contains("0 lines in your tool result"), "{seed}");
+        assert!(!seed.contains("last line"), "no output means no last line: {seed}");
+    }
+}
+
 /// A newly authored pair belongs to a model turn, so a shell failure before
 /// authoring it needs a seed too. Only a connected session's existing pair
 /// observes its own settled error without one.
@@ -526,7 +659,7 @@ async fn act_on_executable_answer(
     // Shared capture owns unwinding after source execution can begin. Never
     // replace its captured output with a preparation-only no-run result.
     preparation.armed = false;
-    if let Err(error) = crate::runtime::command::run_into_blocks(
+    let outcome = match crate::runtime::command::run_into_blocks(
         &kaish,
         source,
         &receipt,
@@ -536,9 +669,12 @@ async fn act_on_executable_answer(
         CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(stop.clone()), ..Default::default() },
     )
     .await {
-        kernel.turns().conversations().evict(context_id);
-        return ExecAction::Tell(format!("Approved command settlement failed: {error}. Inspect operation output {} before retrying.", output_block_id.to_key()));
-    }
+        Ok(outcome) => outcome,
+        Err(error) => {
+            kernel.turns().conversations().evict(context_id);
+            return ExecAction::Tell(format!("Approved command settlement failed: {error}. Inspect operation output {} before retrying.", output_block_id.to_key()));
+        }
+    };
 
     // `run_into_blocks` just settled the pair in place. When it was
     // already `Waiting` in a cached mailbox, that edit is invisible to
@@ -550,12 +686,9 @@ async fn act_on_executable_answer(
         // Either the output blocks reach the model as new blocks in its
         // context (driver-authored), or the fill is an in-place edit to a
         // model turn's own pair that its cached mailbox will not re-read on
-        // its own (`PairOwner::Turn`); either way the seed only has to say
-        // who approved and that it ran.
-        ExecAction::Tell(format!(
-            "{who} approved the action you were waiting on: {}\n\nIt has run.",
-            answer.description
-        ))
+        // its own (`PairOwner::Turn`); either way the seed names that block
+        // and carries only what the outcome needs.
+        ExecAction::Tell(executed_turn_seed(&who, source, &outcome.envelope(), &output_block_id))
     } else {
         ExecAction::Settled
     }
@@ -1421,7 +1554,7 @@ mod lifetime_tests {
                     assert_eq!(recovered.shell_operations().list_for_context(context).unwrap().len(), 1);
                     Some(recovered)
                 } else {
-                    assert!(matches!(action, ExecAction::Tell(ref seed) if seed.contains("It has run.")));
+                    assert!(matches!(action, ExecAction::Tell(ref seed) if seed.contains("approved and ran: ") && seed.contains("exit 0 in ")));
                     None
                 };
                 let settled = recovered.as_ref().unwrap_or(kernel.as_ref());

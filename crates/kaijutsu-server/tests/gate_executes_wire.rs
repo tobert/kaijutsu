@@ -459,7 +459,7 @@ fn shutdown_keeps_the_approved_turns_delivery_seed() {
         tokio::time::timeout(std::time::Duration::from_secs(2),
             s.kernel.kernel.shutdown_runtime_worker()).await.unwrap().unwrap();
         assert!(s.worker_blocks().iter().any(|block| block.kind == BlockKind::Text
-            && block.content.contains("approved the action")),
+            && block.content.contains("approved and ran: ")),
             "shutdown discarded the durable delivery seed for the spent approval");
         assert!(!s.undelivered(&ask));
         s.close().await;
@@ -688,7 +688,7 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
         // then insist it did not: a session-owned pair tells nobody.
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
-            !s.worker_blocks().iter().any(|b| b.content.contains("It has run.")),
+            !s.worker_blocks().iter().any(|b| b.content.contains("approved and ran: ")),
             "a session-owned pair must not get a seed telling anyone it ran"
         );
 
@@ -714,7 +714,7 @@ fn an_allowed_ask_fills_the_pair_that_was_waiting_on_it() {
 /// (`docs/gate-resume.md`, "The subscriber, in order").
 ///
 /// Falsified by treating every linked pair as told-nobody regardless of
-/// owner: no "It has run." seed would appear and a delegated turn would
+/// owner: no "approved and ran: " seed would appear and a delegated turn would
 /// never learn its approved tool call ran.
 #[test]
 fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
@@ -751,8 +751,7 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
         wait_for("the seed block saying it ran", || {
             s.worker_blocks().iter().any(|b| {
                 b.kind == kaijutsu_types::BlockKind::Text
-                    && b.content.contains("approved the action")
-                    && b.content.contains("It has run.")
+                    && b.content.contains("approved and ran: ")
             })
         })
         .await;
@@ -764,7 +763,7 @@ fn an_allowed_ask_that_fills_a_turns_pair_tells_the_model() {
             .expect("the filled output block");
         let seed_index = blocks
             .iter()
-            .position(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("It has run."))
+            .position(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("approved and ran: "))
             .expect("the seed block");
         assert!(
             seed_index > output_index,
@@ -1166,8 +1165,7 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         wait_for("the seed block saying it ran", || {
             s.worker_blocks().iter().any(|b| {
                 b.kind == kaijutsu_types::BlockKind::Text
-                    && b.content.contains("approved the action")
-                    && b.content.contains("It has run.")
+                    && b.content.contains("approved and ran: ")
             })
         })
         .await;
@@ -1175,7 +1173,7 @@ fn an_allowed_ask_with_no_pair_authors_one_and_tells_the_model() {
         let seed = s
             .worker_blocks()
             .into_iter()
-            .find(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("It has run."))
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Text && b.content.contains("approved and ran: "))
             .expect("the seed block");
         assert!(
             !seed.content.contains("Nothing has run yet"),
@@ -1426,7 +1424,7 @@ fn shell_box_pair_fills_when_its_own_ask_is_allowed() {
             "a run into the pair the caller authored must author nothing else"
         );
         assert!(
-            !blocks.iter().any(|b| b.content.contains("It has run.")),
+            !blocks.iter().any(|b| b.content.contains("approved and ran: ")),
             "a run into a caller-authored pair tells nobody"
         );
         s.close().await;
