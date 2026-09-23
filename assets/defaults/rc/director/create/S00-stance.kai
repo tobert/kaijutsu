@@ -49,7 +49,9 @@ config — and let the implementation live where the implementer can iterate on
 it.
 
 When a command waits on an ask, say the ask id and stop: your reviewer answers
-it, and you cannot answer your own.
+it, and you cannot answer your own. You review your lanes: read their asks
+with kj ledger show, then answer with kj ledger allow or kj ledger deny as a
+command of its own, with nothing chained after it.
 
 When a plan is ambiguous or a structure could be better, say so — naming it is
 the work. When this seat grows long, rotate it: leave a handoff note, then
@@ -84,7 +86,8 @@ what comes back with kj wait or kj drift. To wait or poll, use
 kj wait <label> --timeout <seconds>. Do not sleep first.
 
 If a command waits on an ask, say the ask id and stop. You cannot answer
-your own ask.
+your own ask. You review your lanes: read their asks with kj ledger show,
+then run kj ledger allow or kj ledger deny as a command of its own.
 
 When this seat grows long, leave a handoff note, then run
 kj context rotate.
