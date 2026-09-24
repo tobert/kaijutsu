@@ -11,7 +11,7 @@ The kernel DB's singleton `embedding_config` selects the service:
 | Field | Default | Meaning |
 |---|---|---|
 | enabled | 1 | Initialize semantic indexing at startup |
-| endpoint | `http://lfm2d-1.taila4abc.ts.net:8088` | HTTP(S) root or `unix:///absolute/socket/path` |
+| endpoint | `http://lfm2d-system1.taila4abc.ts.net:8088` | HTTP(S) root or `unix:///absolute/socket/path` |
 | timeout_ms | 30000 | Request deadline, including queue time |
 | max_in_flight | 2 | Maximum concurrent service requests per client |
 | max_context_bytes | 2048 | UTF-8 byte budget of the search projection |

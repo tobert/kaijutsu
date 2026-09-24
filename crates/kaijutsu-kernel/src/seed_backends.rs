@@ -134,7 +134,16 @@ const FACTORY_MAX_TOKENS: i64 = 16384;
 /// than through this default.
 const FACTORY_EFFORT: &str = "max";
 
-pub(crate) const FACTORY_EMBEDDING_ENDPOINT: &str = "http://lfm2d-1.taila4abc.ts.net:8088";
+/// lfm2d-system1 serves LFM2.5-Embedding-350M on `/embed` (lfm2d `f6fd4bb`,
+/// 2026-09-24). Changing the service's checkpoint changes the vector space;
+/// the index pins the discovered weight hash, so it refuses a mixed space.
+pub(crate) const FACTORY_EMBEDDING_ENDPOINT: &str = "http://lfm2d-system1.taila4abc.ts.net:8088";
+
+/// Earlier factory defaults. A kernel whose row still holds one of these
+/// never chose it, so the additive migrations move it to the current
+/// default. lfm2d-1 serves the frozen classifier heads and never had an
+/// embedder: discovery there fails with "no embedding model".
+pub(crate) const RETIRED_FACTORY_EMBEDDING_ENDPOINTS: &[&str] = &["http://lfm2d-1.taila4abc.ts.net:8088"];
 
 /// True when `name` is a factory backend name. Not a hard reservation — an
 /// operator may absolutely re-point `anthropic` at a gateway — but
