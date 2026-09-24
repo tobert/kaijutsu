@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -80,10 +80,8 @@ impl McpServerLike for BuiltinResourcesServer {
     }
 
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-        let list_schema = schemars::schema_for!(ListParams);
-        let uri_schema = schemars::schema_for!(UriParams);
-        let list_value = serde_json::to_value(&list_schema).map_err(McpError::InvalidParams)?;
-        let uri_value = serde_json::to_value(&uri_schema).map_err(McpError::InvalidParams)?;
+        let list_value = tool_input_schema::<ListParams>();
+        let uri_value = tool_input_schema::<UriParams>();
         Ok(vec![
             KernelTool {
                 instance: self.instance_id.clone(),
@@ -135,7 +133,7 @@ impl McpServerLike for BuiltinResourcesServer {
         let broker = self.broker()?;
         match params.tool.as_str() {
             "list" => {
-                let p: ListParams = decode_params(params.arguments.clone())?;
+                let p: ListParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance);
                 let list = broker.list_resources(&instance, ctx).await?;
                 let json =
@@ -155,7 +153,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 })
             }
             "read" => {
-                let p: UriParams = decode_params(params.arguments.clone())?;
+                let p: UriParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance.clone());
                 let _result = broker.read_resource(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(
@@ -164,7 +162,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 )))
             }
             "subscribe" => {
-                let p: UriParams = decode_params(params.arguments.clone())?;
+                let p: UriParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance.clone());
                 broker.subscribe(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(
@@ -173,7 +171,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 )))
             }
             "unsubscribe" => {
-                let p: UriParams = decode_params(params.arguments.clone())?;
+                let p: UriParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance.clone());
                 broker.unsubscribe(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(

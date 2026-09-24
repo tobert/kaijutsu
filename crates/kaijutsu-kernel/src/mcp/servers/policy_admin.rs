@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -82,8 +82,6 @@ impl McpServerLike for BuiltinPolicyServer {
     }
 
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-        let show_schema = schemars::schema_for!(PolicyShowParams);
-        let set_schema = schemars::schema_for!(PolicySetParams);
         Ok(vec![
             KernelTool {
                 instance: self.instance_id.clone(),
@@ -94,8 +92,7 @@ impl McpServerLike for BuiltinPolicyServer {
                      MCP instance."
                         .to_string(),
                 ),
-                input_schema: serde_json::to_value(show_schema)
-                    .map_err(McpError::InvalidParams)?,
+                input_schema: tool_input_schema::<PolicyShowParams>(),
             },
             KernelTool {
                 instance: self.instance_id.clone(),
@@ -106,8 +103,7 @@ impl McpServerLike for BuiltinPolicyServer {
                      registration time only and cannot be changed live."
                         .to_string(),
                 ),
-                input_schema: serde_json::to_value(set_schema)
-                    .map_err(McpError::InvalidParams)?,
+                input_schema: tool_input_schema::<PolicySetParams>(),
             },
         ])
     }
@@ -122,7 +118,7 @@ impl McpServerLike for BuiltinPolicyServer {
         match params.tool.as_str() {
             "policy_show" => {
                 let parsed: PolicyShowParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let id = InstanceId::new(parsed.instance);
                 let policy = broker
                     .policy_of(&id)
@@ -142,7 +138,7 @@ impl McpServerLike for BuiltinPolicyServer {
             }
             "policy_set" => {
                 let parsed: PolicySetParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let id = InstanceId::new(parsed.instance);
                 let timeout = parsed.call_timeout_ms.map(Duration::from_millis);
                 let bytes = parsed.max_result_bytes.map(|b| b as usize);

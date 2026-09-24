@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult, ToolContent};
 
@@ -41,10 +41,10 @@ pub struct CancelOperationParams {
     pub id: String,
 }
 
-fn tool_def<P: JsonSchema>(instance: &InstanceId, name: &str, description: &str) -> McpResult<KernelTool> {
+fn tool_def<P: JsonSchema + 'static>(instance: &InstanceId, name: &str, description: &str) -> McpResult<KernelTool> {
     Ok(KernelTool {
         instance: instance.clone(), name: name.to_owned(), description: Some(description.to_owned()),
-        input_schema: serde_json::to_value(schemars::schema_for!(P)).map_err(McpError::InvalidParams)?,
+        input_schema: tool_input_schema::<P>(),
     })
 }
 
@@ -123,7 +123,7 @@ impl McpServerLike for ShellOperationsServer {
         let registry = dispatcher.kernel().shell_operations();
         match params.tool.as_str() {
             Self::TOOL_LIST => {
-                let _: ListOperationsParams = decode_params(params.arguments)?;
+                let _: ListOperationsParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let entries = registry.list_for_context(ctx.context_id).map_err(McpError::Protocol)?;
                 Ok(json_result(serde_json::json!(entries.into_iter().map(|entry| {
                     serde_json::json!({
@@ -136,7 +136,7 @@ impl McpServerLike for ShellOperationsServer {
                 }).collect::<Vec<_>>())))
             }
             Self::TOOL_READ => {
-                let p: ReadOperationParams = decode_params(params.arguments)?;
+                let p: ReadOperationParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let entry = registry.get(&p.id, ctx.context_id).map_err(McpError::Protocol)?
                     .ok_or_else(|| McpError::Protocol(no_such_operation_message(registry, &p.id)))?;
                 let block = dispatcher.block_store().get_block_snapshot(ctx.context_id, &entry.receipt.output_block_id)
@@ -158,7 +158,7 @@ impl McpServerLike for ShellOperationsServer {
                 })))
             }
             Self::TOOL_KILL => {
-                let p: CancelOperationParams = decode_params(params.arguments)?;
+                let p: CancelOperationParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 if !broker.binding(&ctx.context_id).await.is_some_and(|b| b.allows(&crate::mcp::Capability::Facade("shell_write".into()))) {
                     return Err(McpError::Protocol("cancel_shell_operation requires facade:shell_write".into()));
                 }

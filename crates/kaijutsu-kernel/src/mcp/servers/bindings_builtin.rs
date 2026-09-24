@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
     InstanceId, KernelCallParams, KernelReadResource, KernelResource, KernelResourceContents,
@@ -160,11 +160,8 @@ impl McpServerLike for BuiltinBindingsServer {
     }
 
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-        let instance_schema = schemars::schema_for!(InstanceParams);
-        let show_schema = schemars::schema_for!(ShowParams);
-        let instance_value =
-            serde_json::to_value(&instance_schema).map_err(McpError::InvalidParams)?;
-        let show_value = serde_json::to_value(&show_schema).map_err(McpError::InvalidParams)?;
+        let instance_value = tool_input_schema::<InstanceParams>();
+        let show_value = tool_input_schema::<ShowParams>();
         Ok(vec![
             KernelTool {
                 instance: self.instance_id.clone(),
@@ -210,7 +207,7 @@ impl McpServerLike for BuiltinBindingsServer {
         let broker = self.broker()?;
         match params.tool.as_str() {
             "bind" => {
-                let p: InstanceParams = decode_params(params.arguments.clone())?;
+                let p: InstanceParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 // `bind` widens the loadout. Loadout-write policy: a context may
                 // not widen itself unless it holds binding-admin. (`unbind` is
                 // self-narrowing and stays open.) Mirrors `kj binding`'s guard
@@ -236,7 +233,7 @@ impl McpServerLike for BuiltinBindingsServer {
                 })
             }
             "unbind" => {
-                let p: InstanceParams = decode_params(params.arguments.clone())?;
+                let p: InstanceParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let instance = InstanceId::new(p.instance.clone());
                 // Same rule the `kj binding revoke` verb applies: a broad
                 // `*` out-ranks every granular entry, so unbinding one
@@ -265,7 +262,7 @@ impl McpServerLike for BuiltinBindingsServer {
                 })
             }
             "show" => {
-                let _: ShowParams = decode_params(params.arguments.clone())?;
+                let _: ShowParams = serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
                 let binding = broker.binding(&ctx.context_id).await.unwrap_or_default();
                 let allowed: Vec<&str> = binding
                     .allowed_instances

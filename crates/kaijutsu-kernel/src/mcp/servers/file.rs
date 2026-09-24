@@ -20,7 +20,7 @@ use crate::execution::{ExecContext, ExecResult};
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 use super::adapter::{from_exec_result, to_exec_context};
@@ -136,17 +136,16 @@ impl FileToolsServer {
     }
 }
 
-fn tool_def<P: JsonSchema>(
+fn tool_def<P: JsonSchema + 'static>(
     instance: &InstanceId,
     name: &str,
     description: &str,
 ) -> McpResult<KernelTool> {
-    let schema = schemars::schema_for!(P);
     Ok(KernelTool {
         instance: instance.clone(),
         name: name.to_string(),
         description: Some(description.to_string()),
-        input_schema: serde_json::to_value(schema).map_err(McpError::InvalidParams)?,
+        input_schema: tool_input_schema::<P>(),
     })
 }
 
@@ -202,7 +201,7 @@ impl McpServerLike for FileToolsServer {
         let exec = match params.tool.as_str() {
             "read" => {
                 let p: ReadParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_read(&tool_ctx, &path)
@@ -221,7 +220,7 @@ impl McpServerLike for FileToolsServer {
             }
             "edit" => {
                 let p: EditParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)
@@ -233,7 +232,7 @@ impl McpServerLike for FileToolsServer {
             }
             "write" => {
                 let p: WriteParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
                 if let Some(ref guard) = self.guard
                     && let Err(denied) = guard.check_write(&tool_ctx, &path)
@@ -245,7 +244,7 @@ impl McpServerLike for FileToolsServer {
             }
             "glob" => {
                 let p: GlobParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let glob_path = match kaish_glob::GlobPath::new(&p.pattern) {
                     Ok(g) => g,
                     Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid pattern: {}", e)))),
@@ -314,7 +313,7 @@ impl McpServerLike for FileToolsServer {
             }
             "grep" => {
                 let p: GrepParams =
-                    decode_params(params.arguments)?;
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
                 let re = match regex::Regex::new(&p.pattern) {
                     Ok(r) => r,
                     Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid regex pattern: {}", e)))),
@@ -1184,44 +1183,6 @@ mod tests {
                 .principal_id(),
             performer,
             "the current performer, rather than the file hydrator, owns the live edit"
-        );
-    }
-
-    /// Observed live 2026-09-24: qwen3.8-flash calls `read` with `offset`
-    /// and `limit` encoded as JSON strings (`"2"`, `"1"`) rather than JSON
-    /// numbers. Before `decode_params` this refused with `invalid type:
-    /// string "2", expected u32` — a wasted model round trip. The
-    /// string-encoded call must return exactly the same window as the
-    /// integer-encoded one, not merely "succeed".
-    #[tokio::test]
-    async fn read_accepts_string_encoded_offset_and_limit() {
-        let path = "/tmp/lines.txt";
-        let (broker, _cache) = broker_with_file(path, "one\ntwo\nthree\nfour\n").await;
-
-        let with_numbers = call(
-            &broker,
-            "read",
-            serde_json::json!({ "path": path, "offset": 2, "limit": 1 }),
-        )
-        .await;
-        let with_strings = call(
-            &broker,
-            "read",
-            serde_json::json!({ "path": path, "offset": "2", "limit": "1" }),
-        )
-        .await;
-
-        assert!(!with_numbers.is_error, "integer call failed: {}", text_of(&with_numbers));
-        assert!(!with_strings.is_error, "string call failed: {}", text_of(&with_strings));
-        assert_eq!(
-            text_of(&with_strings),
-            text_of(&with_numbers),
-            "a string-encoded offset/limit must return the identical window as the integer form"
-        );
-        assert!(
-            text_of(&with_strings).contains("two"),
-            "the requested window (line 2) must actually be present: {}",
-            text_of(&with_strings)
         );
     }
 

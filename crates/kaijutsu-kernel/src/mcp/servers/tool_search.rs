@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
-use super::super::params::decode_params;
+use super::super::schema::tool_input_schema;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -84,7 +84,6 @@ impl McpServerLike for BuiltinToolSearchServer {
     }
 
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-        let schema = schemars::schema_for!(ToolSearchParams);
         Ok(vec![KernelTool {
             instance: self.instance_id.clone(),
             name: "tool_search".to_string(),
@@ -94,7 +93,7 @@ impl McpServerLike for BuiltinToolSearchServer {
                  context's visible tools."
                     .to_string(),
             ),
-            input_schema: serde_json::to_value(schema).map_err(McpError::InvalidParams)?,
+            input_schema: tool_input_schema::<ToolSearchParams>(),
         }])
     }
 
@@ -111,7 +110,7 @@ impl McpServerLike for BuiltinToolSearchServer {
             });
         }
         let parsed: ToolSearchParams =
-            decode_params(params.arguments)?;
+            serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
         let query = parsed.query.trim().to_lowercase();
         let limit = match parsed.limit {
             Some(0) | None => DEFAULT_LIMIT,
