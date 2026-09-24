@@ -28,7 +28,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use kaijutsu_client::KeySource;
+use kaijutsu_client::{KeyArgs, KeySource};
 use kaijutsu_mcp::{KaijutsuMcp, StartupGate};
 use kaijutsu_mcp::hook_listener::{
     HookListener, PING_TIMEOUT, candidate_sockets, default_socket_path, resolve_hook_socket,
@@ -94,24 +94,8 @@ struct ServeArgs {
     #[arg(long)]
     hook_socket: Option<PathBuf>,
 
-    /// SSH agent identity to connect as, given as its OpenSSH
-    /// `SHA256:<base64>` fingerprint (the string `ssh-add -l` prints).
-    /// Falls back to `KAIJUTSU_KEY_FINGERPRINT`; a flag wins over its
-    /// variable. Default, with `--key-file` also unset: try every key the
-    /// agent holds. A fingerprint the agent does not offer fails the
-    /// connection rather than falling back to another key.
-    #[arg(long)]
-    key_fingerprint: Option<String>,
-
-    /// Private key file to connect with, read directly instead of through
-    /// the SSH agent. Falls back to `KAIJUTSU_KEY_FILE`; a flag wins over
-    /// its variable. Default, with `--key-fingerprint` also unset: try
-    /// every key the agent holds. The file must be unencrypted — an
-    /// encrypted key fails the connection instead of prompting for a
-    /// passphrase, and giving both `--key-fingerprint` and `--key-file`
-    /// (after resolving their variables) is also an error.
-    #[arg(long)]
-    key_file: Option<PathBuf>,
+    #[command(flatten)]
+    key: KeyArgs,
 
     /// The context, by label or id, that new session contexts are created
     /// under. Falls back to `KAIJUTSU_PARENT`; a flag wins over its
@@ -168,12 +152,7 @@ async fn main() -> Result<()> {
 
 /// MCP stdio server + hook socket listener.
 async fn run_serve(args: ServeArgs) -> Result<()> {
-    let key_source = resolve_key_source(
-        args.key_fingerprint.clone(),
-        args.key_file.clone(),
-        std::env::var("KAIJUTSU_KEY_FINGERPRINT").ok(),
-        std::env::var("KAIJUTSU_KEY_FILE").ok(),
-    )?;
+    let key_source = args.key.key_source()?;
 
     // Detect hosting agent (Claude Code, etc.)
     let agent = kaijutsu_agent_tools::detect();
@@ -520,43 +499,6 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `--key-fingerprint`/`--key-file` against their environment
-/// fallbacks (`KAIJUTSU_KEY_FINGERPRINT`, `KAIJUTSU_KEY_FILE`) into a
-/// [`KeySource`]. A flag wins over its variable. Naming both (after
-/// resolution) is an error — never a silent pick of one over the other.
-/// Naming neither keeps `KeySource::Agent`, trying every key the agent
-/// holds.
-///
-/// An env variable set to the empty string counts as unset, not as a
-/// value naming an empty fingerprint or path — an exported-but-blank
-/// `KAIJUTSU_KEY_FINGERPRINT=""` must not collide with a `--key-file`
-/// flag. A flag given as an empty string is not filtered the same way:
-/// `KeySource::agent_key`/`from_file` still receive it and fail loudly
-/// downstream, since a flag is a deliberate argument, not ambient
-/// environment.
-fn resolve_key_source(
-    key_fingerprint: Option<String>,
-    key_file: Option<PathBuf>,
-    env_fingerprint: Option<String>,
-    env_file: Option<String>,
-) -> Result<KeySource> {
-    let fingerprint = key_fingerprint.or(env_fingerprint.filter(|s| !s.is_empty()));
-    let file =
-        key_file.or_else(|| env_file.filter(|s| !s.is_empty()).map(PathBuf::from));
-
-    match (fingerprint, file) {
-        (Some(fingerprint), Some(path)) => Err(anyhow::anyhow!(
-            "--key-fingerprint ({fingerprint}) and --key-file ({}) (or their \
-             KAIJUTSU_KEY_FINGERPRINT/KAIJUTSU_KEY_FILE variables) name two \
-             different keys; give exactly one",
-            path.display()
-        )),
-        (Some(fingerprint), None) => Ok(KeySource::agent_key(fingerprint)),
-        (None, Some(path)) => Ok(KeySource::from_file(path)),
-        (None, None) => Ok(KeySource::Agent),
-    }
-}
-
 /// Basenames `ssh` itself tries automatically when no `-i` is given — the
 /// files a human's own login almost certainly uses. A `--key-file` naming
 /// one of these under the user's `~/.ssh` is a personal key pressed into
@@ -826,132 +768,6 @@ mod tests {
         assert_eq!(agent_label_prefix(Some("codex")), "codex");
         assert_eq!(agent_label_prefix(None), "mcp");
         assert_eq!(agent_label_prefix(Some("future-agent")), "mcp");
-    }
-
-    // -- resolve_key_source (--key-fingerprint / --key-file precedence) --
-
-    #[test]
-    fn resolve_key_source_defaults_to_agent_when_nothing_given() {
-        let source = resolve_key_source(None, None, None, None).expect("no error");
-        assert!(matches!(source, KeySource::Agent));
-    }
-
-    #[test]
-    fn resolve_key_source_flag_fingerprint_wins_over_its_env_var() {
-        let source = resolve_key_source(
-            Some("SHA256:flag".to_string()),
-            None,
-            Some("SHA256:env".to_string()),
-            None,
-        )
-        .expect("no error");
-        match source {
-            KeySource::AgentKey { fingerprint } => assert_eq!(fingerprint, "SHA256:flag"),
-            other => panic!("expected AgentKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_env_fingerprint_used_when_flag_unset() {
-        let source = resolve_key_source(None, None, Some("SHA256:env".to_string()), None)
-            .expect("no error");
-        match source {
-            KeySource::AgentKey { fingerprint } => assert_eq!(fingerprint, "SHA256:env"),
-            other => panic!("expected AgentKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_flag_file_wins_over_its_env_var() {
-        let source = resolve_key_source(
-            None,
-            Some(PathBuf::from("/flag/key")),
-            None,
-            Some("/env/key".to_string()),
-        )
-        .expect("no error");
-        match source {
-            KeySource::File { path, passphrase } => {
-                assert_eq!(path, PathBuf::from("/flag/key"));
-                assert_eq!(passphrase, None);
-            }
-            other => panic!("expected File, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_env_file_used_when_flag_unset() {
-        let source =
-            resolve_key_source(None, None, None, Some("/env/key".to_string())).expect("no error");
-        match source {
-            KeySource::File { path, .. } => assert_eq!(path, PathBuf::from("/env/key")),
-            other => panic!("expected File, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_both_given_after_resolution_is_an_error() {
-        // Both from flags.
-        let err = resolve_key_source(
-            Some("SHA256:flag".to_string()),
-            Some(PathBuf::from("/flag/key")),
-            None,
-            None,
-        )
-        .expect_err("both a fingerprint and a file must be refused");
-        assert!(err.to_string().contains("SHA256:flag"));
-        assert!(err.to_string().contains("/flag/key"));
-
-        // One from a flag, the other from its variable — still both given.
-        let err = resolve_key_source(
-            Some("SHA256:flag".to_string()),
-            None,
-            None,
-            Some("/env/key".to_string()),
-        )
-        .expect_err("a flag plus the OTHER option's env var must still be refused");
-        assert!(err.to_string().contains("SHA256:flag"));
-        assert!(err.to_string().contains("/env/key"));
-    }
-
-    #[test]
-    fn resolve_key_source_empty_env_fingerprint_does_not_collide_with_a_file_flag() {
-        // An exported-but-blank KAIJUTSU_KEY_FINGERPRINT must read as unset,
-        // not as a fingerprint naming the empty string — otherwise a
-        // --key-file flag would spuriously error as "both given".
-        let source = resolve_key_source(
-            None,
-            Some(PathBuf::from("/flag/key")),
-            Some(String::new()),
-            None,
-        )
-        .expect("an empty env fingerprint must not collide with --key-file");
-        match source {
-            KeySource::File { path, .. } => assert_eq!(path, PathBuf::from("/flag/key")),
-            other => panic!("expected File, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_empty_env_file_does_not_collide_with_a_fingerprint_flag() {
-        let source = resolve_key_source(
-            Some("SHA256:flag".to_string()),
-            None,
-            None,
-            Some(String::new()),
-        )
-        .expect("an empty env file must not collide with --key-fingerprint");
-        match source {
-            KeySource::AgentKey { fingerprint } => assert_eq!(fingerprint, "SHA256:flag"),
-            other => panic!("expected AgentKey, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_key_source_both_env_vars_empty_defaults_to_agent() {
-        let source = resolve_key_source(None, None, Some(String::new()), Some(String::new()))
-            .expect("no error");
-        assert!(matches!(source, KeySource::Agent));
     }
 
     // -- is_default_personal_key_path / personal_key_warning --

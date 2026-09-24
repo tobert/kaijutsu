@@ -133,9 +133,12 @@ External lead models need their own character-bound credential; two processes
 using the same credential are the same character. The `user_initiated` flag
 controls presentation, never approval authority.
 
-The Bevy app accepts `--key-fingerprint <fingerprint>` to select one SSH-agent
-key, or `--key-file <path>` to select a private-key file. The selectors are
-mutually exclusive and do not fall back to another key. Its displayed identity
+The Bevy app, the TUI, `kaijutsu-mcp`, and `kaijutsu-acp` all accept the same
+`--key-fingerprint <fingerprint>` (select one SSH-agent key) and `--key-file
+<path>` (select a private-key file) pair, resolved by the one shared
+`kaijutsu_client::key_select::resolve_key_source` (`docs/character.md`, "The
+bridge identity: a key per model character"). The selectors are mutually
+exclusive and do not fall back to another key. The app's displayed identity
 and draft ownership come from the authenticated connection's `whoami` result.
 The app has dedicated ledger controls: an ask sheet
 (`crates/kaijutsu-app/src/ui/ask_sheet.rs`) and a ledger ribbon

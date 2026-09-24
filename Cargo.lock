@@ -6579,6 +6579,7 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "clap",
  "dirs",
  "env_logger",
  "futures",

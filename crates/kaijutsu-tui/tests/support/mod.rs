@@ -101,7 +101,7 @@ impl Drop for EphemeralServer {
 }
 
 /// Write `server`'s root key to `<dir>/id_ed25519` in OpenSSH format, for
-/// `kaijutsu-tui --key <path>`. Returns the key file path.
+/// `kaijutsu-tui --key-file <path>`. Returns the key file path.
 ///
 /// Must be `server`'s own key: the server rejects any key its `init` step
 /// did not bind.
@@ -256,7 +256,7 @@ impl TuiSession {
         cmd.arg("--user");
         cmd.arg("test_user");
         cmd.arg("--insecure");
-        cmd.arg("--key");
+        cmd.arg("--key-file");
         cmd.arg(key_path);
         cmd.arg("--context");
         cmd.arg("probe");

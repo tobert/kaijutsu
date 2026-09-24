@@ -9,6 +9,7 @@ pub mod context_create;
 pub mod context_feed;
 pub mod document_store;
 pub mod kernel_clock;
+pub mod key_select;
 pub mod ledger;
 pub mod midi_exchange;
 pub mod rank;
@@ -46,6 +47,9 @@ pub use ledger::{
     decide_ask_remember, list_history, list_pending, poll_new_asks, show_ask, show_ask_detail,
 };
 pub use kernel_clock::{KernelClockHandle, local_epoch_ns};
+pub use key_select::{KeySelectError, resolve_key_source};
+#[cfg(feature = "cli")]
+pub use key_select::KeyArgs;
 pub use rank::{RankedSeat, ranked_context_ids, ranked_seats};
 pub use sftp::{CasFetch, CasResolver, ResolveSource, SftpClient, SftpError, default_cache_dir};
 pub use share_server::{

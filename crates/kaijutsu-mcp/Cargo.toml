@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 kaijutsu-kernel.workspace = true
 kaijutsu-types.workspace = true
-kaijutsu-client.workspace = true
+kaijutsu-client = { workspace = true, features = ["cli"] }
 kaijutsu-agent-tools.workspace = true
 kaijutsu-telemetry.workspace = true
 tokio.workspace = true

@@ -640,7 +640,11 @@ lookups, nothing to keep in sync. Decided with Amy, 2026-09-05:
   A fingerprint the agent does not hold, or an encrypted key file, **fails
   the connection loudly** and names what was asked for; it never falls back
   to trying every key, since that would silently reconnect as Amy. Neither
-  given keeps today's behavior.
+  given keeps today's behavior. `kaijutsu-acp`, `kaijutsu-app`, and
+  `kaijutsu-tui` accept the identical pair, resolved the identical way:
+  `kaijutsu_client::key_select` owns `--key-fingerprint`/`--key-file` and
+  their env fallbacks once (`KeyArgs`, `resolve_key_source`), flattened into
+  each binary's own `clap::Parser` rather than declared per binary.
 - Keys for model characters are unencrypted and live under `~/.ssh/`, so a
   login shell can `ssh-add` them without anyone thinking about it, or the
   MCP reads the file directly. Their public halves go in through the

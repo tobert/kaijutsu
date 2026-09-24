@@ -7,6 +7,14 @@ description = "Cap'n Proto RPC client library for kaijutsu"
 [lints]
 workspace = true
 
+[features]
+default = []
+# `KeyArgs`, a `clap::Args` struct flattened into every binary that connects
+# over SSH (`kaijutsu-mcp`, `kaijutsu-acp`, `kaijutsu-app`, `kaijutsu-tui`) so
+# `--key-fingerprint`/`--key-file` are declared once. Off by default so
+# library-only consumers of this crate (`kaijutsu-kernel`) never need clap.
+cli = ["dep:clap"]
+
 [dependencies]
 capnp.workspace = true
 capnp-rpc.workspace = true
@@ -22,6 +30,7 @@ rand_v10 = { package = "rand", version = "0.10" }
 log.workspace = true
 thiserror.workspace = true
 whoami.workspace = true
+clap = { workspace = true, optional = true }
 home = "0.5"
 serde_json = { workspace = true }
 tracing = { workspace = true }

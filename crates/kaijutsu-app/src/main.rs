@@ -30,7 +30,7 @@ use bevy::window::{
 use bevy::winit::{UpdateMode, WinitSettings};
 use bevy_brp_extras::BrpExtrasPlugin;
 use clap::Parser;
-use kaijutsu_client::{KeySource, SshConfig};
+use kaijutsu_client::{KeyArgs, SshConfig};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// 会術 Kaijutsu — collaborative workspace
@@ -49,14 +49,8 @@ struct Cli {
     #[arg(long)]
     insecure: bool,
 
-    /// Select exactly one SSH-agent key by its `SHA256:<base64>` fingerprint.
-    /// The app fails if the agent does not hold that key.
-    #[arg(long, conflicts_with = "key_file")]
-    key_fingerprint: Option<String>,
-
-    /// Authenticate with this private-key file. Conflicts with `--key-fingerprint`.
-    #[arg(long, conflicts_with = "key_fingerprint")]
-    key_file: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    key: KeyArgs,
 
     /// Start borderless-fullscreen on the primary monitor (runner/gamescope)
     #[arg(long, conflicts_with = "maximize")]
@@ -104,15 +98,12 @@ fn main() {
             .exit();
     }
 
-    let key_source = match key_source_from_selectors(
-        cli.key_fingerprint.as_deref(),
-        cli.key_file.as_deref(),
-    ) {
+    let key_source = match cli.key.key_source() {
         Ok(key_source) => key_source,
         Err(e) => {
             use clap::CommandFactory;
             Cli::command()
-                .error(clap::error::ErrorKind::ValueValidation, e)
+                .error(clap::error::ErrorKind::ValueValidation, e.to_string())
                 .exit();
         }
     };
@@ -363,21 +354,6 @@ fn main() {
         .run();
 }
 
-fn key_source_from_selectors(
-    fingerprint: Option<&str>,
-    key_file: Option<&std::path::Path>,
-) -> Result<KeySource, String> {
-    match (fingerprint, key_file) {
-        (Some(_), Some(_)) => Err("choose either --key-fingerprint or --key-file, not both".into()),
-        (Some(fingerprint), None) if fingerprint.is_empty() => {
-            Err("--key-fingerprint must name an SSH SHA256 fingerprint".into())
-        }
-        (Some(fingerprint), None) => Ok(KeySource::agent_key(fingerprint)),
-        (None, Some(path)) => Ok(KeySource::from_file(path)),
-        (None, None) => Ok(KeySource::Agent),
-    }
-}
-
 /// Setup the single, always-on app camera.
 ///
 /// It is a `Camera3d` (not `Camera2d`) so the time well's 3D card meshes and the
@@ -575,25 +551,26 @@ mod cli_tests {
         assert!(Cli::try_parse_from(["kaijutsu", "--maximize"]).is_ok());
     }
 
+    /// Both flags parse fine at the clap level now — mutual exclusivity
+    /// moved to `kaijutsu_client::resolve_key_source` (its own tests cover
+    /// that refusal), the same resolver `kaijutsu-mcp`, `kaijutsu-acp`, and
+    /// `kaijutsu-tui` call through `KeyArgs::key_source`. This test only
+    /// confirms the flags reach the fields the resolver reads.
     #[test]
-    fn key_selectors_are_exclusive_and_choose_one_source() {
-        assert!(Cli::try_parse_from([
+    fn key_selectors_flatten_and_reach_their_fields() {
+        let both = Cli::try_parse_from([
             "kaijutsu",
             "--key-fingerprint",
             "SHA256:chosen",
             "--key-file",
             "/tmp/key",
         ])
-        .is_err());
+        .expect("both flags parse; the resolver, not clap, refuses the combination");
+        assert_eq!(both.key.key_fingerprint.as_deref(), Some("SHA256:chosen"));
+        assert_eq!(both.key.key_file.as_deref(), Some(std::path::Path::new("/tmp/key")));
 
-        assert!(matches!(
-            key_source_from_selectors(Some("SHA256:chosen"), None),
-            Ok(KeySource::AgentKey { fingerprint }) if fingerprint == "SHA256:chosen"
-        ));
-        assert!(matches!(
-            key_source_from_selectors(None, Some(std::path::Path::new("/tmp/key"))),
-            Ok(KeySource::File { path, passphrase: None }) if path == std::path::Path::new("/tmp/key")
-        ));
-        assert!(matches!(key_source_from_selectors(None, None), Ok(KeySource::Agent)));
+        let neither = Cli::try_parse_from(["kaijutsu"]).expect("parses");
+        assert!(neither.key.key_fingerprint.is_none());
+        assert!(neither.key.key_file.is_none());
     }
 }

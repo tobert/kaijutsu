@@ -14,7 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-kaijutsu-client.workspace = true
+kaijutsu-client = { workspace = true, features = ["cli"] }
 kaijutsu-types.workspace = true
 kaijutsu-telemetry.workspace = true
 

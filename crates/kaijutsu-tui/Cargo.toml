@@ -14,7 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-kaijutsu-client.workspace = true
+kaijutsu-client = { workspace = true, features = ["cli"] }
 kaijutsu-diff.workspace = true
 kaijutsu-editor.workspace = true
 kaijutsu-present.workspace = true
@@ -71,7 +71,7 @@ tempfile.workspace = true
 # For writing an ephemeral SSH key to a file in OpenSSH format
 # (`ssh_key::PrivateKey::random` / `to_openssh`, re-exported through
 # `russh::keys`) — the same generation `KeySource::ephemeral()` does, just
-# on disk so `--key <path>` has something to load.
+# on disk so `--key-file <path>` has something to load.
 russh.workspace = true
 rand_v10 = { package = "rand", version = "0.10" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "process", "time"] }
