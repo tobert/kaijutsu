@@ -28,6 +28,16 @@ use crate::llm::{LlmRegistry, Provider};
 use crate::mcp::Broker;
 use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsResult};
 
+/// Outcome of [`Kernel::interrupt_context`]: whether a running turn was
+/// stopped and whether an open continuation epoch was closed to automatic
+/// resume. The two are independent — a caller with neither true made no
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterruptOutcome {
+    pub turn_interrupted: bool,
+    pub continuation_closed: bool,
+}
+
 /// The Kernel: fundamental primitive of kaijutsu.
 ///
 /// Everything is a kernel. A kernel:
@@ -1073,6 +1083,30 @@ impl Kernel {
     /// Outstanding contexts, ordered by their oldest accepted turn.
     pub fn turns_in_flight(&self) -> Vec<(kaijutsu_types::ContextId, std::time::Duration)> {
         self.turn_state.in_flight()
+    }
+
+    /// Interrupt a context: record the durable interrupt fact first, then
+    /// stop any accepted turn. DB-first so a shell completion racing this
+    /// call cannot claim an automatic resume once this returns — see
+    /// `docs/issues.md`, "An interrupt does not end a continuation". `by`
+    /// is the principal recorded as having interrupted the continuation;
+    /// it never overwrites `signed_off_at`, which is the performer's own
+    /// `kj handoff signoff` close. Both `kj interrupt` and the RPC
+    /// `interruptContext` call this one method.
+    pub fn interrupt_context(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        immediate: bool,
+        by: kaijutsu_types::PrincipalId,
+    ) -> Result<InterruptOutcome, String> {
+        let now = kaijutsu_types::now_millis() as i64;
+        let continuation_closed = self
+            .kernel_db()
+            .lock()
+            .record_continuation_interrupt(context_id, by, now)
+            .map_err(|e| e.to_string())?;
+        let turn_interrupted = self.turn_state.interrupt(context_id, immediate);
+        Ok(InterruptOutcome { turn_interrupted, continuation_closed })
     }
 
     /// Get the content-addressed store.

@@ -708,7 +708,12 @@ CREATE TABLE IF NOT EXISTS context_continuations (
     last_request_at INTEGER,
     yielded_at     INTEGER,
     signed_off_at  INTEGER,
-    invalidated_through INTEGER NOT NULL DEFAULT 0
+    invalidated_through INTEGER NOT NULL DEFAULT 0,
+    -- `kj interrupt`/RPC interruptContext's own durable fact, distinct from
+    -- `signed_off_at` (the performer's own `kj handoff signoff` close).
+    -- Refuses automatic resume until the next epoch clears both.
+    interrupted_at INTEGER,
+    interrupted_by BLOB
 );
 
 CREATE TABLE IF NOT EXISTS approval_reviewer_delegations (
@@ -2001,10 +2006,10 @@ impl KernelDb {
         let epoch = previous.unwrap_or(0).checked_add(1)
             .ok_or_else(|| KernelDbError::Validation("continuation epoch overflow".into()))?;
         self.conn.execute(
-            "INSERT INTO context_continuations (context_id, epoch, opened_at, last_request_at, yielded_at, signed_off_at)
-             VALUES (?1, ?2, ?3, NULL, NULL, NULL)
+            "INSERT INTO context_continuations (context_id, epoch, opened_at, last_request_at, yielded_at, signed_off_at, interrupted_at, interrupted_by)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL)
              ON CONFLICT(context_id) DO UPDATE SET epoch = excluded.epoch, opened_at = excluded.opened_at,
-                 last_request_at = NULL, yielded_at = NULL, signed_off_at = NULL",
+                 last_request_at = NULL, yielded_at = NULL, signed_off_at = NULL, interrupted_at = NULL, interrupted_by = NULL",
             params![blob_param(context_id.as_bytes()), epoch, opened_at],
         )?;
         Ok(ContinuationOrigin { epoch, opened_at })
@@ -2071,9 +2076,47 @@ impl KernelDb {
         )? != 0)
     }
 
+    /// Record that this context's open continuation epoch was interrupted
+    /// (`kj interrupt` or RPC `interruptContext`), closing it to automatic
+    /// resume. Distinct from [`Self::sign_off_continuation`]: that is the
+    /// performer's own handoff close, this is a reviewer or director
+    /// stopping the loop from outside. Idempotent and DB-first — a caller
+    /// records this before touching the running turn, so a completion
+    /// racing the interrupt can never claim a resume. Returns `false`
+    /// without writing when there is no open epoch (none opened, already
+    /// signed off) or one is already interrupted.
+    pub fn record_continuation_interrupt(
+        &self,
+        context_id: ContextId,
+        interrupted_by: PrincipalId,
+        interrupted_at: i64,
+    ) -> KernelDbResult<bool> {
+        if self.conn.is_autocommit() {
+            return self.in_transaction(|db| db.record_continuation_interrupt(context_id, interrupted_by, interrupted_at));
+        }
+        Ok(self.conn.execute(
+            "UPDATE context_continuations SET interrupted_at = ?1, interrupted_by = ?2
+             WHERE context_id = ?3 AND signed_off_at IS NULL AND interrupted_at IS NULL",
+            params![interrupted_at, blob_param(interrupted_by.as_bytes()), blob_param(context_id.as_bytes())],
+        )? != 0)
+    }
+
+    /// Who interrupted this context's open continuation epoch, and when —
+    /// `None` when it was never interrupted (or has no continuation row).
+    pub fn continuation_interrupt(&self, context_id: ContextId) -> KernelDbResult<Option<(i64, PrincipalId)>> {
+        self.conn.query_row(
+            "SELECT interrupted_at, interrupted_by FROM context_continuations
+             WHERE context_id = ?1 AND interrupted_at IS NOT NULL",
+            params![blob_param(context_id.as_bytes())],
+            |row| Ok((row.get(0)?, read_principal_id(row, 1)?)),
+        ).optional().map_err(Into::into)
+    }
+
     /// Whether a settled operation may automatically request another turn.
     /// The epoch must have yielded, but the deadline is its last provider
-    /// inference request rather than the yield itself.
+    /// inference request rather than the yield itself. An interrupted epoch
+    /// (`interrupted_at` set) never resumes automatically, even within the
+    /// window — only an explicit new epoch (`begin_continuation`) reopens it.
     pub fn automatic_resume_allowed(
         &self,
         context_id: ContextId,
@@ -2081,12 +2124,12 @@ impl KernelDb {
         now: i64,
         window_ms: i64,
     ) -> KernelDbResult<bool> {
-        let row: Option<(i64, Option<i64>, Option<i64>, Option<i64>)> = self.conn.query_row(
-            "SELECT epoch, last_request_at, yielded_at, signed_off_at FROM context_continuations WHERE context_id = ?1",
+        let row: Option<(i64, Option<i64>, Option<i64>, Option<i64>, Option<i64>)> = self.conn.query_row(
+            "SELECT epoch, last_request_at, yielded_at, signed_off_at, interrupted_at FROM context_continuations WHERE context_id = ?1",
             params![blob_param(context_id.as_bytes())],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).optional()?;
-        let Some((current, Some(last_request_at), Some(_), None)) = row else { return Ok(false) };
+        let Some((current, Some(last_request_at), Some(_), None, None)) = row else { return Ok(false) };
         Ok(current == epoch && now.saturating_sub(last_request_at) <= window_ms)
     }
 
@@ -2668,13 +2711,21 @@ impl KernelDb {
                 opened_at INTEGER NOT NULL,
                 last_request_at INTEGER,
                 yielded_at INTEGER,
-                signed_off_at INTEGER
+                signed_off_at INTEGER,
+                interrupted_at INTEGER,
+                interrupted_by BLOB
             )",
         )?;
-        match conn.execute("ALTER TABLE context_continuations ADD COLUMN last_request_at INTEGER", []) {
-            Ok(_) => {}
-            Err(error) if is_duplicate_column_error(&error) => {}
-            Err(error) => return Err(error.into()),
+        for sql in [
+            "ALTER TABLE context_continuations ADD COLUMN last_request_at INTEGER",
+            "ALTER TABLE context_continuations ADD COLUMN interrupted_at INTEGER",
+            "ALTER TABLE context_continuations ADD COLUMN interrupted_by BLOB",
+        ] {
+            match conn.execute(sql, []) {
+                Ok(_) => {}
+                Err(error) if is_duplicate_column_error(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Self::migrate_context_model_rollover(conn)?;
         Self::migrate_preset_cast_narrowing(conn)?;
@@ -15928,6 +15979,46 @@ mod label_index_tests {
         db.record_continuation_yield(row.context_id, next.epoch, 2_300).unwrap();
         db.sign_off_continuation(row.context_id, 2_400).unwrap();
         assert!(!db.claim_automatic_resume(row.context_id, next.epoch, 2_500, 600).unwrap());
+    }
+
+    #[test]
+    fn interrupt_closes_a_yielded_continuation_independently_of_signoff() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let row = make_context_row(Some("interrupted"));
+        insert_context_with_doc(&db, &row, ws_id);
+        let interrupter = PrincipalId::new();
+
+        // No continuation open yet: nothing to interrupt.
+        assert!(!db.record_continuation_interrupt(row.context_id, interrupter, 900).unwrap());
+        assert_eq!(db.continuation_interrupt(row.context_id).unwrap(), None);
+
+        let origin = db.begin_continuation(row.context_id, 1_000).unwrap();
+        db.record_continuation_request(row.context_id, origin.epoch, 1_100).unwrap();
+        db.record_continuation_yield(row.context_id, origin.epoch, 1_200).unwrap();
+        assert!(db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
+
+        // Interrupt records who and when, and is idempotent.
+        assert!(db.record_continuation_interrupt(row.context_id, interrupter, 1_250).unwrap());
+        assert_eq!(db.continuation_interrupt(row.context_id).unwrap(), Some((1_250, interrupter)));
+        assert!(!db.record_continuation_interrupt(row.context_id, PrincipalId::new(), 1_260).unwrap(),
+            "a second interrupt on an already-interrupted epoch records nothing new");
+        assert_eq!(db.continuation_interrupt(row.context_id).unwrap(), Some((1_250, interrupter)),
+            "the second call must not overwrite who/when");
+
+        // Interrupting closes automatic resume even though the epoch is
+        // still yielded and within its window; signoff is untouched.
+        assert!(!db.automatic_resume_allowed(row.context_id, origin.epoch, 1_300, 600).unwrap());
+        assert!(!db.claim_automatic_resume(row.context_id, origin.epoch, 1_300, 600).unwrap());
+        assert!(db.sign_off_continuation(row.context_id, 1_400).unwrap(),
+            "interrupting a continuation does not set signed_off_at");
+
+        // Opening a new epoch (an explicit `kj drive`) clears the interrupt.
+        let next = db.begin_continuation(row.context_id, 2_000).unwrap();
+        assert_eq!(db.continuation_interrupt(row.context_id).unwrap(), None);
+        db.record_continuation_request(row.context_id, next.epoch, 2_100).unwrap();
+        db.record_continuation_yield(row.context_id, next.epoch, 2_200).unwrap();
+        assert!(db.automatic_resume_allowed(row.context_id, next.epoch, 2_300, 600).unwrap());
     }
 
     #[test]

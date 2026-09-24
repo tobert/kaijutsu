@@ -217,14 +217,18 @@ operation and any ask; completion arrives as a separate fact.
 
 `kj wait` observes an operation, ask, or kaish job. It does not control that
 work or resume a model. `kj interrupt <target>` stops a context's accepted
-turn: soft by default, or `--immediate` to cancel the model stream and its
-tool calls right away. `kj handoff signoff <note>` closes the continuation
-window immediately. Otherwise, the window lasts 30 minutes from the last
-actual provider inference request, including one made by a tool-loop iteration;
-a yield does not extend it. The policy controls automatic model resumption and
-does not expire an ask. Rotation remains manual and is not part of this
-continuation mechanism. See `docs/approval-identity.md`, "Continuation windows
-and async work".
+turn (soft by default, or `--immediate` to cancel the model stream and its
+tool calls right away) and closes its open continuation to automatic resume,
+so a shell completion that lands after the interrupt cannot restart the
+chain; only an explicit new epoch (`kj drive`) reopens it. `kj handoff
+signoff <note>` closes the continuation window immediately by a different,
+independent fact — the performer's own handoff close, not an interrupt.
+Otherwise, the window lasts 30 minutes from the last actual provider
+inference request, including one made by a tool-loop iteration; a yield does
+not extend it. The policy controls automatic model resumption and does not
+expire an ask. Rotation remains manual and is not part of this continuation
+mechanism. See `docs/approval-identity.md`, "Continuation windows and async
+work".
 
 ## Length and input selection
 

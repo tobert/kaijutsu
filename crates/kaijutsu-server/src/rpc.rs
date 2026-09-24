@@ -5999,6 +5999,7 @@ impl kernel::Server for KernelImpl {
                 .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
         );
         let immediate = params_reader.get_immediate();
+        let principal = self.connection.borrow().principal;
 
         // Hard interrupt: kill this connection's in-flight kaish command(s).
         // The per-use shell holds no persistent handle, so we cancel via the
@@ -6015,12 +6016,17 @@ impl kernel::Server for KernelImpl {
         let kernel = self.kernel.clone();
 
         Promise::from_future(async move {
-            let success = kernel.kernel.turns().interrupt(context_id, immediate);
+            let outcome = kernel.kernel.interrupt_context(context_id, immediate, principal).map_err(|error| {
+                capnp::Error::failed(format!("interruptContext: could not record the interrupt: {error}"))
+            })?;
+            let success = outcome.turn_interrupted || outcome.continuation_closed;
 
             log::info!(
-                "interruptContext: context={}, immediate={}, success={}",
+                "interruptContext: context={}, immediate={}, turn_interrupted={}, continuation_closed={}, success={}",
                 context_id,
                 immediate,
+                outcome.turn_interrupted,
+                outcome.continuation_closed,
                 success
             );
 

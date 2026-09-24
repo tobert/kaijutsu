@@ -263,6 +263,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interrupted_continuation_refuses_automatic_resume_on_a_later_completion() {
+        let dispatcher = test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel();
+        let actor = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("interrupted-continuation"), None, actor);
+        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let now = kaijutsu_types::now_millis() as i64;
+        let epoch = kernel.kernel_db().lock().begin_continuation(context, now).unwrap().epoch;
+        kernel.kernel_db().lock().record_continuation_request(context, epoch, now).unwrap();
+        kernel.kernel_db().lock().record_continuation_yield(context, epoch, now).unwrap();
+        // Every turn end records a yield even when cancelled
+        // (`runtime/llm_stream.rs`). The durable interrupt fact
+        // `kj interrupt`/RPC `interruptContext` leave behind is what must
+        // stop a later completion from restarting the chain.
+        assert!(kernel.kernel_db().lock().record_continuation_interrupt(context, actor, now + 1).unwrap(),
+            "the open epoch must accept the interrupt");
+
+        let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
+        let receipt = super::super::tool_command::create_operation(kernel, &call, "never run after interrupt", None).unwrap();
+        let source = Source::Shell(receipt.operation_id.clone());
+        prepare(&kernel.kernel_db().lock(), &source, "completion after interrupt").unwrap();
+
+        deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
+
+        assert!(!kernel.turn_in_flight(context),
+            "an interrupted continuation must not resume automatically on a later completion");
+    }
+
+    #[tokio::test]
     async fn notification_marker_and_block_recover_together_without_a_provider_wake() {
         for fault in ["marker", "journal", "compaction"] {
             let dispatcher = test_dispatcher_persistent().await;

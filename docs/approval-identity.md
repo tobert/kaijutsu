@@ -228,7 +228,14 @@ continuation.toml` owns the policy: its shipped `[gate_resume] window_secs =
 1800` keeps the window open for 30 minutes after the last actual provider
 inference request. Each inference request, including a tool-loop iteration,
 refreshes that time. Yielding, polling, and tool activity do not. `kj handoff
-signoff <note>` closes the window immediately.
+signoff <note>` closes the window immediately. `kj interrupt <target>` (and
+the RPC `interruptContext`) records a separate, independent fact —
+`interrupted_at`/`interrupted_by` on the epoch — that also closes the
+window; unlike signoff, this is a reviewer or director stopping the loop
+from outside, not the performer's own handoff close, and it does not set
+`signed_off_at`. Stopping the running turn alone is not enough: every turn
+end records a yield even when cancelled, so without this fact a later async
+shell completion would still restart the chain.
 
 Changing a context's performer closes its continuation and invalidates all
 previous epochs in the same transaction as the assignment. Queued automatic
@@ -237,9 +244,11 @@ assigning the original performer again. An inference admitted before reassignmen
 may finish under its original performer; the next request is refused. Explicit
 turn preparation rechecks the performer before opening an epoch.
 
-Signoff and a newer explicit drive only close automatic resumption. Already
-accepted turns can finish, but their requests do not refresh a closed window or
-a newer epoch. Reviewer-only changes preserve the performer's continuation.
+Signoff, interrupt, and a newer explicit drive only close automatic
+resumption. Already accepted turns can finish, but their requests do not
+refresh a closed window or a newer epoch. Reviewer-only changes preserve the
+performer's continuation. Opening a new epoch (`kj drive`) clears a prior
+interrupt along with the rest of the epoch's state.
 
 Async shell submission returns a stable receipt naming the operation and any
 approval dependency. Completion is a separate durable fact,

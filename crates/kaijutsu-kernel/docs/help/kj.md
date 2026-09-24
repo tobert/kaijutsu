@@ -115,12 +115,16 @@ handoff         note [--for <character>], tail [--window] — a character's
 hook            list, show, remove, add — broker hook tables, direct (never
                 through hook evaluation); the recovery path for a self-inflicted
                 PreCall Deny("*") lockout
-interrupt       <target> [--immediate] — stop an accepted turn; whoever can
-                drive a context can also stop it. Soft (default) stops the
-                agentic loop before its next call to the model, letting a
-                running tool call finish; --immediate cancels the model
-                stream and its in-flight tool calls right away. No default
-                target, so a bare `kj interrupt` cannot stop your own turn
+interrupt       <target> [--immediate] — stop an accepted turn and close its
+                open continuation to automatic resume; whoever can drive a
+                context can also stop it. Soft (default) stops the agentic
+                loop before its next call to the model, letting a running
+                tool call finish; --immediate cancels the model stream and
+                its in-flight tool calls right away. Closing the
+                continuation refuses a later async shell completion from
+                restarting the chain; only an explicit `kj drive` reopens
+                it. No default target, so a bare `kj interrupt` cannot stop
+                your own turn
 kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
                 what S05-kaish.kai turns into a per-context system block
 ledger          list, show, allow, deny, rules, forget, runs — answer pending

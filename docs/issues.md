@@ -193,8 +193,8 @@ model gets one final tool-free call and must report, rather than being cut off
 mid-tool-chain. Context windows for Alibaba (qwen) models are unpinned, so a
 fraction of the context window is not a usable proxy for the budget — it needs
 its own configured number. Not built yet. `kj interrupt <target>
-[--immediate]` is the manual backstop until the budget lands, but it stops
-only the running turn; see "An interrupt does not end a continuation" below.
+[--immediate]` is the manual backstop until the budget lands: it stops the
+running turn and refuses automatic resume until the next explicit turn.
 Live evidence: "What the cap-free banto review showed (2026-09-24)" below.
 
 ### Lazy file documents
@@ -325,20 +325,6 @@ restarted the kernel. No optional int arrived as a string. Open:
 - **Builtin `git diff --from A --to B -- <path>` refuses the path** with
   "takes no bare operands", although its own help shows that form. Something
   between kaish argument parsing and the tool drops the `--`. Unlocated.
-
-## An interrupt does not end a continuation (2026-09-24)
-
-Every turn end records a yield, including a cancelled one
-(`runtime/llm_stream.rs:1827`). A later async shell completion then starts a
-new turn when the context is idle, yielded, and within the resume window of
-its last inference request (`runtime/completion_notice.rs:195-208`). So
-`kj interrupt` and the app's interrupt stop the running turn, and the next
-completion restarts the chain. Proposed to Amy: record the interrupt as its
-own fact on `context_continuations` (`interrupted_at`, `interrupted_by`,
-reset with each new epoch) and refuse automatic resume after it, through one
-kernel method both surfaces call. Not `signed_off_at`: that is the
-performer's own handoff close. Inferred from the code; the red test comes
-first.
 
 ## A client does not say which principal it connected as (2026-09-24)
 

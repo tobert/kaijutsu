@@ -91,7 +91,7 @@ pub use block_store::{
 pub use approval_ledger::ask::UndeliveredAnswer;
 pub use approval_ledger::types::{ApprovalStatus, PairOwner};
 pub use kaijutsu_types::DocKind;
-pub use kernel::Kernel;
+pub use kernel::{InterruptOutcome, Kernel};
 pub use llm::{
     // Default model
     // Configuration (SQL-native: kernel_db is the source of truth)

@@ -1,4 +1,5 @@
-//! Interrupt subcommand: stop an admitted turn on a context.
+//! Interrupt subcommand: stop an admitted turn on a context and close its
+//! open continuation to automatic resume.
 //!
 //! Soft (default) sets the turn's `stop_after_turn` flag: the agentic loop
 //! checks it before its next call to the model and breaks cleanly, so a
@@ -7,6 +8,13 @@
 //! model stream right away and, because tool-call execution is threaded off
 //! the same token, its in-flight tool calls with it
 //! (`runtime/interrupt.rs`).
+//!
+//! Stopping the turn alone is not enough: every turn end records a yield,
+//! even a cancelled one, so a later async shell completion would otherwise
+//! restart the chain. `Kernel::interrupt_context` also records the
+//! interrupt as its own durable fact on the context's continuation, which
+//! refuses that automatic resume (`docs/issues.md`, "An interrupt does not
+//! end a continuation").
 
 use clap::Parser;
 use kaijutsu_types::ContentType;
@@ -18,7 +26,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "interrupt",
-    about = "Stop an admitted turn on a context.",
+    about = "Stop an admitted turn on a context and close its open continuation to automatic resume.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -64,23 +72,34 @@ impl KjDispatcher {
             }
         };
 
-        let stopped = self.kernel().turns().interrupt(target, parsed.immediate);
-        if !stopped {
+        let outcome = match self.kernel().interrupt_context(target, parsed.immediate, caller.principal_id) {
+            Ok(outcome) => outcome,
+            Err(error) => return KjResult::Err(format!("kj interrupt: could not record the interrupt: {error}")),
+        };
+        if !outcome.turn_interrupted && !outcome.continuation_closed {
             return KjResult::Err(format!(
-                "kj interrupt: context '{}' has no accepted turn to interrupt",
+                "kj interrupt: context '{}' has no accepted turn and no open continuation to interrupt",
                 target.short()
             ));
         }
 
         let mode = if parsed.immediate { "immediate" } else { "soft" };
         let display = target.short();
+        let message = match (outcome.turn_interrupted, outcome.continuation_closed) {
+            (true, true) => format!("interrupted turn and closed the open continuation in '{display}' ({mode})"),
+            (true, false) => format!("interrupted turn in '{display}' ({mode})"),
+            (false, true) => format!("closed the open continuation in '{display}'; no turn was running"),
+            (false, false) => unreachable!("handled above"),
+        };
         KjResult::Ok {
-            message: format!("interrupted turn in '{display}' ({mode})"),
+            message,
             content_type: ContentType::Plain,
             ephemeral: false,
             data: Some(serde_json::json!({
                 "context_id": target.to_hex(),
                 "immediate": parsed.immediate,
+                "turn_interrupted": outcome.turn_interrupted,
+                "continuation_closed": outcome.continuation_closed,
             })),
         }
     }
@@ -182,12 +201,39 @@ mod tests {
 
         let c = caller_with_context(here);
         let result = d.dispatch(&[s("interrupt"), s("idle")], &c).await;
-        assert!(!result.is_ok(), "interrupting an idle context must error");
+        assert!(!result.is_ok(), "interrupting an idle context with no continuation must error");
         assert!(
-            result.message().contains("no accepted turn"),
+            result.message().contains("no accepted turn") && result.message().contains("no open continuation"),
             "error should say why: {}",
             result.message()
         );
+    }
+
+    #[tokio::test]
+    async fn interrupt_on_an_idle_context_closes_its_open_continuation() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let here = register_context(&d, Some("here"), None, principal);
+        let target = register_context(&d, Some("target"), None, principal);
+        let now = kaijutsu_types::now_millis() as i64;
+        d.kernel().kernel_db().lock().begin_continuation(target, now).unwrap();
+
+        let c = caller_with_context(here);
+        let result = d.dispatch(&[s("interrupt"), s("target")], &c).await;
+        assert!(result.is_ok(), "closing an open continuation on an idle context must not error: {}", result.message());
+        assert!(result.message().contains("continuation"), "{}", result.message());
+
+        let data = match result {
+            crate::kj::KjResult::Ok { data, .. } => data.expect("interrupt should carry data"),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        assert_eq!(data["turn_interrupted"], serde_json::json!(false));
+        assert_eq!(data["continuation_closed"], serde_json::json!(true));
+        assert!(d.kernel().kernel_db().lock().continuation_interrupt(target).unwrap().is_some());
+
+        // A second interrupt has nothing left to do.
+        let again = d.dispatch(&[s("interrupt"), s("target")], &c).await;
+        assert!(!again.is_ok(), "interrupting an already-interrupted, idle continuation has nothing to do");
     }
 
     #[tokio::test]
