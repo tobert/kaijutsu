@@ -326,6 +326,24 @@ restarted the kernel. No optional int arrived as a string. Open:
   "takes no bare operands", although its own help shows that form. Something
   between kaish argument parsing and the tool drops the `--`. Unlocated.
 
+Rerun after c76ff70a (`banto-0924d`, same prompt and cast): in 15 minutes
+banto made about 180 tool calls and about 45 short narration steps, answered
+part of question (1) ("all 12 builtin servers call `tool_input_schema`"),
+and said "Nearly there" at minute 10, but wrote no report. `kj interrupt`
+(soft) ended it as `Cancelled { immediate: false }` about 23 s later; two
+shell completions that landed afterward did not resume it. Open from this
+run:
+
+- **Banto invented three things and caught each one itself**: an operation
+  id, `/tmp` spill paths, and a spill path it assumed from an error. Same
+  family as the 09-24 "quoted an operation id it never received".
+- **Tool pace differed by an order of magnitude between the runs** (about
+  40 s per call in the first, about 3 s in this one). Unexplained; parallel
+  calls or provider latency are candidates.
+- **A soft interrupt gives the model no chance to report.** For a review the
+  work so far is lost unless someone reads the blocks. The per-cast budget's
+  "one final tool-free call" is the designed answer.
+
 ## A client does not say which principal it connected as (2026-09-24)
 
 Amy's tui tried to allow an ask and got "awaits its assigned reviewer": with
