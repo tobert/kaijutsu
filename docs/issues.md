@@ -349,6 +349,24 @@ run:
   work so far is lost unless someone reads the blocks. The per-cast budget's
   "one final tool-free call" is the designed answer.
 
+## Banto with foreground shell calls (2026-09-24)
+
+`banto-0924e` (house cast, qwen3.8-flash), same review prompt as 0924c/d,
+after 08b7a741: 82 tool calls in 15 minutes, no polls, one empty result, no
+report; interrupted. 49 thinking blocks, one of 15,412 characters. Of 21
+errors, 17 are builtin-tool friction:
+
+- **kaish `grep` rejects GNU BRE alternation.** 10 pre-validation refusals
+  ("invalid regex pattern … unclosed group") for `"a\\|b("`-style patterns;
+  the hint says to use `[(]` or `-E`, and banto kept writing GNU grep.
+- **Builtin `git diff … -- <path>` drops the `--`** ("takes no bare
+  operands"), three times; the refusal suggests the very form that fails.
+- **Builtin git gaps:** `--stat` (2), `-C` (1), and no repository found from
+  the director's home cwd (2).
+- **The `system/error` block beside a rejected call shows an empty
+  envelope**, while the real reason is in the `tool_result` (and reaches the
+  model through `stdout`). Misleads a reader of the log.
+
 ## A `session.end` hook archived a live session's context (2026-09-24)
 
 At 17:40:04 this Claude Code session's hook pipeline delivered `SessionEnd`
