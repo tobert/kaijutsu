@@ -54,6 +54,13 @@ const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Maximum size of a block's content created from hook events.
 const DEFAULT_MAX_BLOCK_SIZE: usize = 4096;
 
+/// Bound on the archive RPC [`HookListener::archive_if_session_ended`] issues
+/// at process shutdown. Not on the hook critical path — the hosting process
+/// is already exiting — but still bounded so a wedged kernel connection
+/// cannot hang that exit indefinitely. [`tiers::REQUEST`]: "a single call
+/// that may do real work."
+const ARCHIVE_ON_SHUTDOWN_TIMEOUT: Duration = tiers::REQUEST;
+
 /// Run the hook's work under `budget`, degrading to a permissive response if
 /// it overruns.
 ///
@@ -184,6 +191,13 @@ pub struct HookListener {
     /// Guards `set_context_model` (from `session.start`'s `model` field) to
     /// at most one call per process.
     context_model_set: Mutex<bool>,
+    /// A `session.end` recorded for this listener's own session
+    /// ([`should_record_session_end`]), not yet confirmed by process exit.
+    /// Cleared by ANY later hook event (proof the session kept going) or
+    /// consumed by [`Self::archive_if_session_ended`] at real shutdown. See
+    /// that method's doc comment for why `session.end` alone must not
+    /// archive.
+    session_end_recorded: Mutex<bool>,
 }
 
 /// Where a listener's session id came from.
@@ -218,17 +232,21 @@ pub fn should_adopt_session_id(
     }
 }
 
-/// Whether a `session.end` event should archive this listener's joined
-/// context.
+/// Whether a `session.end` event should record this listener's joined
+/// context as ended — pending confirmation, by [`HookListener::
+/// archive_if_session_ended`], that the process is really exiting.
+/// `session.end` alone never archives (see that method's doc comment for
+/// why): the hosting process can keep running after it, and the event's
+/// `session_id` can also just be wrong.
 ///
 /// Requires BOTH: the event's `session_id` equals the stored one, and the
 /// stored id came from a real hook event ([`SessionIdSource::Event`]) —
 /// never a startup transcript scrape ([`SessionIdSource::Detected`]). A
 /// scraped id can name the wrong (often previous) session; trusting it here
-/// would let that other session's `SessionEnd` archive the context THIS
-/// listener actually serves. See `should_adopt_session_id` for the capture
-/// side of the same hazard.
-pub fn should_archive_on_session_end(
+/// would let that other session's `SessionEnd` record (and later archive)
+/// the context THIS listener actually serves. See `should_adopt_session_id`
+/// for the capture side of the same hazard.
+pub fn should_record_session_end(
     stored: Option<&str>,
     source: SessionIdSource,
     event_session_id: Option<&str>,
@@ -276,6 +294,7 @@ impl HookListener {
             agent_name: Arc::new(Mutex::new(None)),
             pending_label_base: Mutex::new(None),
             context_model_set: Mutex::new(false),
+            session_end_recorded: Mutex::new(false),
         }
     }
 
@@ -324,6 +343,7 @@ impl HookListener {
             agent_name,
             pending_label_base: Mutex::new(pending_label_base),
             context_model_set: Mutex::new(false),
+            session_end_recorded: Mutex::new(false),
         }
     }
 
@@ -580,6 +600,27 @@ impl HookListener {
     /// error note into the response's `context` field alongside (or instead
     /// of) any drift.
     async fn process_event(&self, event: &HookEvent) -> HookResponse {
+        // 0. Any event other than `session.end` proves this session is still
+        // alive: clear a previously recorded pending archive rather than let
+        // a later real shutdown archive a context that kept working in
+        // between (`should_record_session_end`, `archive_if_session_ended`).
+        // Checked before the self-referential-tool filter below — that
+        // filter still means a genuine event reached this listener.
+        if event.event != "session.end"
+            && std::mem::take(
+                &mut *self
+                    .session_end_recorded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        {
+            tracing::info!(
+                event = %event.event,
+                "hook event arrived after a reported session end — the \
+                 session is still alive; clearing the pending archive"
+            );
+        }
+
         // 1. Filter self-referential kaijutsu MCP tools. Adapters normalize
         // source-specific tool names before they reach this listener.
         if let Some(ref tool) = event.tool {
@@ -647,15 +688,26 @@ impl HookListener {
                     author_error.get_or_insert(e);
                 }
 
-                // Then archive the context (Amy's ruling, 2026-08-12) — but ONLY
-                // when this event really belongs to the session we serve.
-                // Routing can deliver a `session.end` here for someone else's
-                // session (a stale startup-detected id this process still
-                // carries, or the sole-responder fallback in
-                // `resolve_hook_socket`) — `should_archive_on_session_end`
-                // requires the stored id to be event-sourced AND match. Ordering
-                // matters: the "Session ended" block above is written first so
-                // the record is complete before it is frozen.
+                // Record the end — but do NOT archive yet, and only when this
+                // event really belongs to the session we serve. A
+                // `session.end` hook event can fire while the hosting
+                // process keeps right on running (observed live:
+                // `docs/issues.md`, "A `session.end` hook archived a live
+                // session's context"); archiving on the event alone trapped
+                // that still-running session on a dead context —
+                // `register_session` answered `already_registered` with the
+                // archived id, `shell` was refused, and only `/mcp` (a fresh
+                // process) recovered. `archive_if_session_ended`, called once
+                // stdio actually closes, performs the real archive; any later
+                // hook event clears this recording (see the top of this
+                // function). Routing can also deliver a `session.end` here
+                // for someone else's session (a stale startup-detected id
+                // this process still carries, or the sole-responder fallback
+                // in `resolve_hook_socket`) — `should_record_session_end`
+                // requires the stored id to be event-sourced AND match.
+                // Ordering matters: the "Session ended" block above is
+                // written first so the record is complete before archiving
+                // can ever freeze it.
                 //
                 // Archiving — not concluding. `list_active_contexts` filters on
                 // `archived_at IS NULL` only, and `conclude_context` never
@@ -678,7 +730,7 @@ impl HookListener {
                 // re-keying a live process) is safe: `register_session` never
                 // resurrects an archived context, it mints a fresh
                 // suffixed-label one.
-                if let Some(ref remote) = self.remote
+                if self.remote.is_some()
                     && let Some(ctx_id) = self.context_id()
                 {
                     let stored = self.session_id.lock().ok().and_then(|g| g.clone());
@@ -686,25 +738,24 @@ impl HookListener {
                         .session_id_source
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    if should_archive_on_session_end(
+                    if should_record_session_end(
                         stored.as_deref(),
                         source,
                         event.session_id.as_deref(),
                     ) {
-                        match remote.actor.archive_context(ctx_id).await {
-                            Ok(()) => tracing::info!(
-                                context = %ctx_id.short(),
-                                "archived context on session.end"
-                            ),
-                            // Loud, not swallowed: a failure here means the label
-                            // keeps competing for drift resolution, which is the
-                            // whole problem this closes.
-                            Err(e) => tracing::warn!(
-                                context = %ctx_id.short(),
-                                "failed to archive context on session.end, its label \
-                                 stays in the active set: {e}"
-                            ),
-                        }
+                        // Recover a poisoned lock rather than `.ok()`-skip —
+                        // same reasoning as `context_model_set` above: losing
+                        // track of "a session.end was recorded" under
+                        // poisoning is the wrong failure mode.
+                        *self
+                            .session_end_recorded
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = true;
+                        tracing::info!(
+                            context = %ctx_id.short(),
+                            "recorded session.end — archiving deferred until the \
+                             process actually exits (archive_if_session_ended)"
+                        );
                     } else {
                         // Loud, not silent: this is exactly the misroute that
                         // used to archive the wrong context. Naming both ids
@@ -716,8 +767,8 @@ impl HookListener {
                             stored_source = ?source,
                             event_session_id = ?event.session_id,
                             "session.end did not match this listener's owned session — \
-                             not archiving; likely a stale startup-detected id or a \
-                             sole-responder-fallback misroute"
+                             not recording it for archive; likely a stale \
+                             startup-detected id or a sole-responder-fallback misroute"
                         );
                     }
                 }
@@ -1155,6 +1206,63 @@ impl HookListener {
         match result_err {
             None => Ok(()),
             Some(e) => Err(format!("failed to author tool result: {e}")),
+        }
+    }
+
+    /// Archive this listener's joined context if a `session.end` was
+    /// recorded ([`should_record_session_end`]) and no later hook event
+    /// cleared it (see the top of [`Self::process_event`]).
+    ///
+    /// Call exactly once, from the stdio server's own shutdown path (the
+    /// hosting process's stdin/stdout actually closing) — never from the
+    /// `session.end` hook event itself. The event alone is not proof the
+    /// session ended: Claude Code can deliver `SessionEnd` while its process
+    /// keeps running (observed live, `docs/issues.md`, "A `session.end` hook
+    /// archived a live session's context"), and archiving on that event
+    /// trapped the still-running session on a dead context (`shell` refused,
+    /// `register_session` stuck on `already_registered`). Stdio actually
+    /// closing is the one signal that is never a false positive.
+    ///
+    /// Bounded by [`ARCHIVE_ON_SHUTDOWN_TIMEOUT`] so a wedged kernel
+    /// connection cannot hang process exit; a failure or timeout is logged
+    /// loudly rather than swallowed, matching the old inline archive's
+    /// failure handling.
+    pub async fn archive_if_session_ended(&self) {
+        let recorded = std::mem::take(
+            &mut *self
+                .session_end_recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !recorded {
+            return;
+        }
+        let Some(ref remote) = self.remote else { return };
+        let Some(ctx_id) = self.context_id() else { return };
+        match tokio::time::timeout(
+            ARCHIVE_ON_SHUTDOWN_TIMEOUT,
+            remote.actor.archive_context(ctx_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::info!(
+                context = %ctx_id.short(),
+                "archived context: the session actually ended (stdio closed)"
+            ),
+            // Loud, not swallowed: a failure here means the label keeps
+            // competing for drift resolution, which is the whole problem
+            // archiving exists to close.
+            Ok(Err(e)) => tracing::warn!(
+                context = %ctx_id.short(),
+                "failed to archive context on session end, its label stays \
+                 in the active set: {e}"
+            ),
+            Err(_) => tracing::warn!(
+                context = %ctx_id.short(),
+                timeout = ?ARCHIVE_ON_SHUTDOWN_TIMEOUT,
+                "archiving on session end timed out at process shutdown, \
+                 its label stays in the active set"
+            ),
         }
     }
 
@@ -1750,16 +1858,16 @@ mod tests {
         ));
     }
 
-    // -- session.end archiving: only an event-owned session may archive --
+    // -- session.end recording: only an event-owned session may record it --
 
     /// A stale scraped id ([`SessionIdSource::Detected`]) that happens to
-    /// equal the ending session's id must NOT authorize archiving — the
+    /// equal the ending session's id must NOT authorize recording — the
     /// scrape can name the previous session, and this is exactly the live
     /// bug: L(new) advertises S(old)'s id, S(old) ends, and the match alone
     /// is not enough to trust it.
     #[test]
-    fn a_stale_detected_id_matching_the_event_does_not_archive() {
-        assert!(!should_archive_on_session_end(
+    fn a_stale_detected_id_matching_the_event_does_not_record() {
+        assert!(!should_record_session_end(
             Some("357380d2-old"),
             SessionIdSource::Detected,
             Some("357380d2-old"),
@@ -1767,11 +1875,11 @@ mod tests {
     }
 
     /// An event-sourced id that matches the ending session's id is the one
-    /// case that should archive — this listener really did serve that
+    /// case that should record — this listener really did serve that
     /// session.
     #[test]
-    fn an_event_sourced_matching_id_archives() {
-        assert!(should_archive_on_session_end(
+    fn an_event_sourced_matching_id_records() {
+        assert!(should_record_session_end(
             Some("83768815-this"),
             SessionIdSource::Event,
             Some("83768815-this"),
@@ -1780,21 +1888,21 @@ mod tests {
 
     /// An event-sourced id that does NOT match the ending session's id
     /// means this `session.end` belongs to some other session (a stray
-    /// delivery via the sole-responder fallback) — must not archive.
+    /// delivery via the sole-responder fallback) — must not record.
     #[test]
-    fn an_event_sourced_non_matching_id_does_not_archive() {
-        assert!(!should_archive_on_session_end(
+    fn an_event_sourced_non_matching_id_does_not_record() {
+        assert!(!should_record_session_end(
             Some("83768815-this"),
             SessionIdSource::Event,
             Some("other-session"),
         ));
     }
 
-    /// No stored id at all — never archive; there is nothing to attribute
+    /// No stored id at all — never record; there is nothing to attribute
     /// the ending session to.
     #[test]
-    fn no_stored_id_does_not_archive() {
-        assert!(!should_archive_on_session_end(
+    fn no_stored_id_does_not_record() {
+        assert!(!should_record_session_end(
             None,
             SessionIdSource::Detected,
             Some("some-session"),

@@ -20,7 +20,7 @@
 //! rather than a quiet wrong mode.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -210,6 +210,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 
         let socket_path = args.hook_socket.clone().or_else(default_socket_path);
         let owns_socket = Arc::new(AtomicBool::new(false));
+        // Filled in by `start_behind_handshake` once the hook listener
+        // exists, so `run_serve` can archive through it once stdio actually
+        // closes — see `HookListener::archive_if_session_ended`. `None`
+        // until then (and stays `None` if the hook socket is disabled).
+        let hook_listener: Arc<Mutex<Option<Arc<HookListener>>>> = Arc::new(Mutex::new(None));
 
         // Registration and the hook socket run behind the MCP handshake, never
         // before it: a host gives a stdio server a short window to answer its
@@ -221,6 +226,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             agent_label,
             socket_path.clone(),
             Arc::clone(&owns_socket),
+            Arc::clone(&hook_listener),
         ));
 
         let service = mcp
@@ -235,6 +241,15 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         // Wait for the service to complete
         service.waiting().await?;
         startup.abort();
+
+        // Stdio just closed — the one signal that the hosting session is
+        // really gone, not merely a `session.end` hook event (which can fire
+        // while the process keeps running). Archive whatever `session.end`
+        // was recorded and never cleared; see
+        // `HookListener::archive_if_session_ended`.
+        if let Some(listener) = hook_listener.lock().ok().and_then(|g| g.clone()) {
+            listener.archive_if_session_ended().await;
+        }
 
         // Cleanup socket on exit — ONLY if this process is the one that
         // bound it. Unlinking unconditionally deletes whatever now lives at
@@ -261,6 +276,7 @@ async fn start_behind_handshake(
     agent_label: &'static str,
     socket_path: Option<PathBuf>,
     owns_socket: Arc<AtomicBool>,
+    hook_listener_slot: Arc<Mutex<Option<Arc<HookListener>>>>,
 ) {
     // `Some(base)` only when register_session_auto below succeeds *and*
     // the session id wasn't known yet — that's the one case where the
@@ -377,6 +393,13 @@ async fn start_behind_handshake(
             ))
         }
     };
+
+    // Publish before spawning `serve` — `run_serve` reads this slot only
+    // after `service.waiting()` returns (process shutdown), so there is no
+    // race with a hook event that needs it sooner.
+    if let Ok(mut slot) = hook_listener_slot.lock() {
+        *slot = Some(Arc::clone(&listener));
+    }
 
     tokio::spawn(async move {
         if let Err(e) = listener.serve(unix_listener).await {

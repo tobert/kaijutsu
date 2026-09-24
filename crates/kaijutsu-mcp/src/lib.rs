@@ -357,6 +357,13 @@ pub struct RemoteState {
 pub struct JoinedContext {
     /// Context ID we joined
     pub context_id: kaijutsu_types::ContextId,
+    /// The label this context was joined under. Not a second copy of
+    /// identity — `context_id` names the context, this names the slot it
+    /// currently fills — but it lets `register_session`'s already-joined
+    /// fast path re-check that slot's liveness (`resolve_context_label`)
+    /// before trusting a bound context that another player may have
+    /// archived out from under this process.
+    pub label: String,
     /// Abort handle for the pulse task (see `spawn_pulse_task`) — the sole
     /// remaining consumer of the actor's event broadcast in this process.
     _pulse_task: Arc<AbortOnDrop>,
@@ -490,6 +497,7 @@ async fn finish_join(
         let mut guard = remote.joined.write().await;
         *guard = Some(JoinedContext {
             context_id,
+            label: label.clone(),
             _pulse_task: Arc::new(AbortOnDrop(pulse_abort)),
         });
     }
@@ -1867,16 +1875,90 @@ impl KaijutsuMcp {
             }
         };
 
-        // Check if already joined
-        {
-            let guard = remote.joined.read().await;
-            if let Some(joined) = guard.as_ref() {
-                return serde_json::json!({
-                    "already_registered": true,
-                    "context_id": joined.context_id.to_hex(),
-                    "context_short": joined.context_id.short(),
-                })
-                .to_string();
+        // Check if already joined — but trust that fast path only while the
+        // bound context is confirmed still live. A context this process is
+        // bound to can be archived by another player (`kj context archive`)
+        // or by this process's own deferred session-end archive at shutdown
+        // (`HookListener::archive_if_session_ended`) without this call ever
+        // hearing about it — `already_registered` answering with a now-dead
+        // context id used to trap the session there permanently (`shell`
+        // refused, no way back short of `/mcp`; docs/issues.md, "A
+        // `session.end` hook archived a live session's context"). Falling
+        // through instead of returning re-runs the normal label-resolution
+        // flow below, which mints a fresh context: under a suffixed label
+        // when the bound label still names a CONCLUDED row (KernelDb keeps
+        // that label reserved), or under the SAME label when it names an
+        // ARCHIVED one — `idx_contexts_label` only covers live rows, so an
+        // archived context's label is free for reuse by design
+        // (`kernel_db.rs`'s schema comment on `idx_contexts_label`).
+        //
+        // `resolve_context_label` (`find_context_by_label`) excludes
+        // archived rows from that same index, so it cannot tell us what the
+        // bound context WAS — only that it's gone. `previous_bound` recovers
+        // that detail from the in-memory registry (`list_contexts`, which
+        // does retain archived entries) so the reply still carries
+        // `previous_context`, matching `register_session`'s documented
+        // promise, even though the label-resolution flow below won't
+        // populate it for this case on its own.
+        let bound = remote
+            .joined
+            .read()
+            .await
+            .as_ref()
+            .map(|j| (j.context_id, j.label.clone()));
+        let mut previous_bound: Option<serde_json::Value> = None;
+        if let Some((bound_id, bound_label)) = bound {
+            match remote.actor.resolve_context_label(&bound_label).await {
+                Ok(Some(ctx))
+                    if ctx.id == bound_id && ctx.concluded_at.is_none() && !ctx.archived =>
+                {
+                    return serde_json::json!({
+                        "already_registered": true,
+                        "context_id": bound_id.to_hex(),
+                        "context_short": bound_id.short(),
+                    })
+                    .to_string();
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        context_id = %bound_id,
+                        label = %bound_label,
+                        "register_session: the bound context is archived, concluded, \
+                         or no longer resolves at its label — rebinding to a fresh \
+                         context instead of trapping this session on a dead one",
+                    );
+                    previous_bound = remote
+                        .actor
+                        .list_contexts()
+                        .await
+                        .ok()
+                        .and_then(|contexts| contexts.into_iter().find(|c| c.id == bound_id))
+                        .map(|ctx| {
+                            serde_json::json!({
+                                "context_id": ctx.id.to_hex(),
+                                "context_short": ctx.id.short(),
+                                "label": bound_label,
+                                "concluded_at": ctx.concluded_at,
+                                "archived": ctx.archived,
+                            })
+                        });
+                }
+                Err(e) => {
+                    // Can't confirm liveness — stay on the known-working
+                    // fast path rather than mint an extra context over a
+                    // transient RPC hiccup.
+                    tracing::warn!(
+                        context_id = %bound_id,
+                        "register_session: could not confirm the bound context's \
+                         liveness ({e}); keeping the existing binding",
+                    );
+                    return serde_json::json!({
+                        "already_registered": true,
+                        "context_id": bound_id.to_hex(),
+                        "context_short": bound_id.short(),
+                    })
+                    .to_string();
+                }
             }
         }
 
@@ -2049,7 +2131,20 @@ impl KaijutsuMcp {
         // case (see `finish_join`). No replica is built and no doc task runs:
         // reads are authoritative queries, and the pulse only supplies an
         // early-wake hint.
-        let outcome = match finish_join(remote, context_id, label, resumed, previous_context).await
+        //
+        // `previous_context.or(previous_bound)`: the label-resolution flow
+        // above only populates `previous_context` for a CONCLUDED label
+        // (still indexed); `previous_bound` fills the same field for the
+        // archived-bound-context case that flow can't see (see the
+        // already-joined check's doc comment above).
+        let outcome = match finish_join(
+            remote,
+            context_id,
+            label,
+            resumed,
+            previous_context.or(previous_bound),
+        )
+        .await
         {
             Ok(outcome) => outcome,
             Err(e) => return e,

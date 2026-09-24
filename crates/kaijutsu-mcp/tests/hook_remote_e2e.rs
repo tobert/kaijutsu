@@ -858,3 +858,175 @@ fn new_session_same_repo_gets_a_distinct_context() {
         assert!(contexts.iter().any(|c| c.label == format!("{base}-bbbbbbbb")));
     });
 }
+
+// ============================================================================
+// Deferred session.end archiving
+//
+// A `session.end` hook event can fire while the hosting process keeps right
+// on running (observed live: docs/issues.md, "A `session.end` hook archived
+// a live session's context") — archiving on the event alone trapped that
+// still-running session on a dead context. `session.end` now only records
+// the end; `HookListener::archive_if_session_ended` performs the real
+// archive, and it must be called explicitly once (from `main.rs`'s stdio
+// shutdown path in production) — these tests call it directly to stand in
+// for "the process actually exited".
+// ============================================================================
+
+/// Register a session, join a `HookListener::remote` for it (no pending
+/// label base — these tests want a stable, already-known label rather than
+/// exercising `maybe_stabilize_label`), and send a `session.start` so the
+/// listener's `session_id` is `Event`-sourced. Returns the listener, its
+/// socket, the joined `ContextId`, and the session id used.
+async fn registered_listener_with_event_sourced_session(
+    tag: &str,
+) -> (Arc<HookListener>, PathBuf, kaijutsu_client::ActorHandle, kaijutsu_types::ContextId, String)
+{
+    let addr = start_server().await;
+    let mcp = connect_mcp(addr).await;
+    let label = format!("session-end-e2e-{tag}");
+    let reg = auto_register_with_retry(&mcp, &label).await;
+    assert!(
+        reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+        "register_session_auto failed: {reg}"
+    );
+    let context_id =
+        kaijutsu_types::ContextId::parse(reg["context_id"].as_str().unwrap()).unwrap();
+
+    let Backend::Remote(remote) = mcp.backend().clone() else {
+        panic!("expected remote backend");
+    };
+    let listener = Arc::new(HookListener::remote(
+        remote.clone(),
+        Arc::clone(&remote.shared_context_id),
+        Arc::clone(mcp.session_id_arc()),
+        None,
+    ));
+    let socket_path = spawn_listener(Arc::clone(&listener), tag).await;
+
+    let session_id = format!("{tag}-11112222-3333-4444-5555-666677778888");
+    let start_event = serde_json::json!({
+        "event": "session.start",
+        "source": "claude-code",
+        "session_id": session_id,
+        "model": "claude-opus-4-8",
+    })
+    .to_string();
+    send_hook_event(&socket_path, &start_event)
+        .await
+        .unwrap()
+        .expect("session.start must get a response");
+
+    (listener, socket_path, remote.actor, context_id, session_id)
+}
+
+fn is_archived(contexts: &[kaijutsu_client::ContextInfo], id: kaijutsu_types::ContextId) -> bool {
+    contexts
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("context {id} missing from list_contexts"))
+        .archived
+}
+
+/// Item 1: `session.end` alone (no stdio close simulated) must NOT archive.
+#[test]
+fn session_end_without_process_exit_does_not_archive() {
+    run_local(async {
+        let (_listener, socket_path, actor, context_id, session_id) =
+            registered_listener_with_event_sourced_session("no-exit").await;
+
+        let end_event = serde_json::json!({
+            "event": "session.end",
+            "source": "claude-code",
+            "session_id": session_id,
+            "reason": "prompt_input_exit",
+        })
+        .to_string();
+        send_hook_event(&socket_path, &end_event)
+            .await
+            .unwrap()
+            .expect("session.end must get a response");
+
+        let contexts = actor.list_contexts().await.unwrap();
+        assert!(
+            !is_archived(&contexts, context_id),
+            "session.end alone must not archive — the process may still be running"
+        );
+    });
+}
+
+/// Item 2: `session.end` followed by the stdio-close signal
+/// (`archive_if_session_ended`, called directly here in place of a real
+/// process exit) DOES archive.
+#[test]
+fn session_end_then_process_exit_archives() {
+    run_local(async {
+        let (listener, socket_path, actor, context_id, session_id) =
+            registered_listener_with_event_sourced_session("with-exit").await;
+
+        let end_event = serde_json::json!({
+            "event": "session.end",
+            "source": "claude-code",
+            "session_id": session_id,
+            "reason": "prompt_input_exit",
+        })
+        .to_string();
+        send_hook_event(&socket_path, &end_event)
+            .await
+            .unwrap()
+            .expect("session.end must get a response");
+
+        listener.archive_if_session_ended().await;
+
+        let contexts = actor.list_contexts().await.unwrap();
+        assert!(
+            is_archived(&contexts, context_id),
+            "session.end followed by real process exit must archive"
+        );
+    });
+}
+
+/// Item 3: `session.end`, then another hook event from the same session,
+/// then the stdio-close signal — must NOT archive. The later event proves
+/// the session kept going; it must clear the pending archive.
+#[test]
+fn a_later_hook_event_clears_a_pending_session_end() {
+    run_local(async {
+        let (listener, socket_path, actor, context_id, session_id) =
+            registered_listener_with_event_sourced_session("cleared").await;
+
+        let end_event = serde_json::json!({
+            "event": "session.end",
+            "source": "claude-code",
+            "session_id": session_id,
+            "reason": "prompt_input_exit",
+        })
+        .to_string();
+        send_hook_event(&socket_path, &end_event)
+            .await
+            .unwrap()
+            .expect("session.end must get a response");
+
+        // The session keeps going: one more event arrives before the
+        // process actually exits.
+        let prompt_event = serde_json::json!({
+            "event": "prompt.submit",
+            "source": "claude-code",
+            "session_id": session_id,
+            "prompt": "still here",
+        })
+        .to_string();
+        send_hook_event(&socket_path, &prompt_event)
+            .await
+            .unwrap()
+            .expect("prompt.submit must get a response");
+
+        listener.archive_if_session_ended().await;
+
+        let contexts = actor.list_contexts().await.unwrap();
+        assert!(
+            !is_archived(&contexts, context_id),
+            "a later hook event must clear the pending archive, even once the \
+             process really does exit afterward"
+        );
+    });
+}

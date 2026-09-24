@@ -317,6 +317,79 @@ fn concluded_context_gets_fresh_suffixed_label_not_resurrected() {
     });
 }
 
+/// The already-joined fast path must not trap a session on a context that
+/// became archived out from under it (e.g. another player's `kj context
+/// archive`, or this process's own deferred session-end archive at
+/// shutdown — see `hook_listener.rs`'s `archive_if_session_ended`).
+/// `register_session_impl` used to answer `already_registered` with
+/// whatever `remote.joined` held, unconditionally — once that context was
+/// archived, every later `register_session` call (and every `shell` call)
+/// stayed stuck on a dead context with no way back short of a fresh MCP
+/// process. It must instead rebind to a fresh context, exactly as the
+/// documented behavior for an archived label promises (`previous_context`
+/// in the reply).
+#[test]
+fn a_bound_context_archived_out_from_under_the_session_gets_rebound() {
+    run_local(async {
+        let addr = start_server().await;
+        let label = "upsert-archived-while-bound-test";
+
+        let mcp = connect_mcp(addr).await;
+        let reg1 = register_with_retry(&mcp, label).await;
+        assert!(reg1.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg1}");
+        let original_context_id = reg1["context_id"].as_str().unwrap().to_string();
+
+        // Archive the bound context directly through the kernel — standing
+        // in for another player's `kj context archive`, or this process's
+        // own deferred session-end archive. `mcp`'s `remote.joined` still
+        // names this context; nothing on the MCP side has heard about the
+        // archive yet.
+        let Backend::Remote(remote) = mcp.backend() else {
+            panic!("expected Remote backend");
+        };
+        let ctx_id = {
+            let guard = remote.joined.read().await;
+            guard.as_ref().expect("must be joined").context_id
+        };
+        remote
+            .actor
+            .archive_context(ctx_id)
+            .await
+            .expect("archive_context must succeed");
+
+        // Same MCP session, same label: the naive `already_registered` fast
+        // path would answer with the now-archived `original_context_id`.
+        let reg2 = register_with_retry(&mcp, label).await;
+        assert!(
+            reg2.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            "register_session must rebind, not report already_registered on a \
+             dead context: {reg2}"
+        );
+        assert_ne!(
+            reg2.get("already_registered"),
+            Some(&serde_json::Value::Bool(true)),
+            "must not answer already_registered with an archived context: {reg2}"
+        );
+
+        let new_context_id = reg2["context_id"].as_str().unwrap().to_string();
+        assert_ne!(
+            new_context_id, original_context_id,
+            "the archived context must not be reused — a fresh context is required"
+        );
+
+        let previous = reg2
+            .get("previous_context")
+            .filter(|v| !v.is_null())
+            .expect("previous_context must be populated for the archived-while-bound case");
+        assert_eq!(previous["context_id"].as_str(), Some(original_context_id.as_str()));
+        assert_eq!(previous["archived"].as_bool(), Some(true), "{previous}");
+
+        // The fresh context must actually work through the SAME session.
+        let out = run_shell(&mcp, "echo rebound").await;
+        assert_eq!(out["stdout"].as_str(), Some("rebound\n"), "{out}");
+    });
+}
+
 /// `register_session` attaches the MCP session as a peer (docs/
 /// instrument-design.md, "Many hands, one trust boundary" — every connected
 /// client registers so the room can render who's at the table). Nick follows

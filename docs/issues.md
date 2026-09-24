@@ -357,15 +357,47 @@ with reason `prompt_input_exit` while the process (pid 375691, running since
 archived the session's context `181a0b9e` on that event alone
 (`kaijutsu-mcp/src/hook_listener.rs`, the `session.end` arm). Amy did not
 press Ctrl+C; her tui's connection closed cleanly 14 s later, so a key
-aimed elsewhere is a candidate. The trigger is unconfirmed. Open:
+aimed elsewhere is a candidate. The trigger is still unconfirmed.
 
-- **Archive on `session.end` trusts one event.** Archive when the MCP's
-  stdio actually closes or the parent process is gone, not on the hook.
-- **The MCP stays bound to the archived context.** `register_session`
-  answers `already_registered` with the archived id, even given a new
-  label; `shell` is refused ("context … is archived"); the hook mirror keeps
-  appending blocks to it. Only `/mcp` recovers. Rebind to a fresh context
-  when the bound one is archived.
+Fixed 2026-09-24: `session.end` now only records the end
+(`HookListener::should_record_session_end` /`session_end_recorded`); the
+archive itself runs from `main.rs`'s stdio-shutdown path
+(`HookListener::archive_if_session_ended`), and any later hook event clears
+the recording. `register_session_impl`'s already-joined fast path now
+re-checks the bound context's liveness (`resolve_context_label`) before
+trusting it, and rebinds to a fresh context — carrying `previous_context` —
+when the bound one turns out to be archived, concluded, or gone. Two things
+this left open:
+
+- **`shell`'s archived-context refusal is not structurally recognizable.**
+  `admission.rs::ContextAdmission::acquire` returns a plain `String`
+  ("context … is archived; restore it with `kj context promote …`"), which
+  reaches the client as `CallError::Rpc(String)` — the same catch-all every
+  other kernel-side RPC failure uses. `shell_impl` cannot point the caller at
+  `register_session` without matching that exact prose. Giving this refusal
+  a structured kind (like `Refusal` or `VfsErrorKind`) is a design
+  conversation, not a follow-up patch.
+- **`register_session`'s tool description overstates the archived-label
+  case.** It promises a suffixed fresh label plus `previous_context` for
+  "concluded or archived", but `idx_contexts_label` covers live rows only
+  (`kernel_db.rs`) — an archived context's label is free for reuse by
+  design, so `resolve_context_label` returns `None` for it and a **fresh**
+  `register_session` call (not already bound to that context) creates a
+  context under the exact same label with no `previous_context`. Only
+  "concluded" actually gets the suffixed-label treatment. The tool
+  description needs correcting, or the archived case needs the same
+  registry-fallback treatment the already-joined fast path now gets.
+- **Another session's MCP instance archived this session's context.** At
+  19:01:23 a `kaijutsu-mcp` from the user-scope entry in `~/.claude.json`
+  (no `KAIJUTSU_KEY_FINGERPRINT`, so it authenticated as amy) serving the
+  `kaiseki` session ran `configure_llm` on this session's context `8f2c6a3f`,
+  joined its own `cc-kaiseki-0924-2301`, disconnected three seconds later,
+  and `8f2c6a3f` was archived 0.2 s after that. The kaiseki session kept
+  running. How that instance came to own this session's context is
+  unlocated; candidates are session detection (`kaijutsu-agent-tools`
+  `claude.rs` guesses from the newest transcript) and a fallback to the
+  highest-ranked live context. An instance must archive only a context it
+  created for a session id it confirmed.
 
 ## A client does not say which principal it connected as (2026-09-24)
 
