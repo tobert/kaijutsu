@@ -25,7 +25,9 @@ use crate::llm::{ContentBlock, LlmError, ToolDefinition};
 use crate::mcp::{McpError, PolicyError};
 use crate::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
-use kaijutsu_types::{ConsentMode, ContextId, PrincipalId};
+use kaijutsu_types::{ContextId, PrincipalId};
+#[cfg(test)]
+use kaijutsu_types::ConsentMode;
 
 use crate::runtime::interrupt::ContextInterruptState;
 use super::turn_state::{ConversationCache, TurnLease};
@@ -663,20 +665,6 @@ impl StreamTimeouts {
     }
 }
 
-/// Agentic-loop iteration cap by consent mode (M1-A6).
-///
-/// Both modes leave enough headroom for real chained tool work; the cap
-/// is a runaway guard, not a checkpoint. Autonomous gets more rope.
-const COLLABORATIVE_MAX_ITERATIONS: u32 = 50;
-const AUTONOMOUS_MAX_ITERATIONS: u32 = 100;
-
-fn iteration_cap_for_consent(mode: ConsentMode) -> u32 {
-    match mode {
-        ConsentMode::Collaborative => COLLABORATIVE_MAX_ITERATIONS,
-        ConsentMode::Autonomous => AUTONOMOUS_MAX_ITERATIONS,
-    }
-}
-
 /// Whether a stream-start failure is worth retrying under the bounded
 /// backoff, or a permanent refusal that repeating the same request cannot
 /// change.
@@ -734,8 +722,6 @@ struct CeilingStop {
     continuations_spent: u32,
     /// A beat is waiting on this turn's output.
     timed_delivery: bool,
-    /// Another pass fits under the agentic-loop iteration cap.
-    iterations_left: bool,
     cancelled: bool,
     stopping_after_turn: bool,
 }
@@ -744,16 +730,15 @@ impl CeilingStop {
     /// Whether the turn takes another inference.
     ///
     /// It continues only when the ceiling is what stopped it, the turn has
-    /// continuations left, no beat is waiting on it, another pass fits under
-    /// the iteration cap, and no interrupt is pending. Every other ending is
-    /// somebody else's to report, and the caller writes no notice for an
-    /// inference that will not run — a durable notice for a response that no
-    /// longer exists would instruct the next turn instead.
+    /// continuations left, no beat is waiting on it, and no interrupt is
+    /// pending. Every other ending is somebody else's to report, and the
+    /// caller writes no notice for an inference that will not run — a
+    /// durable notice for a response that no longer exists would instruct
+    /// the next turn instead.
     fn continues(self) -> bool {
         self.ceiling
             && self.continuations_spent < MAX_OUTPUT_CEILING_CONTINUATIONS
             && !self.timed_delivery
-            && self.iterations_left
             && !self.cancelled
             && !self.stopping_after_turn
     }
@@ -812,7 +797,6 @@ mod ceiling_decision_tests {
             ceiling: true,
             continuations_spent: 0,
             timed_delivery: false,
-            iterations_left: true,
             cancelled: false,
             stopping_after_turn: false,
         }
@@ -851,13 +835,6 @@ mod ceiling_decision_tests {
     #[test]
     fn a_turn_a_beat_waits_on_does_not_continue() {
         assert!(!CeilingStop { timed_delivery: true, ..clear() }.continues());
-    }
-
-    /// The next pass would halt at the iteration cap, so the notice would
-    /// describe an inference that never ran.
-    #[test]
-    fn the_iteration_cap_stops_the_continuation() {
-        assert!(!CeilingStop { iterations_left: false, ..clear() }.continues());
     }
 
     #[test]
@@ -966,21 +943,6 @@ mod stream_timeout_tests {
         slow.request_timeout_secs = Some(1200);
         let t = StreamTimeouts::resolve(&policy, Some(&slow));
         assert_eq!(t.request, Duration::from_secs(1200));
-    }
-}
-
-#[cfg(test)]
-mod consent_tests {
-    use super::*;
-
-    #[test]
-    fn collaborative_caps_at_fifty_iterations() {
-        assert_eq!(iteration_cap_for_consent(ConsentMode::Collaborative), 50);
-    }
-
-    #[test]
-    fn autonomous_caps_at_one_hundred_iterations() {
-        assert_eq!(iteration_cap_for_consent(ConsentMode::Autonomous), 100);
     }
 }
 
@@ -2085,14 +2047,7 @@ async fn run_llm_stream(
         context_id
     );
 
-    // Resolve the iteration cap once per stream so the guard and halt message
-    // agree. Both modes allow chained tool work; this is a runaway limit.
-    // TODO: Resolve consent from this context or retire the per-context setting.
-    // `kj context set --consent` writes ContextRow, but this reads kernel state.
-    // Do not copy context configuration into the shared kernel-wide value.
-    // See docs/issues.md, "Consent setting ownership".
-    let consent = kernel.consent_mode().await;
-    let max_iterations = iteration_cap_for_consent(consent);
+    // Counts inferences this turn, for logging only.
     let mut iteration: u32 = 0;
     // Output-ceiling continuations spent by this turn, against
     // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
@@ -2115,45 +2070,15 @@ async fn run_llm_stream(
     // publishes exactly one terminal event either way.
     let mut stop_reason_out = TurnStopReason::EndTurn;
 
-    // Continue until completion, cancellation, or the iteration limit.
+    // Continue until the model ends its turn or the turn is cancelled. There
+    // is no per-turn bound on tool rounds; see docs/issues.md, "Per-cast turn
+    // token budget".
     'agentic: loop {
         if interrupt.cancel.is_cancelled() {
             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
         }
         iteration += 1;
-        if iteration > max_iterations {
-            // Consent-aware halt message (M1-A6): in Collaborative mode the
-            // cap is intentional, not a runaway. Tell the user how to
-            // resume rather than just signaling an alarm.
-            let halt_msg = match consent {
-                ConsentMode::Collaborative => format!(
-                    "Paused after {max_iterations} agentic iteration(s) (consent: collaborative). \
-                     Send a follow-up to continue, or switch to autonomous to extend chains."
-                ),
-                ConsentMode::Autonomous => format!(
-                    "⚠️ Maximum tool iterations reached ({max_iterations})."
-                ),
-            };
-            tracing::warn!(
-                "Agentic loop hit max iterations ({}, consent={}), stopping",
-                max_iterations,
-                consent,
-            );
-            let _ = documents.insert_block_as(
-                context_id,
-                None,
-                Some(&last_block_id),
-                Role::Model,
-                BlockKind::Text,
-                &halt_msg,
-                Status::Done,
-                ContentType::Plain,
-                Some(PrincipalId::system()),
-            );
-            stop_reason_out = TurnStopReason::MaxIterations;
-            break;
-        }
 
         // Soft interrupt: stop before the next LLM call. The in-flight model
         // call already finished, so the output block is a whole phrase — that
@@ -2837,7 +2762,6 @@ async fn run_llm_stream(
                 ceiling: output_ceiling_hit,
                 continuations_spent: ceiling_continuations,
                 timed_delivery: turn_lease.owes_timed_delivery(),
-                iterations_left: iteration < max_iterations,
                 cancelled: interrupt.cancel.is_cancelled(),
                 stopping_after_turn: interrupt
                     .stop_after_turn
@@ -7444,6 +7368,67 @@ mod lifetime_tests {
         })));
         assert!(!kernel.turn_in_flight(context));
         assert!(kernel.turns().active_count(context) == 0);
+    }
+
+    /// The agentic loop has no per-turn iteration cap: a turn that chains far
+    /// more tool rounds than the old 50-iteration Collaborative cap still
+    /// ends with `EndTurn`, not a halt message. `ROUNDS` is chosen well past
+    /// that retired cap so the test is a meaningful regression guard, not a
+    /// coincidence of timing.
+    #[tokio::test]
+    async fn agentic_loop_runs_past_the_old_collaborative_iteration_cap() {
+        use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
+            KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
+        struct PokeTool { id: InstanceId }
+        #[async_trait::async_trait]
+        impl McpServerLike for PokeTool {
+            fn instance_id(&self) -> &InstanceId { &self.id }
+            async fn list_tools(&self, _: &CallContext) -> McpResult<Vec<KernelTool>> {
+                Ok(vec![KernelTool { instance: self.id.clone(), name: "poke".into(), description: None,
+                    input_schema: serde_json::json!({"type": "object"}) }])
+            }
+            async fn call_tool(&self, _: KernelCallParams, _: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
+                Ok(KernelToolResult::text("poked"))
+            }
+            fn notifications(&self) -> tokio::sync::broadcast::Receiver<ServerNotification> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+        const ROUNDS: usize = 60;
+        let done = || StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+        let mut script: Vec<Vec<StreamEvent>> = (0..ROUNDS).map(|i| vec![
+            StreamEvent::ToolUse { id: format!("poke-{i}"), name: "poke".into(), input: serde_json::json!({}) },
+            done(),
+        ]).collect();
+        script.push(vec![
+            StreamEvent::TextStart,
+            StreamEvent::TextDelta("done after many rounds".into()),
+            StreamEvent::TextEnd,
+            done(),
+        ]);
+        let mock = MockClient::new("").with_scripted_stream(script);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let instance = InstanceId::new("iteration-cap-probe");
+        kernel.broker().register(Arc::new(PokeTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
+        kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(20), completed.recv()).await
+            .expect(&format!("a turn with no iteration cap must still finish after {ROUNDS} tool rounds"))
+            .unwrap();
+        match event.payload {
+            TurnFlow::Completed { reason, .. } => {
+                assert_eq!(reason, TurnStopReason::EndTurn, "{ROUNDS} tool rounds must not trip an iteration cap");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let blocks = kernel.blocks().block_snapshots(context).unwrap();
+        assert!(
+            !blocks.iter().any(|b| b.content.contains("Maximum tool iterations") || b.content.contains("Paused after")),
+            "no halt-message block should be written when the loop has no cap"
+        );
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
 }

@@ -234,7 +234,7 @@ pass after a turn that fell over.
 | `yielded_on_async` | the last tool result left an operation nobody awaited |
 | `output_starved` | the last tool results spilled their output cap |
 | `token_ceiling` | `max_tokens` |
-| `iteration_cap` | the per-turn agentic iteration cap |
+| `iteration_cap` | ACP `max_turn_requests`; kaijutsu's agentic loop has no per-turn iteration cap today, so this class is unreachable from a kaijutsu trial |
 | `cancelled` | `session/cancel` |
 | `provider_failure` / `setup_failure` | the run errored, with or without a session |
 | `unclassified_stop_reason` | a stop reason this scheme does not name |
@@ -327,8 +327,10 @@ contrib/bench/harbor/run-control.sh --job-name ctl-tb2-miniswe \
 
 The model string is `deepseek/deepseek-v4-flash`; litellm already prices it.
 mini-swe-agent ships with no step limit, and Harbor overrides its $3 cost limit
-to unlimited, so set `HARBOR_CONTROL_STEP_LIMIT` to match kaijutsu's
-100-iteration cap. Its shell inherits the process environment: a model that
+to unlimited. kaijutsu's agentic loop has no per-turn iteration cap either
+(`docs/issues.md`, "Per-cast turn token budget"), so `HARBOR_CONTROL_STEP_LIMIT`
+has no kaijutsu value to match; pick a limit that bounds the control run's
+cost instead. Its shell inherits the process environment: a model that
 runs `env` puts the provider key in its transcript. That happened once in the
 recorded control run; the post-run scan exits 3 and names the file to scrub.
 

@@ -91,9 +91,7 @@ did before continuations existed:
 - a beat waits on the turn's output (a score delivery), because extra
   inferences would put slow work on the beat path and the resolver validates
   one block as a whole tune — see `docs/tracks.md`;
-- an interrupt is pending, which names the ending it caused;
-- another pass would halt at the agentic-loop iteration cap. Each continuation
-  spends an iteration, so that cap still bounds the turn.
+- an interrupt is pending, which names the ending it caused.
 
 The decision comes before any durable write: a notice for an inference that
 never runs would survive as an instruction to the *next* turn.

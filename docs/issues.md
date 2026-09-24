@@ -182,13 +182,30 @@ and BRP. Keep this separate from the shared recovery migration.
 
 ### Consent setting ownership
 
-`kj context set --consent` writes `ContextRow.consent_mode`, while the model
-loop reads the kernel-wide value, whose setter has no workspace callers.
-Choose context resolution or removal before implementation. Do not copy
-context configuration into shared kernel state. If retained, test two contexts
-with distinct limits through the real turn path. If removed, check CLI help,
-schema/persistence migration, and rejection of the retired option. This is a
-behavior decision, not part of the dead-API deletion.
+`kj context set --consent` writes `ContextRow.consent_mode`, which `kj
+context` display and round-trip paths still read. The model loop's own
+reader of the kernel-wide `Kernel::consent_mode()` value is gone — it backed
+the agentic-loop iteration cap, which is retired (see "Per-cast turn token
+budget" below). `Kernel::consent_mode()`, its setter, and the kernel-wide
+`RwLock<ConsentMode>` field now have no workspace caller. Decide whether to
+remove them, or give the kernel-wide value a real reader, before either
+option is safe to skip on. Check CLI help, schema/persistence migration, and
+rejection of any retired option before removing `ContextRow.consent_mode`
+itself — that field still has live readers.
+
+### Per-cast turn token budget
+
+The agentic loop's per-turn iteration cap (50 collaborative / 100 autonomous)
+is removed; a turn now runs until `EndTurn`, cancellation, or the
+output-ceiling continuation budget, with no count of tool rounds. Amy: "let's
+remove that turn cap if it's not useful… no cap for now, we'll come back to
+this, and it'll need to be per cast/model since it varies by model and model
+configuration." The replacement is a per-cast/model budget of cumulative
+input+output tokens across a turn's model calls; at roughly 90% of budget the
+model gets one final tool-free call and must report, rather than being cut off
+mid-tool-chain. Context windows for Alibaba (qwen) models are unpinned, so a
+fraction of the context window is not a usable proxy for the budget — it needs
+its own configured number. Not built yet.
 
 ### Lazy file documents
 

@@ -1424,8 +1424,10 @@ pub enum TurnStopReason {
     /// from the provider's own terminal stop reason (`max_tokens` on Anthropic,
     /// `length` on the OpenAI-compatible providers).
     MaxTokens,
-    /// The agentic loop hit its per-turn tool-iteration cap — ACP
-    /// `max_turn_requests`.
+    /// Reserved on the wire (ACP `max_turn_requests`) for a per-turn
+    /// tool-iteration cap. The agentic loop has no such cap today, so
+    /// nothing in the kernel constructs this variant; it stays for capnp
+    /// enum-ordinal stability and any external reader still matching on it.
     MaxIterations,
 }
 
