@@ -313,12 +313,17 @@ restarted the kernel. No optional int arrived as a string. Open:
 - **A turn runs without a bound and without a report.** This is the first
   live evidence for "Per-cast turn token budget" above; the 09-24 read-only
   probe's cap-hit ended the same way, just sooner.
-- **Each async shell result reaches the block log twice.** A `tool_result`
-  block carries the output, then a user `text` block ("Shell operation …
-  completed … Output block: …") repeats it in full (e.g. #218, 6.8 kB). For a
-  failed call the `tool_result` is empty and only the notification carries
-  the error. Whether both reach the hydrated conversation is unverified; if
-  they do, every call pays for its output twice.
+- **An async shell call's stored result is empty.** The model receives the
+  receipt envelope (status, `operation_id`), but the `tool_result` block
+  keeps only `readable_output()`, empty for a running receipt
+  (`runtime/llm_stream.rs` `dispatch_recorded_tool_result`). Hydration
+  replays stored content (`llm/hydrate.rs`), so a later turn, resume, or
+  fork sees those calls return an empty string with no operation id; 104
+  of 227 results in `banto-0924d` are empty. Completion notices ("Shell
+  operation … completed …") do not reach a running turn: its message list
+  is built once at turn start (`llm_stream.rs`, the mailbox comment near
+  the stream loop), so inside one turn the model can only poll. Keep the
+  receipt durable so replay still names the operation.
 - **Each tool round took about 40 s.** The model appears to wait for the
   completion notification before its next call. Unmeasured: how much is
   provider latency versus the async settle.
@@ -343,6 +348,24 @@ run:
 - **A soft interrupt gives the model no chance to report.** For a review the
   work so far is lost unless someone reads the blocks. The per-cast budget's
   "one final tool-free call" is the designed answer.
+
+## A `session.end` hook archived a live session's context (2026-09-24)
+
+At 17:40:04 this Claude Code session's hook pipeline delivered `SessionEnd`
+with reason `prompt_input_exit` while the process (pid 375691, running since
+13:12) kept going; no `SessionStart` followed. kaijutsu-mcp's hook listener
+archived the session's context `181a0b9e` on that event alone
+(`kaijutsu-mcp/src/hook_listener.rs`, the `session.end` arm). Amy did not
+press Ctrl+C; her tui's connection closed cleanly 14 s later, so a key
+aimed elsewhere is a candidate. The trigger is unconfirmed. Open:
+
+- **Archive on `session.end` trusts one event.** Archive when the MCP's
+  stdio actually closes or the parent process is gone, not on the hook.
+- **The MCP stays bound to the archived context.** `register_session`
+  answers `already_registered` with the archived id, even given a new
+  label; `shell` is refused ("context … is archived"); the hook mirror keeps
+  appending blocks to it. Only `/mcp` recovers. Rebind to a fresh context
+  when the bound one is archived.
 
 ## A client does not say which principal it connected as (2026-09-24)
 
@@ -458,21 +481,16 @@ more readily than other agents". Open, most costly first:
   reading the text stops; one reading the status assumes it ran. The refusal
   remedy (`kaijutsu-types/src/refusal.rs`) tells the reader to run
   `kj ledger allow`, which a model cannot do for itself.
-- **Shell is asynchronous by default, and foreground is not a free fix.**
-  `mcp/servers/shell.rs` defaults `foreground` to false, so every command
-  costs a second `kj wait` call to read. The broker call timeout is 120 s for
-  `shell` and 315 s for `shell_write` (`mcp/policy.rs`), and on expiry the
-  model gets plain text with no partial output. A foreground default for the
-  coder type has to move with a larger `call_timeout` and partial output on
-  timeout.
-  Evidence 2026-09-22, qwen3.8-flash in both seats: banto and a coder each
-  called `read_shell_operation` with operation ids they made up (three
-  "no shell operation ... was ever created" errors in one 130 s coder turn),
-  and the coder lane a director made with `kj context create` started with
-  no working directory ("glob: this context has no working directory set"),
-  so its first command ran in `/home/atobey`. Banto's `kj wait <lane>
-  --timeout 240` through the `shell` tool hit that tool's 120 s ceiling
-  ("Tool 'shell' timed out after 120.0s") and had to re-poll.
+- **A foreground command dies at the broker call timeout.** `shell` and
+  `shell_write` now wait for completion by default (Amy, 2026-09-24:
+  "defaulting to background was a bad idea"). The broker's call timeout is
+  120 s for `shell` and 315 s for `shell_write` (`mcp/policy.rs`); on expiry
+  the model gets a `Timeout` error with no partial output, and the command
+  is cancelled (`runtime/tool_command.rs`, the foreground `task_cancel`).
+  A long `cargo test` must pass `foreground: false`, which the tool
+  description says but a model has to anticipate. Still open: a larger
+  `call_timeout` for coder seats and partial output on timeout. Banto's
+  `kj wait <lane> --timeout 240` through `shell` hits the same 120 s ceiling.
 - **Any text with no tool call ends the turn** (`runtime/llm_stream.rs`, "no
   tool calls this iteration"). There is no completion command, no check of
   unfinished plan items and no continuation nudge. Direction from Amy: "a done
