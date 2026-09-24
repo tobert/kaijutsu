@@ -286,9 +286,16 @@ all succeeded. Open:
   "Let me check…". The turn ends with no answer for the requester. Design
   question: a final tool-free turn at the cap that must report, or a stance
   line to answer before exploring further.
-- **An array param sent as a string is refused.** `"range": "[0, 400]"` →
-  `invalid type: string, expected a tuple of size 2`. `decode_params` could
-  parse a JSON string for a field typed `array` or `object`, by the same rule.
+- **Nullable schema types make qwen send strings.** schemars renders an
+  `Option<T>` field as `"type": ["T", "null"]`, and the openai provider sends
+  tool schemas verbatim (`llm/openai/build.rs:97`). A direct qwen3.8-flash
+  probe, 3 calls per variant: with `null` in the type array, `offset` and
+  `range` came back as strings every time (`"range": "[0, 400]"` hit
+  `block_read`); without it, integers and lists every time, with `format`
+  and `prefixItems` unchanged. A required integer was an integer in every
+  variant. Fix at the schema: generate tool schemas without the null type
+  (schemars `option_add_null_type = false`); optional fields stay optional by
+  leaving `required`. `decode_params` only covers integers.
 - **`kaish-mounts` lists `/dev` twice.** kaish's overlay appends its virtual
   mounts to `MountBackend::mounts()`, so the host `/dev` mount
   (`kaijutsu-server/src/rpc.rs:1528`) and kaish's virtual `/dev` both show.
