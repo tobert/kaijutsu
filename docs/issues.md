@@ -265,13 +265,6 @@ hit the 50-iteration cap). The coder's two `cargo test` asks went to banto,
 which answered them from inside `kj wait`; two banto asks reached the lead.
 Open, most costly first:
 
-- **Tool integer params refuse strings.** qwen3.8-flash sends `offset`/`limit`
-  as `"240"`; serde answers `invalid type: string, expected u32`. Four
-  refusals across both seats, each a lost round trip. Accept numeric strings,
-  or teach the schema; decide which.
-- **A director cannot read git.** Banto's read-only shell refuses external
-  commands, so `git status --porcelain && git diff --stat` became an ask to
-  its reviewer. A reviewing seat needs to see the change it reviews.
 - **lfm2d still escalates `cargo test`** at situation-normal 0.90. Same entry
   as 09-22; now it costs one banto answer instead of a stall.
 - **A `</think>` tag leaks into qwen model text** (coder block #25). The
