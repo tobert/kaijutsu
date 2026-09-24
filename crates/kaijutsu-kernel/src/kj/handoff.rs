@@ -18,7 +18,7 @@
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{
-    BlockKind, ConsentMode, ContentType, ContextId, ContextState, Role, Status,
+    BlockKind, ContentType, ContextId, ContextState, Role, Status,
 };
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
@@ -349,7 +349,6 @@ impl KjDispatcher {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: "handoff".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,

@@ -26,7 +26,7 @@ use kaijutsu_kernel::mcp::{
 };
 use kaijutsu_kernel::Kernel;
 use kaijutsu_types::{
-    now_millis, BlockFilter, BlockKind, ConsentMode, ContextId, ContextState, KernelId,
+    now_millis, BlockFilter, BlockKind, ContextId, ContextState, KernelId,
     NotificationKind, PrincipalId, RefusalKind, SessionId,
 };
 use tokio::sync::broadcast;
@@ -56,7 +56,6 @@ fn insert_context_row(
         provider: None,
         model: None,
         system_prompt: None,
-        consent_mode: ConsentMode::Collaborative,
         context_state: ContextState::Live,
         context_type: "default".to_string(),
         created_at: now_millis() as i64,
@@ -1483,7 +1482,6 @@ async fn setup_with_db() -> (Fixture, Arc<parking_lot::Mutex<KernelDb>>) {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: now_millis() as i64,

@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult,
 use tracing::{info, warn};
 
 use kaijutsu_types::{
-    BackendId, BlockId, CastId, ConsentMode, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
+    BackendId, BlockId, CastId, ContextId, ContextState, DocKind, EdgeKind, ForkKind,
     KernelId, PresetId, PrincipalId, WorkspaceId,
 };
 
@@ -103,7 +103,6 @@ pub struct ContextRow {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
-    pub consent_mode: ConsentMode,
     pub context_state: ContextState,
     pub context_type: String,
     pub created_at: i64,
@@ -362,7 +361,6 @@ pub struct PresetRow {
     /// — "cast = who plays; preset = patch recall over verb args."
     pub cast_id: Option<CastId>,
     pub system_prompt: Option<String>,
-    pub consent_mode: ConsentMode,
     pub created_at: i64,
     pub created_by: PrincipalId,
 }
@@ -622,7 +620,6 @@ CREATE TABLE IF NOT EXISTS presets (
     description  TEXT,
     cast_id      BLOB REFERENCES casts(cast_id) ON DELETE SET NULL,
     system_prompt TEXT,
-    consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB NOT NULL
 );
@@ -668,7 +665,6 @@ CREATE TABLE IF NOT EXISTS contexts (
     provider     TEXT,
     model        TEXT,
     system_prompt TEXT,
-    consent_mode TEXT NOT NULL DEFAULT 'collaborative',
     context_state TEXT NOT NULL DEFAULT 'live',
     context_type TEXT NOT NULL DEFAULT 'default',
     created_at   INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -1774,14 +1770,6 @@ fn decode_cache_target(kind: &str, index: Option<i64>, ttl: &str) -> Option<Cach
     }
 }
 
-/// Parse ConsentMode from TEXT column.
-fn consent_mode_from_sql(s: &str) -> ConsentMode {
-    ConsentMode::from_str(s).unwrap_or_else(|_| {
-        warn!(mode = %s, "unknown ConsentMode in DB, defaulting to Collaborative");
-        ConsentMode::Collaborative
-    })
-}
-
 /// Parse ContextState from TEXT column.
 fn context_state_from_sql(s: &str) -> ContextState {
     ContextState::from_str(s).unwrap_or_else(|_| {
@@ -2697,9 +2685,30 @@ impl KernelDb {
         Self::migrate_label_index_live_only(conn)?;
         Self::migrate_subtree_fork_kind_clear(conn)?;
         Self::drop_doc_snapshots_content_column(conn)?;
+        Self::drop_consent_mode_columns(conn)?;
         // Review has no configured default; the lineage root holds that
         // authority (`docs/approval-identity.md`).
         conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
+        Ok(())
+    }
+
+    /// Drops the unread `contexts.consent_mode` and `presets.consent_mode`
+    /// columns so an older database keeps loading; guarded on
+    /// `PRAGMA table_info` so a fresh database, whose `CREATE TABLE` never
+    /// had the column, does nothing and this stays safe to call on every
+    /// open.
+    fn drop_consent_mode_columns(conn: &Connection) -> KernelDbResult<()> {
+        for table in ["contexts", "presets"] {
+            let has_column = conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<SqliteResult<Vec<String>>>()?
+                .iter()
+                .any(|name| name == "consent_mode");
+            if has_column {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN consent_mode;"))?;
+            }
+        }
         Ok(())
     }
 
@@ -3969,18 +3978,18 @@ impl KernelDb {
         conn.execute(
                 "INSERT INTO contexts (
                 context_id, label, provider, model,
-                system_prompt, consent_mode, context_state, context_type,
+                system_prompt, context_state, context_type,
                 created_at, created_by, forked_from, fork_kind,
                 archived_at, workspace_id, preset_id, concluded_at,
                 last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
                 origin_host, played_by, reviewer_id, director_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23, ?24, ?25
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23, ?24
             )",
                 params![
                     blob_param(row.context_id.as_bytes()),
@@ -3988,7 +3997,6 @@ impl KernelDb {
                     row.provider,
                     row.model,
                     row.system_prompt,
-                    row.consent_mode.as_str(),
                     row.context_state.as_str(),
                     row.context_type,
                     row.created_at,
@@ -4024,7 +4032,7 @@ impl KernelDb {
     pub fn get_context(&self, id: ContextId) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
-                    system_prompt, consent_mode, context_state, context_type,
+                    system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
@@ -4177,16 +4185,11 @@ impl KernelDb {
         &self,
         id: ContextId,
         system_prompt: Option<&str>,
-        consent_mode: ConsentMode,
     ) -> KernelDbResult<()> {
         let updated = self.conn.execute(
-            "UPDATE contexts SET system_prompt = ?1, consent_mode = ?2
-             WHERE context_id = ?3",
-            params![
-                system_prompt,
-                consent_mode.as_str(),
-                blob_param(id.as_bytes()),
-            ],
+            "UPDATE contexts SET system_prompt = ?1
+             WHERE context_id = ?2",
+            params![system_prompt, blob_param(id.as_bytes())],
         )?;
         if updated == 0 {
             return Err(KernelDbError::NotFound(format!("context {}", id.short())));
@@ -4528,7 +4531,7 @@ impl KernelDb {
     pub fn list_active_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
-                    system_prompt, consent_mode, context_state, context_type,
+                    system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
@@ -4545,7 +4548,7 @@ impl KernelDb {
     pub fn list_all_contexts(&self) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
-                    system_prompt, consent_mode, context_state, context_type,
+                    system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
@@ -4596,7 +4599,7 @@ impl KernelDb {
     pub fn structural_parents(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
+                    c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                     c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id
@@ -4615,7 +4618,7 @@ impl KernelDb {
     pub fn structural_children(&self, id: ContextId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.context_id, c.label, c.provider, c.model,
-                    c.system_prompt, c.consent_mode, c.context_state, c.context_type,
+                    c.system_prompt, c.context_state, c.context_type,
                     c.created_at, c.created_by, c.forked_from, c.fork_kind,
                     c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                     c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at, c.cast_id, c.origin_host, c.played_by, c.reviewer_id, c.director_id
@@ -4653,7 +4656,7 @@ impl KernelDb {
                 JOIN contexts c2 ON c2.context_id = e.target_id AND c2.archived_at IS NULL
             )
             SELECT c.context_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
+                   c.system_prompt, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
@@ -4665,7 +4668,7 @@ impl KernelDb {
 
         let rows = stmt.query_map([], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(25)?;
+            let depth: i64 = row.get(24)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4684,7 +4687,7 @@ impl KernelDb {
                 WHERE c.forked_from IS NOT NULL
             )
             SELECT c.context_id, c.label, c.provider, c.model,
-                   c.system_prompt, c.consent_mode, c.context_state, c.context_type,
+                   c.system_prompt, c.context_state, c.context_type,
                    c.created_at, c.created_by, c.forked_from, c.fork_kind,
                    c.archived_at, c.workspace_id, c.preset_id, c.concluded_at,
                    c.last_activity_at, c.promoted_at, c.demoted_at, c.paused_at,
@@ -4696,7 +4699,7 @@ impl KernelDb {
 
         let rows = stmt.query_map(params![blob_param(context_id.as_bytes())], |row| {
             let ctx = row_to_context_row(row)?;
-            let depth: i64 = row.get(25)?;
+            let depth: i64 = row.get(24)?;
             Ok((ctx, depth))
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
@@ -4864,15 +4867,14 @@ impl KernelDb {
             .execute(
                 "INSERT INTO presets (
                 preset_id, label, description, cast_id,
-                system_prompt, consent_mode, created_at, created_by
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                system_prompt, created_at, created_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     blob_param(row.preset_id.as_bytes()),
                     row.label,
                     row.description,
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.system_prompt,
-                    row.consent_mode.as_str(),
                     row.created_at,
                     blob_param(row.created_by.as_bytes()),
                 ],
@@ -4887,7 +4889,7 @@ impl KernelDb {
     pub fn get_preset(&self, id: PresetId) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, label, description, cast_id,
-                    system_prompt, consent_mode, created_at, created_by
+                    system_prompt, created_at, created_by
              FROM presets WHERE preset_id = ?1",
         )?;
 
@@ -4903,7 +4905,7 @@ impl KernelDb {
     pub fn get_preset_by_label(&self, label: &str) -> KernelDbResult<Option<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, label, description, cast_id,
-                    system_prompt, consent_mode, created_at, created_by
+                    system_prompt, created_at, created_by
              FROM presets WHERE label = ?1",
         )?;
 
@@ -4919,7 +4921,7 @@ impl KernelDb {
     pub fn list_presets(&self) -> KernelDbResult<Vec<PresetRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT preset_id, label, description, cast_id,
-                    system_prompt, consent_mode, created_at, created_by
+                    system_prompt, created_at, created_by
              FROM presets
              ORDER BY label",
         )?;
@@ -4937,14 +4939,13 @@ impl KernelDb {
             .execute(
                 "UPDATE presets SET
                 label = ?1, description = ?2, cast_id = ?3,
-                system_prompt = ?4, consent_mode = ?5
-             WHERE preset_id = ?6",
+                system_prompt = ?4
+             WHERE preset_id = ?5",
                 params![
                     row.label,
                     row.description,
                     row.cast_id.as_ref().map(|id| id.as_bytes().to_vec()),
                     row.system_prompt,
-                    row.consent_mode.as_str(),
                     blob_param(row.preset_id.as_bytes()),
                 ],
             )
@@ -6898,7 +6899,7 @@ impl KernelDb {
     pub fn find_context_by_label(&self, label: &str) -> KernelDbResult<Option<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
-                    system_prompt, consent_mode, context_state, context_type,
+                    system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id, origin_host, played_by, reviewer_id, director_id
@@ -7891,7 +7892,7 @@ impl KernelDb {
     pub fn contexts_played_by(&self, principal_id: PrincipalId) -> KernelDbResult<Vec<ContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT context_id, label, provider, model,
-                    system_prompt, consent_mode, context_state, context_type,
+                    system_prompt, context_state, context_type,
                     created_at, created_by, forked_from, fork_kind,
                     archived_at, workspace_id, preset_id, concluded_at,
                     last_activity_at, promoted_at, demoted_at, paused_at, cast_id,
@@ -8037,9 +8038,8 @@ fn row_to_document_row(row: &rusqlite::Row<'_>) -> SqliteResult<DocumentRow> {
 }
 
 fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
-    let consent_str: String = row.get(5)?;
-    let state_str: String = row.get(6)?;
-    let fork_kind_str: Option<String> = row.get(11)?;
+    let state_str: String = row.get(5)?;
+    let fork_kind_str: Option<String> = row.get(10)?;
 
     Ok(ContextRow {
         context_id: read_context_id(row, 0)?,
@@ -8047,26 +8047,25 @@ fn row_to_context_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextRow> {
         provider: row.get(2)?,
         model: row.get(3)?,
         system_prompt: row.get(4)?,
-        consent_mode: consent_mode_from_sql(&consent_str),
         context_state: context_state_from_sql(&state_str),
-        context_type: row.get(7)?,
-        created_at: row.get(8)?,
-        created_by: read_principal_id(row, 9)?,
-        forked_from: read_opt_context_id(row, 10)?,
+        context_type: row.get(6)?,
+        created_at: row.get(7)?,
+        created_by: read_principal_id(row, 8)?,
+        forked_from: read_opt_context_id(row, 9)?,
         fork_kind: fork_kind_from_sql(fork_kind_str)?,
-        archived_at: row.get(12)?,
-        workspace_id: read_opt_workspace_id(row, 13)?,
-        preset_id: read_opt_preset_id(row, 14)?,
-        concluded_at: row.get(15)?,
-        last_activity_at: row.get(16)?,
-        promoted_at: row.get(17)?,
-        demoted_at: row.get(18)?,
-        paused_at: row.get(19)?,
-        cast_id: read_opt_cast_id(row, 20)?,
-        origin_host: row.get(21)?,
-        played_by: read_opt_principal_id(row, 22)?,
-        reviewer_id: read_opt_principal_id(row, 23)?,
-        director_id: read_opt_principal_id(row, 24)?,
+        archived_at: row.get(11)?,
+        workspace_id: read_opt_workspace_id(row, 12)?,
+        preset_id: read_opt_preset_id(row, 13)?,
+        concluded_at: row.get(14)?,
+        last_activity_at: row.get(15)?,
+        promoted_at: row.get(16)?,
+        demoted_at: row.get(17)?,
+        paused_at: row.get(18)?,
+        cast_id: read_opt_cast_id(row, 19)?,
+        origin_host: row.get(20)?,
+        played_by: read_opt_principal_id(row, 21)?,
+        reviewer_id: read_opt_principal_id(row, 22)?,
+        director_id: read_opt_principal_id(row, 23)?,
     })
 }
 
@@ -8083,17 +8082,14 @@ fn row_to_edge_row(row: &rusqlite::Row<'_>) -> SqliteResult<ContextEdgeRow> {
 }
 
 fn row_to_preset_row(row: &rusqlite::Row<'_>) -> SqliteResult<PresetRow> {
-    let consent_str: String = row.get(5)?;
-
     Ok(PresetRow {
         preset_id: read_preset_id(row, 0)?,
         label: row.get(1)?,
         description: row.get(2)?,
         cast_id: read_opt_cast_id(row, 3)?,
         system_prompt: row.get(4)?,
-        consent_mode: consent_mode_from_sql(&consent_str),
-        created_at: row.get(6)?,
-        created_by: read_principal_id(row, 7)?,
+        created_at: row.get(5)?,
+        created_by: read_principal_id(row, 6)?,
     })
 }
 
@@ -8443,7 +8439,6 @@ fn make_context_row(label: Option<&str>) -> ContextRow {
         provider: None,
         model: None,
         system_prompt: None,
-        consent_mode: ConsentMode::default(),
         context_state: ContextState::Live,
         context_type: "default".to_string(),
         created_at: now_millis(),
@@ -8717,7 +8712,6 @@ mod tests {
             description: None,
             cast_id: None,
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             created_at: now_millis(),
             created_by: PrincipalId::new(),
         })
@@ -10098,7 +10092,6 @@ mod tests {
             description: Some("Deep research preset".into()),
             cast_id: Some(research_cast),
             system_prompt: None,
-            consent_mode: ConsentMode::Autonomous,
             created_at: now,
             created_by: creator,
         };
@@ -10447,7 +10440,6 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("opus".into()),
             system_prompt: None,
-            consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: now,
@@ -10504,7 +10496,6 @@ mod tests {
             provider: Some("anthropic".into()),
             model: Some("claude-opus-4-6".into()),
             system_prompt: Some("You are helpful.".into()),
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: 1000,
@@ -10536,7 +10527,6 @@ mod tests {
             provider: Some("google".into()),
             model: Some("gemini-2.0-flash".into()),
             system_prompt: Some("Be concise.".into()),
-            consent_mode: ConsentMode::Autonomous,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: 2000,
@@ -10566,7 +10556,6 @@ mod tests {
         assert_eq!(recovered.provider, Some("google".into()));
         assert_eq!(recovered.model, Some("gemini-2.0-flash".into()));
         assert_eq!(recovered.system_prompt, Some("Be concise.".into()));
-        assert_eq!(recovered.consent_mode, ConsentMode::Autonomous);
         assert_eq!(recovered.created_at, 2000);
         assert_eq!(recovered.created_by, creator);
         assert_eq!(recovered.forked_from, Some(parent_id));
@@ -10664,7 +10653,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: now_millis(),
@@ -15217,6 +15205,99 @@ mod tests {
         let db = KernelDb::temporary().unwrap();
         let doc = setup_snapshot_document(&db);
         put_doc_snapshots_back_with_its_content_column(&db.conn, doc);
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+    }
+
+    /// Bring `contexts.consent_mode` and `presets.consent_mode` back, with a
+    /// non-default value on each row, so the next open has something real to
+    /// migrate.
+    fn put_consent_mode_columns_back(conn: &Connection, ctx: ContextId, preset: PresetId) {
+        conn.execute(
+            "ALTER TABLE contexts ADD COLUMN consent_mode TEXT NOT NULL DEFAULT 'collaborative'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE presets ADD COLUMN consent_mode TEXT NOT NULL DEFAULT 'collaborative'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE contexts SET consent_mode = 'autonomous' WHERE context_id = ?1",
+            params![blob_param(ctx.as_bytes())],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE presets SET consent_mode = 'autonomous' WHERE preset_id = ?1",
+            params![blob_param(preset.as_bytes())],
+        )
+        .unwrap();
+    }
+
+    /// A database still carrying `contexts.consent_mode` and
+    /// `presets.consent_mode` loses both columns on the next open, and the
+    /// rows they held keep every other value. Nothing reads the field any
+    /// more — the migration exists only to leave an old database loadable.
+    #[test]
+    fn the_consent_mode_columns_are_dropped_and_rows_survive() {
+        let db = KernelDb::temporary().unwrap();
+        let ws = setup_test_db(&db);
+        let row = make_context_row(Some("consent-drop-ctx"));
+        let ctx = row.context_id;
+        insert_context_with_doc(&db, &row, ws);
+        let preset = insert_test_preset(&db, "consent-drop-preset");
+
+        put_consent_mode_columns_back(&db.conn, ctx, preset);
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+
+        let contexts_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'contexts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !contexts_sql.contains("consent_mode"),
+            "contexts.consent_mode must be gone, got: {contexts_sql}"
+        );
+        let presets_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'presets'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !presets_sql.contains("consent_mode"),
+            "presets.consent_mode must be gone, got: {presets_sql}"
+        );
+
+        let loaded = db.get_context(ctx).unwrap().expect("the context row must survive the drop");
+        assert_eq!(loaded.label, Some("consent-drop-ctx".to_string()));
+        let loaded_preset =
+            db.get_preset(preset).unwrap().expect("the preset row must survive the drop");
+        assert_eq!(loaded_preset.label, "consent-drop-preset");
+    }
+
+    /// The drop is guarded, so a second open does not re-run it — an
+    /// unguarded `ALTER TABLE ... DROP COLUMN` on a column that is already
+    /// gone is an error, not a no-op.
+    #[test]
+    fn dropping_the_consent_mode_columns_is_idempotent() {
+        let db = KernelDb::temporary().unwrap();
+        let ws = setup_test_db(&db);
+        let row = make_context_row(Some("consent-drop-idempotent"));
+        let ctx = row.context_id;
+        insert_context_with_doc(&db, &row, ws);
+        let preset = insert_test_preset(&db, "consent-drop-idempotent-preset");
+        put_consent_mode_columns_back(&db.conn, ctx, preset);
 
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
         KernelDb::apply_additive_migrations(&db.conn).unwrap();

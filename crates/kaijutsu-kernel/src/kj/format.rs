@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(format_age_compact(future), "now");
     }
     use super::*;
-    use kaijutsu_types::{ConsentMode, ContextState, PrincipalId};
+    use kaijutsu_types::{ContextState, PrincipalId};
 
     fn make_row(label: Option<&str>, id: ContextId) -> ContextRow {
         ContextRow {
@@ -520,7 +520,6 @@ mod tests {
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,

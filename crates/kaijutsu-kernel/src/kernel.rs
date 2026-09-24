@@ -5,7 +5,6 @@
 //! - Durable context and block state
 //! - Tools (execution engines)
 //! - LLM providers (for model access)
-//! - Control plane (consent mode)
 
 use crate::runtime::context_shell::ShellIdentity;
 use async_trait::async_trait;
@@ -19,7 +18,6 @@ use tokio::sync::RwLock;
 use kaijutsu_cas::FileStore;
 
 use crate::peers::{InvokeRequest, PeerConfig, PeerError, PeerInfo, PeerRegistry};
-use crate::control::ConsentMode;
 use crate::drift::{SharedDriftRouter, shared_drift_router};
 use crate::execution::{ExecContext, ExecResult};
 use crate::flows::{
@@ -35,7 +33,6 @@ use crate::vfs::{DirEntry, FileAttr, MountTable, SetAttr, StatFs, VfsOps, VfsRes
 /// Everything is a kernel. A kernel:
 /// - Owns `/` in its VFS
 /// - Can mount worktrees, repos, other kernels
-/// - Has a consent mode (collaborative vs autonomous)
 /// - Holds contexts and their block logs
 pub struct Kernel {
     /// Stable kernel identity — set at construction from the KernelDb
@@ -51,8 +48,6 @@ pub struct Kernel {
     /// Peer registry. A synchronous lock: the registry never awaits while
     /// held, and a connection's `Drop` detaches through it.
     peers: parking_lot::RwLock<PeerRegistry>,
-    /// Consent mode (collaborative vs autonomous).
-    consent_mode: RwLock<ConsentMode>,
     /// FlowBus for block events.
     block_flows: SharedBlockFlowBus,
     /// FlowBus for autonomous turn requests (headless drive). Kernel-side
@@ -211,7 +206,6 @@ impl std::fmt::Debug for Kernel {
             .field("state", &"<locked>")
             .field("tools", &"<locked>")
             .field("llm", &"<locked>")
-            .field("consent_mode", &"<locked>")
             .field("drift", &"<shared>")
             .finish()
     }
@@ -401,7 +395,6 @@ impl Kernel {
             name: RwLock::new(name),
             llm: RwLock::new(LlmRegistry::new()),
             peers: parking_lot::RwLock::new(PeerRegistry::new()),
-            consent_mode: RwLock::new(ConsentMode::default()),
             block_flows,
             turn_flows: shared_turn_flow_bus(default_flow_capacity()),
             drift: shared_drift_router(),
@@ -2003,20 +1996,6 @@ impl Kernel {
             .into_iter()
             .map(|s| s.to_string())
             .collect()
-    }
-
-    // ========================================================================
-    // Consent Mode
-    // ========================================================================
-
-    /// Get the current consent mode.
-    pub async fn consent_mode(&self) -> ConsentMode {
-        *self.consent_mode.read().await
-    }
-
-    /// Set the consent mode.
-    pub async fn set_consent_mode(&self, mode: ConsentMode) {
-        *self.consent_mode.write().await = mode;
     }
 
     // ========================================================================

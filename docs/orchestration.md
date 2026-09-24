@@ -101,9 +101,9 @@ To make a context's binding take a turn:
 kj drive --prompt "..."
 ```
 
-The kernel pumps the binding for as long as the consent budget allows
-(see [Turn Pump](#the-turn-pump)), then pauses. New blocks accumulate in the
-document. Read them with `block_list`.
+The kernel pumps the binding until the turn ends (see
+[Turn Pump](#the-turn-pump)). New blocks accumulate in the document. Read
+them with `block_list`.
 
 `kj drive` seeds a turn on the current context (or a named target — see
 `kj drive --help`) and publishes a turn request; the binding runs against
@@ -212,10 +212,12 @@ When does a binding actually take a turn?
 
 - **A submit (`submitInput`, the human's compose path) or `kj drive` triggers
   a turn.** That's the event.
-- The pump runs the binding for up to the **consent budget**. In
-  collaborative mode the kernel pauses after a few agentic iterations with
-  a `Paused after N agentic iteration(s)` message. The User or an Agent has
-  to submit again to resume. In autonomous mode the budget is broader.
+- The pump runs the binding until the model ends its turn, the turn is
+  cancelled, or the output-ceiling continuation budget is reached — no
+  per-turn count of tool rounds (the earlier iteration cap and its
+  collaborative/autonomous consent split are retired; see
+  `docs/issues.md`, "Per-cast turn token budget" for the planned
+  per-cast/model token budget that replaces it).
 - **Drift arrival does NOT trigger a turn.** Drifts land as blocks; the
   next submit incorporates them.
 - **`invoke_peer` does NOT trigger a turn** in the receiving context (it

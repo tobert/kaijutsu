@@ -405,7 +405,7 @@ impl RosterStore {
 mod tests {
     use super::*;
     use crate::kernel_db::{ContextRow, KernelDb, KernelDbError};
-    use kaijutsu_types::{ConsentMode, ContextState};
+    use kaijutsu_types::ContextState;
 
     fn db_with_context() -> (Arc<parking_lot::Mutex<KernelDb>>, ContextId) {
         let db = KernelDb::temporary().expect("temporary KernelDb");
@@ -417,7 +417,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: kaijutsu_types::now_millis() as i64,

@@ -185,7 +185,6 @@ Settings ride environment variables, each of which has a matching
 
 | Variable | Kwarg | What it sets |
 |---|---|---|
-| `KAIJUTSU_ACP_CONSENT` | `consent` | `--consent collaborative\|autonomous`. Unset: the binary's default, collaborative, a 50-iteration per-turn cap. |
 | `KAIJUTSU_ACP_MAX_TOKENS` | `max_tokens` | `--max-tokens N`. Unset: the factory ceiling, 16384. |
 | `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
 | `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |
@@ -269,7 +268,7 @@ for: job name, dataset or task path, task names, Harbor version, timeout
 multiplier, binary and gate paths, the key's variable name, Harbor's exit
 status. `<job>/<trial>/agent/kaijutsu-provenance.json` records what ran:
 `binary.sha256` and size, `gate.sha256`, `worktree.head` and whether it was
-dirty, backend and model, consent and `max_tokens`, the rc overlay and its
+dirty, backend and model, `max_tokens`, the rc overlay and its
 hash, the CA bundle, and the state directory.
 
 To map a binary back to a commit, match `binary.sha256` against
@@ -301,7 +300,7 @@ KAIJUTSU_ACP_RC_OVERLAY="$PWD/contrib/bench/rc-variants/coder-driven" \
 The overlay path resolves against the directory `harbor` runs in, so give it
 absolutely.
 
-Same tasks, same binary, same gate policy, same consent mode, same token
+Same tasks, same binary, same gate policy, same token
 ceiling, same timeout multiplier. Each job's provenance records all of them, and
 the overlay's sha256 ties a job to the exact variant that produced it. Compare
 with `summarize_job.py`: pass rate, tokens per solved task, `turns_ended_early`,

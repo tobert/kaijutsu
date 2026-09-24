@@ -1282,7 +1282,7 @@ struct TrackInfo {
 # ============================================================================
 # Kernel configuration
 # ============================================================================
-# Kernel identity, mount/consent policy, and timeout defaults.
+# Kernel identity, mount policy, and timeout defaults.
 
 struct KernelInfo {
   id @0 :Data;                    # 16-byte KernelId (UUIDv7)
@@ -1295,7 +1295,6 @@ struct KernelInfo {
 struct KernelConfig {
   name @0 :Text;
   mounts @1 :List(MountSpec);
-  consentMode @2 :ConsentMode;
 }
 
 # Kernel-wide timeout policy. Mirrors `kaijutsu_types::TimeoutPolicy`.
@@ -1320,11 +1319,6 @@ struct MountSpec {
   path @0 :Text;           # e.g. "/mnt/kaijutsu"
   source @1 :Text;         # e.g. "~/src/kaijutsu" or "kernel://other"
   writable @2 :Bool;
-}
-
-enum ConsentMode {
-  collaborative @0;
-  autonomous @1;
 }
 
 struct MountInfo {

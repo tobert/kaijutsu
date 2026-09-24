@@ -633,15 +633,7 @@ pub struct PresetInfo {
 #[derive(Debug, Clone)]
 pub struct KernelConfig {
     pub name: String,
-    pub consent_mode: ConsentMode,
     pub mounts: Vec<MountSpec>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConsentMode {
-    #[default]
-    Collaborative,
-    Autonomous,
 }
 
 #[derive(Debug, Clone)]

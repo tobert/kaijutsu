@@ -26,8 +26,6 @@ use crate::mcp::{McpError, PolicyError};
 use crate::{Kernel, LlmMessage, Provider, SharedBlockStore};
 use kaijutsu_types::ToolKind as TypesToolKind;
 use kaijutsu_types::{ContextId, PrincipalId};
-#[cfg(test)]
-use kaijutsu_types::ConsentMode;
 
 use crate::runtime::interrupt::ContextInterruptState;
 use super::turn_state::{ConversationCache, TurnLease};
@@ -5077,7 +5075,6 @@ mod usage_tests {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -6325,7 +6322,7 @@ mod lifetime_tests {
             }
             db.insert_context(&crate::ContextRow {
                 context_id: context, label: None, provider: None, model: None, system_prompt: None,
-                consent_mode: ConsentMode::Collaborative, context_state: ContextState::Live,
+                context_state: ContextState::Live,
                 context_type: "default".into(), created_at: 0, created_by: reviewer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,

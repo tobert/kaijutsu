@@ -1,7 +1,7 @@
 //! Context subcommands: list, info, switch, create, set, log, move, archive, retag.
 
 use clap::{Args, Parser, Subcommand};
-use kaijutsu_types::{BlockId, ConsentMode, ContentType, ContextId, ContextState, EdgeKind, PrincipalId};
+use kaijutsu_types::{BlockId, ContentType, ContextId, ContextState, EdgeKind, PrincipalId};
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow, DemoteOutcome, PromoteOutcome, KernelDb, KernelDbError, KernelDbResult};
 
@@ -35,9 +35,6 @@ pub(crate) struct ContextConfigArgs {
     /// Stored legacy prompt value; not included in model instructions. Use rc instruction blocks
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
-    /// Consent mode: collaborative|autonomous
-    #[arg(long)]
-    consent: Option<String>,
     /// Working directory for the context's shell
     #[arg(long)]
     cwd: Option<String>,
@@ -59,7 +56,6 @@ impl From<ContextConfigArgs> for ContextConfig {
         ContextConfig {
             model_spec: a.model,
             system_prompt: a.system_prompt,
-            consent_spec: a.consent,
             cwd_spec: a.cwd,
             env_spec: a.env,
             type_spec: a.type_,
@@ -200,8 +196,8 @@ enum ContextCommand {
     },
     /// Replace a context with a fresh successor (default: current). The
     /// successor is created from the same parent and copies the type, cast,
-    /// performer, director, reviewer override, model, system prompt, consent
-    /// mode, workspace, env, and cwd, then runs the `create` rc lifecycle.
+    /// performer, director, reviewer override, model, system prompt,
+    /// workspace, env, and cwd, then runs the `create` rc lifecycle.
     /// `ROTATED_FROM` names the predecessor by id. When the successor has a
     /// loadout, it takes the label, the ring seat, and any character's
     /// `root_ctx` pointer, and the predecessor is archived. The performer
@@ -285,15 +281,14 @@ enum ContextCommand {
 /// Settable context configuration shared by `create` and `set`.
 ///
 /// These are the knobs that can be applied to an existing context row:
-/// model, system prompt, consent mode, working directory, an env var, and
-/// the rc-dispatch `context_type`. `create` reuses the same surface so a
-/// context can be born fully configured (fork-parity) instead of needing a
-/// follow-up `kj context set`.
+/// model, system prompt, working directory, an env var, and the rc-dispatch
+/// `context_type`. `create` reuses the same surface so a context can be born
+/// fully configured (fork-parity) instead of needing a follow-up
+/// `kj context set`.
 #[derive(Default)]
 struct ContextConfig {
     model_spec: Option<String>,
     system_prompt: Option<String>,
-    consent_spec: Option<String>,
     cwd_spec: Option<String>,
     env_spec: Vec<String>,
     type_spec: Option<String>,
@@ -401,8 +396,8 @@ impl KjDispatcher {
     /// Validate user-supplied config and resolve `--model`/`--cast` BEFORE
     /// any mutation.
     ///
-    /// Checks provider existence, consent-mode spelling, and `--env KEY=VALUE`
-    /// shape, and resolves a bare model name (no `provider/` prefix) to the
+    /// Checks provider existence and `--env KEY=VALUE` shape, and resolves a
+    /// bare model name (no `provider/` prefix) to the
     /// registry's default provider — erroring if none is configured, exactly
     /// like `kj fork`. A `--cast <label>` is resolved against `list_casts`
     /// the same way: an unknown label fails loud, listing the known casts,
@@ -424,13 +419,6 @@ impl KjDispatcher {
             _ => None,
         };
 
-        if let Some(ref spec) = cfg.consent_spec
-            && spec.parse::<ConsentMode>().is_err()
-        {
-            return Err(format!(
-                "invalid consent mode '{spec}' — use 'collaborative' or 'autonomous'"
-            ));
-        }
         if let Some(env) = cfg.env_spec.iter().find(|e| !e.contains('=')) {
             return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
         }
@@ -544,13 +532,7 @@ impl KjDispatcher {
                     changes.push(format!("cast={label}"));
                 }
 
-                // consent_spec is validated upstream; treat a parse miss as absent.
-                let consent_mode = cfg
-                    .consent_spec
-                    .as_ref()
-                    .and_then(|s| s.parse::<ConsentMode>().ok());
-
-                if cfg.system_prompt.is_some() || consent_mode.is_some() {
+                if cfg.system_prompt.is_some() {
                     let current = db
                         .get_context(target_id)
                         ?
@@ -564,16 +546,8 @@ impl KjDispatcher {
                         .system_prompt
                         .as_deref()
                         .or(current.system_prompt.as_deref());
-                    let new_consent = consent_mode.unwrap_or(current.consent_mode);
-                    db.update_settings(target_id, new_prompt, new_consent)?;
-                    if cfg.system_prompt.is_some() {
-                        changes.push("system-prompt".to_string());
-                    }
-                    if let Some(ref spec) = cfg.consent_spec
-                        && consent_mode.is_some()
-                    {
-                        changes.push(format!("consent={spec}"));
-                    }
+                    db.update_settings(target_id, new_prompt)?;
+                    changes.push("system-prompt".to_string());
                 }
 
                 if let Some(ref cwd) = cfg.cwd_spec {
@@ -1073,7 +1047,6 @@ impl KjDispatcher {
             "label": row.label,
             "provider": row.provider,
             "model": row.model,
-            "consent_mode": format!("{:?}", row.consent_mode),
             "context_state": format!("{:?}", row.context_state),
             "context_type": row.context_type,
             // Advisory: the registering client's self-reported hostname
@@ -1515,7 +1488,7 @@ impl KjDispatcher {
         // "context_type is an rc bundle of features".
 
         // Validate + resolve the rest before any mutation so a typo'd
-        // --model/--cast/--consent/--env can't leave an orphan context behind.
+        // --model/--cast/--env can't leave an orphan context behind.
         let (resolved_model, resolved_cast) = match self.resolve_context_config(&cfg).await {
             Ok(r) => r,
             Err(e) => return KjResult::Err(format!("kj context create: {e}")),
@@ -1580,7 +1553,6 @@ impl KjDispatcher {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type,
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1616,7 +1588,7 @@ impl KjDispatcher {
             }
         }
 
-        // Apply settable config (model, cast, system-prompt, consent, cwd,
+        // Apply settable config (model, cast, system-prompt, cwd,
         // env) now that the row and drift handle exist. Validated above;
         // only DB I/O errors surface here.
         let config_changes = match self
@@ -1839,7 +1811,6 @@ impl KjDispatcher {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1932,7 +1903,7 @@ impl KjDispatcher {
         Err(format!("only the context's lineage root, its effective reviewer, or its director may {action}"))
     }
 
-    /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--consent mode] [--cwd path] [--env KEY=VALUE] [--type t]`
+    /// `kj context set <ctx> [--model p/m] [--cast label] [--system-prompt text] [--cwd path] [--env KEY=VALUE] [--type t]`
     async fn context_set(
         &self,
         target_arg: Option<&str>,
@@ -2771,7 +2742,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::kj::KjResult;
     use crate::kj::test_helpers::*;
-    use kaijutsu_types::{ConsentMode, ContextId, ContextState, EdgeKind, PrincipalId};
+    use kaijutsu_types::{ContextId, ContextState, EdgeKind, PrincipalId};
 
     fn s(v: &str) -> String {
         v.to_string()
@@ -3644,6 +3615,28 @@ mod tests {
         assert!(help.contains("loopback literal"), "{help}");
     }
 
+    /// `--consent` is retired: the turn loop's only reader of consent mode
+    /// (the iteration cap) is gone, and nothing else ever branched on it.
+    /// `kj context set` must refuse the flag as unknown clap input, not
+    /// silently accept and discard it.
+    #[tokio::test]
+    async fn context_set_rejects_the_retired_consent_flag() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("consent-gone"), None, principal);
+        let c = caller_with_context(ctx);
+        let result = d
+            .dispatch(&[s("context"), s("set"), s("."), s("--consent"), s("autonomous")], &c)
+            .await;
+        assert!(!result.is_ok(), "{}", result.message());
+        assert!(
+            result.message().to_lowercase().contains("unexpected argument")
+                || result.message().contains("--consent"),
+            "expected an unknown-argument refusal, got: {}",
+            result.message()
+        );
+    }
+
     /// `kj context info` shows the egress list — an explicit "none" when
     /// empty, then the granted hosts after `--egress-allow`. The caller
     /// must be the context's lineage root to grant it, so this runs as
@@ -3714,7 +3707,7 @@ mod tests {
         db.update_context_review_assignment(seat, Some(banto), Some(judge), Some(amy)).unwrap();
         db.set_character_root_ctx(banto, Some(seat)).unwrap();
         db.update_model(seat, Some("mock"), Some("mock-banto")).unwrap();
-        db.update_settings(seat, Some("seat prompt"), ConsentMode::Autonomous).unwrap();
+        db.update_settings(seat, Some("seat prompt")).unwrap();
         db.set_context_env(seat, "SEAT_VAR", "kept").unwrap();
         db.set_context_env(seat, "ROTATED_FROM", "an-older-seat").unwrap();
         db.upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(s("/tmp/seat")), updated_at: 1 }).unwrap();
@@ -3757,7 +3750,7 @@ mod tests {
         assert_eq!(new.cast_id, before.cast_id);
         assert_eq!((new.played_by, new.reviewer_id, new.director_id), (before.played_by, before.reviewer_id, before.director_id));
         assert_eq!((new.provider.as_deref(), new.model.as_deref()), (Some("mock"), Some("mock-banto")));
-        assert_eq!((new.system_prompt.as_deref(), new.consent_mode), (Some("seat prompt"), ConsentMode::Autonomous));
+        assert_eq!(new.system_prompt.as_deref(), Some("seat prompt"));
         assert_eq!(new.workspace_id, before.workspace_id);
         let env: std::collections::HashMap<_, _> = db.get_context_env(successor).unwrap().into_iter().map(|e| (e.key, e.value)).collect();
         assert_eq!(env.get("SEAT_VAR").map(String::as_str), Some("kept"));
@@ -4122,7 +4115,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: s("default"),
             created_at: 1,
@@ -4173,7 +4165,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: s("default"),
             created_at: 1,

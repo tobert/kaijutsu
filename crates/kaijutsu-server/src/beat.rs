@@ -46,7 +46,7 @@ use kaijutsu_kernel::kernel_db::{
 };
 use kaijutsu_kernel::{ContentStore, Kernel, KjDispatcher};
 use kaijutsu_types::{
-    BlockSnapshot, ConsentMode, ContentType, ContextId, ContextState, DocKind, PrincipalId,
+    BlockSnapshot, ContentType, ContextId, ContextState, DocKind, PrincipalId,
     Tick, TickDelta, TrackId, now_millis,
 };
 
@@ -403,7 +403,6 @@ impl BeatScheduler {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "score".to_string(),
                 created_at: now_millis() as i64,
@@ -3968,7 +3967,7 @@ mod tests {
     ) {
         use kaijutsu_kernel::block_store::shared_block_store_with_db;
         use kaijutsu_kernel::kernel_db::{ContextRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState};
+        use kaijutsu_types::ContextState;
 
         let kernel = Arc::new(Kernel::new_ephemeral("test").await);
         let db: kaijutsu_kernel::block_store::DbHandle =
@@ -3986,7 +3985,6 @@ mod tests {
                     provider: None,
                     model: None,
                     system_prompt: None,
-                    consent_mode: ConsentMode::default(),
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
                     created_at: 0,
@@ -4023,7 +4021,7 @@ mod tests {
         use kaijutsu_kernel::kernel_db::ContextRow;
         use kaijutsu_kernel::vfs::{MemoryBackend, VfsOps};
         use kaijutsu_kernel::KjDispatcher;
-        use kaijutsu_types::{ConsentMode, ContextState};
+        use kaijutsu_types::ContextState;
         use std::path::Path;
 
         let kernel = Arc::new(Kernel::new_ephemeral("archived-tick").await);
@@ -4041,7 +4039,6 @@ mod tests {
                     provider: None,
                     model: None,
                     system_prompt: None,
-                    consent_mode: ConsentMode::default(),
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
                     created_at: 0,
@@ -4886,7 +4883,7 @@ mod tests {
     #[tokio::test]
     async fn two_producers_failures_route_to_their_own_conversations() {
         use kaijutsu_kernel::kernel_db::ContextRow;
-        use kaijutsu_types::{ConsentMode, ContextState};
+        use kaijutsu_types::ContextState;
         use kaijutsu_types::BlockKind;
 
         let (kernel, documents) = fresh_kernel_and_docs().await;
@@ -4937,7 +4934,7 @@ mod tests {
             let workspace = db.get_or_create_default_workspace(performer).unwrap();
             db.insert_context_with_document(&ContextRow {
                 context_id: context, label: None, provider: None, model: None, system_prompt: None,
-                consent_mode: ConsentMode::default(), context_state: ContextState::Live,
+                context_state: ContextState::Live,
                 context_type: "musician".into(), created_at: 0, created_by: performer,
                 forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
@@ -5455,7 +5452,7 @@ mod tests {
         // proves "every attached context," not just the one `db_backed_kernel_and_docs`
         // hands back.
         use kaijutsu_kernel::kernel_db::ContextRow;
-        use kaijutsu_types::{ConsentMode, ContextState};
+        use kaijutsu_types::ContextState;
         let ctx_b = ContextId::new();
         {
             let g = db.lock();
@@ -5467,7 +5464,6 @@ mod tests {
                     provider: None,
                     model: None,
                     system_prompt: None,
-                    consent_mode: ConsentMode::default(),
                     context_state: ContextState::Live,
                     context_type: "musician".to_string(),
                     created_at: 0,

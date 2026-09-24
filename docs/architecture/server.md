@@ -139,8 +139,10 @@ approval preparation and execution and joins settlement too. See
 `process_llm_stream` is the agentic loop: acquire the per-context
 conversation lock, read hydration policy (full vs windowed), hydrate the mailbox
 (`catch_up` or `rehydrate_windowed`), resolve image blocks from CAS, then loop
-(consent-capped: `COLLABORATIVE_MAX_ITERATIONS` = 50 / `AUTONOMOUS_MAX_ITERATIONS`
-= 100). Each iteration builds `BuildOpts` with cache breakpoints, calls
+until the model ends its turn, the turn is cancelled, or the output-ceiling
+continuation budget is reached — no per-turn count of tool rounds (see
+`docs/issues.md`, "Per-cast turn token budget" for the planned replacement).
+Each iteration builds `BuildOpts` with cache breakpoints, calls
 `provider.stream` with exponential backoff, and processes `StreamEvent`s under
 a two-layer timeout (per-chunk idle + total wall-clock). Tokens write directly
 to the block store; clients observe via `BlockFlow`. Tool calls run

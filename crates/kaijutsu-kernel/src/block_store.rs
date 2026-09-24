@@ -5853,7 +5853,7 @@ mod tests {
     #[test]
     fn journal_op_stamps_context_last_activity_at() {
         use crate::kernel_db::{ContextRow, KernelDb};
-        use kaijutsu_types::{ConsentMode, ContextState};
+        use kaijutsu_types::ContextState;
 
         let db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let creator = PrincipalId::system();
@@ -5875,7 +5875,6 @@ mod tests {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
                 created_at,
@@ -7399,7 +7398,7 @@ mod tests {
     #[test]
     fn load_from_db_keeps_a_contentless_file_document_a_context_depends_on() {
         use crate::kernel_db::ContextRow;
-        use kaijutsu_types::{ConsentMode, ContextState, now_millis};
+        use kaijutsu_types::{ContextState, now_millis};
 
         let (db, ws_id, _store) = store_with_db();
         let ctx = insert_contentless_doc(&db, ws_id, DocumentKind::File);
@@ -7410,7 +7409,6 @@ mod tests {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: now_millis() as i64,

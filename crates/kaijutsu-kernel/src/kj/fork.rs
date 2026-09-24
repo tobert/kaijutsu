@@ -15,7 +15,7 @@
 
 use clap::Parser;
 use kaijutsu_types::{
-    ConsentMode, ContentType, ContextId, ContextState, EdgeKind, ForkKind, PrincipalId,
+    ContentType, ContextId, ContextState, EdgeKind, ForkKind, PrincipalId,
 };
 
 use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
@@ -577,7 +577,6 @@ impl KjDispatcher {
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: if staging {
                     ContextState::Staging
                 } else {
@@ -959,7 +958,6 @@ impl KjDispatcher {
                 provider: resolved.provider.clone(),
                 model: resolved.model.clone(),
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: if staging { ContextState::Staging } else { ContextState::Live },
                 context_type: source_row.context_type.clone(),
                 created_at: kaijutsu_types::now_millis() as i64,
@@ -1138,12 +1136,8 @@ impl KjDispatcher {
             db.update_cast(context_id, Some(cast_id))
                 .map_err(|e| e.to_string())?;
         }
-        db.update_settings(
-            context_id,
-            preset.system_prompt.as_deref(),
-            preset.consent_mode,
-        )
-        .map_err(|e| e.to_string())?;
+        db.update_settings(context_id, preset.system_prompt.as_deref())
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }

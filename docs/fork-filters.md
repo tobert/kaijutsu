@@ -146,8 +146,8 @@ routing, and velocity curves in one gesture, and the synth stays the same
 machine. `kj fork --preset foo` recalls the patch; the selection algebra
 and the inheritance manifest never change.
 
-This **extends the existing preset concept** (cast / system_prompt /
-consent_mode) rather than adding a parallel one: today's presets are
+This **extends the existing preset concept** (cast / system_prompt)
+rather than adding a parallel one: today's presets are
 patches that only move the model knobs; `window` is a patch that only
 moves filter knobs; a future `player` patch moves both (spawn-shaped
 filter + a cast) in one recall.

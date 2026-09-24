@@ -1325,7 +1325,6 @@ pub fn ensure_drift_queue_context(
                     provider: None,
                     model: None,
                     system_prompt: None,
-                    consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                     context_state: ContextState::Live,
                     context_type: "default".to_string(),
                     created_at: now,

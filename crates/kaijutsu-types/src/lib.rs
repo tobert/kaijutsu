@@ -108,7 +108,7 @@ pub const SSH_SHARE_SUBSYSTEM: &str = "kaijutsu-share";
 /// Starts at 1. 0 is reserved as the "old client that predates this field"
 /// sentinel (capnp's struct default for an unset `UInt32`) and must never be
 /// a real version.
-pub const WIRE_VERSION: u32 = 2;
+pub const WIRE_VERSION: u32 = 3;
 
 /// Build the human-facing diagnosis for a `bindKernel` [`WIRE_VERSION`]
 /// mismatch — names both sides and points the remedy at whichever one is
@@ -159,7 +159,7 @@ pub use error_block::IntoErrorPayload;
 pub use summary::summarize_thinking;
 pub use context::{Context, RING_SLOTS, fork_lineage};
 pub use dag::ConversationDAG;
-pub use enums::{ConsentMode, ContextState, DocKind, EdgeKind, ForkKind};
+pub use enums::{ContextState, DocKind, EdgeKind, ForkKind};
 pub use ids::{
     BackendId, CastId, ContextId, KernelId, PresetId, PrincipalId, SessionId, TurnId, WorkspaceId,
 };

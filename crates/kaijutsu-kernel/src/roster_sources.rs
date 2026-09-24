@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use crate::kernel_db::{ContextRow, KernelDb};
     use crate::peers::PeerConfig;
-    use kaijutsu_types::{ConsentMode, ContextId, ContextState, PrincipalId};
+    use kaijutsu_types::{ContextId, ContextState, PrincipalId};
 
     fn peer(nick: &str, instance: &str, principal: Option<PrincipalId>) -> PeerInfo {
         PeerInfo::from_config(PeerConfig {
@@ -235,7 +235,6 @@ mod tests {
             provider: None,
             model: None,
             system_prompt: None,
-            consent_mode: ConsentMode::default(),
             context_state: ContextState::Live,
             context_type: "default".to_string(),
             created_at: now_millis() as i64,

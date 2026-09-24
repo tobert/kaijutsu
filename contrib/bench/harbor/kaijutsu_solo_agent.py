@@ -43,7 +43,6 @@ GATE_ENV = "KAIJUTSU_ACP_GATE"
 MODEL_ENV = "KAIJUTSU_ACP_MODEL"
 BACKEND_ENV = "KAIJUTSU_ACP_BACKEND"
 RUST_LOG_ENV = "KAIJUTSU_ACP_RUST_LOG"
-CONSENT_ENV = "KAIJUTSU_ACP_CONSENT"
 MAX_TOKENS_ENV = "KAIJUTSU_ACP_MAX_TOKENS"
 RC_OVERLAY_ENV = "KAIJUTSU_ACP_RC_OVERLAY"
 
@@ -54,9 +53,6 @@ DEFAULT_RUST_LOG = "info"
 
 #: Backends `kaijutsu-solo-acp --backend-kind` accepts in a release build.
 SOLO_BACKEND_KINDS = ("anthropic", "deepseek", "openai")
-
-#: Consent modes `kaijutsu-solo-acp --consent` accepts.
-SOLO_CONSENT_MODES = ("collaborative", "autonomous")
 
 #: `gate_config_path` value that means "ship no gate policy", on purpose.
 GATE_NONE = "none"
@@ -209,15 +205,6 @@ class KaijutsuSoloOptions(AcpOptions):
             "lines disappear and a run keeps no token record at all."
         ),
     )
-    consent: str | None = Field(
-        default=None,
-        description=(
-            "Consent mode passed to --consent, one of "
-            f"{', '.join(SOLO_CONSENT_MODES)}. Default: ${CONSENT_ENV}, else "
-            "left off the command line entirely, which keeps the binary's own "
-            "default (collaborative)."
-        ),
-    )
     max_tokens: int | None = Field(
         default=None,
         description=(
@@ -260,7 +247,6 @@ class KaijutsuSoloAcp(AcpAgent):
         solo_model: str | None = None,
         solo_args: list[str] | str | None = None,
         rust_log: str | None = None,
-        consent: str | None = None,
         max_tokens: int | str | None = None,
         rc_overlay: str | None = None,
         **kwargs: Any,
@@ -329,17 +315,9 @@ class KaijutsuSoloAcp(AcpAgent):
         self._rust_log = rust_log or os.environ.get(RUST_LOG_ENV) or DEFAULT_RUST_LOG
         self._solo_args = _split_args(solo_args)
 
-        # Both are left off the command line when unset, which is what keeps
-        # the binary's own defaults (collaborative consent, the factory
-        # token ceiling) in effect -- this module changes no default of its
-        # own, only what it passes through.
-        self._consent = consent if consent is not None else os.environ.get(CONSENT_ENV)
-        if self._consent is not None and self._consent not in SOLO_CONSENT_MODES:
-            raise ValueError(
-                f"consent {self._consent!r} is not one kaijutsu-solo-acp knows. "
-                f"Known: {', '.join(SOLO_CONSENT_MODES)}."
-            )
-
+        # Left off the command line when unset, which is what keeps the
+        # binary's own default (the factory token ceiling) in effect -- this
+        # module changes no default of its own, only what it passes through.
         max_tokens_raw = max_tokens if max_tokens is not None else os.environ.get(MAX_TOKENS_ENV)
         if max_tokens_raw is None:
             self._max_tokens: int | None = None
@@ -391,7 +369,6 @@ class KaijutsuSoloAcp(AcpAgent):
             solo_model=self._solo_model,
             solo_args=self._solo_args,
             rust_log=self._rust_log,
-            consent=self._consent,
             max_tokens=self._max_tokens,
             rc_overlay=str(self._rc_overlay) if self._rc_overlay is not None else None,
             **kwargs,
@@ -462,8 +439,6 @@ class KaijutsuSoloAcp(AcpAgent):
         ]
         if self._local_gate is not None:
             args += ["--gate-config", self.REMOTE_GATE.as_posix()]
-        if self._consent is not None:
-            args += ["--consent", self._consent]
         if self._max_tokens is not None:
             args += ["--max-tokens", str(self._max_tokens)]
         if self._rc_overlay is not None:
@@ -577,7 +552,6 @@ class KaijutsuSoloAcp(AcpAgent):
                 ),
                 "rust_log": self._rust_log,
                 "extra_args": self._solo_args,
-                "consent": self._consent,
                 "max_tokens": self._max_tokens,
             },
             "environment": {

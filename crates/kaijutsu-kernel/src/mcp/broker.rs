@@ -11200,7 +11200,7 @@ mod tests {
     #[tokio::test]
     async fn binding_checked_surfaces_a_real_db_failure() {
         use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
-        use kaijutsu_types::{now_millis, ConsentMode, ContextState, DocKind};
+        use kaijutsu_types::{now_millis, ContextState, DocKind};
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ctx = ContextId::new();
@@ -11226,7 +11226,6 @@ mod tests {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: now_millis() as i64,
@@ -11285,7 +11284,7 @@ mod tests {
     /// setup exactly.
     async fn broker_with_poisoned_binding_row() -> (Arc<Broker>, ContextId) {
         use crate::kernel_db::{ContextRow, DocumentRow, KernelDb};
-        use kaijutsu_types::{now_millis, ConsentMode, ContextState, DocKind};
+        use kaijutsu_types::{now_millis, ContextState, DocKind};
 
         let kernel_db = Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()));
         let ctx = ContextId::new();
@@ -11309,7 +11308,6 @@ mod tests {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: now_millis() as i64,

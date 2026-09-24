@@ -15,7 +15,7 @@
 //! `player` patch = base=spawn + a local model). Recall (slice 3c) reads
 //! `base` to construct the `IntervalSet`.
 
-use kaijutsu_types::{ConsentMode, PresetId, PrincipalId};
+use kaijutsu_types::{PresetId, PrincipalId};
 
 use crate::kernel_db::{KernelDb, KernelDbResult, PresetArg, PresetRow};
 
@@ -96,7 +96,6 @@ fn insert_factory_preset(
         description: Some(fp.description.to_string()),
         cast_id: None,
         system_prompt: None,
-        consent_mode: ConsentMode::Collaborative,
         created_at: kaijutsu_types::now_millis() as i64,
         created_by,
     })?;

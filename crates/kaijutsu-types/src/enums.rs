@@ -77,37 +77,6 @@ impl fmt::Display for EdgeKind {
 }
 
 // ============================================================================
-// ConsentMode — collaborative vs autonomous
-// ============================================================================
-
-/// Consent mode determines how collaborative vs autonomous the kernel is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, EnumString)]
-#[serde(rename_all = "lowercase")]
-#[strum(ascii_case_insensitive)]
-pub enum ConsentMode {
-    /// Human approval required for mutations.
-    #[default]
-    Collaborative,
-    /// Agent can act autonomously.
-    Autonomous,
-}
-
-impl ConsentMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Collaborative => "collaborative",
-            Self::Autonomous => "autonomous",
-        }
-    }
-}
-
-impl fmt::Display for ConsentMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-// ============================================================================
 // ContextState — lifecycle phase of a context
 // ============================================================================
 
@@ -328,58 +297,6 @@ mod tests {
             let bytes = crate::codec::encode(&kind).unwrap();
             let parsed: EdgeKind = crate::codec::decode(&bytes).unwrap();
             assert_eq!(kind, parsed);
-        }
-    }
-
-    // ── ConsentMode ─────────────────────────────────────────────────────
-
-    #[test]
-    fn consent_mode_default() {
-        assert_eq!(ConsentMode::default(), ConsentMode::Collaborative);
-    }
-
-    #[test]
-    fn consent_mode_as_str_roundtrip() {
-        for mode in [ConsentMode::Collaborative, ConsentMode::Autonomous] {
-            let s = mode.as_str();
-            let parsed = ConsentMode::from_str(s).unwrap();
-            assert_eq!(mode, parsed);
-        }
-    }
-
-    #[test]
-    fn consent_mode_case_insensitive() {
-        assert_eq!(
-            ConsentMode::from_str("COLLABORATIVE").unwrap(),
-            ConsentMode::Collaborative
-        );
-        assert_eq!(
-            ConsentMode::from_str("Autonomous").unwrap(),
-            ConsentMode::Autonomous
-        );
-    }
-
-    #[test]
-    fn consent_mode_display() {
-        assert_eq!(format!("{}", ConsentMode::Collaborative), "collaborative");
-        assert_eq!(format!("{}", ConsentMode::Autonomous), "autonomous");
-    }
-
-    #[test]
-    fn consent_mode_serde_roundtrip() {
-        let mode = ConsentMode::Autonomous;
-        let json = serde_json::to_string(&mode).unwrap();
-        assert_eq!(json, "\"autonomous\"");
-        let parsed: ConsentMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(mode, parsed);
-    }
-
-    #[test]
-    fn consent_mode_cbor_roundtrip() {
-        for mode in [ConsentMode::Collaborative, ConsentMode::Autonomous] {
-            let bytes = crate::codec::encode(&mode).unwrap();
-            let parsed: ConsentMode = crate::codec::decode(&bytes).unwrap();
-            assert_eq!(mode, parsed);
         }
     }
 

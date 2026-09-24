@@ -12,7 +12,6 @@ use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState, PrincipalId, SessionId};
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
-use crate::control::ConsentMode;
 use crate::kernel_db::{CharacterRow, ContextRow};
 
 /// The rc bundle a root context runs.
@@ -349,7 +348,6 @@ impl KjDispatcher {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: ConsentMode::Collaborative,
                 context_state: ContextState::Live,
                 context_type: ROOT_CONTEXT_TYPE.to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,

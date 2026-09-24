@@ -1599,7 +1599,6 @@ pub(crate) mod test_helpers {
                 provider: None,
                 model: None,
                 system_prompt: None,
-                consent_mode: kaijutsu_types::ConsentMode::Collaborative,
                 context_state: kaijutsu_types::ContextState::Live,
                 context_type: "default".to_string(),
                 created_at: kaijutsu_types::now_millis() as i64,

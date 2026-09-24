@@ -180,19 +180,6 @@ Preserve welcome/offline sources and geometry/glyph caches. Reuse collapse
 regressions and check streaming plus context switching through the GUI runner
 and BRP. Keep this separate from the shared recovery migration.
 
-### Consent setting ownership
-
-`kj context set --consent` writes `ContextRow.consent_mode`, which `kj
-context` display and round-trip paths still read. The model loop's own
-reader of the kernel-wide `Kernel::consent_mode()` value is gone — it backed
-the agentic-loop iteration cap, which is retired (see "Per-cast turn token
-budget" below). `Kernel::consent_mode()`, its setter, and the kernel-wide
-`RwLock<ConsentMode>` field now have no workspace caller. Decide whether to
-remove them, or give the kernel-wide value a real reader, before either
-option is safe to skip on. Check CLI help, schema/persistence migration, and
-rejection of any retired option before removing `ContextRow.consent_mode`
-itself — that field still has live readers.
-
 ### Per-cast turn token budget
 
 The agentic loop's per-turn iteration cap (50 collaborative / 100 autonomous)

@@ -6,7 +6,6 @@
 //! A kernel:
 //! - Owns `/` in its VFS (virtual filesystem)
 //! - Can mount worktrees, repos, other kernels at paths like `/mnt/project`
-//! - Has a consent mode (collaborative vs autonomous)
 //! - Holds durable contexts and their block logs
 //! - Has a DriftRouter for cross-context communication
 
@@ -19,7 +18,6 @@ pub mod block_tools;
 pub mod cc_inbox;
 pub mod image;
 pub mod config_seed;
-pub mod control;
 pub mod continuation;
 pub mod drift;
 pub mod editor;
@@ -88,7 +86,6 @@ pub use block_store::{
     BlockStore, BlockStoreError, BlockStoreResult, DbHandle, SharedBlockStore, shared_block_store,
 };
 
-pub use control::ConsentMode;
 // Re-exported because `KernelDb::undelivered_answers` hands these out and a
 // caller outside this crate has to be able to read the answer.
 pub use approval_ledger::ask::UndeliveredAnswer;

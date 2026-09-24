@@ -10,7 +10,7 @@ use super::{clap_help_for, KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "preset",
-    about = "Manage model/consent presets",
+    about = "Manage model presets",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -40,9 +40,6 @@ enum PresetCommand {
         /// System prompt text
         #[arg(long = "system-prompt")]
         system_prompt: Option<String>,
-        /// Consent mode (e.g. collaborative, autonomous)
-        #[arg(long)]
-        consent: Option<String>,
         /// Description text
         #[arg(long, alias = "description")]
         desc: Option<String>,
@@ -94,9 +91,8 @@ impl KjDispatcher {
                 label,
                 cast,
                 system_prompt,
-                consent,
                 desc,
-            } => self.preset_save(&label, cast, system_prompt, consent, desc, caller),
+            } => self.preset_save(&label, cast, system_prompt, desc, caller),
             PresetCommand::Remove { label } => self.preset_remove(&label),
             PresetCommand::Reseed => self.preset_reseed(caller),
         }
@@ -161,7 +157,6 @@ impl KjDispatcher {
                     .map(|c| c.label)
                     .unwrap_or_else(|| "(no cast)".to_string());
                 lines.push(format!("Cast: {cast}"));
-                lines.push(format!("Consent: {:?}", p.consent_mode));
                 if let Some(ref sp) = p.system_prompt {
                     let preview = if sp.len() > 80 {
                         format!("{}...", &sp[..77])
@@ -177,13 +172,12 @@ impl KjDispatcher {
         }
     }
 
-    /// `kj preset save <label> [--cast label] [--system-prompt text] [--consent mode] [--desc text]`
+    /// `kj preset save <label> [--cast label] [--system-prompt text] [--desc text]`
     fn preset_save(
         &self,
         label: &str,
         cast_spec: Option<String>,
         system_prompt: Option<String>,
-        consent_spec: Option<String>,
         desc: Option<String>,
         caller: &KjCaller,
     ) -> KjResult {
@@ -193,16 +187,6 @@ impl KjDispatcher {
                  use `kj preset reseed` to restore it"
             ));
         }
-
-        let consent_mode = match consent_spec {
-            Some(ref spec) => match spec.parse::<kaijutsu_types::ConsentMode>() {
-                Ok(cm) => cm,
-                Err(_) => {
-                    return KjResult::Err(format!("kj preset save: invalid consent mode '{spec}'"));
-                }
-            },
-            None => kaijutsu_types::ConsentMode::Collaborative,
-        };
 
         let db = self.kernel_db().lock();
 
@@ -240,7 +224,6 @@ impl KjDispatcher {
                     description: desc.or(existing.description),
                     cast_id: cast_id.or(existing.cast_id),
                     system_prompt: system_prompt.or(existing.system_prompt),
-                    consent_mode,
                     created_at: existing.created_at,
                     created_by: existing.created_by,
                 };
@@ -256,7 +239,6 @@ impl KjDispatcher {
                     description: desc,
                     cast_id,
                     system_prompt,
-                    consent_mode,
                     created_at: kaijutsu_types::now_millis() as i64,
                     created_by: caller.principal_id,
                 };

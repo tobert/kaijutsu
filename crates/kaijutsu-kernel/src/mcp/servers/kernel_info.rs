@@ -130,7 +130,7 @@ mod tests {
     use crate::drift::shared_drift_router;
     use crate::kernel_db::{ContextRow, DocumentRow};
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
-    use kaijutsu_types::{ConsentMode, ContextId, ContextState, DocKind, PrincipalId};
+    use kaijutsu_types::{ContextId, ContextState, DocKind, PrincipalId};
 
     fn ctx_row(id: ContextId, context_type: &str) -> ContextRow {
         ContextRow {
@@ -139,7 +139,6 @@ mod tests {
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-4-6".to_string()),
             system_prompt: None,
-            consent_mode: ConsentMode::Collaborative,
             context_state: ContextState::Live,
             context_type: context_type.to_string(),
             created_at: kaijutsu_types::now_millis() as i64,

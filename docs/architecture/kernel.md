@@ -9,7 +9,7 @@ The kernel owns context data, model interactions, the VFS, and tools. It does
 
 ---
 
-## `Kernel` (`src/kernel.rs:41`)
+## `Kernel` (`src/kernel.rs:37`)
 
 `Kernel` owns the shared `BlockStore`, `KernelDb` handle, VFS mount table,
 and `FileDocumentCache`. Constructors build these services together; callers
@@ -17,7 +17,7 @@ use `blocks()`, `kernel_db()`, `vfs()`, and `file_cache()` to reach the same
 instances. `new` and `with_flows` share initialization.
 
 Other owners include the model registry, broker, peer registry, drift router,
-CAS, timeout and consent policies, timelines, and audio registries. Four flow
+CAS, timeout policy, timelines, and audio registries. Four flow
 buses carry block, turn, editor, and ledger events. `ShellOperationRegistry`
 owns durable operation receipts and the per-context kaish job managers.
 

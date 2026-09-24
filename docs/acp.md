@@ -145,7 +145,7 @@ Keep the three ACP affordances distinct:
 - **modes** are persistent operating stances, naturally backed by casts,
   presets, or context type;
 - **configuration options** are selectable session settings such as model or
-  consent mode;
+  cast;
 - **available commands** are one-shot kj actions.
 
 Do not advertise modes or configuration until their set methods and update
@@ -182,7 +182,7 @@ Identity is ergonomic routing and presence, not a security boundary.
 Not done: nothing writes `/config/client/<id>/cast.toml` for an operator yet —
 it is a plain file (config is host files now, `docs/config-namespace.md`),
 so today that means `kj editor` or the file tools, by hand, per client.
-Client-identity-driven **presets** (system prompt + consent mode alongside
+Client-identity-driven **presets** (system prompt alongside
 the cast) are also not built — `kj context set` has no `--preset` flag, only
 `--cast`; a preset applies today only at fork/apply time
 (`crates/kaijutsu-kernel/src/kj/preset.rs`). And there is still no
@@ -232,7 +232,7 @@ a Toad flight before the next one needs to start.
 3. **Client identity and presence — shipped.** `clientInfo` is retained,
    `acp/<name>` attaches as a peer, and `session/new` on a fresh context now
    feeds the `/config/client` cascade for cast selection (see "Client identity
-   and parity" above). Not done: a full preset (system prompt + consent, not
+   and parity" above). Not done: a full preset (system prompt, not
    just cast), and the seed data itself — nobody has written a
    `/config/client/<id>/cast.toml` for toad/Zed/Happy yet, that's an operator
    action.

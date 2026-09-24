@@ -28,7 +28,7 @@ pub use actor::{
     UnansweredCommands, spawn_actor,
 };
 pub use rpc::{
-    AuthorBlock, Completion, CompletionKind, ConsentMode, ContextCluster, ContextInfo, ContextMembership,
+    AuthorBlock, Completion, CompletionKind, ContextCluster, ContextInfo, ContextMembership,
     EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, MountSpec, PeerInfo, PresetInfo,
     RpcClient, RpcError, ShellDryRunOutcome, ShellDryRunReport, ShellSubmission, ShellValue, SimilarContext,
