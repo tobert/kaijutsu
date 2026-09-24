@@ -216,7 +216,9 @@ Shell work uses `foreground: false` by default. Its stable receipt names the
 operation and any ask; completion arrives as a separate fact.
 
 `kj wait` observes an operation, ask, or kaish job. It does not control that
-work or resume a model. `kj handoff signoff <note>` closes the continuation
+work or resume a model. `kj interrupt <target>` stops a context's accepted
+turn: soft by default, or `--immediate` to cancel the model stream and its
+tool calls right away. `kj handoff signoff <note>` closes the continuation
 window immediately. Otherwise, the window lasts 30 minutes from the last
 actual provider inference request, including one made by a tool-loop iteration;
 a yield does not extend it. The policy controls automatic model resumption and

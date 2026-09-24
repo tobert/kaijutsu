@@ -37,6 +37,7 @@ pub mod gate;
 pub mod handoff;
 pub mod hook;
 pub mod hook_gate;
+pub mod interrupt;
 pub mod kaish;
 pub mod mcp;
 pub mod midi;
@@ -694,6 +695,7 @@ impl KjDispatcher {
             "drive" => self.dispatch_drive(&argv[1..], caller).await,
             "system" => self.dispatch_system(&argv[1..], caller).await,
             "wait" => self.dispatch_wait(&argv[1..], caller).await,
+            "interrupt" => self.dispatch_interrupt(&argv[1..], caller).await,
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),

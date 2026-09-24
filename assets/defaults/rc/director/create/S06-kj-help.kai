@@ -20,6 +20,7 @@ h_stage="$(kj stage --help || true)"
 h_fork="$(kj fork --help || true)"
 h_drive="$(kj drive --help || true)"
 h_wait="$(kj wait --help || true)"
+h_interrupt="$(kj interrupt --help || true)"
 h_drift="$(kj drift --help || true)"
 h_ledger="$(kj ledger --help || true)"
 h_cast="$(kj cast --help || true)"
@@ -54,6 +55,9 @@ $h_drive
 
 ## kj wait
 $h_wait
+
+## kj interrupt
+$h_interrupt
 
 ## kj drift
 $h_drift
