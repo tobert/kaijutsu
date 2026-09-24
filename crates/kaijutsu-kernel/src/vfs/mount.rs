@@ -193,6 +193,36 @@ impl MountTable {
             .collect()
     }
 
+    /// Sync mount listing, mirroring [`Self::resolve_real_path_sync`]'s
+    /// `try_read` seam: a kaish `KernelBackend::mounts()` implementation is a
+    /// sync trait method (it can't ride the async [`Self::list_mounts`]), and
+    /// a tool that computes a discovery ceiling from the mount topology —
+    /// `kaish-tools-git`'s `resolve_repo_paths`, which pairs this with
+    /// [`Self::resolve_real_path_sync`] to find the mount containing a path
+    /// and that mount's real root — needs the *real* mount list, not a
+    /// synthetic stand-in. Same lock-contention reasoning as
+    /// `resolve_real_path_sync`: the table is frozen after startup mounts, so
+    /// a write-held lock here is effectively impossible, and an empty result
+    /// under contention is the honest answer, not a silent stall.
+    pub fn list_mounts_sync(&self) -> Vec<MountInfo> {
+        let mounts = match self.mounts.try_read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::warn!(
+                    "list_mounts_sync: mount table write-locked; reporting no mounts this call"
+                );
+                return Vec::new();
+            }
+        };
+        mounts
+            .iter()
+            .map(|(path, fs)| MountInfo {
+                path: path.clone(),
+                read_only: fs.read_only(),
+            })
+            .collect()
+    }
+
     /// Normalize a mount path: ensure it starts with `/` and has no trailing slash.
     fn normalize_mount_path(path: PathBuf) -> PathBuf {
         let s = path.to_string_lossy();

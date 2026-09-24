@@ -630,7 +630,18 @@ impl KernelBackend for MountBackend {
     }
 
     fn mounts(&self) -> Vec<kaish_kernel::vfs::MountInfo> {
-        self.docs_tools.mounts()
+        // Report the real mount table. `kaish-tools-git` pairs each mount's
+        // path with `resolve_real_path` to find the mount containing a
+        // repository and use its real root as the discovery ceiling.
+        self.mount_table
+            .list_mounts_sync()
+            .into_iter()
+            .map(|mount| kaish_kernel::vfs::MountInfo {
+                path: mount.path,
+                read_only: mount.read_only,
+                resident_bytes: None,
+            })
+            .collect()
     }
 
     fn resolve_real_path(&self, path: &Path) -> Option<PathBuf> {

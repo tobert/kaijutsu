@@ -46,6 +46,7 @@ pub mod context_shell;
 pub mod curl_tool;
 pub mod docs_filesystem;
 pub mod embedded_kaish;
+pub mod git_tool;
 pub mod kaish_backend;
 pub mod kj_builtin;
 pub mod ps_builtin;

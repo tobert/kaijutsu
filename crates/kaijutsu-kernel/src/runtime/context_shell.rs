@@ -191,6 +191,13 @@ impl EmbeddedKaish {
                     &egress_hosts,
                     classifier_host.as_deref(),
                 ));
+                // Read-only `git` (`runtime/git_tool.rs`): registered only
+                // here, so only a `ShellPolicy::ReadOnly` shell ever sees it.
+                // The writable shell keeps host `git` reachable through
+                // `ExternalExec::Allow` instead of this builtin.
+                if read_only {
+                    tools.register(crate::runtime::git_tool::git_tool());
+                }
             };
 
         let kaish = if read_only {
@@ -1201,5 +1208,179 @@ mod tests {
         );
         d.set_semantic_index(None);
         assert!(d.semantic_index().is_none());
+    }
+
+    // ── read-only `git` (runtime/git_tool.rs) ──
+    //
+    // A `ShellPolicy::ReadOnly` shell never grants host exec, so an
+    // unregistered `git` reports kaish's generic "external commands are
+    // disabled" (exit 127) and a director review's `git status`/`git diff`
+    // becomes an approval ask instead of an inspection. These pin the
+    // registered builtin's actual behavior: its own refusal outside a
+    // repository, and a real repository read end to end.
+
+    /// Build a real repository with a dirty working tree using the HOST
+    /// `git` binary directly (`std::process::Command`), OUTSIDE the kaish
+    /// shell under test. CLAUDE.md: "Tests should deny host subprocess
+    /// execution unless they test subprocess behavior" — this is fixture
+    /// setup, not the shell's own execution path; the read-only
+    /// `EmbeddedKaish` built from it still has `ExternalExec::Deny` and can
+    /// never itself spawn a process. The host `git` binary building the
+    /// fixture is a separate concern from the in-process, no-exec
+    /// `kaish-tools-git` tool this test exercises.
+    fn git_fixture_repo_with_a_modified_file() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("host git must be on PATH to build the test fixture");
+            assert!(status.success(), "git {args:?} failed to set up the fixture");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "kaijutsu test fixture"]);
+        std::fs::write(dir.path().join("tracked.txt"), "original\n").unwrap();
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-q", "-m", "initial"]);
+        // Dirty the working tree after the commit so `git status` has
+        // something to report.
+        std::fs::write(dir.path().join("tracked.txt"), "modified\n").unwrap();
+        dir
+    }
+
+    /// Materialize a `ShellPolicy::ReadOnly` shell rooted at `cwd`, over a
+    /// real (read-only-mounted) host filesystem — the shape a director's
+    /// review shell runs in, minus the full broker wiring this doesn't need
+    /// (git construction never reaches `binding_checked`: `ContextShellInputs::load`
+    /// short-circuits `external_exec` to `Deny` for `read_only`, so no
+    /// context binding row is required).
+    async fn read_only_shell_rooted_at(
+        d: &Arc<KjDispatcher>,
+        name: &str,
+        cwd: &std::path::Path,
+    ) -> EmbeddedKaish {
+        d.kernel().mount("/", crate::vfs::backends::LocalBackend::read_only("/")).await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(d, Some(name), None, principal);
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: ctx, cwd: Some(cwd.to_string_lossy().into_owned()), updated_at: 0,
+        }).unwrap();
+        EmbeddedKaish::for_context(d, name, ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::ReadOnly, ShellCwd::Context, None, Arc::new(NoopBlockSource))
+            .await
+            .expect("materialize read-only context shell")
+    }
+
+    /// In a directory that is not a repository, `git info` must return the
+    /// builtin's own "no repository" refusal (exit 1) — not kaish's generic
+    /// "external commands are disabled" (exit 127), which is what a read-only
+    /// shell reports for any unregistered command today. This is the RED
+    /// case: it fails until the `git` tool is registered for `ShellPolicy::ReadOnly`.
+    #[tokio::test]
+    async fn read_only_shell_git_info_outside_a_repo_reports_no_repository() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let kaish = read_only_shell_rooted_at(&d, "git-no-repo", not_a_repo.path()).await;
+
+        let result = kaish
+            .execute_with_options("git info", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(!result.ok(), "git info outside a repository must fail: {result:?}");
+        assert_eq!(
+            result.code, 1,
+            "must be the git tool's own NotARepository refusal (exit 1), not kaish's \
+             external-command-disabled refusal (exit 127): {result:?}"
+        );
+        assert!(
+            result.err.contains("no repository"),
+            "must name the git-level refusal, not \"external commands are disabled\": {}",
+            result.err
+        );
+        assert!(
+            !result.err.contains("external commands are disabled"),
+            "an unregistered command's refusal must not leak through: {}",
+            result.err
+        );
+    }
+
+    /// A read-only shell whose cwd is a real git repository runs `git status`
+    /// successfully and reports the modified file — the builtin actually
+    /// works end to end (schema, dispatch, real host-path discovery through
+    /// `resolve_real_path`), not just "refuses cleanly outside a repo".
+    #[tokio::test]
+    async fn read_only_shell_git_status_reports_a_modified_file_in_a_real_repo() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let repo = git_fixture_repo_with_a_modified_file();
+        let kaish = read_only_shell_rooted_at(&d, "git-status-real-repo", repo.path()).await;
+
+        let result = kaish
+            .execute_with_options("git status", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(result.ok(), "git status in a real repo must succeed: {result:?}");
+        assert!(
+            result.text_out().contains("tracked.txt"),
+            "must report the modified file: {}",
+            result.text_out()
+        );
+
+        // `git diff` (unstaged, index vs. worktree) — the second half of the
+        // banto review idiom this change exists for. This build has no
+        // `--stat` flag (`kaish-tools-git` 0.9.0's `git diff` reports the
+        // typed per-file model, not a patch-style stat summary — see
+        // `docs/design/architecture.md` §B.4 in `~/src/kaish-extras`); bare
+        // `git diff` is the closest available equivalent and still names the
+        // changed file.
+        let diff = kaish
+            .execute_with_options("git diff", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(diff.ok(), "git diff in a real repo must succeed: {diff:?}");
+        assert!(
+            diff.text_out().contains("tracked.txt"),
+            "diff must name the changed file: {}",
+            diff.text_out()
+        );
+    }
+
+    /// The writable shell does not carry the read-only `git` builtin: `git
+    /// info` there is not this crate's tool, so it never produces the
+    /// builtin's `gix_pins` marker (unique to `kaish-tools-git`'s JSON
+    /// output — real host `git` has no `info` subcommand at all). Cheapest
+    /// honest signal that registration stayed scoped to the read-only shell,
+    /// without depending on whether a host `git` binary is even reachable.
+    #[tokio::test]
+    async fn writable_shell_has_no_git_builtin() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/", crate::vfs::backends::LocalBackend::read_only("/")).await;
+        let repo = git_fixture_repo_with_a_modified_file();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("git-writable"), None, principal);
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: ctx, cwd: Some(repo.path().to_string_lossy().into_owned()), updated_at: 0,
+        }).unwrap();
+        let kaish = EmbeddedKaish::for_context(&d, "git-writable", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Agent, ShellCwd::Context, None, Arc::new(NoopBlockSource))
+            .await
+            .expect("materialize writable context shell");
+
+        let result = kaish
+            .execute_with_options("git info", ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            !result.text_out().contains("gix_pins"),
+            "the writable shell must not carry the read-only git builtin: {result:?}"
+        );
     }
 }

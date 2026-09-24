@@ -100,6 +100,13 @@ kaish-help.workspace = true
 # exactly one version after this is added.
 kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "1a0c30390ce97c59243f5feb8aeee24c07134c1a" }
 
+# Read-only `git` tool for the read-only context shell (docs/kaish-integration.md,
+# runtime/git_tool.rs) — same rev as kaish-tools-curl above, same reasoning.
+# Default features (no `textdiff`): the read-only shell has no need for
+# unified patch text yet. See kaish-extras' docs/embedding-git.md for the
+# read-only guarantees and containment story.
+kaish-tools-git = { git = "https://github.com/tobert/kaish-extras", rev = "1a0c30390ce97c59243f5feb8aeee24c07134c1a" }
+
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true
 

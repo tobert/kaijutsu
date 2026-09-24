@@ -136,6 +136,15 @@ These are source observations, not promises that all paths behave alike.
   the aggregate read-only flag on kaish's temporary filesystem overlays.
   `kj synth` now shares its argument declaration, effect classification, and
   help rendering with the rest of `kj`; the runtime still owns its index/source.
+- A `ShellPolicy::ReadOnly` shell registers a builtin read-only `git`
+  (`runtime/git_tool.rs`, `kaish-tools-git` from kaish-extras). The writable
+  shell does not; it reaches host `git` through `ExternalExec::Allow`. The
+  builtin links no write or spawn machinery, so it needs no gate of its own.
+  Its verbs are `info`, `status`, `log`, `ls`, `show`, `diff`, `branch`,
+  `tag`, and `worktree list`; `diff` has `--name-only` but no `--stat`.
+  Repository discovery stops at the containing mount's real root, so
+  `MountBackend::mounts()` reports the real `MountTable`. A linked worktree
+  needs its main repository's `.git` inside a mount.
 - `runtime/synthesis.rs` owns the block-source adapters used by contextual
   shells; hooks no longer depend on rc for synthesis wiring.
   Hydration errors stop synthesis before embedding work. Image imports read
@@ -489,7 +498,7 @@ remove the obsolete API in the same change as its final caller.
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
 | Migrated | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | One atomic cwd/export snapshot and shared defaults; validated typed restore preserves unset values and avoids overlay collisions; approval uses original identities and captured inputs; transactional write-back stays explicit |
 | Pending | Job/receipt readers and controllers | kernel `shell_operations.rs`, `kj/wait.rs`, `kj/context.rs`, runtime job builtins | In-memory jobs and durable receipts keep their distinct lifetimes |
-| Migrated | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `ps_builtin`, synthesis, file tools/cache | Direct kaish backend/tool implementations retain contextual construction and policy. Docs/image/synthesis adapters and file-tool/cache mutation carry the invoking performer; hydration keeps the loader principal |
+| Migrated | Integration backends and builtins | `runtime/*_backend.rs`, filesystem adapters, `kj_builtin`, `vi_builtin`, `curl_tool`, `git_tool`, `ps_builtin`, synthesis, file tools/cache | Direct kaish backend/tool implementations retain contextual construction and policy. Docs/image/synthesis adapters and file-tool/cache mutation carry the invoking performer; hydration keeps the loader principal |
 | Migrated | Gate planning and parsing | `kj/gate*`, `hook_gate`, `shell_gate`, `plan_clauses`, `readonly` | Direct syntax consumers: kaish owns parsing/plans, shared clause rendering feeds review and broker scoring, and the retained plan supplies approval environment capture without a second interpreter |
 | Migrated | Tests and fixtures | kernel and server unit/integration tests | SSH, kernel rc, and direct interpreter fixtures deny host execution by default; explicit subprocess cases opt in. Direct engine tests cover settlement/cancellation without contextual dispatch; builtin fixtures test their kaish interfaces; gate/parser fixtures only parse or plan. Real kernel/SSH and container tests cover contextual behavior, resolution, and lifecycle. |
 
