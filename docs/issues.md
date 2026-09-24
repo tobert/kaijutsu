@@ -192,7 +192,10 @@ input+output tokens across a turn's model calls; at roughly 90% of budget the
 model gets one final tool-free call and must report, rather than being cut off
 mid-tool-chain. Context windows for Alibaba (qwen) models are unpinned, so a
 fraction of the context window is not a usable proxy for the budget — it needs
-its own configured number. Not built yet.
+its own configured number. Not built yet. `kj interrupt <target>
+[--immediate]` is the manual backstop until the budget lands, but it stops
+only the running turn; see "An interrupt does not end a continuation" below.
+Live evidence: "What the cap-free banto review showed (2026-09-24)" below.
 
 ### Lazy file documents
 
@@ -297,6 +300,55 @@ all succeeded. Open:
 - **Builtin git differs from host git.** No `log --oneline`, no `diff --stat`,
   and `diff <path>` needs `--`. The refusals say so and banto adapted; decide
   whether the director stance should name the builtin's forms.
+
+## What the cap-free banto review showed (2026-09-24)
+
+Banto (`banto-0924c`, director, house cast, qwen3.8-flash) was asked to
+review 56b1ab3a from its read-only shell and report on two questions with
+file:line citations. After 47 minutes and about 80 tool calls it had written
+no `model/text` block and no report; it had moved from `mcp/schema.rs` into
+the broker and turn hydration. Nothing in kaish could stop it, so the lead
+restarted the kernel. No optional int arrived as a string. Open:
+
+- **A turn runs without a bound and without a report.** This is the first
+  live evidence for "Per-cast turn token budget" above; the 09-24 read-only
+  probe's cap-hit ended the same way, just sooner.
+- **Each async shell result reaches the block log twice.** A `tool_result`
+  block carries the output, then a user `text` block ("Shell operation …
+  completed … Output block: …") repeats it in full (e.g. #218, 6.8 kB). For a
+  failed call the `tool_result` is empty and only the notification carries
+  the error. Whether both reach the hydrated conversation is unverified; if
+  they do, every call pays for its output twice.
+- **Each tool round took about 40 s.** The model appears to wait for the
+  completion notification before its next call. Unmeasured: how much is
+  provider latency versus the async settle.
+- **Builtin `git diff --from A --to B -- <path>` refuses the path** with
+  "takes no bare operands", although its own help shows that form. Something
+  between kaish argument parsing and the tool drops the `--`. Unlocated.
+
+## An interrupt does not end a continuation (2026-09-24)
+
+Every turn end records a yield, including a cancelled one
+(`runtime/llm_stream.rs:1827`). A later async shell completion then starts a
+new turn when the context is idle, yielded, and within the resume window of
+its last inference request (`runtime/completion_notice.rs:195-208`). So
+`kj interrupt` and the app's interrupt stop the running turn, and the next
+completion restarts the chain. Proposed to Amy: record the interrupt as its
+own fact on `context_continuations` (`interrupted_at`, `interrupted_by`,
+reset with each new epoch) and refuse automatic resume after it, through one
+kernel method both surfaces call. Not `signed_off_at`: that is the
+performer's own handoff close. Inferred from the code; the red test comes
+first.
+
+## A client does not say which principal it connected as (2026-09-24)
+
+Amy's tui tried to allow an ask and got "awaits its assigned reviewer": with
+no key selected it tried the agent's keys in order, `kaijutsu-lead` came
+first, and the tui authenticated as the ask's own performer. The tui and app
+now take `--key-fingerprint`/`--key-file` like the mcp and acp bridges, but
+nothing on screen names the principal, so the mistake only shows at the first
+refusal. Show the connected principal's name where the tui and app show the
+context.
 
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
@@ -1148,7 +1200,9 @@ forks; the model's repaired wire pair does not change that durable status.
 raise an lfm2d advisory ask scored `escalate` even at 0.76-0.82
 `situation-normal`, because the seat's `LFM2D_BENIGN_LABEL=informative` is the
 only passing label, and same-seat answer is refused — every note needs a
-second seat.
+second seat. 2026-09-24: the same holds for `kj drive <ctx> <prompt>` (0.81)
+and for `kj context create … ; kj cast show …`; the same `create` alone, and
+`kj drive <ctx> --prompt …`, passed.
 
 **Decided (Amy, 2026-09-08): fix it through the general gate-policy
 mechanism**, not a one-off exemption. `docs/gate-policy-tuning.md` (designed
