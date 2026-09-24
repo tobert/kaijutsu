@@ -274,6 +274,29 @@ Open, most costly first:
 - **Banto quoted an operation id it never received** (`…afa5-f7a0-afa5`).
   The refusal named the problem; noted as model behavior, no fix proposed.
 
+## What the read-only git probe showed (2026-09-24)
+
+After deploying 8e210275, banto (qwen3.8-flash) reviewed a57ad069 from its
+read-only shell. `git info`, `git diff --from --to`, and `git show rev:path`
+worked with no asks; three file reads sent `offset`/`limit` as strings and
+all succeeded. Open:
+
+- **A review turn hit MaxIterations (50) without a report.** Banto chased
+  side questions (the `/` mount, the `/dev` pair below) and its last text was
+  "Let me check…". The turn ends with no answer for the requester. Design
+  question: a final tool-free turn at the cap that must report, or a stance
+  line to answer before exploring further.
+- **An array param sent as a string is refused.** `"range": "[0, 400]"` →
+  `invalid type: string, expected a tuple of size 2`. `decode_params` could
+  parse a JSON string for a field typed `array` or `object`, by the same rule.
+- **`kaish-mounts` lists `/dev` twice.** kaish's overlay appends its virtual
+  mounts to `MountBackend::mounts()`, so the host `/dev` mount
+  (`kaijutsu-server/src/rpc.rs:1528`) and kaish's virtual `/dev` both show.
+  Which one serves a `/dev` path under the overlay is unverified.
+- **Builtin git differs from host git.** No `log --oneline`, no `diff --stat`,
+  and `diff <path>` needs `--`. The refusals say so and banto adapted; decide
+  whether the director stance should name the builtin's forms.
+
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
 Read by the lead; each line re-checked before it went here.
