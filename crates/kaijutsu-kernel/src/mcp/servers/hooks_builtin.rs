@@ -26,6 +26,7 @@ use uuid::Uuid;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{HookId, McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::hook_table::{
     AskSpec, GlobPattern, HookAction, HookBody, HookEntry, McpHookPhase, HookTable, LogSpec,
 };
@@ -489,9 +490,7 @@ impl McpServerLike for BuiltinHooksServer {
         let broker = self.broker()?;
         match params.tool.as_str() {
             "hook_add" => {
-                let p: HookAddParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookAddParams = decode_params(params.arguments.clone())?;
                 let phase = parse_phase(&p.phase)?;
                 validate_action_for_phase(phase, &p.action)?;
                 let match_context = p
@@ -554,9 +553,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_remove" => {
-                let p: HookRemoveParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookRemoveParams = decode_params(params.arguments.clone())?;
                 // Durable delete FIRST — same contract as `hook_add`: a
                 // failed write surfaces as an error and the mirror is left
                 // alone so the two stores cannot disagree. Idempotent, so a
@@ -590,9 +587,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_list" => {
-                let p: HookListParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookListParams = decode_params(params.arguments.clone())?;
                 let filter_phase = p.phase.as_deref().map(parse_phase).transpose()?;
                 let hooks = broker.hooks().read().await;
                 let mut out: Vec<serde_json::Value> = Vec::new();
@@ -618,9 +613,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_inspect" => {
-                let p: HookInspectParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookInspectParams = decode_params(params.arguments.clone())?;
                 let hooks = broker.hooks().read().await;
                 let mut found: Option<serde_json::Value> = None;
                 for (phase, table) in [
@@ -647,9 +640,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_script_add" => {
-                let p: HookScriptAddParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookScriptAddParams = decode_params(params.arguments.clone())?;
                 let script_id = p
                     .script_id
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -671,9 +662,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_script_update" => {
-                let p: HookScriptUpdateParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookScriptUpdateParams = decode_params(params.arguments.clone())?;
                 let updated = broker
                     .update_hook_script(&p.script_id, &p.body, p.description.as_deref())
                     .await?;
@@ -712,9 +701,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_script_inspect" => {
-                let p: HookScriptInspectParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookScriptInspectParams = decode_params(params.arguments.clone())?;
                 let body = broker
                     .get_hook_script_body(&p.script_id)
                     .await
@@ -733,9 +720,7 @@ impl McpServerLike for BuiltinHooksServer {
                 })
             }
             "hook_script_remove" => {
-                let p: HookScriptRemoveParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: HookScriptRemoveParams = decode_params(params.arguments.clone())?;
                 let removed = broker.delete_hook_script(&p.script_id).await?;
                 let json = serde_json::json!({ "removed": removed });
                 Ok(KernelToolResult {

@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -134,9 +135,7 @@ impl McpServerLike for BuiltinResourcesServer {
         let broker = self.broker()?;
         match params.tool.as_str() {
             "list" => {
-                let p: ListParams =
-                    serde_json::from_value(params.arguments.clone())
-                        .map_err(McpError::InvalidParams)?;
+                let p: ListParams = decode_params(params.arguments.clone())?;
                 let instance = InstanceId::new(p.instance);
                 let list = broker.list_resources(&instance, ctx).await?;
                 let json =
@@ -156,8 +155,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 })
             }
             "read" => {
-                let p: UriParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let p: UriParams = decode_params(params.arguments.clone())?;
                 let instance = InstanceId::new(p.instance.clone());
                 let _result = broker.read_resource(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(
@@ -166,8 +164,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 )))
             }
             "subscribe" => {
-                let p: UriParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let p: UriParams = decode_params(params.arguments.clone())?;
                 let instance = InstanceId::new(p.instance.clone());
                 broker.subscribe(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(
@@ -176,8 +173,7 @@ impl McpServerLike for BuiltinResourcesServer {
                 )))
             }
             "unsubscribe" => {
-                let p: UriParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let p: UriParams = decode_params(params.arguments.clone())?;
                 let instance = InstanceId::new(p.instance.clone());
                 broker.unsubscribe(&instance, &p.uri, ctx).await?;
                 Ok(KernelToolResult::text(format!(

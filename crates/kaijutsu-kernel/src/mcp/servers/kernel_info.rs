@@ -16,6 +16,7 @@ use crate::kj::format::hex32;
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -79,8 +80,7 @@ impl McpServerLike for KernelInfoServer {
 
         // Validate params shape even though it's empty — catches accidental
         // extras via `deny_unknown_fields`.
-        let _: WhoamiParams =
-            serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
+        let _: WhoamiParams = decode_params(params.arguments.clone())?;
 
         let router = self.drift_router.read();
         let handle = router.get(ctx.context_id);

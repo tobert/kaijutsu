@@ -24,6 +24,7 @@ use crate::vfs::{MountTable, VfsOps};
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 use super::adapter::{from_exec_result, to_exec_context};
@@ -343,8 +344,7 @@ impl McpServerLike for BlockToolsServer {
 
         let exec = match params.tool.as_str() {
             "block_create" => {
-                let p: BlockCreateParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockCreateParams = decode_params(params.arguments)?;
                 let role = self.parse_role(&p.role)?;
                 let kind = self.parse_kind(&p.kind)?;
                 let content = p.content.unwrap_or_default();
@@ -377,8 +377,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_append" => {
-                let p: BlockAppendParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockAppendParams = decode_params(params.arguments)?;
                 let block_id = self.parse_block_id(&p.block_id)?;
                 let context_id = tool_ctx.context_id;
 
@@ -411,8 +410,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_edit" => {
-                let p: BlockEditParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockEditParams = decode_params(params.arguments)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
 
                 let original = self.documents
@@ -452,8 +450,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_splice" => {
-                let p: BlockSpliceParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockSpliceParams = decode_params(params.arguments)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
                 let insert = p.insert.unwrap_or_default();
 
@@ -475,8 +472,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_read" => {
-                let p: BlockReadParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockReadParams = decode_params(params.arguments)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
 
                 let entry = self.documents
@@ -524,8 +520,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_search" => {
-                let p: BlockSearchParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockSearchParams = decode_params(params.arguments)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
 
                 let entry = self.documents
@@ -597,8 +592,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_list" => {
-                let p: BlockListParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockListParams = decode_params(params.arguments)?;
                 // `.transpose()?`, not `.ok()`: an unparseable filter is an
                 // error, never a silently dropped filter. Dropping one fails
                 // in the worst direction — the caller gets MORE blocks than it
@@ -667,8 +661,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "block_status" => {
-                let p: BlockStatusParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: BlockStatusParams = decode_params(params.arguments)?;
                 let (context_id, block_id) = self.find_block(&p.block_id)?;
                 let status = self.parse_status(&p.status)?;
                 if status == Status::Draft {
@@ -686,8 +679,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "kernel_search" => {
-                let p: KernelSearchParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: KernelSearchParams = decode_params(params.arguments)?;
                 let regex = regex::Regex::new(&p.query)
                     .map_err(|e| McpError::Protocol(format!("Invalid regex: {}", e)))?;
 
@@ -802,15 +794,13 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "svg_block" => {
-                let p: SvgBlockParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: SvgBlockParams = decode_params(params.arguments)?;
                 let key = self.append_block(&tool_ctx, Role::Tool, &p.content, ContentType::Svg)?;
                 let res_json = serde_json::json!({ "block_id": key });
                 ExecResult::success(res_json.to_string())
             }
             "abc_block" => {
-                let p: AbcBlockParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: AbcBlockParams = decode_params(params.arguments)?;
 
                 let parse = kaijutsu_abc::parse_with_mode(&p.content, kaijutsu_abc::ParseMode::Strict);
                 if parse.has_errors() {
@@ -826,8 +816,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "diff_block" => {
-                let p: DiffBlockParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: DiffBlockParams = decode_params(params.arguments)?;
 
                 // Validate before storing, the abc_block pattern. A block that
                 // *declares* itself a diff but holds text the dialect rejects
@@ -847,8 +836,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "img_block" => {
-                let p: ImgBlockParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: ImgBlockParams = decode_params(params.arguments)?;
 
                 let hash = match p.hash.parse::<kaijutsu_cas::ContentHash>() {
                     Ok(h) => h,
@@ -890,8 +878,7 @@ impl McpServerLike for BlockToolsServer {
                 ExecResult::success(res_json.to_string())
             }
             "img_block_from_path" => {
-                let p: ImgBlockFromPathParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: ImgBlockFromPathParams = decode_params(params.arguments)?;
 
                 let data = match self.vfs.read_all(std::path::Path::new(&p.path)).await {
                     Ok(d) => d,

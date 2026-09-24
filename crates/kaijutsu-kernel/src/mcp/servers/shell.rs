@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use kaijutsu_types::RefusalKind;
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
 use super::super::server_like::{McpServerLike, ServerNotification};
@@ -225,8 +226,7 @@ impl McpServerLike for ShellServer {
                 tool: params.tool,
             });
         }
-        let parsed: ShellParams =
-            serde_json::from_value(params.arguments.clone()).map_err(McpError::InvalidParams)?;
+        let parsed: ShellParams = decode_params(params.arguments.clone())?;
 
         // The dispatcher supplies the same context policy, index, and block
         // source used by other runtime callers.

@@ -49,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{
     InstanceId, KernelCallParams, KernelReadResource, KernelResource, KernelResourceContents,
@@ -209,8 +210,7 @@ impl McpServerLike for BuiltinBindingsServer {
         let broker = self.broker()?;
         match params.tool.as_str() {
             "bind" => {
-                let p: InstanceParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let p: InstanceParams = decode_params(params.arguments.clone())?;
                 // `bind` widens the loadout. Loadout-write policy: a context may
                 // not widen itself unless it holds binding-admin. (`unbind` is
                 // self-narrowing and stays open.) Mirrors `kj binding`'s guard
@@ -236,8 +236,7 @@ impl McpServerLike for BuiltinBindingsServer {
                 })
             }
             "unbind" => {
-                let p: InstanceParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let p: InstanceParams = decode_params(params.arguments.clone())?;
                 let instance = InstanceId::new(p.instance.clone());
                 // Same rule the `kj binding revoke` verb applies: a broad
                 // `*` out-ranks every granular entry, so unbinding one
@@ -266,8 +265,7 @@ impl McpServerLike for BuiltinBindingsServer {
                 })
             }
             "show" => {
-                let _: ShowParams = serde_json::from_value(params.arguments.clone())
-                    .map_err(McpError::InvalidParams)?;
+                let _: ShowParams = decode_params(params.arguments.clone())?;
                 let binding = broker.binding(&ctx.context_id).await.unwrap_or_default();
                 let allowed: Vec<&str> = binding
                     .allowed_instances

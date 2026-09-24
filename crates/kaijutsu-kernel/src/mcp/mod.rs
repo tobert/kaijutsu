@@ -14,6 +14,7 @@ pub mod external_registry;
 pub mod hook_persist;
 pub mod hook_table;
 pub mod hooks_builtin;
+pub mod params;
 pub mod policy;
 pub mod server_like;
 pub mod servers;

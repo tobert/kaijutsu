@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::broker::Broker;
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 
@@ -110,7 +111,7 @@ impl McpServerLike for BuiltinToolSearchServer {
             });
         }
         let parsed: ToolSearchParams =
-            serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
+            decode_params(params.arguments)?;
         let query = parsed.query.trim().to_lowercase();
         let limit = match parsed.limit {
             Some(0) | None => DEFAULT_LIMIT,

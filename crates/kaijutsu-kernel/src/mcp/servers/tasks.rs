@@ -32,6 +32,7 @@ use kaijutsu_types::{BlockSnapshot, ContextId};
 
 use super::super::context::CallContext;
 use super::super::error::{McpError, McpResult};
+use super::super::params::decode_params;
 use super::super::server_like::{McpServerLike, ServerNotification};
 use super::super::types::{InstanceId, KernelCallParams, KernelTool, KernelToolResult};
 use super::adapter::{from_exec_result, to_exec_context};
@@ -223,8 +224,7 @@ impl McpServerLike for BuiltinTasksServer {
 
         let exec = match params.tool.as_str() {
             "task_create" => {
-                let p: TaskCreateParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: TaskCreateParams = decode_params(params.arguments)?;
                 let status = match &p.status {
                     Some(s) => self.parse_task_status(s)?,
                     None => TaskStatus::default(),
@@ -281,8 +281,7 @@ impl McpServerLike for BuiltinTasksServer {
                 ExecResult::success(res_json.to_string())
             }
             "task_update" => {
-                let p: TaskUpdateParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: TaskUpdateParams = decode_params(params.arguments)?;
                 if p.content.is_none() && p.status.is_none() {
                     return Err(McpError::InvalidParams(serde::de::Error::custom(
                         "task_update requires at least one of content/status",
@@ -312,8 +311,7 @@ impl McpServerLike for BuiltinTasksServer {
                 ExecResult::success(res_json.to_string())
             }
             "task_complete" => {
-                let p: TaskCompleteParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: TaskCompleteParams = decode_params(params.arguments)?;
                 let (task_context_id, block_id) = self.find_task(&p.block_id)?;
                 self.documents
                     .set_task_status(task_context_id, &block_id, TaskStatus::Done)
@@ -331,8 +329,7 @@ impl McpServerLike for BuiltinTasksServer {
                 ExecResult::success(res_json.to_string())
             }
             "task_cancel" => {
-                let p: TaskCancelParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: TaskCancelParams = decode_params(params.arguments)?;
                 let (task_context_id, block_id) = self.find_task(&p.block_id)?;
                 self.documents
                     .set_task_status(task_context_id, &block_id, TaskStatus::Cancelled)
@@ -350,8 +347,7 @@ impl McpServerLike for BuiltinTasksServer {
                 ExecResult::success(res_json.to_string())
             }
             "task_list" => {
-                let p: TaskListParams = serde_json::from_value(params.arguments)
-                    .map_err(McpError::InvalidParams)?;
+                let p: TaskListParams = decode_params(params.arguments)?;
                 let parent_id_filter = p
                     .parent_id
                     .as_ref()
