@@ -256,6 +256,31 @@ covering 2026-09-22. Open, most costly first:
 - **kaish bare `echo` prints nothing.** POSIX prints a newline. Upstream kaish
   issue; Amy decides whether and how it is posted.
 
+## What the banto rerun showed (2026-09-24)
+
+Banto (director, qwen3.8-flash, house cast) drove `fix-handoff-tail` to a
+correct, test-first fix: red observed, green verified by banto itself, no
+commits. Banto 50k tokens, coder 69k (09-22: banto alone 142k and the coder
+hit the 50-iteration cap). The coder's two `cargo test` asks went to banto,
+which answered them from inside `kj wait`; two banto asks reached the lead.
+Open, most costly first:
+
+- **Tool integer params refuse strings.** qwen3.8-flash sends `offset`/`limit`
+  as `"240"`; serde answers `invalid type: string, expected u32`. Four
+  refusals across both seats, each a lost round trip. Accept numeric strings,
+  or teach the schema; decide which.
+- **A director cannot read git.** Banto's read-only shell refuses external
+  commands, so `git status --porcelain && git diff --stat` became an ask to
+  its reviewer. A reviewing seat needs to see the change it reviews.
+- **lfm2d still escalates `cargo test`** at situation-normal 0.90. Same entry
+  as 09-22; now it costs one banto answer instead of a stall.
+- **A `</think>` tag leaks into qwen model text** (coder block #25). The
+  provider does not strip it on every path.
+- **Banto's `shell` tool times out at 120 s inside `kj wait`.** Its wait asked
+  for longer than the tool allows; the stance or the tool should say the cap.
+- **Banto quoted an operation id it never received** (`…afa5-f7a0-afa5`).
+  The refusal named the problem; noted as model behavior, no fix proposed.
+
 ## From the kaibo review of the scripted mock and the session scenario (2026-09-15)
 
 Read by the lead; each line re-checked before it went here.
@@ -265,11 +290,6 @@ Read by the lead; each line re-checked before it went here.
   `kj backend`, and `kj alias` writes rebuild it, so a mid-scenario write
   replays consumed turns instead of panicking. `session_scenario.rs` survives
   by ordering; say so in the file, or hold the queues outside the provider.
-- **`kj handoff tail <other>` refuses a reader with no sheet** because the
-  caller is resolved before the target is chosen (`kj/handoff.rs:250-253`).
-  Resolve the caller only on the no-target branch.
-- Stale comments: `llm/mod.rs:470-476` says the mock refuses streaming;
-  `kj/handoff.rs:17,274` point at a `READ_ONLY_TABLE` that no longer exists.
 
 ## Accountability at the handoff log (Amy, 2026-09-15)
 
