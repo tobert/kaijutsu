@@ -2615,6 +2615,14 @@ impl KernelDb {
             tx.commit()?;
             tracing::info!("migrated builtin embedding configuration to the default lfm2d service");
         }
+        for retired in crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
+            let moved = conn.execute("UPDATE embedding_config SET endpoint = ?1 WHERE endpoint = ?2",
+                [crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT, retired])?;
+            if moved > 0 {
+                tracing::info!(from = retired, to = crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT,
+                    "moved a retired factory embedding endpoint to the current default");
+            }
+        }
         let alters = [
             "ALTER TABLE context_continuations ADD COLUMN invalidated_through INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE approval_pair_handoffs ADD COLUMN abandoned_reason TEXT",
@@ -8535,6 +8543,38 @@ mod tests {
         assert_eq!(row.timeout_ms, 30_000);
         let mut edited = row;
         edited.endpoint = "unix:///tmp/lfm2d.sock".into();
+        db.set_embedding_config(&edited).unwrap();
+        drop(db);
+        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(edited));
+    }
+
+    /// lfm2d-1 never served an embedder (no `--embedder-dir`), so a kernel
+    /// still on that factory default logged "discovery returned no embedding
+    /// model" on every start. The default moved to lfm2d-system1; a row still
+    /// holding a retired default follows it, an operator's endpoint does not.
+    #[test]
+    fn retired_factory_embedding_endpoint_follows_the_new_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let retired = crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS[0];
+        assert_ne!(retired, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.set_embedding_config(&EmbeddingConfigRow {
+                enabled: false,
+                endpoint: retired.into(),
+                timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
+            })
+            .unwrap();
+        }
+        let db = KernelDb::open(&path).unwrap();
+        let row = db.get_embedding_config().unwrap().unwrap();
+        assert_eq!(row.endpoint, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
+        assert!(!row.enabled, "only the endpoint moves");
+        assert_eq!(row.timeout_ms, 1234, "only the endpoint moves");
+
+        let mut edited = row;
+        edited.endpoint = "http://my-own-lfm2d:8088".into();
         db.set_embedding_config(&edited).unwrap();
         drop(db);
         assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(edited));

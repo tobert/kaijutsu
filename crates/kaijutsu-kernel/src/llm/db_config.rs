@@ -488,7 +488,7 @@ mod tests {
     fn embedding_config_reads_service_defaults() {
         let db = seeded_db();
         let emb = load_embedding_config(&db).unwrap().expect("floor seeds embedding");
-        assert_eq!(emb.endpoint, "http://lfm2d-1.taila4abc.ts.net:8088");
+        assert_eq!(emb.endpoint, "http://lfm2d-system1.taila4abc.ts.net:8088");
         assert_eq!(emb.timeout_ms, 30_000);
         assert_eq!(emb.max_in_flight, 2);
         assert_eq!(emb.max_context_bytes, 2048);
@@ -577,6 +577,6 @@ mod tests {
         .unwrap();
         reseed_factory_backends(&mut db, PrincipalId::system()).unwrap();
         let emb = load_embedding_config(&db).unwrap().expect("reseed re-enables");
-        assert_eq!(emb.endpoint, "http://lfm2d-1.taila4abc.ts.net:8088");
+        assert_eq!(emb.endpoint, "http://lfm2d-system1.taila4abc.ts.net:8088");
     }
 }
