@@ -223,8 +223,8 @@ impl std::fmt::Debug for Broker {
 }
 
 /// What [`Broker::run_permission_ask`] decided, distinguishing a real
-/// verdict from a broken control (`docs/gate-and-shell-split.md`, "'Gate
-/// unavailable' and 'denied' must be distinguishable to a model"). One
+/// verdict from a broken control — see `docs/gate-resume.md`, "The refusal
+/// contract and approval execution". One
 /// producer, one consumer, both in this file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PermissionAskOutcome {
@@ -2772,7 +2772,7 @@ impl Broker {
             );
         }
 
-        // `KJ_HOOK_MODE` (docs/gate-and-shell-split.md, "Dry-run mode"):
+        // `KJ_HOOK_MODE` (docs/kaish-integration.md):
         // present with the value `dryrun` when nothing this body decides
         // will be honored, and ABSENT otherwise. A body that never reads it
         // still cannot block a dry run — the evaluator converts every
@@ -2802,7 +2802,7 @@ impl Broker {
             }
         }
 
-        // `KJ_TOOL_PLAN` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): when
+        // `KJ_TOOL_PLAN` (docs/gate-policy-tuning.md): when
         // the hooked tool is the shell, hand the body kaish's own plan
         // projection of the `command` argument — `{"statements":[{"index",
         // "plan":{"rendered","statement_kind","commands":[{"name","args",
@@ -2815,7 +2815,7 @@ impl Broker {
         // failure the var is absent and `KJ_TOOL_PLAN_ERROR` carries the
         // diagnostics.
         //
-        // `kj_readonly` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): a
+        // `kj_readonly` (docs/gate-policy-tuning.md): a
         // bool on every command object, `true` only when
         // `kj::readonly::is_read_only_kj` resolves that exact command to a
         // verb whose own declared effect (`kj/effect.rs`) is `Read`. A hook
@@ -2823,7 +2823,7 @@ impl Broker {
         // structure itself. Additive — every field above already existed
         // and is unchanged.
         //
-        // `clause` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"): the text
+        // `clause` (docs/gate-policy-tuning.md): the text
         // a classifier scores for that command, from
         // `kj::plan_clauses::command_clause_texts` — the one place the cut
         // between statement and command is decided, shared with
@@ -2840,7 +2840,7 @@ impl Broker {
             if let Some(command) = params.arguments.get("command").and_then(|v| v.as_str()) {
                 match kaish_kernel::ast::plan::plan_program(command) {
                     Ok(statements) => {
-                        // `tier` (docs/gate-and-shell-split.md, "KJ_TOOL_PLAN"):
+                        // `tier` (docs/gate-policy-tuning.md):
                         // the gate policy's per-command verdict word —
                         // `allow`, `ask`, `deny` or `score` — from
                         // `kj::gate_policy::command_verdict`, the same
@@ -3070,7 +3070,7 @@ impl Broker {
     // blocks — none of which `call_tool`'s `(KernelCallParams) ->
     // KernelToolResult` shape carries. Evaluating the phases directly and
     // handing the caller a verdict to act on is the smaller, honest
-    // integration `docs/gate-and-shell-split.md` calls for.
+    // integration this shape calls for.
 
     /// Instance/tool identity used to match a direct kaish exec against the
     /// broker's hook tables — the same identity `builtin.shell_write`'s real
@@ -3138,7 +3138,7 @@ impl Broker {
     /// answer a human already gave is spent. The report is advisory in the
     /// strongest sense — there is no verdict here for a caller to honor.
     ///
-    /// `docs/gate-and-shell-split.md`, "Dry-run mode".
+    /// See `docs/kaish-integration.md`.
     pub async fn shell_pre_call_hooks_dry_run(
         &self,
         command: &str,
@@ -3704,8 +3704,7 @@ enum PhaseOutcome {
     /// A `Deny` hook matched, or an `Ask` hook's subscriber answered "no".
     /// `reason` reaches the model on the refusal: a verdict delivered
     /// without one reads exactly like a broken control, and there is no
-    /// adversary inside the trust boundary to withhold it from
-    /// (`docs/gate-and-shell-split.md`). `ask` is the durable ask this deny
+    /// adversary inside the trust boundary to withhold it from. `ask` is the durable ask this deny
     /// came from, and `None` for a hook body that denied outright with no
     /// gate involved.
     Deny {
@@ -3716,8 +3715,8 @@ enum PhaseOutcome {
     /// An `Ask` hook fired but never reached a verdict — no subscriber
     /// attached, or nobody answered in time. Distinct from `Deny` so the
     /// LLM-visible error is built by `McpError::gate_unavailable`, not
-    /// `McpError::denied_by_hook` — gate unavailable and denied must stay
-    /// distinguishable to a model (`docs/gate-and-shell-split.md`).
+    /// `McpError::denied_by_hook` — gate unavailable and denied stay
+    /// distinguishable to a model (`docs/gate-resume.md`).
     /// `reason` reaches the model, same as `Deny`; `ask` is the durable
     /// row, when the gate got far enough to record one.
     GateUnavailable {
@@ -3764,7 +3763,7 @@ enum PhaseEval {
 }
 
 /// What the PreCall phase would have decided about a command that was never
-/// run (`docs/gate-and-shell-split.md`, "Dry-run mode").
+/// run. See `docs/kaish-integration.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DryRunOutcome {
     /// Every matching hook let the call through.
@@ -4075,8 +4074,7 @@ fn emit_deny_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
 /// Tracing attribution for a `GateUnavailable` result — an `Ask` hook that
 /// never reached a verdict. Kept as its own event name (`hook.gate_unavailable`,
 /// not `hook.deny`) so a trace consumer can tell a broken control apart from
-/// an actual "no" without parsing `reason` prose
-/// (`docs/gate-and-shell-split.md`).
+/// an actual "no" without parsing `reason` prose.
 fn emit_gate_unavailable_attribution(phase: McpHookPhase, hook_id: &HookId, reason: &str) {
     tracing::info!(
         hook_id = %format!("hook:{hook_id}"),
@@ -8452,7 +8450,7 @@ mod tests {
         assert!(err.is_refusal(RefusalKind::Denied), "expected Denied, got {err:?}");
     }
 
-    /// (`docs/gate-and-shell-split.md`, "Exit 3 = escalate to an ask"): a `HookBody::Kaish` body that exits 3 does not
+    /// A `HookBody::Kaish` body that exits 3 does not
     /// deny outright — it escalates through the same ledger ask round trip
     /// `HookAction::Ask` uses, with the body's stderr tail as the ask's
     /// description. The first call returns `GatePending` immediately
@@ -8930,7 +8928,7 @@ mod tests {
         assert_eq!(server_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
-    /// `KJ_TOOL_PLAN` (`docs/gate-and-shell-split.md`): a shell hook body
+    /// `KJ_TOOL_PLAN` (`docs/gate-policy-tuning.md`): a shell hook body
     /// sees kaish's plan projection of the `command` argument. Three
     /// statements for `a && b; c | d; for f in x; do delete $f; done`, and
     /// `delete` appears as its own command inside the loop body — per-command
@@ -9027,7 +9025,7 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// `env` (`docs/gate-and-shell-split.md`, "KJ_TOOL_PLAN"): the classifier
+    /// `env` (`docs/gate-resume.md`, "The ask carries its free variables"): the classifier
     /// sees the same free-variable snapshot the ask records —
     /// `kj::env_snapshot::free_variable_values` called with the calling
     /// context's `context_env`. `FOO` is set, `BAZ` is free but unset, so
@@ -9089,7 +9087,7 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    // ── Dry-run mode (`docs/gate-and-shell-split.md`, "Dry-run mode") ────
+    // ── Dry-run mode (`docs/kaish-integration.md`) ────
 
     /// A wired broker plus a REGISTERED context. A dry run records a real
     /// ask row, and building one reads the context's cwd, so the random id
@@ -9397,7 +9395,7 @@ mod tests {
     const SHELL_GUARD_SEED: &str =
         include_str!("../../../../assets/defaults/rc/lib/create/S45-shell-guard.kai");
 
-    /// The `sh -c` guard (`docs/gate-and-shell-split.md` item 4): denies any
+    /// The `sh -c` guard: denies any
     /// `shell_write` command that routes through `sh`/`bash`/`zsh`/`dash` `-c`
     /// (optionally via `exec`) at a statement
     /// boundary or the start of the command, and lets everything else
@@ -11393,7 +11391,7 @@ mod tests {
     }
 
     // ── HookAction::Ask goes through the approval ledger ────────────────────
-    // See `docs/gate-and-shell-split.md`, "The shared seam". There is no
+    // See `docs/gate-resume.md`. There is no
     // scripted asker double; `run_permission_ask` calls `kj::gate::run_gate`
     // for real, so these tests wire a real `KjDispatcher` (mirroring
     // `wired_kaish_broker` above) and answer/inspect the durable ledger

@@ -182,7 +182,7 @@ merge into a kernel document is structurally impossible.
 
 **Block text is a plain `String`, and the kernel sequences every write.**
 Streaming is 100% append and `push_str` is amortized O(1). Changing that needs
-a design conversation; the measurements are in `docs/crdt-position-2026-08.md`.
+a design conversation.
 
 ---
 

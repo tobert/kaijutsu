@@ -1,19 +1,11 @@
 # ABC Music Notation Reference for Kaijutsu
 
 This is a comprehensive ABC notation reference tailored for the `kaijutsu-abc` crate.
-It covers the ABC v2.1 standard with notes on what kaijutsu-abc currently parses,
-renders (SVG), and outputs (MIDI).
+It covers the ABC v2.1 standard's syntax and semantics. For what the crate
+parses, renders (SVG), and outputs (MIDI) today, read its own tests — they
+are truth, and this document does not track per-feature implementation status.
 
 **Standard**: [ABC v2.1](https://abcnotation.com/wiki/abc:standard:v2.1) (Dec 2011)
-
-## Legend
-
-Throughout this document, support status is marked:
-
-- **parse** = parsed into AST
-- **midi** = reflected in MIDI output
-- **svg** = rendered in SVG engraving
-- (unmarked = standard feature not yet implemented)
 
 ---
 
@@ -48,45 +40,45 @@ Rules:
 
 ### Required Fields
 
-| Field | Name | Example | Status |
-|-------|------|---------|--------|
-| `X:` | Reference number | `X:1` | parse, midi |
-| `T:` | Title | `T:Cooley's Reel` | parse, svg |
-| `K:` | Key signature | `K:D`, `K:Am`, `K:Gmix` | parse, midi, svg |
+| Field | Name | Example |
+|-------|------|---------|
+| `X:` | Reference number | `X:1` |
+| `T:` | Title | `T:Cooley's Reel` |
+| `K:` | Key signature | `K:D`, `K:Am`, `K:Gmix` |
 
 ### Musical Fields
 
-| Field | Name | Example | Status |
-|-------|------|---------|--------|
-| `M:` | Meter | `M:6/8`, `M:C`, `M:C\|`, `M:none` | parse, midi, svg |
-| `L:` | Unit note length | `L:1/8`, `L:1/16` | parse, midi, svg |
-| `Q:` | Tempo | `Q:1/4=120`, `Q:"Allegro" 1/4=120` | parse, midi, svg |
-| `V:` | Voice definition | `V:1 name="Melody" clef=treble` | parse, midi, svg (v1 only) |
+| Field | Name | Example |
+|-------|------|---------|
+| `M:` | Meter | `M:6/8`, `M:C`, `M:C\|`, `M:none` |
+| `L:` | Unit note length | `L:1/8`, `L:1/16` |
+| `Q:` | Tempo | `Q:1/4=120`, `Q:"Allegro" 1/4=120` |
+| `V:` | Voice definition | `V:1 name="Melody" clef=treble` |
 
 ### Metadata Fields
 
-| Field | Name | Example | Status |
-|-------|------|---------|--------|
-| `C:` | Composer | `C:O'Carolan` | parse |
-| `R:` | Rhythm | `R:Jig` | parse |
-| `S:` | Source | `S:Offord MSS` | parse |
-| `N:` | Notes | `N:see also Playford` | parse |
-| `O:` | Origin | `O:Irish` | — |
-| `B:` | Book | `B:Cole's 1000` | — |
-| `D:` | Discography | `D:Chieftains IV` | — |
-| `Z:` | Transcription | `Z:atobey 2026` | — |
-| `H:` | History | `H:collected in 1801` | — |
-| `F:` | File URL | `F:https://...` | — |
-| `P:` | Parts | `P:AABB` | — |
-| `w:` | Lyrics (aligned) | `w:doh re mi fa` | — |
-| `W:` | Lyrics (at end) | `W:Verse two` | — |
-| `m:` | Macro | `m:~G2 = {A}G{F}G` | — |
-| `U:` | User symbols | `U:T = !trill!` | — |
-| `I:` | Instruction | `I:linebreak <none>` | — |
-| `s:` | Symbol line | `s: !pp! ** !f!` | — |
-| `r:` | Remark (inline) | `[r:editorial note]` | — |
+| Field | Name | Example |
+|-------|------|---------|
+| `C:` | Composer | `C:O'Carolan` |
+| `R:` | Rhythm | `R:Jig` |
+| `S:` | Source | `S:Offord MSS` |
+| `N:` | Notes | `N:see also Playford` |
+| `O:` | Origin | `O:Irish` |
+| `B:` | Book | `B:Cole's 1000` |
+| `D:` | Discography | `D:Chieftains IV` |
+| `Z:` | Transcription | `Z:atobey 2026` |
+| `H:` | History | `H:collected in 1801` |
+| `F:` | File URL | `F:https://...` |
+| `P:` | Parts | `P:AABB` |
+| `w:` | Lyrics (aligned) | `w:doh re mi fa` |
+| `W:` | Lyrics (at end) | `W:Verse two` |
+| `m:` | Macro | `m:~G2 = {A}G{F}G` |
+| `U:` | User symbols | `U:T = !trill!` |
+| `I:` | Instruction | `I:linebreak <none>` |
+| `s:` | Symbol line | `s: !pp! ** !f!` |
+| `r:` | Remark (inline) | `[r:editorial note]` |
 
-### MIDI Directives **parse, midi**
+### MIDI Directives
 
 ```
 %%MIDI program 67           ← set MIDI program (instrument) 0-127
@@ -95,7 +87,7 @@ Rules:
 
 ---
 
-## 3. Key Signatures **parse, midi, svg**
+## 3. Key Signatures
 
 ### Basic Syntax
 
@@ -146,7 +138,7 @@ K:Hp                   ← Highland bagpipe (F#, C#, G natural displayed)
 K:none                 ← no key signature
 ```
 
-### Clef and Other K: Attributes **parse**
+### Clef and Other K: Attributes
 
 K: accepts attribute clauses after the key signature per §4.6:
 
@@ -174,7 +166,7 @@ Mid-tune K: changes are supported via both the bracketed form
 
 ---
 
-## 4. Meter (Time Signature) **parse, midi, svg**
+## 4. Meter (Time Signature)
 
 ```
 M:4/4                  ← 4/4 time
@@ -189,7 +181,7 @@ Can change mid-tune with inline field: `[M:3/4]`
 
 ---
 
-## 5. Unit Note Length **parse, midi, svg**
+## 5. Unit Note Length
 
 The `L:` field sets the default duration of an unmodified note letter.
 
@@ -203,7 +195,7 @@ Default if omitted: `1/8` if meter >= 3/4, else `1/16`.
 
 ---
 
-## 6. Tempo **parse, midi, svg**
+## 6. Tempo
 
 ```
 Q:1/4=120              ← quarter note = 120 BPM
@@ -214,7 +206,7 @@ Q:"Allegro" 1/4=144    ← with text annotation
 
 ---
 
-## 7. Notes **parse, midi, svg**
+## 7. Notes
 
 ### Pitch
 
@@ -233,7 +225,7 @@ Octave modifiers:
 - `'` (apostrophe) raises one octave — stackable: `c''` = two up
 - `,` (comma) lowers one octave — stackable: `C,,` = two down
 
-### Accidentals **parse, midi, svg**
+### Accidentals
 
 Placed *before* the note letter:
 
@@ -253,7 +245,7 @@ to the key signature. This matches standard music notation.
  C D E F |  ← C reverts to key signature after bar line
 ```
 
-### Duration **parse, midi, svg**
+### Duration
 
 Duration is relative to the unit note length (`L:` field).
 
@@ -269,7 +261,7 @@ Duration is relative to the unit note length (`L:` field).
 | `A3` | 3x unit | dotted quarter |
 | `A7/4` | 7/4 unit | double-dotted quarter |
 
-### Rests **parse, midi, svg**
+### Rests
 
 | Syntax | Meaning |
 |--------|---------|
@@ -298,7 +290,7 @@ parser; they don't appear in the AST.
 
 ---
 
-## 8. Broken Rhythm **parse, midi**
+## 8. Broken Rhythm
 
 A shorthand for dotted rhythms — the operator scales whatever explicit
 duration each surrounding note already has:
@@ -318,7 +310,7 @@ unknown-character path.
 
 ---
 
-## 9. Ties and Slurs **parse, midi**
+## 9. Ties and Slurs
 
 ### Ties
 
@@ -331,7 +323,7 @@ A-|A           ← tie across bar line
 
 The `-` must be adjacent to the first note.
 
-### Slurs **parse**
+### Slurs
 
 Group notes into a phrasing arc:
 
@@ -343,7 +335,7 @@ Group notes into a phrasing arc:
 
 ---
 
-## 10. Chords **parse, midi, svg**
+## 10. Chords
 
 ### Note Chords (simultaneous notes)
 
@@ -356,7 +348,7 @@ Square brackets enclose notes played together:
 [^CE_G]        ← accidentals inside chords
 ```
 
-### Guitar/Chord Symbols **parse**
+### Guitar/Chord Symbols
 
 Double-quoted strings above the staff:
 
@@ -379,7 +371,7 @@ Position-prefixed text placed relative to the staff:
 
 ---
 
-## 11. Bar Lines **parse, midi, svg**
+## 11. Bar Lines
 
 | Syntax | Meaning |
 |--------|---------|
@@ -393,7 +385,7 @@ Position-prefixed text placed relative to the staff:
 | `.|` | Dotted bar line |
 | `[|]` | Invisible bar line |
 
-### Variant Endings (Volta Brackets) **parse**
+### Variant Endings (Volta Brackets)
 
 ```
 |: ABCD |1 EFGA :|2 EFGc ||
@@ -411,7 +403,7 @@ Supports numbered and ranged endings:
 
 ---
 
-## 12. Tuplets **parse, midi**
+## 12. Tuplets
 
 General syntax: `(p:q:r` — p notes in the time of q, for the next r notes.
 
@@ -437,7 +429,7 @@ Full form example:
 
 ---
 
-## 13. Grace Notes **parse, midi**
+## 13. Grace Notes
 
 ### Appoggiatura (unslashed)
 
@@ -462,114 +454,114 @@ Grace notes:
 
 ## 14. Decorations and Ornaments
 
-### Short Form **parse**
+### Short Form
 
 Single-character decorations placed before a note:
 
-| Char | Decoration | Status |
-|------|-----------|--------|
-| `.` | Staccato | parse |
-| `~` | Roll / Irish roll | parse |
-| `H` | Fermata (hold) | parse |
-| `T` | Trill | parse |
-| `u` | Up bow | parse |
-| `v` | Down bow | parse |
-| `L` | Accent | — |
-| `M` | Mordent (lower) | — |
-| `P` | Pralltriller (upper mordent) | — |
-| `S` | Segno | — |
-| `O` | Coda | — |
-| `R` | Roll | — |
-| `J` | Slide | — |
+| Char | Decoration |
+|------|-----------|
+| `.` | Staccato |
+| `~` | Roll / Irish roll |
+| `H` | Fermata (hold) |
+| `T` | Trill |
+| `u` | Up bow |
+| `v` | Down bow |
+| `L` | Accent |
+| `M` | Mordent (lower) |
+| `P` | Pralltriller (upper mordent) |
+| `S` | Segno |
+| `O` | Coda |
+| `R` | Roll |
+| `J` | Slide |
 
-### Long Form `!name!` or `+name+` **parse**
+### Long Form `!name!` or `+name+`
 
 Both delimiter forms accept the same vocabulary (§4.14). `+name+` is
 the older alternate from dialects that used `!` for line breaks; the
 parser routes both through the same lookup table.
 
-| Decoration | Category | Status |
-|-----------|----------|--------|
-| **Ornaments** | | |
-| `!trill!` | Trill (tr) | parse |
-| `!mordent!` | Mordent (lower) | parse |
-| `!lowermordent!` | Lower mordent | parse |
-| `!uppermordent!` | Upper mordent | — |
-| `!pralltriller!` | Pralltriller | — |
-| `!roll!` | Roll | parse |
-| `!turn!` | Turn | parse |
-| `!turnx!` | Turn with line through | — |
-| `!invertedturn!` | Inverted turn | — |
-| `!invertedturnx!` | Inverted turn with line | — |
-| `!slide!` | Slide | — |
-| `!irishroll!` | Irish roll (synonym for ~) | — |
-| **Articulations** | | |
-| `!staccato!` | Staccato (.) | parse |
-| `!accent!` | Accent (>) | parse |
-| `!tenuto!` | Tenuto (—) | — |
-| `!fermata!` | Fermata (hold) | parse |
-| `!invertedfermata!` | Inverted fermata | — |
-| `!marcato!` | Marcato (^) | — |
-| `!umarcato!` | Upper marcato | — |
-| `!dmarcato!` | Lower marcato | — |
-| `!wedge!` | Wedge | — |
-| `!snap!` | Snap pizzicato | — |
-| **Bowing** | | |
-| `!upbow!` | Up bow (V) | parse |
-| `!downbow!` | Down bow | parse |
-| `!open!` | Open string (o) | — |
-| `!thumb!` | Thumb position | — |
-| **Dynamics** | | |
-| `!pppp!` | Pianissississimo | — |
-| `!ppp!` | Pianississimo | parse |
-| `!pp!` | Pianissimo | parse |
-| `!p!` | Piano | parse |
-| `!mp!` | Mezzo piano | parse |
-| `!mf!` | Mezzo forte | parse |
-| `!f!` | Forte | parse |
-| `!ff!` | Fortissimo | parse |
-| `!fff!` | Fortississimo | parse |
-| `!ffff!` | Fortissississimo | — |
-| `!sfz!` | Sforzando | — |
-| **Dynamic Lines** | | |
-| `!crescendo(!` | Start crescendo (hairpin) | parse |
-| `!crescendo)!` | End crescendo | parse |
-| `!diminuendo(!` | Start diminuendo | parse |
-| `!diminuendo)!` | End diminuendo | parse |
-| `!<(!` | Start crescendo (alias) | parse |
-| `!<)!` | End crescendo (alias) | parse |
-| `!>(!` | Start diminuendo (alias) | parse |
-| `!>)!` | End diminuendo (alias) | parse |
-| **Form Marks** | | |
-| `!segno!` | Segno sign | — |
-| `!coda!` | Coda sign | — |
-| `!D.S.!` | Dal Segno | — |
-| `!D.C.!` | Da Capo | — |
-| `!D.S.alfine!` | Dal Segno al fine | — |
-| `!D.S.alcoda!` | Dal Segno al coda | — |
-| `!D.C.alfine!` | Da Capo al fine | — |
-| `!D.C.alcoda!` | Da Capo al coda | — |
-| `!fine!` | Fine | — |
-| **Phrasing** | | |
-| `!breath!` | Breath mark / comma | — |
-| `!shortphrase!` | Short phrase mark | — |
-| `!mediumphrase!` | Medium phrase mark | — |
-| `!longphrase!` | Long phrase mark | — |
-| **Fingering** | | |
-| `!0!`–`!5!` | Finger numbers | — |
-| **Beaming** | | |
-| `!beambr1!` | Beam break (single) | — |
-| `!beambr2!` | Beam break (double) | — |
-| **Tremolo** | | |
-| `!trem1!`–`!trem4!` | Tremolo marks (1-4 slashes) | — |
-| **Glissando** | | |
-| `!glissando(!` | Start glissando | — |
-| `!glissando)!` | End glissando | — |
-| **Style** | | |
-| `!style=normal!` | Normal noteheads | — |
-| `!style=harmonic!` | Diamond noteheads | — |
-| `!style=rhythm!` | Rhythm (x) noteheads | — |
-| `!style=triangle!` | Triangle noteheads | — |
+| Decoration | Category |
+|-----------|----------|
+| **Ornaments** | |
+| `!trill!` | Trill (tr) |
+| `!mordent!` | Mordent (lower) |
+| `!lowermordent!` | Lower mordent |
+| `!uppermordent!` | Upper mordent |
+| `!pralltriller!` | Pralltriller |
+| `!roll!` | Roll |
+| `!turn!` | Turn |
+| `!turnx!` | Turn with line through |
+| `!invertedturn!` | Inverted turn |
+| `!invertedturnx!` | Inverted turn with line |
+| `!slide!` | Slide |
+| `!irishroll!` | Irish roll (synonym for ~) |
+| **Articulations** | |
+| `!staccato!` | Staccato (.) |
+| `!accent!` | Accent (>) |
+| `!tenuto!` | Tenuto (—) |
+| `!fermata!` | Fermata (hold) |
+| `!invertedfermata!` | Inverted fermata |
+| `!marcato!` | Marcato (^) |
+| `!umarcato!` | Upper marcato |
+| `!dmarcato!` | Lower marcato |
+| `!wedge!` | Wedge |
+| `!snap!` | Snap pizzicato |
+| **Bowing** | |
+| `!upbow!` | Up bow (V) |
+| `!downbow!` | Down bow |
+| `!open!` | Open string (o) |
+| `!thumb!` | Thumb position |
+| **Dynamics** | |
+| `!pppp!` | Pianissississimo |
+| `!ppp!` | Pianississimo |
+| `!pp!` | Pianissimo |
+| `!p!` | Piano |
+| `!mp!` | Mezzo piano |
+| `!mf!` | Mezzo forte |
+| `!f!` | Forte |
+| `!ff!` | Fortissimo |
+| `!fff!` | Fortississimo |
+| `!ffff!` | Fortissississimo |
+| `!sfz!` | Sforzando |
+| **Dynamic Lines** | |
+| `!crescendo(!` | Start crescendo (hairpin) |
+| `!crescendo)!` | End crescendo |
+| `!diminuendo(!` | Start diminuendo |
+| `!diminuendo)!` | End diminuendo |
+| `!<(!` | Start crescendo (alias) |
+| `!<)!` | End crescendo (alias) |
+| `!>(!` | Start diminuendo (alias) |
+| `!>)!` | End diminuendo (alias) |
+| **Form Marks** | |
+| `!segno!` | Segno sign |
+| `!coda!` | Coda sign |
+| `!D.S.!` | Dal Segno |
+| `!D.C.!` | Da Capo |
+| `!D.S.alfine!` | Dal Segno al fine |
+| `!D.S.alcoda!` | Dal Segno al coda |
+| `!D.C.alfine!` | Da Capo al fine |
+| `!D.C.alcoda!` | Da Capo al coda |
+| `!fine!` | Fine |
+| **Phrasing** | |
+| `!breath!` | Breath mark / comma |
+| `!shortphrase!` | Short phrase mark |
+| `!mediumphrase!` | Medium phrase mark |
+| `!longphrase!` | Long phrase mark |
+| **Fingering** | |
+| `!0!`–`!5!` | Finger numbers |
+| **Beaming** | |
+| `!beambr1!` | Beam break (single) |
+| `!beambr2!` | Beam break (double) |
+| **Tremolo** | |
+| `!trem1!`–`!trem4!` | Tremolo marks (1-4 slashes) |
+| **Glissando** | |
+| `!glissando(!` | Start glissando |
+| `!glissando)!` | End glissando |
+| **Style** | |
+| `!style=normal!` | Normal noteheads |
+| `!style=harmonic!` | Diamond noteheads |
+| `!style=rhythm!` | Rhythm (x) noteheads |
+| `!style=triangle!` | Triangle noteheads |
 
 Unknown decorations are preserved in `Decoration::Other(String)` by the parser.
 
@@ -577,7 +569,7 @@ The legacy `+name+` syntax (ABC v2.0) is equivalent to `!name!`.
 
 ---
 
-## 15. Voices (Multi-voice / Multi-staff) **parse, midi**
+## 15. Voices (Multi-voice / Multi-staff)
 
 ### Voice Definition (in header)
 
@@ -606,7 +598,7 @@ V:2
 C,G,C,G,|C,G,C,G,|
 ```
 
-### Voice Overlay **parse**
+### Voice Overlay
 
 The `&` symbol starts a parallel run aligned to the music since the
 last bar of the same voice. Repeating it (`&&`, `&&&`) introduces
@@ -624,7 +616,7 @@ work — the AST captures the structural marker only.
 
 ---
 
-## 16. Inline Fields **parse**
+## 16. Inline Fields
 
 Two forms per spec §3.2. Bracketed inline within a music line:
 
@@ -652,9 +644,9 @@ Allowed inline letters: `K:`, `L:`, `M:`, `Q:`, `I:`, `V:`, `N:`, `R:`, `r:`, `U
 
 ---
 
-## 17. Lyrics **parse**
+## 17. Lyrics
 
-### Aligned Lyrics (`w:`) **parse**
+### Aligned Lyrics (`w:`)
 
 Each syllable aligns to the next note. Content is captured verbatim
 into `Element::Lyrics { aligned: true, text }`; syllable-level parsing
@@ -676,7 +668,7 @@ Alignment controls (significant within the captured text):
 - `|` advances to the next bar line
 - `\-` is a soft hyphen across the next note
 
-### End-of-tune Lyrics (`W:`) **parse**
+### End-of-tune Lyrics (`W:`)
 
 Captured the same way as `w:` but with `aligned: false`:
 
@@ -687,7 +679,7 @@ W:
 W: This is the second verse
 ```
 
-### Continuation Lines (`+:`) **parse**
+### Continuation Lines (`+:`)
 
 A line beginning with `+:` extends the previous `w:`/`W:`/`s:` line.
 Its content is folded into the previous element's text, joined with
@@ -699,7 +691,7 @@ w: verse one of the syl-la-bles
 +: con-tin-ued lyric here
 ```
 
-### Symbol Lines (`s:`) **parse**
+### Symbol Lines (`s:`)
 
 `s:` lines pair symbols (chord symbols, decorations, annotations,
 `*` skips, `|` bar-aligns) with the music on the preceding line:
@@ -716,7 +708,7 @@ to the renderer.
 
 ## 18. Macros and User Symbols
 
-### User-Defined Symbol Shortcuts (`U:`) **standard only**
+### User-Defined Symbol Shortcuts (`U:`)
 
 Map single characters to decoration names:
 
@@ -729,7 +721,7 @@ U:~ = !turn!           ← override default ~ meaning
 The `U:` field is captured in `Header::other_fields` but its mappings
 are not yet applied to body parsing.
 
-### Macros (`m:`) **parse**
+### Macros (`m:`)
 
 Static macro:
 ```
@@ -747,7 +739,7 @@ parse time is not yet implemented.
 
 ---
 
-## 19. Line Continuation and Breaks **parse**
+## 19. Line Continuation and Breaks
 
 `\<newline>` is a typesetting hint that suppresses the visual line
 break; the next physical line is still parsed normally, so field-line
@@ -775,7 +767,7 @@ I:linebreak <none>     ← disable automatic line breaks (NOT YET)
 ABcd|$                 ← forces a line break ($ NOT YET)
 ```
 
-### Field Continuation **parse**
+### Field Continuation
 
 ```
 w:First part of lyrics

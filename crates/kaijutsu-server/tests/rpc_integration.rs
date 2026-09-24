@@ -584,11 +584,10 @@ async fn setup_execute_context(
     (client, kernel)
 }
 
-/// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md`, "The three
-/// rpc.rs shell paths take the hook path"): `execute_shell_command` runs
-/// kaish directly, bypassing `Broker::call_tool` entirely — before this
-/// ruling landed, a `PreCall Deny` matched on `shell_write` had no effect on
-/// `shell_execute`, because nothing on this path ever asked the broker. This
+/// `execute_shell_command` runs
+/// kaish directly, bypassing `Broker::call_tool` entirely, so it evaluates
+/// PreCall hooks itself: a `PreCall Deny` matched on `shell_write` refuses
+/// `shell_execute` too. This
 /// installs the hook directly on the live kernel's broker (reached via
 /// `start_server_with_kernel_handle`, same pattern `ledger_events_wire.rs`
 /// uses) and proves it now blocks the RPC end to end, not just a real MCP
@@ -1456,12 +1455,11 @@ fn test_active_ring_cap_enforced_over_rpc() {
     });
 }
 
-/// `getContextVersion` (docs/crdt-position-2026-08.md) is the projected,
-/// oplog-free counterpart to `getBlocks`'s `version` field — added so a
-/// caller that only needs staleness/gap detection never has to fetch (or, in
-/// the pre-flag-day world, decode) anything it would otherwise throw away.
-/// The two must never diverge: they both read `DocumentEntry::version()` off
-/// the same `BlockStore` entry (`documents.version()` vs
+/// `getContextVersion` is the projected, oplog-free counterpart to
+/// `getBlocks`'s `version` field — added so a caller that only needs
+/// staleness/gap detection never has to fetch or decode anything it would
+/// otherwise throw away. The two must never diverge: they both read
+/// `DocumentEntry::version()` off the same `BlockStore` entry (`documents.version()` vs
 /// `documents.query_versioned()`), so this equality assertion is the one that
 /// would actually fail if a future change split them onto different sources
 /// of truth. (Originally cross-checked against the now-deleted

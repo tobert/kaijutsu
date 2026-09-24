@@ -1,18 +1,15 @@
 # Character — the persistent someone a name resolves to
 
-> Design + rollout plan, 2026-09-05, revised 2026-09-06. Drawn from a
-> morning's conversation with Amy about her restart-every-session routine
-> and what kaijutsu needs so the morning is smooth, then revised through two
-> model reviews the same afternoon ("Review", below) and a readiness pass
-> the next day. **Slices 0a–4 are built; slices 5–8 remain planned.**
+> Design + rollout plan, 2026-09-05, revised 2026-09-06.
+> **Slices 0a–4 are built; slices 5–8 remain planned.**
 > Read "Current implementation" first; historical line references need rechecking.
 > Amy's statements are guidance, not rulings.
 
 ## Current implementation
 
-Read this section for current behavior; the design and original inventory below
-also describe work that has not shipped. `AGENTS.md` links here so the roadmap
-does not become an instruction to use nonexistent features.
+Read this section for current behavior; the design below also describes work
+that has not shipped. `AGENTS.md` links here so the roadmap does not become
+an instruction to use nonexistent features.
 
 | Part | Implemented contract |
 |---|---|
@@ -51,9 +48,6 @@ scheduled janitor/proctor work (slice 8). The sheet still has no
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.
-
-The original inventory and gap analysis below describe the pre-implementation
-state. Use this section and the rollout to distinguish them from current code.
 
 ## The problem, in one paragraph
 
@@ -247,95 +241,6 @@ the persistent someone; for text say code point, glyph, or `char`. The
 collision is real in code (about 300 uses of the word as a text unit across
 the crates), which is one reason the design below adds **no new Rust noun**
 for identity.
-
-## Original inventory — the parts
-
-Read before designing; most of the character is already in the kernel under
-other names.
-
-| Part of a character | Exists today as | Where |
-|---|---|---|
-| id + given name | `Principal { id, username, display_name }` — the id half survives; the name half melts into the sheet ("`auth.db` is a keyring") | `kaijutsu-types/src/principal.rs:16`, `ids.rs:20` |
-| handles, many per character | `credentials(fingerprint → principal_id)`; `principals.username UNIQUE`; `add-key --nick` chooses which principal a key joins (default: a new hash-named one) | server `auth_db.rs:37`, `:44`; default path `~/.local/share/kaijutsu/auth.db` (`:104`) |
-| presence, derived | the roster: `RosterEntity::{Principal, Context}`, liveness `Bound`/`Recent`, self-reported `Availability {Active, Idle, Away, Dnd}`; four `roster_*` tables; `kj roster` | `kernel/src/roster.rs:103`, `:192`, `:250`; `kernel_db.rs:1189–1281`; `kj/roster.rs` |
-| a role's rc bundle | `context_type` → `/config/rc/<type>/<verb>/`, loaded and sorted by `SXX-name` | `kaijutsu-types/src/paths.rs:144`; `rc/mod.rs` |
-| who plays | casts: one slot per role, keyed `(cast_id, role)`; per-context `cast_id` and `provider`/`model` override; resolution ladder explicit override → cast slot on `context_type` → registry default | `kernel_db.rs:1094`, `:1118`; `contexts.cast_id`; `kj/context.rs:704–722` |
-| a cadence that outlives contexts | a track: clock (`BeatPolicy`) + score context + attachments; `kj transport attach` creates the track stopped if absent; non-rotating attachments are first-class | `hyoushigi/mod.rs:45`, `:47`, `:125`; `kj/transport.rs:40–48`; `docs/tracks.md` §5 |
-| a window over a long log | `kj context hydrate --window N`: `[0, marker] ∪ last-N`, persisted per context | `kj/context.rs:1498`; `kernel_db.rs:5443` |
-| async notes reaching the next turn | the mailbox, a pull cursor over the block log | `llm/mailbox.rs:153` |
-| addressed sends | `kj drift push <ctx>`, staged queue, flush, cancel | `kj/drift.rs:37–70` |
-| idle detection | `contexts.last_activity_at` | `kernel_db.rs:612` |
-| driving a session | `kj drive [ctx] --prompt`; archived contexts refuse | `kj/drive.rs:31–35`, `:265` |
-| driving a Claude Code session | `kj cc send` over the socket protocol, with a liveness gate | `kj/cc.rs:55–59`; `docs/cc-peer.md` |
-| a Claude Code session as a context | `register_session` makes a `cc-<repo>-…` bridge context | `kaijutsu-mcp/src/lib.rs:1821`; label test `main.rs:560` |
-
-Two facts from that table drive the whole design:
-
-1. **A principal is already most of a character.** It has the opaque id, the
-   unique given name, a display name, and many credentials mapping into it.
-   The schema allows Amy's keys from every machine to resolve to one
-   principal; in practice `add-key` defaults the nick to a fingerprint hash,
-   so on 2026-09-05 zorak's auth db held her as three (`amy`, `amy/moltar`,
-   and a hash-named one for usagi). So the character is **a principal with
-   a sheet**, not a new identity beside the principal. Consolidating her
-   three is re-binding each key to one principal id — slice 2's
-   `add-key --as`, since before the melt every way to do it mints.
-2. **The kernel already has a roster that knows principals and contexts,
-   presence, and self-reported availability.** Inverting it onto characters
-   is grouping, not a new store.
-
-## Original gap analysis
-
-- **The sheet.** Nothing hangs off a principal but credentials. No
-  accountable-to, no default cast, no pointers to rc, memory, handoff, root.
-- **A model character's blocks are stamped `PrincipalId::system()`.** The
-  turn path inserts every provider-emitted block, thinking, text and tool
-  call alike, with the system principal (`kaijutsu-server/src/llm_stream.rs:1837`,
-  `:1862`, `:1909`, `:1932`, `:1965`; 21 stamp sites in that file, not all of
-  them provider output). The human's principal goes on the user's prompt block
-  (`rpc.rs:4686`), which is right. There is no principal for kaijutsu-lead,
-  so `system` is all there is to stamp. The consumer that shows this is the
-  wire: a block's author on the wire *is* its principal id (`rpc.rs:10234`,
-  `:10432`). Capabilities key on the caller's context (`kj/mod.rs:666`), the
-  ledger stamps the caller who tripped the gate (`kj/gate.rs:372`), and the
-  hydrator maps by role and kind (`llm/hydrate.rs:169`); none of them read a
-  block's principal. One production path does, and it is the one that
-  *wants* the change: the beat scheduler reads a model block's principal as
-  `played_by` and records it as the attachment's producer so a cell failure
-  routes back to the producing conversation (`kaijutsu-server/src/beat.rs:2213–2221`,
-  matched in `producer_ctx_for` at `:1481–1494`). With every model block
-  stamped `system` today, every producer records the same value and the
-  match returns whichever attachment iterates first. Distinct character
-  principals make it work as documented; the multi-producer path has no
-  test that would have caught the collapse, so slice 3 adds one. Nothing in
-  production compares a principal against `system()`; the only sentinel
-  equality is against `beat()` (`beat.rs:2199`). Sequence lanes tolerate
-  foreign principals by construction (`blocks/block_store.rs:353–362`).
-- **A context does not know which character performs it.** `contexts` has
-  `created_by`, `context_type`, `cast_id`, but no "played by".
-- **The auth database does not honor the principal's documented permanence.**
-  `Principal` says its id is permanent (`principal.rs:16–18`), but
-  `set_username` renames (`auth_db.rs:224`) and `remove_principal` deletes,
-  cascading credentials (`auth_db.rs:242`). A character that must retire
-  and never be deleted cannot rest on that as it stands. The keyring melt
-  removes both verbs along with the columns they mutate: there is no
-  username to rename, and removal is a key's business, not an identity's.
-- **rc reads one directory.** `load_scripts` takes `(context_type, verb)`
-  and nothing else. rc scripts see `KJ_CONTEXT`, `KJ_VERB`, `KJ_CONTEXT_TYPE`
-  (seeded 2026-09-05), `KJ_RC_DEPTH`, `KJ_PARENT_CONTEXT`, `KJ_FORK_INFO`,
-  `KJ_PARENT_BLOCK_COUNT`, `KJ_DRIFT_INFO` (`rc/mod.rs`, `run_kai_script`),
-  not a character.
-- **Drift addresses contexts only.** Push resolves through
-  `refs::resolve_context_arg` (`kj/refs.rs:80`) with a `DriftRouter`
-  fallback (`kernel/src/drift.rs:527`) for archived contexts the router
-  still holds; both grammars are one since `46878b28`. A character with no
-  context has nowhere to receive a note.
-- **The handoff is a file nothing reads.** Whole-file rewrite, one writer,
-  no per-entry stamp or author, no window, melting by hand.
-- ~~Distillation picks the source's cast silently.~~ Fixed 2026-09-05:
-  `summarize_with_model_for_caller` (`kj/mod.rs`) refuses when the caller's
-  and source's (provider, model) pairs differ and no `--distill-model` is
-  named; `kj drift pull` and `merge` take the flag.
 
 ## The design
 
@@ -1082,92 +987,3 @@ it.
   some asks by policy and escalates fewer to Amy. `docs/issues.md` "The
   escalation seat" is the earlier sketch of the same idea.
 
-## Review
-
-- **kaibo, cast `crusoe` (GLM-5.2 synth, DeepSeek-V4-Flash explorer),
-  2026-09-05, whole files attached.** Confirmed every citation but two.
-  Corrected: the attribution gap was misread (model blocks carry `system`,
-  not the driving human; the cited lines were `TurnFlow::Failed` publishes),
-  and the track citation pointed at the attachment half only. Narrowed the
-  blast radius of re-stamping model blocks to the wire author projection.
-  Confirmed the rc union and the cross-database reference are consistent
-  with the loader and the schema, and supplied the sort-once and
-  link-name-collision notes.
-- **kaibo `deliberate`, cast `gpt-deliberate` (GPT-5.6 synth on the batch
-  lane, GPT-5.6 explorer), 2026-09-05, dossier
-  `kaibo://cas/866c1b75…`.** Adopted: the requester versus effective-actor
-  split and its attribution matrix; provenance not role as the criterion;
-  the ledger redemption invariant; the block-id lane change; the
-  kernel-owned immutable `name` and the no-deletion rule, after it showed
-  `auth.db` renames and deletes principals; the handoff on an ordinary
-  context instead of a track score; explicit `@name` drift addressing in
-  place of a liveness-dependent fallback; no automatic rc inheritance up
-  the accountability chain; rc output keeps its `created_by` author; the roster inversion was gated on wiring the refresh loop, which
-  turned out to be wired already; slice 1 trimmed
-  to identity and attribution with the sheet's other columns arriving with
-  their readers; the `PrincipalId` consumer audit. Declined, for Amy:
-  a distinct `CharacterId` (see "Character = principal + sheet"); deferring the rc union
-  outright (kept, ordered after the handoff). Every citation acted on here
-  was re-read in the source before it was written down.
-
-- **PrincipalId consumer audit (Opus lane, read-only, 2026-09-05),
-  `scratchpad/audit-principal-consumers.md`.** Every reader classified.
-  Findings folded in above: the beat scheduler's `played_by` read, the
-  tool-server authoring split, the gate-resume seed, the bridge's
-  per-session author principal, and the absence of any `system()`
-  comparison or principal-keyed cache. One headline was an artifact: it
-  reported the `actor_principal` binding as pre-existing, but that binding
-  is the refactor lane's in-progress edit to the same file (zero occurrences
-  in HEAD at the time). A read-only lane running beside builders must read
-  `git show HEAD:<path>`, not the working tree.
-
-- **kaibo, cast `crusoe` (GLM-5.2 synth), 2026-09-05 afternoon, on the
-  MCP bridge and SSH client changes, whole files attached.** Found no
-  defect in the session-end guard, the ping hiding, the fingerprint parity
-  with `auth_db`, or the flag/env precedence. Two follow-ups adopted: a
-  `Stale` probe verdict is confirmed by a second probe before a socket is
-  unlinked, because BSD-derived systems return ECONNREFUSED for a live
-  listener with a full backlog where Linux returns EAGAIN; and an empty
-  environment value counts as unset. Noted and accepted: a session whose
-  end event carries no session id, or whose scraped id happened to be
-  right with no earlier event, stays un-archived, and the warn line names
-  why.
-- **kaibo, cast `crusoe-ds4` (DeepSeek-V4-Flash), 2026-09-05 afternoon, on
-  the kernel and server changes, whole files attached.** The authorship
-  classification and `KJ_CONTEXT_TYPE` threading are clean. Two defects
-  adopted: the distillation refusal compared `DriftRouter` pairs, which
-  exist only for explicitly pinned contexts, so a default-configured caller
-  pulling from a pinned expensive source, the very case it was built for,
-  slipped through; both sides now resolve through the turn path's ladder.
-  And `kj drift push` could deliver into an archived context through the
-  router fallback, mutating retained work and firing its `drift` rc; push
-  now refuses an archived target as `kj drive` does. Minor: the roster
-  loop test's two-second deadlines were a flake vector under load.
-
-- **kaibo, cast `crusoe` (GLM-5.2 synth, DeepSeek-V4-Flash explorer),
-  2026-09-06, whole-file attach of this design plus `auth_db.rs`,
-  `principal.rs`, `ids.rs`.** A readiness review of the keyring melt before
-  any code. Confirmed the structural claim (nothing joins on a username;
-  authentication resolves from the fingerprint alone and never compares the
-  SSH login user), the no-cache claim, the WAL implication, the slice 1→2→3
-  ordering and both of its stated reasons, the rebind mechanic against the
-  primary key, and the lockout recovery. Found and fixed here: the
-  anonymous auto-register path at `ssh.rs:1111`, a *runtime* minting path
-  the design had missed entirely; `materialize_context_shell_for`
-  (`rpc.rs:9307`) as a third compile-time name read; `add-key`'s new
-  `kernel.db` dependency; the wipe-and-rebind scenario; and five stale
-  citations — the hydrate window (`kernel_db.rs:5413` → `:5443`), three
-  `llm_stream.rs` anchors that sat near their stamp sites rather than on
-  them, and the tool-result stamp (`:2376` → `:2396`). Every correction was
-  re-read in the source before it was applied, which is how the
-  `allow_anonymous` finding sharpened: the mode is off in `production()`
-  (`ssh.rs:241`) and on only in the ephemeral test config (`:226`), so it
-  binds to `hajime` rather than needing to survive as a minting path.
-
-## Records
-
-- Design artifact, three passes with concept art:
-  https://claude.ai/code/artifact/3cd90372-dc4c-4fa9-8255-a66d4c16d824
-- Sheet sketches (superseded by the third pass above):
-  https://claude.ai/code/artifact/7d9b47f7-b528-4306-8a77-241fce26dd93
-- exomemory `daily/2026-09-05.md` carries the fleet-facing decision.

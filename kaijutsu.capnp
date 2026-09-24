@@ -454,8 +454,7 @@ struct Refusal {
 }
 
 # What the PreCall hook phase WOULD have decided about a command that was
-# never run. See `shellDryRun` and docs/gate-and-shell-split.md, "Dry-run
-# mode".
+# never run. See `shellDryRun` and docs/kaish-integration.md.
 enum ShellDryRunOutcome {
   # Every matching hook let the call through.
   wouldProceed @0;
@@ -2190,15 +2189,12 @@ interface Kernel {
   # Get context version history for timeline scrubber
   getContextHistory @48 (contextId :Data, limit :UInt32, trace :TraceContext) -> (snapshots :List(VersionSnapshot));
 
-  # ── RPC authoring (docs/crdt-position-2026-08.md, migration step 3) ───────
+  # ── RPC authoring (docs/change-feed.md, "The feed is read-only, and that
+  # is the whole client contract") ────────────────────────────────────────
   #
   # The verbs that let a client author blocks WITHOUT being a storage replica.
-  # `kaijutsu-mcp` was the last client that still pushed ops; these verbs
-  # replaced that path, and the 2026-08-15 flag day then retired `pushOps`
-  # (@37, zero production callers) outright — the Option-2 client contract
-  # ("consume a projected stream, author via RPC") is real rather than
-  # aspirational, and concurrent merge into kernel documents is now
-  # structurally impossible rather than merely unused.
+  # There is no client-facing RPC for editing block text; concurrent merge
+  # into kernel documents is structurally impossible, not merely unused.
   #
   # Why not the existing `block_create` MCP tool: it hardcodes `after`,
   # `Status::Done` and `ContentType::Plain`, and its `metadata` argument is
@@ -2492,7 +2488,7 @@ interface Kernel {
   reportMidiPresence @90 (device :Text, present :Bool, backend :Text, ports :List(MidiPortFact), epochNs :UInt64, trace :TraceContext, sinkHost :Text) -> ();
 
   # Retired: HookAction::Ask now runs through the approval ledger
-  # (docs/gate-and-shell-split.md) and announces via subscribeLedgerEvents.
+  # (docs/gate-resume.md) and announces via subscribeLedgerEvents.
   retired93 @93 ();
 
   # Kernel-wide: a ledger change can originate from any call path (a gated
@@ -2541,7 +2537,7 @@ interface Kernel {
   # is recorded as an abandoned ask row and returned in the report; the
   # caller is free to ignore it, and nothing here can block anyone.
   #
-  # docs/gate-and-shell-split.md, "Dry-run mode".
+  # docs/kaish-integration.md.
   shellDryRun @103 (contextId :Data, command :Text, trace :TraceContext) -> (report :ShellDryRunReport);
 
   # ── Sink-fed audio inventory (docs/audio-daemon.md "One inventory owner") ──

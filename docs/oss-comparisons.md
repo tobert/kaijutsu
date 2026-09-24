@@ -445,13 +445,9 @@ with an explorer and synthesis agent. Its prompt composition has one owner,
 orientation/house-rule layers. Tool-bearing phases share generated kaish
 guidance; oneshot and offline synthesis explicitly lack project tools.
 
-The [complete rendered prompt resource](kaibo-prompts-current.md) preserves
-the current text. The [Kaibo implementation report](kaibo-prompt-proposal.md)
-maps the prompt contracts back into its roles, with proposed evidence and review
-passages, auxiliary-prompt changes, and tests. That report pins the source
-and [explorer PR #183](https://github.com/tobert/kaibo/pull/183), which names
-whether an explorer reports to the caller or a synthesis agent. These are
-distinct reader needs even when the reading procedure is shared.
+[Explorer PR #183](https://github.com/tobert/kaibo/pull/183) names whether an
+explorer reports to the caller or a synthesis agent. These are distinct
+reader needs even when the reading procedure is shared.
 
 Lessons for Kaijutsu: prompt previews should disclose the layers they omit;
 evidence status should survive a handoff; a source citation needs an explanation
@@ -631,9 +627,8 @@ adapters that actually request it. Raw review output remains in the private
 review archive. These are source-level conclusions, not model-effectiveness
 measurements or a live deployment check.
 
-The [Kaibo proposal](kaibo-prompt-proposal.md) uses these checked review mistakes
-as examples for evidence status, grounding, and handoff tests. A cited claim
-still needs an explanation of how its source establishes the behavior.
+A cited claim still needs an explanation of how its source establishes the
+behavior.
 
 ## Maintaining this dossier
 

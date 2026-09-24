@@ -264,9 +264,8 @@ fn session_start_renames_label_once_and_listener_stays_live() {
     });
 }
 
-/// **Slice 0 of the storage-position migration** (docs/crdt-position-2026-08.md,
-/// "Build notes"): the acceptance test that has to exist *before* the MCP is
-/// moved off client-side replication.
+/// **The acceptance test that has to exist *before* the MCP is moved off
+/// client-side replication.**
 ///
 /// **Written before the migration, and it did its job.** At the time, its
 /// sibling `tool_after_completes_the_call_block_remote_mode` (deleted —
@@ -282,9 +281,9 @@ fn session_start_renames_label_once_and_listener_stays_live() {
 /// *contract* (hook fires ⇒ server holds a correct ToolCall/ToolResult pair)
 /// rather than the mechanism.
 ///
-/// (The sibling is gone now, not just strengthened: once slice 4 of
-/// docs/crdt-position-2026-08.md deleted `RemoteState.synced` entirely,
-/// asserting against it stopped being possible, and its round-trip claim —
+/// (The sibling is gone now, not just strengthened: once `RemoteState.synced`
+/// was deleted entirely, asserting against it stopped being possible, and
+/// its round-trip claim —
 /// "the kernel accepted the pair and the event feed carried it back" — is a
 /// strict subset of what this test already proves via the server-authoritative
 /// read. Keeping both would have meant keeping a mirror alive solely so a
@@ -489,7 +488,7 @@ fn hook_authored_blocks_belong_to_the_agent_session() {
 }
 
 /// RPC authoring, end to end over the real wire — `authorBlock @106` and
-/// `completeBlock @107`, migration step 3 of `docs/crdt-position-2026-08.md`.
+/// `completeBlock @107`.
 ///
 /// This is the surface that replaces client-side replication, so it is
 /// tested against the *server's* view: everything asserted below is read

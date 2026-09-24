@@ -16,9 +16,9 @@ and that half was reversed a day later.
 > anything block on the wire? so kernel would instruct the client it is
 > working, client can block, but they don't block on rpc."*
 
-This supersedes the blocking wait that shipped in Slice 4.6
-(`gate-and-shell-split.md`), which was verified live holding 81.2s. Deleting
-it is the point, not a cost: see "What this deletes".
+This supersedes the blocking wait that shipped earlier, which was verified
+live holding 81.2s. Deleting it is the point, not a cost: see "What this
+deletes".
 
 **Status, 2026-09-20:** most of what "Still open" below narrates is live
 behavior, not pending work — read it as a description, not a TODO list. Two
@@ -28,37 +28,15 @@ patient hold (`kaijutsu-types/src/timeout.rs`; still read by
 continuation-admission audit, which `docs/issues.md` still points back at
 this section by name.
 
-## Captured result review (September 16)
+## Captured result review
 
-PostCall and OnError approval reviews work that already ran. Interactive and
-approved commands, including authored structured kj calls, retain execution and
-the current ask in a durable checkpoint,
-publish Waiting blocks, and consume the answer inside their ordered hook
-snapshot. Approval continues remaining hooks; it never executes the command or
-earlier hooks again. These asks use `hook_result` origin, carry no executable
-source, and are excluded from generic retry redemption and the execution/resume
-queue. Only the retained execution owner consumes the answer. Inspect them
-with `kj ledger list --origin hook_result`.
-
-Cancellation or dropping the wait abandons an unanswered ask. Restart preserves
-the captured execution but reports interrupted review; it cannot recreate the
-in-memory hook snapshot. Authored structured calls return a typed Pending
-refusal while the kernel worker retains review; the RPC does not wait for a
-human. Disconnect leaves accepted structured work running. Kernel shutdown
-cancels retained review and joins settlement without repeating execution.
-Quiet structured calls use the same review owner without authoring transcript
-blocks. `kj ledger show <request-id>` includes the captured execution and final
-result; its structured data exposes `result_review.captured` and
-`result_review.settled`. Every ask in a sequence retains the same invocation link.
-Streaming commands retain review on the kernel worker too; their connection
-keeps the execution ID active until settlement and output delivery. Interrupt
-or disconnect cancels the caller token. Kernel shutdown cancels and joins review
-settlement, preserving captured execution even after the RPC adapter departs.
-MCP shell commands use the same review owner. Async calls keep their operation
-receipt; foreground calls return typed Pending while execution remains retained.
-Their kernel worker survives caller disconnect. Other MCP tools still lack a
-review owner and fail escalation before creating an ask. See
-`docs/kaish-integration.md` for the caller inventory.
+PostCall and OnError approval reviews work that already ran: execution and the
+current ask retain in a durable checkpoint, the pair publishes `Waiting`, and
+approval continues remaining hooks without re-executing the command or earlier
+hooks. `kj ledger list --origin hook_result` lists these asks; `kj ledger show
+<request-id>` exposes `result_review.captured`/`result_review.settled`. See
+`docs/kaish-integration.md` for the full caller inventory and cancellation/shutdown
+contract.
 
 ## Why blocking could never reach where Amy wants it
 
@@ -97,12 +75,10 @@ Checked against the code on 2026-08-22, not recalled:
   and `BlockKind::Notification` is LLM-visible. Telling a model its ask
   resolved means authoring a block — no new channel.
 - **The error vocabulary is already right.** `GateUnavailable` is distinct
-  from `Denied` by Amy's 2026-08-17 guidance, and carries a reason the model
-  reads in full — shipped 2026-09-01 as `RefusalKind::GateUnavailable` vs
-  `RefusalKind::Denied`, both cases of one `McpError::Refused(Refusal)`
-  rather than the separate `McpError` variants this was written against
-  (`docs/gate-and-shell-split.md`, "Amy's rulings, 2026-08-17", item 2's
-  shipped-shape note). A third state (`Pending`) joins them rather than
+  from `Denied`, and carries a reason the model
+  reads in full: `RefusalKind::GateUnavailable` vs
+  `RefusalKind::Denied`, both cases of one `McpError::Refused(Refusal)`.
+  A third state (`Pending`) joins them rather than
   replacing either.
 
 **Verified absent:** `create_ask` does no deduplication — every call makes a
@@ -225,8 +201,7 @@ Three rules this has to keep, and the third is what makes it safe:
 2. **An answer is single-use, and a denial is an answer.** A decided ask —
    allowed *or* denied — is delivered to exactly one retry and is then
    spent. Allowed authorizes one execution and never becomes a standing
-   permission; that is what rules are for (see `gate-and-shell-split.md`,
-   "Digest-keyed allow-always").
+   permission; that is what rules are for (see `docs/gate-policy-tuning.md`).
 
    Denied has to be redeemable for the same reason, found while writing
    slice 1: if only allowed asks were consumable, a model whose request was
@@ -411,12 +386,11 @@ was the outlier. A related gap is disclosed rather than fixed:
 
 ## Slices
 
-1. **The call stops blocking, and an answered ask is redeemable.** SHIPPED
-   (`d8d45d39`). Two halves that cannot be separated — see below.
-2. ~~The persisted action.~~ **Deleted 2026-08-23**, the day after it landed.
-3. ~~The executor.~~ **Deleted with it** — there is nothing durable to execute.
-4. **Abandon on boot, and pin the cwd.** SHIPPED (`8123a873`, `f880285a`),
-   with the digest fix (`ee8b6749`).
+1. **The call stops blocking, and an answered ask is redeemable.** SHIPPED.
+   Two halves that cannot be separated — see below.
+2. ~~The persisted action~~ and 3. ~~the executor~~. **Deleted** — there is
+   nothing durable to execute.
+4. **Abandon on boot, and pin the cwd.** SHIPPED.
 5. **Delete `timeout::gate` and the patient hold.** The ladder is what still
    makes a retry work, so it comes out only once the rest is deployed and
    living.
@@ -457,7 +431,6 @@ executes** rather than a retry it has to reconstruct byte-for-byte.
   symptoms".
 - Which idiom this family gets, and where the family stops:
   `docs/error-chain.md`, "The one shared shape, and where it stops".
-- The gate's own doctrine: `docs/gate-and-shell-split.md`.
 
 **This grew into most of the durable-resume design "Rescoped" above deleted.**
 `docs/issues.md` split the work in two: this contract was structured refusals
@@ -631,59 +604,24 @@ carry what it was asked under. It is one column, not a claim protocol.
 ### Slices: the wire and execution build
 
 1. **The shared types.** SHIPPED. `kaijutsu-types::refusal` and the capnp
-   declarations. No behavior change.
+   declarations.
 2. **`McpError` carries a `Refusal`.** SHIPPED. The three gate variants
-   collapsed to `McpError::Refused(Refusal)` — the kind carries what the
-   variants did — and the hookless `shell_write` gate produces a real
-   verdict for the first time (finding 1). `settled_block_status()` reads
-   the kind and keeps its one mapping.
-
-   It also closed something not in the plan: `PhaseOutcome::Deny` carried a
-   reason the LLM-visible path discarded, which is why `docs/issues.md`'s
-   first hard receipt showed a broken hook as a bare "denied by hook
-   shell-escape-guard". Denials keep their reason now — a D-28 change, and
-   the one `docs/gate-and-shell-split.md` already argued for.
-3. **The wire.** Seven result structs, the server side, the client side,
-   `RpcError::Refused` → `CallError::Refused`. Two helpers carry a refusal
-   across: `set_refusal` on the server, `refusal_from_capnp` on the client,
-   both total matches so a new kind is a build error.
-4. **The consumers.** SHIPPED, and larger than expected. The client wrappers
-   kept their signatures, so app/mcp/acp needed no changes and their existing
-   error rendering picked up the structured `Display` — reason, ask id and
-   remedy — for free.
-
-   What did need work was **the model's own tool path**, a seventh
-   block-settling site that never reached `settled_block_status()`.
-   `llm_stream.rs` derived `final_status` from `is_error`, so a pending ask
-   settled its ToolCall/ToolResult pair `Error` and reached the model as
-   `"Execution error: …"`. That is the collapse this lane exists to remove,
-   on the surface where it costs the most: a model reads a crash, retries,
-   and mints another ask. `map_tool_dispatch_result` now returns the settled
-   status beside the error flag, because the two answer different questions —
-   `is_error` is the D-28 channel and is always true for a refusal; `status`
-   is what the blocks settle to and is `Waiting` for a pending one.
-
-   Each kind also carries a stable `ErrorPayload.code` (`gate.pending`,
-   `gate.denied`, `gate.unavailable`, `capability.*`), following
-   `tool.timeout`'s precedent, so a consumer branches on a code rather than
-   on prose.
-5. **Approval executes.** SHIPPED. The cwd and `exec_source` columns, the
-   block link, the free-variable snapshot, the executor branch in the
-   `ledger.changed` driver, and the split of `PENDING_REASON` into an
-   executes text and a retry text. The digest set match STAYS (below).
-
-   **Live for every shell origin.** The first live probe after deploy
-   showed the gap: with hooks installed, every production shell ask comes
-   through `hook_gate.rs`, which carried no source, no plan and no
-   variables, so approval executed for nothing and, worse, an ALLOW rule
-   remembered on `dd of=${DEV}` would have redeemed every future value of
-   `DEV`. The hook gate now plans a shell-shaped call the way the shell
-   gate plans a submission: the command rides as `exec_source`, the
-   planned statements feed the snapshot, and the free and bound names go
-   on the statement so the rule refusal fires. The RPC shell box's own
-   pair fills; the MCP `shell` path gets a pair authored and a wake. A
-   command that does not parse keeps the retry shape. The wire tests still
-   synthesize the link, because the harness installs no hook.
+   collapsed to `McpError::Refused(Refusal)`, so a hookless `shell_write`
+   gate produces a real verdict too; `settled_block_status()` reads the
+   kind and keeps its one mapping.
+3. **The wire.** SHIPPED. Seven result structs, the server and client
+   sides, `RpcError::Refused` → `CallError::Refused`.
+4. **The consumers.** SHIPPED. Client wrappers needed no signature changes;
+   the model's own tool path (`llm_stream.rs`) needed the fix —
+   `map_tool_dispatch_result` now returns the settled status beside the
+   error flag, so a pending ask settles `Waiting` instead of `Error` and
+   reaching the model as a crash.
+5. **Approval executes.** SHIPPED. Live for every shell origin: `hook_gate.rs`
+   plans a shell-shaped call the way `shell_gate.rs` plans a submission, so
+   the command rides as `exec_source` and the free/bound names go on the
+   statement — without this, an ALLOW rule remembered on `dd of=${DEV}`
+   would redeem every future value of `DEV`. See "Slice 5: approval
+   executes" below.
 
 ### Slice 5: approval executes
 

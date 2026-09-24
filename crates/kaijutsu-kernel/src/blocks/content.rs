@@ -3,8 +3,7 @@
 //! Each block owns its content as a plain `String`, plus a `BlockHeader` for
 //! metadata (kind, role, status, parent_id, etc.). The kernel is the sole
 //! sequencer for every mutation (CLAUDE.md "Durable state and the wire"), so
-//! no block ever needs concurrent-branch reconciliation. See
-//! `docs/crdt-position-2026-08.md`.
+//! no block ever needs concurrent-branch reconciliation.
 
 use kaijutsu_types::{
     BlockHeader, BlockId, BlockSnapshot, ContentType, InputEdge, PrincipalId, Status, TaskStatus,

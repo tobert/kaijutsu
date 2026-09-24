@@ -637,8 +637,7 @@ impl KjDispatcher {
         // in-memory `HookTables`), never through `Broker::call_tool`/
         // `evaluate_phase` — the recovery path for a self-inflicted
         // `PreCall Deny("*")` lockout that would otherwise deny
-        // `builtin.hooks`' own admin tools (`docs/gate-and-shell-split.md`
-        // Slice 1). Broker-wide, not scoped to any context — same
+        // `builtin.hooks`' own admin tools. Broker-wide, not scoped to any context — same
         // exemption rationale as `kj mcp`/`kj policy`.
         if cmd == "hook" {
             return self.dispatch_hook(&argv[1..], caller).await;

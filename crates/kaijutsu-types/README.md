@@ -134,7 +134,7 @@ Named constructors: `text()`, `thinking()`, `tool_call()`, `tool_result()`,
 
 - [ ] Replace `Identity` struct with `Principal`
 - [ ] Update agent registration to use `PrincipalId`
-- [x] `BlockDocument` removed 2026-08-09 (`BlockStore` was already the live model — see `docs/crdt-position-2026-08.md`)
+- [x] `BlockDocument` removed 2026-08-09 (`BlockStore` was already the live model)
 
 ### kaijutsu-server — pending
 

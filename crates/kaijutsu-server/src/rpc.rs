@@ -4021,8 +4021,7 @@ impl kernel::Server for KernelImpl {
     ///
     /// Context/principal resolution mirrors `execute_shell_command`'s, so a
     /// hook matched on context or principal sees the same call site it would
-    /// see on the enforcing path. See `docs/gate-and-shell-split.md`,
-    /// "Dry-run mode".
+    /// see on the enforcing path. See `docs/kaish-integration.md`.
     fn shell_dry_run(
         self: Rc<Self>,
         params: kernel::ShellDryRunParams,
@@ -4152,7 +4151,7 @@ impl kernel::Server for KernelImpl {
     }
 
     /// Retired: HookAction::Ask now runs through the approval ledger
-    /// (docs/gate-and-shell-split.md) and announces via subscribeLedgerEvents.
+    /// (docs/gate-resume.md) and announces via subscribeLedgerEvents.
     fn retired93(
         self: Rc<Self>,
         _params: kernel::Retired93Params,
@@ -5790,8 +5789,8 @@ impl kernel::Server for KernelImpl {
     }
 
     /// Reads `DocumentEntry::version()` directly and serializes nothing
-    /// else. Clients use this for staleness/gap detection without decoding
-    /// DTE — see `docs/crdt-position-2026-08.md`.
+    /// else. Clients use this for staleness/gap detection without fetching
+    /// or decoding anything they would otherwise throw away.
     fn get_context_version(
         self: Rc<Self>,
         params: kernel::GetContextVersionParams,
@@ -6489,8 +6488,7 @@ impl kernel::Server for KernelImpl {
     }
 
     /// Author one block on behalf of a client that never sequences blocks
-    /// itself — the kernel is the sole sequencer. Migration step 3 of
-    /// `docs/crdt-position-2026-08.md`.
+    /// itself — the kernel is the sole sequencer.
     ///
     /// The reservation half of Amy's reserve-then-flow model: short, holds
     /// nothing, returns an id. A ToolCall authored here sits at whatever

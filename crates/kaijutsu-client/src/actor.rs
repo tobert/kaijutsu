@@ -1187,8 +1187,8 @@ impl ActorHandle {
     }
 
     /// Author one block over RPC. See `crate::rpc::AuthorBlock` for the
-    /// field meanings and `docs/crdt-position-2026-08.md` for why this
-    /// exists.
+    /// field meanings and `docs/change-feed.md`, "The feed is read-only, and
+    /// that is the whole client contract", for why this exists.
     pub async fn author_block(
         &self,
         req: crate::rpc::AuthorBlock,

@@ -551,8 +551,7 @@ pub enum ShellDryRunOutcome {
 
 /// One dry-run PreCall report. Advisory in the strongest sense: there is no
 /// verdict here to honor, because the command this describes runs somewhere
-/// the kernel does not control. See `docs/gate-and-shell-split.md`, "Dry-run
-/// mode".
+/// the kernel does not control. See `docs/kaish-integration.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellDryRunReport {
     pub outcome: ShellDryRunOutcome,
@@ -1938,10 +1937,8 @@ impl KernelHandle {
     }
 
     /// Author one block over RPC — no separate replication step required.
-    ///
-    /// The client half of migration step 3
-    /// (`docs/crdt-position-2026-08.md`). See [`AuthorBlock`] for the field
-    /// meanings; the reservation/flow split is documented on the schema.
+    /// See [`AuthorBlock`] for the field meanings; the reservation/flow
+    /// split is documented on the schema.
     #[tracing::instrument(skip(self, req), name = "rpc_client.author_block")]
     pub async fn author_block(&self, req: &AuthorBlock) -> Result<BlockId, RpcError> {
         let mut request = self.kernel.author_block_request();
@@ -2458,7 +2455,7 @@ impl KernelHandle {
     /// For a client whose commands run somewhere the kernel does not
     /// control. Nothing here can refuse anything: the return is a report,
     /// not a verdict, and the kernel neither runs the command, opens a gate,
-    /// nor wakes a context (`docs/gate-and-shell-split.md`, "Dry-run mode").
+    /// nor wakes a context (`docs/kaish-integration.md`).
     #[tracing::instrument(skip(self, command), name = "rpc_client.shell_dry_run")]
     pub async fn shell_dry_run(
         &self,

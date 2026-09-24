@@ -18,7 +18,7 @@ on every event; every reader (cold prompts/resources/completions, and the shell
 completion poll) treats a bump only as "look again" and reads the server
 directly over RPC. The prior design fetched a server snapshot to seed a
 now-deleted `RemoteState.synced` mirror; nothing here builds or holds a document
-at all today (`docs/crdt-position-2026-08.md`, "The mirror that stopped being a
+at all today (`docs/devlog.md`, "The mirror that stopped being a
 mirror"). Tools: `shell`, `register_session`, `whoami`, `invoke_peer`,
 `list_kernel_tools`. The compose-input tools
 (`read_input`/`write_input`/`edit_input`/`submit_input`) were removed

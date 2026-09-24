@@ -290,8 +290,8 @@ impl KernelBridge {
         Ok(result.block_id)
     }
 
-    /// Run one kaish statement as the human — the gated path
-    /// (`docs/gate-and-shell-split.md`), what `:!<statement>` runs through.
+    /// Run one kaish statement as the human — the gated path,
+    /// what `:!<statement>` runs through.
     /// Output arrives as blocks on the context feed; nothing is returned
     /// here to print.
     pub async fn shell_execute(&self, context_id: ContextId, code: &str) -> Result<BlockId> {

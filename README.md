@@ -252,6 +252,7 @@ text rendering, theming, and the UI architecture.
 | [docs/instrument-design.md](docs/instrument-design.md) | The instrument stance — principles for system-message design |
 | [docs/architecture/](docs/architecture/) | Code-verified architecture map, per crate |
 | [docs/devlog.md](docs/devlog.md) | The story of how kaijutsu took shape — arcs, decisions, lessons |
+| [docs/orchestration.md](docs/orchestration.md) | Playing multi-model, multi-context work — at the `kj` prompt or through MCP |
 | [docs/telemetry.md](docs/telemetry.md) | OpenTelemetry integration |
 | [docs/abc-reference.md](docs/abc-reference.md) | ABC music notation reference |
 | [docs/issues.md](docs/issues.md) | Live work items not yet in code |

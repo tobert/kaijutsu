@@ -831,7 +831,7 @@ impl HookListener {
                 // carries the output too. What happens here instead is the
                 // dry run — the kernel's PreCall hooks score a command that
                 // is about to run in ANOTHER harness, so the ledger learns
-                // from it (`docs/gate-and-shell-split.md`, "Dry-run mode").
+                // from it (`docs/kaish-integration.md`).
                 //
                 // Detached and never awaited. This path must not add
                 // latency to the harness's own reply, and must not fail it:
@@ -911,8 +911,7 @@ impl HookListener {
     //
     // Remote mode authors over RPC (`authorBlock` / `completeBlock`) — the
     // kernel is the writer, and every reader here reads the kernel back
-    // directly (there is no local mirror; `RemoteState.synced` was deleted
-    // in docs/crdt-position-2026-08.md slice 4). On failure: still LOUD
+    // directly (there is no local mirror). On failure: still LOUD
     // (`tracing::error!`, not `warn!`; the caller folds the returned message
     // into the hook's `context` field) but never fails the hook call itself —
     // recording an event must not block the user's actual action. Local mode
@@ -1063,10 +1062,9 @@ impl HookListener {
         };
         let principal = self.author_principal();
 
-        // Reserve, then flow (docs/crdt-position-2026-08.md, decision 2).
-        // Three RPCs rather than one, deliberately: the call is reserved at
-        // Running, the result arrives parented to it, and only then does the
-        // call move to its terminal state.
+        // Reserve, then flow. Three RPCs rather than one, deliberately: the
+        // call is reserved at Running, the result arrives parented to it,
+        // and only then does the call move to its terminal state.
         //
         // A `tool.after` hook already knows the outcome, so we could author
         // the call straight to Done and save a round trip on a path that

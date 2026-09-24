@@ -1,15 +1,14 @@
 # Fork filters — interval selection, presets, seams
 
-Status: design locked 2026-06-12 (Amy + Fable). **IMPLEMENTED 2026-06-12
-(slices 1–4):** splice module, interval algebra (`kaijutsu_kernel::blocks::selection`),
-`preset_args` + factory presets, `parse_range`, recall+compose at fork
-(`resolve_fork_selection`), hydration-policy travel, and the CLI surface
-(`--include`/`--exclude` ranges; `--shallow`/`--depth`/`max_blocks` retired →
-`--include end-N:`). Coding plan/log in `tsugi.md` (ephemeral); backlog entries
-in `docs/issues.md`; player-side consequences in `docs/chameleon.md`. The
-windowed-notation **pull primitive** ($HEARD / fork-carry / marker-archive,
-"slice 5") and tick-endpoint grammar remain deferred — they belong to the
-Chameleon thread, not this core.
+Fork selection ships as: the seam module, interval algebra
+(`kaijutsu_kernel::blocks::selection`), `preset_args` + factory presets,
+`parse_range`, recall+compose at fork (`resolve_fork_selection`),
+hydration-policy travel, and the CLI surface (`--include`/`--exclude` ranges;
+`--shallow`/`--depth`/`max_blocks` retired → `--include end-N:`). Backlog
+entries in `docs/issues.md`; player-side consequences in `docs/chameleon.md`.
+The windowed-notation **pull primitive** ($HEARD / fork-carry /
+marker-archive) and tick-endpoint grammar remain deferred — they belong to
+the Chameleon thread, not this core; see "Deferred" below.
 
 ## Mental model
 

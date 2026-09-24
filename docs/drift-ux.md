@@ -111,31 +111,20 @@ B and D compose, and together they are probably the closest thing to what cc
 messaging *feels* like without adopting its spend model. That is an
 observation, not a recommendation.
 
-**A GLM review (2026-08-12) pushed back hard on deferring this at all, and the
-argument deserves to be on the record:** for the music case specifically, gap
-#2 *is* the problem, not a follow-on. Slices 1 and 3 make the plumbing work;
-until something wakes the receiver, material handed mid-piece sits unread
-until that player happens to take a turn — "the difference between an
-instrument and a message board". It also observed that shape B is closer to
-free than the doc implies: `deliver_drift` already runs the target's `drift`
-rc lifecycle on every delivery, `kj drive` already publishes
+**For the music case specifically, gap #2 is the problem, not a follow-on.**
+Slices 1 and 3 make the plumbing work; until something wakes the receiver,
+material handed mid-piece sits unread until that player happens to take a
+turn. Shape B is close to free: `deliver_drift` already runs the target's
+`drift` rc lifecycle on every delivery, `kj drive` already publishes
 `TurnFlow::Requested`, and the shipped `S40-cache.kai` already runs on
 arrival — so shape B is roughly "add an `S50-drive.kai` for musician
-contexts".
-
-One part of that review I checked and **disagree with**: it argued shape B
-inherits shape C's consent flaw because the rc lifecycle runs under the
-sender's `KjCaller`. The principal *is* the sender's (`lifecycle.rs:376`),
-but capabilities gate on `caller.context_id` (`kj/mod.rs:563-576`), and the
-rc shell is materialized against the **target** context (`lifecycle.rs:388`,
-`kj_builtin.rs:638`). So `kj drive` inside a drift rc script authorizes
-against the *target's* binding — the right direction for consent, and shape B
-does not inherit C's flaw.
-
-The real residue is narrower: blocks the script writes are attributed to the
-sender's principal, and `privileged` rides in from the sender's shell. That
-is an identity smear worth fixing before shape B ships, but it is not the
-consent hole it was reported as.
+contexts". Shape B's consent is sound: capabilities gate on
+`caller.context_id` (`kj/mod.rs:563-576`), and the rc shell is materialized
+against the **target** context (`lifecycle.rs:388`, `kj_builtin.rs:638`), so
+`kj drive` inside a drift rc script authorizes against the *target's*
+binding, not the sender's. The residue: blocks the script writes are
+attributed to the sender's principal, and `privileged` rides in from the
+sender's shell — an identity smear worth fixing before shape B ships.
 
 ### 3. `push` and `pull` speak different address grammars (SHIPPED 46878b28)
 
@@ -283,42 +272,16 @@ touched.
 on `session.end`, and sweep the 152 already resident. The hook already fires
 and currently only writes a text block, so the trigger is free.
 
-**RULED 2026-08-12 (Amy): archive on `session.end`, names unchanged, and the
-resident backlog gets a one-shot sweep.** That settles the choice below in
-favour of the first option — and see "Amy's rulings" for why the framing that
-made archive look like the *worse* option was wrong. Archive is retained work,
-not trash. No kernel change is needed: `archived_at` is already what both
-resolvers filter on.
-
-**Corrected 2026-08-12 after a GLM review caught a load-bearing error here.**
-The first draft said "conclude on `session.end`" and claimed concluding frees
-the label. It does not:
-
-- `list_active_contexts` filters on `archived_at IS NULL` **only**
-  (`kernel_db.rs:2687`) — concluded contexts are still returned.
-- `conclude_context` sets `context_state`/`concluded_at` and never touches
-  `archived_at` (`kernel_db.rs:2500-2511`).
-- `DriftRouter::set_state` mutates the handle in place; the handle stays in
-  the `contexts` map, and `resolve_context` iterates all values with no state
-  filter (`drift.rs:334-336, 376-386`).
-
-So concluding leaves a context competing for its name on **both** resolution
-paths, and slice 2 as originally written would not have fixed the
-60-candidate ambiguity that motivated it. Conclude/archive were conflated.
-
-Three ways to actually fix it, and this is the real decision:
-
-- **Archive instead of conclude.** Works today with no kernel change —
-  `archived_at` is exactly what both resolvers filter on. But archive is the
-  "trash" state, not the "done" state, and it is a heavier claim to make
-  about a session that merely ended.
-- **Exclude concluded from resolution.** Change `list_active_contexts` and
-  `DriftRouter::resolve_context` to skip concluded contexts. Cleanest
-  semantically — a concluded context *is* done and should not compete for a
-  name — but it changes what `resolve_context` returns for **every** caller,
-  not just drift. That blast radius needs its own look.
-- **Unregister from the router only.** Fixes the in-memory path and leaves the
-  DB path broken. Half a fix; listed for completeness, not recommended.
+**Decided: archive on `session.end`, names unchanged, resident backlog gets a
+one-shot sweep.** Archive is retained work, not trash — referential
+integrity, future search, research substrate — and needs no kernel change:
+`archived_at` (`kernel_db.rs:2687`) is exactly what both resolvers
+(`list_active_contexts` and `DriftRouter::resolve_context`) already filter
+on. Archiving frees the name and keeps the content; concluding does not
+(`conclude_context` never touches `archived_at`), so archive is the fix, not
+conclude. Names do not change on archive — the label stops competing for
+resolution because the row leaves the active set, not because it was
+mangled.
 
 **Slice 3 — one address grammar. SHIPPED 2026-08-12 (`46878b28`).** `push`
 resolves through `refs::resolve_context_arg` like everything else, so `.`,
@@ -406,102 +369,12 @@ per-context setting decides whether drive requests are honoured, defaulting
 to off. **Blocked on** the rc identity-smear fix (`issues.md`) — a driven turn
 must not be attributed to the sender's principal.
 
-## Amy's rulings, 2026-08-12
+## Open question for Amy
 
-All three questions ruled. Recorded in her framing, including one correction
-to mine.
-
-### (c) Arrival: gentle by default, `--drive` to force, receiver can refuse
-
-> "the default should be a gentle mailbox drop that gets picked up on the next
-> turn but we have the `--drive` option too to ensure a turn happens. I think
-> we will also want a way for a context to be able to disable drive requests,
-> perhaps by default."
-
-**The general policy lives in `docs/issues.md`** ("Drive gates — self vs
-external, and don't drive the archived"), because it is not drift's question —
-drift's `--drive` is just its first caller. Two things from there bear on
-drift directly: **self-drive is already gated** by `Capability::Drive` on the
-caller (`kj/drive.rs:61-64`), so only *external* drive needs the new
-target-side gate; and **`kj drive` must refuse archived contexts**, which is
-required independent of any consent work. What follows is the drift-shaped
-summary.
-
-This is **shape A as the default with an explicit opt-in escalation**, plus a
-receiver-side veto the four shapes did not contain. Note what it is *not*:
-not shape C. C was rejected because a sender flag spending a receiver's tokens
-is the wrong direction for consent — and the veto is exactly what fixes that.
-`--drive` is a *request*; the receiving context decides whether requests are
-honoured, "perhaps by default" meaning off.
-
-Consequences for implementation:
-
-- Default path is unchanged from today: the block lands, `catch_up` folds it
-  in on the receiver's next natural turn. No new machinery.
-- `kj drift push --drive` requests a turn. Authorization must resolve against
-  the **target's** binding, which is how the rc path already works
-  (`kj/mod.rs:563-576`) — see the identity-smear caveat below.
-- A per-context "accept drive requests" setting, defaulting to off. Natural
-  home is the context binding / loadout rather than a new concept, since it
-  is exactly an ergonomic-nudge capability in the CLAUDE.md sense.
-- **Prerequisite:** the rc lifecycle identity smear filed in `issues.md` —
-  the rc kaish is materialized with the *sender's* principal
-  (`rc/mod.rs`) while bound to the target's context. Capabilities
-  gate correctly, but block authorship and `privileged` ride in from the
-  sender. Must be fixed before `--drive` ships, or a driven turn is attributed
-  to whoever asked for it.
-
-### (a) `session.end` archives — and archive is not trash
-
-> "session.end should archive a context, names should not change. we'll do
-> some indexing of these soon... archive isn't really trash, it's archive :)
-> we keep them for referential integrity, searching later, and for future
-> research. it's not ossuary so much as accumulation of our paid for and
-> earned efforts."
-
-**Correcting this doc:** an earlier revision called `kj context list` "an
-ossuary" and treated archive as the trash state, which is why slice 2 offered
-"exclude concluded from resolution" as the semantically-nicer option. That
-framing was wrong. Archived contexts are *retained work* — referential
-integrity, future search, research substrate. Indexing work is already in
-flight elsewhere to use them.
-
-So the ruling is the simple option and it needs **no kernel change**:
-`archived_at` is already exactly what both resolvers filter on
-(`kernel_db.rs:2687`, and `DriftRouter`). Archiving on `session.end` frees the
-name and keeps the content.
-
-**"Names should not change"** is a distinct constraint and it matters: do not
-rename or suffix on archive. The label stops competing for resolution because
-the row leaves the active set, not because it was mangled. This also keeps
-archived labels meaningful for the coming index.
-
-### (b) Sweep approved
-
-> "a one-shot sweep would be ok to do, you may modify that data."
-
-Explicit authorization to archive the resident `cc-*` backlog (152 measured
-2026-08-12). Same rules: archive, do not rename, do not delete.
-
-### Follow-on filed
-
-`lost+found` has no discovery or working surface — it is created lazily and
-nothing points at it. Amy: "let's note we need to add some tools for
-discovering and working with lost+found." Filed in `docs/issues.md`.
-
-## Open questions for Amy
-
-1. **Does the short-id retirement shape above get a yes?** See "Should short
-   ids exist at all?" — the open part is whether labels become mandatory
-   (auto-named at create) or the full UUID stays as the fallback for the 19
-   currently-unlabelled contexts.
-
-Resolved while drafting: *does `push` delivering immediately break an existing
-caller?* No — no rc script, orchestration path, or non-test caller invokes
-`kj drift push` anywhere in-repo. Only help docs and tests, all updated.
-
-All three original rulings (arrival/wake, `session.end` retirement, the
-sweep) are answered above.
+**Does the short-id retirement shape above get a yes?** See "Should short ids
+exist at all?" — the open part is whether labels become mandatory (auto-named
+at create) or the full UUID stays as the fallback for the 19
+currently-unlabelled contexts.
 
 ## What we are not doing
 

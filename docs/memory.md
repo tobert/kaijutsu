@@ -12,8 +12,7 @@ attacks and counter-attacks, the ancestry survey — lives in
 is the direction; that file is why.** Claims here cite code and are meant to
 be re-verified by grepping next to them.
 
-Related: [`crdt-position-2026-08.md`](crdt-position-2026-08.md) (the DTE
-doctrine this sits under), [`devlog.md`](devlog.md) — "The kernel becomes
+Related: [`devlog.md`](devlog.md) — "The kernel becomes
 sole owner of itself, then gives it back" (the kernel-ownership pattern
 deliberately *not* used here, and why it was later given up anyway),
 [`issues.md`](issues.md) (open work).
@@ -117,15 +116,17 @@ Four reasons that stand on their own, plus one that confirms:
   tests, hand-curated indexes — conventions among readers, not properties of
   a store. A migration ports none of them.
 
-The confirming one is standing doctrine, not a trend: the 2026-08-09 ruling
-in [`crdt-position-2026-08.md`](crdt-position-2026-08.md) is **"refine, don't
-shed"** — clients released from replication, the kernel keeping block storage
-as its own private engine — and its coda says **"No new DTE integration…
-CRDT-based features are admitted deliberately, on merit — never by default
-coupling."** A memory system is a new surface. The reader design does not
-approach the bar, and that is checkable rather than asserted: read-only
-mounts serve straight from disk (`kernel/src/runtime/mount_backend.rs:264-267`)
-and hashline edit safety is content-hash reverification, not merge.
+The confirming one is standing doctrine, not a trend: a 2026-08-09 review
+judged the kernel's CRDT investment worth refining rather than shedding, and
+a week later the text CRDT came out anyway — replaced structurally by one
+ordered per-context change feed (`docs/devlog.md`, "The melt begins, and
+finds two armed fields"; `docs/change-feed.md`). That outcome argues harder
+for the same doctrine, not softer: a new mechanism is admitted deliberately,
+on merit, never by default coupling. A memory system is a new surface. The
+reader design does not approach the bar, and that is checkable rather than
+asserted: read-only mounts serve straight from disk
+(`kernel/src/runtime/mount_backend.rs:264-267`) and hashline edit safety is
+content-hash reverification, not merge.
 
 Two findings from that same review cut the same way and are worth knowing
 before anyone re-proposes kernel ownership: the MCP doc task is *"1,044 lines

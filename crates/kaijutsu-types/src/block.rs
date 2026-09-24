@@ -1095,7 +1095,7 @@ pub enum Status {
     ///
     /// The one producer today is the gate: a call that left a durable ask
     /// and ran nothing settles here instead of `Error`, because a question
-    /// nobody has answered is not a refusal (`docs/gate-and-shell-split.md`).
+    /// nobody has answered is not a refusal (`docs/gate-resume.md`).
     ///
     /// Not terminal, but nothing in the kernel moves it either — an answered
     /// ask authorizes a retry, which authors a new block. It is the state a

@@ -330,8 +330,7 @@ fn submit_input_authors_the_connection_principal_and_starts_an_interactive_turn(
 /// **3. `user_initiated` is presentation only.** With an `Ask` hook
 /// installed, a human's own typed `shell_execute` — `user_initiated: true`
 /// — is refused pending exactly like a model's `shell_write` tool call: the
-/// command block is `Role::User` and excluded from hydration by default
-/// (docs/gate-and-shell-split.md's split, and the shell submit design), but
+/// command block is `Role::User` and excluded from hydration by default, but
 /// none of that grants it authority to run. The ask stays `Pending` until
 /// someone answers it.
 #[test]

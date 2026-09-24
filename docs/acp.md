@@ -364,8 +364,7 @@ sessions take `context_type=coder` (the model-facing stance bundle), not
 
 **Permission asks, ledger-driven.** `permission.rs`'s Ask pathway follows
 the approval ledger, not a bespoke wire — the old `PermissionEvents::onAsk`
-take-once channel is gone (`docs/gate-and-shell-split.md`, "The shared
-seam"). The `.with_spawned` task registered in `serve_stdio`
+take-once channel is gone (`docs/gate-resume.md`). The `.with_spawned` task registered in `serve_stdio`
 (`permission::start_permission_pump`) subscribes to
 `ActorHandle::subscribe_ledger_events()` — a broadcast of bare generation
 numbers — and on each bump (or a `Lagged` warning) polls `kj ledger list`

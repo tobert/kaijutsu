@@ -11,8 +11,8 @@ mailbox, flush at the next turn", so `--drive` is a **sink**, not a new
 subsystem. And it spends nothing: pure local IPC, no vendor auth touched, no
 CLI wrapped, no libpython, no metered tokens. Amy's sessions burn her
 subscription seat because *she* started them under her own login; kaijutsu only
-coordinates. That sidesteps the entire library-vs-binary policy question in
-`python-player.md`.
+coordinates. That sidesteps the policy question the other two directions in
+the table below carry.
 
 **Provenance discipline.** Anthropic documents the *feature* (cross-session
 messaging, CC 2.1.224+, macOS/Linux) but not the *wire*. Every protocol claim
@@ -29,8 +29,7 @@ wrong today and corrected only because someone re-probed them.
 | (B) kaijutsu drives the harness | subscription-backed inference as a kernel LLM backend | undesigned; collides with kaish exec ownership; gated on Amy's policy read |
 | **(C) kaijutsu messages a harness it does not drive** | **this doc** | protocol measured, send path built |
 
-(C) is the cheapest and the only one with no policy question attached. See
-`python-player.md` for (A)/(B).
+(C) is the cheapest and the only one with no policy question attached.
 
 ## The protocol
 

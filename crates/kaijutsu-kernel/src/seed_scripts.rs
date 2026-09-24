@@ -733,9 +733,8 @@ mod tests {
 
     /// `kj kaish primer` (composed kaish-help guidance) is wired into every
     /// context_type whose `S10-binding.kai` actually grants a shell facade
-    /// (`facade:shell` or `facade:shell_write` — post-2026-08-17-flag-day
-    /// names, `docs/gate-and-shell-split.md` "Slice 3"; `shell_readonly`
-    /// retired) — coder/default/mcp via the shared `lib/create/S10-binding.kai`
+    /// (`facade:shell` or `facade:shell_write`; there is no
+    /// `shell_readonly` facade) — coder/default/mcp via the shared `lib/create/S10-binding.kai`
     /// (`facade:*`), director explicitly (`facade:shell` +
     /// `facade:shell_write`), and toolie via `facade:shell`. `musician` is
     /// deliberately excluded: its binding grants no shell facade at all

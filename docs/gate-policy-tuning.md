@@ -7,8 +7,8 @@ slice 5 unbuilt, slice 4 retired by the verb class; slice 6, the uncovered
 tier, shipped 2026-09-18. Amy's rulings of the same day are quoted
 where they decide a shape. Reviewed against the live tree by kaibo (cast
 `crusoe`) the same day; the revision absorbs its findings. This doc is
-canonical for the gate-policy evaluator; `docs/gate-and-shell-split.md`
-remains canonical for the gate and the shell themselves.
+canonical for the gate-policy evaluator; `docs/gate-resume.md`
+remains canonical for the gate itself.
 
 ## The rulings this design sits on (Amy, 2026-09-08)
 
@@ -77,7 +77,7 @@ At broker PreCall the evaluator runs **before** the hook snapshot, in this
 order: any statement Deny → the call is refused (a `PhaseOutcome::Deny`
 whose `subject` reads `gate policy` — there is no hook id, and the reason
 names the layer and key, so the refusal stays distinguishable per
-`docs/gate-and-shell-split.md`, ruling 2, with no new `RefusalKind`); every
+`docs/gate-resume.md`, with no new `RefusalKind`); every
 statement Allow → hooks are skipped, replacing today's
 `program_is_gate_exempt` consult; anything else → hooks run as they do now.
 All three RPC paths reach this with `tool = shell_write`, each through a
@@ -86,7 +86,7 @@ runtime entry point that calls `Broker::shell_pre_call_hooks`:
 `execute_shell_command` (via `runtime::interactive::submit`), and
 `execute_kj_command` (via `runtime::structured::execute_kj`). A fourth,
 `shell_dry_run`, takes the same evaluator in dry-run mode and enforces
-nothing (`docs/gate-and-shell-split.md`, "Dry-run mode").
+nothing (`docs/kaish-integration.md`).
 
 Inside `run_gate` the evaluator replaces the direct `rules::redeem` call as
 step 1. The archived-context check still runs first and is never bypassed by
@@ -153,8 +153,7 @@ on the ask they answered. Exact text, exact authorization.
 - **Deny** — refused at broker PreCall for both stacks (the RPC paths
   evaluate PreCall too, so a config deny reaches a human at their own
   keyboard exactly like a model — the existing doctrine,
-  `docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
-  hook path"). The refusal names the layer and key. Leaves a durable row
+  `docs/kaish-integration.md`). The refusal names the layer and key. Leaves a durable row
   when it happens inside `run_gate`.
 - **Ask** (a statement the config marks ask-tier) — never auto-allowed by a
   lower layer; the existing ask machinery of each stack does the asking, and
@@ -464,33 +463,18 @@ verb's effect:
 Slices, each landing with tests and nothing downstream depending on an
 unreleased one:
 
-1. **Evaluator seam — shipped.** `kj/gate_policy.rs` composes today's two
-   sources (the verb class, digest rules) behind `evaluate`; broker PreCall
-   consults `evaluate_planned` (builtin layer only, no store) and
-   `run_gate` consults `evaluate`, with the `KjVerb`-origin boundary stated
-   above. Behavior changes, both deliberate: an exempt program now
-   auto-allows inside `run_gate` too (the mismatch fix, with the durable
-   row), and `auto_reason` reads `gate policy: builtin allows kj block
-   list` / `gate policy: user rule denies the exact statement (rule …) —
-   statement #2 (…)`. Parity tests pin everything else.
-2. **Config layer — shipped.** `assets/defaults/gate.toml` + seed + `[global]` /
-   `[context_type.<type>]` + kj key validation through the verb tables + the
-   PreCall Deny branch (`subject = gate policy`) + the `KJ_TOOL_PLAN` `tier`
-   field + the lfm2d hook's ask-tier exit 3 + the `--help` structural rule in the evaluator with its Rust
-   bypass test. The non-kj test entries (`rg`, `wc`, `git push`, `dd`) ride
-   in this slice — ruling 3's "a few other things just to test it out".
-3. **Learned family rules — shipped.** Schema, `learn_family_from_approval`,
-   `--family` at answer time, `family_coverage()` beside `redeem()`,
-   `kj ledger rules` (the composed view) and `forget` over both kinds,
-   both guarantee carve-outs pinned. Two deviations from the section above,
-   both recorded there: the row carries one `family_key` column in the
-   config key space rather than `program`/`subcommand`, and the structural
-   refusal lives in the kernel (`gate_policy::family_keys_for_program`),
-   which re-plans the ask's `exec_source`.
-4. **Retired by the verb class (2026-09-09).** This slice authored a corpus
-   `gate` field and retired the readonly tables; both went with
-   `kj-expectations.toml`, and the builtin tier is each verb's declared
-   `Effect` (§Builtin tier). Nothing remains to build here.
+1. **Evaluator seam — shipped.** `kj/gate_policy.rs` composes the verb class
+   and digest rules behind `evaluate`, consulted from both broker PreCall
+   and `run_gate`.
+2. **Config layer — shipped.** `assets/defaults/gate.toml`, the
+   `[global]`/`[context_type.<type>]` layers, the `KJ_TOOL_PLAN` `tier`
+   field, and the `--help` structural rule.
+3. **Learned family rules — shipped.** `approval_rule_families`,
+   `--family` at answer time, `family_coverage()` beside `redeem()`, and
+   `kj ledger rules`/`forget` over both digest and family rules.
+4. **Retired by the verb class.** The builtin tier is each verb's declared
+   `Effect` (§Builtin tier); the corpus `gate` field and the readonly tables
+   it replaced are gone.
 5. **First tuning pass.** Three tests run the shipped `lfm2d.kai` through a
    real `shell_write` call (`mcp/broker.rs`, the `..._real_lfm2d_hook...`
    tests): an all-Allow program never reaches the hook, an ask-tier clause
@@ -502,17 +486,9 @@ unreleased one:
    case.
 6. **The uncovered tier — shipped.** `uncovered = "ask" | "allow"` on
    `[global]` and each `[context_type.<type>]` (§The uncovered tier), decided
-   last in `command_verdict` and, for a statement with no command, in
-   `statement_verdict`; a new `Layer::UncoveredAllow` so a tier decision
-   never reads as an allow-list hit; the row and the prose line in
-   `kj ledger rules`; the commented, disabled example in the shipped file.
-   Two behavior changes ride with it, both deliberate. A
-   `[context_type.<name>]` section naming no live context type now fails the
-   load (§The file), which caught the shipped `[context_type.explorer]`
-   section — inert since that type was renamed, now `[context_type.toolie]`,
-   so its `kj context create` deny is live for the first time. And
-   `load_config` reads the rc tree, which `GateConfig::parse` does not: the
-   validation is at load, not in the pure shape check.
+   last and reported as its own layer in `kj ledger rules`; a
+   `[context_type.<name>]` section naming no live context type fails the
+   load (§The file).
 
 ### Tests each slice must land with
 

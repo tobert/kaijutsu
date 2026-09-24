@@ -38,13 +38,11 @@ pub type ResolvedName = (InstanceId, String);
 /// the player's alone: no MCP tool, `kj` verb, or editor session reaches it
 /// (`docs/issues.md`, "The compose draft is the player's alone").
 ///
-/// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3", Amy's
-/// 2026-08-16 ruling): `shell` is the unmarked, SAFE facade
+/// `shell` is the unmarked, SAFE facade
 /// (`ExternalExec::Deny`) — the name a caller reaches for by default has to be
 /// the one that cannot hurt anything. `shell_write` is the hot, mutating
-/// facade (`ExternalExec::Allow`, what `facade:shell` gated before this flag
-/// day), granted not default. `shell_readonly` retires as a facade name
-/// entirely — no dual-name transition period.
+/// facade (`ExternalExec::Allow`), granted not default. There is no
+/// `shell_readonly` facade name.
 ///
 /// The `shell`/`shell_write` facades additionally **project** the in-kernel
 /// `builtin.shell`/`builtin.shell_write` broker tools (see
@@ -93,12 +91,10 @@ pub const KNOWN_AUTHORITIES: &[&str] = &[
 /// binding treats a projected instance as allowed exactly when its backing
 /// facade is allowed.
 ///
-/// **2026-08-17 flag day** (`docs/gate-and-shell-split.md`, "Slice 3"):
-/// `builtin.shell` is now the SAFE tool (`ExternalExec::Deny`), projected by
+/// `builtin.shell` is the SAFE tool (`ExternalExec::Deny`), projected by
 /// `facade:shell` — the unmarked name a caller reaches for by default.
-/// `builtin.shell_write` is the HOT, mutating tool (`ExternalExec::Allow`,
-/// what `builtin.shell` was before this flag day), projected by
-/// `facade:shell_write`. `shell_readonly` retires as a facade name entirely.
+/// `builtin.shell_write` is the HOT, mutating tool (`ExternalExec::Allow`),
+/// projected by `facade:shell_write`. There is no `shell_readonly` facade name.
 /// A role grants one or the other (or both — `director`, the operator's
 /// console, holds both post-flag-day) so it sees one shell or two, never a
 /// stale mismatch. Broad `facade:*` roles match both projections and see both

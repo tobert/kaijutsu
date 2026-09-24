@@ -394,7 +394,7 @@ pub(crate) struct JoinOutcome {
 
 /// Spawn the pulse task — the sole remaining consumer of the actor's event
 /// broadcast in this crate, and everything that replaced the old
-/// doc-task-plus-event-bridge pair (docs/crdt-position-2026-08.md, slice 4).
+/// doc-task-plus-event-bridge pair.
 /// It applies nothing and holds no document: every `ServerEvent` just bumps
 /// `change`, waking `execute_and_poll_shell`'s completion poll early. A
 /// broadcast `Lagged` bumps too — a lag means events were dropped, so
@@ -434,11 +434,10 @@ fn spawn_pulse_task(
 /// publish the result via `remote.joined` / `remote.shared_context_id`.
 ///
 /// There is no server snapshot fetched or document built here anymore —
-/// that was solely to seed the now-deleted `RemoteState.synced` mirror
-/// (docs/crdt-position-2026-08.md, slice 4). Every reader (cold
-/// prompts/resources/completions, and the shell completion poll) reads the
-/// server directly, so joining needs nothing from the server beyond the
-/// pulse task's live subscription.
+/// that was solely to seed the now-deleted `RemoteState.synced` mirror.
+/// Every reader (cold prompts/resources/completions, and the shell
+/// completion poll) reads the server directly, so joining needs nothing
+/// from the server beyond the pulse task's live subscription.
 ///
 /// Writing a fresh `JoinedContext` into `remote.joined` drops whatever was
 /// there before, and `JoinedContext`'s field is `AbortOnDrop` — so calling
@@ -882,10 +881,9 @@ impl KaijutsuMcp {
     // Cold readers — prompts/resources/completions. Remote answers every
     // one of them with an authoritative RPC. There is no local mirror left
     // to touch: `RemoteState.synced` (the event-fed replica) is gone —
-    // slices 1 and 4 of docs/crdt-position-2026-08.md moved every reader,
-    // cold and hot alike (`execute_and_poll_shell`'s completion poll
-    // included), off it and onto the server. Local is unchanged: same
-    // in-process `BlockStore` lookups as before this migration.
+    // every reader, cold and hot alike (`execute_and_poll_shell`'s
+    // completion poll included), reads the server directly now. Local is
+    // unchanged: same in-process `BlockStore` lookups as always.
     // ------------------------------------------------------------------
 
     /// Resident context ids. Local lists the multi-context kernel store.
@@ -2670,10 +2668,9 @@ impl ServerHandler for KaijutsuMcp {
         if uri == "kaijutsu://docs" {
             // Return list of all documents. This wants only a per-context
             // count, but `context_blocks` transfers every block's full
-            // content to compute it — there's no cheap count RPC today
-            // (docs/crdt-position-2026-08.md notes the same gap for shell
-            // Phase 2). Not adding one now; revisit if this resource gets
-            // used against contexts big enough for it to matter.
+            // content to compute it — there's no cheap count RPC today.
+            // Not adding one now; revisit if this resource gets used
+            // against contexts big enough for it to matter.
             let mut docs = Vec::new();
             for id in self.context_ids().await {
                 let block_count = self

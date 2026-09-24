@@ -5,8 +5,7 @@ one timebase" — the timing doctrine every cue rides), `docs/tracks.md`
 (track/transport), `docs/hyoushigi.md` (the `Cell` substrate),
 `docs/chameleon.md` (vocabulary: **clip** = placed media on a track, DAW
 sense; "cue" stays chameleon's trap message), `docs/slash-v.md` (the
-`/v/cas` mount + client fetcher), `docs/cue-prior-art.md` (the survey the
-clip record was synthesized from), `docs/audio-daemon.md` (who owns
+`/v/cas` mount + client fetcher), `docs/audio-daemon.md` (who owns
 hardware now — see below), `docs/devlog.md` ("The music stack — from one
 loop to a band on the wire", "The beat learns to carry its own clock" for
 how this shipped).
@@ -112,8 +111,8 @@ application/vnd.kaijutsu.clip+json`, `Clip::parse` /
 
 ### `Cell` stays untouched — the mapping
 
-The `cue-prior-art.md` survey found every industry re-inventing the same six
-field clusters. They map onto what exists without touching the substrate
+Industry precedent converges on the same six field clusters. They map onto
+what exists without touching the substrate
 (expanding `Cell` would break hyoushigi's founding rule — a new modality
 never edits the substrate):
 

@@ -1,5 +1,4 @@
-# The shell-escape guard (docs/gate-and-shell-split.md, "shell escape
-# guard"). A `shell_write` command that hands text to a second shell --
+# The shell-escape guard. A `shell_write` command that hands text to a second shell --
 # `sh -c`, `bash -c`, or any wrapper (`sudo`, `env`, `xargs`, ...) that ends
 # up invoking one -- is opaque to the shell gate: `kj/shell_gate.rs`'s own
 # module docs name this exact gap, and a text-pattern match on the raw

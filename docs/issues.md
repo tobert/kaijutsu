@@ -1507,8 +1507,8 @@ to the kaish lead, not ours to build.
 ## The Claude Code advisory hook forwards to the kernel (2026-09-02, shipped; open follow-ups)
 
 `PreToolUse` Bash → `kaijutsu-mcp hook claude` → `shellDryRun` → PreCall in
-dry-run mode → abandoned ask row, always allow (`docs/gate-and-shell-split.md`,
-"Dry-run mode"). Still open: count a day of `kj ledger list --status
+dry-run mode → abandoned ask row, always allow (`docs/kaish-integration.md`).
+Still open: count a day of `kj ledger list --status
 abandoned --since 24h` against the Python hook's verdicts before retiring it;
 the `( … ) &` subshell planning gap (kaish cannot plan it, S45 denies "no
 execution plan") is an ask to the kaish lead; an export verb for corpus
@@ -1651,8 +1651,7 @@ Full reports: `docs/audits/`. Re-verified against the current tree:
   undecided. M, design.
 - **rc softening for interactive seats is still missing** — that a human's
   interactive shell takes the hook path is written down
-  (`docs/gate-and-shell-split.md`, "The three rpc.rs shell paths take the
-  hook path"); the softening itself is not built.
+  (`docs/kaish-integration.md`); the softening itself is not built.
 - **The rc bootstrap gate still seeds a tree only when the whole directory is
   empty** (`rpc.rs:2585`, `if dir_is_empty(&host_dir)`), not path-by-path —
   confirmed still true, so a script added to the embedded set after a kernel
@@ -1795,9 +1794,7 @@ before changing it.
 ## The file write/edit tools are not gated by the approval ledger (Amy, 2026-08-16)
 
 `builtin.file:write`/`:edit` still route as plain capability tokens, not
-through `approval_ledger` — confirmed still true, and
-`docs/gate-and-shell-split.md` ("What this does NOT do") names this exact
-gap as unsolved by that design. Not a security boundary (every player is
+through `approval_ledger` — confirmed still true and unsolved. Not a security boundary (every player is
 already inside the trust boundary); the ask is an ergonomic nudge so a
 large destructive edit is visible and undoable rather than only
 forensically reconstructable afterwards. A cheap partial worth keeping on
@@ -2132,9 +2129,9 @@ Per-subscription bounded queues, `subSeq` and the lag kick shipped. Open:
 
 The hook body (`assets/defaults/rc/lib/hooks/lfm2d.kai`) re-derives each
 secondary signal's verdict, exempts read-only `kj` and `kj ledger`, and
-requires ladder position 0 plus a label match before auto-allowing. No
-self-approval and approval-executes are canonical in
-`docs/gate-and-shell-split.md` and `docs/gate-resume.md`; the layered policy
+requires ladder position 0 plus a label match before auto-allowing.
+No self-approval is canonical in `docs/approval-identity.md`;
+approval-executes is canonical in `docs/gate-resume.md`; the layered policy
 tiers are `docs/gate-policy-tuning.md`. Old measurements in this entry's
 history must not be quoted. Open:
 
@@ -2389,13 +2386,6 @@ count); decide what they measure before polishing.
 - **ABC MIDI pitch/velocity are unmasked.** The `kaijutsu-abc` MidiWriter
   leaves pitch/velocity unmasked (`midi.rs:970-995`), safe while the one
   caller uses velocity 80.
-
-## `docs/abc-reference.md`'s support matrix is four months stale
-
-The ABC v2.1 reference maps notation to `kaijutsu-abc` support status as of
-2026-05-25; 27 commits have touched the crate since, including the June 30
-conformance push. The crate's tests are truth; re-derive the matrix from
-them or drop the status columns.
 
 ## Tracks do not re-arm after a kernel restart
 

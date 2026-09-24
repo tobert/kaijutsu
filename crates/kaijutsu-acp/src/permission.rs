@@ -3,10 +3,10 @@
 //! `HookAction::Ask` (and `shell_write`'s gate) leave a durable row in the
 //! approval ledger and wait; this module is the ACP side of answering one.
 //! It does not talk to a bespoke permission wire — that wire
-//! (`PermissionEvents::onAsk`, `ActorHandle::take_permission_asks`) is gone
-//! (`docs/gate-and-shell-split.md`, "The shared seam: one ledger, one
-//! announcement, one write path"). The ledger is the one durable record and
+//! (`PermissionEvents::onAsk`, `ActorHandle::take_permission_asks`) is gone.
+//! The ledger is the one durable record and
 //! `kj ledger` is the one write path, from any surface, ACP included.
+//! See `docs/gate-resume.md`.
 //!
 //! The ledger round trip itself — `kj ledger list`/`show`/`allow`/`deny` —
 //! is `kaijutsu_client::ledger`, shared with every client. What is ACP-only

@@ -2,7 +2,7 @@
 //! against a command it will never run, hands back what they would have
 //! decided, and leaves the ledger with a record nobody has to answer.
 //!
-//! `docs/gate-and-shell-split.md`, "Dry-run mode".
+//! See `docs/kaish-integration.md`.
 //!
 //! The hooks are pushed onto the live broker's table rather than installed
 //! through `kj hook add`: the subject here is the RPC method and what it

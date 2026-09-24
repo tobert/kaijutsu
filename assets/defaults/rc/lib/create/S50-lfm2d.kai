@@ -1,5 +1,5 @@
 # lfm2d risk scoring, wired into the seats that hold Exec
-# (docs/gate-and-shell-split.md, "lfm2d risk scoring"). Runs at create. This
+# (docs/gate-policy-tuning.md). Runs at create. This
 # script is symlinked (not copied) into the create/ lifecycle of each seat
 # that scores its shell, the same composition S45 in this directory uses.
 # Two things:

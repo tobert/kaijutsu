@@ -333,5 +333,4 @@ pinned pre-change baseline. It defaults to dark mode, supports optional shared
 base inclusion, and needs no network. Regenerate with
 `python3 contrib/render-prompt-comparison.py`; `--check` fails on stale output
 without writing. Input hashes cover the baseline, seeds, template, and generator.
-The [OSS dossier](oss-comparisons.md) keeps research and review lessons; the
-[Kaibo proposal](kaibo-prompt-proposal.md) carries findings back to that project.
+The [OSS dossier](oss-comparisons.md) keeps research and review lessons.

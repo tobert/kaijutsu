@@ -130,8 +130,7 @@ impl GateOutcome {
     /// render a blank where an ask id is expected.
     /// The one-line summary the refusal layers wrap: which ask, and what to
     /// do about it. `McpError::refused_gate` already names the subject and
-    /// the state, so this adds neither — see
-    /// `docs/gate-and-shell-split.md`, "One fact per layer".
+    /// the state, so this adds neither.
     pub fn ask_summary(&self) -> String {
         format!("{} — {}", self.ask_description(), self.reason)
     }
@@ -797,8 +796,7 @@ pub(crate) async fn run_gate_recorded(
 /// unable to check whether an answer is already waiting is worse than
 /// reporting what the hook itself decided.
 ///
-/// Nothing here runs the gated action. See `docs/gate-and-shell-split.md`,
-/// "Dry-run mode".
+/// Nothing here runs the gated action. See `docs/kaish-integration.md`.
 #[tracing::instrument(
     name = "approval.gate.dry_run",
     skip_all,

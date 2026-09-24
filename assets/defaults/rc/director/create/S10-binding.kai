@@ -45,10 +45,9 @@ kj binding allow "exec"
 # sweep, docs/issues.md).
 kj binding allow "editor"
 # Facades: full interaction surface (shell + edit + submit). `facade:shell` is
-# the safe, unmarked shell (ExternalExec::Deny, docs/gate-and-shell-split.md
-# "Slice 3" — this used to be the mutating grant before the 2026-08-17 flag
-# day; kept explicit rather than implied). `facade:shell_write` is the hot,
-# mutating twin (ExternalExec::Allow, what this grant alone used to mean) —
+# the safe, unmarked shell (ExternalExec::Deny; kept explicit rather than
+# implied). `facade:shell_write` is the hot, mutating twin
+# (ExternalExec::Allow) —
 # JUDGMENT CALL (Amy should confirm): granted here because director is the
 # operator's console and wants the safe tool available by default AND the hot
 # one on hand, not because "director" is inherently a write-shell role.

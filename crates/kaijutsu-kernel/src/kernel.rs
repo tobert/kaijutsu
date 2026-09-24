@@ -986,9 +986,8 @@ impl Kernel {
         // reached its tool roster). Gated by `facade:shell_write` via the
         // binding's facade projection (FACADE_PROJECTED_INSTANCES), NOT a
         // separate instance grant — one capability covers both surfaces.
-        // 2026-08-17 flag day (`docs/gate-and-shell-split.md`, "Slice 3"):
-        // this is what `builtin.shell`/`facade:shell` used to be — a stale
-        // `facade:shell` grant no longer reaches this instance. Holds
+        // A stale `facade:shell` grant (the safe, read-only tool) does not
+        // reach this instance. Holds
         // Weak<Broker> to reach the kj dispatcher (wired post-bootstrap by
         // `set_kj_dispatcher`) and materialize a per-context kaish on demand.
         //

@@ -475,8 +475,8 @@ CREATE TABLE IF NOT EXISTS approval_events (
 -- ── Refused answer attempts ────────────────────────────────────────────
 -- An answer this crate refused on an invariant, which therefore committed
 -- nothing else. Today the one reason is `self_approval`: the answering
--- context is the context that raised the ask (`docs/gate-and-shell-split.md`,
--- "No self-approval — the gate's own answer path"). A refusal that is only
+-- context is the context that raised the ask (`docs/approval-identity.md`).
+-- A refusal that is only
 -- returned to its caller is invisible to the measurement the gate is tuned
 -- on, so it lands here.
 --

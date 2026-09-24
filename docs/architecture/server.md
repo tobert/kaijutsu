@@ -200,8 +200,11 @@ keyring"). Management CLI in `main.rs`: `init --as <name> --key <file>`,
 
 ## Smells (not fixed — see [issues](../issues.md))
 
-- **External MCP offline** — `list_mcp_servers` returns empty; admin deferred to
-  Phase 2. Clients silently get nothing.
+- **External MCP admin surface offline** — the capnp `list_mcp_servers` RPC
+  always returns an empty list; `reconcile_external_mcp_servers` still reads
+  `/config/kernel/mcp.toml` and registers/connects servers into the broker at
+  boot and on `kj mcp reload`. The admin surface is what is offline, not
+  external MCP itself.
 - **No graceful SIGTERM** — no signal handler in `main.rs`; the WAL checkpoint
   only fires on clean `Arc` drop, so a `systemd stop` leaves the WAL for next
   open.

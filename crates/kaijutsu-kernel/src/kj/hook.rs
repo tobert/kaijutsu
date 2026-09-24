@@ -1,8 +1,7 @@
 //! `kj hook` — administer the broker's hook tables without ever entering
 //! hook evaluation (`Broker::evaluate_phase`) to do it.
 //!
-//! Slice 1 of `docs/gate-and-shell-split.md` (Amy's ruling, 2026-08-17,
-//! "Hook self-lockout recovery"). A `PreCall Deny("*")` hook denies
+//! Exists for hook self-lockout recovery. A `PreCall Deny("*")` hook denies
 //! `builtin.hooks`' own `hook_list`/`hook_remove` MCP tools — proven by
 //! `hooks_admin_is_subject_to_hooks`
 //! (`mcp/servers/hooks_builtin.rs`) — and because hooks rehydrate from
@@ -833,8 +832,7 @@ mod tests {
         assert_eq!(data.as_ref().unwrap()["removed"], false);
     }
 
-    /// Amy's ruling, 2026-08-20 (`docs/gate-and-shell-split.md` item 4):
-    /// `kj hook add` with a stable id must be a no-op on re-add of the
+    /// `kj hook add` with a stable id is a no-op on re-add of the
     /// SAME shape — no DB primary-key error, no duplicate entry (so rc can
     /// run it on every context create without piling up hooks). Falsified
     /// against the `hooks.hook_id PRIMARY KEY` constraint: without this
@@ -1047,8 +1045,8 @@ mod tests {
         );
     }
 
-    /// End-to-end for `assets/defaults/rc/lib/create/S45-shell-guard.kai`
-    /// (`docs/gate-and-shell-split.md` item 4): run through the REAL `create`
+    /// End-to-end for `assets/defaults/rc/lib/create/S45-shell-guard.kai`:
+    /// run through the REAL `create`
     /// rc lifecycle for a context type it's symlinked into (`default`), not
     /// just its extracted body in isolation
     /// (`mcp::broker::tests::shell_guard_denies_sh_dash_c_and_allows_benign_shapes`

@@ -29,7 +29,7 @@
 //! are (see that function's doc for why a partial rule set is worse than no
 //! rule at all). `approval_ledger::rules::learn_from_approval` refuses to
 //! create an `allow` rule for a statement with any free variable
-//! (`docs/gate-and-shell-split.md`, "Rulings"); this module never
+//! (`docs/gate-policy-tuning.md`); this module never
 //! re-implements that check, only reports what the ledger said. Once
 //! a rule exists, [`crate::kj::gate::run_gate`]'s gate policy step
 //! (`kj/gate_policy.rs`, user-rule layer) auto-decides the next identical
@@ -337,8 +337,7 @@ enum LedgerCommand {
         /// The ask to allow. Request ids come from `kj ledger list`.
         request_id: String,
         // Why an `allow` rule is refused over a free variable, and why the
-        // ask's own decision survives that refusal: `docs/gate-and-shell-split.md`,
-        // "Digest-keyed allow-always: refuse on free variables".
+        // ask's own decision survives that refusal: `docs/gate-policy-tuning.md`.
         /// Remember this decision as a standing rule, so future identical
         /// asks decide without asking anyone. Refused when any covered
         /// statement has a free variable; the decision on THIS ask still
@@ -2197,8 +2196,7 @@ mod tests {
 
     /// A second seat, used wherever a test answers a gate it raised itself.
     /// No self-approval: an ask may not be answered from the context that
-    /// raised it (`docs/gate-and-shell-split.md`, "No self-approval — the
-    /// gate's own answer path"). `test_caller` mints a fresh `ContextId`, so
+    /// raised it (`docs/approval-identity.md`). `test_caller` mints a fresh `ContextId`, so
     /// this is a peer, and peer-seat approval is permitted.
     fn answering_seat() -> crate::kj::KjCaller {
         let mut caller = test_caller();

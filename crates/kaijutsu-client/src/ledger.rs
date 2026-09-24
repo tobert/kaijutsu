@@ -3,8 +3,7 @@
 //! client that offers asks to a player drives the same way.
 //!
 //! This is not a bespoke wire: there is no `PermissionEvents::onAsk`
-//! (`docs/gate-and-shell-split.md`, "The shared seam: one ledger, one
-//! announcement, one write path"). The ledger is the one durable record and
+//! (see `docs/gate-resume.md`). The ledger is the one durable record and
 //! `kj ledger` is the one write path, from any surface. This module drives
 //! that path through [`ActorHandle::execute_kj`] and
 //! [`ActorHandle::execute_kj_quiet`]; it opens no bespoke connection and

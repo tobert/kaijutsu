@@ -7,7 +7,7 @@
 //!
 //! The instances are facade projections: `facade:shell` and
 //! `facade:shell_write` govern visibility and dispatch without a second grant.
-//! Rc selects each context type's loadout; see `docs/gate-and-shell-split.md`.
+//! Rc selects each context type's loadout.
 
 #[cfg(test)]
 use crate::runtime::command_result::shell_result_to_envelope;
@@ -522,8 +522,7 @@ mod tests {
         }
     }
 
-    /// `shell_write` is gated (`docs/gate-and-shell-split.md`, "Slice 4"),
-    /// and `run_gate` never waits (`docs/gate-resume.md`): a test that calls
+    /// `shell_write` is gated, and `run_gate` never waits (`docs/gate-resume.md`): a test that calls
     /// it synchronously gets `Pending`/`GatePending` back immediately, with
     /// nothing run, and a durable ask already sitting in the ledger. Answer
     /// that ask directly — no poll loop, no spawned task — the way a human
@@ -1428,7 +1427,7 @@ mod tests {
         assert!(out.contains("hello-ro"), "stdout missing, got: {out:?}");
     }
 
-    /// **Slice 3 spec test 1** (`docs/gate-and-shell-split.md`): a context
+    /// A context
     /// bound to the OLD `facade:shell` grant (a stale rc script, a cached
     /// binding, a model's habit — nobody updated it for the flag day) must
     /// see the mutating tool disappear and the safe one take over under the

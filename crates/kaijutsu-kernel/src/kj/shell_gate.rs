@@ -1,5 +1,5 @@
 //! Builds a [`crate::kj::gate::GateSpec`] for the `shell_write` gate
-//! (`docs/gate-and-shell-split.md`) from a submission's kaish
+//! from a submission's kaish
 //! source text.
 //!
 //! ## What this covers, and what it structurally cannot
@@ -31,8 +31,7 @@
 //!   separately gated call executes it — each call is gated on its own
 //!   text, never on what an earlier call wrote to disk.
 //!
-//! The airtight configuration, as `docs/gate-and-shell-split.md` says
-//! plainly, is `subprocess` off. This gate improves the common case: a
+//! The airtight configuration is `subprocess` off. This gate improves the common case: a
 //! model that types a destructive kaish command directly gets stopped and a
 //! human sees exactly what would run before it does.
 //!
@@ -60,9 +59,9 @@
 //! (the gate cannot pause mid-run — see above). A preview that goes stale
 //! between "what was shown" and "what ran" is exactly the kind of quiet
 //! mismatch a gate exists to prevent, not a feature worth the risk. Showing
-//! the free-variable names instead of a guessed value is the form of "say
-//! what will be substituted" that `docs/gate-and-shell-split.md` asks for
-//! and the only one that cannot go stale.
+//! the free-variable names instead of a guessed value says what will be
+//! substituted without guessing a value, and is the only form that cannot
+//! go stale.
 
 use approval_ledger::types::{Origin, VarBinding};
 
@@ -96,8 +95,8 @@ impl std::fmt::Display for ShellGateBuildError {
 /// `authorized_label` is the submitted source text itself, trimmed — for
 /// `shell_write` there is no separate "target" the way `kj cc send` has a
 /// session name to resolve; what the caller typed IS the whole statement,
-/// so the label that scopes confirmation to what was typed (the property
-/// described in `docs/gate-and-shell-split.md`) is the source text.
+/// so the label that scopes confirmation to what was typed is the source
+/// text.
 #[cfg(test)]
 pub(crate) fn build_shell_gate_spec(source: &str) -> Result<GateSpec, ShellGateBuildError> {
     build_shell_gate_spec_with_stdin(source, None)

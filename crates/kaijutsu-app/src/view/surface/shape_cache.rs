@@ -338,8 +338,7 @@ pub struct ShapedBlock {
     /// This shaping was produced while the block was `Running`.
     ///
     /// It is what licenses [`incremental_prefix`]: a streaming block's text is
-    /// append-only (`docs/crdt-position-2026-08.md`, "streaming is 100%
-    /// append"), so a chunk that was complete when it was shaped is still the
+    /// append-only, so a chunk that was complete when it was shaped is still the
     /// same bytes now. A `Done` block's text can be *edited*, where equal byte
     /// ranges say nothing about equal bytes — so an edit to a settled block
     /// always re-shapes whole. The flag survives one frame past the end of the

@@ -12,7 +12,7 @@
 //! Executable hooks inherit their owner's cancellation and finish cleanup
 //! before returning. Hook bodies must not spawn tasks that re-enter the broker
 //! without inheriting its task-local hook depth; doing so bypasses recursion
-//! limits. See `docs/gate-and-shell-split.md` for verdicts and approval waits.
+//! limits. See `docs/gate-resume.md` for verdicts and approval waits.
 
 use std::sync::Arc;
 

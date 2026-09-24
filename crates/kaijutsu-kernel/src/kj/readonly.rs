@@ -63,7 +63,7 @@
 //! a hook's policy: the gate policy evaluator (`kj/gate_policy.rs`) skips
 //! PreCall for a program made only of exempt commands. It is safe only because a
 //! seat cannot answer its own ask (a context check in the ledger,
-//! `docs/gate-and-shell-split.md`, "No self-approval"); remove that
+//! `docs/approval-identity.md`); remove that
 //! invariant and this exemption goes with it.
 
 use kaish_types::plan::{PlannedCommand, PlannedValue};

@@ -1,6 +1,6 @@
-//! Slice 1 of `docs/crdt-position-2026-08.md` — the cold readers (prompts,
-//! resources, completions) moved off `RemoteState.synced` (the event-fed
-//! mirror that existed at the time) onto authoritative server RPCs. This
+//! The cold readers (prompts, resources, completions) moved off
+//! `RemoteState.synced` (the event-fed mirror that existed at the time)
+//! onto authoritative server RPCs. This
 //! suite was written to prove it the only way that actually distinguishes
 //! "reads the server" from "reads a cache that usually agrees with the
 //! server": kill this process's event listener FIRST (so a mirror, if one

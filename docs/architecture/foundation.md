@@ -117,8 +117,7 @@ fractional indexing, metadata in `BlockHeader` is plain data, and text is a
 plain `String`.
 
 Streaming is 100% append and `push_str` is amortized O(1). Changing the text
-representation needs a design conversation; the measurements are in
-`docs/crdt-position-2026-08.md`.
+representation needs a design conversation.
 
 ### One storage impl: `BlockDocument`
 

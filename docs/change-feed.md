@@ -258,9 +258,3 @@ and are renewed on reload, so they need no storage or wire migration.
 2. **`BlockId` is a Lamport timestamp** (`{contextId, principalId, seq}`) —
    multi-writer identity that a single sequencer does not need. A
    kernel-assigned UUIDv7 would do. Large blast radius; deliberately deferred.
-3. **Renumbering already happened.** The KV-deletion stubs this question was
-   about are gone under those ordinals; the live retired stubs in
-   `kaijutsu.capnp` today are `retired0`–`retired1`, `retired3`,
-   `retired6`–`retired15`, `retired18`, `retired26`, `retired58`, and
-   `retired93`, spread across several interfaces. The flag day this question
-   asked for has already happened.

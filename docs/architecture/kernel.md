@@ -88,8 +88,7 @@ journaling.
 (`:2437`/`:2672`). `BlockDocument::ops_since`/`merge_ops` (`blocks/block_store.rs`)
 still exist, but `ops_since` has no caller outside its own tests and
 `merge_ops` runs only sequential self-application during oplog replay —
-concurrent merge is structurally impossible, not merely unobserved
-(`docs/crdt-position-2026-08.md`).
+concurrent merge is structurally impossible, not merely unobserved.
 
 ### Context registry + drift — `DriftRouter` (`src/drift.rs:290`)
 

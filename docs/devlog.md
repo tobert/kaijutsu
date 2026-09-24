@@ -619,6 +619,13 @@ is a batch. The last holdout on the old surface was the time well's activity
 glow, which counted events and never looked inside them; Amy disabled it
 rather than migrate it, and four thousand lines went.
 
+The CRDT investment itself had been reviewed on 2026-08-09 and judged worth
+refining, not shedding. A week later the text CRDT came out anyway: this
+melt replaced it structurally rather than tuning it further, and by August 16
+the wire it had argued for was gone too, in favor of the one ordered
+per-context change feed above — `docs/change-feed.md` is what carries the
+wire now.
+
 The renumber exposed an assumption the least visible way available: the
 client crate's build script had never declared the schema as a dependency,
 and every previous change had been additive enough to hide it. Amy reading

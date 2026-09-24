@@ -106,10 +106,7 @@ a permanently gone process leaves its pinned job pending. No force-abandon or
 broad staging-cleanup sweep is implemented. Successful publication and explicit
 cancellation clean their own staging paths only.
 
-## Evolution: observe once, retain windows, request material
-
-This section is the implementation plan, not a description of shipped APIs.
-The runtime and installation sections describe what is available today.
+## Observation, inventory and retained history
 
 Amy: "anything in the system can ask for a hunk off the buffer and the reads
 are already done"; "it doesn't have to be realtime except for keeping up
@@ -249,227 +246,54 @@ connection ownership from local stream continuity. Across reconnect, a request
 may name retained history only after the current node connection advertises
 that generation and coverage again. Missing history is never fabricated.
 
-### Ambient recording and keeping a take
+### Deferred: ambient recording, summaries, publication (unshipped)
 
-Ambient recording is a primary use of retained history, not just diagnostic
-telemetry. Amy: "if we turn 'em up and put 'em on nvme or use plenty of ram,
-we can keep enough to occasionally grab a happy accident real quick."
-Watching an input can retain a substantial rolling recording without a track
-or context. Retention remains finite and visible; export is deliberate.
+Slices 3–6 below are still open. The direction, in brief:
 
-Support a RAM history backend first and a local-NVMe rolling-chunk backend
-when longer retention needs it. They share generation, position, coverage and
-loss semantics. Storage is local to the daemon; network availability is not
-required for ambient recording. Disk-backed history is not automatically
-kernel CAS content and is not a promise of permanent archival storage.
-At 48 kHz stereo float32, one hour is about 1.38 GB before metadata; the
-configuration should express time and byte budgets so the tradeoff is visible.
+- **Ambient recording.** Watching an input keeps a rolling recording without
+  a track or context — a RAM backend first, a local-NVMe rolling-chunk
+  backend for longer retention later. "Keep the last N seconds" reserves its
+  window at one sampled local head so rolling eviction cannot remove an
+  acknowledged take; a keep acknowledgement must say whether protection is
+  memory-only or locally durable. No disk capture exists yet.
+- **Summaries and queries.** Deterministic window summaries (event counts,
+  note/velocity ranges, changed CCs, clock estimate) reuse the existing MIDI
+  cursor/window mechanism and need no context or model turn. SysEx probing
+  is explicit request/reply work built on `kj midi identify` and the
+  exchange worker; the daemon enforces message/reply limits and generation
+  validity across concurrent scripts.
+- **Kernel publication.** A requested window becomes an immutable artifact
+  only when exported: encode/hash/upload on ordinary workers, verified and
+  accepted by the kernel before it is a usable content reference. Exporting
+  is not automatically a block or track placement — that is a separate,
+  explicit kernel operation.
 
-"Keep the last N seconds" resolves its end at one sampled local head and
-reserves the actual window before asynchronous encoding/upload begins. After
-the reservation is acknowledged, rolling eviction cannot remove that take.
-Keep requests must support meaningful musical windows, not a fixed small RPC
-payload limit. Chunked export keeps a long take from requiring one large
-contiguous allocation. Repeated keeps and slow uploads remain bounded by a
-separate retained-take budget; refuse new requests explicitly when exhausted,
-without interrupting ambient ingestion or discarding an acknowledged take.
-Release kept material only on successful publication or explicit cancellation.
-The keep acknowledgement must name whether protection is memory-only or
-locally durable; it cannot imply that RAM survives a process or machine crash.
+### Slices
 
-The NVMe backend needs preallocated/reusable chunks, explicit disk-full and
-I/O-loss reporting, and a crash-recovery/index contract before it ships. File
-allocation, filesystem work and sealing stay off the input callback. Stopping
-a watch stops acquisition, not a previously acknowledged keep operation.
-Default retention sizes, persistent watch settings, durability policy and the
-eventual `kj` spelling remain open; no disk capture is enabled by this plan.
+Each slice adds failing tests first. No compatibility layer is required for a
+replaced Kaijutsu mechanism.
 
-### Summaries and queries
-
-Reuse the existing independent MIDI cursor/window mechanism for deterministic
-summaries: event counts by type/channel, note and velocity ranges, changed CCs,
-last observed bank/program, transport observations, clock estimate and loss.
-Window statistics and carried last-observed state are separate. Observation
-does not assign musical roles or establish current device programming.
-Clock/active-sensing counters are collected before musical capture filtering.
-Summaries do not require a context, create blocks, or trigger model turns.
-An explicit recording consumer may continue committing windows through the
-existing capture path. Retrospective reads and summaries neither require nor
-replace that consumer. Retention reads do not delete events after reduction.
-
-SysEx probing is explicit request/reply work. Existing `kj midi identify` and
-the exchange worker supply the starting mechanism. Scripts choose known
-queries, refresh intervals, backoff and when a deeper dump is useful. The
-daemon enforces message/reply limits, serialization, timeouts and endpoint
-generation validity even when several scripts ask at once. Query policy can
-defer expensive work during playing; incoming replies still need accounting.
-Do not periodically broadcast arbitrary SysEx to unknown devices.
-
-An exchange's separate ALSA client does not by itself keep device replies out
-of the ambient ear. Classify known transactions and unsolicited SysEx without
-claiming certainty where the protocol has no transaction identifier. Keep raw
-observations available within budgets; exclude classified settings dumps from
-musical interpretation, not silently from all history. Tests must cover reply
-fanout and ambiguous replies before automatic probing is enabled.
-
-### Kernel publication and kaish utilities
-
-Occasional watch configuration, inspection, snapshot requests and probe policy
-belong in `kj` and scripts. Chatty daemon reports use RPC. Device codecs and
-window reducers are reusable Rust functions beneath those verbs. Scripts never
-open another ALSA client or dispatch a shell command for each incoming event.
-Exact verb names and JSON schemas are not committed by this plan.
-
-Requested MIDI/PCM windows become immutable artifacts only when exported.
-Encode/hash/upload on ordinary workers, not in the hardware callback. The
-daemon's existing SFTP/CAS path downloads playback assets; publishing capture
-requires a separate upload/acceptance path. Prefer existing CAS staging APIs
-where their contract fits. The kernel verifies and accepts bytes before
-returning a globally usable content reference. A local hash is not proof that
-the kernel has the artifact. Preserve generation, format, actual coverage,
-timing anchors and gaps in an accompanying manifest.
-
-Retries must not duplicate recording mutations. Cancellation releases bounded
-snapshot resources; incomplete uploads must not appear as accepted artifacts.
-An export is not automatically a block or a track placement. Those are explicit
-kernel operations after artifact acceptance. Offline retention is bounded;
-reconnect does not upload all history or replay it as live music.
-
-Hootenanny prior art: chaosgarden `stream_io.rs` writes local mmap chunks while
-hootenanny owns staging/sealing. Reuse that separation, not its shared-path
-assumption across hosts. Its output-tap snapshot consumes an SPSC buffer;
-our retained-window API must support independent retrospective readers.
-
-### Execution checklist
-
-Each slice adds failing tests first and updates this section to distinguish
-library primitives, wired APIs and live verification. No compatibility layer
-is required for a replaced Kaijutsu mechanism.
-
-Implementation progress:
-
-- Inventory audit complete: the older profile presence path discards unmatched ports, and
-  an initial empty profile match sends no report. The live JD-Xi has no profile;
-  all-unknown profile presence does not prove a connection failure. Raw inventory
-  and matching health are now reported independently through raw inventory.
-  Profile snapshot denial and truncation currently go unchecked; reload is
-  reconnect-driven. Raw inventory now reconciles periodically and after hotplug.
-  Profile presence currently
-  carries queried identity across present-to-present replacements even if the
-  endpoint changed; replace that with generation-scoped identity.
-- Pure MIDI primitive implemented in `kaijutsu-audio/src/capture.rs`: explicit
-  message/retained-byte limits, fallible admission and non-destructive owned
-  position-window snapshots. Six regression tests cover independent reads,
-  expired/future coverage, byte eviction/rejection, wallclock rollback and
-  overwrite after snapshot. The runtime now has a per-source stamped history
-  manager for time retention/generations, bounded ingress and protected keeps;
-  its explicit-recording ring is byte-bounded too. A `VecDeque` supports direct
-  time eviction; it is not an SPSC queue pretending to be shared history.
-  Source watch controls and configurable policy remain open.
-- MIDI keep/export vertical path implemented; see "Keep recent MIDI". Runtime
-  tests cover loss fences, sampled heads, cancellation, upload chunks and hash
-  ownership. Kernel tests cover instance pinning, private staging and CAS-before-
-  release. A live synthetic SFTP upload on zorak passed; musical-input capture
-  on moltar is not yet verified. No running daemon or kernel was replaced.
-
-- [x] **1 — inventory.** Diagnosis of unknown MIDI presence and the raw
-  per-source retained-MIDI primitive shipped earlier (see the "Inventory audit
-  complete" and pure-primitive notes above); this slice adds the coherent
-  `/run` read: `reportAudioInventory` (`kaijutsu.capnp`), `AudioInventoryStore`
-  + the `/run/audio` projection (`crates/kaijutsu-kernel/src/
-  audio_inventory.rs`), and the daemon-side report builder + cadence
-  (`kaijutsu-audio-runtime/src/inventory_report.rs`, wired into `runtime.rs`).
-  Tests: connection/revision ordering and stale-marking
-  (`audio_inventory.rs`); a report landing at the projected path with the
-  kernel's own `received_epoch_ns`/`stale`, two nodes as separate
-  directories, and a dropped connection's node going stale within the reap
-  window — never removed (`audio_inventory_wire.rs`); `own_clients` carrying
-  ear/exchange/patchview and never render, and `events` reading from the
-  right counter for an input vs. the render port (`inventory_report.rs`).
-  Unplug/replug address reuse and missed-notification reconciliation were
-  already covered by the observer's own periodic/hotplug reconciliation
-  before this slice and are unchanged by it.
-- [x] **2 — retained MIDI windows.** Add independent retrospective reads and
-  byte bounds to the existing capture substrate; wire per-source lifecycle
-  and bounded ingress. Tests: repeated/overlapping reads; overwrite and
-  oversize messages; clock rollback; stale generation; slow reader; stop and
-  restart; no source can exhaust the node budget unnoticed.
+- [x] **1 — inventory.** The coherent `/run` read: `reportAudioInventory`
+  (`kaijutsu.capnp`), `AudioInventoryStore` + the `/run/audio` projection
+  (`crates/kaijutsu-kernel/src/audio_inventory.rs`), and the daemon-side
+  report builder + cadence (`kaijutsu-audio-runtime/src/inventory_report.rs`).
+- [x] **2 — retained MIDI windows.** Independent retrospective reads and byte
+  bounds on the existing capture substrate (`kaijutsu-audio/src/capture.rs`);
+  per-source lifecycle and bounded ingress.
 - [ ] **3 — ambient summaries.** Publish a bounded deterministic observation
-  feed with no context. Tests: note-on velocity zero, notes spanning windows,
-  CC bursts, clock-only source, loss invalidating inferred state, idle expiry.
-- [ ] **4 — snapshot to CAS.** Freeze bounded windows, encode and upload through
-  kernel acceptance; expose `kj` operations. Tests: expired/partial requests,
-  corruption, interrupted upload, retries, cancellation and concurrent readers.
-  Add immediate keep reservations: eviction cannot remove an acknowledged take,
-  and a full take budget rejects new keeps without stopping input. Export long
-  windows in bounded chunks rather than imposing a small whole-take byte limit.
-  The bounded MIDI path is implemented; longer artifacts and restart recovery
-  remain open. Current artifact limit is 16 MiB.
-- [ ] **5 — PCM input.** Add opt-in input watches behind the same coverage and
-  lifecycle contract. Tests: frame alignment, format changes, xruns, retention
-  budget, unplug while reading, and callback progress during a slow export.
-  Follow with the local-NVMe rolling-chunk backend for long ambient recordings;
-  test disk-full, chunk reuse, crash recovery and kept-take protection. Mark
-  RAM-only and durable keep acknowledgements distinctly.
-- [ ] **6 — scripted probing.** Expose bounded transactions and sample scripts.
-  Tests: no reply/backoff, competing requests, reply fanout, disconnect and
-  endpoint reuse. Device-specific queries require documented protocol evidence.
+  feed with no context.
+- [ ] **4 — snapshot to CAS.** Freeze bounded windows, encode and upload
+  through kernel acceptance; expose `kj` operations. Current artifact limit
+  is 16 MiB; longer artifacts and restart recovery remain open.
+- [ ] **5 — PCM input.** Opt-in input watches behind the same coverage and
+  lifecycle contract, then the local-NVMe rolling-chunk backend for longer
+  ambient recordings.
+- [ ] **6 — scripted probing.** Bounded transactions and sample scripts;
+  device-specific queries require documented protocol evidence.
 
-Inventory investigation and the pure retained-MIDI primitive can proceed in
-parallel. Wire changes, CAS upload and default budgets wait for design review.
-Live acceptance is moltar inventory and unplug/replug first, then retrospective
-MIDI windows and an opt-in PCM capture. Do not treat synthetic tests as physical
-playback or capture verification. Do not restart another machine's daemon as a
-side effect of building these changes.
-
-### Review and open decisions
-
-Gemini Pro batch review through kaibo was submitted as
-`gemini/batches/haggchzwu5upwehlrqyxy7qimz0pw75xibpw` using
-`gemini-pro-latest`. Review collected; dispositions:
-
-The ambient-recording/NVMe and immediate-keep requirements were added after
-this batch review. They require a focused storage/lifetime review before that
-backend is implemented; do not treat this batch as covering those additions.
-
-- Accepted: isolate source retention, bound bytes/messages/exports, expose
-  multi-node inventory, scope identity to generations and classify reply fanout.
-  These remain acceptance conditions, not claims that runtime wiring is done.
-- Clarified: network reconnect is not necessarily a capture discontinuity.
-  Connection ownership and hardware stream generations are separate lifetimes.
-- Declined: removing every four-second capture commit. Explicit recording is an
-  independent consumer and can coexist with passive retrospective history.
-- Declined: exclusive port locking as reply classification. It does not supply
-  protocol correlation and must not interrupt normal input observation.
-- Corrected: the review saw tests for byte bounds without their implementation
-  while the subagent was in its red/green cycle. The completed primitive has
-  production byte limits and passing tests; the runtime still uses count-only
-  construction, so runtime byte bounds remain open.
-- Corrected: `CuePayload::Inline | Cas` is a playback reference contract, not
-  a capture-upload API. Slice 4 must select and verify kernel CAS acceptance.
-- Budget suggestions were not adopted. The review's 1 MB MIDI source budget
-  does not guarantee hours of input; payload rate and event metadata matter.
-  Its 5 MB export limit would cover only about 13 seconds of 48 kHz stereo
-  float32. Retention and request defaults must be chosen together with a
-  visible node budget, not inferred from an event-count limit.
-
-The implemented MIDI path above settles initial budgets, upload reuse and keep
-verbs. Node path encoding and watch controls remain open. The full
-role/port/channel/programming binding remains a later routing plan, not an
-implicit part of observation.
-
-Implementation review collected from Gemini Pro through kaibo:
-`gemini/batches/wnpwihn04wyjir98qvfzvem06lioopihh1wm`.
-
-- Declined: replace CAS `write` with `write_all`. `StreamingWriter::write`
-  returns `Result<(), StoreError>`, not a byte count; its staging writer already
-  writes the full slice. The review assumed the `std::io::Write` contract.
-- Accepted as follow-up: ingress loss currently stops retained sources until
-  inventory reconciliation, then starts new generations. This discards old
-  history and may reject up to two seconds of otherwise valid new input.
-  Do not simply remove the reset: the shared ingress queue can also lose hotplug
-  events, so continued device identity is not assured. Separate data loss from
-  topology uncertainty before preserving generations across loss.
+Do not treat synthetic tests as physical playback or capture verification.
+Do not restart another machine's daemon as a side effect of building these
+changes.
 
 ## Run
 

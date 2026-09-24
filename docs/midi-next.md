@@ -444,64 +444,35 @@ Three moves change that:
 ## Slices
 
 1. **Devices become available — shipped.**
-   - Embedded seeds under `assets/defaults/midi/devices/`, `/config/midi/devices/`
-     namespace, `kj midi list|show`.
-   - The matcher is a pure, backend-neutral function
-     (`kaijutsu-audio-runtime/src/midi_match.rs`: names + USB IDs in, device +
-     role out; ambiguity refuses rather than guesses) fed by the ear's
-     announce watcher; `reportMidiPresence` carries `{device, present,
-     backend, ports, at}` to the kernel, which records it in an ephemeral
-     in-memory store rendered read-only at `/run/midi/<device>`
-     (`kaijutsu-kernel/src/midi_presence.rs`). `kj midi list` has a
-     live/absent/**unknown** column — unknown is load-bearing: a restarted
-     kernel with no sinks connected knows nothing and says so. Deferred with
-     a seam in place: USB `vendor:product` enrichment (`PortFacts::usb_id`
-     is never filled on Linux yet — matching runs on name substrings).
-   - `kj midi send`/`panic` ride the existing `RenderCue` wire under a
-     control mime, `application/vnd.kaijutsu.midi-control+json`
-     (`kaijutsu-audio/src/midi_control.rs`): a small JSON envelope carrying
-     the device name plus hex-encoded complete MIDI messages, each with an
-     `offset_ms` (how a gated note's Note Off rides the same cue). Kernel
-     side (`kj/midi.rs`): `send <device> note|cc|pc|sysex`, `panic [device]`;
-     channels 1-16 at the surface; the **profile** is the gate (unknown
-     device = loud error), **presence is not** (absent/unknown warns and
-     sends anyway — the sink drops what it can't route). Sink side
-     (`dj/midi.rs`): the matcher ships a device→address table to the DJ
-     thread (`DjCtl::MidiRoutes`), and a control cue rides a per-device
-     `ctl:<name>` port wired to its device by subscription — visible in
-     `aconnect -l`, exact (its one subscription IS the device, so the score
-     never leaks in). Routes are re-verified per cue so replug self-heals;
-     unroutable = loud warn + drop, **never** a fallback to the
-     auto-connected render port. Deferred with the seam in place:
-     role-aware port choice (slice 1 takes the device's *first* matched
-     port), `/run/midi` sent-provenance, CoreMIDI address forms
-     (`parse_alsa_addr` refuses them rather than guessing).
-   - The **`exchange()` sink method** + `kj midi identify` closes this
-     slice. The wire is one method on the existing subscriber callback
-     (`BlockEvents.exchange @15 {portOrDevice, payload, replyMatch,
-     timeoutMs} -> reply`). An exchange is **addressed, not fanned out**, so
-     the kernel needs a way to call ONE connection: presence already knew
-     which (`SinkAttribution::connection`), so the kernel has a matching
-     registry (`kaijutsu-kernel/src/midi_exchange.rs`, connection → channel,
-     registered by the server at `subscribe_blocks*` and reaped on
-     disconnect exactly like presence) and the server owns the task that
-     turns a channel request into the capnp call — the kernel still holds no
-     capnp capability and no hardware. Sink side: a third ALSA client
-     (`kaijutsu-exchange`, alongside render and the ear) on its own thread,
-     one dialogue at a time, the request and reply each riding a temporary
-     subscription taken and dropped inside the exchange, so the ear never
-     sees request/reply traffic. Timeouts are a ladder so the layer that
-     actually wedged is the layer whose error a player reads; every failure
-     — unknown device, absent device, sink not serving exchanges, silent
-     device, unparseable reply — is a named error, never a hang and never an
-     empty reply. `kj midi identify` files the parsed reply at
-     `/run/midi/<device>` as the **`pulled`** provenance — the first fact in
-     that store the *device itself* asserted. It survives re-reports that
-     keep the device live, and dies on any unplug or reap (what returns to a
-     port may be a different unit; re-plug ⇒ re-identify). Deferred with
-     seams in place: per-port (rather than per-sink) serialization,
-     role-aware port choice, a CoreMIDI worker, and the timeout ladder's
-     duplication across crates (`docs/issues.md`).
+   - Embedded device seeds (`assets/defaults/midi/devices/`) load into
+     `/config/midi/devices/`; `kj midi list|show` reads them. A pure,
+     backend-neutral matcher (`kaijutsu-audio-runtime/src/midi_match.rs`)
+     resolves device + role from names and USB IDs; ambiguity refuses
+     rather than guesses.
+   - The ear's announce watcher reports presence (`reportMidiPresence`) to
+     an ephemeral in-memory store rendered read-only at `/run/midi/<device>`
+     (`kaijutsu-kernel/src/midi_presence.rs`); `kj midi list` shows
+     live/absent/**unknown**, and unknown is load-bearing — a restarted
+     kernel with no sinks connected knows nothing and says so.
+   - `kj midi send`/`panic` ride the existing `RenderCue` wire under
+     `application/vnd.kaijutsu.midi-control+json`
+     (`kaijutsu-audio/src/midi_control.rs`). The profile gates an unknown
+     device (loud error); presence does not (absent/unknown warns and sends
+     anyway — the sink drops what it can't route). The DJ thread
+     (`dj/midi.rs`) routes each device to a per-device `ctl:<name>` ALSA
+     port wired to it by subscription, re-verified per cue so replug
+     self-heals; unroutable is a loud warn and drop, never a silent
+     fallback to the render port.
+   - `exchange()` (`BlockEvents.exchange @15`) and `kj midi identify` close
+     the slice: an addressed (not fanned-out) request/reply over a
+     dedicated ALSA client (`kaijutsu-exchange`), routed through a
+     connection registry (`kaijutsu-kernel/src/midi_exchange.rs`) that maps
+     connection to channel and reaps on disconnect like presence does.
+     Every failure mode — unknown/absent device, non-exchanging sink,
+     silent device, unparseable reply — is a named error, never a hang or
+     an empty reply. `kj midi identify` files the parsed reply at
+     `/run/midi/<device>` as the **`pulled`** provenance, the first fact
+     the device itself asserted; it dies on unplug or reap.
 2. **Routing consumes profiles.** The render sink resolves "track →
    *device.role*" through the profile to port + channel — paying for the
    per-track channel-routing open item (`docs/midi.md`, `docs/chameleon.md`)

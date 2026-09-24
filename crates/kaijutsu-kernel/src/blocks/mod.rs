@@ -9,15 +9,13 @@
 //! ever concurrently edited and concurrent merge is structurally impossible.
 //! Reintroducing a text CRDT here is a design conversation, not a patch —
 //! streaming is 100% append and `push_str` is amortized O(1), while the
-//! per-block merge metadata measured about 4x the text it represented. See
-//! `docs/crdt-position-2026-08.md`.
+//! per-block merge metadata measured about 4x the text it represented.
 //!
 //! This module used to be a standalone crate. It moved in-tree 2026-08-16:
 //! the crate held no dependency the kernel didn't already have, and its
 //! exported abstractions (blocks, forks, selection)
 //! are meaningful only over the wire the kernel serves — not at a
-//! `Cargo.toml` boundary. See CLAUDE.md "Durable state and the wire" and
-//! `docs/crdt-position-2026-08.md`.
+//! `Cargo.toml` boundary. See CLAUDE.md "Durable state and the wire".
 //!
 //! # Block Types
 //!

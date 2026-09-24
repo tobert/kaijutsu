@@ -1,25 +1,22 @@
 # The `/v` virtual filesystem: `/v/cas`, `/v/ctx`
 
 **`/v/cas` is shipped** — the CAS pool and client sync below are live. **`/v/ctx`**
-(context + block introspection) is designed here but unbuilt. **`/v/session`**,
-this doc's original sketch for a per-session view exposing each connection's
-currently-acting context, did not ship as such: the live-participant roster
-shipped instead as `/run/roster` (`crate::roster`), a broader `kernel_db`-backed
-liveness view over principals and contexts (`docs/devlog.md`, "The instrument
-could not say who was in the room"). It answers "who and what is around," not
-"which session is driving which context" — the `/v/session` idea below remains
-open, kept as design record rather than duplicated work.
+(context + block introspection) is designed here but unbuilt. A per-session view
+exposing each connection's currently-acting context was sketched here as
+`/v/session`; the live-participant roster shipped instead as `/run/roster`
+(`crate::roster`), a broader `kernel_db`-backed liveness view over principals
+and contexts (`docs/devlog.md`, "The instrument could not say who was in the
+room"). It answers "who and what is around," not "which session is driving
+which context."
 
-`/v` is kaijutsu's virtual namespace. This note covers three **sysfs-style**
+`/v` is kaijutsu's virtual namespace. This note covers two **sysfs-style**
 surfaces under it:
 
 - **`/v/cas`** — the kernel's CAS object pool, rendered as immutable files
   (**shipped** — the substrate for client CAS sync).
 - **`/v/ctx`** — every context and its block log, rendered as files (planned).
-- **`/v/session`** — the live participants (app, MCP, SFTP) and, read-only, the
-  context each one is currently acting as (planned).
 
-Because all three are ordinary `VfsBackend`s on the **kernel `MountTable`**, the same
+Because both are ordinary `VfsBackend`s on the **kernel `MountTable`**, the same
 trees are reachable from the Bevy app, kaish, the file tools, **and** SFTP — build
 once, every surface gets the view. This is the "instrument you play" stance made
 literal: `grep`, `less`, `ls -l` over live kernel state.
@@ -57,7 +54,7 @@ overlap:
 ## Why this is its own doc, independent of SFTP
 
 These are general surfaces with value far beyond SFTP — `awk` over a `blocks/index`,
-`ls -l /v/session`, a context browser reading `index`, a clip sink pulling a sample —
+a context browser reading `index`, a clip sink pulling a sample —
 so they get built and tested on their own (via `kaish ls /v/ctx`, zero SFTP
 involved). SFTP is a **read/view consumer**: it serves the same kernel mount table,
 so each tree becomes remotely browsable the moment it mounts — not the capability
@@ -88,8 +85,8 @@ driver it was in the first draft (see "Capability").
    `/v` (a deliberate destination a project crawler never wanders into) is what lets
    `/v/ctx` hold *all* contexts safely.
 7. **Resist the `/proc` junk-drawer.** Each `/v` root is one thing. `/v/ctx` is
-   *only* the context/block model; `/v/session` is *only* live participants.
-   Neither is a place to put something that did not fit elsewhere. **Config is
+   *only* the context/block model. It is not a place to put something that did
+   not fit elsewhere. **Config is
    not under `/v` at all** — it lives at `/config`, a sibling top-level tree
    (`docs/config-namespace.md`), because a config directory is an ordinary host
    directory and `/v` is for what the kernel synthesizes. *(This principle read
@@ -298,54 +295,6 @@ per the context/conversation split) is noted but out of scope. Today you remedia
 via the existing verbs (`kj stage exclude <key>`, then `kj fork`); `/v/ctx` *reflects*
 the result immediately.
 
-## `/v/session` — live participants (read-only roster)
-
-A `VfsBackend` view over the kernel's **live participant registry**, `/proc`-style
-(in-memory; entries appear on attach, vanish on disconnect). The seed exists:
-`PeerRegistry` (`crates/kaijutsu-kernel/src/peers.rs:103`) already tracks the app and
-MCP servers with `nick`, a unique-per-process `instance`, a **server-stamped
-`principal`** (never trusted from the client), and `attached_at` (`PeerInfo`,
-`peers.rs:55`); it gains a session *kind* field (none today). SFTP and terminal
-client connections register as new kinds (`docs/tui.md`).
-
-```
-/v/session/
-├── index                         # roster TSV: instance  kind  principal  attached  context
-├── self -> <my-instance>         # resolved per-caller (/proc/self); introspection only
-├── <app-instance>/
-│   ├── kind        # "app"
-│   ├── principal   # <id>        (server-stamped)
-│   ├── attached    # <iso>
-│   └── context -> /v/ctx/<ab>/<id>   # read-only: its *live* acting context (session registry, not KV)
-├── <mcp-instance>/…                  # same shape
-└── <sftp-conn>/
-    ├── kind principal                # "sftp"; <id>
-    └── (no context — SFTP carries none; see Capability)
-```
-
-`ls -l /v/session/` (or one read of `index`) is a live roster of who's playing the
-instrument and what context each is acting as.
-
-**`context` is read-only observation, not a setter — and it renders *live* session
-state, never KV.** It shows the participant's **current acting context** read from
-the live state the kernel already tracks: `SessionContextMap`
-(`runtime/context_engine.rs:31`, an ephemeral `DashMap<SessionId, ContextId>` the
-shell resolves per-op). Deliberately the *ephemeral* value — a disconnected session
-has no live context, nothing to render. KV is **not** the source (KV was retired
-2026-07-04 — `docs/shared-state.md`); KV's one real job, **durable** per-client
-restoration, survives disconnect and therefore lives in a typed per-client store
-(*Future: `/v/clients`* below), not here — this tree only ever shows who is live
-*right now*. No symlink-to-arm, no TTL — see "Capability".
-
-**`conversation/` (deferred — omitted from the tree on purpose).** The
-context/conversation split (durable multi-writer context vs. the append-only sequence
-actually shipped to the LLM) is currently invisible. Each session that *runs* a
-conversation (app / MCP / SSH-shell, **not** SFTP) would gain a `conversation/`
-subdir for the hydrated sequence — append-only, ordinal-stable, read-only, with its
-own `index` — so a debugger can diff it against `/v/ctx/<id>/blocks/index` and *see*
-what a pending `stage exclude` will drop at the next fork. Namespace reserved now;
-built later.
-
 ### `self` resolution
 
 `self` is resolved **at adapter altitude**, where the caller's identity exists — each
@@ -402,15 +351,15 @@ privileges; the constraint is for safe operation. A non-privileged context simpl
 can't write the privileged trees (the guard denies, fail-loud, naming the path).
 Identity follows the Unix model: a session's `principal` is the **authenticated
 user**; multiple sessions by one user share that principal and authorship lane
-(`BlockId.principal_id`). The per-connection `instance` distinguishes `/v/session`
+(`BlockId.principal_id`). The per-connection `instance` distinguishes `/run/roster`
 rows and rides traces but never enters authorship — two logins are two ttys for one
 uid.
 
 ## Future: `/v/clients` — durable per-client state, and steering it
 
-`/v/session` is the *live* roster (who's connected **now**, ephemeral, read-only).
-Its mirror-image sibling is **`/v/clients`** — the **durable** per-client state,
-keyed by the stable installation client-id (`client_id.rs`), surviving disconnect:
+`/run/roster` is the *live* roster (who's connected **now**, ephemeral, read-only).
+Its durable counterpart is **`/v/clients`** — per-client state keyed by the
+stable installation client-id (`client_id.rs`), surviving disconnect:
 the typed per-client store that replaces KV (`docs/shared-state.md`, *Retiring KV*),
 *projected* as files the slash-v way — the canonical store is a normalized `KernelDb`
 row with a typed RPC; `/v/clients` is the introspection-and-control surface over it.
@@ -418,13 +367,13 @@ row with a typed RPC; `/v/clients` is the introspection-and-control surface over
 ```
 /v/clients/
 ├── index                         # TSV: client-id  last-seen  context  …
-├── self -> <my-client-id>        # the durable id (cf. /v/session/self = the live instance)
+├── self -> <my-client-id>        # the durable id (cf. /run/roster's live instance)
 └── <client-id>/
     ├── last_seen   # <iso>
     └── context -> /v/ctx/<ab>/<id>   # the context this client should be showing
 ```
 
-The axis that makes it interesting: unlike `/v/ctx` and `/v/session` (strictly
+The axis that makes it interesting: unlike `/v/ctx` and `/run/roster` (strictly
 read-only), **`/v/clients/<id>/context` is writable, and a write *steers* that
 client.** The client watches its own row (a `generation` bump, like every other hot
 file here) and follows the change. So `context` is simultaneously **the client's own
@@ -447,7 +396,7 @@ for the dedicated session: how a steered client *observes* the change (poll
 `generation` vs. a notify — KV's `kvWatch` is gone); whether `context` is
 the only steerable field (theme, layout, a "spotlight this block" pointer all fit);
 and the exact typed-RPC vs. file-write split (the file is the *projection*; the RPC
-is canonical). Reserved as a direction now; `/v/ctx` + `/v/session` land first.
+is canonical). Reserved as a direction now; `/v/ctx` lands first.
 
 ## Decisions (2026-06-27; track B 2026-07-02, landed)
 
@@ -477,9 +426,6 @@ is canonical). Reserved as a direction now; `/v/ctx` + `/v/session` land first.
 - **Huge `content`** — a giant `tool_result` body via one `content` file; lean is no
   size cap, chunked reads, `json`/`index` omitting the body. Range-read discipline
   vs. a cap still unsettled (sysfs's PAGE_SIZE problem, our version).
-- **`conversation/` home** — confirmed under `/v/session/<id>/`, but the hydration
-  boundary semantics (one conversation per running loop? per fork?) want pinning
-  when it's built.
 - **Reconnect flicker** — peer entries can flicker on reconnect
   (`[[tech_debt_peer_reattach_on_reconnect]]`); that churn will be visible here.
   Acceptable for `/proc`-style state.
@@ -506,19 +452,12 @@ write/capability work this surface used to drive is gone — SFTP is a read cons
    Testable via `kaish ls /v/ctx` with no SFTP. Mounts on the kernel `MountTable`
    (see "The mount-table reality"); mind the kaish `/v/cas` shadow-overlay
    papercut in track B — verify the mount is not similarly shadowed.
-2. **`/v/session` read-only roster.** View over the participant registry
-   (`PeerRegistry` generalized to carry a session *kind* — `PeerInfo` has none today,
-   `peers.rs:55`); rows render each session's **live** acting context from
-   `SessionContextMap` as a read-only `context` edge (never KV); `self` resolution
-   wired per surface; `index` TSV. (`conversation/` is namespace-reserved, not built
-   here.)
-3. **SFTP mounts `/v` read-only.** The SFTP adapter exposes the same backends so an
-   sshfs session can browse context/block/session state. `/v/ctx` and `/v/session`
-   are `EROFS` by construction (the backend itself refuses writes), same as `/v/cas` —
-   no guard injection needed, and no lexical deny (SFTP carries none; see
-   "Capability").
+2. **SFTP mounts `/v` read-only.** The SFTP adapter exposes the same backends so an
+   sshfs session can browse context/block state. `/v/ctx` is `EROFS` by
+   construction (the backend itself refuses writes), same as `/v/cas` — no guard
+   injection needed, and no lexical deny (SFTP carries none; see "Capability").
 
-**Dependency order:** 0 → 1 → 2; slice 3 depends only on 1–2.
+**Dependency order:** 0 → 1 → 2.
 
 ## File references
 
@@ -532,14 +471,13 @@ Track B (`/v/cas`, landed):
 - `crates/kaijutsu-client/src/ssh.rs:210` — `connect_subsystem` (the `SftpClient` transport); `sftp.rs` — `SftpClient`/`BlobFetch`/`BlobResolver` (sharded `blob_path`, single-flight, read-to-EOF, `HashMismatch`)
 - `crates/kaijutsu-app/src/audio.rs` — the B4 consumer; `Cargo.toml:63` — `russh-sftp = "2.3"` (workspace; client + server halves of one crate)
 
-Track V (`/v/ctx` + `/v/session`, unbuilt):
+Track V (`/v/ctx`, unbuilt):
 
 - `crates/kaijutsu-kernel/src/runtime/embedded_kaish.rs` — `/v/docs` (**kaish-side** mount, not kernel-`MountTable` — not SFTP-visible; see "The mount-table reality")
 - `crates/kaijutsu-kernel/src/vfs/backends/cas.rs`, `roster.rs` — synthetic `VfsBackend`s to mirror the pattern of
 - `crates/kaijutsu-types/src/ids.rs:54` — all ids are `Uuid::now_v7()` (the trailing-byte sharding rule)
-- `crates/kaijutsu-kernel/src/peers.rs:55,115` — `PeerInfo` / `PeerRegistry` (the session seed; `PeerInfo` needs a `kind` field)
-- `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source `context` renders; KV is retired, see `docs/shared-state.md`)
-- `crates/kaijutsu-app/src/connection/actor_plugin.rs:924,1144` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/v/session`)
+- `crates/kaijutsu-kernel/src/runtime/context_engine.rs:31` — `SessionContextMap` (the live acting-context source; KV is retired, see `docs/shared-state.md`)
+- `crates/kaijutsu-app/src/connection/actor_plugin.rs:924,1144` — the app's *durable* per-client restore (via the typed per-client store `set_last_context`/`get_client_view`, **not** `/run/roster`)
 - `crates/kaijutsu-types/src/block.rs:67,134` — `BlockId::to_key()`; `BlockHeader` (would gain `content_len` — not landed)
 - `crates/kaijutsu-kernel/src/blocks/block_store.rs:213` — `block_ids_ordered()` (per-context timeline truth → `blocks/index` order)
 - `crates/kaijutsu-kernel/src/block_store.rs:191,162` — `documents: DashMap<ContextId, DocumentEntry>`; `DocumentEntry::version()` (coherence stamp; bumped on local write, restored on remote `merge_ops`, e.g. `block_store.rs:2587`)
