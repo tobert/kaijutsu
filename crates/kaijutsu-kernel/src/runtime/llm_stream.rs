@@ -1545,9 +1545,15 @@ fn make_pending_shell_receipt(
         return;
     }
     let Some(ask_id) = ask_id else { return; };
-    if serde_json::from_str::<serde_json::Value>(params).ok()
-        .and_then(|value| value.get("foreground").and_then(serde_json::Value::as_bool)) == Some(true)
-    {
+    // Read the model's raw call arguments, not a parsed `ShellParams` — this
+    // helper only sees the JSON the model actually sent. A missing key
+    // defaults to `true`, matching `ShellParams`'s own default: an omitted
+    // `foreground` waits for completion, so it must not mint a background
+    // receipt any more than an explicit `foreground: true` would.
+    let foreground = serde_json::from_str::<serde_json::Value>(params).ok()
+        .and_then(|value| value.get("foreground").and_then(serde_json::Value::as_bool))
+        .unwrap_or(true);
+    if foreground {
         return;
     }
     match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id) {
@@ -7146,6 +7152,58 @@ mod lifetime_tests {
             assert!(block.provenance.is_some());
             assert!(!block.is_error);
             assert_eq!(lease.settle_blocks(kernel.blocks()).unwrap(), 0);
+        }
+    }
+
+    /// `make_pending_shell_receipt` reads the model's raw, unparsed call
+    /// arguments to decide whether a pending gate ask should mint a
+    /// background operation receipt — it cannot see `ShellParams`'s serde
+    /// default, only the JSON the model actually sent. Omitting `foreground`
+    /// must be treated the same as sending `foreground: true` (both mean
+    /// "wait for completion" under the current default): neither mints a
+    /// receipt, and the caller's own Waiting content and status pass through
+    /// untouched. Only an explicit `foreground: false` mints one.
+    ///
+    /// Falsified by comparing the parsed value against `Some(true)` instead
+    /// of defaulting a missing key to `true`, which is the bug this default
+    /// change introduced and this test pins shut.
+    #[tokio::test]
+    async fn make_pending_shell_receipt_matches_the_shell_params_default() {
+        use approval_ledger::types::{NewAsk, Origin};
+        let (kernel, context, _after, call) = fixture(None).await;
+        let documents = kernel.blocks().clone();
+        let reviewer = PrincipalId::new();
+        for (label, args, should_mint) in [
+            ("omitted", serde_json::json!({"command": "echo x"}), false),
+            ("explicit true", serde_json::json!({"command": "echo x", "foreground": true}), false),
+            ("explicit false", serde_json::json!({"command": "echo x", "foreground": false}), true),
+        ] {
+            // A real durable ask — `start_shell_operation`'s link step looks
+            // it up by id, so a fabricated string fails before the
+            // foreground/background branch under test is even reached.
+            let ask_id = approval_ledger::ask::create_ask(kernel.kernel_db().lock().conn_for_ledger(), &NewAsk {
+                context_id: context.as_bytes().to_vec(), actor_id: call.actor_id.as_bytes().to_vec(),
+                reviewer_id: reviewer.as_bytes().to_vec(), principal_id: call.principal_id.as_bytes().to_vec(),
+                origin: Origin::ShellGate, instance: None, tool: None, hook_id: None,
+                description: format!("pending shell call ({label})"), statements: vec![], authorized_label: None,
+                rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+                exec_source: Some("echo x".into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+            }).unwrap();
+            let mut content = "unmodified pending refusal text".to_string();
+            let mut is_error = false;
+            let mut status = Status::Waiting;
+            make_pending_shell_receipt(
+                &kernel, &documents, context, &call, "shell", &args.to_string(),
+                Some(&ask_id), &mut content, &mut is_error, &mut status,
+            );
+            if should_mint {
+                assert_eq!(status, Status::Done, "{label}: an explicit background call must mint a receipt: {content}");
+                assert!(content.contains("operation"), "{label}: {content}");
+            } else {
+                assert_eq!(status, Status::Waiting, "{label}: a foreground-by-default call must not mint a receipt");
+                assert_eq!(content, "unmodified pending refusal text", "{label}: content must pass through untouched");
+                assert!(!is_error, "{label}");
+            }
         }
     }
 

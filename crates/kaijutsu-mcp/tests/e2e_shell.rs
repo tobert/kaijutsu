@@ -155,14 +155,38 @@ fn shell_returns_stdout() {
     });
 }
 
+/// `foreground` defaults to `true`: a call that omits it entirely must wait
+/// for completion and return the finished envelope, not a receipt.
 #[test]
-fn shell_defaults_to_a_receipt_and_wait_observes_completion() {
+fn shell_omitted_foreground_waits_for_completion() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        register_with_retry(&mcp, "omitted-foreground").await;
+
+        let request: ShellRequest = serde_json::from_value(serde_json::json!({
+            "command": "echo hello",
+        })).unwrap();
+        let out = mcp.shell_impl(request, None).await;
+        let env = out.structured_content.expect("shell must return structuredContent");
+
+        assert_eq!(env["status"].as_str(), Some("done"), "expected Done status, got envelope: {env}");
+        assert_eq!(env["stdout"].as_str(), Some("hello\n"), "stdout did not replicate into the envelope: {env}");
+    });
+}
+
+/// Omitting `foreground` now waits for completion (see
+/// `shell_omitted_foreground_waits_for_completion` above) — this exercises
+/// the background path through its explicit opt-out instead.
+#[test]
+fn shell_explicit_background_returns_a_receipt_and_wait_observes_completion() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
         register_with_retry(&mcp, "async-receipt").await;
         let request = serde_json::from_value(serde_json::json!({
             "command": "sleep 3; echo async-finished",
+            "foreground": false,
         })).unwrap();
         let started = std::time::Instant::now();
         let out = mcp.shell_impl(request, None).await;

@@ -45,17 +45,22 @@ pub struct ShellParams {
     /// stdin ignores it.
     #[serde(default)]
     pub stdin: Option<String>,
-    /// Wait for command completion and result hooks. Defaults to `false`.
+    /// Wait for command completion and result hooks. Defaults to `true`.
     /// A result review returns a pending refusal; inspect its captured and
     /// final results with `kj ledger show` after the reviewer answers.
     ///
-    /// An asynchronous command runs the same complete kaish program as a
-    /// foreground command, with the same context identity, tools, mounts,
-    /// variables, working directory, and external-command policy. It returns
-    /// a stable operation receipt without waiting for completion; read, wait,
-    /// or cancel it through the shell operation API.
-    #[serde(default)]
+    /// Pass `false` for long-running work: an asynchronous command runs the
+    /// same complete kaish program as a foreground command, with the same
+    /// context identity, tools, mounts, variables, working directory, and
+    /// external-command policy. It returns a stable operation receipt
+    /// without waiting for completion; read, wait, or cancel it through the
+    /// shell operation API.
+    #[serde(default = "default_true")]
     pub foreground: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // The kaish-language guidance (word-splitting, globs, `case`/`esac`,
@@ -368,6 +373,15 @@ mod tests {
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
+    /// Omitting `foreground` must deserialize to `true` — the model waits
+    /// for completion unless it opts into a receipt for long-running work.
+    #[test]
+    fn shell_params_omitted_foreground_defaults_to_true() {
+        let parsed: ShellParams =
+            serde_json::from_value(serde_json::json!({"command": "echo hi"})).unwrap();
+        assert!(parsed.foreground, "omitting foreground must wait for completion by default");
+    }
+
     #[tokio::test]
     async fn emitted_shell_tools_do_not_advertise_compose_draft() {
         let ctx = CallContext::new(
@@ -506,11 +520,14 @@ mod tests {
         }
     }
 
+    /// `foreground` now defaults to `true`, so these callers ask for the
+    /// background path explicitly — `foreground: false` — rather than
+    /// relying on omission the way they could before the default flipped.
     fn call_async(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
             tool: ShellServer::TOOL.to_string(),
-            arguments: serde_json::json!({ "command": command }),
+            arguments: serde_json::json!({ "command": command, "foreground": false }),
         }
     }
 
@@ -518,6 +535,17 @@ mod tests {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
             tool: ShellServer::TOOL_WRITE.to_string(),
+            arguments: serde_json::json!({ "command": command, "foreground": false }),
+        }
+    }
+
+    /// Params with no `foreground` key at all — the omission a caller hits
+    /// under the new default (`ShellParams`'s `#[serde(default =
+    /// "default_true")]`), distinct from `call_async`'s explicit opt-out.
+    fn call_omitted(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(ShellServer::INSTANCE),
+            tool: ShellServer::TOOL.to_string(),
             arguments: serde_json::json!({ "command": command }),
         }
     }
@@ -2307,6 +2335,28 @@ mod tests {
         assert_eq!(body_of(&result)["status"], serde_json::json!("done"));
         assert!(streams_of(&result).contains("foreground"));
         assert!(body_of(&result)["operation_id"].is_null());
+    }
+
+    /// The default itself, exercised through the broker: a call that omits
+    /// `foreground` entirely must behave exactly like `foreground: true` —
+    /// the finished envelope, not a receipt — because that is what the new
+    /// default means. Falsified by a broker call returning `running` with an
+    /// `operation_id` for an omitted field.
+    #[tokio::test]
+    async fn omitted_foreground_waits_for_completion_by_default() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("default-foreground"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let result = broker.call_tool(call_omitted("echo default-foreground"), &cc, CancellationToken::new()).await.unwrap();
+        assert_eq!(body_of(&result)["status"], serde_json::json!("done"),
+            "omitting foreground must wait for completion, not return a receipt: {result:?}");
+        assert!(streams_of(&result).contains("default-foreground"));
+        assert!(body_of(&result)["operation_id"].is_null(),
+            "a foreground-by-default call must not mint an operation receipt");
     }
 
 }

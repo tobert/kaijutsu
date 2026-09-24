@@ -21,8 +21,9 @@ pub struct ShellRequest {
         description = "kaish command to execute in the current kernel context (e.g., 'cargo check', 'kj context list --tree')"
     )]
     pub command: String,
-    /// Wait for completion. Defaults to false: return an operation receipt.
-    #[serde(default)]
+    /// Wait for completion. Defaults to true. Pass false to get an
+    /// operation receipt for long-running work, then read or wait on it.
+    #[serde(default = "default_true")]
     pub foreground: bool,
     /// Foreground wait timeout in seconds (default: 300, max: 600).
     /// Reaching the timeout leaves the operation running.
@@ -30,17 +31,30 @@ pub struct ShellRequest {
     pub timeout_secs: Option<u64>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod shell_request_tests {
     use super::ShellRequest;
 
     #[test]
-    fn shell_schema_defaults_to_async_and_rejects_background() {
+    fn shell_schema_defaults_to_foreground_and_rejects_background() {
         let schema = serde_json::to_value(schemars::schema_for!(ShellRequest)).unwrap();
-        assert_eq!(schema["properties"]["foreground"]["default"], false);
+        assert_eq!(schema["properties"]["foreground"]["default"], true);
         assert!(serde_json::from_value::<ShellRequest>(serde_json::json!({
             "command": "echo hello", "background": true,
         })).is_err());
+    }
+
+    /// Omitting `foreground` must deserialize to `true` — the wire caller
+    /// waits for completion unless it opts into a receipt.
+    #[test]
+    fn shell_request_omitted_foreground_defaults_to_true() {
+        let parsed: ShellRequest =
+            serde_json::from_value(serde_json::json!({"command": "echo hello"})).unwrap();
+        assert!(parsed.foreground, "omitting foreground must wait for completion by default");
     }
 }
 

@@ -2004,7 +2004,7 @@ fn native_shell_result_review_survives_submitter_disconnect() {
             s.worker,
             session,
             "shell",
-            serde_json::json!({ "command": "echo captured MCP output" }),
+            serde_json::json!({ "command": "echo captured MCP output", "foreground": false }),
         ).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&receipt.stdout).unwrap();
         assert_eq!(body["status"], "running");

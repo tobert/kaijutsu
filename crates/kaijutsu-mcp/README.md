@@ -68,7 +68,7 @@ transport.
 
 | Tool | Does |
 |---|---|
-| `shell` | Submit a kaish command in the current kernel context. Returns an operation receipt by default; `foreground: true` waits for completion (default timeout 300s, max 600s). Requires `--connect` and a registered session. |
+| `shell` | Submit a kaish command in the current kernel context. Waits for completion by default (default timeout 300s, max 600s); set `foreground: false` to get an operation receipt for long-running work. Requires `--connect` and a registered session. |
 | `register_session` | Register this agent session and join a context. Must run before `shell`. Upserts on the session's label: attaches to an existing live context of that label, or creates a fresh one if the label names a concluded or archived context. |
 | `whoami` | This connection's identity: authenticated user, joined context id and label, agent session info. |
 | `list_kernel_tools` | List broker tools visible to the joined context (name, description, category, input schema). Requires `--connect`. |
