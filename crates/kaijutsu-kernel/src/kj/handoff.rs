@@ -246,11 +246,8 @@ impl KjDispatcher {
     }
 
     fn handoff_tail(&self, character: Option<&str>, window: Option<u32>, caller: &KjCaller) -> KjResult {
-        let caller_char = match self.resolve_caller_character(caller, "tail") {
-            Ok(row) => row,
-            Err(e) => return KjResult::Err(e),
-        };
-
+        // Only a bare `tail` needs the caller's own sheet; naming a character
+        // reads that log whether or not the caller has one.
         let target = match character {
             Some(name) => {
                 let db = self.kernel_db().lock();
@@ -265,7 +262,10 @@ impl KjDispatcher {
                     Err(e) => return KjResult::Err(format!("kj handoff tail: {e}")),
                 }
             }
-            None => caller_char,
+            None => match self.resolve_caller_character(caller, "tail") {
+                Ok(row) => row,
+                Err(e) => return KjResult::Err(e),
+            },
         };
 
         // `tail` never mints — a target with no log yet has nothing to
@@ -660,6 +660,27 @@ mod tests {
             panic!("expected Ok, got {result:?}");
         };
         assert!(message.contains("before retiring"), "got: {message}");
+    }
+
+    /// Naming an explicit target reads that target's log without the caller
+    /// needing a sheet of its own — the caller's character row is only the
+    /// default for a bare `tail`, never a precondition for any `tail`.
+    #[tokio::test]
+    async fn tail_with_explicit_target_does_not_require_the_caller_to_have_a_character() {
+        let d = test_dispatcher().await;
+        let hajime = create_and_play(&d, "hajime").await;
+        let noted = d
+            .dispatch(&[s("handoff"), s("note"), s("green"), s("on"), s("arrival")], &hajime)
+            .await;
+        assert!(matches!(noted, KjResult::Ok { .. }), "{noted:?}");
+
+        // A principal with no character sheet at all.
+        let stranger = caller_as(PrincipalId::new());
+        let result = d.dispatch(&[s("handoff"), s("tail"), s("hajime")], &stranger).await;
+        let KjResult::Ok { message, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(message.contains("green on arrival"), "got: {message}");
     }
 
     #[tokio::test]
