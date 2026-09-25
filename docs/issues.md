@@ -406,6 +406,18 @@ this left open:
   description needs correcting, or the archived case needs the same
   registry-fallback treatment the already-joined fast path now gets.
 
+## kaijutsu-mcp startup against a sick kernel (2026-09-25)
+
+- **Auto-registration gives up after about 8 s and never retries.** This
+  session's MCP started at 09:00:31 while the kernel was out of file
+  descriptors; `start_behind_handshake` (`kaijutsu-mcp/src/main.rs`) retried
+  six times, settled the gate, and left the process unjoined until a manual
+  `register_session`. After a kernel outage every session needs the same
+  manual step.
+- **Claude Code 2.1.282 rejects our `resources/list` result**: `ttlMs` must
+  be a number and `cacheScope` must be `public` or `private` (rmcp 3.4.0,
+  protocol 2026-07-28). Logged at every MCP start in every session.
+
 ## A client does not say which principal it connected as (2026-09-24)
 
 Amy's tui tried to allow an ask and got "awaits its assigned reviewer": with
