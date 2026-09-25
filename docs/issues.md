@@ -432,6 +432,18 @@ From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
   logged at 15:52:59 (`kaijutsu-server/src/rpc.rs`), and the shared kernel
   came up at 15:53:00. Clients in that window see `ssh dial exceeded 5s`
   rather than a refusal. The cost grows with the document count.
+- **Label stabilization does not take `RemoteState::registering`.** A
+  `register_session` on a join path can interleave with a hook event's
+  reattach (`stabilize_context_label`), leaving the connection's context and
+  `remote.joined` on different contexts (kaibo, deepseek). Taking the lock
+  in the hook path runs into the hook budget, which drops the future after
+  `Mutex::take` has consumed the one-shot label base. Fix both together.
+  Across processes, two MCPs for one session can still race resolve→create
+  on the no-row path; the loser gets a label-conflict verdict.
+- **The deferred-registration fault cap has no end-to-end test.** The
+  ephemeral kernel offers no deterministic untyped error on a live
+  connection. `register_when_connected` stops after `DEFERRED_FAULT_DELAYS`
+  by reading, not by a test that went red.
 - **`run_local` in the kaijutsu-mcp e2e tests drops its `LocalSet` outside
   the runtime.** When a test fails, live SSH channels drop there too, and
   russh's `ChannelCloseOnDrop` adds a second panic: `there is no reactor

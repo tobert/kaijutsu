@@ -280,6 +280,18 @@ const STARTUP_REGISTER_DELAYS: [Duration; 6] = [
     Duration::from_secs(4),
 ];
 
+/// After the startup window, how long a registration that faulted on a live
+/// connection sleeps before each retry. Waiting for a connection spends none
+/// of it. One try remains after the last delay; then registration stops.
+const DEFERRED_FAULT_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+
 /// Startup work that runs after the MCP server is already answering: session
 /// auto-registration (remote only), then the hook socket. Settles `gate` when
 /// the registration window ends. A kernel that answers after the window still
@@ -316,15 +328,18 @@ async fn start_behind_handshake(
                 pending_label_base = label_base;
                 tracing::info!(label = %label, "Auto-registered MCP session");
             }
+            AutoRegistration::AlreadyJoined => {
+                tracing::info!("Auto-register found a context already joined");
+            }
             AutoRegistration::Refused(reply) => tracing::warn!(
                 response = %reply,
                 "Auto-register refused — continuing without a joined context; \
                  register_session can still be called manually",
             ),
-            AutoRegistration::Unreachable(reply) => {
+            AutoRegistration::NoAnswer(reply) => {
                 tracing::warn!(
                     response = %reply,
-                    "Auto-register found no kernel — registering when it answers",
+                    "Auto-register got no answer — registering when the kernel answers",
                 );
                 deferred = Some((label, label_base));
             }
@@ -337,14 +352,17 @@ async fn start_behind_handshake(
             .await;
 
     if let Some((label, label_base)) = deferred {
-        match mcp.register_when_connected(&label).await {
+        match mcp.register_when_connected(&label, &DEFERRED_FAULT_DELAYS).await {
             AutoRegistration::Joined => {
                 if let (Some(listener), Some(base)) = (&listener, label_base) {
                     listener.arm_label_stabilization(base);
                 }
                 tracing::info!(label = %label, "Auto-registered MCP session once the kernel answered");
             }
-            AutoRegistration::Refused(reply) | AutoRegistration::Unreachable(reply) => {
+            AutoRegistration::AlreadyJoined => {
+                tracing::info!("Deferred auto-register found a context already joined; leaving its label");
+            }
+            AutoRegistration::Refused(reply) | AutoRegistration::NoAnswer(reply) => {
                 tracing::warn!(
                     response = %reply,
                     "Deferred auto-register failed — continuing without a joined context; \

@@ -76,7 +76,9 @@ transport.
 
 `--connect` mode auto-registers a session context at startup so hook events
 land somewhere without a model calling `register_session` first; calling it
-manually still works and upserts on the same label.
+manually still works and upserts on the same label. Tool calls wait up to
+about 8 s for startup registration. When the kernel has not answered by
+then, registration continues once it does and stops on a refusal.
 
 Example — running a `kj` verb through `shell`:
 

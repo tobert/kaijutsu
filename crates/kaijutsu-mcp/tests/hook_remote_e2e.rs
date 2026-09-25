@@ -794,6 +794,91 @@ fn relaunch_reattaches_to_the_same_stable_context() {
     });
 }
 
+/// A placeholder joined after the listener started still stabilizes, once
+/// armed: the kernel came up after the MCP, so startup built the listener
+/// before any context existed.
+#[test]
+fn a_late_join_stabilizes_once_armed() {
+    run_local(async {
+        let addr = start_server().await;
+        let base = "cc-late-arm-e2e";
+        let mcp = connect_mcp(addr).await;
+        let Backend::Remote(remote) = mcp.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let listener = Arc::new(HookListener::remote(
+            remote.clone(),
+            Arc::clone(&remote.shared_context_id),
+            Arc::clone(mcp.session_id_arc()),
+            None,
+        ));
+        let socket = spawn_listener(Arc::clone(&listener), "late-arm").await;
+
+        let placeholder = format!("{base}-0925-1552");
+        let reg = auto_register_with_retry(&mcp, &placeholder).await;
+        assert!(reg["success"].as_bool().unwrap_or(false), "register failed: {reg}");
+        let placeholder_id =
+            kaijutsu_types::ContextId::parse(reg["context_id"].as_str().unwrap()).unwrap();
+        listener.arm_label_stabilization(base.to_string());
+
+        let tool_event = serde_json::json!({
+            "event": "tool.after",
+            "source": "claude-code",
+            "session_id": "abcd0123-3333-4444-5555-666677778888",
+            "tool": {"name": "Bash", "input": {"command": "ls"}, "output": "total 0"},
+        })
+        .to_string();
+        send_hook_event(&socket, &tool_event).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stable_label = format!("{base}-abcd0123");
+        let resolved = remote.actor.resolve_context_label(&stable_label).await.unwrap();
+        assert_eq!(resolved.map(|c| c.id), Some(placeholder_id), "the placeholder was not stabilized");
+    });
+}
+
+/// After the placeholder is renamed onto its stable label, `register_session`
+/// still recognizes the session's context instead of rebinding to a new one.
+#[test]
+fn register_after_stabilization_keeps_the_context() {
+    run_local(async {
+        let addr = start_server().await;
+        let base = "cc-restable-e2e";
+        let mcp = connect_mcp(addr).await;
+        let placeholder = format!("{base}-0925-1601");
+        let reg = auto_register_with_retry(&mcp, &placeholder).await;
+        assert!(reg["success"].as_bool().unwrap_or(false), "register failed: {reg}");
+        let placeholder_id =
+            kaijutsu_types::ContextId::parse(reg["context_id"].as_str().unwrap()).unwrap();
+
+        let Backend::Remote(remote) = mcp.backend().clone() else {
+            panic!("expected remote backend");
+        };
+        let listener = Arc::new(HookListener::remote(
+            remote.clone(),
+            Arc::clone(&remote.shared_context_id),
+            Arc::clone(mcp.session_id_arc()),
+            Some(base.to_string()),
+        ));
+        let socket = spawn_listener(listener, "restable").await;
+        let tool_event = serde_json::json!({
+            "event": "tool.after",
+            "source": "claude-code",
+            "session_id": "feed0123-3333-4444-5555-666677778888",
+            "tool": {"name": "Bash", "input": {"command": "ls"}, "output": "total 0"},
+        })
+        .to_string();
+        send_hook_event(&socket, &tool_event).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stable = remote.actor.resolve_context_label(&format!("{base}-feed0123")).await.unwrap();
+        assert_eq!(stable.map(|c| c.id), Some(placeholder_id), "sanity: renamed in place");
+
+        let again = auto_register_with_retry(&mcp, &placeholder).await;
+        assert_eq!(again["already_registered"].as_bool(), Some(true), "{again}");
+        assert_eq!(again["context_id"].as_str(), Some(placeholder_id.to_hex().as_str()), "{again}");
+    });
+}
+
 /// The other half of the same fix: a genuinely NEW Claude Code session in
 /// the same repo (different session id) must NOT be folded into an
 /// existing session's stabilized context just because the repo-derived

@@ -3055,9 +3055,20 @@ The afternoon restart supplied its own lesson. This session's MCP started 23
 seconds into a 33-second kernel boot, used up its eight-second registration
 window, and stayed unjoined. That window was sized for a busy handshake, not an
 outage, and lengthening it would only move the cliff. The actor already
-reconnects on its own and publishes each connection through `watch_status()`.
-Registration now tries again on each new connection, and a failure on a
-connection that stayed up is a refusal, which ends the wait. The test proves
-the window ended before it starts the kernel.
+reconnects on its own and publishes each connection through `watch_status()`,
+so registration now waits for a live connection and keeps trying. The first
+version called any failure on a connection that stayed up a refusal. kaibo
+pointed out that a per-call timeout leaves the connection up too.
+Registration now splits its failures as `docs/error-chain.md` does: a typed
+refusal is a verdict and ends the wait, and anything else, including an
+untyped kernel error, is a fault that retries on a bounded schedule. A lock
+over the whole registration keeps a model's `register_session` and startup
+from both creating a context. Its second pass found an older bug that fires
+with no race at all: stabilization renamed the context but not the MCP's
+record of its label, so the next `register_session` took the session for
+dead and bound it to a new context. The e2e test starts the kernel only after
+the MCP logs that its window ended, and waits for the session's peer, which
+attaches only after the join.
 
-Credits: Claude Opus 5.5; kaibo (DeepSeek) reviewed the identity change.
+Credits: Claude Opus 5.5; kaibo (DeepSeek) reviewed the identity and
+registration changes.

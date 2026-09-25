@@ -194,7 +194,7 @@ fn a_session_started_before_the_kernel_joins_once_it_answers() {
             panic!("kaijutsu-mcp never logged the end of its startup registration window")
         });
         match rx.recv_timeout(remaining) {
-            Ok(line) if line.contains("Auto-register found no kernel") => break,
+            Ok(line) if line.contains("Auto-register got no answer") => break,
             Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("kaijutsu-mcp exited during startup ({:?})", child.wait());
@@ -226,9 +226,14 @@ fn a_session_started_before_the_kernel_joins_once_it_answers() {
         );
         let Backend::Remote(remote) = observer.backend() else { unreachable!() };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        // Registration attaches the session as peer `mcp/<label>` only after
+        // it joins, so the peer proves the join, not just the create.
         while tokio::time::Instant::now() < deadline {
             let contexts = remote.actor.list_contexts().await.unwrap_or_default();
-            if let Some(ctx) = contexts.iter().find(|c| c.label.ends_with(&label_suffix)) {
+            let peers = remote.actor.list_peers().await.unwrap_or_default();
+            if let Some(ctx) = contexts.iter().find(|c| c.label.ends_with(&label_suffix))
+                && peers.iter().any(|p| p.nick == format!("mcp/{}", ctx.label))
+            {
                 return Some(ctx.id);
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -241,5 +246,5 @@ fn a_session_started_before_the_kernel_joins_once_it_answers() {
         let _runtime = rt.enter();
         drop(local);
     }
-    assert!(joined.is_some(), "the session never registered after the kernel came up");
+    assert!(joined.is_some(), "the session never joined after the kernel came up");
 }

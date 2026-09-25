@@ -1926,6 +1926,7 @@ mod tests {
             change,
             joined: Arc::new(tokio::sync::RwLock::new(None)),
             shared_context_id: shared_context_id.clone(),
+            registering: Arc::new(tokio::sync::Mutex::new(())),
         };
         let listener = HookListener::remote(
             remote,

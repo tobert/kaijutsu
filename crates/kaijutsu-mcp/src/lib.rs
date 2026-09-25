@@ -350,6 +350,10 @@ pub struct RemoteState {
     pub joined: Arc<tokio::sync::RwLock<Option<JoinedContext>>>,
     /// Shared context_id for hook listener (updated by register_session)
     pub shared_context_id: Arc<Mutex<Option<kaijutsu_types::ContextId>>>,
+    /// Held for a whole `register_session`, so a model's call and startup
+    /// registration cannot both create and join a context. Label
+    /// stabilization does not take it.
+    pub registering: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// State for a joined context — created by `register_session`.
@@ -459,7 +463,7 @@ async fn finish_join(
     label: String,
     resumed: bool,
     previous_context: Option<serde_json::Value>,
-) -> Result<JoinOutcome, String> {
+) -> JoinOutcome {
     // 1. Spawn the pulse task — bumps `remote.change` on every server event
     // for this context, so the shell completion poll can wake early instead
     // of relying purely on its floor cadence. See `spawn_pulse_task`.
@@ -514,7 +518,7 @@ async fn finish_join(
         "Session registered"
     );
 
-    Ok(JoinOutcome { context_id, label, resumed, previous_context })
+    JoinOutcome { context_id, label, resumed, previous_context }
 }
 
 /// Stabilize this process's auto-registered context onto a label that's
@@ -575,7 +579,7 @@ pub(crate) async fn stabilize_context_label(
                 .join_context(ctx.id)
                 .await
                 .map_err(|e| format!("Error joining context {}: {e}", ctx.id.short()))?;
-            finish_join(remote, ctx.id, stable_label, true, None).await
+            Ok(finish_join(remote, ctx.id, stable_label, true, None).await)
         }
         Some(ctx) if ctx.id == current_context_id => {
             // Already stable — defensive no-op (shouldn't happen: this runs
@@ -600,6 +604,7 @@ pub(crate) async fn stabilize_context_label(
                 .rename_context(current_context_id, &fresh_label)
                 .await
                 .map_err(|e| format!("Error renaming context: {e}"))?;
+            relabel_joined(remote, current_context_id, &fresh_label).await;
             Ok(JoinOutcome {
                 context_id: current_context_id,
                 label: fresh_label,
@@ -619,6 +624,7 @@ pub(crate) async fn stabilize_context_label(
                 .rename_context(current_context_id, &stable_label)
                 .await
                 .map_err(|e| format!("Error renaming context: {e}"))?;
+            relabel_joined(remote, current_context_id, &stable_label).await;
             Ok(JoinOutcome {
                 context_id: current_context_id,
                 label: stable_label,
@@ -626,6 +632,17 @@ pub(crate) async fn stabilize_context_label(
                 previous_context: None,
             })
         }
+    }
+}
+
+/// Record a renamed context's new label in `remote.joined`. The
+/// already-joined check in `register_session` resolves that label, and a
+/// stale one reads as a dead context.
+async fn relabel_joined(remote: &RemoteState, context_id: ContextId, label: &str) {
+    if let Some(joined) = remote.joined.write().await.as_mut()
+        && joined.context_id == context_id
+    {
+        joined.label = label.to_string();
     }
 }
 
@@ -702,30 +719,78 @@ impl StartupGate {
 /// How a startup registration ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoRegistration {
-    /// Joined a context, or was already joined.
+    /// This call joined a context.
     Joined,
-    /// The kernel answered and refused; the reply says why.
+    /// Another caller had already joined a context, such as a model's
+    /// `register_session`. Its label is that caller's choice.
+    AlreadyJoined,
+    /// The kernel answered no; the reply says why.
     Refused(String),
-    /// The kernel never answered; the reply is the last error.
-    Unreachable(String),
+    /// No answer: the kernel was unreachable, a call timed out, or it
+    /// failed without a verdict. The reply is the last error.
+    NoAnswer(String),
 }
 
-/// The live connection's epoch, or `None` when the actor is not connected.
-/// Equal values before and after a call mean it ran on one connection.
-fn live_connection(actor: &ActorHandle) -> Option<u64> {
-    matches!(actor.current_status(), ConnectionStatus::Connected { .. })
-        .then(|| actor.connection_epoch())
+/// A registration that ended joined.
+enum Registered {
+    /// This call joined; the reply describes the join.
+    Joined(serde_json::Value),
+    /// A context was already joined before this call.
+    AlreadyJoined(serde_json::Value),
 }
 
-/// Whether a `register_session` reply joined a context.
-fn registration_succeeded(reply: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(reply)
-        .ok()
-        .map(|v| {
-            v.get("success").and_then(|b| b.as_bool()).unwrap_or(false)
-                || v.get("already_registered").and_then(|b| b.as_bool()).unwrap_or(false)
-        })
-        .unwrap_or(false)
+/// Why a registration did not join. As in `docs/error-chain.md`, a verdict
+/// is the kernel's answer and must not be retried; a fault means no answer
+/// arrived, and a retry is reasonable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegisterFailure {
+    Verdict(String),
+    Fault(String),
+}
+
+impl RegisterFailure {
+    /// A failed call, reported as `message`. Only a typed refusal is a
+    /// verdict, and a gate that never reached one is not. An untyped kernel
+    /// error arrives as a string, so it counts as a fault.
+    fn call(message: String, error: &CallError) -> Self {
+        match error {
+            CallError::Refused(refusal) if refusal.kind == kaijutsu_types::RefusalKind::GateUnavailable => {
+                Self::Fault(message)
+            }
+            CallError::Refused(_) | CallError::Vfs { .. } => Self::Verdict(message),
+            _ => Self::Fault(message),
+        }
+    }
+
+    /// A failed `kj context create`, reported as `message`.
+    fn create(message: String, error: &kaijutsu_client::CreateContextError) -> Self {
+        match error {
+            kaijutsu_client::CreateContextError::Refused(_) => Self::Verdict(message),
+            kaijutsu_client::CreateContextError::Call(e) => Self::call(message, e),
+        }
+    }
+
+    /// The same failure, its message prefixed with what registration was doing.
+    fn doing(self, what: &str) -> Self {
+        match self {
+            Self::Verdict(message) => Self::Verdict(format!("{what}: {message}")),
+            Self::Fault(message) => Self::Fault(format!("{what}: {message}")),
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Verdict(message) | Self::Fault(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for RegisterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verdict(message) | Self::Fault(message) => f.write_str(message),
+        }
+    }
 }
 
 /// MCP server exposing the kaijutsu kernel.
@@ -867,6 +932,7 @@ impl KaijutsuMcp {
                 change: watch::channel(0u64).0,
                 joined: Arc::new(tokio::sync::RwLock::new(None)),
                 shared_context_id,
+                registering: Arc::new(tokio::sync::Mutex::new(())),
             }),
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
@@ -1785,46 +1851,41 @@ impl KaijutsuMcp {
 
     /// Register at startup, once after each of `delays`. The actor dials in
     /// the background, so early attempts can meet "not ready: connecting".
-    /// When every attempt fails, the result is a refusal only if the last
-    /// attempt ran start to finish on one live connection; otherwise the
-    /// kernel never answered.
+    /// A verdict ends the window; faults leave it `NoAnswer`.
     pub async fn auto_register(
         &self,
         label: &str,
         delays: &[std::time::Duration],
     ) -> AutoRegistration {
-        let Some(remote) = self.remote() else {
-            return AutoRegistration::Refused(REQUIRES_CONNECT.to_string());
-        };
-        let mut reply = String::new();
-        let mut refused = false;
+        let mut last_fault = String::new();
         for delay in delays {
             if !delay.is_zero() {
                 tokio::time::sleep(*delay).await;
             }
-            let before = live_connection(&remote.actor);
-            reply = self.register_session_auto(Some(label.to_string()), None).await;
-            if registration_succeeded(&reply) {
-                return AutoRegistration::Joined;
+            match self.register(Self::startup_request(label)).await {
+                Ok(Registered::Joined(_)) => return AutoRegistration::Joined,
+                Ok(Registered::AlreadyJoined(_)) => return AutoRegistration::AlreadyJoined,
+                Err(RegisterFailure::Verdict(message)) => return AutoRegistration::Refused(message),
+                Err(RegisterFailure::Fault(message)) => last_fault = message,
             }
-            refused = before.is_some() && before == live_connection(&remote.actor);
         }
-        if refused {
-            AutoRegistration::Refused(reply)
-        } else {
-            AutoRegistration::Unreachable(reply)
-        }
+        AutoRegistration::NoAnswer(last_fault)
     }
 
-    /// Register as soon as the actor reaches the kernel, for a startup that
-    /// found it unreachable. Tries once on each new connection. A failure on
-    /// a connection that stayed up is a refusal and ends the wait. Returns
-    /// `Unreachable` only when the actor fails permanently.
-    pub async fn register_when_connected(&self, label: &str) -> AutoRegistration {
+    /// Keep registering after a startup window that got no answer. Each try
+    /// waits for a live connection, and waiting spends no delay. A fault
+    /// sleeps the next of `fault_delays` and tries again. A verdict, a fault
+    /// after the last delay, or an actor that fails permanently ends the wait.
+    pub async fn register_when_connected(
+        &self,
+        label: &str,
+        fault_delays: &[std::time::Duration],
+    ) -> AutoRegistration {
         let Some(remote) = self.remote() else {
             return AutoRegistration::Refused(REQUIRES_CONNECT.to_string());
         };
         let mut status = remote.actor.watch_status();
+        let mut delays = fault_delays.iter();
         loop {
             let stopped = match status
                 .wait_for(|s| {
@@ -1839,17 +1900,29 @@ impl KaijutsuMcp {
                 Err(_) => Some("the RPC actor stopped".to_string()),
             };
             if let Some(reason) = stopped {
-                return AutoRegistration::Unreachable(reason);
+                return AutoRegistration::NoAnswer(reason);
             }
-            let before = live_connection(&remote.actor);
-            let reply = self.register_session_auto(Some(label.to_string()), None).await;
-            if registration_succeeded(&reply) {
-                return AutoRegistration::Joined;
-            }
-            if before.is_some() && before == live_connection(&remote.actor) {
-                return AutoRegistration::Refused(reply);
+            match self.register(Self::startup_request(label)).await {
+                Ok(Registered::Joined(_)) => return AutoRegistration::Joined,
+                Ok(Registered::AlreadyJoined(_)) => return AutoRegistration::AlreadyJoined,
+                Err(RegisterFailure::Verdict(message)) => return AutoRegistration::Refused(message),
+                Err(RegisterFailure::Fault(message)) => {
+                    let Some(delay) = delays.next() else {
+                        return AutoRegistration::NoAnswer(message);
+                    };
+                    tracing::warn!(
+                        response = %message,
+                        retry_in = ?delay,
+                        "Deferred auto-register got no answer; trying again",
+                    );
+                    tokio::time::sleep(*delay).await;
+                }
             }
         }
+    }
+
+    fn startup_request(label: &str) -> RegisterSessionRequest {
+        RegisterSessionRequest { label: Some(label.to_string()), context_type: None }
     }
 
     /// Find a free label derived from `base` by trying `base-2`, `base-3`, …
@@ -1867,19 +1940,19 @@ impl KaijutsuMcp {
     async fn find_available_suffixed_label(
         actor: &ActorHandle,
         base: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, RegisterFailure> {
         const MAX_SUFFIX: u32 = 1000;
         for n in 2..=MAX_SUFFIX {
             let candidate = format!("{base}-{n}");
             match actor.resolve_context_label(&candidate).await {
                 Ok(None) => return Ok(candidate),
                 Ok(Some(_)) => continue,
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(RegisterFailure::call(e.to_string(), &e)),
             }
         }
-        Err(format!(
+        Err(RegisterFailure::Verdict(format!(
             "exhausted {MAX_SUFFIX} suffixed candidates derived from '{base}' — all taken"
-        ))
+        )))
     }
 
     /// Whether a create failed only because a concurrent register claimed the
@@ -1908,7 +1981,7 @@ impl KaijutsuMcp {
         base_label: &str,
         context_type: &str,
         create: &SessionCreate,
-    ) -> Result<(ContextId, String), String> {
+    ) -> Result<(ContextId, String), RegisterFailure> {
         const MAX_RETRIES: u32 = 5;
         let mut last_conflict: Option<String> = None;
         for attempt in 1..=MAX_RETRIES {
@@ -1931,50 +2004,67 @@ impl KaijutsuMcp {
                     last_conflict = Some(e.to_string());
                     continue;
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(RegisterFailure::create(e.to_string(), &e)),
             }
         }
-        Err(format!(
+        Err(RegisterFailure::Fault(format!(
             "gave up after {MAX_RETRIES} attempts deriving a free label from \
              '{base_label}' — concurrent registers kept winning the race \
              (last conflict: {})",
             last_conflict.unwrap_or_else(|| "<none>".to_string())
-        ))
+        )))
     }
 
     /// Choose the parent for a new session context and the performer to
     /// record. The performer is this connection's character unless that
     /// character is a root, which has no model and cannot be cast.
-    async fn prepare_session_create(&self, actor: &ActorHandle) -> Result<SessionCreate, String> {
-        let contexts = actor.list_contexts().await.map_err(|e| format!("could not list contexts: {e}"))?;
-        let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &contexts)?;
+    async fn prepare_session_create(&self, actor: &ActorHandle) -> Result<SessionCreate, RegisterFailure> {
+        let contexts = actor
+            .list_contexts()
+            .await
+            .map_err(|e| RegisterFailure::call(format!("could not list contexts: {e}"), &e))?;
+        let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &contexts)
+            .map_err(RegisterFailure::Verdict)?;
         if parent.source == kaijutsu_client::ParentSource::OnlyRoot {
             tracing::warn!(
                 parent = %parent.label,
                 "register_session: no parent named; creating under the kernel's only root context",
             );
         }
-        let me = actor.whoami().await.map_err(|e| format!("could not read this connection's identity: {e}"))?;
+        let me = actor.whoami().await.map_err(|e| {
+            RegisterFailure::call(format!("could not read this connection's identity: {e}"), &e)
+        })?;
         let sheet = actor
             .execute_kj_quiet(parent.context_id, vec!["character".into(), "show".into(), me.username.clone()])
             .await
-            .map_err(|e| format!("could not read character '{}': {e}", me.username))?;
+            .map_err(|e| RegisterFailure::call(format!("could not read character '{}': {e}", me.username), &e))?;
         let root = sheet
             .data
             .as_ref()
             .and_then(|data| data.get("root"))
             .and_then(serde_json::Value::as_bool)
-            .ok_or_else(|| format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))?;
+            // `kj character show` reports a missing character and a failed
+            // lookup the same untyped way, so this cannot be a verdict.
+            .ok_or_else(|| {
+                RegisterFailure::Fault(format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))
+            })?;
         Ok(SessionCreate { parent, performer: (!root).then_some(me.username) })
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
-        let remote = match self.remote() {
-            Some(r) => r,
-            None => {
-                return REQUIRES_CONNECT.to_string();
-            }
+        match self.register(req).await {
+            Ok(Registered::Joined(reply) | Registered::AlreadyJoined(reply)) => reply.to_string(),
+            Err(failure) => failure.into_message(),
+        }
+    }
+
+    /// Join a context for this session: attach to the one its label names,
+    /// or create one. Holds `RemoteState::registering` throughout.
+    async fn register(&self, req: RegisterSessionRequest) -> Result<Registered, RegisterFailure> {
+        let Some(remote) = self.remote() else {
+            return Err(RegisterFailure::Verdict(REQUIRES_CONNECT.to_string()));
         };
+        let _registering = remote.registering.lock().await;
 
         // Check if already joined — but trust that fast path only while the
         // bound context is confirmed still live. A context this process is
@@ -2013,12 +2103,11 @@ impl KaijutsuMcp {
                 Ok(Some(ctx))
                     if ctx.id == bound_id && ctx.concluded_at.is_none() && !ctx.archived =>
                 {
-                    return serde_json::json!({
+                    return Ok(Registered::AlreadyJoined(serde_json::json!({
                         "already_registered": true,
                         "context_id": bound_id.to_hex(),
                         "context_short": bound_id.short(),
-                    })
-                    .to_string();
+                    })));
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -2053,12 +2142,11 @@ impl KaijutsuMcp {
                         "register_session: could not confirm the bound context's \
                          liveness ({e}); keeping the existing binding",
                     );
-                    return serde_json::json!({
+                    return Ok(Registered::AlreadyJoined(serde_json::json!({
                         "already_registered": true,
                         "context_id": bound_id.to_hex(),
                         "context_short": bound_id.short(),
-                    })
-                    .to_string();
+                    })));
                 }
             }
         }
@@ -2084,7 +2172,9 @@ impl KaijutsuMcp {
         // label if the prior one concluded/archived.
         let existing = match remote.actor.resolve_context_label(&requested_label).await {
             Ok(v) => v,
-            Err(e) => return format!("Error resolving label '{requested_label}': {e}"),
+            Err(e) => {
+                return Err(RegisterFailure::call(format!("Error resolving label '{requested_label}': {e}"), &e));
+            }
         };
 
         let mut resumed = false;
@@ -2111,7 +2201,8 @@ impl KaijutsuMcp {
                 // comment server-side) exists for defense-in-depth, not
                 // because this call path is expected to need it.
                 if let Err(e) = remote.actor.join_context(ctx.id).await {
-                    return format!("Error joining existing context {}: {e}", ctx.id.short());
+                    let message = format!("Error joining existing context {}: {e}", ctx.id.short());
+                    return Err(RegisterFailure::call(message, &e));
                 }
                 resumed = true;
                 (ctx.id, requested_label.clone())
@@ -2119,7 +2210,7 @@ impl KaijutsuMcp {
             Some(ctx) => {
                 let create = match self.prepare_session_create(&remote.actor).await {
                     Ok(create) => create,
-                    Err(e) => return format!("Error choosing where to create the session context: {e}"),
+                    Err(e) => return Err(e.doing("Error choosing where to create the session context")),
                 };
                 // Concluded or archived — never silently resurrect. Create a
                 // fresh context under a deterministic suffixed label and tell
@@ -2136,10 +2227,9 @@ impl KaijutsuMcp {
                 {
                     Ok(pair) => pair,
                     Err(e) => {
-                        return format!(
-                            "Error creating a fresh context derived from \
-                             '{requested_label}': {e}"
-                        );
+                        return Err(e.doing(&format!(
+                            "Error creating a fresh context derived from '{requested_label}'"
+                        )));
                     }
                 };
                 tracing::info!(
@@ -2152,7 +2242,7 @@ impl KaijutsuMcp {
                      creating a fresh context under a suffixed label",
                 );
                 if let Err(e) = remote.actor.join_context(new_id).await {
-                    return format!("Error joining context: {e}");
+                    return Err(RegisterFailure::call(format!("Error joining context: {e}"), &e));
                 }
                 parent = Some(create.parent);
                 previous_context = Some(serde_json::json!({
@@ -2167,7 +2257,7 @@ impl KaijutsuMcp {
             None => {
                 let create = match self.prepare_session_create(&remote.actor).await {
                     Ok(create) => create,
-                    Err(e) => return format!("Error choosing where to create the session context: {e}"),
+                    Err(e) => return Err(e.doing("Error choosing where to create the session context")),
                 };
                 let new_id = match remote
                     .actor
@@ -2180,10 +2270,10 @@ impl KaijutsuMcp {
                     .await
                 {
                     Ok(id) => id,
-                    Err(e) => return format!("Error creating context: {e}"),
+                    Err(e) => return Err(RegisterFailure::create(format!("Error creating context: {e}"), &e)),
                 };
                 if let Err(e) = remote.actor.join_context(new_id).await {
-                    return format!("Error joining context: {e}");
+                    return Err(RegisterFailure::call(format!("Error joining context: {e}"), &e));
                 }
                 parent = Some(create.parent);
                 (new_id, requested_label.clone())
@@ -2231,18 +2321,8 @@ impl KaijutsuMcp {
         // (still indexed); `previous_bound` fills the same field for the
         // archived-bound-context case that flow can't see (see the
         // already-joined check's doc comment above).
-        let outcome = match finish_join(
-            remote,
-            context_id,
-            label,
-            resumed,
-            previous_context.or(previous_bound),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => return e,
-        };
+        let outcome =
+            finish_join(remote, context_id, label, resumed, previous_context.or(previous_bound)).await;
 
         // 9. Attach as a peer so the kernel's peer registry — and anything
         // rendering "who's at the table" (docs/instrument-design.md, "Many
@@ -2311,7 +2391,7 @@ impl KaijutsuMcp {
             }
         }
 
-        serde_json::json!({
+        Ok(Registered::Joined(serde_json::json!({
             "success": true,
             "context_id": outcome.context_id.to_hex(),
             "context_short": outcome.context_id.short(),
@@ -2326,8 +2406,7 @@ impl KaijutsuMcp {
                     kaijutsu_client::ParentSource::OnlyRoot => "only_root",
                 },
             })),
-        })
-        .to_string()
+        })))
     }
 
     // ========================================================================
@@ -3139,6 +3218,45 @@ fn normalize_peer_params(params: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registration retries a call that got no answer, including an untyped
+    /// kernel error or a gate that never decided, and stops on a typed
+    /// refusal or a refused create.
+    #[test]
+    fn register_failures_split_verdicts_from_faults() {
+        let fault = |error: CallError| RegisterFailure::call("m".into(), &error);
+        assert_eq!(fault(CallError::Timeout(std::time::Duration::from_secs(30))), RegisterFailure::Fault("m".into()));
+        assert_eq!(fault(CallError::Rpc("Cap'n Proto error: Failed".into())), RegisterFailure::Fault("m".into()));
+        assert_eq!(fault(CallError::NotReady(kaijutsu_client::NotReadyReason::Idle)), RegisterFailure::Fault("m".into()));
+        assert_eq!(
+            fault(CallError::Vfs { kind: kaijutsu_types::VfsErrorKind::NotFound, path: "/x".into() }),
+            RegisterFailure::Verdict("m".into())
+        );
+        let refusal = |kind| kaijutsu_types::Refusal {
+            kind,
+            reason: "no".into(),
+            subject: String::new(),
+            ask: None,
+            remedy: None,
+        };
+        assert_eq!(fault(CallError::Refused(refusal(kaijutsu_types::RefusalKind::Denied))), RegisterFailure::Verdict("m".into()));
+        assert_eq!(
+            fault(CallError::Refused(refusal(kaijutsu_types::RefusalKind::CapabilityDenied))),
+            RegisterFailure::Verdict("m".into())
+        );
+        assert_eq!(
+            fault(CallError::Refused(refusal(kaijutsu_types::RefusalKind::GateUnavailable))),
+            RegisterFailure::Fault("m".into())
+        );
+        let refused = kaijutsu_client::CreateContextError::Refused("label conflict".into());
+        assert_eq!(RegisterFailure::create("m".into(), &refused), RegisterFailure::Verdict("m".into()));
+        let timed_out = kaijutsu_client::CreateContextError::Call(CallError::Timeout(std::time::Duration::from_secs(1)));
+        assert_eq!(RegisterFailure::create("m".into(), &timed_out), RegisterFailure::Fault("m".into()));
+        assert_eq!(
+            RegisterFailure::Verdict("no parent".into()).doing("Error choosing"),
+            RegisterFailure::Verdict("Error choosing: no parent".into())
+        );
+    }
 
     /// `register_session`'s peer nick follows the `<kind>/<name>` convention
     /// (docs/instrument-design.md): a session labeled "toad" attaches as

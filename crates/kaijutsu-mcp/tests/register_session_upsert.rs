@@ -25,7 +25,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
-use kaijutsu_client::{KeySource, SshConfig};
+use kaijutsu_client::{ConnectionStatus, KeySource, SshConfig};
 use kaijutsu_mcp::{AutoRegistration, Backend, KaijutsuMcp, RegisterSessionRequest, ShellRequest};
 use kaijutsu_server::{SshServer, SshServerConfig};
 
@@ -166,31 +166,71 @@ fn several_roots_without_a_named_parent_refuse() {
     });
 }
 
-/// A kernel that answers and refuses ends startup registration: the window
-/// reports a refusal rather than an unreachable kernel, and the wait for a
-/// connection returns instead of retrying on every reconnect.
+/// Wait until `mcp`'s actor holds a live connection.
+async fn wait_connected(mcp: &KaijutsuMcp) {
+    let Backend::Remote(remote) = mcp.backend() else { unreachable!("connect_mcp is remote") };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        remote.actor.watch_status().wait_for(|s| matches!(s, ConnectionStatus::Connected { .. })),
+    )
+    .await
+    .expect("the actor connects to the ephemeral kernel")
+    .expect("the actor is running");
+}
+
+/// A kernel that answers no ends startup registration: the window reports a
+/// refusal rather than no answer, and the deferred wait returns instead of
+/// retrying.
 #[test]
-fn a_refusal_on_a_live_connection_ends_auto_registration() {
+fn a_verdict_ends_auto_registration() {
     use std::time::Duration;
 
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await.with_parent(Some("no-such-parent".to_string()));
-        let delays = [Duration::ZERO, Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+        wait_connected(&mcp).await;
 
-        let window = mcp.auto_register("refused-seat", &delays).await;
+        let window = mcp.auto_register("refused-seat", &[Duration::ZERO]).await;
         assert!(
             matches!(&window, AutoRegistration::Refused(reply) if reply.contains("no-such-parent")),
             "{window:?}"
         );
 
-        let late = tokio::time::timeout(Duration::from_secs(10), mcp.register_when_connected("refused-seat"))
+        let late = tokio::time::timeout(Duration::from_secs(10), mcp.register_when_connected("refused-seat", &[Duration::from_secs(1)]))
             .await
-            .expect("a refusal on a live connection must end the wait");
+            .expect("a verdict must end the wait");
         assert!(
             matches!(&late, AutoRegistration::Refused(reply) if reply.contains("no-such-parent")),
             "{late:?}"
         );
+    });
+}
+
+/// A model's `register_session` racing startup registration yields one
+/// join, and startup reports it as another caller's so the hook listener
+/// leaves that label alone.
+#[test]
+fn a_manual_register_racing_startup_registration_joins_once() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        wait_connected(&mcp).await;
+
+        let manual = mcp.register_session(Parameters(RegisterSessionRequest {
+            label: Some("chosen-by-the-model".to_string()),
+            context_type: None,
+        }));
+        let startup = mcp.register_when_connected("cc-startup-label", &[]);
+        // `join!` polls the manual call first, so it takes the lock first.
+        let (manual, startup) = tokio::join!(manual, startup);
+        let manual: serde_json::Value = serde_json::from_str(&manual).expect("register_session replies JSON");
+
+        assert_eq!(manual["success"].as_bool(), Some(true), "{manual}");
+        assert_eq!(startup, AutoRegistration::AlreadyJoined);
+        let Backend::Remote(remote) = mcp.backend() else { unreachable!() };
+        let labels: Vec<String> =
+            remote.actor.list_contexts().await.unwrap().into_iter().map(|c| c.label).collect();
+        assert!(!labels.iter().any(|l| l == "cc-startup-label"), "{labels:?}");
     });
 }
 
