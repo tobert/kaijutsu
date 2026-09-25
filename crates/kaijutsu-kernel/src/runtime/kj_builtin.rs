@@ -1372,8 +1372,27 @@ mod tests {
     /// (read-only `toolie` becomes the default loadout). The equals form is
     /// the control: it binds regardless of the schema, so if both asserts
     /// pass we know the space form genuinely round-tripped.
-    #[tokio::test]
-    async fn context_create_type_flag_binds_both_forms() {
+    ///
+    /// Driving `kj context create` through kaish (rather than a direct
+    /// `dispatch` call) stacks the interpreter's own frames on top of the
+    /// rc lifecycle's, overflowing the default 2 MiB test stack; run it on
+    /// the production rc stack instead (see `self_recreating_rc_chain_
+    /// stops_at_guard` above for the pattern's origin).
+    #[test]
+    fn context_create_type_flag_binds_both_forms() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime")
+                .block_on(context_create_type_flag_binds_both_forms_body());
+        })
+        .expect("spawn rc-stack thread")
+        .join()
+        .expect("rc-stack thread panicked");
+    }
+
+    async fn context_create_type_flag_binds_both_forms_body() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
         let principal = PrincipalId::system();
@@ -2269,8 +2288,27 @@ mod tests {
     /// (`Json(Array [String("0:1")])`) makes the range parser reject a bad
     /// endpoint. This drives the forms end-to-end through kaish, including a repeated `--include` (two
     /// occurrences → the array path is guaranteed).
-    #[tokio::test]
-    async fn fork_include_ranges_survive_kaish_bridge() {
+    ///
+    /// Driving `kj fork` through kaish (rather than a direct `dispatch`
+    /// call) stacks the interpreter's own frames on top of the fork's rc
+    /// lifecycle, overflowing the default 2 MiB test stack; run it on the
+    /// production rc stack instead (see `self_recreating_rc_chain_stops_at_
+    /// guard` above for the pattern's origin).
+    #[test]
+    fn fork_include_ranges_survive_kaish_bridge() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime")
+                .block_on(fork_include_ranges_survive_kaish_bridge_body());
+        })
+        .expect("spawn rc-stack thread")
+        .join()
+        .expect("rc-stack thread panicked");
+    }
+
+    async fn fork_include_ranges_survive_kaish_bridge_body() {
         let dispatcher = Arc::new(test_dispatcher().await);
         dispatcher.set_self_arc();
         let principal = PrincipalId::new();

@@ -350,14 +350,20 @@ pub async fn run_into_blocks(
         CommandJobOutput::LiveExecution => CommandOutcome::new(outcome.execution.clone(), outcome.elapsed_ms).exec_result(),
         CommandJobOutput::Settled => result.clone(),
     };
-    // kaish closes the streams and fills only an empty stderr; stdout that
-    // was not streamed live is written here from the settled result.
+    // `JobManager::finalize_streams` only closes the streams; live
+    // publication belongs to `Kernel::execute_background_with_options`, which
+    // this settled path does not call. A stream that was not written live is
+    // written here from the settled result before closing, stdout and stderr
+    // alike.
     if let Some(streams) = manager.streams(job).await {
         if streams.stdout.stats().await.total_written == 0 {
             match streams_result.out_bytes() {
                 Some(bytes) => streams.stdout.write(bytes).await,
                 None => streams.stdout.write(streams_result.text_out().as_bytes()).await,
             }
+        }
+        if streams.stderr.stats().await.total_written == 0 {
+            streams.stderr.write(streams_result.err.as_bytes()).await;
         }
     }
     manager.finalize_streams(job, &streams_result).await;

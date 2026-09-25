@@ -3971,8 +3971,25 @@ mod tests {
         assert!(d.kernel_db().lock().get_context(context).unwrap().unwrap().archived_at.is_some());
     }
 
-    #[tokio::test]
-    async fn context_create_as_preserves_character_names_in_rc_and_handoff_advice() {
+    // Creating `--as` a character loads director handoff advice through rc,
+    // which re-enters kaish many levels deep (see `context_create_as_records_
+    // performer_and_loads_director_handoff` above); run it on the production
+    // rc stack rather than the default 2 MiB test-thread stack.
+    #[test]
+    fn context_create_as_preserves_character_names_in_rc_and_handoff_advice() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(context_create_as_preserves_character_names_in_rc_and_handoff_advice_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn context_create_as_preserves_character_names_in_rc_and_handoff_advice_body() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let mut caller = test_caller();

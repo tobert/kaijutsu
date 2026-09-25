@@ -365,7 +365,7 @@ impl EmbeddedKaish {
         config = config.with_job_manager(context_jobs.clone());
 
         config.initial_vars = super::context_shell::initial_environment(&external_exec);
-        config = config.with_allow_external_commands(matches!(external_exec, ExternalExec::Allow { .. }));
+        config = config.with_allow_unwrapped_commands(matches!(external_exec, ExternalExec::Allow { .. }));
 
         // The kernel document view (`/v/docs`) mounts directly on the kaish VFS,
         // bypassing MountBackend. ReadOnlyFs refuses writes in read-only mode.
@@ -823,6 +823,50 @@ mod tests {
         );
     }
 
+    /// Canary for kaish #479. `grep` without `-E`/`-F` reads GNU BRE, as
+    /// GNU grep 3.12 does: a bare `( ) { } | + ?` is literal, while the
+    /// escaped forms (`\(`, `\|`, ...) keep their special meaning. Models
+    /// write patterns like `grep 'fn consult('` from GNU habit.
+    ///
+    /// **If this test fails, the kaish dependency has gone backward.**
+    /// Check the `kaish-*` revs in the workspace `Cargo.toml` against
+    /// github.com/tobert/kaish PR #479.
+    #[tokio::test]
+    async fn grep_reads_gnu_bre_by_default() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = test_kernel("test-grep-bre").await;
+        let kaish = EmbeddedKaish::new("test-grep-bre", blocks, kernel, None).unwrap();
+
+        // A bare `(` is literal in GNU BRE, not an unclosed group.
+        let result = kaish
+            .execute_with_options(
+                "echo 'fn consult(x) {}' | grep 'fn consult('",
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "fn consult(x) {}",
+            "a bare '(' must be literal in default grep, as in GNU grep 3.12",
+        );
+
+        // `\|` still means alternation, escaped, as GNU BRE has always
+        // allowed.
+        let result = kaish
+            .execute_with_options(
+                "printf 'onlyfoo\\nonlybar\\nneither\\n' | grep 'foo\\|bar'",
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.text_out().trim(),
+            "onlyfoo\nonlybar",
+            "escaped alternation \\| must still match, as GNU BRE allows",
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_with_options_feeds_stdin() {
         let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
@@ -870,7 +914,10 @@ mod tests {
             }
         };
 
-        // A shared script body, written once under a `lib` type.
+        // A shared script body, written once under a `lib` type. A redirect
+        // target's parent directory must exist, as in bash.
+        let r = run("mkdir -p /config/rc/lib/create /config/rc/coder/create").await;
+        assert!(r.ok(), "mkdir -p: {}", r.text_out());
         let r = run("echo shared-body > /config/rc/lib/create/binding.kai").await;
         assert!(r.ok(), "echo>: {}", r.text_out());
         // Compose it into a context type by symlink. `LocalBackend::symlink`

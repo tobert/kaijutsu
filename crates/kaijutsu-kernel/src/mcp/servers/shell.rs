@@ -2317,7 +2317,7 @@ mod tests {
             CancellationToken::new(),
         ).await.expect("read-only jobfs refusal is a shell result");
         assert!(write_attempt.is_error, "a safe shell must not write the shared job filesystem");
-        assert!(streams_of(&write_attempt).contains("read-only") || streams_of(&write_attempt).contains("Permission denied"),
+        assert!(streams_of(&write_attempt).contains("read-only") || streams_of(&write_attempt).contains("permission denied"),
             "jobfs write must fail loudly: {write_attempt:?}");
         d.kernel().shell_operations().cancel(&operation_id, context).await.unwrap();
     }

@@ -91,8 +91,25 @@
         assert_eq!(run.script_count, Some(2));
     }
 
-    #[tokio::test]
-    async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt() {
+    // Creating each type re-enters kaish for rc, which nests many levels
+    // deep (see `context_create_as_records_performer_and_loads_director_
+    // handoff` in kj/context.rs); run it on the production rc stack rather
+    // than the default 2 MiB test-thread stack.
+    #[test]
+    fn shipped_instruction_scripts_preserve_order_and_rendered_prompt() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(shipped_instruction_scripts_preserve_order_and_rendered_prompt_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
         for context_type in ["default", "coder", "director", "mcp", "toolie", "musician"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -2362,8 +2379,26 @@ esac
 
     /// The per-type policy matrix, create side: coder/director/mcp/default
     /// ("time-aware" types) each get exactly one seeded datetime note.
-    #[tokio::test]
-    async fn create_seeds_datetime_notification_for_time_aware_types() {
+    ///
+    /// Creating each type re-enters kaish for rc, which nests many levels
+    /// deep (see `context_create_as_records_performer_and_loads_director_
+    /// handoff` above); run it on the production rc stack rather than the
+    /// default 2 MiB test-thread stack.
+    #[test]
+    fn create_seeds_datetime_notification_for_time_aware_types() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(create_seeds_datetime_notification_for_time_aware_types_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn create_seeds_datetime_notification_for_time_aware_types_body() {
         for context_type in ["coder", "director", "mcp", "default"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
