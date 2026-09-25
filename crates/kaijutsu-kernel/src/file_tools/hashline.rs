@@ -9,8 +9,9 @@
 //!
 //! The line *number* is the primary anchor; the hash is a checksum that detects
 //! the line changed since it was shown. Hashing is over the line content as
-//! [`str::lines`] yields it (no terminator, no trailing `\r`), so `read` and
-//! `edit` agree byte-for-byte on what a "line" is.
+//! [`str::lines`] yields it, so `read` and `edit` agree byte-for-byte on what
+//! a "line" is: `\n` and `\r\n` are terminators and are not hashed, but a
+//! lone `\r` at end of file stays in the last line.
 
 /// Number of hex digits in a line hash. 4 hex = 16 bits → a changed line has
 /// only a ~1/65536 chance of colliding with its old hash, so a stale edit is

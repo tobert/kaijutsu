@@ -1728,8 +1728,11 @@ artifacts rebuilt — its own decision.
 
 Something now wants it: kaish's coming `edit` and hashline work (Amy,
 2026-09-25) marks which file line each output row is and has the kernel hash
-it. `OutputNode` will probably need `line`, and possibly a hash field, so
-anchors survive the wire. `grep -n`, an editor jump-to-match, and the vi
+it. kaish's draft brief (`~/exomemory/kaish/edit-hashline-brief.md`) sends
+the hash as a typed field rather than having clients recompute it, since an
+embedder can swap the algorithm. `cat --hashline a b` and `grep --hashline
+-r` number each file from 1, so `OutputNode` needs `path`, `line` and
+`hash`. `grep -n`, an editor jump-to-match, and the vi
 surface are line-anchored already.
 
 ## An Error block is shown twice after a fork (2026-08-22)
@@ -1872,7 +1875,13 @@ Bring these to that session:
   - The CLI grammar is not designed yet.
 
   The builtin needs our `edit` alias for vi gone first: see "`edit` still
-  names two different things on two surfaces".
+  names two different things on two surfaces". Nothing in kaijutsu depends
+  on the MCP `edit` tool's string mode (`old_string`): no rc script, prompt,
+  or other code uses it; models find it only through the tool schema.
+- Our anchor edit inserts multi-line text as given (`plan_anchor_edit`,
+  `format!("{new}{terminator}")`), so a multi-line replacement inside a
+  CRLF file gets `\n` between its lines and `\r\n` only at the end. Sent to
+  kaish as a design point; not fixed here since the tool is moving.
 - `write` has no staleness guard: see "`write` has no staleness guard".
 - `docs/file-buffers.md` slice 4 now points at the kaish builtin; rewrite
   it from the session's outcome.

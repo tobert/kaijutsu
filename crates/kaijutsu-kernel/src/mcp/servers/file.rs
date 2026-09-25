@@ -2011,6 +2011,18 @@ mod tests {
         assert_eq!(plan.expected, "a\r\nc\r\n");
     }
 
+    /// A lone `\r` at end of file is part of the last line, as `str::lines`
+    /// yields it, so its anchor hashes the `\r`. kaish's `edit` matches this,
+    /// and an anchor carries between the two only while both agree.
+    #[test]
+    fn anchor_lone_cr_at_eof_is_part_of_the_line() {
+        let content = "a\r\nb\r";
+        assert_ne!(line_hash("b\r"), line_hash("b"));
+        let plan = plan_anchor_edit(content, &format!("2:{}", line_hash("b\r")), "B").unwrap();
+        assert_eq!(plan.expected, "a\r\nB");
+        assert!(plan_anchor_edit(content, &format!("2:{}", line_hash("b")), "B").is_err());
+    }
+
     #[test]
     fn anchor_empty_file_errors_without_panic() {
         let err = plan_anchor_edit("", "1:abcd", "x").unwrap_err();
