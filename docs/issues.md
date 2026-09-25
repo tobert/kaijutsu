@@ -1724,9 +1724,13 @@ must agree and are set in different places).
 `name`/`entryType`/`text`/`hasText`/`cells`/`children` only. kaish 0.16+'s own
 `OutputNode.line` cannot be populated on our wire, so any client reading
 structured output loses the anchor. Adding it is a schema change plus all five
-artifacts rebuilt — its own decision. Worth doing when something wants it:
-`grep -n`, an editor jump-to-match, and the vi surface are all line-anchored
-already.
+artifacts rebuilt — its own decision.
+
+Something now wants it: kaish's coming `edit` and hashline work (Amy,
+2026-09-25) marks which file line each output row is and has the kernel hash
+it. `OutputNode` will probably need `line`, and possibly a hash field, so
+anchors survive the wire. `grep -n`, an editor jump-to-match, and the vi
+surface are line-anchored already.
 
 ## An Error block is shown twice after a fork (2026-08-22)
 
@@ -1853,12 +1857,25 @@ Bring these to that session:
 
 - kaish emits a `line` anchor under `--json` (kaish `aafc0ee4`), and the wire
   drops it: see "The wire drops kaish's output line anchor".
-- Hashline stays on our side. kaish has no hashline code; the kaish builtin
-  `edit` and the MCP tool `edit` are two mechanisms: see "`edit` still names
-  two different things on two surfaces".
+- kaish is getting an `edit` builtin and hashline anchors. Amy,
+  2026-09-25: "kaish gets edit and hashline support throughout." Once they
+  ship, the MCP `read` and `edit` tools reduce onto kaish. Decided on the
+  kaish side so far (kaish-25, 2026-09-25):
+  - An anchor looks like `42:cafe`, with no algorithm name in it.
+  - Builtins mark which file line each output row is; the kernel computes
+    the hash.
+  - The hash algorithm is chosen per embedder through `KernelConfig`. The
+    default matches ours (`file_tools/hashline.rs`: FNV-1a, 4 hex,
+    `line_hash("alpha") == "202b"`), so anchors carry over.
+  - `edit` checks each edit before writing it (compare-and-set) and applies
+    a batch all or nothing. It never falls back to replacing the whole file.
+  - The CLI grammar is not designed yet.
+
+  The builtin needs our `edit` alias for vi gone first: see "`edit` still
+  names two different things on two surfaces".
 - `write` has no staleness guard: see "`write` has no staleness guard".
-- `docs/file-buffers.md` describes a different slice 4 (remove `write` and
-  `grep`, make `edit` hashline-only). Rewrite it from the session's outcome.
+- `docs/file-buffers.md` slice 4 now points at the kaish builtin; rewrite
+  it from the session's outcome.
 
 Slice 5 (`swapRecovered`/`diskChangedSinceLoad` on `EditorState`) is also
 open; neither field is in `kaijutsu.capnp`.
@@ -1883,12 +1900,19 @@ pointing at content never written.
 
 ## `edit` still names two different things on two surfaces (2026-08-18)
 
-Confirmed unchanged: kaish builtin `edit <path>` (`context_shell.rs:217`,
+Confirmed unchanged: kaish builtin `edit <path>` (`runtime/context_shell.rs:171`,
 registered alongside `vi`) opens an interactive vi session; MCP tool `edit`
 (`mcp/servers/file.rs:163`) is a surgical, non-interactive hashline/string
-edit. Same name, same coder, opposite mechanism. `vi` is already the
-documented front door (`docs/vi.md`), so dropping the kaish `edit` alias is
-the cheap fix — check rc scripts and help text for callers first.
+edit. Same name, same coder, opposite mechanism.
+
+kaish will ship its own `edit` builtin (Amy, 2026-09-25: "kaish gets edit
+and hashline support throughout"), and our alias would shadow it. Dropping
+the alias is now a prerequisite for taking that kaish release, not an option.
+`vi` is already the documented front door (`docs/vi.md`). The alias is also
+named in `runtime/embedded_kaish.rs:400` (read-only denial),
+`runtime/vi_builtin.rs:180` (test registration), and the front-door test at
+`runtime/context_shell.rs:505`. Check rc scripts and help text for callers
+first.
 
 ## `write` has no staleness guard (2026-08-18)
 

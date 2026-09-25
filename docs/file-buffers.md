@@ -214,7 +214,8 @@ such check. Ranges (`N:hash..M:hash`) already cover multi-line replacement, and
 an empty `new_string` deletes, so nothing is lost but the unguarded path.
 
 The cost is a required `read` before an edit. That is the correct discipline,
-and it is what makes rule 3 enforceable.
+and it is what makes rule 3 enforceable. kaish's coming `edit` builtin takes
+over this role with the same per-line check; see slice 4.
 
 ### `grep` is removed
 
@@ -228,10 +229,12 @@ appears. If it comes back, it should emit hashline anchors so that
 `grep` → `edit` composes without a separate `read` — that is the ergonomic
 answer to hashline-only editing.
 
-**Open, from the same conversation:** whether shell `cat`/`grep` should learn
-hashline output. Attractive, with one caveat worth stating before anyone builds
-it — hashline prefixes are metadata, so making them the default would corrupt
-every existing pipeline. It needs a flag, not a new default.
+**Shell hashline output is coming in kaish** (Amy, 2026-09-25: "kaish gets
+edit and hashline support throughout"). Builtins mark which file line each
+output row is and the kernel computes the hash. The caveat still holds:
+hashline prefixes are metadata, so making them the default text output would
+corrupt every existing pipeline. They need a flag or the structured output,
+not a new default.
 
 ## Wire: no new RPC
 
@@ -289,9 +292,13 @@ via a file tool gets a tool *result*; the announcement rides that text.
    overrides.
 4. **Tool surface — open.** `write` and `grep` still exist as MCP tools;
    `edit` still has both string mode (`old_string`/`new_string`) and hashline
-   mode. Removing `write` and `grep`, making `edit` hashline-only, and adding
-   `create_file` if wanted are still ahead, along with updating
-   `docs/kj-help/` and every published `///`.
+   mode. The target is now kaish's own `edit` builtin with hashline anchors
+   (Amy, 2026-09-25: "kaish gets edit and hashline support throughout"):
+   once it ships, the MCP `read` and `edit` tools reduce onto kaish instead
+   of `edit` becoming hashline-only here. Removing `write` and `grep`, adding
+   `create_file` if wanted, dropping our `edit` alias for vi, and updating
+   `docs/kj-help/` and every published `///` are still ahead. See
+   `docs/issues.md`, "File buffers: reduce the MCP file tools to kaish".
 5. **Wire fields — open.** `swapRecovered` / `diskChangedSinceLoad` are not
    yet on `EditorState` in `kaijutsu.capnp`; renderer work to show them
    follows.
