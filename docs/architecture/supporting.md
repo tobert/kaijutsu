@@ -24,7 +24,7 @@ mirror"). Tools: `shell`, `register_session`, `whoami`, `invoke_peer`,
 (`read_input`/`write_input`/`edit_input`/`submit_input`) were removed
 2026-09-15 — the draft is the player's alone (`docs/issues.md`, "The
 compose draft is the player's alone"). `HookListener`
-(`hook_listener.rs:29`) is a Unix-socket server that turns Claude Code lifecycle
+(`hook_listener.rs:147`) is a Unix-socket server that turns Claude Code lifecycle
 events into blocks and injects drift context into responses.
 
 It is the **terminal consumer** — depends on `-kernel`, `-client`, `-types`,
@@ -56,19 +56,16 @@ for configuration, cache identity, failure behavior, and remaining work.
 
 ## `kaijutsu-agent-tools` — agent session detection
 
-Detects the hosting AI tool. `AgentSession` trait (`lib.rs:26`) has two impls:
+Detects the hosting AI tool. `AgentSession` trait (`lib.rs:27`) has two impls:
 **`CodexSession`** (`codex.rs:14`), discovered from a nonempty `CODEX_THREAD_ID`
 env var forwarded by kaijutsu's Codex integration (no process-walking — Codex
 does not expose its active thread through a transcript file); **`ClaudeCodeSession`**
-(`claude.rs:13`), discovered by walking the parent process for `CLAUDECODE=1`
-and extracting session metadata, encoding cwd the way Claude Code does
-(`/home/u/x → -home-u-x`) to scan `~/.claude/projects/{encoded}/*.jsonl`.
-`detect()` (`lib.rs:50`) prefers Codex when both hosts' markers are present —
-its thread id directly identifies the conversation, unlike `CLAUDECODE`. Leaf
-crate; used by `-mcp`. Smells: Claude Code discovery silently falls back to
-`minimal()` if the path convention changes; mtime-sorted transcript selection
-is filesystem-dependent; no Gemini CLI or opencode detection despite `-mcp`
-serving them.
+(`claude.rs:15`), detected by `CLAUDECODE=1` and read from
+`CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR`, which Claude Code hands the
+MCP servers it spawns; without the id the first hook event names the session.
+`detect()` (`lib.rs:48`) prefers Codex when both hosts' markers are present.
+Leaf crate; used by `-mcp`. Smells: no Gemini CLI or opencode detection
+despite `-mcp` serving them.
 
 ## `kaijutsu-telemetry` — OpenTelemetry
 

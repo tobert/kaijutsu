@@ -406,6 +406,25 @@ this left open:
   description needs correcting, or the archived case needs the same
   registry-fallback treatment the already-joined fast path now gets.
 
+## kaijutsu-mcp session identity (2026-09-25)
+
+From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
+
+- **Codex premises are unverified.** The listener compares the MCP's
+  `CODEX_THREAD_ID` with each hook payload's `session_id` and refuses a
+  mismatch; the hook client assumes Codex spawns hooks directly, so its
+  parent pid names the Codex process. Only our own fixtures back either.
+  Probe a live Codex session: its hook payload's `session_id`, and the hook
+  process's parent. If either fails, every Codex event is refused or dropped.
+- **A misrouted `session.start` would still rename a listener.** Adoption
+  runs before the foreign-session check, and `session.start` always renames
+  (that is how `/clear` works). Reachable only after a routing error: a
+  reused pid, a stale `CLAUDE_PID`, or an explicit `--socket`.
+- **After `/clear` or `/resume` the session id moves and the context does
+  not.** Blocks keep landing in the old context; after `/mcp` the new process
+  registers `{base}-{new sid8}` and starts a fresh context. Decide whether a
+  context follows the Claude Code session or the process.
+
 ## kaijutsu-mcp startup against a sick kernel (2026-09-25)
 
 - **Auto-registration gives up after about 8 s and never retries.** This

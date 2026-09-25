@@ -8,7 +8,7 @@
 //!   cargo run -p kaijutsu-mcp
 //!   cargo run -p kaijutsu-mcp -- --connect
 //!
-//!   # One-shot hook client — reads stdin, sends to daemon socket
+//!   # One-shot hook client — reads stdin, sends to its host's MCP listener
 //!   cargo run -p kaijutsu-mcp -- hook
 //!   cargo run -p kaijutsu-mcp -- hook --socket /tmp/kj-hook.sock
 //!

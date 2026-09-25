@@ -1,7 +1,8 @@
 //! Agent detection and session correlation.
 //!
-//! Discovers which AI coding tool (Codex, Claude Code, Gemini CLI, etc.) is running
-//! as a parent process, and extracts session metadata for context correlation.
+//! Discovers which AI coding tool (Codex, Claude Code) spawned this process,
+//! from the environment it hands its MCP servers, and extracts session
+//! metadata for context correlation.
 //!
 //! ## Usage
 //!

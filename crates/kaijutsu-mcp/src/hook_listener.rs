@@ -5,8 +5,8 @@
 //! one JSON response, and disconnect.
 //!
 //! On each event the listener:
-//! 1. Creates kernel blocks in the shared store
-//! 2. Pushes ops to the server (if remote)
+//! 1. Refuses an event that names another session
+//! 2. Authors blocks: into the local store, or through the kernel over RPC
 //! 3. Checks for pending drift and injects it into the response
 
 use std::path::{Path, PathBuf};
@@ -197,8 +197,12 @@ pub struct HookListener {
 /// [`hook_client_socket_path`]), so an event-carried id is this host's. With
 /// no id yet, the first one names the session. After that only
 /// `session.start` renames it: `/clear` starts a new session id in the same
-/// host process. The same id again is never an adoption.
+/// host process. The same id again is never an adoption, and an empty id
+/// names no session.
 pub fn should_adopt_session_id(current: Option<&str>, event: &str, incoming: &str) -> bool {
+    if incoming.trim().is_empty() {
+        return false;
+    }
     match current {
         None => true,
         Some(cur) if cur == incoming => false,
@@ -218,10 +222,10 @@ pub fn should_record_session_end(stored: Option<&str>, event_session_id: Option<
 
 /// Whether an event names a session other than the one this listener
 /// serves. Such an event is refused before it writes anything. A listener
-/// that has no session id yet, or an event that carries none, is not a
-/// mismatch.
+/// that has no session id yet, or an event that carries none (or an empty
+/// one), is not a mismatch.
 pub fn is_foreign_session(stored: Option<&str>, event_session_id: Option<&str>) -> bool {
-    matches!((stored, event_session_id), (Some(s), Some(e)) if s != e)
+    matches!((stored, event_session_id), (Some(s), Some(e)) if !e.trim().is_empty() && s != e)
 }
 
 impl HookListener {
@@ -1637,6 +1641,15 @@ mod tests {
     fn a_named_session_is_renamed_only_by_session_start() {
         assert!(!should_adopt_session_id(Some("83768815-this"), "tool.before", "other-session"));
         assert!(should_adopt_session_id(Some("83768815-this"), "session.start", "4e1d0c2a-next"));
+    }
+
+    /// An empty id names no session: adopting it would make every real id
+    /// that follows look foreign.
+    #[test]
+    fn an_empty_session_id_names_nothing() {
+        assert!(!should_adopt_session_id(None, "session.start", ""));
+        assert!(!should_adopt_session_id(Some("83768815-this"), "session.start", " "));
+        assert!(!is_foreign_session(Some("83768815-this"), Some("")));
     }
 
     #[test]
