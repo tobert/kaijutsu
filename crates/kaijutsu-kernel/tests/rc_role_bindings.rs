@@ -78,16 +78,47 @@ async fn harness() -> Harness {
     }
 }
 
+/// Mint a root character via `kj character create --root` and return its
+/// root context id: the same `ensure_root_context` path boot runs
+/// (`docs/fork-and-create.md`, "Where a created context sits"). A root
+/// console is parentless, which `kj context create` never mints.
+async fn ensure_root(h: &Harness, name: &str) -> kaijutsu_types::ContextId {
+    let caller = KjCaller {
+        principal_id: h.creator,
+        actor_id: h.creator,
+        reviewer_id: None,
+        context_id: None,
+        session_id: SessionId::new(),
+        confirmed: false,
+        rc_depth: 0,
+        privileged: true,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let argv: Vec<String> = ["character", "create", name, "--root"].iter().map(|s| s.to_string()).collect();
+    let res = h.dispatcher.dispatch(&argv, &caller).await;
+    assert!(matches!(res, KjResult::Ok { .. }), "character create --root failed: {}", res.message());
+    h.db
+        .lock()
+        .get_character_by_name(name)
+        .unwrap()
+        .unwrap_or_else(|| panic!("character '{name}' not found"))
+        .root_ctx
+        .expect("character create --root must bind a root context")
+}
+
 /// Create a context of `context_type` via `kj context create`, firing its rc
-/// `create` lifecycle, and return the new context id.
+/// `create` lifecycle, and return the new context id. The caller stands in
+/// a root console, because `kj context create` needs a current context or
+/// `--parent`.
 async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_types::ContextId {
+    let root = ensure_root(h, "amy").await;
     // Unprivileged caller: the rc create lifecycle assigns the loadout via its
     // own privileged kaish (EmbeddedKaish::for_context), not this caller.
     let caller = KjCaller {
         principal_id: h.creator,
         actor_id: h.creator,
         reviewer_id: None,
-        context_id: None,
+        context_id: Some(root),
         session_id: SessionId::new(),
         confirmed: false,
         rc_depth: 0,
@@ -110,6 +141,21 @@ async fn create_typed(h: &Harness, label: &str, context_type: &str) -> kaijutsu_
         .unwrap_or_else(|e| panic!("context '{label}' not found: {e}"))
 }
 
+/// Run `body` to completion on a thread sized for rc lifecycles, joining it
+/// and re-raising any panic. `create_typed` nests two rc lifecycles
+/// (`ensure_root`'s root create, then the typed context's own create), each
+/// re-entering kaish many levels deep on one stack — enough to overflow the
+/// default ~2 MiB test-harness thread stack. Mirrors the in-crate
+/// `run_on_rc_stack` helper (`kj/transport.rs`) and the server's own
+/// beat-scheduler/SSH threads, which spawn through
+/// [`kaijutsu_kernel::spawn_kaish_thread`] for the same reason.
+fn run_on_rc_stack(body: impl FnOnce() + Send + 'static) {
+    kaijutsu_kernel::spawn_kaish_thread("rc-test-thread", body)
+        .expect("spawn rc-stack thread")
+        .join()
+        .expect("rc-stack thread panicked");
+}
+
 /// Thin wrapper so the facade assertions read cleanly.
 async fn fx_broker_check(
     h: &Harness,
@@ -119,8 +165,18 @@ async fn fx_broker_check(
     h.kernel.broker().check_facade(ctx, facade).await
 }
 
-#[tokio::test]
-async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
+#[test]
+fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(toolie_role_seeds_readonly_allow_set_and_refuses_writes_body());
+    });
+}
+
+async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes_body() {
     let h = harness().await;
     let ctx = create_typed(&h, "exp", "toolie").await;
 
@@ -211,8 +267,18 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
     );
 }
 
-#[tokio::test]
-async fn director_role_seeds_block_tooling_but_not_file_writes() {
+#[test]
+fn director_role_seeds_block_tooling_but_not_file_writes() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(director_role_seeds_block_tooling_but_not_file_writes_body());
+    });
+}
+
+async fn director_role_seeds_block_tooling_but_not_file_writes_body() {
     let h = harness().await;
     let ctx = create_typed(&h, "dir", "director").await;
 
@@ -297,10 +363,27 @@ async fn director_role_seeds_block_tooling_but_not_file_writes() {
 
 /// A root context is a human's admin console with no model: it holds the
 /// operator's whole authority set and composes no instruction blocks.
-#[tokio::test]
-async fn root_role_is_a_model_less_admin_console() {
+///
+/// A root context is minted at boot (`ensure_root_contexts`) or by `kj
+/// character create --root` — never by `kj context create --type root`,
+/// which would hang a "root"-typed context off another context as a plain
+/// child instead of minting the parentless console the type means. This
+/// exercises the real path via `ensure_root`, the same `ensure_root_context`
+/// internals boot runs.
+#[test]
+fn root_role_is_a_model_less_admin_console() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(root_role_is_a_model_less_admin_console_body());
+    });
+}
+
+async fn root_role_is_a_model_less_admin_console_body() {
     let h = harness().await;
-    let ctx = create_typed(&h, "amy", "root").await;
+    let ctx = ensure_root(&h, "amy").await;
 
     let binding = h
         .kernel
@@ -371,8 +454,18 @@ async fn character_create_root_binds_its_root_context() {
     assert!(binding.is_admin(), "the root context must hold binding-admin");
 }
 
-#[tokio::test]
-async fn mcp_role_holds_config_governance() {
+#[test]
+fn mcp_role_holds_config_governance() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(mcp_role_holds_config_governance_body());
+    });
+}
+
+async fn mcp_role_holds_config_governance_body() {
     // The `mcp` context_type is the producer/orchestrator voice (Claude Code
     // over MCP, cheaper than API rates). On top of the shared broad loadout it
     // adds the config governance cap via S15-governance.kai, so it can drive
