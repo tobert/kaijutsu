@@ -165,6 +165,27 @@ pub struct SubscriptionEntry {
     /// hardcoded instance literal; an old age smells like an ordinary
     /// reconnect after a dead socket.
     registered_at: std::time::Instant,
+    /// Identifies exactly this registration, distinct from every other one
+    /// ever made (including a same-session, same-key re-subscribe). The
+    /// bridge task captures its own generation before spawning and, on
+    /// natural exit, removes its map entry only if the entry's generation
+    /// still matches — see [`next_subscription_generation`] and the removal
+    /// in `subscribe_blocks_filtered`. `session_id` alone can't do this job:
+    /// a same-connection re-subscribe (`ReplacedSameConnection`) keeps the
+    /// same session id on a brand-new entry, and the old task's natural exit
+    /// must not delete that new entry.
+    generation: u64,
+}
+
+/// Mint a value that identifies one subscription registration uniquely
+/// across the whole process, so a bridge task can tell "the entry with my
+/// key is still mine" from "someone replaced it" without comparing anything
+/// about *what* replaced it. Monotonic, not reused — a `HashMap` key's
+/// lifetime says nothing about whether two different registrations under it
+/// were the same registration.
+fn next_subscription_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Outcome of [`register_subscription`] inserting a new entry.
@@ -201,11 +222,13 @@ fn register_subscription(
     key: (PrincipalId, String),
     session_id: SessionId,
     abort: tokio::task::AbortHandle,
+    generation: u64,
 ) -> SubscriptionRegistration {
     let new_entry = SubscriptionEntry {
         abort,
         session_id,
         registered_at: std::time::Instant::now(),
+        generation,
     };
     let prior = {
         let mut reg = registry.lock();
@@ -226,6 +249,68 @@ fn register_subscription(
                 prior_session_id,
                 age,
             }
+        }
+    }
+}
+
+/// Remove `key`'s registry entry on a subscription bridge task's own natural
+/// exit — but only if that entry is still the one identified by
+/// `generation`. A concurrent reconnect may already have replaced it (same
+/// key, newer generation, possibly even the same `session_id`); that entry
+/// belongs to the live task and must survive this call untouched. Returns
+/// whether an entry was actually removed, purely so the caller can decide
+/// whether to log.
+///
+/// This is what makes a finished subscription's `AbortHandle` transient
+/// instead of permanent: left in place, it keeps the finished task's cell
+/// alive, which keeps that task's `tokio::runtime::Handle` alive, which owns
+/// the connection's io driver — a leaked epoll fd (a registry-duplicated
+/// handle) and waker eventfd per subscription whose `instance` is never
+/// reused (`kaijutsu-audiod`'s per-process instance is exactly that shape).
+fn remove_subscription_if_current(
+    registry: &parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>>,
+    key: &(PrincipalId, String),
+    generation: u64,
+) -> bool {
+    let mut reg = registry.lock();
+    if let std::collections::hash_map::Entry::Occupied(entry) = reg.entry(key.clone())
+        && entry.get().generation == generation
+    {
+        entry.remove();
+        true
+    } else {
+        false
+    }
+}
+
+/// RAII cleanup for one `subscribe_blocks_filtered` bridge task, held across
+/// its own `.await` so `Drop` — not sequenced code after the task's main
+/// future resolves — is what removes its registry entry.
+///
+/// This distinction is required, not stylistic: when `spawn_rpc_thread`'s
+/// `local.block_on` returns (because `run_rpc`'s own future resolved,
+/// typically as `ConnectionState::Drop` fires `conn_cancel`), it does not
+/// then drain the `LocalSet`'s other still-pending spawned tasks — it just
+/// drops `local`. A bridge task parked in `run_block_bridge`'s `tokio::select!`
+/// at that moment is woken by `conn_cancel` but never actually re-polled: the
+/// `LocalSet` drop tears it down mid-`select!`, before it can ever reach code
+/// sequenced after its own `.await`. Only `Drop` glue on locals already live
+/// in the task's state machine is guaranteed to run in that case — the same
+/// reason `ConnectionState`'s own cleanup lives in `Drop` rather than at the
+/// tail of `run_rpc`.
+struct SubscriptionCleanupGuard {
+    registry: Arc<parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>>>,
+    key: (PrincipalId, String),
+    generation: u64,
+}
+
+impl Drop for SubscriptionCleanupGuard {
+    fn drop(&mut self) {
+        if remove_subscription_if_current(&self.registry, &self.key, self.generation) {
+            log::debug!(
+                "Removed finished FlowBus subscription entry for instance={} principal={:?}",
+                self.key.1, self.key.0,
+            );
         }
     }
 }
@@ -5903,7 +5988,22 @@ impl kernel::Server for KernelImpl {
             let dedupe_key = (principal_id, instance.clone());
             let wire_filter = if has_filter { Some(filter) } else { None };
 
+            // Minted before the task is spawned so the task can carry its own
+            // identity for the cleanup guard below — see `SubscriptionEntry::
+            // generation`.
+            let generation = next_subscription_generation();
+            let cleanup_guard = SubscriptionCleanupGuard {
+                registry: registry.clone(),
+                key: dedupe_key.clone(),
+                generation,
+            };
+
             let task = tokio::task::spawn_local(async move {
+                // Held across every `.await` below so its `Drop` — not any
+                // code sequenced after them — removes this subscription's
+                // registry entry. See `SubscriptionCleanupGuard`'s doc
+                // comment for why that distinction matters.
+                let _cleanup_guard = cleanup_guard;
                 let block_sub = block_flows.subscribe(subscribe_pattern);
                 log::debug!(
                     "Started filtered FlowBus subscription for kernel {} (filter_active={}, \
@@ -5922,6 +6022,13 @@ impl kernel::Server for KernelImpl {
                     "Filtered FlowBus",
                 )
                 .await;
+                // `_cleanup_guard` drops here — or, if this task is torn down
+                // before reaching this point at all (aborted by a
+                // replacement, or dropped along with the `LocalSet` without
+                // ever being re-polled), wherever the future's state machine
+                // is actually dropped. Either way `SubscriptionCleanupGuard`
+                // removes this registration's entry unless something newer
+                // has already replaced it.
             });
 
             // Register the AbortHandle. If a prior subscription exists for
@@ -5932,13 +6039,13 @@ impl kernel::Server for KernelImpl {
             // any more events; the dead callback held by that task is dropped
             // with the task frame.
             //
-            // We do NOT remove our own entry on natural exit (when conn_cancel
-            // fires from the connection's Drop). The cost of leaving a
-            // finished AbortHandle in the map is O(small struct) per distinct
-            // (principal, instance) ever seen; correctness wins over a tiny
-            // bounded leak.
+            // This entry is removed by the task's own `SubscriptionCleanupGuard`
+            // whenever it is dropped (see above); a REPLACED entry is removed
+            // here instead, synchronously, by aborting the old task outright —
+            // so the map never holds more than one live entry per key, and a
+            // finished one is transient rather than permanent.
             let new_handle = task.abort_handle();
-            match register_subscription(&registry, dedupe_key.clone(), session_id, new_handle) {
+            match register_subscription(&registry, dedupe_key.clone(), session_id, new_handle, generation) {
                 SubscriptionRegistration::Fresh | SubscriptionRegistration::ReplacedFinished => {}
                 // Same connection re-issuing the RPC (e.g. a changed filter)
                 // — ordinary, not worth an operator's attention.
@@ -10305,7 +10412,13 @@ mod subscription_registry_tests {
         let key = (p, "stable-instance".to_string());
 
         let first_session = SessionId::new();
-        let outcome = register_subscription(&registry, key.clone(), first_session, live_abort_handle());
+        let outcome = register_subscription(
+            &registry,
+            key.clone(),
+            first_session,
+            live_abort_handle(),
+            next_subscription_generation(),
+        );
         assert_eq!(outcome, SubscriptionRegistration::Fresh);
         assert_eq!(registry.lock().len(), 1, "first subscribe registers one entry");
 
@@ -10313,7 +10426,13 @@ mod subscription_registry_tests {
         // TCP connection always mints a new SessionId) — this is the
         // intended "replace my own prior subscription" path.
         let second_session = SessionId::new();
-        let outcome = register_subscription(&registry, key.clone(), second_session, live_abort_handle());
+        let outcome = register_subscription(
+            &registry,
+            key.clone(),
+            second_session,
+            live_abort_handle(),
+            next_subscription_generation(),
+        );
         match outcome {
             SubscriptionRegistration::ReplacedDifferentConnection {
                 prior_session_id,
@@ -10362,12 +10481,14 @@ mod subscription_registry_tests {
             (p, instance_a.clone()),
             SessionId::new(),
             live_abort_handle(),
+            next_subscription_generation(),
         );
         let outcome_b = register_subscription(
             &registry,
             (p, instance_b.clone()),
             SessionId::new(),
             live_abort_handle(),
+            next_subscription_generation(),
         );
 
         assert_eq!(outcome_a, SubscriptionRegistration::Fresh);
@@ -10405,10 +10526,22 @@ mod subscription_registry_tests {
         let key = (p, "stable-instance".to_string());
         let session = SessionId::new();
 
-        register_subscription(&registry, key.clone(), session, live_abort_handle());
+        register_subscription(
+            &registry,
+            key.clone(),
+            session,
+            live_abort_handle(),
+            next_subscription_generation(),
+        );
         // The SAME connection re-issues subscribeBlocksFiltered (e.g. the
         // client changed its filter) — same SessionId both times.
-        let outcome = register_subscription(&registry, key, session, live_abort_handle());
+        let outcome = register_subscription(
+            &registry,
+            key,
+            session,
+            live_abort_handle(),
+            next_subscription_generation(),
+        );
 
         assert_eq!(
             outcome,
@@ -10431,8 +10564,20 @@ mod subscription_registry_tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert!(finished.is_finished(), "test setup: task must have finished");
 
-        register_subscription(&registry, key.clone(), SessionId::new(), finished);
-        let outcome = register_subscription(&registry, key, SessionId::new(), live_abort_handle());
+        register_subscription(
+            &registry,
+            key.clone(),
+            SessionId::new(),
+            finished,
+            next_subscription_generation(),
+        );
+        let outcome = register_subscription(
+            &registry,
+            key,
+            SessionId::new(),
+            live_abort_handle(),
+            next_subscription_generation(),
+        );
 
         assert_eq!(
             outcome,
@@ -10442,6 +10587,72 @@ mod subscription_registry_tests {
         );
     }
 
+    /// A subscription bridge task removes its own registry entry on natural
+    /// exit, but only when that entry is still the one it registered.
+    /// Companion to
+    /// `crates/kaijutsu-server/tests/rpc_connection_fd_leak.rs`'s
+    /// `subscribe_blocks_filtered_fresh_instance_leaks_eventpoll_fds`, at the
+    /// registry-mutation level rather than over a live SSH connection.
+    #[tokio::test]
+    async fn natural_exit_removes_its_own_still_current_entry() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let key = (principal(), format!("kaijutsu-audiod-{}", uuid::Uuid::new_v4()));
+        let generation = next_subscription_generation();
+
+        register_subscription(&registry, key.clone(), SessionId::new(), live_abort_handle(), generation);
+        assert_eq!(registry.lock().len(), 1);
+
+        let removed = remove_subscription_if_current(&registry, &key, generation);
+        assert!(removed, "a still-current entry must be removed on natural exit");
+        assert!(
+            registry.lock().is_empty(),
+            "a finished, unreplaced subscription must not linger in the registry \
+             forever — that is the fd leak this fix closes",
+        );
+    }
+
+    /// The other half: a natural exit must NOT remove an entry that a
+    /// reconnect already replaced — including a same-session reconnect
+    /// (`ReplacedSameConnection`), where `session_id` alone can't tell the
+    /// old registration from the new one. Only the generation can.
+    #[tokio::test]
+    async fn natural_exit_does_not_remove_a_replaced_entry() {
+        let registry: parking_lot::Mutex<HashMap<(PrincipalId, String), SubscriptionEntry>> =
+            parking_lot::Mutex::new(HashMap::new());
+        let p = principal();
+        let key = (p, "stable-instance".to_string());
+        let session = SessionId::new();
+
+        let old_generation = next_subscription_generation();
+        register_subscription(&registry, key.clone(), session, live_abort_handle(), old_generation);
+
+        // Same connection re-subscribes (e.g. a changed filter) — same
+        // session id, a NEW generation, and the old task's `AbortHandle` is
+        // aborted by `register_subscription` itself. If the old task's
+        // future still ran its self-removal code (it shouldn't — `abort()`
+        // drops the future without resuming it — but this test does not rely
+        // on that), the generation check must refuse to remove the new entry.
+        let new_generation = next_subscription_generation();
+        let outcome = register_subscription(&registry, key.clone(), session, live_abort_handle(), new_generation);
+        assert_eq!(outcome, SubscriptionRegistration::ReplacedSameConnection);
+
+        let removed = remove_subscription_if_current(&registry, &key, old_generation);
+        assert!(
+            !removed,
+            "an outdated generation must never remove a newer live registration",
+        );
+        assert_eq!(
+            registry.lock().len(),
+            1,
+            "the replacement's entry must survive the old registration's cleanup",
+        );
+        assert_eq!(
+            registry.lock().get(&key).map(|e| e.generation),
+            Some(new_generation),
+            "the surviving entry must be the replacement, not a stale one",
+        );
+    }
 }
 
 #[cfg(test)]

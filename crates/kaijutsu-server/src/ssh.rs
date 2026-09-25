@@ -772,11 +772,16 @@ impl ConnectionHandler {
             {
                 Ok(rt) => rt,
                 Err(e) => {
+                    // Almost always fd exhaustion (EMFILE). A server that
+                    // cannot build a new connection's runtime refuses every
+                    // later client too, so exit and let the service manager
+                    // restart it with a clean fd table.
                     log::error!(
-                        "Failed to build tokio runtime for {}: {}",
+                        "Failed to build tokio runtime for {}: {} — exiting so the \
+                         service manager restarts us with a clean file descriptor table",
                         short_id_for_thread, e,
                     );
-                    return;
+                    std::process::exit(1);
                 }
             };
             // Channel and task destructors may spawn cleanup work during unwind.
