@@ -1677,6 +1677,13 @@ the `( … ) &` subshell planning gap (kaish cannot plan it, S45 denies "no
 execution plan") is an ask to the kaish lead; an export verb for corpus
 builders was ruled "later" — they read the ledger directly for now.
 
+Every forwarded dry run warns `approval reviewer unavailable for direct RPC`
+(`context_reviewer*`, `kaijutsu-server/src/rpc.rs`): contexts created by
+kaijutsu-mcp for Claude Code sessions have no reviewer. On 2026-09-25 that was
+98 warnings in 30 minutes, one per Bash call, burying real warnings. Decide
+whether a dry run needs a reviewer at all (then log at debug) or whether
+those contexts should get one.
+
 ## A secret source that runs a command has no home yet (2026-08-31)
 
 `env.TOKEN = { command = "..." }` is still rejected —
