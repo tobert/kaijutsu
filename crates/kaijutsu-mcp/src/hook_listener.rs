@@ -301,6 +301,12 @@ impl HookListener {
         }
     }
 
+    /// Arm label stabilization for a placeholder label joined after this
+    /// listener started. See `pending_label_base`.
+    pub fn arm_label_stabilization(&self, base: String) {
+        *self.pending_label_base.lock().unwrap_or_else(|e| e.into_inner()) = Some(base);
+    }
+
     /// Bind and start listening on a Unix socket, then serve forever.
     /// Convenience wrapper over [`Self::bind_socket`] + [`Self::serve`] for
     /// callers that don't need to observe bind success separately from serve
@@ -1231,10 +1237,9 @@ impl HookListener {
         let Some(base) = base else { return };
 
         let Some(current_context_id) = self.context_id() else {
-            // Shouldn't happen — auto-register sets shared_context_id before
-            // the listener starts accepting connections. Put the base back
-            // rather than lose it silently; the next event with a session id
-            // retries.
+            // Shouldn't happen — the base is armed only after a context is
+            // joined. Put the base back rather than lose it silently; the
+            // next event with a session id retries.
             let mut guard =
                 self.pending_label_base.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(base);

@@ -26,7 +26,7 @@ use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
 use kaijutsu_client::{KeySource, SshConfig};
-use kaijutsu_mcp::{Backend, KaijutsuMcp, RegisterSessionRequest, ShellRequest};
+use kaijutsu_mcp::{AutoRegistration, Backend, KaijutsuMcp, RegisterSessionRequest, ShellRequest};
 use kaijutsu_server::{SshServer, SshServerConfig};
 
 /// capnp-rpc requires a current-thread runtime with a LocalSet.
@@ -163,6 +163,34 @@ fn several_roots_without_a_named_parent_refuse() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(raw.contains("second-root") && raw.contains("--parent"), "{raw}");
+    });
+}
+
+/// A kernel that answers and refuses ends startup registration: the window
+/// reports a refusal rather than an unreachable kernel, and the wait for a
+/// connection returns instead of retrying on every reconnect.
+#[test]
+fn a_refusal_on_a_live_connection_ends_auto_registration() {
+    use std::time::Duration;
+
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await.with_parent(Some("no-such-parent".to_string()));
+        let delays = [Duration::ZERO, Duration::from_millis(250), Duration::from_secs(1), Duration::from_secs(2)];
+
+        let window = mcp.auto_register("refused-seat", &delays).await;
+        assert!(
+            matches!(&window, AutoRegistration::Refused(reply) if reply.contains("no-such-parent")),
+            "{window:?}"
+        );
+
+        let late = tokio::time::timeout(Duration::from_secs(10), mcp.register_when_connected("refused-seat"))
+            .await
+            .expect("a refusal on a live connection must end the wait");
+        assert!(
+            matches!(&late, AutoRegistration::Refused(reply) if reply.contains("no-such-parent")),
+            "{late:?}"
+        );
     });
 }
 

@@ -84,8 +84,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use kaijutsu_client::{
-    ActorHandle, CallError, KeySource, PeerConfig, PeerInvocation, ServerEvent, SshConfig,
-    TurnCompletedStopReason, spawn_actor,
+    ActorHandle, CallError, ConnectionStatus, KeySource, PeerConfig, PeerInvocation, ServerEvent,
+    SshConfig, TurnCompletedStopReason, spawn_actor,
 };
 use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, ContextId, ConversationDAG, PrincipalId};
 use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
@@ -673,6 +673,9 @@ pub struct StartupGate(Arc<watch::Sender<bool>>);
 /// is up, and a call should not hang for long when it is down.
 pub const STARTUP_WAIT: std::time::Duration = kaijutsu_types::timeout::tiers::HANDSHAKE;
 
+/// `register_session`'s reply without a kernel connection.
+const REQUIRES_CONNECT: &str = "Error: register_session requires --connect to kaijutsu-server";
+
 impl StartupGate {
     /// A gate that is already open.
     pub fn open() -> Self {
@@ -694,6 +697,35 @@ impl StartupGate {
         let mut rx = self.0.subscribe();
         tokio::time::timeout(limit, rx.wait_for(|settled| *settled)).await.is_ok()
     }
+}
+
+/// How a startup registration ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoRegistration {
+    /// Joined a context, or was already joined.
+    Joined,
+    /// The kernel answered and refused; the reply says why.
+    Refused(String),
+    /// The kernel never answered; the reply is the last error.
+    Unreachable(String),
+}
+
+/// The live connection's epoch, or `None` when the actor is not connected.
+/// Equal values before and after a call mean it ran on one connection.
+fn live_connection(actor: &ActorHandle) -> Option<u64> {
+    matches!(actor.current_status(), ConnectionStatus::Connected { .. })
+        .then(|| actor.connection_epoch())
+}
+
+/// Whether a `register_session` reply joined a context.
+fn registration_succeeded(reply: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(reply)
+        .ok()
+        .map(|v| {
+            v.get("success").and_then(|b| b.as_bool()).unwrap_or(false)
+                || v.get("already_registered").and_then(|b| b.as_bool()).unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 /// MCP server exposing the kaijutsu kernel.
@@ -1751,6 +1783,75 @@ impl KaijutsuMcp {
         self.register_session_impl(req).await
     }
 
+    /// Register at startup, once after each of `delays`. The actor dials in
+    /// the background, so early attempts can meet "not ready: connecting".
+    /// When every attempt fails, the result is a refusal only if the last
+    /// attempt ran start to finish on one live connection; otherwise the
+    /// kernel never answered.
+    pub async fn auto_register(
+        &self,
+        label: &str,
+        delays: &[std::time::Duration],
+    ) -> AutoRegistration {
+        let Some(remote) = self.remote() else {
+            return AutoRegistration::Refused(REQUIRES_CONNECT.to_string());
+        };
+        let mut reply = String::new();
+        let mut refused = false;
+        for delay in delays {
+            if !delay.is_zero() {
+                tokio::time::sleep(*delay).await;
+            }
+            let before = live_connection(&remote.actor);
+            reply = self.register_session_auto(Some(label.to_string()), None).await;
+            if registration_succeeded(&reply) {
+                return AutoRegistration::Joined;
+            }
+            refused = before.is_some() && before == live_connection(&remote.actor);
+        }
+        if refused {
+            AutoRegistration::Refused(reply)
+        } else {
+            AutoRegistration::Unreachable(reply)
+        }
+    }
+
+    /// Register as soon as the actor reaches the kernel, for a startup that
+    /// found it unreachable. Tries once on each new connection. A failure on
+    /// a connection that stayed up is a refusal and ends the wait. Returns
+    /// `Unreachable` only when the actor fails permanently.
+    pub async fn register_when_connected(&self, label: &str) -> AutoRegistration {
+        let Some(remote) = self.remote() else {
+            return AutoRegistration::Refused(REQUIRES_CONNECT.to_string());
+        };
+        let mut status = remote.actor.watch_status();
+        loop {
+            let stopped = match status
+                .wait_for(|s| {
+                    matches!(s, ConnectionStatus::Connected { .. } | ConnectionStatus::Terminal { .. })
+                })
+                .await
+            {
+                Ok(s) => match &*s {
+                    ConnectionStatus::Terminal { reason } => Some(reason.clone()),
+                    _ => None,
+                },
+                Err(_) => Some("the RPC actor stopped".to_string()),
+            };
+            if let Some(reason) = stopped {
+                return AutoRegistration::Unreachable(reason);
+            }
+            let before = live_connection(&remote.actor);
+            let reply = self.register_session_auto(Some(label.to_string()), None).await;
+            if registration_succeeded(&reply) {
+                return AutoRegistration::Joined;
+            }
+            if before.is_some() && before == live_connection(&remote.actor) {
+                return AutoRegistration::Refused(reply);
+            }
+        }
+    }
+
     /// Find a free label derived from `base` by trying `base-2`, `base-3`, …
     /// against the durable KernelDb (via `resolve_context_label`, not the
     /// registry). Used when `base` itself names a concluded/archived context
@@ -1871,7 +1972,7 @@ impl KaijutsuMcp {
         let remote = match self.remote() {
             Some(r) => r,
             None => {
-                return "Error: register_session requires --connect to kaijutsu-server".to_string();
+                return REQUIRES_CONNECT.to_string();
             }
         };
 

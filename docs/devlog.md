@@ -3030,3 +3030,34 @@ its increment. Her report that the prefix failed from the inline draft did not
 reproduce in a pty, so the key path gained an opt-in trace instead of a guess.
 
 Credits: Claude Fable 5.1.
+
+## The session that answered for its neighbor (September 25)
+
+Two Claude Code sessions archived each other's contexts on September 24. Amy
+suspected they were not using their Claude Code session info, and they were
+not. The MCP read its session id from the newest transcript in the project, and hook
+routing fell back to whichever listener answered, so one session's
+`SessionEnd` archived another's context. Claude Code passes
+`CLAUDE_CODE_SESSION_ID` to its MCP servers and `CLAUDE_PID` to its hooks. The
+MCP now takes the first, the hook client delivers only to the socket the
+second names, and a listener refuses an event for any other session.
+
+The kernel meanwhile ran out of file descriptors about 44 minutes after each
+start. The block-subscription registry kept every finished task's
+`AbortHandle`, which is small but keeps the task alive, and the task holds its
+connection's current-thread runtime with that runtime's epoll and eventfd.
+audiod reconnects with a fresh instance id, so each reconnect leaked two
+descriptors. A generation-checked drop guard now removes the entry when the task
+ends. The clue was the absence of growth: with audiod stopped, a stale client
+kept reconnecting and the count held still.
+
+The afternoon restart supplied its own lesson. This session's MCP started 23
+seconds into a 33-second kernel boot, used up its eight-second registration
+window, and stayed unjoined. That window was sized for a busy handshake, not an
+outage, and lengthening it would only move the cliff. The actor already
+reconnects on its own and publishes each connection through `watch_status()`.
+Registration now tries again on each new connection, and a failure on a
+connection that stayed up is a refusal, which ends the wait. The test proves
+the window ended before it starts the kernel.
+
+Credits: Claude Opus 5.5; kaibo (DeepSeek) reviewed the identity change.

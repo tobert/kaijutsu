@@ -427,12 +427,17 @@ From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
 
 ## kaijutsu-mcp startup against a sick kernel (2026-09-25)
 
-- **Auto-registration gives up after about 8 s and never retries.** This
-  session's MCP started at 09:00:31 while the kernel was out of file
-  descriptors; `start_behind_handshake` (`kaijutsu-mcp/src/main.rs`) retried
-  six times, settled the gate, and left the process unjoined until a manual
-  `register_session`. After a kernel outage every session needs the same
-  manual step.
+- **Kernel boot holds SSH connections for about 33 s.** On the 15:52 restart
+  the listener started at 15:52:27, `Loaded 3377 documents from database`
+  logged at 15:52:59 (`kaijutsu-server/src/rpc.rs`), and the shared kernel
+  came up at 15:53:00. Clients in that window see `ssh dial exceeded 5s`
+  rather than a refusal. The cost grows with the document count.
+- **`run_local` in the kaijutsu-mcp e2e tests drops its `LocalSet` outside
+  the runtime.** When a test fails, live SSH channels drop there too, and
+  russh's `ChannelCloseOnDrop` adds a second panic: `there is no reactor
+  running`. The first panic still names the failure.
+  `mcp_startup.rs`'s late-kernel test drops its `LocalSet` inside
+  `rt.enter()`.
 - **Claude Code 2.1.282 rejects our `resources/list` result**: `ttlMs` must
   be a number and `cacheScope` must be `public` or `private` (rmcp 3.4.0,
   protocol 2026-07-28). Logged at every MCP start in every session.

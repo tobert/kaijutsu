@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -29,7 +30,7 @@ use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kaijutsu_client::{KeyArgs, KeySource};
-use kaijutsu_mcp::{KaijutsuMcp, StartupGate};
+use kaijutsu_mcp::{AutoRegistration, KaijutsuMcp, StartupGate};
 use kaijutsu_mcp::hook_types::short_session_suffix;
 use kaijutsu_mcp::hook_listener::{
     HookListener, default_socket_path, hook_client_socket_path, send_hook_event,
@@ -268,9 +269,21 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     }).await
 }
 
+/// When startup registration tries, each delay measured from the previous
+/// attempt. Tool calls wait on the startup gate through this window.
+const STARTUP_REGISTER_DELAYS: [Duration; 6] = [
+    Duration::ZERO,
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
 /// Startup work that runs after the MCP server is already answering: session
-/// auto-registration (remote only), then the hook socket. Settles `gate` once
-/// registration is done, whether it succeeded or not.
+/// auto-registration (remote only), then the hook socket. Settles `gate` when
+/// the registration window ends. A kernel that answers after the window still
+/// gets the registration, on the actor's next connection.
 async fn start_behind_handshake(
     mcp: KaijutsuMcp,
     gate: Option<StartupGate>,
@@ -279,17 +292,17 @@ async fn start_behind_handshake(
     owns_socket: Arc<AtomicBool>,
     hook_listener_slot: Arc<Mutex<Option<Arc<HookListener>>>>,
 ) {
-    // `Some(base)` only when register_session_auto below succeeds *and*
-    // the host supplied no session id — the one case where the label needs
-    // stabilizing once a hook event names the session
-    // (HookListener::remote, `stabilize_context_label`).
+    // `Some(base)` only when registration joins *and* the host supplied no
+    // session id — the one case where the label needs stabilizing once a
+    // hook event names the session (HookListener::remote,
+    // `stabilize_context_label`).
     let mut pending_label_base: Option<String> = None;
+    // The label and base to register once the kernel answers.
+    let mut deferred: Option<(String, Option<String>)> = None;
 
     if let Some(gate) = gate {
         // Auto-register a session context so hook events land somewhere
         // without requiring a model to call register_session first.
-        // Best-effort: on failure we log and keep serving — the tool
-        // can still be called manually.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -298,45 +311,62 @@ async fn start_behind_handshake(
         let session_id = mcp.session_id_arc().lock().ok().and_then(|g| g.clone());
         let (label, label_base) =
             startup_label(&cwd, unix_secs, agent_label, session_id.as_deref());
-        // The actor connects on the first command, so the first attempt can
-        // race it ("not ready: connecting"). Retry briefly with backoff;
-        // exhaustion stays fail-open (the tool can be called manually).
-        let mut result = String::new();
-        let mut success = false;
-        for delay_ms in [0u64, 250, 500, 1000, 2000, 4000] {
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        match mcp.auto_register(&label, &STARTUP_REGISTER_DELAYS).await {
+            AutoRegistration::Joined => {
+                pending_label_base = label_base;
+                tracing::info!(label = %label, "Auto-registered MCP session");
             }
-            result = mcp.register_session_auto(Some(label.clone()), None).await;
-            success = serde_json::from_str::<serde_json::Value>(&result)
-                .ok()
-                .map(|v| {
-                    v.get("success").and_then(|b| b.as_bool()).unwrap_or(false)
-                        || v.get("already_registered")
-                            .and_then(|b| b.as_bool())
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if success {
-                break;
-            }
-        }
-        if success {
-            pending_label_base = label_base;
-            tracing::info!(label = %label, "Auto-registered MCP session");
-        } else {
-            tracing::warn!(
-                response = %result,
-                "Auto-register failed — continuing without a joined context; \
+            AutoRegistration::Refused(reply) => tracing::warn!(
+                response = %reply,
+                "Auto-register refused — continuing without a joined context; \
                  register_session can still be called manually",
-            );
+            ),
+            AutoRegistration::Unreachable(reply) => {
+                tracing::warn!(
+                    response = %reply,
+                    "Auto-register found no kernel — registering when it answers",
+                );
+                deferred = Some((label, label_base));
+            }
         }
         gate.settle();
     }
 
+    let listener =
+        start_hook_socket(&mcp, socket_path, owns_socket, hook_listener_slot, pending_label_base)
+            .await;
+
+    if let Some((label, label_base)) = deferred {
+        match mcp.register_when_connected(&label).await {
+            AutoRegistration::Joined => {
+                if let (Some(listener), Some(base)) = (&listener, label_base) {
+                    listener.arm_label_stabilization(base);
+                }
+                tracing::info!(label = %label, "Auto-registered MCP session once the kernel answered");
+            }
+            AutoRegistration::Refused(reply) | AutoRegistration::Unreachable(reply) => {
+                tracing::warn!(
+                    response = %reply,
+                    "Deferred auto-register failed — continuing without a joined context; \
+                     register_session can still be called manually",
+                )
+            }
+        }
+    }
+}
+
+/// Bind the hook socket and serve it. `None` when the socket is disabled or
+/// another live listener owns its path.
+async fn start_hook_socket(
+    mcp: &KaijutsuMcp,
+    socket_path: Option<PathBuf>,
+    owns_socket: Arc<AtomicBool>,
+    hook_listener_slot: Arc<Mutex<Option<Arc<HookListener>>>>,
+    pending_label_base: Option<String>,
+) -> Option<Arc<HookListener>> {
     let Some(socket_path) = socket_path else {
         tracing::warn!("$XDG_RUNTIME_DIR not set — hook socket disabled. Set --hook-socket explicitly to enable.");
-        return;
+        return None;
     };
 
     // Sweep other processes' abandoned sockets before binding ours —
@@ -358,7 +388,7 @@ async fn start_behind_handshake(
                 "Failed to bind hook socket: {e} — continuing without a hook socket \
                  rather than share another listener's endpoint"
             );
-            return;
+            return None;
         }
     };
     owns_socket.store(true, Ordering::SeqCst);
@@ -391,13 +421,15 @@ async fn start_behind_handshake(
         *slot = Some(Arc::clone(&listener));
     }
 
+    let serving = Arc::clone(&listener);
     tokio::spawn(async move {
-        if let Err(e) = listener.serve(unix_listener).await {
+        if let Err(e) = serving.serve(unix_listener).await {
             tracing::error!("Hook listener error: {e}");
         }
     });
 
     tracing::info!(socket = %socket_path.display(), "Hook socket started");
+    Some(listener)
 }
 
 /// One-shot hook client: reads stdin, sends to socket, prints response.
