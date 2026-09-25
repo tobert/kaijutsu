@@ -10,7 +10,4 @@ description = "Agent detection and session correlation for MCP servers"
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
 tracing = { workspace = true }
-dirs = { workspace = true }

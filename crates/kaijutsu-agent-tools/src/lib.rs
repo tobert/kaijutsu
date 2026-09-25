@@ -30,9 +30,6 @@ pub trait AgentSession: Send + Sync {
     /// Opaque session ID from the agent (UUID string for CC).
     fn session_id(&self) -> Option<&str>;
 
-    /// Human-readable session slug (e.g., "encapsulated-percolating-grove").
-    fn slug(&self) -> Option<&str>;
-
     /// Project directory the agent is operating in.
     fn project_dir(&self) -> Option<&Path>;
 
@@ -57,14 +54,7 @@ pub fn detect() -> Option<Box<dyn AgentSession>> {
 
     // Claude Code sets CLAUDECODE=1 for MCP servers it spawns
     if std::env::var("CLAUDECODE").ok().as_deref() == Some("1") {
-        match ClaudeCodeSession::discover() {
-            Ok(session) => return Some(Box::new(session)),
-            Err(e) => {
-                tracing::warn!("CLAUDECODE=1 but session discovery failed: {e}");
-                // Fall through — still return a minimal session
-                return Some(Box::new(ClaudeCodeSession::minimal()));
-            }
-        }
+        return Some(Box::new(ClaudeCodeSession::discover()));
     }
 
     // Future: Gemini CLI, Cursor, etc.

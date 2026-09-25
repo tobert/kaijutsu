@@ -405,17 +405,6 @@ this left open:
   "concluded" actually gets the suffixed-label treatment. The tool
   description needs correcting, or the archived case needs the same
   registry-fallback treatment the already-joined fast path now gets.
-- **Another session's MCP instance archived this session's context.** At
-  19:01:23 a `kaijutsu-mcp` from the user-scope entry in `~/.claude.json`
-  (no `KAIJUTSU_KEY_FINGERPRINT`, so it authenticated as amy) serving the
-  `kaiseki` session ran `configure_llm` on this session's context `8f2c6a3f`,
-  joined its own `cc-kaiseki-0924-2301`, disconnected three seconds later,
-  and `8f2c6a3f` was archived 0.2 s after that. The kaiseki session kept
-  running. How that instance came to own this session's context is
-  unlocated; candidates are session detection (`kaijutsu-agent-tools`
-  `claude.rs` guesses from the newest transcript) and a fallback to the
-  highest-ranked live context. An instance must archive only a context it
-  created for a session id it confirmed.
 
 ## A client does not say which principal it connected as (2026-09-24)
 

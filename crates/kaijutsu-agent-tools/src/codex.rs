@@ -53,10 +53,6 @@ impl AgentSession for CodexSession {
         Some(&self.thread_id)
     }
 
-    fn slug(&self) -> Option<&str> {
-        None
-    }
-
     fn project_dir(&self) -> Option<&Path> {
         self.project_dir.as_deref()
     }
@@ -95,7 +91,6 @@ mod tests {
 
         assert_eq!(session.agent_name(), "codex");
         assert_eq!(session.session_id(), Some("thread-123"));
-        assert_eq!(session.slug(), None);
         assert_eq!(session.project_dir(), Some(Path::new("/workspace/project")));
         assert_eq!(session.version(), Some("0.114.0"));
     }

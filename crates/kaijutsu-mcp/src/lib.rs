@@ -1721,7 +1721,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true — check this and the context id/age before trusting it's the conversation you expect, since a stale reported session id can otherwise attach you to the wrong prior conversation). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -1991,22 +1991,15 @@ impl KaijutsuMcp {
         let mut parent: Option<kaijutsu_client::ParentChoice> = None;
         let (context_id, label) = match existing {
             Some(ctx) if ctx.concluded_at.is_none() && !ctx.archived => {
-                // Attach: the label already names a live context. Loud on
-                // purpose — startup agent detection can occasionally report
-                // a previous session's id; a stale id here would silently
-                // attach to the wrong prior conversation, so this
-                // stays visible in the server log AND in the reply's
-                // `resumed`/`last_activity_at` fields for the caller to
-                // sanity-check rather than trust blindly.
-                tracing::warn!(
+                // Attach: the label already names a live context, as it does
+                // when a relaunch within the same session registers again.
+                tracing::info!(
                     context_id = %ctx.id,
                     label = %requested_label,
                     created_at = ctx.created_at,
                     last_activity_at = ?ctx.last_activity_at,
                     "register_session: label already names a live context — \
-                     attaching instead of creating (reconnect/restart upsert); \
-                     verify this is the expected prior session, not a stale \
-                     agent-session id",
+                     attaching instead of creating (reconnect/restart upsert)",
                 );
                 // Ordinarily a same-process reconnect (the label just
                 // survived because nothing ever unregisters a context from

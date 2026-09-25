@@ -277,10 +277,8 @@ Layers 1 and 4 keep 2 and 3 honest. Do not ship the actor without both.
   delivery and receipt. Real events for the concepted trace-packet comets.
 - **Fan-out**: "every session whose cwd is `~/src/kaijutsu`, re-read
   `signoff.md`."
-- **It closes a live bug**: nothing in the tree reads `CLAUDE_CODE_*` today;
-  agent identity is scraped from the newest transcript file, which at
-  MCP-spawn time can name a *previous* session. `CLAUDE_CODE_SESSION_ID`
-  removes the guess.
+- **One session identity**: kaijutsu-mcp takes its session id from
+  `CLAUDE_CODE_SESSION_ID`, the id a peer channel would address.
 - **Eventually cross-machine without vendor relay.** CC routes cross-machine
   replies through Anthropic; kaijutsu already speaks SSH+capnp between
   machines, and the `hop-chain` field suggests receivers tolerate relayed

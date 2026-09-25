@@ -30,9 +30,10 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use kaijutsu_client::{KeyArgs, KeySource};
 use kaijutsu_mcp::{KaijutsuMcp, StartupGate};
+use kaijutsu_mcp::hook_types::short_session_suffix;
 use kaijutsu_mcp::hook_listener::{
-    HookListener, PING_TIMEOUT, candidate_sockets, default_socket_path, resolve_hook_socket,
-    send_hook_event, sweep_stale_sockets,
+    HookListener, default_socket_path, hook_client_socket_path, send_hook_event,
+    sweep_stale_sockets,
 };
 use kaijutsu_types::timeout::tiers;
 
@@ -113,7 +114,8 @@ struct HookArgs {
     source: Option<NativeHookSource>,
 
     /// Socket path to connect to.
-    /// Default: $XDG_RUNTIME_DIR/kaijutsu/hook-{ppid}.sock
+    /// Default: $XDG_RUNTIME_DIR/kaijutsu/hook-{pid}.sock, where pid is
+    /// $CLAUDE_PID or else this process's parent.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -160,7 +162,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         tracing::info!(
             agent = a.agent_name(),
             session_id = a.session_id(),
-            slug = a.slug(),
             version = a.version(),
             "Detected hosting agent"
         );
@@ -279,13 +280,9 @@ async fn start_behind_handshake(
     hook_listener_slot: Arc<Mutex<Option<Arc<HookListener>>>>,
 ) {
     // `Some(base)` only when register_session_auto below succeeds *and*
-    // the session id wasn't known yet — that's the one case where the
-    // label needs stabilizing once a hook event tells us the session id
-    // (HookListener::remote, `stabilize_context_label`). `base` is the
-    // repo-only prefix (`auto_register_base`), NOT the timestamped
-    // label used for the initial join — the stable label is
-    // `{base}-{sid8}`, deterministic across MCP relaunches within the
-    // same hosting-agent session.
+    // the host supplied no session id — the one case where the label needs
+    // stabilizing once a hook event names the session
+    // (HookListener::remote, `stabilize_context_label`).
     let mut pending_label_base: Option<String> = None;
 
     if let Some(gate) = gate {
@@ -298,16 +295,9 @@ async fn start_behind_handshake(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // No session-id suffix here even when detection reported one.
-        // Claude detection scrapes the newest transcript file, and at MCP
-        // spawn time the CURRENT session's transcript may not exist yet —
-        // that id can belong to a previous session (observed live). Codex
-        // supplies its thread id directly, but uses the same stabilization
-        // path. The first hook event that carries a session_id (any event
-        // type — not just session.start, which never fires again on a
-        // same-session MCP relaunch) carries the true id;
-        // `stabilize_context_label` does the fixup.
-        let label = auto_register_label(&cwd, unix_secs, agent_label);
+        let session_id = mcp.session_id_arc().lock().ok().and_then(|g| g.clone());
+        let (label, label_base) =
+            startup_label(&cwd, unix_secs, agent_label, session_id.as_deref());
         // The actor connects on the first command, so the first attempt can
         // race it ("not ready: connecting"). Retry briefly with backoff;
         // exhaustion stays fail-open (the tool can be called manually).
@@ -332,7 +322,7 @@ async fn start_behind_handshake(
             }
         }
         if success {
-            pending_label_base = Some(auto_register_base(&cwd, agent_label));
+            pending_label_base = label_base;
             tracing::info!(label = %label, "Auto-registered MCP session");
         } else {
             tracing::warn!(
@@ -441,7 +431,6 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
         tracing::debug!("Hook stdin is not valid JSON, failing open");
         return Ok(());
     };
-    let event_session_id = event.session_id.clone();
     let compact = serde_json::to_string(&event)?;
 
     if args.dry_run {
@@ -449,35 +438,17 @@ async fn run_hook_client(args: HookArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve which of the (possibly many stale) sockets in the runtime dir
-    // is actually ours: ping every live candidate, prefer the explicit
-    // socket, then fall back to a session-id match. Without `--socket` the
-    // PPID-derived default is the explicit candidate: it is the same
-    // derivation the flag would carry, and it must outrank a session-id
-    // match on every call, not only when routing falls through.
-    // One deadline covers resolution, send, and reply, held under the host's
-    // hook timeout: a listener that answers the ping and then stalls must
-    // cost this much, not a hook error in every session.
+    // Deliver only to our own host's listener (`hook_client_socket_path`).
+    // One deadline covers send and reply, held under the host's hook
+    // timeout: a listener that accepts and then stalls must cost this much,
+    // not a hook error in every session.
     let deadline = tiers::HOOK_CLIENT;
-    let explicit = args.socket.clone().or_else(default_socket_path);
-    let delivered = tokio::time::timeout(deadline, async {
-        let candidates = candidate_sockets(explicit.clone());
-        let socket_path = resolve_hook_socket(
-            candidates,
-            explicit.as_deref(),
-            event_session_id.as_deref(),
-            PING_TIMEOUT,
-        )
-        .await?;
-        Some((send_hook_event(&socket_path, &compact).await, socket_path))
-    })
-    .await;
-    let (sent, socket_path) = match delivered {
-        Ok(Some(delivered)) => delivered,
-        Ok(None) => {
-            tracing::debug!("No hook socket resolved, failing open");
-            return Ok(());
-        }
+    let Some(socket_path) = hook_client_socket_path(args.socket.clone()) else {
+        tracing::debug!("No hook socket for this host, failing open");
+        return Ok(());
+    };
+    let sent = match tokio::time::timeout(deadline, send_hook_event(&socket_path, &compact)).await {
+        Ok(sent) => sent,
         Err(_) => {
             eprintln!("kaijutsu: hook listener did not answer within {deadline:?}; not blocking");
             return Ok(());
@@ -582,32 +553,31 @@ fn personal_key_warning(key_source: &KeySource, ssh_dir: Option<&Path>) -> Optio
     }
 }
 
-/// Parse hook stdin as JSON and re-serialize compact (single line), also
-/// extracting `session_id` (if present) for socket resolution. `None` if
-/// `input` isn't valid JSON — the caller must never forward garbage.
-#[cfg(test)]
-fn normalize_hook_input(input: &str) -> Option<(String, Option<String>)> {
-    let value: serde_json::Value = serde_json::from_str(input).ok()?;
-    let session_id = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let compact = serde_json::to_string(&value).ok()?;
-    Some((compact, session_id))
-}
-
-/// Generate the auto-register label: `{agent}-{cwd basename}-{MMDD-HHMM}` (UTC).
-///
-/// Deliberately no session-id suffix — startup agent detection can report a
-/// PREVIOUS session's id (it scrapes the newest transcript file, which may
-/// predate this session). `HookListener`'s label-stabilization handling
-/// (`stabilize_context_label`) appends `-{first 8 chars}` to
-/// `auto_register_base`'s prefix — NOT this timestamp — once a hook event
-/// reveals the true id, so the stabilized label stays the same across an
-/// MCP relaunch within the same Claude Code session even though this
-/// timestamped one differs every time.
+/// The placeholder label for a process that starts without a session id:
+/// `{agent}-{cwd basename}-{MMDD-HHMM}` (UTC). Once a hook event names the
+/// session, `stabilize_context_label` moves the context onto
+/// `auto_register_base`'s prefix plus `-{first 8 chars}`, the label a
+/// relaunch within the same session also reaches.
 fn auto_register_label(cwd: &Path, unix_secs: u64, agent: &str) -> String {
     format!("{}-{}", auto_register_base(cwd, agent), format_stamp(unix_secs))
+}
+
+/// The label startup registration joins, and the base still waiting for a
+/// session id. A host-supplied session id gives the stable label
+/// `{base}-{sid8}` at once, so a relaunch within the same session attaches
+/// to the same context. Without one, a timestamped placeholder waits for
+/// the first hook event to name the session (`stabilize_context_label`).
+fn startup_label(
+    cwd: &Path,
+    unix_secs: u64,
+    agent: &str,
+    session_id: Option<&str>,
+) -> (String, Option<String>) {
+    let base = auto_register_base(cwd, agent);
+    match session_id {
+        Some(sid) => (format!("{base}-{}", short_session_suffix(sid)), None),
+        None => (auto_register_label(cwd, unix_secs, agent), Some(base)),
+    }
 }
 
 /// The label prefix stable for a whole agent session: `{agent}-{cwd
@@ -667,7 +637,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
-    // -- normalize_hook_input (item 1) --
+    // -- command line --
 
     #[test]
     fn connect_is_declared_once_so_it_cannot_be_read_from_the_wrong_field() {
@@ -710,28 +680,6 @@ mod tests {
         assert!(!cli.serve.insecure, "skipping verification must be opt-in");
     }
 
-    #[test]
-    fn normalize_hook_input_reformats_pretty_json() {
-        let pretty = "{\n  \"event\": \"tool.after\",\n  \"source\": \"claude-code\"\n}";
-        let (compact, session_id) = normalize_hook_input(pretty).unwrap();
-        assert_eq!(compact.lines().count(), 1, "must be a single line: {compact}");
-        assert!(compact.contains("\"event\":\"tool.after\""));
-        assert_eq!(session_id, None);
-    }
-
-    #[test]
-    fn normalize_hook_input_extracts_session_id() {
-        let json = r#"{"event":"session.start","source":"claude-code","session_id":"abc-123"}"#;
-        let (_, session_id) = normalize_hook_input(json).unwrap();
-        assert_eq!(session_id.as_deref(), Some("abc-123"));
-    }
-
-    #[test]
-    fn normalize_hook_input_rejects_invalid_json() {
-        assert!(normalize_hook_input("not json at all").is_none());
-        assert!(normalize_hook_input("{\"event\": \"tool.after\", }").is_none());
-    }
-
     // -- format_stamp / civil_from_days (item 4) --
 
     #[test]
@@ -742,15 +690,25 @@ mod tests {
         assert_eq!(format_stamp(1_234_567_890), "0213-2331");
     }
 
-    // -- auto_register_label (item 4) --
+    // -- startup labels --
 
     #[test]
-    fn auto_register_label_has_no_session_suffix() {
-        // Even when startup detection reports a session id it is NOT baked
-        // into the label — it can be a previous session's (stale transcript
-        // scrape). session.start's rename appends the true id later.
-        let label = auto_register_label(Path::new("/home/amy/src/kaijutsu"), 0, "cc");
+    fn a_host_session_id_gives_the_stable_label_at_once() {
+        let (label, pending) = startup_label(
+            Path::new("/home/amy/src/kaijutsu"),
+            0,
+            "cc",
+            Some("70b2c659-f80b-43ad-9f85-53196913838f"),
+        );
+        assert_eq!(label, "cc-kaijutsu-70b2c659");
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn without_a_session_id_a_placeholder_waits_for_stabilizing() {
+        let (label, pending) = startup_label(Path::new("/home/amy/src/kaijutsu"), 0, "cc", None);
         assert_eq!(label, "cc-kaijutsu-0101-0000");
+        assert_eq!(pending.as_deref(), Some("cc-kaijutsu"));
     }
 
     #[test]
