@@ -5,7 +5,6 @@ use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, InputEdge, Prin
 use crate::{ExecContext, Kernel, KjCaller};
 use super::admission::ContextAdmission;
 use super::turn_request::{StartupRequest, TurnRequest, queue_startup};
-use super::turn_state::LiveInput;
 
 pub enum PromptSource {
     Text { content: String, model: Option<String> },
@@ -71,9 +70,11 @@ pub async fn submit(
     Ok(after_block_id)
 }
 
-/// Start the turn for input a running turn accepted but never delivered.
+/// Start the turn for a submit a running turn accepted but never delivered.
 /// The input and its submit lifecycle are already durable.
-pub(crate) fn follow_up(kernel: &Arc<Kernel>, context: ContextId, input: LiveInput) -> Result<(), String> {
+pub(crate) fn follow_up(
+    kernel: &Arc<Kernel>, context: ContextId, block: BlockId, principal: PrincipalId, session: SessionId,
+) -> Result<(), String> {
     let slot = kernel.reserve_runtime_slot()?;
     let (admission, lease) = {
         let db = kernel.kernel_db().lock();
@@ -82,10 +83,10 @@ pub(crate) fn follow_up(kernel: &Arc<Kernel>, context: ContextId, input: LiveInp
     // The startup result reports only preparation; the turn reports its own end.
     let _startup = queue_startup(kernel, StartupRequest {
         admission, lease, request: TurnRequest {
-            context_id: context, after_block_id: input.block, content: String::new(),
-            principal_id: input.principal, model: None, continuation_epoch: None, score: None,
+            context_id: context, after_block_id: block, content: String::new(),
+            principal_id: principal, model: None, continuation_epoch: None, score: None,
         },
-        origin: crate::flows::TurnOrigin::Interactive, tool_ctx: None, session: input.session,
+        origin: crate::flows::TurnOrigin::Interactive, tool_ctx: None, session,
         submit: None, joins_live_turn: false,
     }, None, slot)?;
     Ok(())

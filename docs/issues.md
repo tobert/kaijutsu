@@ -320,10 +320,9 @@ restarted the kernel. No optional int arrived as a string. Open:
   replays stored content (`llm/hydrate.rs`), so a later turn, resume, or
   fork sees those calls return an empty string with no operation id; 104
   of 227 results in `banto-0924d` are empty. Completion notices ("Shell
-  operation … completed …") reach a running turn only when a player's
-  submit delivers them (`docs/conversation-session.md`, "Input during a
-  turn"), so inside one turn the model otherwise polls. Keep the receipt
-  durable so replay still names the operation.
+  operation … completed …") now join a running turn at its next tool round
+  (`docs/conversation-session.md`, "Input during a turn"). Keep the
+  receipt durable so replay still names the operation.
 - **Each tool round took about 40 s.** The model appears to wait for the
   completion notification before its next call. Unmeasured: how much is
   provider latency versus the async settle.
@@ -900,24 +899,12 @@ message that knew where the player was looking"). Left:
 
 ## Input during a turn: what is still open (2026-09-26)
 
-A submit during a running turn now joins it after a tool round or after the
-final inference (`docs/conversation-session.md`, "Input during a turn"). Amy:
-"if I submit async it should go as soon as possible and not have a new turn
-queued." Left:
+Submits, completion notices, and drift arrivals during a running turn join
+it after a tool round or after the final inference
+(`docs/conversation-session.md`, "Input during a turn"). Amy: "if I submit
+async it should go as soon as possible and not have a new turn queued";
+"drift and completion should land with asap delivery". Left:
 
-- **Drift and completion notices do not offer themselves.** Amy wants drift
-  arrivals delivered the same way ("user input, and eventually drifts
-  too"). Until then they reach a running turn only when a submit's
-  delivery carries them. Each source needs its own rule for input the
-  turn never delivers. A player's submit starts a turn
-  (`prompt::follow_up`). A drift starts none today: `deliver_drift`
-  inserts at the log tail and wakes nothing (`kj/drift.rs`). A completion
-  notice must pass the continuation policy (`automatic_resume_allowed`,
-  epoch, performer), and it returns early while a turn is in flight
-  (`runtime/completion_notice.rs`, `deliver`). The ingress keeps only the
-  newest pending input, so a drift offered after a note would erase the
-  note's claim to a follow-up; the input that wants a turn must stay
-  pending on its own.
 - **Not watched live.** A wire test drives a draft submit with the linked
   `S10-edge.kai` through a held turn
   (`compose_draft_wire::a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge`);
@@ -927,8 +914,8 @@ queued." Left:
   arrived; the result lands before the write point, so this turn never
   sends it, and the next turn's hydration places the pair earlier than
   this turn's later output.
-- **A follow-up turn drops the `prompt` RPC's model override.** `LiveInput`
-  carries block, principal, and session only.
+- **A follow-up turn drops the `prompt` RPC's model override.**
+  `Wake::Submit` carries principal and session only.
 - **A note can hide a ceiling stop.** When the ceiling-continuation budget
   is spent, a pending note still earns an inference, with the truncated
   text replayed and no ceiling notice; the turn then reports the later
@@ -963,21 +950,13 @@ pins full wire equality for an errored call).
 
 ## Async completion recovery follow-ups
 
-- Completion during a model's final inference can reach the durable mailbox
-  after that request was sent. The current automatic wake check skips an
-  in-flight turn. Reconcile unread completion notifications when the turn
-  yields, using its mailbox cursor, so a late result within the continuation
-  window does not wait for the next explicit drive. Do not refresh the window
-  or replay already consumed results.
-  The yield delivery for submitted input is that reconciliation once a
-  completion notice offers its block ("Input during a turn: what is still
-  open").
 - RPC PostCall hooks can replace output/status while the durable exit code
   still records the executed command. Define separate command outcome and hook
   outcome before changing job summaries to infer a synthetic exit code.
 - Shell operation inspection currently uses bounded result/block output.
   Integrate kaish job streams and spill references for live, complete output
   retrieval without invalidating pagination offsets.
+
 ## Config defaults ARE the config; the VFS path proxies XDG (Amy, 2026-09-12)
 
 Design direction for `theme.toml` and the other `/config/kernel` singletons

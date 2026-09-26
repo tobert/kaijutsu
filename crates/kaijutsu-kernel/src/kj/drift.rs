@@ -206,7 +206,7 @@ impl KjDispatcher {
         // (`docs/approval-identity.md`, "Three identities"). Everything the
         // arrival then triggers (the target's `drift` rc scripts) belongs to
         // the context owner instead — see `rc::run`.
-        self.block_store()
+        let block = self.block_store()
             .insert_drift_block_as(
                 target_ctx,
                 None,
@@ -252,6 +252,12 @@ impl KjDispatcher {
             caller,
         )
             .await;
+        // A running turn in the target delivers the drift at its next tool
+        // round, after the drift rc output has landed
+        // (`docs/conversation-session.md`, "Input during a turn").
+        self.kernel().turns().offer_input(target_ctx, crate::runtime::turn_state::LiveInput {
+            block, wake: crate::runtime::turn_state::Wake::Drift,
+        });
         if caller.cancel.is_cancelled() {
             return Ok(DriftDeliveryOutcome::LifecycleCancelled(
                 lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into()),
@@ -1413,6 +1419,30 @@ mod tests {
         // Nothing left staged.
         let queue = d.dispatch(&[s("drift"), s("queue")], &c).await;
         assert_eq!(queue.message(), "(queue empty)");
+    }
+
+    /// A drift into a context whose turn is running is offered to that turn,
+    /// which delivers it at its next tool round; it does not wait for the
+    /// next turn (`docs/conversation-session.md`, "Input during a turn").
+    #[tokio::test]
+    async fn drift_push_is_offered_to_the_targets_running_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("src"), None, principal);
+        let dst = register_context(&d, Some("dst"), None, principal);
+        d.block_store().create_document(dst, crate::DocumentKind::Conversation, None).unwrap();
+        let turns = d.kernel().turns();
+        let lease = turns.begin(dst);
+        turns.open_ingress(dst, lease.id(), lease.interrupt());
+
+        let result = d.dispatch(&[s("drift"), s("push"), s("dst"), s("mid-turn finding")], &caller_with_context(src)).await;
+        assert!(result.is_ok(), "push failed: {}", result.message());
+        let drift = d.block_store().block_snapshots(dst).unwrap().into_iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift).expect("drift block");
+        let pending = turns.close_ingress(dst, lease.id());
+        assert_eq!(pending, vec![crate::runtime::turn_state::LiveInput {
+            block: drift.id, wake: crate::runtime::turn_state::Wake::Drift,
+        }]);
     }
 
     /// The identity smear, drift half: the drift block is the ONE block in the

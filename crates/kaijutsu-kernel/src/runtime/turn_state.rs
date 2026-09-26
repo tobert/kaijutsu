@@ -14,14 +14,38 @@ struct ActiveTurn {
 
 type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<TurnId, ActiveTurn>>;
 
-/// Input submitted while a turn runs, which that turn has not yet delivered
-/// to its model. The block is already durable; this names who sent it and
-/// where it sits, so a turn that cannot deliver it can start the next turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Input that arrived while a turn runs, which that turn has not yet
+/// delivered to its model. The block is already durable; `wake` says what
+/// the input asks of the turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiveInput {
     pub block: BlockId,
-    pub principal: PrincipalId,
-    pub session: SessionId,
+    pub wake: Wake,
+}
+
+/// Whether live input earns the turn another inference when it arrives
+/// during the final one, and what starts after the turn if it was never
+/// delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// A player's submit continues the turn, and starts the next turn.
+    Submit { principal: PrincipalId, session: SessionId },
+    /// A completion notice continues the turn when its notice allows an
+    /// automatic resume; after the turn, its continuation policy decides.
+    Completion { source: super::completion_notice::Source, resume_allowed: bool },
+    /// A drift arrival rides any delivery but never extends or starts a
+    /// turn, just as a drift into an idle context starts none.
+    Drift,
+}
+
+impl Wake {
+    pub(crate) fn continues_turn(&self) -> bool {
+        match self {
+            Self::Submit { .. } => true,
+            Self::Completion { resume_allowed, .. } => *resume_allowed,
+            Self::Drift => false,
+        }
+    }
 }
 
 /// The running turn's door for new input. The turn holding a context's
@@ -29,11 +53,10 @@ pub(crate) struct LiveInput {
 struct Ingress {
     turn: TurnId,
     interrupt: Arc<ContextInterruptState>,
-    /// The newest undelivered input. Delivery reads the whole unseen log
-    /// tail, so older input sits before it and needs no entry of its own.
-    pending: Option<LiveInput>,
+    /// Undelivered input, oldest first. Each keeps its own wake.
+    pending: Vec<LiveInput>,
     /// Blocks carried by an inference that completed. Delivery reads the
-    /// log, so input can reach the model before its submit offers it.
+    /// log, so input can reach the model before it is offered.
     delivered: std::collections::HashSet<BlockId>,
 }
 
@@ -154,18 +177,18 @@ impl TurnState {
     }
 
     /// Open `context`'s ingress for the turn that holds its conversation lock.
-    pub(super) fn open_ingress(&self, context: ContextId, turn: TurnId, interrupt: Arc<ContextInterruptState>) {
+    pub(crate) fn open_ingress(&self, context: ContextId, turn: TurnId, interrupt: Arc<ContextInterruptState>) {
         let mut ingress = self.ingress.lock();
         assert!(!ingress.open.contains_key(&context), "one turn at a time holds a context's conversation lock");
         // This turn's hydration folds whatever the last turn answered.
         ingress.answered.remove(&context);
-        ingress.open.insert(context, Ingress { turn, interrupt, pending: None, delivered: Default::default() });
+        ingress.open.insert(context, Ingress { turn, interrupt, pending: Vec::new(), delivered: Default::default() });
     }
 
-    /// Hand submitted input to the context's running turn. Refused when no
-    /// turn is running or the running turn is stopping; the caller then
-    /// starts a turn of its own. Input the last finished turn already
-    /// delivered is accepted, since that turn answered it.
+    /// Hand input to the context's running turn. Refused when no turn is
+    /// running or the running turn is stopping; the caller then handles the
+    /// input as it would for an idle context. Input the last finished turn
+    /// already delivered is accepted, since that turn answered it.
     pub(crate) fn offer_input(&self, context: ContextId, input: LiveInput) -> bool {
         let mut ingress = self.ingress.lock();
         let Some(open) = ingress.open.get_mut(&context) else {
@@ -174,17 +197,17 @@ impl TurnState {
         if open.interrupt.cancel.is_cancelled() || open.interrupt.stop_after_turn.load(Ordering::Relaxed) {
             return false;
         }
-        if !open.delivered.contains(&input.block) {
-            open.pending = Some(input);
+        if !open.delivered.contains(&input.block) && !open.pending.iter().any(|p| p.block == input.block) {
+            open.pending.push(input);
         }
         true
     }
 
-    pub(super) fn pending_input(&self, context: ContextId, turn: TurnId) -> Option<LiveInput> {
+    pub(super) fn pending_inputs(&self, context: ContextId, turn: TurnId) -> Vec<LiveInput> {
         let ingress = self.ingress.lock();
         let open = ingress.open.get(&context).expect("a delivering turn holds its ingress open");
         assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
-        open.pending
+        open.pending.clone()
     }
 
     /// Record that an inference carrying `blocks` completed. Input offered
@@ -194,13 +217,12 @@ impl TurnState {
         let open = ingress.open.get_mut(&context).expect("a delivering turn holds its ingress open");
         assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
         open.delivered.extend(blocks.iter().copied());
-        if open.pending.is_some_and(|input| open.delivered.contains(&input.block)) {
-            open.pending = None;
-        }
+        let delivered = &open.delivered;
+        open.pending.retain(|input| !delivered.contains(&input.block));
     }
 
     /// Close the ingress and return input the turn accepted but never delivered.
-    pub(super) fn close_ingress(&self, context: ContextId, turn: TurnId) -> Option<LiveInput> {
+    pub(crate) fn close_ingress(&self, context: ContextId, turn: TurnId) -> Vec<LiveInput> {
         let mut ingress = self.ingress.lock();
         let open = ingress.open.remove(&context).expect("the turn that opened an ingress closes it");
         assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
@@ -343,7 +365,7 @@ mod ingress_tests {
     use super::*;
 
     fn input(block: BlockId) -> LiveInput {
-        LiveInput { block, principal: PrincipalId::new(), session: SessionId::new() }
+        LiveInput { block, wake: Wake::Submit { principal: PrincipalId::new(), session: SessionId::new() } }
     }
 
     #[test]
@@ -351,17 +373,18 @@ mod ingress_tests {
         let state = TurnState::default();
         let context = ContextId::new();
         let note = input(BlockId::new(context, PrincipalId::new(), 1));
-        assert!(!state.offer_input(context, note), "no turn is running");
+        assert!(!state.offer_input(context, note.clone()), "no turn is running");
 
         let lease = state.begin(context);
         state.open_ingress(context, lease.id(), lease.interrupt());
-        assert!(state.offer_input(context, note));
-        assert_eq!(state.pending_input(context, lease.id()), Some(note));
+        assert!(state.offer_input(context, note.clone()));
+        assert_eq!(state.pending_inputs(context, lease.id()), vec![note.clone()]);
 
         lease.interrupt().soft();
-        assert!(!state.offer_input(context, note), "a stopping turn refuses new input");
-        assert_eq!(state.close_ingress(context, lease.id()), Some(note), "accepted input outlives the refusal");
-        assert!(!state.offer_input(context, note), "a closed ingress refuses input");
+        assert!(!state.offer_input(context, note.clone()), "a stopping turn refuses new input");
+        assert_eq!(state.close_ingress(context, lease.id()), vec![note.clone()], "accepted input outlives the refusal");
+        assert!(!state.offer_input(context, input(BlockId::new(context, PrincipalId::new(), 2))),
+            "a closed ingress refuses input it did not deliver");
     }
 
     #[test]
@@ -372,12 +395,38 @@ mod ingress_tests {
         let (older, newer) = (input(BlockId::new(context, principal, 1)), input(BlockId::new(context, principal, 2)));
         let lease = state.begin(context);
         state.open_ingress(context, lease.id(), lease.interrupt());
-        assert!(state.offer_input(context, older));
-        assert!(state.offer_input(context, newer));
+        assert!(state.offer_input(context, older.clone()));
+        assert!(state.offer_input(context, newer.clone()));
         state.settle_input(context, lease.id(), &[older.block]);
-        assert_eq!(state.pending_input(context, lease.id()), Some(newer));
+        assert_eq!(state.pending_inputs(context, lease.id()), vec![newer.clone()]);
         state.settle_input(context, lease.id(), &[newer.block]);
-        assert_eq!(state.close_ingress(context, lease.id()), None);
+        assert!(state.close_ingress(context, lease.id()).is_empty());
+    }
+
+    /// Each pending input keeps its own wake: a drift arriving after a note
+    /// must not cost the note its follow-up turn.
+    #[test]
+    fn a_later_drift_keeps_an_earlier_submit_pending() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let principal = PrincipalId::new();
+        let note = input(BlockId::new(context, principal, 1));
+        let drift = LiveInput { block: BlockId::new(context, principal, 2), wake: Wake::Drift };
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        assert!(state.offer_input(context, note.clone()));
+        assert!(state.offer_input(context, drift.clone()));
+        assert!(state.offer_input(context, note.clone()), "a repeated offer is accepted once");
+        assert_eq!(state.close_ingress(context, lease.id()), vec![note, drift]);
+    }
+
+    #[test]
+    fn only_submits_and_resumable_completions_continue_a_turn() {
+        let source = super::super::completion_notice::Source::Shell("op".into());
+        assert!(input(BlockId::new(ContextId::new(), PrincipalId::new(), 1)).wake.continues_turn());
+        assert!(Wake::Completion { source: source.clone(), resume_allowed: true }.continues_turn());
+        assert!(!Wake::Completion { source, resume_allowed: false }.continues_turn());
+        assert!(!Wake::Drift.continues_turn());
     }
 
     #[test]
@@ -389,7 +438,7 @@ mod ingress_tests {
         state.open_ingress(context, lease.id(), lease.interrupt());
         state.settle_input(context, lease.id(), &[note.block]);
         assert!(state.offer_input(context, note), "the running turn still accepts it");
-        assert_eq!(state.close_ingress(context, lease.id()), None, "and owes it no further turn");
+        assert!(state.close_ingress(context, lease.id()).is_empty(), "and owes it no further turn");
     }
 
     #[test]
@@ -400,7 +449,7 @@ mod ingress_tests {
         let lease = state.begin(context);
         state.open_ingress(context, lease.id(), lease.interrupt());
         state.settle_input(context, lease.id(), &[note.block]);
-        assert_eq!(state.close_ingress(context, lease.id()), None);
+        assert!(state.close_ingress(context, lease.id()).is_empty());
         assert!(state.offer_input(context, note),
             "the finished turn answered it, so its submit starts no turn of its own");
         drop(lease);
@@ -408,7 +457,7 @@ mod ingress_tests {
         let next = state.begin(context);
         state.open_ingress(context, next.id(), next.interrupt());
         let later = input(BlockId::new(context, PrincipalId::new(), 2));
-        assert_eq!(state.close_ingress(context, next.id()), None);
+        assert!(state.close_ingress(context, next.id()).is_empty());
         assert!(!state.offer_input(context, later), "only answered input is absorbed after a close");
     }
 }

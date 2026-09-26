@@ -192,6 +192,31 @@ pub(crate) async fn deliver(kernel: &Arc<Kernel>, source: &Source, stop: &tokio_
     if !kernel.blocks().contains(notice.context) { kernel.blocks().load_one_from_db(notice.context).map_err(|e| e.to_string())?; }
     let Some((block, notice, message)) = kernel.blocks().insert_completion_notice(notice.context, source).map_err(|e| e.to_string())? else { return Ok(()); };
     kernel.turns().conversations().evict(notice.context);
+    if stop.is_cancelled() { return Ok(()); }
+    // A running turn delivers the notice at its next tool round, or after its
+    // final inference (`docs/conversation-session.md`, "Input during a turn").
+    let live = super::turn_state::LiveInput { block, wake: super::turn_state::Wake::Completion {
+        source: source.clone(), resume_allowed: notice.resume_allowed,
+    } };
+    if kernel.turns().offer_input(notice.context, live) { return Ok(()); }
+    resume(kernel, &notice, block, message, stop).await
+}
+
+/// Run the continuation check for a notice a finished turn accepted but
+/// never delivered.
+pub(crate) async fn resume_after_turn(kernel: &Arc<Kernel>, source: &Source) -> Result<(), String> {
+    let notice = read(&kernel.kernel_db().lock(), source).map_err(|e| e.to_string())?
+        .ok_or("completion notice disappeared")?;
+    let block = notice.block.ok_or("an accepted completion notice has no block")?;
+    let message = notice.message.clone().ok_or("an accepted completion notice has no message")?;
+    resume(kernel, &notice, block, message, &tokio_util::sync::CancellationToken::new()).await
+}
+
+/// Consider a live continuation for a delivered notice.
+async fn resume(
+    kernel: &Arc<Kernel>, notice: &Notice, block: BlockId, message: String,
+    stop: &tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
     if stop.is_cancelled() || !notice.resume_allowed || kernel.turn_in_flight(notice.context) { return Ok(()); }
     let Some(epoch) = notice.epoch else { return Ok(()); };
     let window = kernel.gate_resume_window().await?;
@@ -214,6 +239,34 @@ pub(crate) async fn deliver(kernel: &Arc<Kernel>, source: &Source, stop: &tokio_
 mod tests {
     use super::*;
     use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+
+    /// A completion for a context whose turn is running joins that turn and
+    /// requests no turn of its own (`docs/conversation-session.md`, "Input
+    /// during a turn").
+    #[tokio::test]
+    async fn a_completion_is_offered_to_the_running_turn() {
+        let dispatcher = test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel();
+        let actor = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("completion-live"), None, actor);
+        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
+        let receipt = super::super::tool_command::create_operation(kernel, &call, "never run", None).unwrap();
+        let source = Source::Shell(receipt.operation_id);
+        prepare(&kernel.kernel_db().lock(), &source, "finished while the turn ran").unwrap();
+        let lease = kernel.turns().begin(context);
+        kernel.turns().open_ingress(context, lease.id(), lease.interrupt());
+
+        deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        let notice = read(&kernel.kernel_db().lock(), &source).unwrap().unwrap();
+        let block = notice.block.expect("the notice is in the log");
+        assert_eq!(kernel.turns().active_count(context), 1, "no turn of its own");
+        let pending = kernel.turns().close_ingress(context, lease.id());
+        assert_eq!(pending, vec![crate::runtime::turn_state::LiveInput { block,
+            wake: crate::runtime::turn_state::Wake::Completion { source, resume_allowed: notice.resume_allowed } }]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
 
     #[tokio::test]
     async fn ready_backlog_drains_past_one_scan_without_another_event() {

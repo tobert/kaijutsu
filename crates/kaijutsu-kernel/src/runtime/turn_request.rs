@@ -143,7 +143,8 @@ pub(crate) fn queue_startup(
                 // Offered after the submit lifecycle, so the input's rc
                 // output is already in the log when the running turn reads it.
                 if joins_live_turn && host.turns().offer_input(request.context_id, super::turn_state::LiveInput {
-                    block: request.after_block_id, principal: request.principal_id, session,
+                    block: request.after_block_id,
+                    wake: super::turn_state::Wake::Submit { principal: request.principal_id, session },
                 }) {
                     tracing::info!(context.id = %request.context_id, block.id = %request.after_block_id,
                         "Input joined the running turn");

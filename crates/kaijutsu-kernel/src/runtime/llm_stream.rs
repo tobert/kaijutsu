@@ -197,12 +197,13 @@ fn takes_live_input(interrupt: &ContextInterruptState, turn_lease: &TurnLease) -
         && !turn_lease.owes_timed_delivery()
 }
 
-/// Deliver input submitted while this turn runs (`docs/conversation-session.md`,
+/// Deliver input that arrived while this turn runs (`docs/conversation-session.md`,
 /// "Input during a turn"). Appends the unseen blocks after the turn's write
 /// point as hydration renders them and moves the write point past them so
 /// the turn's next blocks follow. Adds the blocks the next request carries to
-/// `carried`; the loop settles them once that inference completes. Returns
-/// whether any message was added.
+/// `carried`; the loop settles them once that inference completes. At the
+/// final yield (`extends_turn`), only input whose wake continues a turn
+/// triggers delivery. Returns whether any message was added.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_live_input(
     kernel: &Kernel,
@@ -214,17 +215,18 @@ async fn deliver_live_input(
     messages: &mut Vec<LlmMessage>,
     write_point: &mut kaijutsu_types::BlockId,
     carried: &mut Vec<kaijutsu_types::BlockId>,
+    extends_turn: bool,
 ) -> Result<bool, StreamFailure> {
-    let Some(input) = kernel.turns().pending_input(context_id, turn_id) else { return Ok(false) };
+    let pending = kernel.turns().pending_inputs(context_id, turn_id);
+    let wanted = if extends_turn { pending.iter().any(|input| input.wake.continues_turn()) } else { !pending.is_empty() };
+    if !wanted { return Ok(false) }
     let blocks = documents.block_snapshots(context_id)
         .map_err(|error| StreamFailure::LiveInput(error.to_string()))?;
     let tail = mailbox.live_tail(&blocks, write_point).map_err(StreamFailure::LiveInput)?;
-    // Input the turn cannot reach stays pending, and the turn's end starts
-    // the next turn for it.
+    // Input the turn cannot reach stays pending, and the turn's end handles
+    // it by its wake.
     carried.extend(tail.delivered.iter().copied());
-    if mailbox.has_seen(&input.block) {
-        carried.push(input.block);
-    }
+    carried.extend(pending.iter().map(|input| input.block).filter(|block| mailbox.has_seen(block)));
     let Some(last) = tail.delivered.last().copied() else { return Ok(false) };
     *write_point = last;
     let mut delivered = tail.messages;
@@ -236,6 +238,44 @@ async fn deliver_live_input(
         "Delivered input to the running turn");
     messages.extend(delivered);
     Ok(true)
+}
+
+/// Handle input a finished turn accepted but never delivered, by its wake.
+/// The newest submit starts the next turn; a completion notice then runs its
+/// own continuation check, which yields to that turn. A drift waits in the
+/// log. A failure is recorded after the input it concerns.
+async fn wake_undelivered_input(
+    kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
+    undelivered: Vec<super::turn_state::LiveInput>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    use super::turn_state::Wake;
+    let mut failures = Vec::new();
+    let submit = undelivered.iter().rev().find_map(|input| match &input.wake {
+        Wake::Submit { principal, session } => Some((input.block, *principal, *session)),
+        _ => None,
+    });
+    if let Some((block, principal, session)) = submit
+        && let Err(error) = super::prompt::follow_up(kernel, context_id, block, principal, session)
+    {
+        failures.push((block, format!("Input sent during the turn could not start the next turn: {error}")));
+    }
+    for input in &undelivered {
+        if let Wake::Completion { source, .. } = &input.wake
+            && let Err(error) = super::completion_notice::resume_after_turn(kernel, source).await
+        {
+            failures.push((input.block, format!("A completion that arrived during the turn could not resume it: {error}")));
+        }
+    }
+    let mut panicked = None;
+    for (block, error) in failures {
+        tracing::error!(%context_id, %error);
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            insert_pre_stream_error_block(documents, context_id, &block, &error))) {
+            tracing::error!(%context_id, "recording the undelivered-input diagnostic panicked");
+            panicked.get_or_insert(panic);
+        }
+    }
+    panicked
 }
 
 /// Hydrate the live conversation session for one turn.
@@ -1863,10 +1903,11 @@ async fn process_llm_stream(
         _ = interrupt.cancel.cancelled() => None,
         mailbox = session.lock() => Some(mailbox),
     };
-    // Input submitted while this turn runs joins it (`deliver_live_input`).
-    // Input it accepted but never delivered starts the next turn, unless this
-    // turn was stopped: stopping a turn also stops the input it accepted.
-    let mut undelivered = None;
+    // Input that arrives while this turn runs joins it (`deliver_live_input`).
+    // Input it accepted but never delivered is handled by its wake after the
+    // turn, unless this turn was stopped: stopping a turn also stops the
+    // input it accepted.
+    let mut undelivered = Vec::new();
     let outcome = if let Some(mailbox) = mailbox.as_mut() {
         kernel.turns().open_ingress(context_id, turn_id, turn_lease.interrupt());
         let outcome = std::panic::AssertUnwindSafe(run_llm_stream(
@@ -1878,7 +1919,9 @@ async fn process_llm_stream(
         let pending = kernel.turns().close_ingress(context_id, turn_id);
         let stopped = turn_lease.interrupt().cancel.is_cancelled()
             || turn_lease.interrupt().stop_after_turn.load(std::sync::atomic::Ordering::Relaxed);
-        undelivered = pending.filter(|input| outcome.is_ok() && !stopped && !mailbox.has_seen(&input.block));
+        if outcome.is_ok() && !stopped {
+            undelivered = pending.into_iter().filter(|input| !mailbox.has_seen(&input.block)).collect();
+        }
         outcome
     } else {
         Ok(Ok(TurnFlow::Completed {
@@ -1929,16 +1972,8 @@ async fn process_llm_stream(
             }
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
-            if let Some(input) = undelivered
-                && let Err(error) = super::prompt::follow_up(&kernel, context_id, input)
-            {
-                let error = format!("Input sent during the turn could not start the next turn: {error}");
-                tracing::error!(%context_id, %error);
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                    insert_pre_stream_error_block(&documents, context_id, &input.block, &error))) {
-                    tracing::error!(%context_id, "recording the follow-up diagnostic panicked");
-                    cleanup_panic.get_or_insert(panic);
-                }
+            if let Some(panic) = wake_undelivered_input(&kernel, &documents, context_id, undelivered).await {
+                cleanup_panic.get_or_insert(panic);
             }
             if let Some(panic) = cleanup_panic { std::panic::resume_unwind(panic); }
         }
@@ -2918,9 +2953,9 @@ async fn run_llm_stream(
                     "Output ceiling reached and the turn does not continue"
                 );
             }
-            // Input submitted during the final inference earns the turn
-            // another one. A stopping turn, or one a beat waits on, leaves
-            // the input pending, and the turn's end starts the next turn.
+            // Input that arrived during the final inference earns the turn
+            // another one when its wake says so. A stopping turn, or one a
+            // beat waits on, leaves input pending for the turn's end.
             if let Some(assistant) = replayed_assistant(
                 std::mem::take(&mut assistant_reasoning),
                 &assistant_text,
@@ -2929,7 +2964,7 @@ async fn run_llm_stream(
             }
             if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
                 context_id, turn_id, mailbox, conversation_cache.image_cache(), &mut messages,
-                &mut last_block_id, &mut carried_input).await?
+                &mut last_block_id, &mut carried_input, true).await?
             {
                 continue 'agentic;
             }
@@ -3015,12 +3050,12 @@ async fn run_llm_stream(
 
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
-        // Input submitted during this round joins here, after its results:
-        // the next request already extends the cached prefix at this point.
+        // Input that arrived during this round joins here, after its
+        // results: the next request already extends the cached prefix here.
         if takes_live_input(&interrupt, turn_lease) {
             deliver_live_input(&kernel, &documents, context_id, turn_id, mailbox,
                 conversation_cache.image_cache(), &mut messages, &mut last_block_id,
-                &mut carried_input).await?;
+                &mut carried_input, false).await?;
         }
 
         // Each mutation is now journaled via journal_op — no explicit checkpoint needed.
@@ -7812,6 +7847,96 @@ mod lifetime_tests {
         assert!(!sent[1].iter().any(|m| user_text(m) == Some("a note")),
             "a turn a beat waits on takes no input: {:#?}", sent[1]);
         assert_eq!(user_text(sent[2].last().unwrap()), Some("a note"), "{:#?}", sent[2]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+
+    /// Land a drift block at the log tail and offer it to the running turn,
+    /// as `kj drift push` does after its rc lifecycle.
+    fn drift_in(kernel: &Kernel, context: ContextId, text: &str) -> BlockId {
+        let tail = kernel.blocks().last_block_id(context);
+        let block = kernel.blocks().insert_drift_block_as(context, None, tail.as_ref(), text, ContextId::new(),
+            None, kaijutsu_types::DriftKind::Push, Some(PrincipalId::new())).unwrap();
+        assert!(kernel.turns().offer_input(context, crate::runtime::turn_state::LiveInput {
+            block, wake: crate::runtime::turn_state::Wake::Drift }));
+        block
+    }
+
+    fn mentions(request: &[LlmMessage], text: &str) -> bool {
+        request.iter().any(|m| serde_json::to_string(m).unwrap().contains(text))
+    }
+
+    #[tokio::test]
+    async fn a_drift_during_a_tool_round_joins_the_next_request() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        drift_in(&kernel, context, "a sibling's finding");
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(300), completed.recv()).await.is_err());
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(mentions(&sent[1], "a sibling's finding"), "{:#?}", sent[1]);
+        let mut expected = sent[1].clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A drift into an idle context starts no turn, so one that lands during
+    /// the final inference does not extend the turn either; the next turn
+    /// reads it.
+    #[tokio::test]
+    async fn a_drift_during_the_final_inference_does_not_extend_the_turn() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![text_reply("done")])
+            .recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        drift_in(&kernel, context, "a sibling's finding");
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(300), completed.recv()).await.is_err(),
+            "an undelivered drift starts no turn");
+        assert_eq!(sent.lock().len(), 1);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A completion notice whose notice allows an automatic resume earns the
+    /// turn another inference, as it would have woken an idle context.
+    #[tokio::test]
+    async fn a_resumable_completion_during_the_final_inference_continues_the_turn() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![text_reply("waiting on it"), text_reply("ack")])
+            .recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        let tail = kernel.blocks().last_block_id(context);
+        let notice = kernel.blocks().insert_block_as(context, None, tail.as_ref(), Role::User, BlockKind::Text,
+            "Shell operation op-1 completed", Status::Done, ContentType::Plain, Some(PrincipalId::system())).unwrap();
+        assert!(kernel.turns().offer_input(context, crate::runtime::turn_state::LiveInput { block: notice,
+            wake: crate::runtime::turn_state::Wake::Completion {
+                source: crate::runtime::completion_notice::Source::Shell("op-1".into()), resume_allowed: true } }));
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(user_text(sent[1].last().unwrap()), Some("Shell operation op-1 completed"));
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

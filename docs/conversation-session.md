@@ -112,19 +112,29 @@ truncation.
 
 ## Input during a turn
 
-A player's submit while a model turn runs joins that turn; it does not
-queue a turn of its own. The turn holding the context's conversation lock
-opens an ingress (`runtime/turn_state.rs`, `TurnState::offer_input`).
-`prompt::submit` writes the user block, runs the `submit` rc verb, and then
-offers the block. A running turn accepts it unless an interrupt is pending;
-a refused offer starts a turn as before.
+Input that arrives while a model turn runs joins that turn; it does not
+wait for the turn to end. The turn holding the context's conversation lock
+opens an ingress (`runtime/turn_state.rs`, `TurnState::offer_input`). Three
+sources offer their block after it is durable and after their rc lifecycle
+has run, so the lifecycle's output rides with it:
+
+| Source | Offered by | Extends the final inference | If never delivered |
+|---|---|---|---|
+| A player's submit | `prompt::submit` | yes | starts the next turn (`prompt::follow_up`) |
+| A completion notice | `completion_notice::deliver` | when its notice allows an automatic resume | runs the notice's continuation check (`resume_after_turn`) |
+| A drift arrival | `kj drift push` (`deliver_drift`) | no | waits in the log, as a drift into an idle context does |
+
+A running turn accepts input unless an interrupt is pending. A refused
+offer is handled as for an idle context: a submit starts a turn, a
+completion runs its continuation check, a drift waits.
 
 The turn delivers accepted input at two points, never mid-inference:
 
 - **After a tool round**, behind that round's results. The next request
-  already extends the cached prefix there.
+  already extends the cached prefix there. Any pending input triggers it.
 - **After the final inference.** The replayed answer and then the input
-  become the next request, and the turn takes one more inference.
+  become the next request, and the turn takes one more inference. Only
+  input whose source extends the final inference triggers it.
 
 A turn that is stopping, or one a beat waits on, takes no input at either
 point.
@@ -135,25 +145,23 @@ It renders every unseen, hydratable block there as hydration would, then
 moves the write point to the last of them. The turn's next blocks follow
 the input in the log, so a later hydration sends what the turn sent.
 Blocks folded at turn start, and drafts, are skipped. Other writers'
-blocks in that span (the input's rc notification, shell pairs, completion
-notices) ride along, in the position a later hydration gives them.
+blocks in that span ride along, in the position a later hydration gives
+them.
 
 Input counts as delivered once the inference that carried it completes.
-Input the turn accepted but never delivered starts the next turn when the
-turn ends (`prompt::follow_up`): for example, when the inference carrying
-it failed, when a beat waited on the turn, or when its block sits before
-the write point. Stopping a turn also stops the input it accepted, as
-interrupting a queued turn always did. The block stays in the log for the
-next turn either way. A turn's ingress remembers what it delivered after it
-closes, so a submit whose offer arrives late starts no second turn.
+Each undelivered input keeps its own entry, so a drift arriving after a
+note cannot cost the note its next turn. When the turn ends, undelivered
+input is handled by its source's rule in the table: for example, when the
+inference carrying it failed, when a beat waited on the turn, or when its
+block sits before the write point. Stopping a turn also stops the input it
+accepted, as interrupting a queued turn always did. The block stays in the
+log for the next turn either way. A turn's ingress remembers what it
+delivered after it closes, so an offer that arrives late starts no second
+turn.
 
 An unsent draft is never marked seen by the mailbox. Submitting promotes
 the draft's own block id, so a draft that was open when a turn hydrated is
 still delivered after it is sent.
-
-Only submits offer input today. Drift arrivals and completion notices
-reach a running turn only when a submit's delivery carries them; see
-`docs/issues.md`, "Input during a turn: what is still open".
 
 ## Before the session change
 
