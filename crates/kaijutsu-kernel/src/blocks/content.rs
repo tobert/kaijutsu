@@ -62,46 +62,33 @@ pub fn base62_encode_padded(value: i64, width: usize) -> String {
 ///
 /// Empty string `""` sorts before everything. Both `a` and `b` must satisfy `a < b`
 /// lexicographically. The result is guaranteed to satisfy `a < result < b`.
+///
+/// Once the result's prefix sorts below `b`, `b` bounds nothing further: the
+/// walk continues along `a` against an open upper bound until a digit leaves
+/// room, so the result never stops at a prefix of `a`.
 pub(crate) fn order_midpoint(a: &str, b: &str) -> String {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let max_len = a_bytes.len().max(b_bytes.len());
-
+    if a >= b {
+        // Stored keys can already tie (`block_ids_ordered` breaks ties by
+        // `BlockId`). There is no key between them; sort after `a`, as this
+        // function always has for that input, and say so.
+        tracing::error!(a, b, "order_midpoint called without a < b; appending after a");
+    }
+    let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut result = Vec::new();
-
-    for i in 0..=max_len {
-        let a_val = if i < a_bytes.len() {
-            base62_index(a_bytes[i])
-        } else {
-            0
-        };
-        let b_val = if i < b_bytes.len() {
-            base62_index(b_bytes[i])
-        } else {
-            62
-        };
-
+    let mut below_b = false;
+    for i in 0.. {
+        let a_val = a.get(i).map_or(0, |&c| base62_index(c));
+        let b_val = if below_b { 62 } else { b.get(i).map_or(62, |&c| base62_index(c)) };
         if a_val + 1 < b_val {
-            let mid = (a_val + b_val) / 2;
-            result.push(BASE62[mid]);
-            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
-        } else if a_val == b_val {
-            result.push(BASE62[a_val]);
-        } else {
-            result.push(BASE62[a_val]);
-            let a_next = if i + 1 < a_bytes.len() {
-                base62_index(a_bytes[i + 1])
-            } else {
-                0
-            };
-            let mid = (a_next + 62) / 2;
-            result.push(BASE62[mid]);
-            return String::from_utf8(result).unwrap_or_else(|_| "V".to_string());
+            result.push(BASE62[(a_val + b_val) / 2]);
+            break;
+        }
+        result.push(BASE62[a_val]);
+        if a_val < b_val {
+            below_b = true;
         }
     }
-
-    result.push(BASE62[31]); // 'V'
-    String::from_utf8(result).unwrap_or_else(|_| "V".to_string())
+    String::from_utf8(result).expect("base62 chars are valid utf8")
 }
 
 /// Decode a fixed-width base-62 string to i64. `None` if the string is empty,
@@ -862,6 +849,36 @@ mod successor_tests {
         let succ = order_key_successor(&pred, "0000");
         let expected = format!("V{}{}", base62_encode_padded(8, 11), "0000");
         assert_eq!(succ, expected);
+    }
+
+    /// The pair that ordered a tool result before its call: `a`'s digit is
+    /// one below `b`'s and the next digit of `a` is already `z`.
+    #[test]
+    fn midpoint_stays_above_a_when_the_next_digit_of_a_is_the_last() {
+        let (a, b) = ("V00000000001zzdUL", "V00000000002zJXG");
+        let mid = order_midpoint(a, b);
+        assert!(a < mid.as_str() && mid.as_str() < b, "{a} < {mid} < {b}");
+    }
+
+    #[test]
+    fn midpoint_lies_strictly_between_for_generated_keys() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17; *state
+        }
+        fn key(state: &mut u64) -> String {
+            let len = 1 + (next(state) % 8) as usize;
+            (0..len).map(|_| BASE62[(next(state) % 62) as usize] as char).collect()
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let (x, y) = (key(&mut state), key(&mut state));
+            let (a, b) = if x < y { (x, y) } else if y < x { (y, x) } else { continue };
+            let mid = order_midpoint(&a, &b);
+            assert!(a < mid && mid < b, "{a} < {mid} < {b}");
+            // Repeated insertion between neighbors keeps ordering too.
+            let inner = order_midpoint(&a, &mid);
+            assert!(a < inner && inner < mid, "{a} < {inner} < {mid}");
+        }
     }
 
     #[test]

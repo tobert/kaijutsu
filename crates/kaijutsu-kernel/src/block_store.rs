@@ -4907,6 +4907,34 @@ mod tests {
     use std::sync::Arc;
 
     /// Helper to create a BlockStore with FlowBus for testing.
+    /// A tool result anchored after its call stays after it when input
+    /// already sits at the log tail: the running turn wrote the call between
+    /// its anchor and that input. Principals are fresh each round because
+    /// order-key ties fall back to principal-major `BlockId` order.
+    #[test]
+    fn a_result_stays_after_its_call_when_input_holds_the_tail() {
+        for round in 0..200 {
+            let (store, _bus) = store_with_flows();
+            let ctx = ContextId::new();
+            store.create_document(ctx, DocumentKind::Conversation, None).unwrap();
+            let (player, performer) = (PrincipalId::new(), PrincipalId::new());
+            let text = |after: Option<&BlockId>, body: &str| store.insert_block_as(ctx, None, after,
+                Role::User, BlockKind::Text, body, Status::Done, ContentType::Plain, Some(player)).unwrap();
+            let answer = text(None, "answer");
+            let go = text(Some(&answer), "go");
+            let _note = text(store.last_block_id(ctx).as_ref(), "a note");
+            let call = store.insert_tool_call_as(ctx, None, Some(&go), "tool", serde_json::json!({}),
+                None, Some(performer), Some("call".into()), None).unwrap();
+            let result = store.insert_tool_result_as(ctx, &call, Some(&call), "", Status::Running,
+                None, None, Some(PrincipalId::system()), Some("call".into())).unwrap();
+            let order: Vec<_> = store.block_snapshots(ctx).unwrap().iter().map(|b| b.id).collect();
+            let at = |id: &BlockId| order.iter().position(|o| o == id).unwrap();
+            assert!(at(&go) < at(&call) && at(&call) < at(&result),
+                "round {round}: {:?}", store.block_snapshots(ctx).unwrap().iter()
+                    .map(|b| (b.content.clone(), b.order_key.clone())).collect::<Vec<_>>());
+        }
+    }
+
     fn store_with_flows() -> (BlockStore, SharedBlockFlowBus) {
         let bus: SharedBlockFlowBus = Arc::new(FlowBus::new(256));
         let store = BlockStore::with_flows(test_agent(), bus.clone());
