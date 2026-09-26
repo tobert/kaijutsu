@@ -8,11 +8,16 @@
 #
 # Usage: contrib/bench/build-static.sh
 # Reads the worktree from WORKTREE (default: this script's repo root).
+# PODMAN_RUN_ARGS adds flags to the build container, e.g. resource caps:
+#   PODMAN_RUN_ARGS="--memory=16g --memory-swap=16g --cpus=8"
+# A rootless container runs outside the caller's cgroup, so a systemd-run
+# scope around this script does not cap the build.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${WORKTREE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORK_ROOT="${WORK_ROOT:-/home/atobey/src/bench-work/dist}"
+read -r -a EXTRA_RUN_ARGS <<< "${PODMAN_RUN_ARGS:-}"
 
 CARGO_HOME_DIR="${WORK_ROOT}/cargo-home"
 TARGET_DIR="${WORK_ROOT}/target"
@@ -55,7 +60,7 @@ echo "    CARGO_TARGET_DIR:${TARGET_DIR}"
 # runtime-stage `apk add ... libgcc libstdc++`, which this build avoids
 # needing).
 STATIC_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
-time podman run --rm \
+time podman run --rm "${EXTRA_RUN_ARGS[@]}" \
     -v "${WORKTREE}:/src:ro" \
     -v "${CARGO_HOME_DIR}:/cargo-home" \
     -v "${TARGET_DIR}:/target" \
