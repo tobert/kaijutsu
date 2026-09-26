@@ -36,6 +36,8 @@ enum StreamFailure {
     Persistence(#[from] crate::block_store::BlockStoreError),
     #[error("Invalid provider stream: {0}")]
     Protocol(String),
+    #[error("Could not deliver input to the running turn: {0}")]
+    LiveInput(String),
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +186,56 @@ fn warn_if_near_context_window(
     ) {
         tracing::warn!("Failed to insert context-size warning Trace block: {e}");
     }
+}
+
+/// Whether this turn takes input submitted while it runs. A stopping turn
+/// does not, nor does one a beat waits on: its caller budgeted one piece of
+/// work, and the input starts the next turn instead.
+fn takes_live_input(interrupt: &ContextInterruptState, turn_lease: &TurnLease) -> bool {
+    !interrupt.cancel.is_cancelled()
+        && !interrupt.stop_after_turn.load(std::sync::atomic::Ordering::Relaxed)
+        && !turn_lease.owes_timed_delivery()
+}
+
+/// Deliver input submitted while this turn runs (`docs/conversation-session.md`,
+/// "Input during a turn"). Appends the unseen blocks after the turn's write
+/// point as hydration renders them and moves the write point past them so
+/// the turn's next blocks follow. Adds the blocks the next request carries to
+/// `carried`; the loop settles them once that inference completes. Returns
+/// whether any message was added.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_live_input(
+    kernel: &Kernel,
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    turn_id: kaijutsu_types::TurnId,
+    mailbox: &crate::ConversationMailbox,
+    image_cache: &crate::llm::image_cache::ImageBase64Cache,
+    messages: &mut Vec<LlmMessage>,
+    write_point: &mut kaijutsu_types::BlockId,
+    carried: &mut Vec<kaijutsu_types::BlockId>,
+) -> Result<bool, StreamFailure> {
+    let Some(input) = kernel.turns().pending_input(context_id, turn_id) else { return Ok(false) };
+    let blocks = documents.block_snapshots(context_id)
+        .map_err(|error| StreamFailure::LiveInput(error.to_string()))?;
+    let tail = mailbox.live_tail(&blocks, write_point).map_err(StreamFailure::LiveInput)?;
+    // Input the turn cannot reach stays pending, and the turn's end starts
+    // the next turn for it.
+    carried.extend(tail.delivered.iter().copied());
+    if mailbox.has_seen(&input.block) {
+        carried.push(input.block);
+    }
+    let Some(last) = tail.delivered.last().copied() else { return Ok(false) };
+    *write_point = last;
+    let mut delivered = tail.messages;
+    if delivered.is_empty() {
+        return Ok(false);
+    }
+    crate::resolve_image_blocks_from_cas(&mut delivered, kernel.cas().clone(), Some(image_cache)).await;
+    tracing::info!(%context_id, blocks = tail.delivered.len(), messages = delivered.len(),
+        "Delivered input to the running turn");
+    messages.extend(delivered);
+    Ok(true)
 }
 
 /// Hydrate the live conversation session for one turn.
@@ -756,8 +808,9 @@ fn replayable_reasoning(
         .collect()
 }
 
-/// The assistant message replayed for an output-ceiling continuation, or
-/// `None` when the truncated response cannot stand as one.
+/// The assistant message replayed when a turn continues after a response
+/// with no tool call (an output-ceiling continuation, or input delivered after
+/// the final inference), or `None` when the response cannot stand as one.
 ///
 /// A replayed assistant message needs text. Reasoning alone is not an
 /// assistant turn — the API requires accompanying text or a tool call, and
@@ -766,7 +819,7 @@ fn replayable_reasoning(
 /// The notice then follows the previous message instead. The shape matches
 /// `flush_assistant` too: plain text when no reasoning survives, blocks
 /// otherwise.
-fn ceiling_continuation_assistant(
+fn replayed_assistant(
     reasoning: Vec<(String, Option<String>)>,
     text: &str,
 ) -> Option<LlmMessage> {
@@ -861,7 +914,7 @@ mod continuation_replay_tests {
     /// Text alone replays as the model wrote it.
     #[test]
     fn text_only_replays_as_an_assistant_message() {
-        let message = ceiling_continuation_assistant(Vec::new(), "half a plan")
+        let message = replayed_assistant(Vec::new(), "half a plan")
             .expect("text can stand as an assistant message");
         assert_eq!(message.as_text(), Some("half a plan"));
     }
@@ -869,7 +922,7 @@ mod continuation_replay_tests {
     /// Signed reasoning rides with the text it belongs to.
     #[test]
     fn signed_reasoning_rides_with_text() {
-        let message = ceiling_continuation_assistant(vec![signed("thinking")], "half a plan")
+        let message = replayed_assistant(vec![signed("thinking")], "half a plan")
             .expect("text can stand as an assistant message");
         let blocks = blocks(&message);
         assert!(
@@ -889,21 +942,21 @@ mod continuation_replay_tests {
     /// the provider something the next hydration could never reproduce.
     #[test]
     fn reasoning_without_text_replays_nothing() {
-        assert!(ceiling_continuation_assistant(vec![signed("thinking")], "").is_none());
+        assert!(replayed_assistant(vec![signed("thinking")], "").is_none());
     }
 
     /// Unsigned reasoning is dropped, so it cannot carry an otherwise empty
     /// message either.
     #[test]
     fn unsigned_reasoning_without_text_replays_nothing() {
-        assert!(ceiling_continuation_assistant(vec![("thinking".into(), None)], "").is_none());
+        assert!(replayed_assistant(vec![("thinking".into(), None)], "").is_none());
     }
 
     /// Nothing arrived before the ceiling: no message at all. An assistant
     /// message with empty content is refused by the providers.
     #[test]
     fn an_empty_response_replays_nothing() {
-        assert!(ceiling_continuation_assistant(Vec::new(), "").is_none());
+        assert!(replayed_assistant(Vec::new(), "").is_none());
     }
 
     /// A signed but empty thinking block is skipped by the message builder
@@ -911,13 +964,13 @@ mod continuation_replay_tests {
     /// assistant message with no content blocks at all.
     #[test]
     fn signed_but_empty_reasoning_replays_nothing() {
-        assert!(ceiling_continuation_assistant(vec![signed("")], "").is_none());
+        assert!(replayed_assistant(vec![signed("")], "").is_none());
     }
 
     /// Whitespace is not text: it cannot carry a message either.
     #[test]
     fn whitespace_only_text_replays_nothing() {
-        assert!(ceiling_continuation_assistant(vec![signed("thinking")], "  \n").is_none());
+        assert!(replayed_assistant(vec![signed("thinking")], "  \n").is_none());
     }
 }
 
@@ -1803,13 +1856,23 @@ async fn process_llm_stream(
         _ = interrupt.cancel.cancelled() => None,
         mailbox = session.lock() => Some(mailbox),
     };
+    // Input submitted while this turn runs joins it (`deliver_live_input`).
+    // Input it accepted but never delivered starts the next turn, unless this
+    // turn was stopped: stopping a turn also stops the input it accepted.
+    let mut undelivered = None;
     let outcome = if let Some(mailbox) = mailbox.as_mut() {
-        std::panic::AssertUnwindSafe(run_llm_stream(
+        kernel.turns().open_ingress(context_id, turn_id, turn_lease.interrupt());
+        let outcome = std::panic::AssertUnwindSafe(run_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, slot_tunables,
             conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
-            continuation_epoch, mailbox, &turn_lease,
-        )).catch_unwind().await
+            continuation_epoch, &mut *mailbox, &turn_lease,
+        )).catch_unwind().await;
+        let pending = kernel.turns().close_ingress(context_id, turn_id);
+        let stopped = turn_lease.interrupt().cancel.is_cancelled()
+            || turn_lease.interrupt().stop_after_turn.load(std::sync::atomic::Ordering::Relaxed);
+        undelivered = pending.filter(|input| outcome.is_ok() && !stopped && !mailbox.has_seen(&input.block));
+        outcome
     } else {
         Ok(Ok(TurnFlow::Completed {
             turn_id, context_id, principal_id: user_principal_id, output_block_id: None,
@@ -1859,6 +1922,17 @@ async fn process_llm_stream(
             }
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
+            if let Some(input) = undelivered
+                && let Err(error) = super::prompt::follow_up(&kernel, context_id, input)
+            {
+                let error = format!("Input sent during the turn could not start the next turn: {error}");
+                tracing::error!(%context_id, %error);
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    insert_pre_stream_error_block(&documents, context_id, &input.block, &error))) {
+                    tracing::error!(%context_id, "recording the follow-up diagnostic panicked");
+                    cleanup_panic.get_or_insert(panic);
+                }
+            }
             if let Some(panic) = cleanup_panic { std::panic::resume_unwind(panic); }
         }
         Err(panic) => {
@@ -2073,6 +2147,9 @@ async fn run_llm_stream(
     // early with `TurnFlow::Failed` and never reaches the tail, so a turn
     // publishes exactly one terminal event either way.
     let mut stop_reason_out = TurnStopReason::EndTurn;
+    // Input blocks the next request carries, settled once that inference
+    // completes; a failed or cancelled inference leaves them pending.
+    let mut carried_input: Vec<kaijutsu_types::BlockId> = Vec::new();
 
     // Continue until the model ends its turn or the turn is cancelled. There
     // is no per-turn bound on tool rounds; see docs/issues.md, "Per-cast turn
@@ -2737,6 +2814,9 @@ async fn run_llm_stream(
             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
             break;
         }
+        if !carried_input.is_empty() {
+            kernel.turns().settle_input(context_id, turn_id, &std::mem::take(&mut carried_input));
+        }
 
         // Check if we need to execute tools.
         // rig doesn't expose stop_reason through FinalCompletionResponse — its own
@@ -2774,7 +2854,7 @@ async fn run_llm_stream(
             if stop.continues() {
                 ceiling_continuations += 1;
                 // Replay what arrived so the model can continue from it.
-                if let Some(assistant) = ceiling_continuation_assistant(
+                if let Some(assistant) = replayed_assistant(
                     std::mem::take(&mut assistant_reasoning),
                     &assistant_text,
                 ) {
@@ -2831,9 +2911,20 @@ async fn run_llm_stream(
                     "Output ceiling reached and the turn does not continue"
                 );
             }
-            // Add final assistant message to history before saving
-            if !assistant_text.is_empty() {
-                messages.push(LlmMessage::assistant(&assistant_text));
+            // Input submitted during the final inference earns the turn
+            // another one. A stopping turn, or one a beat waits on, leaves
+            // the input pending, and the turn's end starts the next turn.
+            if let Some(assistant) = replayed_assistant(
+                std::mem::take(&mut assistant_reasoning),
+                &assistant_text,
+            ) {
+                messages.push(assistant);
+            }
+            if takes_live_input(&interrupt, turn_lease) && deliver_live_input(&kernel, &documents,
+                context_id, turn_id, mailbox, conversation_cache.image_cache(), &mut messages,
+                &mut last_block_id, &mut carried_input).await?
+            {
+                continue 'agentic;
             }
             tracing::debug!("Agentic loop complete - no tool calls this iteration");
             break;
@@ -2917,6 +3008,13 @@ async fn run_llm_stream(
 
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
+        // Input submitted during this round joins here, after its results:
+        // the next request already extends the cached prefix at this point.
+        if takes_live_input(&interrupt, turn_lease) {
+            deliver_live_input(&kernel, &documents, context_id, turn_id, mailbox,
+                conversation_cache.image_cache(), &mut messages, &mut last_block_id,
+                &mut carried_input).await?;
+        }
 
         // Each mutation is now journaled via journal_op — no explicit checkpoint needed.
 
@@ -6297,7 +6395,7 @@ mod lifetime_tests {
                 principal_id: user_principal_id, model: model.map(str::to_owned),
                 continuation_epoch, score: None,
             },
-            origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None,
+            origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None, joins_live_turn: false,
         }, None, slot)?.await.map_err(|_| "turn preparation stopped before replying".to_string())?
     }
 
@@ -7483,6 +7581,246 @@ mod lifetime_tests {
             !blocks.iter().any(|b| b.content.contains("Maximum tool iterations") || b.content.contains("Paused after")),
             "no halt-message block should be written when the loop has no cap"
         );
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    // Input submitted while a turn runs joins that turn at its next safe
+    // point: after a tool round's results, or after its final inference.
+    // docs/conversation-session.md, "Input during a turn".
+
+    async fn submit_text(kernel: &Arc<Kernel>, context: ContextId, principal: PrincipalId, text: &str) -> BlockId {
+        crate::runtime::prompt::submit(kernel, context, principal, SessionId::new(),
+            crate::runtime::prompt::PromptSource::Text { content: text.into(), model: None }).await.unwrap()
+    }
+
+    fn done(stop: &str) -> StreamEvent {
+        StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: Some(1), output_tokens: Some(1), extra: None }
+    }
+
+    fn text_reply(text: &str) -> Vec<StreamEvent> {
+        vec![StreamEvent::TextStart, StreamEvent::TextDelta(text.into()), StreamEvent::TextEnd, done("end_turn")]
+    }
+
+    fn wire(messages: &[LlmMessage]) -> serde_json::Value {
+        serde_json::to_value(messages).unwrap()
+    }
+
+    /// `wire` with tool-result bodies blanked. Hydration folds a result's
+    /// Error child into its text, which the live turn never sends
+    /// (docs/issues.md, "A rehydrated tool error differs from the live one").
+    fn wire_shape(messages: &[LlmMessage]) -> serde_json::Value {
+        let mut wire = wire(messages);
+        for message in wire.as_array_mut().unwrap() {
+            let Some(blocks) = message.pointer_mut("/content/Blocks").and_then(|b| b.as_array_mut()) else { continue };
+            for block in blocks {
+                if let Some(content) = block.pointer_mut("/ToolResult/content") {
+                    *content = serde_json::Value::Null;
+                }
+            }
+        }
+        wire
+    }
+
+    /// What a fresh hydration of the whole log would send.
+    fn rehydrated(kernel: &Kernel, context: ContextId) -> Vec<LlmMessage> {
+        let mut mailbox = crate::ConversationMailbox::new();
+        mailbox.catch_up(&kernel.blocks().block_snapshots(context).unwrap());
+        mailbox.snapshot()
+    }
+
+    fn user_text(message: &LlmMessage) -> Option<&str> {
+        match (&message.role, &message.content) {
+            (crate::llm::Role::User, crate::llm::MessageContent::Text(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_sent_during_a_tool_round_joins_the_next_request() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed { reason: TurnStopReason::EndTurn, .. }), "{event:?}");
+        assert!(tokio::time::timeout(Duration::from_millis(300), completed.recv()).await.is_err(),
+            "a note the live turn accepted must not queue a turn of its own");
+        assert!(!kernel.turn_in_flight(context));
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2, "one tool round, then one inference that carries the note");
+        let request = &sent[1];
+        assert_eq!(user_text(request.last().unwrap()), Some("a note"), "{request:#?}");
+        assert!(matches!(&request[request.len() - 2].content, crate::llm::MessageContent::Blocks(blocks)
+            if matches!(blocks.first(), Some(crate::llm::ContentBlock::ToolResult { .. }))),
+            "the note follows the tool round's results: {request:#?}");
+
+        // The durable log hydrates to the same wire the turn sent.
+        let mut expected = request.clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_eq!(wire_shape(&rehydrated(&kernel, context)), wire_shape(&expected));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_sent_during_the_final_inference_continues_the_turn() {
+        let mut first = vec![StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta("mulling".into()),
+            StreamEvent::ThinkingEnd { signature: Some("sig".into()) }];
+        first.extend(text_reply("working"));
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![first, text_reply("ack")])
+            .recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        let TurnFlow::Completed { reason: TurnStopReason::EndTurn, output_block_id: Some(output), .. } = event.payload else {
+            panic!("expected a completed turn with output, got {event:?}");
+        };
+        let output = kernel.blocks().get_block_snapshot(context, &output).unwrap().unwrap();
+        assert_eq!(output.content, "ack", "the turn's output is its final say, after the note");
+        assert!(tokio::time::timeout(Duration::from_millis(300), completed.recv()).await.is_err(),
+            "a note the live turn accepted must not queue a turn of its own");
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2, "the note earns the turn one more inference");
+        let request = &sent[1];
+        assert_eq!(user_text(request.last().unwrap()), Some("a note"), "{request:#?}");
+        let mut expected = request.clone();
+        expected.push(LlmMessage::assistant("ack"));
+        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected),
+            "the replayed answer keeps its signed reasoning, as hydration does");
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_accepted_by_a_failing_turn_gets_a_turn_of_its_own() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::Error("provider fell over".into())],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await
+            .expect("the undelivered note must start the next turn").unwrap();
+        assert!(matches!(event.payload, TurnFlow::Completed { reason: TurnStopReason::EndTurn, .. }), "{event:?}");
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(user_text(sent[1].last().unwrap()), Some("a note"), "{:#?}", sent[1]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_note_sent_after_a_soft_interrupt_gets_a_turn_of_its_own() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        assert!(kernel.turns().interrupt(context, false));
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(matches!(first.payload, TurnFlow::Completed { reason: TurnStopReason::Cancelled { immediate: false }, .. }),
+            "{first:?}");
+        let second = tokio::time::timeout(Duration::from_secs(5), completed.recv()).await
+            .expect("a stopping turn refuses the note, which starts its own turn").unwrap();
+        assert!(matches!(second.payload, TurnFlow::Completed { reason: TurnStopReason::EndTurn, .. }), "{second:?}");
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(user_text(sent[1].last().unwrap()), Some("a note"), "{:#?}", sent[1]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+
+    #[tokio::test]
+    async fn a_note_whose_inference_fails_gets_a_turn_of_its_own() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            vec![StreamEvent::Error("provider fell over".into())],
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let mut failed = kernel.turn_flows().subscribe("turn.failed");
+        submit_text(&kernel, context, call.principal_id, "go").await;
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await
+            .expect("the request that carried the note failed, so the note starts the next turn").unwrap();
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(user_text(sent[1].last().unwrap()), Some("a note"), "{:#?}", sent[1]);
+        assert!(sent[2].iter().any(|m| user_text(m) == Some("a note")), "{:#?}", sent[2]);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_timed_turn_leaves_a_note_for_the_next_turn() {
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        use kaijutsu_hyoushigi::{Fallback, TickClock};
+        use kaijutsu_types::{Tick, TrackId};
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "call_1".into(), name: "nonexistent_tool".into(),
+                input: serde_json::json!({}) }, done("tool_use")],
+            text_reply("X:1\nK:C\nCDEF|\n"),
+            text_reply("ack"),
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let track = TrackId::new("timed-note").unwrap();
+        let _timeline = kernel.arm_track_timeline(track.clone(), TickClock::default(), Tick::ZERO);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let TurnAdmission::Accepted { .. } = kernel.request_turn(TurnRequest {
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+            score: Some(crate::hyoushigi::model::ScoreIntent { track, start: Tick::new(10), fallback: Fallback::Skip }),
+        }).unwrap() else { panic!("score admission must be accepted") };
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await.unwrap();
+        submit_text(&kernel, context, call.principal_id, "a note").await;
+        hold.release.notify_one();
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), completed.recv()).await
+                .expect("the timed turn and then the note's turn").unwrap();
+        }
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 3);
+        assert!(!sent[1].iter().any(|m| user_text(m) == Some("a note")),
+            "a turn a beat waits on takes no input: {:#?}", sent[1]);
+        assert_eq!(user_text(sent[2].last().unwrap()), Some("a note"), "{:#?}", sent[2]);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

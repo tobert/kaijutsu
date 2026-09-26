@@ -71,7 +71,7 @@ impl Kernel {
         let (release, ready) = tokio::sync::oneshot::channel();
         let admitted = queue_startup(self, StartupRequest {
             admission, lease, request: accepted, origin: TurnOrigin::Autonomous,
-            tool_ctx: None, session: SessionId::new(), submit: None,
+            tool_ctx: None, session: SessionId::new(), submit: None, joins_live_turn: false,
         }, Some(ready), slot);
         if let Err(error) = admitted {
             if let Some((id, timeline)) = score { timeline.lock().cancel(id); }
@@ -99,6 +99,9 @@ pub(crate) struct StartupRequest {
     pub tool_ctx: Option<ExecContext>,
     pub session: SessionId,
     pub submit: Option<(crate::rc::SubmitInfo, crate::KjCaller)>,
+    /// Submitted input, which joins the context's running turn when that
+    /// turn accepts it (`TurnState::offer_input`) instead of starting one.
+    pub joins_live_turn: bool,
 }
 
 pub(crate) fn queue_startup(
@@ -110,7 +113,7 @@ pub(crate) fn queue_startup(
     let host = kernel.clone();
     let span = tracing::Span::current();
     slot.spawn(move |stop| async move {
-        let StartupRequest { admission, lease, request, origin, tool_ctx, session, submit } = accepted;
+        let StartupRequest { admission, lease, request, origin, tool_ctx, session, submit, joins_live_turn } = accepted;
         let turn_id = lease.id();
         let interrupt = lease.interrupt();
         let cancel = interrupt.cancel.clone();
@@ -136,6 +139,15 @@ pub(crate) fn queue_startup(
                         vars: info.vars(),
                         ..crate::rc::RcInvocation::new(crate::rc::VERB_SUBMIT, &admission, &cancel)
                     }, &caller).await.map_err(|error| format!("rc submit lifecycle: {error}"))?;
+                }
+                // Offered after the submit lifecycle, so the input's rc
+                // output is already in the log when the running turn reads it.
+                if joins_live_turn && host.turns().offer_input(request.context_id, super::turn_state::LiveInput {
+                    block: request.after_block_id, principal: request.principal_id, session,
+                }) {
+                    tracing::info!(context.id = %request.context_id, block.id = %request.after_block_id,
+                        "Input joined the running turn");
+                    return Ok(());
                 }
                 let tool_ctx = match tool_ctx {
                     Some(context) => context,
@@ -307,6 +319,7 @@ mod tests {
             origin: TurnOrigin::Interactive, tool_ctx: None, session: caller.session_id,
             submit: Some((crate::rc::SubmitInfo { input_block: input, edge_block: None,
                 edge_shown: None, log_tail: None, turn_live: false }, caller)),
+            joins_live_turn: false,
         }, None, slot).unwrap().await.unwrap();
         kernel.kernel_db().lock().conn_for_ledger().authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
 

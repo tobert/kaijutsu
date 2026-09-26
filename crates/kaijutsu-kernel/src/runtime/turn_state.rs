@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use kaijutsu_types::{ContextId, TurnId};
+use kaijutsu_types::{BlockId, ContextId, PrincipalId, SessionId, TurnId};
 use crate::ConversationMailbox;
 use super::interrupt::ContextInterruptState;
 
@@ -13,6 +13,29 @@ struct ActiveTurn {
 }
 
 type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<TurnId, ActiveTurn>>;
+
+/// Input submitted while a turn runs, which that turn has not yet delivered
+/// to its model. The block is already durable; this names who sent it and
+/// where it sits, so a turn that cannot deliver it can start the next turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveInput {
+    pub block: BlockId,
+    pub principal: PrincipalId,
+    pub session: SessionId,
+}
+
+/// The running turn's door for new input. The turn holding a context's
+/// conversation lock opens it and closes it before releasing the lock.
+struct Ingress {
+    turn: TurnId,
+    interrupt: Arc<ContextInterruptState>,
+    /// The newest undelivered input. Delivery reads the whole unseen log
+    /// tail, so older input sits before it and needs no entry of its own.
+    pending: Option<LiveInput>,
+    /// Blocks carried by an inference that completed. Delivery reads the
+    /// log, so input can reach the model before its submit offers it.
+    delivered: std::collections::HashSet<BlockId>,
+}
 
 /// Owns one admitted turn's liveness and interrupt registration.
 /// Dropping one lease cannot clear another turn in the same context.
@@ -68,6 +91,15 @@ impl Drop for TurnLease {
 pub struct TurnState {
     conversations: Arc<ConversationCache>,
     active: Arc<parking_lot::Mutex<ActiveTurns>>,
+    ingress: parking_lot::Mutex<Ingresses>,
+}
+
+#[derive(Default)]
+struct Ingresses {
+    open: HashMap<ContextId, Ingress>,
+    /// Blocks the context's last finished turn delivered. A submit's offer
+    /// can arrive after the turn that delivered its block has closed.
+    answered: HashMap<ContextId, std::collections::HashSet<BlockId>>,
 }
 
 impl Default for TurnState {
@@ -75,6 +107,7 @@ impl Default for TurnState {
         Self {
             conversations: Arc::new(ConversationCache::new(64)),
             active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            ingress: parking_lot::Mutex::new(Ingresses::default()),
         }
     }
 }
@@ -118,6 +151,61 @@ impl TurnState {
             if immediate { turn.interrupt.hard(); } else { turn.interrupt.soft(); }
         }
         true
+    }
+
+    /// Open `context`'s ingress for the turn that holds its conversation lock.
+    pub(super) fn open_ingress(&self, context: ContextId, turn: TurnId, interrupt: Arc<ContextInterruptState>) {
+        let mut ingress = self.ingress.lock();
+        assert!(!ingress.open.contains_key(&context), "one turn at a time holds a context's conversation lock");
+        // This turn's hydration folds whatever the last turn answered.
+        ingress.answered.remove(&context);
+        ingress.open.insert(context, Ingress { turn, interrupt, pending: None, delivered: Default::default() });
+    }
+
+    /// Hand submitted input to the context's running turn. Refused when no
+    /// turn is running or the running turn is stopping; the caller then
+    /// starts a turn of its own. Input the last finished turn already
+    /// delivered is accepted, since that turn answered it.
+    pub(crate) fn offer_input(&self, context: ContextId, input: LiveInput) -> bool {
+        let mut ingress = self.ingress.lock();
+        let Some(open) = ingress.open.get_mut(&context) else {
+            return ingress.answered.get(&context).is_some_and(|answered| answered.contains(&input.block));
+        };
+        if open.interrupt.cancel.is_cancelled() || open.interrupt.stop_after_turn.load(Ordering::Relaxed) {
+            return false;
+        }
+        if !open.delivered.contains(&input.block) {
+            open.pending = Some(input);
+        }
+        true
+    }
+
+    pub(super) fn pending_input(&self, context: ContextId, turn: TurnId) -> Option<LiveInput> {
+        let ingress = self.ingress.lock();
+        let open = ingress.open.get(&context).expect("a delivering turn holds its ingress open");
+        assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
+        open.pending
+    }
+
+    /// Record that an inference carrying `blocks` completed. Input offered
+    /// after them stays pending.
+    pub(super) fn settle_input(&self, context: ContextId, turn: TurnId, blocks: &[BlockId]) {
+        let mut ingress = self.ingress.lock();
+        let open = ingress.open.get_mut(&context).expect("a delivering turn holds its ingress open");
+        assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
+        open.delivered.extend(blocks.iter().copied());
+        if open.pending.is_some_and(|input| open.delivered.contains(&input.block)) {
+            open.pending = None;
+        }
+    }
+
+    /// Close the ingress and return input the turn accepted but never delivered.
+    pub(super) fn close_ingress(&self, context: ContextId, turn: TurnId) -> Option<LiveInput> {
+        let mut ingress = self.ingress.lock();
+        let open = ingress.open.remove(&context).expect("the turn that opened an ingress closes it");
+        assert_eq!(open.turn, turn, "ingress belongs to the turn that opened it");
+        ingress.answered.insert(context, open.delivered);
+        open.pending
     }
 
     pub fn in_flight(&self) -> Vec<(ContextId, std::time::Duration)> {
@@ -247,6 +335,81 @@ mod turn_lease_tests {
         let next = state.begin_if_idle(context).unwrap();
         assert!(!next.interrupt.cancel.is_cancelled());
         assert!(!next.interrupt.stop_after_turn.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    fn input(block: BlockId) -> LiveInput {
+        LiveInput { block, principal: PrincipalId::new(), session: SessionId::new() }
+    }
+
+    #[test]
+    fn only_a_running_turn_that_is_not_stopping_accepts_input() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let note = input(BlockId::new(context, PrincipalId::new(), 1));
+        assert!(!state.offer_input(context, note), "no turn is running");
+
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        assert!(state.offer_input(context, note));
+        assert_eq!(state.pending_input(context, lease.id()), Some(note));
+
+        lease.interrupt().soft();
+        assert!(!state.offer_input(context, note), "a stopping turn refuses new input");
+        assert_eq!(state.close_ingress(context, lease.id()), Some(note), "accepted input outlives the refusal");
+        assert!(!state.offer_input(context, note), "a closed ingress refuses input");
+    }
+
+    #[test]
+    fn settling_older_input_keeps_newer_input_pending() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let principal = PrincipalId::new();
+        let (older, newer) = (input(BlockId::new(context, principal, 1)), input(BlockId::new(context, principal, 2)));
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        assert!(state.offer_input(context, older));
+        assert!(state.offer_input(context, newer));
+        state.settle_input(context, lease.id(), &[older.block]);
+        assert_eq!(state.pending_input(context, lease.id()), Some(newer));
+        state.settle_input(context, lease.id(), &[newer.block]);
+        assert_eq!(state.close_ingress(context, lease.id()), None);
+    }
+
+    #[test]
+    fn input_delivered_before_its_offer_is_not_pending() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let note = input(BlockId::new(context, PrincipalId::new(), 1));
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        state.settle_input(context, lease.id(), &[note.block]);
+        assert!(state.offer_input(context, note), "the running turn still accepts it");
+        assert_eq!(state.close_ingress(context, lease.id()), None, "and owes it no further turn");
+    }
+
+    #[test]
+    fn input_delivered_by_a_finished_turn_is_not_offered_again() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let note = input(BlockId::new(context, PrincipalId::new(), 1));
+        let lease = state.begin(context);
+        state.open_ingress(context, lease.id(), lease.interrupt());
+        state.settle_input(context, lease.id(), &[note.block]);
+        assert_eq!(state.close_ingress(context, lease.id()), None);
+        assert!(state.offer_input(context, note),
+            "the finished turn answered it, so its submit starts no turn of its own");
+        drop(lease);
+
+        let next = state.begin(context);
+        state.open_ingress(context, next.id(), next.interrupt());
+        let later = input(BlockId::new(context, PrincipalId::new(), 2));
+        assert_eq!(state.close_ingress(context, next.id()), None);
+        assert!(!state.offer_input(context, later), "only answered input is absorbed after a close");
     }
 }
 

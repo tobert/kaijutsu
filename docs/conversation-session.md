@@ -110,6 +110,51 @@ parser's position. The loop continues on that result; the turn does not fail,
 and the ceiling notice is not added on top of it — one message about one
 truncation.
 
+## Input during a turn
+
+A player's submit while a model turn runs joins that turn; it does not
+queue a turn of its own. The turn holding the context's conversation lock
+opens an ingress (`runtime/turn_state.rs`, `TurnState::offer_input`).
+`prompt::submit` writes the user block, runs the `submit` rc verb, and then
+offers the block. A running turn accepts it unless an interrupt is pending;
+a refused offer starts a turn as before.
+
+The turn delivers accepted input at two points, never mid-inference:
+
+- **After a tool round**, behind that round's results. The next request
+  already extends the cached prefix there.
+- **After the final inference.** The replayed answer and then the input
+  become the next request, and the turn takes one more inference.
+
+A turn that is stopping, or one a beat waits on, takes no input at either
+point.
+
+Delivery (`deliver_live_input`, `ConversationMailbox::live_tail`) reads
+the log after the turn's write point, the block its next output follows.
+It renders every unseen, hydratable block there as hydration would, then
+moves the write point to the last of them. The turn's next blocks follow
+the input in the log, so a later hydration sends what the turn sent.
+Blocks folded at turn start, and drafts, are skipped. Other writers'
+blocks in that span (the input's rc notification, shell pairs, completion
+notices) ride along, in the position a later hydration gives them.
+
+Input counts as delivered once the inference that carried it completes.
+Input the turn accepted but never delivered starts the next turn when the
+turn ends (`prompt::follow_up`): for example, when the inference carrying
+it failed, when a beat waited on the turn, or when its block sits before
+the write point. Stopping a turn also stops the input it accepted, as
+interrupting a queued turn always did. The block stays in the log for the
+next turn either way. A turn's ingress remembers what it delivered after it
+closes, so a submit whose offer arrives late starts no second turn.
+
+An unsent draft is never marked seen by the mailbox. Submitting promotes
+the draft's own block id, so a draft that was open when a turn hydrated is
+still delivered after it is sent.
+
+Only submits offer input today. Drift arrivals and completion notices
+reach a running turn only when a submit's delivery carries them; see
+`docs/issues.md`, "Input during a turn: what is still open".
+
 ## Before the session change
 
 `process_llm_stream` in `crates/kaijutsu-server/src/llm_stream.rs` called

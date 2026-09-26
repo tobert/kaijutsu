@@ -320,10 +320,10 @@ restarted the kernel. No optional int arrived as a string. Open:
   replays stored content (`llm/hydrate.rs`), so a later turn, resume, or
   fork sees those calls return an empty string with no operation id; 104
   of 227 results in `banto-0924d` are empty. Completion notices ("Shell
-  operation … completed …") do not reach a running turn: its message list
-  is built once at turn start (`llm_stream.rs`, the mailbox comment near
-  the stream loop), so inside one turn the model can only poll. Keep the
-  receipt durable so replay still names the operation.
+  operation … completed …") reach a running turn only when a player's
+  submit delivers them (`docs/conversation-session.md`, "Input during a
+  turn"), so inside one turn the model otherwise polls. Keep the receipt
+  durable so replay still names the operation.
 - **Each tool round took about 40 s.** The model appears to wait for the
   completion notification before its next call. Unmeasured: how much is
   provider latency versus the async settle.
@@ -898,6 +898,52 @@ message that knew where the player was looking"). Left:
   it refetches. Nothing reads a stored edge from a mirror yet. From the
   kaibo review (deepseek, 2026-09-13).
 
+## Input during a turn: what is still open (2026-09-26)
+
+A submit during a running turn now joins it after a tool round or after the
+final inference (`docs/conversation-session.md`, "Input during a turn"). Amy:
+"if I submit async it should go as soon as possible and not have a new turn
+queued." Left:
+
+- **Drift and completion notices do not offer themselves.** Amy wants drift
+  arrivals delivered the same way ("user input, and eventually drifts
+  too"). A drift or completion notice that lands in the log would call
+  `TurnState::offer_input` with its block; nothing else changes. Until
+  then they reach a running turn only when a submit's delivery carries them.
+- **Not watched live.** Kernel tests drive the `Text` source through the
+  real startup path. No test drives a draft submit with a linked
+  `submit/S10-edge.kai`, whose notification should arrive in the same
+  delivery. Watch it in the tui first.
+- **A running shell pair in the delivered span is skipped for good.** The
+  write point moves past a user shell command whose result has not
+  arrived; the result lands before the write point, so this turn never
+  sends it, and the next turn's hydration places the pair earlier than
+  this turn's later output.
+- **A follow-up turn drops the `prompt` RPC's model override.** `LiveInput`
+  carries block, principal, and session only.
+- **A note can hide a ceiling stop.** When the ceiling-continuation budget
+  is spent, a pending note still earns an inference, with the truncated
+  text replayed and no ceiling notice; the turn then reports the later
+  inference's stop reason. Notes also extend a turn without bound, like
+  tool rounds ("Per-cast turn token budget"). From the kaibo review
+  (deepseek, 2026-09-26).
+- **Ingress cleanup is linear.** `process_llm_stream` closes the ingress
+  after `run_llm_stream` returns; `TurnLease::drop` does not. The worker
+  joins turn tasks rather than aborting them, so nothing skips the close
+  today; after a future abort path, the context's next turn would panic
+  at `open_ingress`.
+
+## A rehydrated tool error differs from the live one (2026-09-26)
+
+Hydration folds a tool result's Error child block into the result text as
+an `<error …>` envelope (`llm/hydrate.rs`, the `BlockKind::Error` arm). The
+live turn sends the result text without it. The next turn's request
+therefore differs from the one before at the first errored tool result, and
+the prompt cache misses from there. Found by the rehydration check in
+`lifetime_tests::a_note_sent_during_a_tool_round_joins_the_next_request`,
+which blanks tool-result bodies until this is fixed. Pick one form and send
+it both ways.
+
 ## Async completion recovery follow-ups
 
 - Completion during a model's final inference can reach the durable mailbox
@@ -906,6 +952,9 @@ message that knew where the player was looking"). Left:
   yields, using its mailbox cursor, so a late result within the continuation
   window does not wait for the next explicit drive. Do not refresh the window
   or replay already consumed results.
+  The yield delivery for submitted input is that reconciliation once a
+  completion notice offers its block ("Input during a turn: what is still
+  open").
 - RPC PostCall hooks can replace output/status while the durable exit code
   still records the executed command. Define separate command outcome and hook
   outcome before changing job summaries to infer a synthetic exit code.
@@ -1050,16 +1099,12 @@ cast, source reading only):
   kernel crate and cannot reach the server's cache.
 - `kj stage exclude` on a warm cache: `excluded` is read only at fold time
   (`hydrate.rs`). Narrow, since the documented flow is exclude then fork.
-- Draft promotion: `submit_draft` turns a `Draft` block `Done` under the
-  same id; `catch_up` adds every block to `seen` even when the fold skips
-  it as ineligible, so a draft that was open during another principal's
-  turn stays invisible to that mailbox for good. Not reproduced.
 - Overlapping prompts on one context: a second turn that called
   `get_or_create` before the fill holds the old `Arc`, waits on the mutex,
   then folds against the stale `seen` set. Needs two prompts in flight on
   one context; the interactive spawn sites do not check `turn_in_flight`.
 
-One mechanism would cover all four: a change feed the mailbox subscribes
+One mechanism would cover all three: a change feed the mailbox subscribes
 to, or a per-block version the fold compares. Both are design
 conversations under `docs/conversation-session.md`.
 

@@ -136,7 +136,7 @@ impl ConversationMailbox {
             return;
         }
         self.state.translate_block(block, parent);
-        self.seen.insert(block.id);
+        mark_seen(&mut self.seen, block);
         self.materialized = true;
     }
 
@@ -171,7 +171,7 @@ impl ConversationMailbox {
             }
             let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
             self.state.translate_block(block, parent);
-            self.seen.insert(block.id);
+            mark_seen(&mut self.seen, block);
             new_blocks += 1;
         }
         self.materialized = true;
@@ -226,7 +226,7 @@ impl ConversationMailbox {
                     let block = &blocks[i];
                     let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
                     self.state.translate_block(block, parent);
-                    self.seen.insert(block.id);
+                    mark_seen(&mut self.seen, block);
                 }
                 SpliceItem::Seam { archived } => {
                     self.state.push_seam(archived);
@@ -246,6 +246,56 @@ impl ConversationMailbox {
     pub fn snapshot(&self) -> Vec<Message> {
         self.state.clone().into_messages()
     }
+
+    /// Whether `block` was folded into this mailbox.
+    pub fn has_seen(&self, block: &BlockId) -> bool {
+        self.seen.contains(block)
+    }
+
+    /// Render the blocks a live turn has not seen: those after its
+    /// `write_point` that this mailbox did not fold at turn start, as
+    /// hydration renders them there. The mailbox is unchanged; the next
+    /// turn's [`catch_up`] folds these blocks in log order, so a turn that
+    /// appends the returned messages and then writes after the returned
+    /// write point sends what a later hydration of the log sends.
+    ///
+    /// Drafts and other ineligible blocks are skipped and never become the
+    /// write point, so an unsent draft stays after the turn's output.
+    ///
+    /// [`catch_up`]: Self::catch_up
+    pub fn live_tail(&self, blocks: &[BlockSnapshot], write_point: &BlockId) -> Result<LiveTail, String> {
+        let start = blocks.iter().position(|block| block.id == *write_point)
+            .ok_or_else(|| format!("the turn's write point {write_point} is not in the log"))?;
+        let by_id: HashMap<BlockId, &BlockSnapshot> = blocks.iter().map(|b| (b.id, b)).collect();
+        let mut state = HydrationState::new();
+        let mut delivered = Vec::new();
+        for block in &blocks[start + 1..] {
+            if self.seen.contains(&block.id) || !super::hydrate::is_history_eligible(block) {
+                continue;
+            }
+            let parent = block.parent_id.and_then(|pid| by_id.get(&pid).copied());
+            state.translate_block(block, parent);
+            delivered.push(block.id);
+        }
+        Ok(LiveTail { messages: state.into_messages(), delivered })
+    }
+}
+
+/// Record a folded block. A draft folds as nothing, and submitting it
+/// promotes the same block id, so a draft stays unseen until it is sent.
+fn mark_seen(seen: &mut HashSet<BlockId>, block: &BlockSnapshot) {
+    if block.status != kaijutsu_types::Status::Draft {
+        seen.insert(block.id);
+    }
+}
+
+/// Unseen blocks a live turn delivers to its model; see
+/// [`ConversationMailbox::live_tail`].
+#[derive(Debug)]
+pub struct LiveTail {
+    pub messages: Vec<Message>,
+    /// Blocks in log order. The last is the turn's next write point.
+    pub delivered: Vec<BlockId>,
 }
 
 impl Default for ConversationMailbox {
@@ -312,6 +362,55 @@ mod tests {
                 }
             }),
         }
+    }
+
+    // ── live_tail: input a running turn has not seen ──────────────────────
+
+    #[test]
+    fn live_tail_renders_unseen_blocks_after_the_write_point_as_hydration_does() {
+        let go = user_text("go");
+        let out = model_text("working");
+        let early = user_text("seen at turn start");
+        let note = user_text("a note");
+        let draft = BlockSnapshotBuilder::new(BlockId::new(TEST_CTX.with(|v| *v), TEST_PRINCIPAL.with(|v| *v), next_seq()), BlockKind::Text)
+            .role(BlockRole::User).content("half typed").status(kaijutsu_types::Status::Draft).build();
+        let mut mailbox = ConversationMailbox::new();
+        mailbox.catch_up(&[go.clone(), early.clone()]);
+
+        let log = vec![go.clone(), out.clone(), early.clone(), note.clone(), draft];
+        let tail = mailbox.live_tail(&log, &out.id).unwrap();
+        assert_eq!(tail.delivered, vec![note.id], "seen blocks and drafts are not delivered");
+        let mut full = ConversationMailbox::new();
+        full.catch_up(&[go, out.clone(), note]);
+        let hydrated = full.snapshot();
+        assert_eq!(serde_json::to_value(&tail.messages).unwrap(),
+            serde_json::to_value(&hydrated[hydrated.len() - 1..]).unwrap());
+        assert!(mailbox.live_tail(&log, &user_text("elsewhere").id).is_err(), "a missing write point is a fault");
+        assert!(mailbox.live_tail(&log[..2], &out.id).unwrap().delivered.is_empty());
+    }
+
+    /// A draft folds as nothing, and submitting it promotes the same block id.
+    /// The mailbox must fold it once it is promoted, and a live turn must
+    /// deliver it.
+    #[test]
+    fn a_draft_open_at_hydration_folds_once_it_is_submitted() {
+        let go = user_text("go");
+        let id = BlockId::new(TEST_CTX.with(|v| *v), TEST_PRINCIPAL.with(|v| *v), next_seq());
+        let draft = BlockSnapshotBuilder::new(id, BlockKind::Text).role(BlockRole::User)
+            .content("a no").status(kaijutsu_types::Status::Draft).ephemeral(true).build();
+        let submitted = BlockSnapshotBuilder::new(id, BlockKind::Text).role(BlockRole::User)
+            .content("a note").build();
+        let mut mailbox = ConversationMailbox::new();
+        mailbox.catch_up(&[go.clone(), draft]);
+        assert!(!mailbox.has_seen(&id), "an unsent draft is not part of the conversation yet");
+
+        let tail = mailbox.live_tail(&[go.clone(), submitted.clone()], &go.id).unwrap();
+        assert_eq!(tail.delivered, vec![id]);
+        mailbox.catch_up(&[go, submitted]);
+        assert_eq!(mailbox.snapshot().last().and_then(|m| match &m.content {
+            MessageContent::Text(text) => Some(text.as_str()),
+            _ => None,
+        }), Some("a note"));
     }
 
     // ── hydration_keep_set: the order-free `window` runs ──────────────────

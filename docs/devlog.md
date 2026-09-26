@@ -1365,6 +1365,42 @@ and asserts the exact rendered line is what proved `jq`, `cut`, and `kj
 block read` behave. And a `case` pattern in kaish never expands a variable,
 so the script compares with `test`.
 
+On September 26 the message stopped waiting for the turn to end. Amy: "I'd
+like it if I add a comment while the model is doing turns, it gets poked
+between tool calls or wherever makes the most sense. We won't interrupt
+thinking yet." A mid-turn submit used to queue its own turn behind the
+conversation lock. Now the running turn accepts it and delivers it after
+the next tool round's results, or after its final inference with one more
+inference to answer it. "if I submit async it should go as soon as possible
+and not have a new turn queued. if the turn happens to end and that's the
+best time to send the message, fine, then it starts the next turn." On cache:
+"we insert at the best point for maintaining prompt cache, not a moment
+earlier."
+
+The design choice was to deliver from the log, not from the offer. The turn
+renders the unseen blocks after its write point as hydration would and
+moves its write point past them, so the next hydration reproduces the live
+wire. The offer is only a signal. That also makes the pieces that were once
+tempting to special-case into consequences: the edge notification rides
+with its message, and a note that reached the model through the log before
+its submit finished offering it costs no extra turn. Two lessons. The
+rehydration check in the new test caught a cache miss unrelated to input:
+a tool error rehydrates with an envelope the live turn never sent
+(`docs/issues.md`). And the old yield pushed a plain assistant message,
+dropping signed reasoning, which only mattered once a turn could continue
+past its final text. The continuation reuses the ceiling path's replay, and
+its test goes red when the plain push comes back.
+
+The kaibo review (deepseek) found four real gaps, each now pinned by a test
+that failed first. Input counted as delivered when it was appended to the
+request, so an inference that then failed lost the note's next turn; it now
+settles when the carrying inference completes. The mailbox marked an open
+draft seen, and submitting promotes the same block id, so a note typed
+while the turn hydrated was invisible for good. That hole was already filed
+as "not reproduced"; live input made it the common case. A turn's ingress
+now remembers what it delivered after it closes, and a turn a beat waits on
+takes no input at a tool round either.
+
 
 ## The tui takes the alternate screen (2026-09-13)
 

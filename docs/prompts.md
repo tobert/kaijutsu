@@ -310,6 +310,10 @@ set, empty rather than absent when the fact does not apply:
 | `KJ_LOG_TAIL` | The newest block in the log other than `KJ_INPUT_BLOCK` and any unsent draft (a block key), ephemeral or not, empty when there is none |
 | `KJ_TURN_LIVE` | `true` or `false` — whether a model turn was running when the submit arrived |
 
+A running turn is offered the input only after its `submit` scripts finish,
+so it delivers their blocks together with the input
+(`docs/conversation-session.md`, "Input during a turn").
+
 No context type links a `submit` script by default; a type opts in by
 symlink, the way any rc verb does. `assets/defaults/rc/lib/submit/S10-edge.kai`
 is the shipped example: it emits a `(System, Notification)` excerpt of the

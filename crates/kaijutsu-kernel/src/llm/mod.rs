@@ -109,6 +109,19 @@ pub struct MockClient {
     /// handed — the only way a test can pin the shape of a request the wire
     /// would have to accept. `None` records nothing.
     sent: Option<Arc<parking_lot::Mutex<Vec<Vec<Message>>>>>,
+    /// One `Provider::stream` call, by zero-based index, that waits for the
+    /// test to release it; see `holding_call`.
+    hold: Option<(usize, Arc<CallHold>)>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The test's side of `MockClient::holding_call`: `entered` fires when the
+/// held call arrives, and the call returns once `release` is notified.
+#[cfg(any(test, feature = "test-mock"))]
+#[derive(Debug, Default)]
+pub struct CallHold {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 /// One model's scripted turns plus the count it started with, so an
@@ -135,7 +148,18 @@ impl MockClient {
             script_dir: None,
             script_by_model: None,
             sent: None,
+            hold: None,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Builder: hold the `index`th `Provider::stream` call (zero-based) after
+    /// it records its messages and before it returns a stream, until the test
+    /// notifies `release`. Lets a test act while a turn is between known points.
+    pub fn holding_call(mut self, index: usize) -> (Self, Arc<CallHold>) {
+        let hold = Arc::new(CallHold::default());
+        self.hold = Some((index, hold.clone()));
+        (self, hold)
     }
 
     /// Builder: record the message list handed to every `Provider::stream`
@@ -993,6 +1017,13 @@ impl Provider {
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
                     sent.lock().push(messages.clone());
+                }
+                let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some((index, hold)) = &mock.hold
+                    && *index == call
+                {
+                    hold.entered.notify_one();
+                    hold.release.notified().await;
                 }
                 if !mock.stream_start_delay.is_zero() {
                     tokio::time::sleep(mock.stream_start_delay).await;
