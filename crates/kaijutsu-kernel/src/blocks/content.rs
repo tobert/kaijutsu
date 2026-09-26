@@ -262,6 +262,9 @@ pub struct BlockContent {
     /// Characters of `edge_block` the client had shown, when it was still
     /// streaming at submit time. Meaningless when `edge_block` is `None`.
     edge_shown: Option<u64>,
+    /// The exact tool-result text a model turn sent; see
+    /// [`kaijutsu_types::BlockSnapshot::model_content`].
+    model_content: Option<String>,
     source_context: Option<kaijutsu_types::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<kaijutsu_types::DriftKind>,
@@ -317,6 +320,7 @@ impl BlockContent {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -372,6 +376,7 @@ impl BlockContent {
         block.summary = snap.summary.clone();
         block.edge_block = snap.edge_block;
         block.edge_shown = snap.edge_shown;
+        block.model_content = snap.model_content.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -706,6 +711,12 @@ impl BlockContent {
         self.edge_shown
     }
 
+    /// Set the exact text a model turn sent for this tool result; `None`
+    /// clears it. A snapshot-only field like `set_edge`.
+    pub fn set_model_content(&mut self, sent: Option<String>) {
+        self.model_content = sent;
+    }
+
     /// Set the player's edge (see [`kaijutsu_types::BlockSnapshot::edge_block`]).
     /// Write-once at draft promotion; `None` clears both fields. A
     /// snapshot-only field, like `set_summary`/`set_stderr` above — does not
@@ -783,6 +794,7 @@ impl BlockContent {
             summary: self.summary.clone(),
             edge_block: self.edge_block,
             edge_shown: self.edge_shown,
+            model_content: self.model_content.clone(),
         }
     }
 

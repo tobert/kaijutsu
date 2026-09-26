@@ -206,7 +206,7 @@ mod setup_tests {
                 }).unwrap();
             }
             let mut events = kernel.block_flows().subscribe("block.*");
-            let accepted = kernel.blocks().settle_tool_result_as(context, &command, &output, "waiting for approval",
+            let accepted = kernel.blocks().settle_tool_result_as(context, &command, &output, "waiting for approval", None,
                 Status::Waiting, false, PrincipalId::system(), None, Some(&ask));
             let db = kernel.kernel_db().clone();
             let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();

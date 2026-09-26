@@ -110,6 +110,25 @@ parser's position. The loop continues on that result; the turn does not fail,
 and the ceiling notice is not added on top of it — one message about one
 truncation.
 
+## Tool results replay as sent
+
+A model's tool result is stored twice over. `content` is what people read:
+a shell result's clean output, without its envelope. `model_content` is
+the exact `tool_result` text the turn sent: a shell result's JSON envelope
+(status, exit code, operation id, output), plus the Error child's envelope
+when the call failed. Hydration replays `model_content` verbatim when it is
+set (`llm/hydrate.rs`, the `(Tool, ToolResult)` arm) and skips that
+result's Error child, so the next request extends the one the turn sent and
+the prompt cache holds across turns. A background call's receipt replays
+with its operation id.
+
+Results no model turn sent (user shell commands, results written before the
+field existed) hydrate from `content` and `stderr` as before. Settling a
+result again without sent text, as an approval that resumes a waiting call
+does, clears `model_content`; that path already evicts the cached mailbox
+and hydrates cold. Shell output is stored in both fields, so tool results
+take about twice the space in `kernel.db`.
+
 ## Input during a turn
 
 Input that arrives while a model turn runs joins that turn; it does not
@@ -122,11 +141,14 @@ has run, so the lifecycle's output rides with it:
 |---|---|---|---|
 | A player's submit | `prompt::submit` | yes | starts the next turn (`prompt::follow_up`) |
 | A completion notice | `completion_notice::deliver` | when its notice allows an automatic resume | runs the notice's continuation check (`resume_after_turn`) |
-| A drift arrival | `kj drift push` (`deliver_drift`) | no | waits in the log, as a drift into an idle context does |
+| A drift arrival | `kj drift push`, `pull`, `merge`, `flush` (`offer_drift`) | no | waits in the log, as a drift into an idle context does |
 
 A running turn accepts input unless an interrupt is pending. A refused
 offer is handled as for an idle context: a submit starts a turn, a
-completion runs its continuation check, a drift waits.
+completion runs its continuation check, a drift waits. A drift joins
+whichever turn runs in its target, whoever performs it: drift is the
+channel between contexts, so it has no counterpart to the completion
+notice's performer check.
 
 The turn delivers accepted input at two points, never mid-inference:
 

@@ -613,6 +613,51 @@ fn tool_failure_reaches_the_client_with_its_result_and_error_flag() {
     });
 }
 
+/// A later hydration of a turn's log sends the bytes the turn sent. A shell
+/// result reaches the model as its JSON envelope while its block shows people
+/// the readable output, so the block must also keep what was sent
+/// (`docs/conversation-session.md`, "Tool results replay as sent").
+#[test]
+fn a_shell_result_rehydrates_as_the_model_received_it() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MockClient, Provider, stream::StreamEvent};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "shell-replay").await.unwrap();
+        assign_turn_identity(&server, context, PrincipalId::new());
+        kj.join_context(context, "shell-replay").await.unwrap();
+        let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "replay-shell".into(), name: "shell".into(),
+                input: serde_json::json!({"command": "echo hello from kaish"}) }, done("tool_use")],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
+        ]).recording_sent_messages();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let (callback, mut events) = turn_events_channel(32);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let admitted = kj.execute_kj_quiet(context, &["drive".into(), "--prompt".into(), "run it".into()]).await.unwrap();
+        assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let wire = serde_json::to_string(&sent[1]).unwrap();
+        assert!(wire.contains("hello from kaish"), "the shell ran and its output reached the model: {wire}");
+        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        mailbox.catch_up(&server.kernel.blocks().block_snapshots(context).unwrap());
+        let mut expected = sent[1].clone();
+        expected.push(kaijutsu_kernel::llm::Message::assistant("ack"));
+        let replayed: Vec<serde_json::Value> = mailbox.snapshot().iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        let expected: Vec<serde_json::Value> = expected.iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        if let Some(i) = (0..replayed.len().max(expected.len())).find(|&i| replayed.get(i) != expected.get(i)) {
+            panic!("message {i} differs\nreplayed: {:#}\nsent: {:#}",
+                replayed.get(i).unwrap_or(&serde_json::Value::Null), expected.get(i).unwrap_or(&serde_json::Value::Null));
+        }
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}
+
 #[test]
 fn authored_tool_results_preserve_their_initial_status() {
     run_local(async {

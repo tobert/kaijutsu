@@ -315,6 +315,42 @@ mod tests {
         assert_eq!(kernel.blocks().block_snapshots(context).unwrap().len(), 2);
     }
 
+    /// A resumable completion a running turn accepted but never delivered
+    /// resumes once that turn has ended, as it would have for an idle context.
+    #[tokio::test]
+    async fn an_undelivered_completion_resumes_after_the_turn() {
+        let dispatcher = test_dispatcher_persistent().await;
+        let kernel = dispatcher.kernel();
+        let actor = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("undelivered-completion"), None, actor);
+        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(PrincipalId::new())).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let now = kaijutsu_types::now_millis() as i64;
+        let epoch = kernel.kernel_db().lock().begin_continuation(context, now).unwrap().epoch;
+        kernel.kernel_db().lock().record_continuation_request(context, epoch, now).unwrap();
+        kernel.kernel_db().lock().record_continuation_yield(context, epoch, now).unwrap();
+        let call = crate::mcp::CallContext::new(actor, context, kaijutsu_types::SessionId::new(), kernel.id());
+        let receipt = super::super::tool_command::create_operation(kernel, &call, "finished late", None).unwrap();
+        let source = Source::Shell(receipt.operation_id.clone());
+        prepare(&kernel.kernel_db().lock(), &source, "finished while the turn ran").unwrap();
+        let mut requested = kernel.turn_flows().subscribe("turn.requested");
+
+        let lease = kernel.turns().begin(context);
+        kernel.turns().open_ingress(context, lease.id(), lease.interrupt());
+        deliver(kernel, &source, &tokio_util::sync::CancellationToken::new()).await.unwrap();
+        assert!(requested.try_recv().is_none(), "the running turn takes the notice; no turn of its own yet");
+        let pending = kernel.turns().close_ingress(context, lease.id());
+        assert!(matches!(&pending[..], [input] if input.wake.continues_turn()), "{pending:?}");
+        drop(lease);
+
+        resume_after_turn(kernel, &source).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), requested.recv()).await
+            .expect("the owed continuation starts after the turn").unwrap();
+        assert!(matches!(event.payload, crate::flows::TurnFlow::Requested { continuation_epoch: Some(e), .. } if e == epoch),
+            "{:?}", event.payload);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
     #[tokio::test]
     async fn an_interrupted_continuation_refuses_automatic_resume_on_a_later_completion() {
         let dispatcher = test_dispatcher_persistent().await;

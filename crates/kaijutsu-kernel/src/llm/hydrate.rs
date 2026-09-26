@@ -325,14 +325,17 @@ impl HydrationState {
                             );
                             block.id.to_key()
                         });
-                    // stdout lives in `content`, stderr in its own field. The
-                    // model needs both — merge them back the way they were
-                    // before stderr was split off (stdout, then stderr).
-                    let content = match block.stderr.as_deref() {
-                        Some(err) if !err.is_empty() && !stdout.is_empty() => {
+                    // A model turn stored the text it sent; replay it as sent,
+                    // so this request extends the one that turn made. Other
+                    // results: stdout lives in `content`, stderr in its own
+                    // field, merged back the way they were before stderr was
+                    // split off (stdout, then stderr).
+                    let content = match (&block.model_content, block.stderr.as_deref()) {
+                        (Some(sent), _) => sent.clone(),
+                        (None, Some(err)) if !err.is_empty() && !stdout.is_empty() => {
                             format!("{stdout}\n{err}")
                         }
-                        Some(err) if !err.is_empty() => err.to_string(),
+                        (None, Some(err)) if !err.is_empty() => err.to_string(),
                         _ => stdout.to_string(),
                     };
                     self.tool_results.push(ContentBlock::ToolResult {
@@ -357,6 +360,10 @@ impl HydrationState {
                 self.messages.push(Message::user(&prefixed));
             }
             (_, BlockKind::Error) => {
+                // A result a model turn sent already carries this envelope.
+                if parent.is_some_and(|p| p.kind == BlockKind::ToolResult && p.model_content.is_some()) {
+                    return;
+                }
                 // Error blocks: fold into parent ToolResult content if possible,
                 // otherwise emit as standalone user message.
                 let envelope = kaijutsu_types::format_error_for_llm(block);
@@ -749,6 +756,31 @@ mod pairing_repair_tests {
                     .collect(),
             ),
         }
+    }
+
+    /// A result a model turn sent replays verbatim: not `content` plus
+    /// `stderr`, and without folding its Error child in a second time.
+    #[test]
+    fn a_result_with_sent_text_replays_it_verbatim() {
+        use kaijutsu_types::{BlockId, BlockSnapshotBuilder, ContextId, ErrorCategory, ErrorPayload, ErrorSeverity, PrincipalId, Role as BlockRole};
+        let (ctx, who) = (ContextId::new(), PrincipalId::new());
+        let call = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 1), BlockKind::ToolCall)
+            .role(BlockRole::Model).tool_name("shell").tool_input("{}").tool_use_id("t1").build();
+        let result = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 2), BlockKind::ToolResult)
+            .role(BlockRole::Tool).parent_id(call.id).tool_call_id(call.id).tool_use_id("t1")
+            .content("people read this").stderr("and this").is_error(true)
+            .model_content("{\"stdout\":\"the model read this\"}").build();
+        let payload = ErrorPayload { category: ErrorCategory::Tool, severity: ErrorSeverity::Error,
+            code: None, detail: Some("boom".into()), span: None, source_kind: None };
+        let error = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 3), BlockKind::Error)
+            .role(BlockRole::System).parent_id(result.id).content("boom").error_payload(payload).build();
+
+        let messages = crate::llm::hydrate_from_blocks(&[call, result, error]);
+        let wire = serde_json::to_value(&messages).unwrap();
+        assert_eq!(messages.len(), 2, "{wire:#}");
+        let MessageContent::Blocks(blocks) = &messages[1].content else { panic!("{wire:#}") };
+        assert!(matches!(&blocks[..], [ContentBlock::ToolResult { content, is_error: true, .. }]
+            if content == "{\"stdout\":\"the model read this\"}"), "{wire:#}");
     }
 
     #[test]

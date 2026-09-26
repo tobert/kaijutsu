@@ -117,6 +117,7 @@ mod tests {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 

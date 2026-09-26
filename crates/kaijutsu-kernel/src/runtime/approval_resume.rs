@@ -1273,7 +1273,7 @@ mod lifetime_tests {
                 let command = kernel.blocks().insert_tool_call_as(command_context, None, None, "shell",
                     serde_json::json!({"command": "never execute this orphan"}), None, Some(command_actor), None, None).unwrap();
                 let output = kernel.blocks().insert_tool_result(command_context, &command, Some(&command), "", false, None, None).unwrap();
-                let settled = kernel.blocks().settle_tool_result_as(command_context, &command, &output, "publisher stopped",
+                let settled = kernel.blocks().settle_tool_result_as(command_context, &command, &output, "publisher stopped", None,
                     Status::Error, true, PrincipalId::system(), None, Some(&request));
                 assert_eq!(settled.is_err(), invalid, "a different pair or performer cannot retire this invocation: {settled:?}");
                 assert_eq!(db.lock().approval_pair_abandoned_reason(&request).unwrap().is_some(), !invalid);

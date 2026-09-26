@@ -151,7 +151,7 @@ fn settle_known_outcome(
         ephemeral: Some(envelope.ephemeral.unwrap_or(false)),
     };
     documents.settle_tool_result_recorded(context_id, command_block_id, output_block_id,
-        crate::block_store::ToolResultUpdate { content: Some(text), status, is_error: status == Status::Error,
+        crate::block_store::ToolResultUpdate { content: Some(text), model_content: None, status, is_error: status == Status::Error,
             author: PrincipalId::system(), ansi, shell: Some(fields) }, |db| {
             if let (Some(owner), Some(ask)) = (ask_owner, envelope.ask_id.as_deref()) {
                 db.link_ask_blocks(ask, command_block_id, output_block_id, owner)?;
@@ -262,7 +262,7 @@ pub(crate) fn recover_unfinished(kernel: &Kernel) -> Result<usize, String> {
             exit_code: None, ephemeral: None,
         };
         blocks.settle_tool_result_recorded(context, &receipt.command_block_id, &receipt.output_block_id,
-            crate::block_store::ToolResultUpdate { content: None, status: Status::Error, is_error: true,
+            crate::block_store::ToolResultUpdate { content: None, model_content: None, status: Status::Error, is_error: true,
                 author: PrincipalId::system(), ansi: None, shell: Some(fields) }, |db| {
                 crate::shell_operations::ShellOperationRegistry::complete_record_in(db, &receipt.operation_id, envelope, None)
                     .map(|_| ()).map_err(crate::kernel_db::KernelDbError::Validation)

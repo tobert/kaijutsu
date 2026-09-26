@@ -382,6 +382,11 @@ mod ingress_tests {
 
         lease.interrupt().soft();
         assert!(!state.offer_input(context, note.clone()), "a stopping turn refuses new input");
+        let cancelled = state.begin(ContextId::new());
+        state.open_ingress(cancelled.context(), cancelled.id(), cancelled.interrupt());
+        cancelled.interrupt().hard();
+        assert!(!state.offer_input(cancelled.context(), note.clone()), "a cancelled turn refuses new input");
+        assert!(state.close_ingress(cancelled.context(), cancelled.id()).is_empty());
         assert_eq!(state.close_ingress(context, lease.id()), vec![note.clone()], "accepted input outlives the refusal");
         assert!(!state.offer_input(context, input(BlockId::new(context, PrincipalId::new(), 2))),
             "a closed ingress refuses input it did not deliver");

@@ -313,16 +313,12 @@ restarted the kernel. No optional int arrived as a string. Open:
 - **A turn runs without a bound and without a report.** This is the first
   live evidence for "Per-cast turn token budget" above; the 09-24 read-only
   probe's cap-hit ended the same way, just sooner.
-- **An async shell call's stored result is empty.** The model receives the
-  receipt envelope (status, `operation_id`), but the `tool_result` block
-  keeps only `readable_output()`, empty for a running receipt
-  (`runtime/llm_stream.rs` `dispatch_recorded_tool_result`). Hydration
-  replays stored content (`llm/hydrate.rs`), so a later turn, resume, or
-  fork sees those calls return an empty string with no operation id; 104
-  of 227 results in `banto-0924d` are empty. Completion notices ("Shell
-  operation … completed …") now join a running turn at its next tool round
-  (`docs/conversation-session.md`, "Input during a turn"). Keep the
-  receipt durable so replay still names the operation.
+- **An async shell call's stored result was empty** (104 of 227 results
+  in `banto-0924d`). Fixed 2026-09-26: the result stores the envelope the
+  model received as `model_content`, and completion notices join a running
+  turn (`docs/conversation-session.md`, "Tool results replay as sent" and
+  "Input during a turn"). Contexts written before the fix still replay
+  empty results.
 - **Each tool round took about 40 s.** The model appears to wait for the
   completion notification before its next call. Unmeasured: how much is
   provider latency versus the async settle.
@@ -928,25 +924,20 @@ async it should go as soon as possible and not have a new turn queued";
   today; after a future abort path, the context's next turn would panic
   at `open_ingress`.
 
-## A rehydrated shell result differs from the live one (2026-09-26)
+## Model shell backgrounding: flag or kaish (Amy, 2026-09-26)
 
-A model's shell tool call is sent live as the `ShellEnvelope` JSON (status,
-exit code, operation id, clean output), but its `ToolResult` block stores
-only the readable output, and hydration replays that
-(`llm/hydrate.rs`, the `(Tool, ToolResult)` arm; `runtime/llm_stream.rs`,
-`dispatch_recorded_tool_result`). The cached mailbox folds each finished
-turn through hydration, so every turn's request diverges from the one
-before at the previous turn's first shell result: that span is billed
-uncached once per turn, and the model reads two shapes of its own history.
-The async-receipt entry under "What the cap-free banto review showed" is
-the same gap from the other side (replay loses the operation id).
-
-Two ways out, both needing Amy: store the exact wire text on the result
-block for hydration to prefer (a snapshot field, journaled), or rebuild the
-envelope from block fields (not byte-identical: `elapsed_ms` is not
-stored). The error-child envelope had the same shape and now goes out live
-too (`lifetime_tests::a_note_sent_during_a_tool_round_joins_the_next_request`
-pins full wire equality for an errored call).
+Amy: "what should happen is a tool call runs and returns in order, and if
+it wants to background, the tool call can do that from inside the tool
+(kaish) as needed." Today the model's `shell` tool takes `foreground:
+false`, which mints an operation receipt, returns it in order, and later
+delivers a completion notice; that is Claude Code's `run_in_background`
+shape. Its replay gap (empty stored result) and its delivery gap (notices
+could not reach a running turn) are both closed as of 2026-09-26
+(`docs/conversation-session.md`, "Tool results replay as sent" and "Input
+during a turn"). A kaish `cmd &` inside an ordinary call starts a kaish
+job without a receipt or notice. The lead recommends keeping the flag;
+moving backgrounding into kaish would mean mapping kaish jobs to receipts.
+Amy's call.
 
 ## Async completion recovery follow-ups
 
@@ -2861,7 +2852,12 @@ experiment" — treat `Editor` as provisional until that sweep.
   startup recovery skips the row because they select `block_id IS NULL`. The
   notice block survives; the owed continuation is lost with no durable record.
   Approval delivery loses its wake the same way by design, but keeps a
-  redeemable answer. Decide between recording an owed wake durably and
+  redeemable answer. Two more paths end the same way (kaibo review,
+  2026-09-26): `deliver` returns after the insert when its stop token is
+  cancelled, and a notice refused by a stopping turn finds that turn still
+  in flight and skips its resume (`completion_notice.rs`, `resume`). The
+  resume's other refusals (context no longer live, performer changed,
+  window closed) are also silent. Decide between recording an owed wake durably and
   reserving turn admission before the notice insert; see the resource admission
   design, `docs/resource-admission.md`, "Known hazards".
 - **Uncovered:** scheduler call sites of tick/rotate (`beat.rs` ~2225, ~2230);

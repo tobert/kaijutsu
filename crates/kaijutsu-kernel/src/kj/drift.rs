@@ -252,12 +252,8 @@ impl KjDispatcher {
             caller,
         )
             .await;
-        // A running turn in the target delivers the drift at its next tool
-        // round, after the drift rc output has landed
-        // (`docs/conversation-session.md`, "Input during a turn").
-        self.kernel().turns().offer_input(target_ctx, crate::runtime::turn_state::LiveInput {
-            block, wake: crate::runtime::turn_state::Wake::Drift,
-        });
+        // Offered after the drift rc output has landed, so it rides along.
+        self.offer_drift(target_ctx, block);
         if caller.cancel.is_cancelled() {
             return Ok(DriftDeliveryOutcome::LifecycleCancelled(
                 lifecycle.err().unwrap_or_else(|| "owner cancelled after rc completion".into()),
@@ -268,6 +264,15 @@ impl KjDispatcher {
         }
 
         Ok(DriftDeliveryOutcome::Complete)
+    }
+
+    /// Offer a landed drift block to its context's running turn, which
+    /// delivers it at its next tool round (`docs/conversation-session.md`,
+    /// "Input during a turn"). With no running turn it waits in the log.
+    fn offer_drift(&self, context: ContextId, block: kaijutsu_types::BlockId) {
+        self.kernel().turns().offer_input(context, crate::runtime::turn_state::LiveInput {
+            block, wake: crate::runtime::turn_state::Wake::Drift,
+        });
     }
 
     /// The refusal a drift delivery into a non-live target gets — the SAME
@@ -531,7 +536,7 @@ impl KjDispatcher {
         // `pull` is a send the caller performs on their own behalf: they asked
         // for the summary and it lands in their context, so the performer
         // authors it — never the requester that opened the connection.
-        if let Err(e) = self.block_store().insert_drift_block_as(
+        let block = match self.block_store().insert_drift_block_as(
             context_id,
             None,
             after.as_ref(),
@@ -541,8 +546,10 @@ impl KjDispatcher {
             DriftKind::Pull,
             Some(caller.actor_id),
         ) {
-            return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}"));
-        }
+            Ok(block) => block,
+            Err(e) => return KjResult::Err(format!("kj drift pull: failed to insert drift block: {e}")),
+        };
+        self.offer_drift(context_id, block);
 
         // Record drift edge
         {
@@ -666,7 +673,7 @@ impl KjDispatcher {
         // `merge` sends the child's distillation up to the parent — the
         // performer is the sender, and the block lands in a context they may
         // not own.
-        if let Err(e) = self.block_store().insert_drift_block_as(
+        let block = match self.block_store().insert_drift_block_as(
             target_id,
             None,
             after.as_ref(),
@@ -676,8 +683,10 @@ impl KjDispatcher {
             DriftKind::Merge,
             Some(caller.actor_id),
         ) {
-            return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}"));
-        }
+            Ok(block) => block,
+            Err(e) => return KjResult::Err(format!("kj drift merge: failed to insert drift block: {e}")),
+        };
+        self.offer_drift(target_id, block);
 
         // Record drift edge
         {
@@ -839,8 +848,9 @@ impl KjDispatcher {
                 drift.drift_kind,
                 Some(drift.staged_by),
             ) {
-                Ok(_) => {
+                Ok(block) => {
                     injected += 1;
+                    self.offer_drift(drift.target_ctx, block);
                     // Delivered — clear the in-flight bookkeeping `drain`
                     // set so this item stops showing up in `queue()` and a
                     // stray `cancel` on its id becomes a normal "not found"
@@ -2133,6 +2143,30 @@ mod tests {
         let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
         assert!(result.is_ok(), "flush: {}", result.message());
         assert!(result.message().contains("flushed 1 drift"));
+    }
+
+    /// A staged push that `flush` lands later still joins the target's
+    /// running turn, the same as an immediate push.
+    #[tokio::test]
+    async fn drift_flush_is_offered_to_the_targets_running_turn() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let src = register_context(&d, Some("sender"), None, principal);
+        let dst = register_context(&d, Some("receiver"), None, principal);
+        d.block_store().create_document(dst, crate::DocumentKind::Conversation, None).unwrap();
+        let c = caller_with_context(src);
+        d.dispatch(&[s("drift"), s("push"), s("--stage"), s("receiver"), s("staged finding")], &c).await;
+        let turns = d.kernel().turns();
+        let lease = turns.begin(dst);
+        turns.open_ingress(dst, lease.id(), lease.interrupt());
+
+        let result = d.dispatch(&[s("drift"), s("flush")], &c).await;
+        assert!(result.is_ok(), "flush: {}", result.message());
+        let drift = d.block_store().block_snapshots(dst).unwrap().into_iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::Drift).expect("drift block");
+        assert_eq!(turns.close_ingress(dst, lease.id()), vec![crate::runtime::turn_state::LiveInput {
+            block: drift.id, wake: crate::runtime::turn_state::Wake::Drift,
+        }]);
     }
 
     #[tokio::test]

@@ -151,7 +151,7 @@ pub use block::{
     ProvenanceTag, ResourcePayload, Role, Status, StyleAttrs, StyleColor, StyleSpan, TaskStatus,
     ToolKind, VfsErrorKind, ERROR_DETAIL_HYDRATION_BUDGET,
     NOTIFICATION_DETAIL_HYDRATION_BUDGET, RESOURCE_CONTENT_HYDRATION_BUDGET,
-    TOOL_CONTENT_HYDRATION_BUDGET, format_error_for_llm, format_notification_for_llm,
+    TOOL_CONTENT_HYDRATION_BUDGET, format_error_for_llm, format_error_payload_for_llm, format_notification_for_llm,
     format_resource_for_llm, format_task_for_llm, format_tool_content_envelope,
     format_tool_content_for_llm,
 };

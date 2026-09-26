@@ -1403,6 +1403,21 @@ as "not reproduced"; live input made it the common case. A turn's ingress
 now remembers what it delivered after it closes, and a turn a beat waits on
 takes no input at a tool round either.
 
+The same day completion notices and drift arrivals joined the path. Amy:
+"drift and completion should land with asap delivery (as soon as possible
+within constraints of cache alignment and model experience)." Each input
+now carries its own rule for the end of a turn: a submit starts the next
+turn, a completion runs its own continuation check, a drift waits, as it
+would for an idle context. Keeping only the newest pending input would have
+let a drift erase a note's claim to a turn. Then byte-identical replay:
+"pretty sure we should go byte identical that was my intent." A tool
+result now stores the exact text the model received (`model_content`), the
+shell envelope included, and hydration replays it, so a turn's request no
+longer diverges from the last one at its first shell result. On
+backgrounding, Amy: "a tool call runs and returns in order, and if it wants
+to background, the tool call can do that from inside the tool (kaish)"; the
+flag-or-kaish choice is open in `docs/issues.md`.
+
 
 ## The tui takes the alternate screen (2026-09-13)
 

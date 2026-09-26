@@ -1201,6 +1201,19 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Set the exact text a model turn sent for a ToolResult block (see
+    /// [`kaijutsu_types::BlockSnapshot::model_content`]); `None` clears it.
+    pub fn set_model_content(&mut self, id: &BlockId, sent: Option<String>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_model_content(sent);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the exit_code on a ToolResult block. The shell execution path
     /// calls this after the underlying command finishes, capturing the real
     /// exit code instead of truncating to the binary Done/Error status.

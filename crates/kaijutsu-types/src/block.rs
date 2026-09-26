@@ -617,10 +617,16 @@ pub const ERROR_DETAIL_HYDRATION_BUDGET: usize = 2048;
 /// Produces an XML-ish envelope that models can parse but won't confuse
 /// with user content. Truncates `detail` to `ERROR_DETAIL_HYDRATION_BUDGET`.
 pub fn format_error_for_llm(block: &BlockSnapshot) -> String {
-    let payload = match &block.error {
-        Some(p) => p,
-        None => return block.content.clone(),
-    };
+    match &block.error {
+        Some(payload) => format_error_payload_for_llm(payload, &block.content),
+        None => block.content.clone(),
+    }
+}
+
+/// The envelope [`format_error_for_llm`] renders for an Error block whose
+/// payload is `payload` and whose content is `content`, available before
+/// the block exists.
+pub fn format_error_payload_for_llm(payload: &ErrorPayload, content: &str) -> String {
 
     let mut attrs = format!(
         "category=\"{}\" severity=\"{}\"",
@@ -644,7 +650,7 @@ pub fn format_error_for_llm(block: &BlockSnapshot) -> String {
             detail.clone()
         }
     } else {
-        block.content.clone()
+        content.to_string()
     };
 
     format!("<error {}>\n{}\n</error>", attrs, body)
@@ -1869,6 +1875,16 @@ pub struct BlockSnapshot {
     /// the edge block was already fully shown.
     #[serde(default)]
     pub edge_shown: Option<u64>,
+
+    /// The exact `tool_result` text a model turn sent for this `ToolResult`.
+    /// `content` is what people read; a shell result reaches the model as its
+    /// JSON envelope, and an error result carries its Error child's envelope.
+    /// Hydration replays this text verbatim when it is set, so a later
+    /// request extends the one the turn sent. `None` on results no model turn
+    /// sent, and on results settled again after the turn (an approval that
+    /// resumes a waiting call). Kernel-side only; not on the wire.
+    #[serde(default)]
+    pub model_content: Option<String>,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -1989,6 +2005,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2038,6 +2055,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2099,6 +2117,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2160,6 +2179,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2228,6 +2248,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2284,6 +2305,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2338,6 +2360,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2392,6 +2415,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2442,6 +2466,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2503,6 +2528,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2563,6 +2589,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2622,6 +2649,7 @@ impl BlockSnapshot {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         }
     }
 
@@ -2689,6 +2717,9 @@ impl BlockSnapshot {
         //
         // `edge_block`/`edge_shown` are excluded too: they record where the
         // submitting client's view stood, not what the block says.
+        //
+        // `model_content` is excluded: it records what a model was sent,
+        // derived from `content` when the result settled.
     }
 }
 
@@ -2760,6 +2791,7 @@ impl BlockSnapshotBuilder {
                 summary: None,
                 edge_block: None,
                 edge_shown: None,
+                model_content: None,
             },
         }
     }
@@ -2965,6 +2997,12 @@ impl BlockSnapshotBuilder {
     /// Set how much of the edge block the client had shown.
     pub fn edge_shown(mut self, shown: u64) -> Self {
         self.snap.edge_shown = Some(shown);
+        self
+    }
+
+    /// Set the exact text a model turn sent for this tool result.
+    pub fn model_content(mut self, sent: impl Into<String>) -> Self {
+        self.snap.model_content = Some(sent.into());
         self
     }
 

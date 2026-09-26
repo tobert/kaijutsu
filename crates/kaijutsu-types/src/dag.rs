@@ -414,6 +414,7 @@ mod tests {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         };
         let snap_b = BlockSnapshot {
             id: id_b,
@@ -455,6 +456,7 @@ mod tests {
             summary: None,
             edge_block: None,
             edge_shown: None,
+            model_content: None,
         };
 
         // Build DAG manually (from_snapshots would not create cycles)

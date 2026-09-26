@@ -1689,8 +1689,10 @@ async fn dispatch_recorded_tool_result(
     make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
         ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
 
-    // The model receives the shell envelope; people and hydration read its
-    // output. Project the actual output once so both readers get clean text.
+    // The model receives the shell envelope, and an error result carries its
+    // Error child's envelope too; people read the clean output. The result
+    // stores what the model receives, which hydration replays verbatim.
+    // Project the actual output once so both readers get clean text.
     let envelope = ShellEnvelope::from_tool_result(&content);
     let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
     let ansi = crate::ansi_ingest::project(source.as_bytes());
@@ -1699,19 +1701,16 @@ async fn dispatch_recorded_tool_result(
         Some(env) => env.with_clean_output(block_content).to_value().to_string(),
         None => block_content.to_owned(),
     };
+    if let Some(payload) = &payload {
+        model_content.push_str("\n\n");
+        model_content.push_str(&kaijutsu_types::format_error_payload_for_llm(payload, &payload.summary_line()));
+    }
     let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
-    documents.settle_tool_result_as(context_id, &call, &result, block_content,
+    documents.settle_tool_result_as(context_id, &call, &result, block_content, Some(&model_content),
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
     let anchor = if let Some(payload) = payload {
-        let error = documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?;
-        // Hydration folds the error child into its result (`llm/hydrate.rs`);
-        // send the same text now so the next request extends this one.
-        let snapshot = documents.get_block_snapshot(context_id, &error)?
-            .ok_or(crate::block_store::BlockStoreError::BlockNotFoundAfterInsert)?;
-        model_content.push_str("\n\n");
-        model_content.push_str(&kaijutsu_types::format_error_for_llm(&snapshot));
-        error
+        documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
     } else { result };
     Ok((InlineToolResult { content: model_content, is_error }, anchor))
 }
@@ -2573,7 +2572,7 @@ async fn run_llm_stream(
                     // Settle the pair rather than writing the result alone:
                     // the call block reaches a final status the same way every
                     // other dispatched call does.
-                    documents.settle_tool_result_as(context_id, &call, &answer, &detail,
+                    documents.settle_tool_result_as(context_id, &call, &answer, &detail, None,
                         Status::Error, true, PrincipalId::system(), None, None)?;
                     last_block_id = answer;
                     invalid_tool_calls.push((id, name, input, detail));
@@ -7934,6 +7933,10 @@ mod lifetime_tests {
         hold.release.notify_one();
 
         tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(300), completed.recv()).await.is_err(),
+            "a completion the turn delivered owes no continuation of its own");
+        assert!(!kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.kind == BlockKind::Error),
+            "the delivered notice never reaches its post-turn wake");
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert_eq!(user_text(sent[1].last().unwrap()), Some("Shell operation op-1 completed"));
