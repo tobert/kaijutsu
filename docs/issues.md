@@ -907,9 +907,17 @@ queued." Left:
 
 - **Drift and completion notices do not offer themselves.** Amy wants drift
   arrivals delivered the same way ("user input, and eventually drifts
-  too"). A drift or completion notice that lands in the log would call
-  `TurnState::offer_input` with its block; nothing else changes. Until
-  then they reach a running turn only when a submit's delivery carries them.
+  too"). Until then they reach a running turn only when a submit's
+  delivery carries them. Each source needs its own rule for input the
+  turn never delivers. A player's submit starts a turn
+  (`prompt::follow_up`). A drift starts none today: `deliver_drift`
+  inserts at the log tail and wakes nothing (`kj/drift.rs`). A completion
+  notice must pass the continuation policy (`automatic_resume_allowed`,
+  epoch, performer), and it returns early while a turn is in flight
+  (`runtime/completion_notice.rs`, `deliver`). The ingress keeps only the
+  newest pending input, so a drift offered after a note would erase the
+  note's claim to a follow-up; the input that wants a turn must stay
+  pending on its own.
 - **Not watched live.** A wire test drives a draft submit with the linked
   `S10-edge.kai` through a held turn
   (`compose_draft_wire::a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge`);
