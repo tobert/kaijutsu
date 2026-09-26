@@ -112,22 +112,23 @@ truncation.
 
 ## Tool results replay as sent
 
-A model's tool result is stored twice over. `content` is what people read:
-a shell result's clean output, without its envelope. `model_content` is
-the exact `tool_result` text the turn sent: a shell result's JSON envelope
-(status, exit code, operation id, output), plus the Error child's envelope
-when the call failed. Hydration replays `model_content` verbatim when it is
-set (`llm/hydrate.rs`, the `(Tool, ToolResult)` arm) and skips that
-result's Error child, so the next request extends the one the turn sent and
-the prompt cache holds across turns. A background call's receipt replays
-with its operation id.
+A model's tool result keeps three things. `content` is what people read: a
+shell result's clean output. `model_content` is the exact `tool_result` text
+the turn sent, stored only when it differs from `content`: a shell result
+with facts rendered below its output (`docs/shell-envelope.md`, "What a
+model turn reads"), or an error result with its Error child's envelope.
+`shell_envelope` is the record behind it: the shell envelope with its output
+blank. Hydration replays `model_content` verbatim when it is set, and
+otherwise `content`, which for a clean success is what the turn sent; it
+skips an Error child whose result carries `model_content` (`llm/hydrate.rs`,
+the `(Tool, ToolResult)` arm). The next request extends the one the turn
+sent, so the prompt cache holds across turns.
 
-Results no model turn sent (user shell commands, results written before the
-field existed) hydrate from `content` and `stderr` as before. Settling a
-result again without sent text, as an approval that resumes a waiting call
-does, clears `model_content`; that path already evicts the cached mailbox
-and hydrates cold. Shell output is stored in both fields, so tool results
-take about twice the space in `kernel.db`.
+Results no model turn sent (user shell commands, results written before
+these fields existed) hydrate from `content` and `stderr` as before.
+Settling a result again without them, as an approval that resumes a waiting
+call does, clears both; that path already evicts the cached mailbox and
+hydrates cold. A rendering change affects only results sent after it.
 
 ## Input during a turn
 

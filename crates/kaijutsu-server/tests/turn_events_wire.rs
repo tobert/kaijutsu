@@ -644,6 +644,27 @@ fn a_shell_result_rehydrates_as_the_model_received_it() {
         assert_eq!(sent.len(), 2);
         let wire = serde_json::to_string(&sent[1]).unwrap();
         assert!(wire.contains("hello from kaish"), "the shell ran and its output reached the model: {wire}");
+        // A clean success reaches the model as its output alone
+        // (docs/shell-envelope.md, "What a model turn reads"), so the block
+        // stores that text once and keeps the envelope as its record.
+        let result = server.kernel.blocks().block_snapshots(context).unwrap().into_iter()
+            .find(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.as_deref() == Some("replay-shell"))
+            .expect("the shell result block");
+        let sent_result = sent[1].iter().rev().find_map(|m| match &m.content {
+            kaijutsu_kernel::llm::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                kaijutsu_kernel::llm::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }).expect("the request carries the tool result");
+        assert_eq!(sent_result, "hello from kaish\n");
+        assert_eq!(result.content, "hello from kaish\n");
+        assert_eq!(result.model_content, None, "output equal to content is stored once");
+        let envelope: serde_json::Value = serde_json::from_str(result.shell_envelope.as_deref()
+            .expect("the kaish record is kept")).unwrap();
+        assert_eq!(envelope["status"], "done");
+        assert_eq!(envelope["exit_code"], 0);
+        assert_eq!(envelope["stdout"], "", "the record does not store the output a second time");
         let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
         mailbox.catch_up(&server.kernel.blocks().block_snapshots(context).unwrap());
         let mut expected = sent[1].clone();

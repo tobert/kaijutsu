@@ -1885,6 +1885,12 @@ pub struct BlockSnapshot {
     /// resumes a waiting call). Kernel-side only; not on the wire.
     #[serde(default)]
     pub model_content: Option<String>,
+    /// The shell envelope a `shell` tool returned for this result, as JSON,
+    /// with `stdout`, `stderr` and `error` blank: that text is `content`. The
+    /// record behind what the model was sent; hydration never reads it.
+    /// `None` on results that are not shell envelopes. Kernel-side only.
+    #[serde(default)]
+    pub shell_envelope: Option<String>,
 }
 
 /// Scalar block metadata carried by the `MetadataChanged` flow / wire event.
@@ -2006,6 +2012,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2056,6 +2063,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2118,6 +2126,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2180,6 +2189,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2249,6 +2259,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2306,6 +2317,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2361,6 +2373,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2416,6 +2429,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2467,6 +2481,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2529,6 +2544,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2590,6 +2606,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2650,6 +2667,7 @@ impl BlockSnapshot {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 
@@ -2718,8 +2736,9 @@ impl BlockSnapshot {
         // `edge_block`/`edge_shown` are excluded too: they record where the
         // submitting client's view stood, not what the block says.
         //
-        // `model_content` is excluded: it records what a model was sent,
-        // derived from `content` when the result settled.
+        // `model_content` and `shell_envelope` are excluded: they record what
+        // a model was sent and the result behind it, derived when the result
+        // settled.
     }
 }
 
@@ -2792,6 +2811,7 @@ impl BlockSnapshotBuilder {
                 edge_block: None,
                 edge_shown: None,
                 model_content: None,
+                shell_envelope: None,
             },
         }
     }
@@ -3003,6 +3023,12 @@ impl BlockSnapshotBuilder {
     /// Set the exact text a model turn sent for this tool result.
     pub fn model_content(mut self, sent: impl Into<String>) -> Self {
         self.snap.model_content = Some(sent.into());
+        self
+    }
+
+    /// Set the shell envelope record for this tool result.
+    pub fn shell_envelope(mut self, envelope: impl Into<String>) -> Self {
+        self.snap.shell_envelope = Some(envelope.into());
         self
     }
 

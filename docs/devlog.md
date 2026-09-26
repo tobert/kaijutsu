@@ -1416,7 +1416,26 @@ shell envelope included, and hydration replays it, so a turn's request no
 longer diverges from the last one at its first shell result. On
 backgrounding, Amy: "a tool call runs and returns in order, and if it wants
 to background, the tool call can do that from inside the tool (kaish)"; the
-flag-or-kaish choice is open in `docs/issues.md`.
+flag stays, renamed to `run_in_background` (default false) to match the
+shape models already know.
+
+Then what the model reads. Amy: "I'm not sure always sending json to the
+model is best? sometimes it just wants the output? we should think about how
+to refine what the model gets then freeze that." A shell result now reaches a
+kernel turn as its clean output, with one bracketed line per fact that
+changes the next step (`[exit 2]`, a background receipt, truncation, `kj`
+data), never JSON and never empty. The envelope stays on the block as the
+record, output blank, and the rendered text is stored only when it differs
+from the output. Amy on where it lives: "maybe this shouldn't be rc quite
+yet"; it is kernel code. The earlier prose body had flipped to JSON on empty
+output, so this one always renders text.
+
+Chasing a one-in-ten flake in the new mid-turn tests found an older bug:
+`order_midpoint` could return a key below its lower bound when the lower
+key's next digit was `z`, so a tool result inserted between its call and a
+note at the tail sorted before the call. Per-writer key suffixes made the
+bad digit depend on random principal bytes. A property test over 20,000
+pairs now pins it.
 
 
 ## The tui takes the alternate screen (2026-09-13)

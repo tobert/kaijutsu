@@ -118,6 +118,7 @@ mod tests {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
         }
     }
 

@@ -252,6 +252,9 @@ pub struct BlockContent {
     /// The exact tool-result text a model turn sent; see
     /// [`kaijutsu_types::BlockSnapshot::model_content`].
     model_content: Option<String>,
+    /// The shell envelope record; see
+    /// [`kaijutsu_types::BlockSnapshot::shell_envelope`].
+    shell_envelope: Option<String>,
     source_context: Option<kaijutsu_types::ContextId>,
     source_model: Option<String>,
     drift_kind: Option<kaijutsu_types::DriftKind>,
@@ -308,6 +311,7 @@ impl BlockContent {
             edge_block: None,
             edge_shown: None,
             model_content: None,
+            shell_envelope: None,
             source_context: None,
             source_model: None,
             drift_kind: None,
@@ -364,6 +368,7 @@ impl BlockContent {
         block.edge_block = snap.edge_block;
         block.edge_shown = snap.edge_shown;
         block.model_content = snap.model_content.clone();
+        block.shell_envelope = snap.shell_envelope.clone();
         block.source_context = snap.source_context;
         block.source_model = snap.source_model.clone();
         block.drift_kind = snap.drift_kind;
@@ -704,6 +709,11 @@ impl BlockContent {
         self.model_content = sent;
     }
 
+    /// Set the shell envelope record; `None` clears it.
+    pub fn set_shell_envelope(&mut self, envelope: Option<String>) {
+        self.shell_envelope = envelope;
+    }
+
     /// Set the player's edge (see [`kaijutsu_types::BlockSnapshot::edge_block`]).
     /// Write-once at draft promotion; `None` clears both fields. A
     /// snapshot-only field, like `set_summary`/`set_stderr` above — does not
@@ -782,6 +792,7 @@ impl BlockContent {
             edge_block: self.edge_block,
             edge_shown: self.edge_shown,
             model_content: self.model_content.clone(),
+            shell_envelope: self.shell_envelope.clone(),
         }
     }
 

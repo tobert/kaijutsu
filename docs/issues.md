@@ -938,6 +938,16 @@ refused. Left from the rename:
 - `contrib/bench/rc-variants/coder-driven/` still tells the model to pass
   `foreground: true`, which is now refused. It is the variant the 09-18
   baseline measured; update it before running it again.
+
+## Blocks stored out of order before 855ace8a (2026-09-26)
+
+`order_midpoint` could return a key below its lower bound, so a block
+inserted between two others sorted before its anchor (`855ace8a`). The
+likeliest victim is a tool result sorted before its call, which hydration
+repairs by synthesizing an "interrupted" result and dropping the real one.
+Nothing re-sorts blocks already stored, and no verb moves a block. A scan
+for results that sort before their `tool_call_id` would size it.
+
 ## Async completion recovery follow-ups
 
 - RPC PostCall hooks can replace output/status while the durable exit code

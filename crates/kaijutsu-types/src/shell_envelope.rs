@@ -192,6 +192,55 @@ impl ShellEnvelope {
         self
     }
 
+    /// What a model reads for this result in a kernel turn: `clean` (the
+    /// readable output, as the durable block stores it), then one bracketed
+    /// line for each fact that changes what the model should do next. A clean
+    /// success is its output alone. Always text, never JSON, and never empty:
+    /// a command that printed nothing reads `(no output)`, so every result has
+    /// one shape. See `docs/shell-envelope.md`, "What a model turn reads".
+    pub fn model_text(&self, clean: &str) -> String {
+        let operation = |label: &str| match (&self.operation_id, &self.ask_id) {
+            (Some(op), Some(ask)) => format!("[{label}: operation {op}, ask {ask}]"),
+            (Some(op), None) => format!("[{label}: operation {op}]"),
+            (None, Some(ask)) => format!("[{label}: ask {ask}]"),
+            (None, None) => format!("[{label}]"),
+        };
+        let mut facts = Vec::new();
+        match self.status {
+            ShellStatus::Done => {
+                if let Some(op) = &self.operation_id {
+                    facts.push(format!("[operation {op}]"));
+                }
+            }
+            ShellStatus::Error => facts.push(match self.exit_code {
+                Some(code) => format!("[exit {code}]"),
+                None => "[failed; no exit code]".to_string(),
+            }),
+            ShellStatus::Rejected => facts.push("[rejected: the program did not run]".to_string()),
+            ShellStatus::Running => facts.push(operation("running in the background")),
+            ShellStatus::Waiting => facts.push(operation("waiting for approval; not run yet")),
+            ShellStatus::Timeout => facts.push(operation("timed out waiting; the command may still be running")),
+            ShellStatus::StreamClosed => facts.push(operation("the outcome never arrived")),
+        }
+        if self.did_spill == Some(true) {
+            facts.push("[output truncated]".to_string());
+        }
+        if let Some(data) = &self.data {
+            facts.push(format!("[data] {data}"));
+        }
+        if let Some(latch) = &self.latch {
+            facts.push(format!("[latch] {latch}"));
+        }
+        let mut text = if clean.is_empty() && facts.is_empty() { "(no output)".to_string() } else { clean.to_string() };
+        for fact in facts {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&fact);
+        }
+        text
+    }
+
     /// The keys this envelope always serializes, in declaration order. The
     /// declared output schema is checked against this list, so a new field
     /// cannot reach the wire undocumented.
@@ -268,6 +317,47 @@ mod tests {
     /// A caller scripting against this envelope reads `.exit_code` without
     /// first testing whether the key exists; `skip_serializing_if` anywhere
     /// in this struct would put the shape flip back.
+    #[test]
+    fn a_clean_success_reads_as_its_output_alone() {
+        let mut env = ShellEnvelope::new(ShellStatus::Done);
+        env.exit_code = Some(0);
+        env.elapsed_ms = Some(12);
+        env.block_id = Some("b".into());
+        env.content_type = Some("text/plain".into());
+        assert_eq!(env.model_text("hello\n"), "hello\n");
+        assert_eq!(env.model_text(""), "(no output)", "an empty result still has one shape");
+    }
+
+    #[test]
+    fn a_failure_names_its_exit_after_the_output() {
+        let mut env = ShellEnvelope::new(ShellStatus::Error);
+        env.exit_code = Some(2);
+        assert_eq!(env.model_text("no such file"), "no such file\n[exit 2]");
+        assert_eq!(env.model_text(""), "[exit 2]");
+        env.exit_code = None;
+        assert_eq!(env.model_text("boom\n"), "boom\n[failed; no exit code]");
+    }
+
+    #[test]
+    fn handles_and_structured_facts_ride_below_the_output() {
+        let mut env = ShellEnvelope::new(ShellStatus::Running);
+        env.operation_id = Some("op-1".into());
+        assert_eq!(env.model_text(""), "[running in the background: operation op-1]");
+        let mut env = ShellEnvelope::new(ShellStatus::Waiting);
+        env.operation_id = Some("op-2".into());
+        env.ask_id = Some("ask-9".into());
+        assert_eq!(env.model_text(""), "[waiting for approval; not run yet: operation op-2, ask ask-9]");
+        let mut env = ShellEnvelope::new(ShellStatus::Done);
+        env.exit_code = Some(0);
+        env.did_spill = Some(true);
+        env.data = Some(serde_json::json!(["a", "b"]));
+        env.latch = Some(serde_json::json!({"command": "kj context archive x --confirm"}));
+        assert_eq!(env.model_text("listed\n"),
+            "listed\n[output truncated]\n[data] [\"a\",\"b\"]\n[latch] {\"command\":\"kj context archive x --confirm\"}");
+        assert_eq!(ShellEnvelope::new(ShellStatus::Rejected).model_text("parse error at 1:4"),
+            "parse error at 1:4\n[rejected: the program did not run]");
+    }
+
     #[test]
     fn every_key_is_present_even_when_unset() {
         let v = ShellEnvelope::new(ShellStatus::Done).to_value();

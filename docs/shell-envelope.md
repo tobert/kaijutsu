@@ -82,9 +82,10 @@ claims no physical exit for it, the same as any other hook effect.
 
 ## The body is the envelope
 
-The envelope is what the model reads, not a side channel next to a prose body.
+The envelope is what a tool returns, not a side channel next to a prose body.
 In the kernel it rides `ToolContent::Json`; over MCP it rides both `content`
-text and `structuredContent`.
+text and `structuredContent`. A kernel model turn renders it for the model;
+see "What a model turn reads".
 
 This is what closed the shape flip a worknote reported. The kernel body used
 to be prose — stdout, with stderr and `[exit N]` appended — and the envelope a
@@ -108,12 +109,14 @@ output — `readable_output()`, ANSI-stripped — because a block is read by peo
 in the tui and the app, and replayed by hydration. A JSON object serves
 neither.
 
-The agentic loop splits them (`llm_stream.rs`, step 4a): it recovers the
-envelope from the flattened tool body with `ShellEnvelope::from_tool_result`,
-takes the output for the block, runs the ANSI projection on **that**, and hands
-the model the same cleaned text back inside the envelope
-(`with_clean_output`). Both readers end up with one text and one set of byte
-offsets, which is what every edit and exclusion range depends on.
+The agentic loop splits them (`llm_stream.rs`, `dispatch_recorded_tool_result`):
+it recovers the envelope from the flattened tool body with
+`ShellEnvelope::from_tool_result`, takes the output for the block, runs the
+ANSI projection on **that**, and renders the model's text from the same
+cleaned output (`model_text`). Both readers share one text and one set of
+byte offsets, which is what every edit and exclusion range depends on. The
+block keeps the envelope with its output blank as `shell_envelope`, the
+record behind what the model read.
 
 Recognition is by deserialization, not by tool name: every field is required,
 so a body that is not an envelope cannot be mistaken for one.
@@ -122,6 +125,31 @@ The ANSI order matters and is easy to get backwards. An envelope's JSON spells
 an escape as the six characters `\u001b`, not a raw `0x1b`, so projecting the
 envelope finds nothing and strips nothing — the escapes then reach the model
 inside `stdout`. Project the output, then rebuild the envelope.
+
+## What a model turn reads
+
+A kernel model turn sends `ShellEnvelope::model_text`, not the JSON. It is
+the readable output, then one bracketed line for each fact that changes what
+the model does next:
+
+| Result | Lines after the output |
+|---|---|
+| exit 0, nothing else | none; an empty result reads `(no output)` |
+| nonzero exit | `[exit N]` (`[failed; no exit code]` when none exists) |
+| refused before running | `[rejected: the program did not run]` |
+| background call | `[running in the background: operation ID]` |
+| waiting for approval | `[waiting for approval; not run yet: operation ID, ask ID]` |
+| gave up waiting, stream closed | `[timed out waiting; ...]`, `[the outcome never arrived ...]` |
+| capped output | `[output truncated]` |
+| a `kj` payload or latch | `[data] JSON`, `[latch] JSON` |
+
+`block_id`, `content_type`, `ephemeral`, and `elapsed_ms` are never sent. The
+rendering is always text, including for a command that printed nothing: the
+earlier prose body returned JSON only when output was empty, which is the
+shape flip described above. The turn stores the rendered text as the result's
+`model_content` only when it differs from `content`, and hydration replays it
+(`docs/conversation-session.md`, "Tool results replay as sent"). The MCP
+`shell` tool still returns the full envelope as `structuredContent`.
 
 ## Known gap
 

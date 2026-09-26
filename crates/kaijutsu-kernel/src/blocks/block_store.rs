@@ -1214,6 +1214,19 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Set the shell envelope record on a ToolResult block (see
+    /// [`kaijutsu_types::BlockSnapshot::shell_envelope`]); `None` clears it.
+    pub fn set_shell_envelope(&mut self, id: &BlockId, envelope: Option<String>) -> Result<()> {
+        let block = self
+            .blocks
+            .get_mut(id)
+            .filter(|b| !b.is_deleted())
+            .ok_or(BlockDocumentError::BlockNotFound(*id))?;
+        block.set_shell_envelope(envelope);
+        self.version += 1;
+        Ok(())
+    }
+
     /// Set the exit_code on a ToolResult block. The shell execution path
     /// calls this after the underlying command finishes, capturing the real
     /// exit code instead of truncating to the binary Done/Error status.

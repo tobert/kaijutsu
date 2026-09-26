@@ -102,12 +102,21 @@ pub type BlockStoreResult<T> = Result<T, BlockStoreError>;
 
 /// A tool-result publication, or recovery that preserves its stored content.
 /// Shell fields are absent for a model result carrying its response envelope.
+/// What a model turn records on a tool result beyond its readable `content`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ModelRecord<'a> {
+    /// The exact text the model was sent, when it differs from `content`.
+    pub model_content: Option<&'a str>,
+    /// The shell envelope the tool returned, as JSON with its output blank.
+    pub envelope: Option<&'a str>,
+}
+
 pub(crate) struct ToolResultUpdate<'a> {
     /// None preserves stored text, styles, and provenance during recovery.
     pub content: Option<&'a str>,
-    /// The text a model turn sent for this result. Applied with a
-    /// replacement `content`; `None` then clears it.
-    pub model_content: Option<&'a str>,
+    /// What a model turn recorded beyond the readable text. Applied with a
+    /// replacement `content`; an empty record clears both fields.
+    pub model: ModelRecord<'a>,
     pub status: Status,
     pub is_error: bool,
     pub author: PrincipalId,
@@ -1673,14 +1682,14 @@ impl BlockStore {
     /// transfer rolls back the result acceptance.
     pub(crate) fn settle_tool_result_as(
         &self, context_id: ContextId, call: &BlockId, result: &BlockId,
-        content: &str, model_content: Option<&str>, status: Status, is_error: bool, author: PrincipalId,
+        content: &str, model: ModelRecord<'_>, status: Status, is_error: bool, author: PrincipalId,
         ansi: Option<(Vec<kaijutsu_types::StyleSpan>, &[u8])>, ask: Option<&str>,
     ) -> BlockStoreResult<()> {
         if status == Status::Waiting && ask.is_none() {
             return Err(BlockStoreError::Validation("waiting tool result has no ask".into()));
         }
         self.settle_tool_result_recorded(context_id, call, result,
-            ToolResultUpdate { content: Some(content), model_content, status, is_error, author, ansi, shell: None }, |db| {
+            ToolResultUpdate { content: Some(content), model, status, is_error, author, ansi, shell: None }, |db| {
                 if let Some(ask) = ask {
                     if status == Status::Waiting {
                         db.link_ask_blocks(ask, call, result, crate::PairOwner::Turn)?;
@@ -1702,7 +1711,7 @@ impl BlockStore {
         record: impl FnOnce(&KernelDb) -> crate::kernel_db::KernelDbResult<()>,
     ) -> BlockStoreResult<()> {
         if self.journaling_db()?.is_none() { return Err(BlockStoreError::NoDatabaseConfigured); }
-        let ToolResultUpdate { content, model_content, status, is_error, author, ansi, shell } = update;
+        let ToolResultUpdate { content, model, status, is_error, author, ansi, shell } = update;
         if content.is_none() && ansi.is_some() {
             return Err(BlockStoreError::Validation("ANSI projection requires replacement text".into()));
         }
@@ -1727,7 +1736,8 @@ impl BlockStore {
             if let Some(content) = content {
                 entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
                 entry.doc.set_style_spans(result, spans.clone(), tag.clone())?;
-                entry.doc.set_model_content(result, model_content.map(str::to_owned))?;
+                entry.doc.set_model_content(result, model.model_content.map(str::to_owned))?;
+                entry.doc.set_shell_envelope(result, model.envelope.map(str::to_owned))?;
             }
             if let Some(fields) = shell {
                 entry.doc.set_stderr(result, fields.stderr)?;
@@ -5737,19 +5747,25 @@ mod tests {
         let result = store.insert_tool_result_as(ctx, &call, Some(&call), "", Status::Running,
             None, None, Some(PrincipalId::system()), Some("sent-1".into())).unwrap();
         let sent = r#"{"stdout":"hi\n","exit_code":0}"#;
-        store.settle_tool_result_as(ctx, &call, &result, "hi\n", Some(sent), Status::Done, false,
+        let envelope = r#"{"stdout":"","status":"done","exit_code":0}"#;
+        store.settle_tool_result_as(ctx, &call, &result, "hi\n",
+            ModelRecord { model_content: Some(sent), envelope: Some(envelope) }, Status::Done, false,
             PrincipalId::system(), None, None).unwrap();
 
         let replayed = replay_journal(&db, ctx);
         let snapshot = replayed.get_block_snapshot(&result).expect("result after replay");
         assert_eq!(snapshot.model_content.as_deref(), Some(sent),
             "the text a model was sent must survive a restart replay");
+        assert_eq!(snapshot.shell_envelope.as_deref(), Some(envelope),
+            "the kaish record must survive a restart replay");
         assert_eq!(snapshot.content, "hi\n", "people still read the clean output");
 
-        store.settle_tool_result_as(ctx, &call, &result, "resumed", None, Status::Done, false,
+        store.settle_tool_result_as(ctx, &call, &result, "resumed", ModelRecord::default(), Status::Done, false,
             PrincipalId::system(), None, None).unwrap();
-        assert_eq!(store.get_block_snapshot(ctx, &result).unwrap().unwrap().model_content, None,
+        let resettled = store.get_block_snapshot(ctx, &result).unwrap().unwrap();
+        assert_eq!(resettled.model_content, None,
             "a later settlement no model turn sent must not replay stale text");
+        assert_eq!(resettled.shell_envelope, None, "nor keep a stale record");
     }
 
     #[tokio::test]
@@ -6362,7 +6378,7 @@ mod tests {
         let BlockFlow::Inserted { block, .. } = events.try_recv().unwrap().payload else { panic!("result insert") };
         assert_eq!(block.status, Status::Running, "never publish an empty completed result");
         store.arm_accept_fault(1);
-        assert!(store.settle_tool_result_as(context, &call, &result, "失敗", None, Status::Error, true,
+        assert!(store.settle_tool_result_as(context, &call, &result, "失敗", ModelRecord::default(), Status::Error, true,
             PrincipalId::system(), None, None).is_err());
         assert!(events.try_recv().is_none(), "refused acceptance publishes no partial result");
         for id in [&call, &result] { assert_eq!(store.get_block_snapshot(context, id).unwrap().unwrap().status, Status::Running); }
@@ -6370,7 +6386,7 @@ mod tests {
         let raw = "\x1b[31m失敗\x1b[0m";
         let projection = crate::ansi_ingest::project(raw.as_bytes()).unwrap();
         let styles = Some((projection.spans, raw.as_bytes()));
-        store.settle_tool_result_as(context, &call, &result, &projection.text, None, Status::Error, true,
+        store.settle_tool_result_as(context, &call, &result, &projection.text, ModelRecord::default(), Status::Error, true,
             PrincipalId::system(), styles, None).unwrap();
         let accepted: Vec<_> = std::iter::from_fn(|| events.try_recv()).map(|event| event.payload).collect();
         assert_eq!(accepted.len(), 5);

@@ -1690,24 +1690,31 @@ async fn dispatch_recorded_tool_result(
     make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
         ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
 
-    // The model receives the shell envelope, and an error result carries its
-    // Error child's envelope too; people read the clean output. The result
-    // stores what the model receives, which hydration replays verbatim.
+    // People read the clean output; the model reads it rendered with the facts
+    // that change its next step (`ShellEnvelope::model_text`), plus the Error
+    // child's envelope for an error result. The result stores the rendered
+    // text only when it differs from the output, and keeps the shell envelope
+    // (output blank) as its record; hydration replays what the model read.
     // Project the actual output once so both readers get clean text.
     let envelope = ShellEnvelope::from_tool_result(&content);
     let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
     let ansi = crate::ansi_ingest::project(source.as_bytes());
     let block_content = ansi.as_ref().map_or(source.as_str(), |projection| projection.text.as_str());
-    let mut model_content = match envelope {
-        Some(env) => env.with_clean_output(block_content).to_value().to_string(),
+    let mut model_content = match &envelope {
+        Some(env) => env.model_text(block_content),
         None => block_content.to_owned(),
     };
     if let Some(payload) = &payload {
         model_content.push_str("\n\n");
         model_content.push_str(&kaijutsu_types::format_error_payload_for_llm(payload, &payload.summary_line()));
     }
+    let record = envelope.map(|env| env.with_clean_output("").to_value().to_string());
     let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
-    documents.settle_tool_result_as(context_id, &call, &result, block_content, Some(&model_content),
+    documents.settle_tool_result_as(context_id, &call, &result, block_content,
+        crate::block_store::ModelRecord {
+            model_content: (model_content != block_content).then_some(model_content.as_str()),
+            envelope: record.as_deref(),
+        },
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
     let anchor = if let Some(payload) = payload {
@@ -2573,7 +2580,7 @@ async fn run_llm_stream(
                     // Settle the pair rather than writing the result alone:
                     // the call block reaches a final status the same way every
                     // other dispatched call does.
-                    documents.settle_tool_result_as(context_id, &call, &answer, &detail, None,
+                    documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
                         Status::Error, true, PrincipalId::system(), None, None)?;
                     last_block_id = answer;
                     invalid_tool_calls.push((id, name, input, detail));
@@ -7282,11 +7289,15 @@ mod lifetime_tests {
                 result
             };
             assert!(!result.is_error);
-            let model = ShellEnvelope::from_tool_result(&result.content).unwrap();
-            assert_eq!(model.stdout, "red");
-            assert_eq!(model.data, Some(serde_json::json!({"phase": 3})));
+            // The model reads the clean output with the facts rendered below
+            // it (docs/shell-envelope.md, "What a model turn reads").
+            assert_eq!(result.content, "red\n[data] {\"phase\":3}", "inline={inline}");
             let block = kernel.blocks().get_block_snapshot(context, &anchor).unwrap().unwrap();
             assert_eq!(block.content, "red");
+            assert_eq!(block.model_content.as_deref(), Some(result.content.as_str()), "inline={inline}");
+            let record = ShellEnvelope::from_tool_result(block.shell_envelope.as_deref().unwrap()).unwrap();
+            assert_eq!(record.data, Some(serde_json::json!({"phase": 3})));
+            assert_eq!(record.stdout, "", "the record does not store the output a second time");
             assert_eq!(block.status, Status::Done);
             assert!(!block.style_spans.is_empty());
             assert!(block.provenance.is_some());
@@ -7648,6 +7659,17 @@ mod lifetime_tests {
         serde_json::to_value(messages).unwrap()
     }
 
+    /// Assert two wires match, naming the first message that differs.
+    fn assert_same_wire(replayed: &[LlmMessage], sent: &[LlmMessage]) {
+        let (replayed, sent) = (wire(replayed), wire(sent));
+        let (replayed, sent) = (replayed.as_array().unwrap(), sent.as_array().unwrap());
+        if let Some(i) = (0..replayed.len().max(sent.len())).find(|&i| replayed.get(i) != sent.get(i)) {
+            let brief = |messages: &[serde_json::Value]| messages.iter()
+                .map(|m| m.to_string().chars().take(160).collect::<String>()).collect::<Vec<_>>().join("\n  ");
+            panic!("message {i} differs\nreplayed:\n  {}\nsent:\n  {}", brief(replayed), brief(sent));
+        }
+    }
+
     /// What a fresh hydration of the whole log would send.
     fn rehydrated(kernel: &Kernel, context: ContextId) -> Vec<LlmMessage> {
         let mut mailbox = crate::ConversationMailbox::new();
@@ -7694,7 +7716,7 @@ mod lifetime_tests {
         // The durable log hydrates to the same wire the turn sent.
         let mut expected = request.clone();
         expected.push(LlmMessage::assistant("ack"));
-        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
@@ -7728,8 +7750,7 @@ mod lifetime_tests {
         assert_eq!(user_text(request.last().unwrap()), Some("a note"), "{request:#?}");
         let mut expected = request.clone();
         expected.push(LlmMessage::assistant("ack"));
-        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected),
-            "the replayed answer keeps its signed reasoning, as hydration does");
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
@@ -7889,7 +7910,7 @@ mod lifetime_tests {
         assert!(mentions(&sent[1], "a sibling's finding"), "{:#?}", sent[1]);
         let mut expected = sent[1].clone();
         expected.push(LlmMessage::assistant("ack"));
-        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
