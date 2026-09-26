@@ -1655,7 +1655,7 @@ async fn dispatch_recorded_tool_result(
     let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
     let ansi = crate::ansi_ingest::project(source.as_bytes());
     let block_content = ansi.as_ref().map_or(source.as_str(), |projection| projection.text.as_str());
-    let model_content = match envelope {
+    let mut model_content = match envelope {
         Some(env) => env.with_clean_output(block_content).to_value().to_string(),
         None => block_content.to_owned(),
     };
@@ -1664,7 +1664,14 @@ async fn dispatch_recorded_tool_result(
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
     let anchor = if let Some(payload) = payload {
-        documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
+        let error = documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?;
+        // Hydration folds the error child into its result (`llm/hydrate.rs`);
+        // send the same text now so the next request extends this one.
+        let snapshot = documents.get_block_snapshot(context_id, &error)?
+            .ok_or(crate::block_store::BlockStoreError::BlockNotFoundAfterInsert)?;
+        model_content.push_str("\n\n");
+        model_content.push_str(&kaijutsu_types::format_error_for_llm(&snapshot));
+        error
     } else { result };
     Ok((InlineToolResult { content: model_content, is_error }, anchor))
 }
@@ -7605,22 +7612,6 @@ mod lifetime_tests {
         serde_json::to_value(messages).unwrap()
     }
 
-    /// `wire` with tool-result bodies blanked. Hydration folds a result's
-    /// Error child into its text, which the live turn never sends
-    /// (docs/issues.md, "A rehydrated tool error differs from the live one").
-    fn wire_shape(messages: &[LlmMessage]) -> serde_json::Value {
-        let mut wire = wire(messages);
-        for message in wire.as_array_mut().unwrap() {
-            let Some(blocks) = message.pointer_mut("/content/Blocks").and_then(|b| b.as_array_mut()) else { continue };
-            for block in blocks {
-                if let Some(content) = block.pointer_mut("/ToolResult/content") {
-                    *content = serde_json::Value::Null;
-                }
-            }
-        }
-        wire
-    }
-
     /// What a fresh hydration of the whole log would send.
     fn rehydrated(kernel: &Kernel, context: ContextId) -> Vec<LlmMessage> {
         let mut mailbox = crate::ConversationMailbox::new();
@@ -7667,7 +7658,7 @@ mod lifetime_tests {
         // The durable log hydrates to the same wire the turn sent.
         let mut expected = request.clone();
         expected.push(LlmMessage::assistant("ack"));
-        assert_eq!(wire_shape(&rehydrated(&kernel, context)), wire_shape(&expected));
+        assert_eq!(wire(&rehydrated(&kernel, context)), wire(&expected));
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

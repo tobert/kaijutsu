@@ -933,16 +933,25 @@ queued." Left:
   today; after a future abort path, the context's next turn would panic
   at `open_ingress`.
 
-## A rehydrated tool error differs from the live one (2026-09-26)
+## A rehydrated shell result differs from the live one (2026-09-26)
 
-Hydration folds a tool result's Error child block into the result text as
-an `<error …>` envelope (`llm/hydrate.rs`, the `BlockKind::Error` arm). The
-live turn sends the result text without it. The next turn's request
-therefore differs from the one before at the first errored tool result, and
-the prompt cache misses from there. Found by the rehydration check in
-`lifetime_tests::a_note_sent_during_a_tool_round_joins_the_next_request`,
-which blanks tool-result bodies until this is fixed. Pick one form and send
-it both ways.
+A model's shell tool call is sent live as the `ShellEnvelope` JSON (status,
+exit code, operation id, clean output), but its `ToolResult` block stores
+only the readable output, and hydration replays that
+(`llm/hydrate.rs`, the `(Tool, ToolResult)` arm; `runtime/llm_stream.rs`,
+`dispatch_recorded_tool_result`). The cached mailbox folds each finished
+turn through hydration, so every turn's request diverges from the one
+before at the previous turn's first shell result: that span is billed
+uncached once per turn, and the model reads two shapes of its own history.
+The async-receipt entry under "What the cap-free banto review showed" is
+the same gap from the other side (replay loses the operation id).
+
+Two ways out, both needing Amy: store the exact wire text on the result
+block for hydration to prefer (a snapshot field, journaled), or rebuild the
+envelope from block fields (not byte-identical: `elapsed_ms` is not
+stored). The error-child envelope had the same shape and now goes out live
+too (`lifetime_tests::a_note_sent_during_a_tool_round_joins_the_next_request`
+pins full wire equality for an errored call).
 
 ## Async completion recovery follow-ups
 
@@ -2427,6 +2436,15 @@ was printed. Same pool (2d829c9d) and the same class of cross-thread
 placement as the ignored same-context ordering test. Queued work that
 vanishes at shutdown loses a settlement, so treat it as a bug until a run
 shows otherwise.
+
+Second failure, 2026-09-26, full run, passed six times alone: this time
+the task's own assert fired, "queued work must receive the stopped token",
+on `kernel-runtime-2`, while the blocked first task held another thread.
+The third task was placed on an idle thread and ran before
+`stop_runtime_worker`, so it never queued behind the blocked task; the
+settlement failure followed from its panic. That points at the test's
+premise (one queue behind the blocked task) rather than at lost work. Check
+whether the 09-22 run was the same placement before closing this.
 
 ## Egress: what stays open (2026-09-21)
 

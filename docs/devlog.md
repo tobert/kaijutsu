@@ -1385,8 +1385,10 @@ tempting to special-case into consequences: the edge notification rides
 with its message, and a note that reached the model through the log before
 its submit finished offering it costs no extra turn. Two lessons. The
 rehydration check in the new test caught a cache miss unrelated to input:
-a tool error rehydrates with an envelope the live turn never sent
-(`docs/issues.md`). And the old yield pushed a plain assistant message,
+a tool error rehydrated with an envelope the live turn never sent. The
+live result now carries it; the larger form of the same gap, shell results
+sent as an envelope but replayed as plain output, waits on a storage
+decision (`docs/issues.md`). And the old yield pushed a plain assistant message,
 dropping signed reasoning, which only mattered once a turn could continue
 past its final text. The continuation reuses the ceiling path's replay, and
 its test goes red when the plain push comes back.
