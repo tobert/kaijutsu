@@ -814,3 +814,69 @@ fn the_draft_rides_the_change_feed() {
         );
     });
 }
+
+/// A draft submitted while a model turn runs joins that turn, with its edge
+/// notification, at the turn's next tool round; it does not queue a turn of
+/// its own. The draft is typed before the turn hydrates, so the turn's
+/// mailbox folds it while it is still a draft, and submitting promotes that
+/// same block id (`docs/conversation-session.md`, "Input during a turn").
+#[test]
+fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
+    run_local(async {
+        use kaijutsu_kernel::VfsOps;
+        use kaijutsu_kernel::llm::{MessageContent, MockClient, Provider, Role as WireRole, stream::StreamEvent};
+
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let vfs = live_kernel.kernel.vfs();
+        let body = vfs.read_all(std::path::Path::new("/config/rc/lib/submit/S10-edge.kai")).await
+            .expect("the shipped example is seeded");
+        vfs.write_all(std::path::Path::new("/config/rc/default/submit/S10-edge.kai"), &body).await
+            .expect("link the example into the default type");
+        let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "round".into(), name: "missing_tool".into(), input: serde_json::json!({}) }, done("tool_use")],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
+        ]).recording_sent_messages();
+        let (mock, hold) = mock.holding_call(0);
+        live_kernel.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let context_id = open_context(&kernel, "draft-joins-turn").await;
+        seed_turn_identity(&live_kernel, context_id);
+        let earlier = live_kernel.documents.insert_block(context_id, None, None, Role::Model, BlockKind::Text,
+            "An earlier reply.", Status::Done, ContentType::Plain).unwrap();
+
+        let session = live_kernel.kernel.turns().conversations().get_or_create(context_id);
+        let held = session.lock().await;
+        kernel.edit_input(context_id, 0, "go", 0).await.unwrap();
+        kernel.submit_input_with_edge(context_id, false, None).await.unwrap();
+        kernel.edit_input(context_id, 0, "a note", 0).await.unwrap();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), hold.entered.notified()).await
+            .expect("the turn reaches its first inference");
+
+        kernel.submit_input_with_edge(context_id, false, Some(InputEdge { block: earlier, shown: None }))
+            .await.unwrap();
+        hold.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !blocks(&kernel, context_id).await.iter().any(|b| b.content == "ack" && b.status == Status::Done) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the turn finishes");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2, "the note rides the running turn; no turn of its own");
+        let texts: Vec<&str> = sent[1].iter().filter(|m| m.role == WireRole::User).filter_map(|m| match &m.content {
+            MessageContent::Text(text) => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        let note = texts.iter().position(|t| *t == "a note")
+            .unwrap_or_else(|| panic!("the note reaches the next request: {:#?}", sent[1]));
+        assert!(texts[note + 1..].iter().any(|t| t.contains("The player wrote the message above")),
+            "its edge notification follows it: {texts:#?}");
+        assert!(live_kernel.kernel.turns().active_count(context_id) == 0);
+    });
+}

@@ -910,10 +910,10 @@ queued." Left:
   too"). A drift or completion notice that lands in the log would call
   `TurnState::offer_input` with its block; nothing else changes. Until
   then they reach a running turn only when a submit's delivery carries them.
-- **Not watched live.** Kernel tests drive the `Text` source through the
-  real startup path. No test drives a draft submit with a linked
-  `submit/S10-edge.kai`, whose notification should arrive in the same
-  delivery. Watch it in the tui first.
+- **Not watched live.** A wire test drives a draft submit with the linked
+  `S10-edge.kai` through a held turn
+  (`compose_draft_wire::a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge`);
+  nobody has yet sent a note from the tui or app during a real turn.
 - **A running shell pair in the delivered span is skipped for good.** The
   write point moves past a user shell command whose result has not
   arrived; the result lands before the write point, so this turn never
