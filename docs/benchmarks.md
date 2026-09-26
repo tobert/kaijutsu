@@ -363,6 +363,8 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-18 | `kj-tb2-armB-driven` | `05d77c21…` → built from `7cd1593d` | deepseek-v4-flash | `coder-driven` overlay, autonomous, 32768 ceiling, multiplier 1 | 20 (tb2-subset) | 15 (0.75) | 3.89M | 0 | 0 | 4 | line present 17/20; done and solved 14, done but failed 2, blocked and failed 1 |
 | 2026-09-18 | `kj-tb2-armC-lost6-ceilingfix` | `d5d21d59…` → `413b9ce0` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1, ran beside arm B | 6 (the tasks arm A lost) | 5 | 4.64M | 0 | 0 | 1 | no verdict line in this arm |
 | 2026-09-18 | `ctl-tb2-miniswe` (control) | mini-swe-agent as Harbor installs it | deepseek/deepseek-v4-flash | step limit 100, cost limit $0.25 per task, multiplier 1, ran beside arm A | 20 (tb2-subset) | 18 (0.90) | 1.79M | n/a | n/a | 2 | n/a |
+| 2026-09-26 | `kj-tb2-render-envelope` | `bc27a61f…` → `855ace8a` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1, shell results as the JSON envelope, ran beside the plain arm | 20 (tb2-subset) | 16 (0.80) | 4.35M | 0 | 0 | 5 | no verdict line in this arm |
+| 2026-09-26 | `kj-tb2-render-plain` | `01f5b424…` → `0e88658c` | deepseek-v4-flash | same, shell results as plain text (`model_text`) | 20 (tb2-subset) | 17 (0.85) | 3.40M | 0 | 0 | 4 | no verdict line in this arm |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -418,6 +420,15 @@ What is supported:
   make the three abnormal endings visible the same way.
 - **Under the sandbox gate nothing asks**, so these runs say nothing about the
   approval path. The host-loop findings in `docs/issues.md` stand.
+
+- **Plain shell results cost fewer tokens than the envelope** (2026-09-26,
+  the two `render` rows). Same binary but the rendering, run side by side:
+  total tokens 92.3M to 69.4M, tokens per solved task 5.77M to 4.08M,
+  inferences 1012 to 909, tool calls 1313 to 1116, repeated identical
+  commands 35 to 19. Plain was cheaper on 14 of 20 paired tasks (sign test
+  p about 0.12), and the median per task moved less (2.79M to 2.55M), so a
+  few long tasks carry most of it. Solves (16 and 17) are inside the noise.
+  `~/src/bench-work/arms/compare_arms.py` produced the comparison.
 
 Left unmeasured: the Rust polyglot slice (`contrib/bench/analysis/polyglot-rust.md`)
 has not been run with a model; the turn-loop fix has not had a full 20-task
