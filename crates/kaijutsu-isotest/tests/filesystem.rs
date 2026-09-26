@@ -145,7 +145,7 @@ fn write_existing_file_to_readonly_mount_fails_clean_and_does_not_poison_later_r
 
         let probe = "/opt/isotest-ro-existing-probe.txt";
         // Seed the file via a REAL host process — bypasses the VFS entirely
-        // (a foreground `shell` call would route `echo >` through kaish's own
+        // (a `shell` call would route `echo >` through kaish's own
         // VFS-backed redirect builtin, which would refuse on this exact
         // read-only mount before the test even starts).
         std::fs::write(probe, "on-disk-original").expect("seed read-only probe");

@@ -45,22 +45,19 @@ pub struct ShellParams {
     /// stdin ignores it.
     #[serde(default)]
     pub stdin: Option<String>,
-    /// Wait for command completion and result hooks. Defaults to `true`.
-    /// A result review returns a pending refusal; inspect its captured and
-    /// final results with `kj ledger show` after the reviewer answers.
+    /// Return immediately with an operation receipt instead of waiting for
+    /// command completion and result hooks. Defaults to `false`, which waits:
+    /// a result review then returns a pending refusal; inspect its captured
+    /// and final results with `kj ledger show` after the reviewer answers.
     ///
-    /// Pass `false` for long-running work: an asynchronous command runs the
-    /// same complete kaish program as a foreground command, with the same
+    /// Pass `true` for long-running work: an asynchronous command runs the
+    /// same complete kaish program as a call that waits, with the same
     /// context identity, tools, mounts, variables, working directory, and
     /// external-command policy. It returns a stable operation receipt
     /// without waiting for completion; read, wait, or cancel it through the
     /// shell operation API.
-    #[serde(default = "default_true")]
-    pub foreground: bool,
-}
-
-fn default_true() -> bool {
-    true
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 // The kaish-language guidance (word-splitting, globs, `case`/`esac`,
@@ -269,7 +266,7 @@ impl McpServerLike for ShellServer {
                     return Ok(envelope_result(env));
                 }
             };
-            spec.publishes_pair = ctx.publishes_pair || !parsed.foreground;
+            spec.publishes_pair = ctx.publishes_pair || parsed.run_in_background;
             let caller = crate::kj::KjCaller {
                 principal_id: ctx.principal_id,
                 actor_id: ctx.actor_id,
@@ -309,13 +306,13 @@ impl McpServerLike for ShellServer {
                         "an allowed gate outcome reached the refusal path"
                     ),
                 };
-                if kind == RefusalKind::Pending && !parsed.foreground {
+                if kind == RefusalKind::Pending && parsed.run_in_background {
                     let ask = outcome.ask.as_ref().expect("a pending gate outcome has an ask");
                     crate::runtime::tool_command::create_operation(
                         dispatcher.kernel(), ctx, &parsed.command, Some(&ask.request_id),
                     ).map_err(McpError::Protocol)?;
                 }
-                if kind == RefusalKind::Pending && !parsed.foreground {
+                if kind == RefusalKind::Pending && parsed.run_in_background {
                     let receipt = dispatcher.kernel().shell_operations().get_by_ask(
                         &outcome.ask.as_ref().expect("pending gate outcome has an ask").request_id,
                         ctx.context_id,
@@ -355,7 +352,7 @@ impl McpServerLike for ShellServer {
         crate::runtime::tool_command::ToolCommand {
             slot, admission,
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
-            code: parsed.command, stdin: parsed.stdin, foreground: parsed.foreground, read_only: self.read_only,
+            code: parsed.command, stdin: parsed.stdin, background: parsed.run_in_background, read_only: self.read_only,
         }.execute(cancel).await
     }
 
@@ -373,13 +370,25 @@ mod tests {
     use crate::mcp::{InstancePolicy, KernelCallParams};
     use kaijutsu_types::{ContextId, PrincipalId, SessionId};
 
-    /// Omitting `foreground` must deserialize to `true` — the model waits
-    /// for completion unless it opts into a receipt for long-running work.
+    /// Omitting `run_in_background` must deserialize to `false` — the model
+    /// waits for completion unless it opts into a receipt for long-running
+    /// work.
     #[test]
-    fn shell_params_omitted_foreground_defaults_to_true() {
+    fn shell_params_omitted_run_in_background_defaults_to_false() {
         let parsed: ShellParams =
             serde_json::from_value(serde_json::json!({"command": "echo hi"})).unwrap();
-        assert!(parsed.foreground, "omitting foreground must wait for completion by default");
+        assert!(!parsed.run_in_background, "omitting run_in_background must wait for completion by default");
+    }
+
+    /// The retired `foreground` flag must be refused loudly, not silently
+    /// ignored — `foreground: false` used to mean "run in the background",
+    /// and ignoring it would run long work in the foreground instead.
+    #[test]
+    fn shell_params_rejects_the_retired_foreground_flag() {
+        let error = serde_json::from_value::<ShellParams>(
+            serde_json::json!({"command": "echo hi", "foreground": false}),
+        ).unwrap_err();
+        assert!(error.to_string().contains("run_in_background"), "{error}");
     }
 
     #[tokio::test]
@@ -506,7 +515,7 @@ mod tests {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
             tool: ShellServer::TOOL.to_string(),
-            arguments: serde_json::json!({ "command": command, "foreground": true }),
+            arguments: serde_json::json!({ "command": command, "run_in_background": false }),
         }
     }
 
@@ -516,18 +525,17 @@ mod tests {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
             tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({ "command": command, "foreground": true }),
+            arguments: serde_json::json!({ "command": command, "run_in_background": false }),
         }
     }
 
-    /// `foreground` now defaults to `true`, so these callers ask for the
-    /// background path explicitly — `foreground: false` — rather than
-    /// relying on omission the way they could before the default flipped.
+    /// Explicit background calls — `run_in_background: true` — distinct from
+    /// `call`/`call_write`'s explicit wait.
     fn call_async(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
             tool: ShellServer::TOOL.to_string(),
-            arguments: serde_json::json!({ "command": command, "foreground": false }),
+            arguments: serde_json::json!({ "command": command, "run_in_background": true }),
         }
     }
 
@@ -535,13 +543,13 @@ mod tests {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
             tool: ShellServer::TOOL_WRITE.to_string(),
-            arguments: serde_json::json!({ "command": command, "foreground": false }),
+            arguments: serde_json::json!({ "command": command, "run_in_background": true }),
         }
     }
 
-    /// Params with no `foreground` key at all — the omission a caller hits
-    /// under the new default (`ShellParams`'s `#[serde(default =
-    /// "default_true")]`), distinct from `call_async`'s explicit opt-out.
+    /// Params with no `run_in_background` key at all — the omission a caller
+    /// hits under the default (`ShellParams`'s `#[serde(default)]`), distinct
+    /// from `call_async`'s explicit opt-in.
     fn call_omitted(command: &str) -> KernelCallParams {
         KernelCallParams {
             instance: InstanceId::new(ShellServer::INSTANCE),
@@ -1686,11 +1694,11 @@ mod tests {
     /// A full worker pool refuses a gated `shell_write` before the gate
     /// writes its ask or the pending path registers a receipt
     /// (`docs/resource-admission.md`, rule 1). Background calls once
-    /// returned Waiting with no reservation at all; foreground calls were
+    /// returned Waiting with no reservation at all; calls that wait were
     /// refused after the ask was already durable and redeemable.
     #[tokio::test]
     async fn full_pool_refuses_gated_shell_write_before_any_ask_or_receipt() {
-        for foreground in [true, false] {
+        for run_in_background in [false, true] {
             let (broker, d) = wired().await;
             let principal = PrincipalId::new();
             let context = crate::kj::test_helpers::register_rooted_context(&d, Some("pool-full-gate"), principal);
@@ -1701,23 +1709,23 @@ mod tests {
             let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
             let releases = d.kernel().fill_runtime_pool_for_test().await;
             let mut params = call_write("echo nobody-answers");
-            params.arguments["foreground"] = serde_json::json!(foreground);
+            params.arguments["run_in_background"] = serde_json::json!(run_in_background);
             let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
             drop(releases);
             let asks = d.kernel_db().lock().list_pending_asks().unwrap();
             d.kernel().shutdown_runtime_worker().await.unwrap();
             let error = result.expect_err("a full pool must refuse, not wait on an ask");
-            assert!(error.to_string().contains("at capacity"), "foreground={foreground}: {error}");
-            assert!(asks.is_empty(), "foreground={foreground}: a refused call left an ask: {asks:?}");
+            assert!(error.to_string().contains("at capacity"), "run_in_background={run_in_background}: {error}");
+            assert!(asks.is_empty(), "run_in_background={run_in_background}: a refused call left an ask: {asks:?}");
             assert!(d.kernel().shell_operations().list_for_context(context).unwrap().is_empty(),
-                "foreground={foreground}: a refused call left a receipt");
+                "run_in_background={run_in_background}: a refused call left a receipt");
         }
     }
 
     #[tokio::test]
     async fn archived_context_refuses_both_shell_tools_without_receipts() {
         for read_only in [true, false] {
-            for foreground in [true, false] {
+            for run_in_background in [true, false] {
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("archived-tool"), principal);
@@ -1729,7 +1737,7 @@ mod tests {
                 let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id())
                     .with_actor(principal, Some(PrincipalId::new()));
                 let mut params = if read_only { call("echo must-not-run") } else { call_write("echo must-not-run") };
-                params.arguments["foreground"] = serde_json::json!(foreground);
+                params.arguments["run_in_background"] = serde_json::json!(run_in_background);
                 let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
                 d.kernel().shutdown_runtime_worker().await.unwrap();
                 let error = result.expect_err("archived context cannot start a new shell tool");
@@ -1743,7 +1751,7 @@ mod tests {
     #[tokio::test]
     async fn shell_state_writeback_respects_read_only_policy() {
         for read_only in [true, false] {
-            for foreground in [true, false] {
+            for run_in_background in [false, true] {
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
                 let context = crate::kj::test_helpers::register_rooted_context(&d, Some("tool-state"), principal);
@@ -1760,12 +1768,12 @@ mod tests {
                     answer_pending_ask(d.kernel_db().clone(), true);
                 }
                 let mut params = if read_only { call(code) } else { call_write(code) };
-                params.arguments["foreground"] = foreground.into();
+                params.arguments["run_in_background"] = run_in_background.into();
                 let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
                 let body = body_of(&result);
-                let envelope = if foreground { body } else {
+                let envelope = if run_in_background {
                     wait_for_operation(&d, context, body["operation_id"].as_str().unwrap()).await.envelope.unwrap().to_value()
-                };
+                } else { body };
                 assert_eq!(envelope["stdout"], "kept\n");
                 let env = d.kernel_db().lock().get_context_env(context).unwrap();
                 assert_eq!(env.iter().find(|row| row.key == "TOOL_STATE").map(|row| row.value.as_str()),
@@ -1929,7 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn result_review_checkpoint_failure_leaves_no_actionable_ask() {
         use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern, AskSpec};
-        for foreground in [false, true] {
+        for run_in_background in [true, false] {
             for table in ["shell_result_reviews", "shell_result_review_asks"] {
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
@@ -1948,9 +1956,9 @@ mod tests {
                     "CREATE TRIGGER fail_checkpoint BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected checkpoint fault'); END;"
                 )).unwrap();
                 let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
-                let params = if foreground { call("echo captured") } else { call_async("echo captured") };
+                let params = if run_in_background { call_async("echo captured") } else { call("echo captured") };
                 let result = broker.call_tool(params, &cc, CancellationToken::new()).await;
-                if foreground {
+                if !run_in_background {
                     let Err(McpError::Refused(refusal)) = result else { panic!("failed checkpoint must refuse review") };
                     assert!(refusal.reason.contains("injected checkpoint fault"), "{refusal:?}");
                 } else {
@@ -1974,9 +1982,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_result_reviews_retain_execution_for_foreground_and_background_calls() {
+    async fn tool_result_reviews_retain_execution_for_waiting_and_background_calls() {
         use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern, AskSpec};
-        for foreground in [false, true] {
+        for run_in_background in [true, false] {
             for decision in ["deny", "allow", "cancel", "shutdown", "panic"] {
                 let allow = decision == "allow";
                 let (broker, d) = wired().await;
@@ -2004,14 +2012,16 @@ mod tests {
                         action, priority, kaish_script_id: None });
                 }
                 drop(hooks);
-                let params = if foreground { call("echo captured") } else { call_async("echo captured") };
+                let params = if run_in_background { call_async("echo captured") } else { call("echo captured") };
                 let cancel = CancellationToken::new();
                 let result = tokio::time::timeout(std::time::Duration::from_secs(5),
                     broker.call_tool(params, &cc, cancel.clone())).await.expect("review releases the tool call");
-                let operation = if foreground {
+                let operation = if run_in_background {
+                    Some(body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned())
+                } else {
                     assert!(matches!(result, Err(McpError::Refused(ref r)) if r.kind == RefusalKind::Pending));
                     None
-                } else { Some(body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned()) };
+                };
                 let ask = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         let asks = d.kernel_db().lock().list_pending_asks().unwrap();
@@ -2068,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn result_hooks_settle_the_command_instead_of_replacing_its_receipt() {
         use crate::mcp::{HookAction, HookEntry, HookId, GlobPattern};
-        for (foreground, input) in [(false, ""), (false, "captured input"), (true, "captured input")] {
+        for (run_in_background, input) in [(true, ""), (true, "captured input"), (false, "captured input")] {
             let (broker, d) = wired().await;
             let principal = PrincipalId::new();
             let context = register_context(&d, Some("settled-tool"), None, principal);
@@ -2086,10 +2096,10 @@ mod tests {
                     content: vec![ToolContent::Text("replacement".into())], structured: Some(replacement.clone()) }),
             });
             let params = KernelCallParams { instance: InstanceId::new(ShellServer::INSTANCE), tool: "shell".into(),
-                arguments: serde_json::json!({"command": "cat", "stdin": input, "foreground": foreground}) };
+                arguments: serde_json::json!({"command": "cat", "stdin": input, "run_in_background": run_in_background}) };
             let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
             let body = body_of(&result);
-            let settled = if foreground { body } else {
+            let settled = if run_in_background {
                 assert_eq!(body["status"], "running", "PostCall must not replace an admission receipt");
                 let id = body["operation_id"].as_str().unwrap();
                 let state = wait_for_operation(&d, context, id).await;
@@ -2105,7 +2115,7 @@ mod tests {
                 assert_eq!(output.content, "replacement");
                 assert_eq!(output.output.unwrap().rich_json, Some(replacement.clone()));
                 state.envelope.unwrap().to_value()
-            };
+            } else { body };
             assert_eq!(settled["stdout"], "replacement");
             assert_eq!(settled["data"], replacement);
             assert!(settled["exit_code"].is_null(), "replacement has no physical exit");
@@ -2323,40 +2333,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_true_keeps_the_completed_result_contract() {
+    async fn run_in_background_false_keeps_the_completed_result_contract() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let context = register_context(&d, Some("explicit-foreground"), None, principal);
+        let context = register_context(&d, Some("explicit-wait"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
-        let result = broker.call_tool(call("echo foreground"), &cc, CancellationToken::new()).await.unwrap();
+        let result = broker.call_tool(call("echo explicit-wait"), &cc, CancellationToken::new()).await.unwrap();
         assert_eq!(body_of(&result)["status"], serde_json::json!("done"));
-        assert!(streams_of(&result).contains("foreground"));
+        assert!(streams_of(&result).contains("explicit-wait"));
         assert!(body_of(&result)["operation_id"].is_null());
     }
 
     /// The default itself, exercised through the broker: a call that omits
-    /// `foreground` entirely must behave exactly like `foreground: true` —
-    /// the finished envelope, not a receipt — because that is what the new
-    /// default means. Falsified by a broker call returning `running` with an
-    /// `operation_id` for an omitted field.
+    /// `run_in_background` entirely must behave exactly like
+    /// `run_in_background: false` — the finished envelope, not a receipt —
+    /// because that is what the default means. Falsified by a broker call
+    /// returning `running` with an `operation_id` for an omitted field.
     #[tokio::test]
-    async fn omitted_foreground_waits_for_completion_by_default() {
+    async fn omitted_run_in_background_waits_for_completion_by_default() {
         let (broker, d) = wired().await;
         let principal = PrincipalId::new();
-        let context = register_context(&d, Some("default-foreground"), None, principal);
+        let context = register_context(&d, Some("default-run-in-background"), None, principal);
         let mut binding = ContextToolBinding::new();
         binding.grant(Capability::Facade("shell".into()));
         broker.set_binding(context, binding).await.unwrap();
         let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
-        let result = broker.call_tool(call_omitted("echo default-foreground"), &cc, CancellationToken::new()).await.unwrap();
+        let result = broker.call_tool(call_omitted("echo default-run-in-background"), &cc, CancellationToken::new()).await.unwrap();
         assert_eq!(body_of(&result)["status"], serde_json::json!("done"),
-            "omitting foreground must wait for completion, not return a receipt: {result:?}");
-        assert!(streams_of(&result).contains("default-foreground"));
+            "omitting run_in_background must wait for completion, not return a receipt: {result:?}");
+        assert!(streams_of(&result).contains("default-run-in-background"));
         assert!(body_of(&result)["operation_id"].is_null(),
-            "a foreground-by-default call must not mint an operation receipt");
+            "a call that omits run_in_background must not mint an operation receipt");
     }
 
 }

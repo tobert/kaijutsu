@@ -1355,7 +1355,7 @@ mod tests {
                 let call = CallContext::new(principal, context, kaijutsu_types::SessionId::new(), shared.id);
                 let result = shared.kernel.broker().call_tool(KernelCallParams {
                     instance: InstanceId::new("builtin.shell"), tool: "shell".into(),
-                    arguments: serde_json::json!({"command": "echo started; sleep 30; echo never", "foreground": false}),
+                    arguments: serde_json::json!({"command": "echo started; sleep 30; echo never", "run_in_background": true}),
                 }, &call, tokio_util::sync::CancellationToken::new()).await.unwrap();
                 let id = result.structured.unwrap()["operation_id"].as_str().unwrap().to_owned();
                 let state = shared.kernel.shell_operations().get(&id, context).unwrap().unwrap();

@@ -585,7 +585,7 @@ mod tests {
             let result = d.kernel().broker().call_tool(KernelCallParams {
                 instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE),
                 tool: "shell".into(),
-                arguments: serde_json::json!({"command": command, "foreground": true}),
+                arguments: serde_json::json!({"command": command, "run_in_background": false}),
             }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
             let text = format!("{result:?}");
             if !result.is_error || !text.contains("read-only") {
@@ -601,7 +601,7 @@ mod tests {
             "kj help", "kj context create help", "kj synth status", "kj synth help", "kj synth --help"] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
                 instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE), tool: "shell".into(),
-                arguments: serde_json::json!({"command": command, "foreground": true}),
+                arguments: serde_json::json!({"command": command, "run_in_background": false}),
             }, &call_context, tokio_util::sync::CancellationToken::new()).await.unwrap();
             if result.is_error { failed_reads.push(format!("{command}: {result:?}")); }
         }

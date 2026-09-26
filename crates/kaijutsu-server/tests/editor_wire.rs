@@ -522,7 +522,7 @@ fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
         ] {
             let quoted = command.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
             let (_, content, status) = common::shell_exec_wait(&kernel,
-                &format!("shell --foreground --command \"{quoted}\""), context).await;
+                &format!("shell --command \"{quoted}\""), context).await;
             assert_eq!(status, kaijutsu_types::Status::Error, "{command}: {content}");
             assert!(content.contains("read-only"), "{command}: {content}");
         }
@@ -530,7 +530,7 @@ fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
         assert_eq!(unchanged.text, original.text);
         assert_eq!(unchanged.dirty, original.dirty);
         let (_, content, status) = common::shell_exec_wait(&kernel,
-            "shell --foreground --command 'kj editor list'", context).await;
+            "shell --command 'kj editor list'", context).await;
         assert_eq!(status, kaijutsu_types::Status::Done, "{content}");
         let direct = kernel.editor_keys(session, ":r !echo direct-read<CR>").await.unwrap();
         assert_eq!(direct.text, format!("direct-read\n{}", original.text));

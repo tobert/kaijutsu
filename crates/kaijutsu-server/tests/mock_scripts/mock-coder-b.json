@@ -1,6 +1,6 @@
 [
   [
-    {"ToolUse": {"id": "coder-b-1", "name": "shell_write", "input": {"command": "kj drift push banto 'report: done'", "foreground": true}}},
+    {"ToolUse": {"id": "coder-b-1", "name": "shell_write", "input": {"command": "kj drift push banto 'report: done'", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [

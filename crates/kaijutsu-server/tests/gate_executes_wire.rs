@@ -226,13 +226,13 @@ impl Seats {
         &self,
         context: ContextId,
         command: &str,
-        foreground: bool,
+        run_in_background: bool,
     ) -> Result<kaijutsu_kernel::ExecResult, kaijutsu_kernel::mcp::McpError> {
         self.native_tool(
             context,
             SessionId::new(),
             "shell_write",
-            serde_json::json!({ "command": command, "foreground": foreground }),
+            serde_json::json!({ "command": command, "run_in_background": run_in_background }),
         )
         .await
     }
@@ -240,7 +240,7 @@ impl Seats {
     /// The native `shell_write` call refuses with `Pending` and leaves one
     /// durable ask carrying `command` as its `exec_source`; return that ask.
     async fn raise(&self, command: &str) -> String {
-        let refusal = self.native_shell_write(self.worker, command, true).await;
+        let refusal = self.native_shell_write(self.worker, command, false).await;
         assert!(
             refusal.is_err(),
             "a gated shell_write must refuse rather than run: {refusal:?}"
@@ -1059,7 +1059,7 @@ fn default_async_shell_write_waits_then_approval_fills_its_operation_pair() {
         let code = format!("echo async-approved > {}", marker.display());
 
         let receipt = s
-            .native_shell_write(s.worker, &code, false)
+            .native_shell_write(s.worker, &code, true)
             .await
             .expect("default async shell_write returns a waiting receipt");
         assert!(receipt.success, "waiting is not an execution error: {receipt:?}");
@@ -1299,7 +1299,7 @@ fn an_archived_context_runs_nothing_after_its_ask_is_answered() {
         let mut binding = s.kernel.kernel.broker().binding(&blocker_ctx).await.unwrap();
         binding.grant(kaijutsu_kernel::mcp::Capability::Exec);
         s.kernel.kernel.broker().set_binding(blocker_ctx, binding).await.unwrap();
-        let blocker_refusal = s.native_shell_write(blocker_ctx, "/bin/sleep 5", true).await;
+        let blocker_refusal = s.native_shell_write(blocker_ctx, "/bin/sleep 5", false).await;
         assert!(blocker_refusal.is_err(), "the blocker must be gated too");
         let blocker_ask = s
             .kernel
@@ -2004,7 +2004,7 @@ fn native_shell_result_review_survives_submitter_disconnect() {
             s.worker,
             session,
             "shell",
-            serde_json::json!({ "command": "echo captured MCP output", "foreground": false }),
+            serde_json::json!({ "command": "echo captured MCP output", "run_in_background": true }),
         ).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&receipt.stdout).unwrap();
         assert_eq!(body["status"], "running");

@@ -309,8 +309,8 @@ These are source observations, not promises that all paths behave alike.
   owner. Its server declares execution-owned result hooks; other MCP servers
   keep broker-owned hooks. PreCall stays in the broker. PostCall/OnError observe
   actual execution using the original tool name and arguments, not an admission
-  receipt. Background calls return only after job attachment; foreground result
-  reviews return a typed Pending refusal while retaining execution.
+  receipt. Background calls return only after job attachment; result reviews
+  for a call that waits return a typed Pending refusal while retaining execution.
   Background job streams expose raw output after each completed statement;
   final job results and receipts include result-hook effects. A hook replacement
   never fills an otherwise empty raw stream.
@@ -492,7 +492,7 @@ remove the obsolete API in the same change as its final caller.
 | Retired | Generic `callMcpTool` | Reserved wire ordinal 58 | Client tests use retained shell submissions; native broker fixtures preserve tool-specific behavior; the uncancellable dispatch wrapper is deleted |
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
-| Partial | Model/MCP foreground and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
+| Partial | Model/MCP waiting and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
 | Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; durable script admission, full returned results, atomic projections, retry/restart without replay, and truthful committed-state failures |
 | Migrated | Hook bodies | kernel `mcp/broker.rs`, `runtime/dry_run.rs`, command result review | Contextual identity/session, snapshot versus path-read semantics, internal output/verdict protocol, real timeout, owner cancellation with joined cleanup, recursion-depth propagation, retained result review, admitted advisory work, and owned notification emission |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
@@ -657,8 +657,8 @@ adapters must have a named deletion step and must not become permanent aliases.
 4. **Consolidate command settlement (owner migration in progress).** Runtime
    owns block-pair execution, result projections, and atomic shell-state
    write-back; server helper dependencies are removed. Introduce one outcome and projection
-   path, then migrate interactive, streaming, structured `kj`, model foreground,
-   model background, and approved-resume callers. Remove server-to-`rpc.rs`
+   path, then migrate interactive, streaming, structured `kj`, model calls
+   that wait, model background calls, and approved-resume callers. Remove server-to-`rpc.rs`
    helper dependencies and duplicate MCP completion logic (both removed). Preserve caller
    policies rather than erasing their differences to make parity tests pass.
 5. **Finish runtime ownership.** Move headless turn execution, interruption,

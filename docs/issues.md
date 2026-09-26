@@ -924,21 +924,20 @@ async it should go as soon as possible and not have a new turn queued";
   today; after a future abort path, the context's next turn would panic
   at `open_ingress`.
 
-## Model shell backgrounding: flag or kaish (Amy, 2026-09-26)
+## Model shell backgrounding: `run_in_background` (Amy, 2026-09-26)
 
-Amy: "what should happen is a tool call runs and returns in order, and if
-it wants to background, the tool call can do that from inside the tool
-(kaish) as needed." Today the model's `shell` tool takes `foreground:
-false`, which mints an operation receipt, returns it in order, and later
-delivers a completion notice; that is Claude Code's `run_in_background`
-shape. Its replay gap (empty stored result) and its delivery gap (notices
-could not reach a running turn) are both closed as of 2026-09-26
-(`docs/conversation-session.md`, "Tool results replay as sent" and "Input
-during a turn"). A kaish `cmd &` inside an ordinary call starts a kaish
-job without a receipt or notice. The lead recommends keeping the flag;
-moving backgrounding into kaish would mean mapping kaish jobs to receipts.
-Amy's call.
+Amy: "keep the foreground flag, we'll probably reverse its wording soon so
+it's default background: false". The shell tools now take
+`run_in_background` (default `false`); an old `foreground` argument is
+refused. Left from the rename:
 
+- `contrib/bench/analysis/classify_run.py` and `summarize_job.py` count
+  `shell_tool_calls_foreground_true` by reading `foreground` from recorded
+  transcripts. New runs carry `run_in_background`; teach the scripts both
+  keys before comparing a new run against the 09-18 baselines.
+- `contrib/bench/rc-variants/coder-driven/` still tells the model to pass
+  `foreground: true`, which is now refused. It is the variant the 09-18
+  baseline measured; update it before running it again.
 ## Async completion recovery follow-ups
 
 - RPC PostCall hooks can replace output/status while the durable exit code

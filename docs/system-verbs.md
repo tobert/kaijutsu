@@ -113,10 +113,10 @@ What exists:
   It is scoped by context and survives a materialized shell instance.
 - Each context owns one kaish `JobManager`. Materialized shells in that context
   share its jobs; a job cannot appear in another context's job list.
-- A `shell` call waits for the completed result by default (`foreground:
-  true`). `foreground: false` runs the same complete kaish program
-  asynchronously, returning the operation receipt and writing its output
-  block when that program completes.
+- A `shell` call waits for the completed result by default
+  (`run_in_background: false`). `run_in_background: true` runs the same
+  complete kaish program asynchronously, returning the operation receipt and
+  writing its output block when that program completes.
 - The turn-liveness registry, which `kj system status` now reads.
 
 What is missing is a **`kj system ps` roster**. An rc hook speaks kaish and

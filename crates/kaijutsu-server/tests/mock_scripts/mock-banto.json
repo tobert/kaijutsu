@@ -1,6 +1,6 @@
 [
   [
-    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj fork --name lane-a && kj fork --name lane-b && kj context set lane-a --as coder-a --model mock/mock-coder-a && kj context set lane-b --as coder-b --model mock/mock-coder-b", "foreground": true}}},
+    {"ToolUse": {"id": "banto-1", "name": "shell_write", "input": {"command": "kj fork --name lane-a && kj fork --name lane-b && kj context set lane-a --as coder-a --model mock/mock-coder-a && kj context set lane-b --as coder-b --model mock/mock-coder-b", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
@@ -10,11 +10,11 @@
     {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    {"ToolUse": {"id": "banto-3", "name": "shell_write", "input": {"command": "kj drive lane-a --prompt 'report status' && kj drive lane-b --prompt 'report status'", "foreground": true}}},
+    {"ToolUse": {"id": "banto-3", "name": "shell_write", "input": {"command": "kj drive lane-a --prompt 'report status' && kj drive lane-b --prompt 'report status'", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    {"ToolUse": {"id": "banto-4", "name": "shell_write", "input": {"command": "kj wait lane-a --timeout 20 && kj wait lane-b --timeout 20", "foreground": true}}},
+    {"ToolUse": {"id": "banto-4", "name": "shell_write", "input": {"command": "kj wait lane-a --timeout 20 && kj wait lane-b --timeout 20", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
@@ -24,7 +24,7 @@
     {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    {"ToolUse": {"id": "banto-5", "name": "shell_write", "input": {"command": "kj handoff note --for banto 'lanes landed'", "foreground": true}}},
+    {"ToolUse": {"id": "banto-5", "name": "shell_write", "input": {"command": "kj handoff note --for banto 'lanes landed'", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
@@ -34,7 +34,7 @@
     {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    {"ToolUse": {"id": "banto-6", "name": "shell_write", "input": {"command": "echo gate-approved-for-real", "foreground": true}}},
+    {"ToolUse": {"id": "banto-6", "name": "shell_write", "input": {"command": "echo gate-approved-for-real", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
@@ -44,7 +44,7 @@
     {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    {"ToolUse": {"id": "banto-7", "name": "shell_write", "input": {"command": "kj handoff signoff 'rotating'", "foreground": true}}},
+    {"ToolUse": {"id": "banto-7", "name": "shell_write", "input": {"command": "kj handoff signoff 'rotating'", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [

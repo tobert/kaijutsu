@@ -125,7 +125,7 @@ fn shell_returns_stdout() {
 
         let out = mcp
             .shell_impl(ShellRequest {
-                foreground: true,
+                run_in_background: false,
                 command: "echo hello".to_string(),
                 timeout_secs: Some(30),
             }, None)
@@ -155,14 +155,14 @@ fn shell_returns_stdout() {
     });
 }
 
-/// `foreground` defaults to `true`: a call that omits it entirely must wait
-/// for completion and return the finished envelope, not a receipt.
+/// `run_in_background` defaults to `false`: a call that omits it entirely
+/// must wait for completion and return the finished envelope, not a receipt.
 #[test]
-fn shell_omitted_foreground_waits_for_completion() {
+fn shell_omitted_run_in_background_waits_for_completion() {
     run_local(async {
         let addr = start_server().await;
         let mcp = connect_mcp(addr).await;
-        register_with_retry(&mcp, "omitted-foreground").await;
+        register_with_retry(&mcp, "omitted-run-in-background").await;
 
         let request: ShellRequest = serde_json::from_value(serde_json::json!({
             "command": "echo hello",
@@ -175,9 +175,9 @@ fn shell_omitted_foreground_waits_for_completion() {
     });
 }
 
-/// Omitting `foreground` now waits for completion (see
-/// `shell_omitted_foreground_waits_for_completion` above) — this exercises
-/// the background path through its explicit opt-out instead.
+/// Omitting `run_in_background` now waits for completion (see
+/// `shell_omitted_run_in_background_waits_for_completion` above) — this
+/// exercises the background path through its explicit opt-in instead.
 #[test]
 fn shell_explicit_background_returns_a_receipt_and_wait_observes_completion() {
     run_local(async {
@@ -186,7 +186,7 @@ fn shell_explicit_background_returns_a_receipt_and_wait_observes_completion() {
         register_with_retry(&mcp, "async-receipt").await;
         let request = serde_json::from_value(serde_json::json!({
             "command": "sleep 3; echo async-finished",
-            "foreground": false,
+            "run_in_background": true,
         })).unwrap();
         let started = std::time::Instant::now();
         let out = mcp.shell_impl(request, None).await;
@@ -196,7 +196,7 @@ fn shell_explicit_background_returns_a_receipt_and_wait_observes_completion() {
         let operation = receipt["operation_id"].as_str().expect("operation id");
         let out = mcp.shell_impl(ShellRequest {
             command: format!("kj wait --operation {operation} --timeout 15"),
-            foreground: true,
+            run_in_background: false,
             timeout_secs: Some(20),
         }, None).await;
         let completion = out.structured_content.expect("wait result");
@@ -247,7 +247,7 @@ fn shell_survives_dead_event_feed() {
         let started = std::time::Instant::now();
         let out = mcp
             .shell_impl(ShellRequest {
-                foreground: true,
+                run_in_background: false,
                 // MUST be slow enough that the first completion poll misses.
                 // This test was `echo still-alive` and went VACUOUS the moment
                 // the poll started querying the server instead of the local
@@ -329,7 +329,7 @@ fn shell_returns_full_nontrivial_stdout() {
         const WANT_BYTES: usize = 4096;
         let out = mcp
             .shell_impl(ShellRequest {
-                foreground: true,
+                run_in_background: false,
                 command: format!("head -c {WANT_BYTES} /dev/zero | tr '\\0' 'a'"),
                 timeout_secs: Some(30),
             }, None)
@@ -371,7 +371,7 @@ fn shell_returns_nonzero_exit_code() {
 
         let out = mcp
             .shell_impl(ShellRequest {
-                foreground: true,
+                run_in_background: false,
                 command: "exit 17".to_string(),
                 timeout_secs: Some(30),
             }, None)
@@ -408,7 +408,7 @@ fn shell_sequential_commands() {
         for n in 1..=3 {
             let out = mcp
                 .shell_impl(ShellRequest {
-                foreground: true,
+                run_in_background: false,
                     command: format!("echo line{n}"),
                     timeout_secs: Some(30),
                 }, None)
@@ -456,8 +456,8 @@ fn published_shell_retains_broker_output() {
             let quoted = command.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$");
             let result = client.call_tool(CallToolRequestParams::new("shell").with_arguments(
                 serde_json::json!({
-                    "command": format!("shell --command \"{quoted}\" --foreground"),
-                    "foreground": true, "timeout_secs": 30,
+                    "command": format!("shell --command \"{quoted}\""),
+                    "run_in_background": false, "timeout_secs": 30,
                 }).as_object().unwrap().clone(),
             )).await.unwrap();
             let envelope = result.structured_content.expect("shell envelope");

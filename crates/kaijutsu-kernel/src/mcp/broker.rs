@@ -4747,7 +4747,7 @@ mod tests {
             kernel: kernel.clone(), broker: kernel.broker().clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
-            code: "echo never".into(), stdin: None, foreground: false, read_only: false,
+            code: "echo never".into(), stdin: None, background: true, read_only: false,
         }.execute(CancellationToken::new());
         let mut call = Box::pin(call);
         assert!(futures::poll!(&mut call).is_pending());
@@ -4791,7 +4791,7 @@ mod tests {
             kernel: kernel.clone(), broker: broker.clone(), kaish,
             params: Broker::shell_write_hook_params("echo never"),
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
-            code: "echo never".into(), stdin: None, foreground: false, read_only: false,
+            code: "echo never".into(), stdin: None, background: true, read_only: false,
         }.execute(CancellationToken::new());
         let mut call = Box::pin(call);
         assert!(futures::poll!(&mut call).is_pending());

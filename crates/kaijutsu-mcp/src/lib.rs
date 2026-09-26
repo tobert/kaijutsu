@@ -1333,7 +1333,7 @@ impl KaijutsuMcp {
             }
         };
         let cmd_block_id = submission.command_block_id;
-        if !req.foreground || submission.refusal.is_some() {
+        if req.run_in_background || submission.refusal.is_some() {
             let mut envelope = ShellEnvelope::new(if submission.refusal.is_some() {
                 ShellStatus::Waiting
             } else {
@@ -1794,7 +1794,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set foreground=false to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. Foreground commands preserve durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error. Unknown values are null. Requires --connect and register_session.",
+        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set run_in_background=true to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. A call that waits for completion preserves durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error. Unknown values are null. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]

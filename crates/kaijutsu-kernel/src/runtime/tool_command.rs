@@ -40,7 +40,7 @@ pub(crate) struct ToolCommand {
     pub call: CallContext,
     pub code: String,
     pub stdin: Option<String>,
-    pub foreground: bool,
+    pub background: bool,
     pub read_only: bool,
 }
 
@@ -48,16 +48,16 @@ impl ToolCommand {
     pub(crate) async fn execute(self, cancel: CancellationToken) -> McpResult<KernelToolResult> {
         debug_assert_eq!(self.admission.context(), self.call.context_id);
         let policy = self.broker.policy_of(&self.params.instance).await.unwrap_or_default();
-        let receipt = if self.foreground { None } else {
+        let receipt = if self.background {
             Some(create_operation(&self.kernel, &self.call, &self.code, None).map_err(McpError::Protocol)?)
-        };
+        } else { None };
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (reply, completed) = tokio::sync::oneshot::channel();
         let (notices, mut reviews) = tokio::sync::mpsc::unbounded_channel();
         let completion_receipt = receipt.clone();
         let failure_kernel = self.kernel.clone();
-        let foreground = self.foreground;
-        let task_cancel = if foreground { cancel.child_token() } else { CancellationToken::new() };
+        let background = self.background;
+        let task_cancel = if background { CancellationToken::new() } else { cancel.child_token() };
         let cancel_guard = task_cancel.clone().drop_guard();
         let span = tracing::Span::current();
         let hook_depth = crate::mcp::broker::current_hook_depth();
@@ -69,7 +69,7 @@ impl ToolCommand {
                     context_switch: CommandContextSwitch::Pinned,
                     hooks: Some(CommandHooks { broker: &self.broker, params: &self.params, max_result_bytes: policy.max_result_bytes }),
                     state_writeback: if self.read_only { ShellStateWriteBack::Discard } else { ShellStateWriteBack::Persist },
-                    job_output: if foreground { CommandJobOutput::Settled } else { CommandJobOutput::LiveExecution },
+                    job_output: if background { CommandJobOutput::LiveExecution } else { CommandJobOutput::Settled },
                     cancel: Some(task_cancel), job_ready: Some(ready_tx), review_notices: Some(notices),
                 };
                 let execute = async { match &completion_receipt {
@@ -195,7 +195,7 @@ mod setup_tests {
                 continuation_epoch: Some(17), env: vec![],
             }, true).unwrap();
             let command = kernel.blocks().insert_tool_call_as(context, None, None, "shell",
-                serde_json::json!({"command": "echo captured", "foreground": true}), None,
+                serde_json::json!({"command": "echo captured", "run_in_background": false}), None,
                 Some(actor), Some("model-call-1".into()), None).unwrap();
             let output = kernel.blocks().insert_tool_result_as(context, &command, Some(&command), "",
                 Status::Running, None, None, Some(PrincipalId::system()), Some("model-call-1".into())).unwrap();

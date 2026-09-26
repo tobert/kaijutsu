@@ -946,7 +946,7 @@ Result reviews belong to their retained command owner and are excluded here.
 Callers declare whether they publish a pair before the gate creates an ask.
 That expectation commits with the ask in `approval_pair_handoffs`. Model calls,
 interactive pre-call hooks, authored structured calls and asynchronous shell
-operations declare it; quiet, streaming and direct foreground calls have no
+operations declare it; quiet, streaming and direct calls that wait have no
 pair to publish. A paired caller releases delivery in the same transaction as
 its Waiting result, complete ask link and receipt. A bare link or a terminal
 caller failure does not release execution. Publication emits a ledger-change

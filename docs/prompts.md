@@ -212,8 +212,8 @@ supersede a handoff. Directed briefing text remains positional:
 
 The coder stance tells a model to keep a task checkpoint while it works and to
 record every unfinished operation ID and ask ID before it yields or signs off.
-Shell work waits for completion by default (`foreground: true`). Pass
-`foreground: false` for long-running work: its stable receipt names the
+Shell work waits for completion by default (`run_in_background: false`). Pass
+`run_in_background: true` for long-running work: its stable receipt names the
 operation and any ask; completion arrives as a separate fact.
 
 `kj wait` observes an operation, ask, or kaish job. It does not control that

@@ -575,7 +575,7 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         // The retained shell invokes the native shell_write tool, whose gate
         // records the authenticated identity on its pending ask.
         let submission = worker_kj
-            .shell_submit("shell_write --command 'echo should-not-run' --foreground", worker_ctx, true)
+            .shell_submit("shell_write --command 'echo should-not-run'", worker_ctx, true)
             .await
             .unwrap();
         assert!(!submission.operation_id.is_empty(), "the retained shell submission needs an operation id");

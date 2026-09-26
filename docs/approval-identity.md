@@ -298,9 +298,9 @@ superseded request need explicit linkage so rotation does not duplicate work.
 - A pending gate returns immediately. The model loop receives its tool result
   and can continue, including writing a handoff; pending does not itself force
   the turn to stop.
-- Shell uses `foreground: true` by default and waits for the result. Both
-  modes execute kaish and use the same gate. An unknown old `background`
-  parameter is rejected. `foreground: false` returns a stable, non-error
+- Shell uses `run_in_background: false` by default and waits for the result.
+  Both modes execute kaish and use the same gate. An unknown old `foreground`
+  parameter is rejected. `run_in_background: true` returns a stable, non-error
   receipt with `operation_id` instead of waiting; a gate receipt may also
   carry `ask_id` and status `waiting`.
 - The original model receipt stays `done`. The operation has a separate,
