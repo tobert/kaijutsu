@@ -6569,6 +6569,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kaijutsu-client",
+ "kaijutsu-server",
+ "kaijutsu-types",
+ "tempfile",
+ "tokio",
+ "whoami",
+]
+
+[[package]]
 name = "kaijutsu-client"
 version = "0.1.0"
 dependencies = [

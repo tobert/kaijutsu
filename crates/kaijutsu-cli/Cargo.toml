@@ -1,0 +1,23 @@
+[package]
+name = "kaijutsu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "kjc: run one kj verb or one shell command against a running kernel, and exit"
+
+[[bin]]
+name = "kjc"
+path = "src/main.rs"
+
+[dependencies]
+kaijutsu-client = { workspace = true, features = ["cli"] }
+kaijutsu-types.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+whoami.workspace = true
+
+[dev-dependencies]
+kaijutsu-server.workspace = true
+tempfile.workspace = true
