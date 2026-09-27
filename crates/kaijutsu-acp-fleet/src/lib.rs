@@ -7,15 +7,22 @@
 //! every expectation that did not hold. See `docs/acp-fleet.md`.
 //!
 //! - [`client`]: a reusable ACP v1 client over a child process's stdio.
+//! - [`classifier`]: a scripted classifier for the gate's advisory hook.
+//! - [`container`]: the podman commands contained scenarios run with.
 //! - [`scenario`]: the scenario file format.
 //! - [`run`]: runs one scenario and judges it.
 
+pub mod classifier;
 pub mod client;
+pub mod container;
 pub mod run;
 pub mod scenario;
 
-/// The scenarios shipped with this crate.
+/// The host-mode scenarios shipped with this crate.
 pub const FLEET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet");
+
+/// The contained-mode scenarios shipped with this crate.
+pub const CONTAINED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/contained");
 
 /// Where scratch state goes by default: a real disk under `$HOME/src`, which
 /// the kernel mounts read-write. `/tmp` on this host is a small tmpfs.

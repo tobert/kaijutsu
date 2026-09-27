@@ -114,6 +114,8 @@ pub struct ToolCallSeen {
     pub kind: Option<String>,
     pub status: Option<String>,
     pub raw_input: Option<Value>,
+    /// The text of every `content` entry reported for the call, joined.
+    pub output: String,
 }
 
 /// A running ACP agent and the client state around it.
@@ -262,18 +264,26 @@ impl AcpClient {
         Ok(message.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Read and handle messages until `done` holds or `within` passes.
-    /// Returns whether `done` held. Responses to requests nobody is waiting
-    /// for are kept for a later [`Self::wait_response`].
-    pub fn pump_until(&mut self, within: Duration, what: &str, mut done: impl FnMut(&Self) -> bool) -> Result<bool> {
+    /// Read and handle messages until none has arrived for `quiet`. Fails
+    /// when the agent is still talking after `within`.
+    pub fn pump_until_quiet(&mut self, quiet: Duration, within: Duration, what: &str) -> Result<()> {
         let deadline = Instant::now() + within;
-        while !done(self) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(false);
+        let mut last = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now.duration_since(last) >= quiet {
+                return Ok(());
             }
-            match self.lines.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            if now >= deadline {
+                bail!(
+                    "the agent was still sending messages {within:?} after {what}\n--- agent stderr (tail) ---\n{}",
+                    self.stderr_tail()
+                );
+            }
+            let wait = (last + quiet).min(deadline).saturating_duration_since(now);
+            match self.lines.recv_timeout(wait) {
                 Ok(line) => {
+                    last = Instant::now();
                     if self.trace {
                         eprintln!("acp-fleet <- {line}");
                     }
@@ -287,12 +297,11 @@ impl AcpClient {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => bail!(
-                    "the agent closed stdout while we waited for {what}\n--- agent stderr (tail) ---\n{}",
+                    "the agent closed stdout after {what}\n--- agent stderr (tail) ---\n{}",
                     self.stderr_tail()
                 ),
             }
         }
-        Ok(true)
     }
 
     /// Send a request and wait for its result.
@@ -470,6 +479,14 @@ fn select_option(params: &Value, prefix: &str) -> Option<String> {
     })
 }
 
+/// The text of a tool call update's `content` entries, joined.
+fn content_text(update: &Value) -> String {
+    let Some(entries) = update.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+    entries.iter().filter_map(|e| e.pointer("/content/text").and_then(Value::as_str)).collect()
+}
+
 /// Every `agent_message_chunk` text in `updates`, joined.
 pub fn agent_text(updates: &[Value]) -> String {
     updates
@@ -494,6 +511,7 @@ pub fn tool_calls(updates: &[Value]) -> Vec<ToolCallSeen> {
                 kind: field("kind"),
                 status: field("status"),
                 raw_input: update.get("rawInput").cloned(),
+                output: content_text(update),
             }),
             Some("tool_call_update") => {
                 if let Some(call) = calls.iter_mut().find(|c| c.id == id) {
@@ -509,6 +527,7 @@ pub fn tool_calls(updates: &[Value]) -> Vec<ToolCallSeen> {
                     if let Some(input) = update.get("rawInput") {
                         call.raw_input = Some(input.clone());
                     }
+                    call.output.push_str(&content_text(update));
                 }
             }
             _ => {}
@@ -542,13 +561,15 @@ mod tests {
             update(json!({"sessionUpdate": "tool_call", "toolCallId": "a", "title": "write", "kind": "edit", "status": "pending"})),
             update(json!({"sessionUpdate": "tool_call", "toolCallId": "b", "title": "shell", "status": "pending"})),
             update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "completed"})),
-            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "b", "status": "failed"})),
+            update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "b", "status": "failed",
+                "content": [{"type": "content", "content": {"type": "text", "text": "refused: use shell_write"}}]})),
         ];
         let calls = tool_calls(&updates);
         let summary: Vec<(&str, Option<&str>)> =
             calls.iter().map(|c| (c.title.as_str(), c.status.as_deref())).collect();
         assert_eq!(summary, vec![("write", Some("completed")), ("shell", Some("failed"))]);
         assert_eq!(calls[0].kind.as_deref(), Some("edit"));
+        assert_eq!(calls[1].output, "refused: use shell_write");
     }
 
     #[test]

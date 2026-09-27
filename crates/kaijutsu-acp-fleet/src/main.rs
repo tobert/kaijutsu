@@ -22,7 +22,8 @@ enum Command {
     /// Run scenarios and print PASS or FAIL for each. Exits 1 when any fails.
     Run {
         /// Scenario files, or directories whose *.toml files are scenarios.
-        /// Default: the fleet shipped with this crate.
+        /// Default: the host scenarios shipped with this crate; contained ones
+        /// are in its fleet/contained directory.
         scenarios: Vec<PathBuf>,
         /// The agent binary: kaijutsu-solo-acp built with --features test-mock.
         /// Default: kaijutsu-solo-acp next to this binary.

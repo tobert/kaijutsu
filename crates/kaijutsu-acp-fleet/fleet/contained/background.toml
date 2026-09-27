@@ -1,0 +1,21 @@
+description = "Contained yolo: a background shell_write finishes after the turn ends, and its completion notice starts a follow-up turn."
+
+mode = "contained"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "sleep 1; git --version > git-version.txt", run_in_background = true } }]
+[[model]]
+text = "started it"
+# Only the completion notice starts this turn.
+[[model]]
+text = "the background job finished"
+
+[[prompt]]
+text = "record the git version in the background"
+text_contains = ["started it", "the background job finished"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell", status = "completed" }]
+
+[[verify]]
+script = """
+grep -q '^git version ' git-version.txt
+"""

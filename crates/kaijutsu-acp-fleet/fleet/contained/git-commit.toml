@@ -1,0 +1,35 @@
+description = "Contained yolo: the model runs real git through shell_write with no asks, and a script verifier reads the commit back."
+
+mode = "contained"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "git init -q" } }]
+[[model]]
+tool_calls = [{ name = "write", input = { path = "hello.txt", content = "hello from the fleet\n" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "git add hello.txt" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "git commit -q -m 'fleet: first commit'" } }]
+[[model]]
+text = "committed"
+
+[[prompt]]
+text = "put hello.txt under git and commit it"
+text_contains = ["committed"]
+tool_calls = [
+  { title = "shell_write", status = "completed" },
+  { title = "write", status = "completed" },
+  { title = "shell_write", status = "completed" },
+  { title = "shell_write", status = "completed" },
+]
+
+[[verify]]
+path = "hello.txt"
+equals = "hello from the fleet\n"
+
+[[verify]]
+script = """
+test "$(git log --format=%s)" = "fleet: first commit"
+test "$(git show HEAD:hello.txt)" = "hello from the fleet"
+git status --porcelain | wc -l | grep -qx 0
+"""

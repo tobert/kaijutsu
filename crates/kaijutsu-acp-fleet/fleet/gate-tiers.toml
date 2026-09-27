@@ -1,0 +1,65 @@
+description = "Gate tiers hold around the classifier: allow runs with no ask and no score, deny refuses with no ask, and ask asks even when the classifier would allow."
+
+gate = """
+[global]
+allow = ["mkdir"]
+ask = ["mv"]
+deny = ["dd"]
+"""
+
+[classifier]
+verdict = "informative"
+expect_unscored = ["mkdir tier-allowed", "dd if=seed.txt of=copy.txt", "mv seed.txt moved.txt"]
+
+[files]
+"seed.txt" = "seed\n"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir tier-allowed" } }]
+[[model]]
+text = "made it"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "dd if=seed.txt of=copy.txt" } }]
+[[model]]
+text = "refused"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mv seed.txt moved.txt" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "left it alone"
+
+[[prompt]]
+text = "make the directory"
+text_contains = ["made it"]
+tool_calls = [{ title = "shell_write", status = "completed" }]
+
+[[prompt]]
+text = "copy with dd"
+text_contains = ["refused"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }]
+
+[[prompt]]
+text = "move the seed"
+permissions = ["deny"]
+permission_titles = ["ask tier"]
+text_contains = ["left it alone"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "tier-allowed"
+exists = true
+
+[[verify]]
+path = "copy.txt"
+exists = false
+
+[[verify]]
+path = "seed.txt"
+equals = "seed\n"
+
+[[verify]]
+path = "moved.txt"
+exists = false

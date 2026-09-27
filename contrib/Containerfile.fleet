@@ -1,0 +1,21 @@
+# Containerfile.fleet — the image contained ACP fleet scenarios run in.
+#
+# Build: podman build -t kaijutsu-fleet -f contrib/Containerfile.fleet contrib
+#
+# The agent binary is built on the host and bind-mounted read-only at run
+# time, so this image supplies only a userland whose glibc is >= the host's
+# (both dev machines run Arch) and the host programs a scenario's model or
+# verifier script calls. Keep the package list short: every addition is
+# something scenarios silently start depending on. docs/acp-fleet.md,
+# "Contained mode", says how a run uses it.
+FROM docker.io/library/archlinux:latest
+
+RUN pacman -Sy --noconfirm --needed git && rm -rf /var/cache/pacman/pkg
+
+# A commit needs an identity; the model's commands should not have to pass one.
+RUN git config --system user.name "acp fleet" \
+ && git config --system user.email "fleet@kaijutsu.invalid" \
+ && git config --system init.defaultBranch main \
+ && git config --system --add safe.directory '*'
+
+RUN mkdir -p /opt/kaijutsu /work /fleet

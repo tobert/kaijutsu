@@ -1,9 +1,10 @@
 //! Run one scenario against an ACP agent and judge it.
 //!
 //! Each run gets a fresh scratch directory holding the workspace (the session
-//! cwd and the agent's launch directory), the mock model script, the agent's
-//! `TMPDIR`, and the gate policy when the scenario gives one. The agent is a
-//! fresh process per scenario, so no state crosses between scenarios.
+//! cwd and the agent's launch directory), the fleet files the agent reads (the
+//! mock model script, the gate policy, and any rc overlay), and, in host mode,
+//! the agent's `TMPDIR`. The agent is a fresh process per scenario, so no state
+//! crosses between scenarios.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
+use crate::classifier::MockClassifier;
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
-use crate::scenario::{Prompt, Scenario, Verify, workspace_relative};
+use crate::container;
+use crate::scenario::{Mode, Prompt, Scenario, Verify, workspace_relative};
+
+/// How long the update stream must stay silent after a prompt's response
+/// before the prompt is judged. Permission requests, and the follow-up turns
+/// their answers start, arrive after the response.
+pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// The model name the agent is started with, and so the mock script's file stem.
 pub const MOCK_MODEL: &str = "fleet-mock";
@@ -122,8 +130,11 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
 
 struct Scratch {
     root: PathBuf,
+    /// The run's unique directory name, reused as its container names.
+    id: String,
     workspace: PathBuf,
-    mock: PathBuf,
+    /// What the agent reads: `mock/`, `gate.toml`, and `rc/`.
+    fleet: PathBuf,
     tmp: PathBuf,
 }
 
@@ -133,14 +144,16 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .context("the clock reads before the epoch")?
             .as_nanos();
-        let root = scratch_root.join(format!("{name}-{}-{stamp}", std::process::id()));
+        let id = format!("{name}-{}-{stamp}", std::process::id());
+        let root = scratch_root.join(&id);
         let scratch = Self {
             workspace: root.join("workspace"),
-            mock: root.join("mock"),
+            fleet: root.join("fleet"),
             tmp: root.join("tmp"),
             root,
+            id,
         };
-        for dir in [&scratch.workspace, &scratch.mock, &scratch.tmp] {
+        for dir in [&scratch.workspace, &scratch.fleet.join("mock"), &scratch.tmp] {
             std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
         Ok(scratch)
@@ -164,40 +177,138 @@ fn drive(
         std::fs::write(&target, body).with_context(|| format!("seed {}", target.display()))?;
     }
     let script = serde_json::to_string_pretty(&scenario.mock_script()?)?;
-    std::fs::write(scratch.mock.join(format!("{MOCK_MODEL}.json")), script).context("write the mock script")?;
+    std::fs::write(scratch.fleet.join("mock").join(format!("{MOCK_MODEL}.json")), script)
+        .context("write the mock script")?;
 
-    let mut command = AgentCommand::new(&config.agent)
-        .arg("--backend-kind")
-        .arg("mock")
-        .arg("--model")
-        .arg(MOCK_MODEL)
-        .env("KJ_MOCK_SCRIPT_DIR", &scratch.mock)
-        .env("TMPDIR", &scratch.tmp)
-        .env("RUST_LOG", "info")
-        .cwd(&scratch.workspace);
-    let gate = match &scenario.gate {
-        Some(gate) => gate.clone(),
-        None => default_gate()?,
+    if scenario.mode == Mode::Contained {
+        container::preflight()?;
+    }
+    let classifier = scenario.classifier.as_ref().map(MockClassifier::start).transpose()?;
+    let gate = gate_policy(scenario, classifier.as_ref().map(MockClassifier::url))?;
+    std::fs::write(scratch.fleet.join("gate.toml"), gate).context("write the gate policy")?;
+    let overlay = rc_overlay(scenario);
+    for (path, body) in &overlay {
+        let target = scratch.fleet.join("rc").join(workspace_relative(path)?);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
+    }
+
+    let (command, session_cwd) = match scenario.mode {
+        Mode::Host => {
+            let mut command = AgentCommand::new(&config.agent)
+                .arg("--backend-kind")
+                .arg("mock")
+                .arg("--model")
+                .arg(MOCK_MODEL)
+                .arg("--gate-config")
+                .arg(scratch.fleet.join("gate.toml"))
+                .env("KJ_MOCK_SCRIPT_DIR", scratch.fleet.join("mock"))
+                .env("TMPDIR", &scratch.tmp)
+                .env("RUST_LOG", "info")
+                .cwd(&scratch.workspace);
+            if !overlay.is_empty() {
+                command = command.arg("--rc-overlay").arg(scratch.fleet.join("rc"));
+            }
+            (command, scratch.workspace.clone())
+        }
+        Mode::Contained => {
+            let gate = format!("{}/gate.toml", container::FLEET);
+            let rc = format!("{}/rc", container::FLEET);
+            let mut args = vec!["--backend-kind", "mock", "--model", MOCK_MODEL, "--gate-config", &gate];
+            if !overlay.is_empty() {
+                args.extend(["--rc-overlay", &rc]);
+            }
+            let command =
+                container::agent_command(&config.agent, &scratch.workspace, &scratch.fleet, &scratch.id, &args);
+            (command, PathBuf::from(container::WORKSPACE))
+        }
     };
-    let gate_path = scratch.root.join("gate.toml");
-    std::fs::write(&gate_path, gate).context("write the gate policy")?;
-    command = command.arg("--gate-config").arg(&gate_path);
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &scratch.workspace, config.timeout, failures);
+    let result = converse(&mut agent, scenario, &session_cwd, config.timeout, failures);
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
     let shutdown = agent.shutdown(Duration::from_secs(60));
     *stderr_tail = agent.stderr_tail();
+    drop(agent);
+    if scenario.mode == Mode::Contained {
+        container::remove(&scratch.id);
+    }
     result?;
     match shutdown {
         Ok(status) if !status.success() => failures.push(format!("the agent exited with {status} after stdin closed")),
         Ok(_) => {}
         Err(error) => failures.push(format!("{error:#}")),
     }
+    if let (Some(mock), Some(spec)) = (&classifier, &scenario.classifier) {
+        failures.extend(spec.judge(&mock.scored()));
+    }
     failures.extend(verify_workspace(&scenario.verify, &scratch.workspace));
+    for (n, check) in scenario.verify.iter().enumerate() {
+        if let Some(script) = &check.script {
+            let name = format!("{}-verify-{}", scratch.id, n + 1);
+            let run = container::run_script(&scratch.workspace, script, &name, config.timeout)?;
+            if !run.success {
+                failures.push(format!(
+                    "verify script {}: exited {}\n{}",
+                    n + 1,
+                    run.code.map_or("on a signal".to_string(), |c| c.to_string()),
+                    run.output.trim_end()
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// The rc overlay files: in contained mode, the one that turns the classifier
+/// hook off, then the scenario's own, which win on the same path.
+fn rc_overlay(scenario: &Scenario) -> std::collections::BTreeMap<String, String> {
+    let mut overlay = std::collections::BTreeMap::new();
+    if scenario.mode == Mode::Contained {
+        overlay.insert(YOLO_HOOK_PATH.to_string(), YOLO_HOOK.to_string());
+    }
+    overlay.extend(scenario.rc.clone());
+    overlay
+}
+
+/// The rc script that installs the classifier hook, relative to the rc tree.
+pub const YOLO_HOOK_PATH: &str = "lib/create/S50-lfm2d.kai";
+
+/// What contained mode puts at [`YOLO_HOOK_PATH`]: the hook's mode is off and
+/// no hook is installed.
+pub const YOLO_HOOK: &str = "\
+# Contained ACP fleet (docs/acp-fleet.md): the classifier hook is off. The
+# agent runs in a container with no network and no host home, under a gate
+# that allows every uncovered statement.
+kj context set . --env LFM2D_MODE=off
+";
+
+/// The gate policy a contained scenario runs under when it names none: every
+/// statement no key covers runs, with no ask.
+pub const YOLO_GATE: &str = "\
+# Contained ACP fleet (docs/acp-fleet.md): a throwaway kernel in a container.
+[global]
+uncovered = \"allow\"
+";
+
+/// The gate policy for a run: the scenario's, or the mode's default, with
+/// `[classifier] url` pointing at the mock classifier when there is one.
+fn gate_policy(scenario: &Scenario, classifier_url: Option<&str>) -> Result<String> {
+    let text = match (&scenario.gate, scenario.mode) {
+        (Some(gate), _) => gate.clone(),
+        (None, Mode::Host) => default_gate()?,
+        (None, Mode::Contained) => YOLO_GATE.to_string(),
+    };
+    let Some(url) = classifier_url else { return Ok(text) };
+    let mut policy: toml::Table = text.parse().context("parse the scenario's gate policy")?;
+    let mut table = toml::Table::new();
+    table.insert("url".to_string(), toml::Value::String(url.to_string()));
+    policy.insert("classifier".to_string(), toml::Value::Table(table));
+    toml::to_string(&policy).context("write the gate policy")
 }
 
 fn converse(
@@ -221,13 +332,9 @@ fn converse(
         let response = agent.prompt(&session, &prompt.text).with_context(|| label.clone())?;
         // A gate ask does not hold the turn open: the tool call is refused as
         // pending, the turn ends, and the permission request follows. An
-        // answer can start a follow-up model turn, whose text arrives later.
-        let want = permissions_before + prompt.permissions.len();
-        agent.pump_until(timeout, "permission requests", |a| a.permissions().len() >= want)?;
-        agent.pump_until(timeout, "the expected agent text", |a| {
-            let text = client::agent_text(&a.updates()[updates_before..]);
-            prompt.text_contains.iter().all(|needle| text.contains(needle.as_str()))
-        })?;
+        // answer can start a follow-up model turn. Waiting for silence also
+        // catches a request a prompt expected not to raise.
+        agent.pump_until_quiet(SETTLE, timeout, &label)?;
         let seen = Seen {
             response: &response,
             updates: &agent.updates()[updates_before..],
@@ -287,14 +394,20 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
             calls.iter().map(|c| format!("{} ({})", c.title, c.status.as_deref().unwrap_or("no status"))).collect();
         let matches = calls.len() == expected.len()
             && calls.iter().zip(expected).all(|(call, want)| {
-                call.title == want.title && want.status.as_ref().is_none_or(|s| call.status.as_ref() == Some(s))
+                call.title == want.title
+                    && want.status.as_ref().is_none_or(|s| call.status.as_ref() == Some(s))
+                    && want.output_contains.as_ref().is_none_or(|o| call.output.contains(o.as_str()))
             });
         if !matches {
             let want: Vec<String> = expected
                 .iter()
-                .map(|w| format!("{} ({})", w.title, w.status.as_deref().unwrap_or("any status")))
+                .map(|w| {
+                    let output = w.output_contains.as_ref().map_or(String::new(), |o| format!(", output contains {o:?}"));
+                    format!("{} ({}{output})", w.title, w.status.as_deref().unwrap_or("any status"))
+                })
                 .collect();
-            failures.push(format!("{label}: expected tool calls {want:?}, got {got:?}"));
+            let outputs: Vec<&str> = calls.iter().map(|c| c.output.as_str()).collect();
+            failures.push(format!("{label}: expected tool calls {want:?}, got {got:?} with outputs {outputs:?}"));
         }
     }
 
@@ -309,6 +422,13 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
         if let Some(problem) = &record.problem {
             failures.push(format!("{label}: permission request {}: {problem}", i + 1));
         }
+        let want = prompt.permission_titles.as_ref().and_then(|titles| titles.get(i));
+        let title = record.params.pointer("/toolCall/title").and_then(Value::as_str).unwrap_or("");
+        if let Some(want) = want
+            && !title.contains(want.as_str())
+        {
+            failures.push(format!("{label}: permission request {} title does not contain {want:?}; it was {title:?}", i + 1));
+        }
     }
     failures
 }
@@ -317,13 +437,14 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
 pub fn verify_workspace(checks: &[Verify], workspace: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     for check in checks {
-        let path = workspace.join(&check.path);
+        let Some(relative) = &check.path else { continue };
+        let path = workspace.join(relative);
         let exists = path.exists();
         if let Some(want) = check.exists
             && want != exists
         {
             let state = if exists { "exists" } else { "does not exist" };
-            failures.push(format!("verify {}: expected exists = {want}, but it {state}", check.path));
+            failures.push(format!("verify {relative}: expected exists = {want}, but it {state}"));
             continue;
         }
         if check.equals.is_none() && check.contains.is_none() {
@@ -332,19 +453,19 @@ pub fn verify_workspace(checks: &[Verify], workspace: &Path) -> Vec<String> {
         let body = match std::fs::read_to_string(&path) {
             Ok(body) => body,
             Err(error) => {
-                failures.push(format!("verify {}: cannot read it: {error}", check.path));
+                failures.push(format!("verify {relative}: cannot read it: {error}"));
                 continue;
             }
         };
         if let Some(want) = &check.equals
             && &body != want
         {
-            failures.push(format!("verify {}: expected contents {want:?}, got {body:?}", check.path));
+            failures.push(format!("verify {relative}: expected contents {want:?}, got {body:?}"));
         }
         if let Some(needle) = &check.contains
             && !body.contains(needle.as_str())
         {
-            failures.push(format!("verify {}: does not contain {needle:?}; it holds {body:?}", check.path));
+            failures.push(format!("verify {relative}: does not contain {needle:?}; it holds {body:?}"));
         }
     }
     failures
@@ -395,6 +516,56 @@ mod tests {
         let failures = check_prompt("p", &p, &seen);
         assert_eq!(failures.len(), 1, "{failures:#?}");
         assert!(failures[0].contains("a model turn failed"), "{failures:#?}");
+    }
+
+    fn scenario(text: &str) -> Scenario {
+        Scenario::parse(&format!("description = \"d\"\n{text}\n[[prompt]]\ntext = \"go\"\n"), "test").unwrap()
+    }
+
+    #[test]
+    fn the_classifier_url_is_written_into_the_scenarios_gate() {
+        let s = scenario("gate = \"[global]\\nallow = [\\\"mkdir\\\"]\\n\"");
+        let policy: toml::Table = gate_policy(&s, Some("http://127.0.0.1:9")).unwrap().parse().unwrap();
+        assert_eq!(policy["classifier"]["url"].as_str(), Some("http://127.0.0.1:9"));
+        assert_eq!(policy["global"]["allow"][0].as_str(), Some("mkdir"), "the scenario's tiers are kept");
+    }
+
+    #[test]
+    fn each_mode_has_its_own_default_gate() {
+        let host: toml::Table = gate_policy(&scenario(""), None).unwrap().parse().unwrap();
+        assert!(host.contains_key("global") && !host.contains_key("classifier"), "{host:#?}");
+        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\""), None).unwrap().parse().unwrap();
+        assert_eq!(contained["global"]["uncovered"].as_str(), Some("allow"));
+    }
+
+    #[test]
+    fn contained_mode_turns_the_hook_off_unless_the_scenario_says_otherwise() {
+        assert!(rc_overlay(&scenario("")).is_empty(), "host mode installs no overlay by default");
+        let contained = rc_overlay(&scenario("mode = \"contained\""));
+        assert!(contained[YOLO_HOOK_PATH].contains("LFM2D_MODE=off"), "{contained:#?}");
+        let own = rc_overlay(&scenario("mode = \"contained\"\n[rc]\n\"lib/create/S50-lfm2d.kai\" = \"mine\""));
+        assert_eq!(own[YOLO_HOOK_PATH], "mine");
+    }
+
+    #[test]
+    fn tool_output_and_permission_titles_are_checked() {
+        let p = prompt(
+            "tool_calls = [{ title = \"shell\", output_contains = \"shell_write\" }]\n\
+             permissions = [\"deny\"]\npermission_titles = [\"says destructive\"]",
+        );
+        let response = json!({"stopReason": "end_turn"});
+        let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "shell",
+            "content": [{"type": "content", "content": {"type": "text", "text": "external commands are disabled"}}]}})];
+        let permissions = [PermissionRecord {
+            params: json!({"toolCall": {"title": "no classifier configured"}}),
+            answer: Some(PermissionAnswer::Deny),
+            option_id: Some("deny".into()),
+            problem: None,
+        }];
+        let seen = Seen { response: &response, updates: &updates, permissions: &permissions };
+        let failures = check_prompt("p", &p, &seen).join("\n");
+        assert!(failures.contains("output contains") && failures.contains("external commands are disabled"), "{failures}");
+        assert!(failures.contains("title does not contain \"says destructive\""), "{failures}");
     }
 
     #[test]

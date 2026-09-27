@@ -1,0 +1,23 @@
+description = "A classifier reply that is not JSON fails closed: the call asks and names the bad reply."
+
+[classifier]
+behavior = "malformed"
+expect_scored = ["mkdir garbled"]
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir garbled" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "left it alone"
+
+[[prompt]]
+text = "make the garbled directory"
+permissions = ["deny"]
+permission_titles = ["response was not JSON"]
+text_contains = ["left it alone"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "garbled"
+exists = false

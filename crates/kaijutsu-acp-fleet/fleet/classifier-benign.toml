@@ -1,0 +1,27 @@
+description = "A benign verdict raises no ask of its own: the only request is the gate's uncovered tier, and allowing it runs the command."
+
+# The classifier may raise an ask and never lower one
+# (docs/gate-policy-tuning.md, "Verdicts"), so under the shipped tiers an
+# uncovered statement still asks after a benign score.
+
+[classifier]
+verdict = "informative"
+expect_scored = ["mkdir benign"]
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir benign" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "made it"
+
+[[prompt]]
+text = "make the benign directory"
+permissions = ["allow"]
+permission_titles = ["shell_write: 1 statement(s) — mkdir benign"]
+text_contains = ["made it"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj" }]
+
+[[verify]]
+path = "benign"
+exists = true

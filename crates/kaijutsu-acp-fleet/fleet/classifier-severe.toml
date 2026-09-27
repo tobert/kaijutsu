@@ -1,0 +1,23 @@
+description = "A severe verdict raises an ask naming the verdict; deny means the command never ran."
+
+[classifier]
+verdict = "destructive"
+expect_scored = ["mkdir doomed"]
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "left it alone"
+
+[[prompt]]
+text = "make the doomed directory"
+permissions = ["deny"]
+permission_titles = ["says destructive"]
+text_contains = ["left it alone"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "doomed"
+exists = false

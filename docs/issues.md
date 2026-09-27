@@ -2484,34 +2484,35 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   sibling on different threads, release, and assert the sibling settles
   with the stop observed.
 
-## ACP fleet: what slice 1 left open (2026-09-27)
+## ACP fleet: what stays open (2026-09-27)
 
 The fleet (`docs/acp-fleet.md`) runs Harbor-shaped scenarios against
-`kaijutsu-solo-acp` with the scripted mock model. Amy: "some of those acp
-sessions can use modified rc too, maybe a more yolo mode for when it's
-contained in docker for simulations with no access to my ~." Open:
+`kaijutsu-solo-acp` with the scripted mock model: host scenarios test that
+the gate and classifier hold, and contained ones run a permissive ("yolo")
+kernel in podman with no network and only the workspace writable. Amy:
+"some of those acp sessions can use modified rc too, maybe a more yolo mode
+for when it's contained in docker". Open:
 
-- **A contained yolo mode.** Scenarios running in a container with no
-  access to the host home can take a permissive rc and gate, and verifiers
-  can then run scripts (host exec) rather than only declarative checks.
-  Decide the container boundary first; outside it, verifiers stay
-  declarative.
-- **A failed follow-up turn has no structured ACP signal.** After a
-  permission answer the kernel starts a follow-up turn; when it fails, the
-  wire carries only agent text "stream error: …", and the runner matches
-  that text.
-- **The permission request's title is the advisory hook's reason** ("lfm2d
-  cannot score this call…"), not the command asked about.
-- **A missed expectation waits out the timeout.** A broken `text_contains`
-  took 128 s to fail; the runner should fail when the turn ends without the
-  text.
-- **Mock replies a scenario never used go unreported.**
+- **The mock classifier speaks lfm2d's protocol** (`src/classifier.rs`).
+  Amy: lfm2d is "going to change soon to use a system[12] model thing we
+  invented recently that's a smarter lfm2d". Replace that module when it
+  lands; scenarios use a generic `[classifier]` key.
+- **A benign verdict never lowers an ask** (`docs/gate-policy-tuning.md`,
+  "Verdicts"); an uncovered command still gets the gate's own ask. Whether
+  a classifier-deferring tier should exist is Amy's call.
+- **A failed follow-up turn has no structured ACP signal.** The runner
+  matches agent text "stream error: …".
+- **The permission request's title is the advisory hook's reason**, not
+  the command asked about.
+- **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
+  prompt. Mock replies a scenario never used go unreported.
+- **Nothing notices a stale fleet image**, and contained runs set no
+  `--pids-limit`.
 - `solo_acp_stdio.rs` still has its own client; move it onto the fleet's.
   Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
-- The shipped `gate.toml` names a tailnet classifier, so solo runs
-  (`solo_acp_stdio.rs`, bench) reach the network at every shell_write
-  (inferred from about 10 s of per-run timing). The fleet's default gate
-  drops `[classifier]`.
+- The shipped `gate.toml` names a tailnet classifier, so solo runs outside
+  the fleet (`solo_acp_stdio.rs`, bench) reach the network at every
+  shell_write (inferred from about 10 s of per-run timing).
 
 ## Egress: what stays open (2026-09-21)
 

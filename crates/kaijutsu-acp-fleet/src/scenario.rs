@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::classifier::ClassifierSpec;
 use crate::client::PermissionAnswer;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -20,10 +21,23 @@ use crate::client::PermissionAnswer;
 pub struct Scenario {
     /// One sentence: what this scenario proves.
     pub description: String,
-    /// The gate policy the agent runs under. Default: the shipped policy
-    /// without its `[classifier]` table.
+    /// Where the agent runs: on the host, or in a container.
+    #[serde(default)]
+    pub mode: Mode,
+    /// The gate policy the agent runs under. Default in host mode: the
+    /// shipped policy without its `[classifier]` table. Default in contained
+    /// mode: every uncovered statement is allowed.
     #[serde(default)]
     pub gate: Option<String>,
+    /// A mock classifier for the gate's advisory hook. Host mode only; the
+    /// runner sets `[classifier] url` in the gate policy to reach it.
+    #[serde(default)]
+    pub classifier: Option<ClassifierSpec>,
+    /// rc files installed over the seeded rc tree, by path relative to it
+    /// (`--rc-overlay`). In contained mode these are added to the overlay
+    /// that turns the classifier hook off.
+    #[serde(default)]
+    pub rc: BTreeMap<String, String>,
     /// Files written into the workspace before the agent starts, by
     /// workspace-relative path.
     #[serde(default)]
@@ -74,6 +88,10 @@ pub struct Prompt {
     /// prompt must raise exactly this many requests.
     #[serde(default)]
     pub permissions: Vec<Answer>,
+    /// When present, one substring per permission request, in order, that
+    /// the request's title must contain.
+    #[serde(default)]
+    pub permission_titles: Option<Vec<String>>,
     /// The `stopReason` the prompt must end with.
     #[serde(default = "end_turn")]
     pub stop_reason: String,
@@ -83,6 +101,17 @@ pub struct Prompt {
     /// When present, the tool calls this prompt must show, exactly and in order.
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallExpect>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// The agent runs on the host, and verifiers are declarative.
+    #[default]
+    Host,
+    /// The agent runs in a container with no network and no host home, and
+    /// `[[verify]]` may run a script in another container.
+    Contained,
 }
 
 fn end_turn() -> String {
@@ -114,14 +143,21 @@ pub struct ToolCallExpect {
     /// The call's last reported status, such as `completed` or `failed`.
     #[serde(default)]
     pub status: Option<String>,
+    /// A substring of the call's reported output text.
+    #[serde(default)]
+    pub output_contains: Option<String>,
 }
 
-/// A check on one workspace path. At least one of `exists`, `equals`, or
-/// `contains` must be set.
+/// A check on the workspace after the run: a `path` with at least one of
+/// `exists`, `equals`, or `contains`, or, in contained mode only, a `script`
+/// run in a fresh container over the workspace that passes on exit 0.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Verify {
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub script: Option<String>,
     #[serde(default)]
     pub exists: Option<bool>,
     #[serde(default)]
@@ -150,6 +186,27 @@ impl Scenario {
         for path in self.files.keys() {
             workspace_relative(path)?;
         }
+        for path in self.rc.keys() {
+            workspace_relative(path).context("an [rc] path is relative to the rc tree")?;
+        }
+        if let Some(classifier) = &self.classifier {
+            if self.mode == Mode::Contained {
+                bail!("[classifier] needs host mode: a contained agent has no network to reach it");
+            }
+            classifier.check()?;
+        }
+        for (n, prompt) in self.prompt.iter().enumerate() {
+            if let Some(titles) = &prompt.permission_titles
+                && titles.len() != prompt.permissions.len()
+            {
+                bail!(
+                    "[[prompt]] {}: `permission_titles` has {} entries for {} `permissions`",
+                    n + 1,
+                    titles.len(),
+                    prompt.permissions.len()
+                );
+            }
+        }
         for (n, turn) in self.model.iter().enumerate() {
             let sugar = turn.text.is_some() || !turn.tool_calls.is_empty();
             match (&turn.events, sugar) {
@@ -158,13 +215,28 @@ impl Scenario {
                 _ => {}
             }
         }
-        for verify in &self.verify {
-            workspace_relative(&verify.path)?;
-            if verify.exists.is_none() && verify.equals.is_none() && verify.contains.is_none() {
-                bail!("[[verify]] {}: give `exists`, `equals`, or `contains`", verify.path);
-            }
-            if verify.exists == Some(false) && (verify.equals.is_some() || verify.contains.is_some()) {
-                bail!("[[verify]] {}: `exists = false` cannot also check contents", verify.path);
+        for (n, verify) in self.verify.iter().enumerate() {
+            let has_check = verify.exists.is_some() || verify.equals.is_some() || verify.contains.is_some();
+            match (&verify.path, &verify.script) {
+                (Some(_), Some(_)) => bail!("[[verify]] {}: give `path` or `script`, not both", n + 1),
+                (None, None) => bail!("[[verify]] {}: give `path` or `script`", n + 1),
+                (None, Some(_)) if has_check => {
+                    bail!("[[verify]] {}: `script` stands alone; `exists`, `equals`, and `contains` need a `path`", n + 1)
+                }
+                (None, Some(_)) if self.mode != Mode::Contained => bail!(
+                    "[[verify]] {}: a `script` verifier needs `mode = \"contained\"`; scripts never run on the host",
+                    n + 1
+                ),
+                (None, Some(_)) => {}
+                (Some(path), None) => {
+                    workspace_relative(path)?;
+                    if !has_check {
+                        bail!("[[verify]] {path}: give `exists`, `equals`, or `contains`");
+                    }
+                    if verify.exists == Some(false) && (verify.equals.is_some() || verify.contains.is_some()) {
+                        bail!("[[verify]] {path}: `exists = false` cannot also check contents");
+                    }
+                }
             }
         }
         Ok(())
@@ -319,6 +391,26 @@ text = "go"
     fn a_reply_mixing_events_and_sugar_is_refused() {
         let text = MINIMAL.replace("text = \"hi\"", "text = \"hi\"\nevents = [\"TextStart\"]");
         assert!(refusal(&text).contains("not both"), "{}", refusal(&text));
+    }
+
+    #[test]
+    fn a_script_verifier_is_refused_outside_contained_mode() {
+        let text = format!("{MINIMAL}\n[[verify]]\nscript = \"true\"\n");
+        assert!(refusal(&text).contains("scripts never run on the host"), "{}", refusal(&text));
+        let contained = format!("mode = \"contained\"\n{MINIMAL}\n[[verify]]\nscript = \"true\"\n");
+        Scenario::parse(&contained, "contained").unwrap();
+    }
+
+    #[test]
+    fn a_classifier_is_refused_in_contained_mode() {
+        let text = format!("mode = \"contained\"\n{MINIMAL}\n[classifier]\nverdict = \"informative\"\n");
+        assert!(refusal(&text).contains("needs host mode"), "{}", refusal(&text));
+    }
+
+    #[test]
+    fn an_rc_path_outside_the_rc_tree_is_refused() {
+        let text = format!("{MINIMAL}\n[rc]\n\"../escape.kai\" = \"x\"\n");
+        assert!(refusal(&text).contains("rc tree"), "{}", refusal(&text));
     }
 
     #[test]
