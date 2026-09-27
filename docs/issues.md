@@ -426,7 +426,24 @@ From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
   the listener started at 15:52:27, `Loaded 3377 documents from database`
   logged at 15:52:59 (`kaijutsu-server/src/rpc.rs`), and the shared kernel
   came up at 15:53:00. Clients in that window see `ssh dial exceeded 5s`
-  rather than a refusal. The cost grows with the document count.
+  rather than a refusal. `run()` binds the listener (`ssh.rs`) but accepts
+  only after `create_shared_kernel` returns, so connects sit in the backlog
+  with no banner. On zorak's 1.3 GB `kernel.db`, 30.3 s of it is
+  `BlockStore::load_from_db` (`block_store.rs`): it decodes every snapshot
+  and replays every oplog row for every document, archived or not.
+  Archived conversations hold 756 MB of the 936 MB of snapshots (888 of
+  1039 contexts); the largest single snapshot is 33 MB. Moltar loads 14,721
+  smaller documents in about 4 s, so cost follows bytes decoded rather than
+  document count (inferred; not profiled). Candidates: load archived
+  contexts on demand through `load_one_from_db` (audit every `get()` caller
+  first); accept SSH early and answer "kernel starting" until it is ready;
+  trim oversized snapshots. Amy (2026-09-27): "that's fine for now".
+- **Boot waits for lfm2d.** `Lfm2dEmbedder::connect` (`rpc.rs`) runs inside
+  kernel construction. On moltar's 2026-09-27 08:42 boot lfm2d was
+  unreachable, and boot waited 30 s before logging "Embedding service
+  unavailable". Connect in the background and attach the index when it
+  answers. No ONNX runs at boot: beat-this loads through rten only for
+  `kj audio beats`.
 - **Label stabilization does not take `RemoteState::registering`.** A
   `register_session` on a join path can interleave with a hook event's
   reattach (`stabilize_context_label`), leaving the connection's context and
