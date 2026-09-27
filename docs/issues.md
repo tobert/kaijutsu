@@ -2468,7 +2468,9 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   but not the `dirty_file_buffers` row. After a restart the path loads as a
   recovered swap nobody made, and `write`/`edit` refuse until `kj swap
   ack|discard`. `mount_backend` and the editor keep both on failure; this
-  rollback is the odd one out.
+  rollback is the odd one out. With an editor session pinning the document
+  the rollback is refused and only logged, so the failed edit stays in the
+  dirty buffer and the next `:w` writes it (gemini review, same day).
 - **`flush_one` can mark a racing edit clean.** It snapshots the block,
   awaits the write, then clears `dirty`. An editor keystroke in that window
   stays in the block with `dirty == false` and no row, so eviction loses it.
