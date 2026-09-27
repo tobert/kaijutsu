@@ -327,9 +327,6 @@ pub struct SharedKernelState {
     /// SQLite persistence for context metadata, edges, presets, workspaces.
     /// Arc<parking_lot::Mutex> (not tokio) — shared with KjDispatcher, all ops sync and sub-ms.
     pub kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
-    /// Semantic vector index for context search/clustering.
-    /// None if embedding model not configured or unavailable.
-    pub semantic_index: Option<Arc<kaijutsu_index::SemanticIndex>>,
     /// kj command dispatcher — shared across all connections.
     pub kj_dispatcher: Arc<kaijutsu_kernel::KjDispatcher>,
     /// Per-session current-context tracking for the `context` shell command.
@@ -1469,6 +1466,79 @@ mod context_bootstrap_tests {
     }
 }
 
+/// Connect to the embedding service and load the semantic index, starting
+/// its re-index watcher. `None` when the service or the index is unavailable;
+/// each cause is logged. Runs after boot (`create_shared_kernel`).
+async fn connect_semantic_index(
+    emb_config: kaijutsu_kernel::EmbeddingModelConfig,
+    data_dir: std::path::PathBuf,
+    documents: SharedBlockStore,
+    flows: kaijutsu_kernel::flows::SharedBlockFlowBus,
+) -> Option<Arc<kaijutsu_index::SemanticIndex>> {
+    match kaijutsu_index::Lfm2dEmbedder::connect(
+        &emb_config.endpoint,
+        std::time::Duration::from_millis(emb_config.timeout_ms),
+        emb_config.max_in_flight,
+    ).await {
+        Ok(embedder) => {
+            use kaijutsu_index::Embedder;
+            let index_config = kaijutsu_index::IndexConfig::new(
+                embedder.dimensions(), emb_config.max_context_bytes, &data_dir,
+            );
+            let loaded = match tokio::task::spawn_blocking(move ||
+                kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder))
+            ).await {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    log::error!("loading the semantic index failed: {e}");
+                    return None;
+                }
+            };
+            match loaded {
+                Ok(idx) => {
+                    let idx = Arc::new(idx);
+                    // Spawn background watcher for re-indexing on block completion
+                    let block_source = Arc::new(BlockStoreSource(documents.clone()));
+                    let status_receiver = FlowBusStatusReceiver {
+                        sub: flows.subscribe("block.status"),
+                    };
+
+                    // Automatic synthesis is off: `run_synthesis` embeds
+                    // every text block in a context on each call, so one
+                    // appended block costs an embed of the whole history.
+                    // Re-enable by passing a callback here once synthesis
+                    // is incremental — `docs/issues.md`, "Synthesis
+                    // re-embeds the whole context on every block write".
+                    // `kj synth <ctx>` still runs it on demand.
+                    kaijutsu_index::watcher::spawn_index_watcher(
+                        idx.clone(),
+                        block_source,
+                        Box::new(status_receiver),
+                        None,
+                    );
+                    log::warn!(
+                        "automatic synthesis is disabled; indexing still runs. \
+                         Use `kj synth <context>` to synthesize on demand."
+                    );
+                    log::info!(
+                        "Semantic index initialized with {}",
+                        emb_config.endpoint
+                    );
+                    Some(idx)
+                }
+                Err(e) => {
+                    log::warn!("Semantic index unavailable: {}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Embedding service unavailable at {}: {}", emb_config.endpoint, e);
+            None
+        }
+    }
+}
+
 /// Create the shared kernel at server startup.
 ///
 /// This performs all kernel initialization: VFS mounts, block store with DB
@@ -2009,68 +2079,6 @@ pub async fn create_shared_kernel(
     // that wants the reconcile calls it explicitly
     // (`kaijutsu-server/tests/mcp_boot.rs`).
 
-    // Initialize semantic index if embedding model is configured
-    let semantic_index = if let Some(emb_config) = embedding_config {
-        match kaijutsu_index::Lfm2dEmbedder::connect(
-            &emb_config.endpoint,
-            std::time::Duration::from_millis(emb_config.timeout_ms),
-            emb_config.max_in_flight,
-        ).await {
-            Ok(embedder) => {
-                use kaijutsu_index::Embedder;
-                let index_config = kaijutsu_index::IndexConfig::new(
-                    embedder.dimensions(), emb_config.max_context_bytes, &resolved_data_dir,
-                );
-                let loaded = tokio::task::spawn_blocking(move ||
-                    kaijutsu_index::SemanticIndex::new(index_config, Box::new(embedder))
-                ).await.map_err(|e| capnp::Error::failed(format!("load semantic index: {e}")))?;
-                match loaded {
-                    Ok(idx) => {
-                        let idx = Arc::new(idx);
-                        // Spawn background watcher for re-indexing on block completion
-                        let block_source = Arc::new(BlockStoreSource(documents.clone()));
-                        let status_receiver = FlowBusStatusReceiver {
-                            sub: block_flows_for_index.subscribe("block.status"),
-                        };
-
-                        // Automatic synthesis is off: `run_synthesis` embeds
-                        // every text block in a context on each call, so one
-                        // appended block costs an embed of the whole history.
-                        // Re-enable by passing a callback here once synthesis
-                        // is incremental — `docs/issues.md`, "Synthesis
-                        // re-embeds the whole context on every block write".
-                        // `kj synth <ctx>` still runs it on demand.
-                        kaijutsu_index::watcher::spawn_index_watcher(
-                            idx.clone(),
-                            block_source,
-                            Box::new(status_receiver),
-                            None,
-                        );
-                        log::warn!(
-                            "automatic synthesis is disabled; indexing still runs. \
-                             Use `kj synth <context>` to synthesize on demand."
-                        );
-                        log::info!(
-                            "Semantic index initialized with {}",
-                            emb_config.endpoint
-                        );
-                        Some(idx)
-                    }
-                    Err(e) => {
-                        log::warn!("Semantic index unavailable: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Embedding service unavailable at {}: {}", emb_config.endpoint, e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Create kj dispatcher — shared across all connections. Takes the SAME
     // `roster_store` the /run/roster mount above uses (`new_with_roster`),
     // not a freshly constructed one. (Cloned, not moved, because the periodic
@@ -2087,9 +2095,6 @@ pub async fn create_shared_kernel(
     // lifecycle, kaish hook bodies) can construct KjBuiltin without
     // threading an Arc through every method.
     kj_dispatcher.set_self_arc();
-    // Contextual shells pair the service-backed index with a block source
-    // for search and synthesis. None means index initialization was unavailable.
-    kj_dispatcher.set_semantic_index(semantic_index.clone());
     // Wire the dispatcher into the broker so HookBody::Kaish can
     // register `kj` as a tool inside hook kaish sessions.
     kernel_arc
@@ -2099,6 +2104,24 @@ pub async fn create_shared_kernel(
 
     // Kernel-lifetime task cancellation; see `SharedKernelState::shutdown`.
     let shutdown = CancellationToken::new();
+
+    // The semantic index attaches when the embedding service answers, never
+    // at boot: an unreachable service would otherwise hold every client for
+    // its connect timeout. Search reports "unavailable" until it arrives.
+    if let Some(emb_config) = embedding_config {
+        let (dispatcher, documents, flows, data_dir, stop) = (
+            kj_dispatcher.clone(), documents.clone(), block_flows_for_index.clone(),
+            resolved_data_dir.clone(), shutdown.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = stop.cancelled() => {}
+                index = connect_semantic_index(emb_config, data_dir, documents, flows) => {
+                    if let Some(index) = index { dispatcher.set_semantic_index(Some(index)); }
+                }
+            }
+        });
+    }
 
     // Drive the roster's scheduled-periodic reconcile (`roster_sources`
     // module doc). Spawned here rather than left to the read surfaces
@@ -2133,7 +2156,6 @@ pub async fn create_shared_kernel(
         kernel: kernel_arc,
         documents,
         kernel_db: kernel_db_arc,
-        semantic_index,
         kj_dispatcher,
         session_contexts,
         subscription_registry: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -3457,7 +3479,7 @@ impl kernel::Server for KernelImpl {
         let kernel_db_arc = self.kernel.kernel_db.clone();
         let kernel_state = self.kernel.clone();
         let _kernel_id = self.kernel.id;
-        let semantic_index = self.kernel.semantic_index.clone();
+        let semantic_index = self.kernel.kj_dispatcher.semantic_index();
         let documents = self.kernel.documents.clone();
 
         let span = extract_rpc_trace(pry!(params.get()).get_trace(), "list_contexts");
@@ -5701,7 +5723,7 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                let search_results = match &kernel.semantic_index {
+                let search_results = match &kernel.kj_dispatcher.semantic_index() {
                     Some(idx) => {
                         idx.search(&query, k).await
                             .map_err(|e| capnp::Error::failed(format!("search: {}", e)))?
@@ -5748,7 +5770,7 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                let search_results = match &kernel.semantic_index {
+                let search_results = match &kernel.kj_dispatcher.semantic_index() {
                     Some(idx) => {
                         let idx = idx.clone();
                         tokio::task::spawn_blocking(move || idx.neighbors(context_id, k))
@@ -5790,7 +5812,7 @@ impl kernel::Server for KernelImpl {
 
         Promise::from_future(
             async move {
-                let clusters = match &kernel.semantic_index {
+                let clusters = match &kernel.kj_dispatcher.semantic_index() {
                     Some(idx) => {
                         let idx = idx.clone();
                         tokio::task::spawn_blocking(move || idx.clusters(min_cluster_size))

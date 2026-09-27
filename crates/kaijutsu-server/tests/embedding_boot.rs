@@ -24,7 +24,7 @@ async fn boot_uses_discovered_dimensions_and_no_builtin_model_files() {
     insert_root_character(&db);
     drop(db);
     let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
-    let index = shared.semantic_index.as_ref().expect("service discovery must initialize the index");
+    let index = wait_for_index(&shared).await.expect("service discovery must initialize the index");
     assert_eq!(index.embedder().model_name(), "boot-test");
     assert_eq!(index.embedder().dimensions(), 1024);
     server.await.unwrap();
@@ -42,7 +42,43 @@ async fn unavailable_service_leaves_index_unavailable() {
     insert_root_character(&db);
     drop(db);
     let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
-    assert!(shared.semantic_index.is_none(), "must not substitute another embedding model");
+    assert!(wait_for_index(&shared).await.is_none(), "must not substitute another embedding model");
+}
+
+/// Boot does not wait for the embedding service: a service that accepts and
+/// never answers must not hold kernel construction for its timeout.
+#[tokio::test]
+async fn a_silent_service_does_not_hold_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let held = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(stream);
+    });
+    let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
+    db.set_embedding_config(&EmbeddingConfigRow { enabled: true, endpoint,
+        timeout_ms: 30_000, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
+    insert_root_character(&db);
+    drop(db);
+    let started = std::time::Instant::now();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10),
+        "boot waited {:?} on a silent embedding service", started.elapsed());
+    assert!(shared.kj_dispatcher.semantic_index().is_none(), "no index before the service answers");
+    held.abort();
+}
+
+/// The index attaches in the background once the service answers. Wait for
+/// it, bounded, and report what arrived.
+async fn wait_for_index(shared: &kaijutsu_server::rpc::SharedKernelState) -> Option<std::sync::Arc<kaijutsu_index::SemanticIndex>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(index) = shared.kj_dispatcher.semantic_index() { return Some(index); }
+        if std::time::Instant::now() > deadline { return None; }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// `create_shared_kernel` refuses to start against a `kernel.db` with no

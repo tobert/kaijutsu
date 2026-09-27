@@ -438,12 +438,11 @@ From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
   contexts on demand through `load_one_from_db` (audit every `get()` caller
   first); accept SSH early and answer "kernel starting" until it is ready;
   trim oversized snapshots. Amy (2026-09-27): "that's fine for now".
-- **Boot waits for lfm2d.** `Lfm2dEmbedder::connect` (`rpc.rs`) runs inside
-  kernel construction. On moltar's 2026-09-27 08:42 boot lfm2d was
-  unreachable, and boot waited 30 s before logging "Embedding service
-  unavailable". Connect in the background and attach the index when it
-  answers. No ONNX runs at boot: beat-this loads through rten only for
-  `kj audio beats`.
+- **A shell built before the semantic index attaches never sees it.** The
+  index now connects after boot (`connect_semantic_index`, `rpc.rs`).
+  `KjBuiltin` copies the dispatcher's index when a shell is built, so a
+  long-lived shell built during that window reports search as unavailable
+  until it is rebuilt. Model shells are built per call.
 - **Label stabilization does not take `RemoteState::registering`.** A
   `register_session` on a join path can interleave with a hook event's
   reattach (`stabilize_context_label`), leaving the connection's context and
