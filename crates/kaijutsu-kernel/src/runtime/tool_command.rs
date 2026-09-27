@@ -57,6 +57,7 @@ impl ToolCommand {
         let completion_receipt = receipt.clone();
         let failure_kernel = self.kernel.clone();
         let background = self.background;
+        let read_only = self.read_only;
         let task_cancel = if background { CancellationToken::new() } else { cancel.child_token() };
         let cancel_guard = task_cancel.clone().drop_guard();
         let span = tracing::Span::current();
@@ -129,10 +130,26 @@ impl ToolCommand {
                 let outcome = result.map_err(|_| McpError::Protocol("runtime worker stopped before completion".into()))?
                     .map_err(McpError::Protocol)?;
                 if let Some(refusal) = outcome.refusal() { return Err(McpError::Refused(refusal.clone())); }
-                Ok(shell_envelope_to_tool_result(outcome.envelope()))
+                let mut envelope = outcome.envelope();
+                if read_only { name_the_write_path(&mut envelope); }
+                Ok(shell_envelope_to_tool_result(envelope))
             }
         }
     }
+}
+
+/// The refusals a read-only shell gives for a host program (kaish) and for
+/// a git verb it does not offer (kaish-tools-git). Each states only its
+/// condition, since the remedy depends on the embedder's tools.
+const READ_ONLY_REFUSALS: [&str; 2] = ["external commands are disabled on this shell", "git: a verb is required"];
+
+/// Append the remedy to a read-only refusal: the write path is `shell_write`.
+fn name_the_write_path(envelope: &mut ShellEnvelope) {
+    if !envelope.is_error() || !READ_ONLY_REFUSALS.iter().any(|refusal| envelope.stderr.contains(refusal)) { return; }
+    if !envelope.stderr.is_empty() && !envelope.stderr.ends_with('\n') { envelope.stderr.push('\n'); }
+    envelope.stderr.push_str(
+        "This is the read-only `shell`: it runs kaish builtins, read-only `git`, and read-only `kj`. \
+         Run host programs and git writes (commit, add, push) with `shell_write`, which asks for approval.\n");
 }
 
 #[cfg(test)]

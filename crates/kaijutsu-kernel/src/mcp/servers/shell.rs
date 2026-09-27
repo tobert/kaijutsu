@@ -1463,6 +1463,31 @@ mod tests {
         assert!(out.contains("hello-ro"), "stdout missing, got: {out:?}");
     }
 
+    /// The read-only shell's refusals of a host program and of a git write
+    /// name `shell_write`, so a model learns the write path from the refusal
+    /// instead of probing for it.
+    #[tokio::test]
+    async fn read_only_refusals_name_shell_write() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("rohint"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await.unwrap();
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        for command in ["id", "git commit -m x"] {
+            let result = broker.call_tool(call(command), &cc, CancellationToken::new()).await
+                .expect("a refused command is a tool result, not a fault");
+            assert!(result.is_error, "{command} must fail on the read-only shell: {result:?}");
+            let streams = streams_of(&result);
+            assert!(streams.contains("shell_write"), "{command}: the refusal must name shell_write: {streams}");
+        }
+
+        let result = broker.call_tool(call("cat /nonexistent-rohint"), &cc, CancellationToken::new()).await.unwrap();
+        assert!(!streams_of(&result).contains("shell_write"), "an ordinary failure gets no write-path hint");
+    }
+
     /// A context
     /// bound to the OLD `facade:shell` grant (a stale rc script, a cached
     /// binding, a model's habit — nobody updated it for the flag day) must
