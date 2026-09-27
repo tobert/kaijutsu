@@ -428,7 +428,9 @@ What is supported:
   commands 35 to 19. Plain was cheaper on 14 of 20 paired tasks (sign test
   p about 0.12), and the median per task moved less (2.79M to 2.55M), so a
   few long tasks carry most of it. Solves (16 and 17) are inside the noise.
-  `~/src/bench-work/arms/compare_arms.py` produced the comparison.
+  `~/src/bench-work/arms/compare_arms.py` produced the comparison. Plain
+  rendering is the kernel default from here (Amy, 2026-09-27: freeze the
+  plain, and "we'll dial in the plain outputs even more over time").
 
 Left unmeasured: the Rust polyglot slice (`contrib/bench/analysis/polyglot-rust.md`)
 has not been run with a model; the turn-loop fix has not had a full 20-task
