@@ -2198,6 +2198,38 @@ impl BlockStore {
         })
     }
 
+    /// Give several blocks new order keys in one accepted mutation, journaled
+    /// as their full post-change snapshots (as [`Self::move_block`] journals
+    /// one). Each block emits `BlockFlow::Moved` naming the block now ahead
+    /// of it. Used by `order_repair` to re-key a run whose keys tie.
+    pub fn rekey_blocks(&self, context_id: ContextId, keys: &[(BlockId, String)]) -> BlockStoreResult<()> {
+        if keys.is_empty() { return Ok(()); }
+        self.accept(context_id, |entry| {
+            entry.doc.set_order_keys(keys)?;
+            entry.touch(self.principal_id());
+            let version = entry.version();
+            let ordered = entry.doc.block_ids_ordered();
+            let mut events = Vec::new();
+            let mut snapshots = Vec::new();
+            for (id, _) in keys {
+                snapshots.push(entry.doc.get_block_snapshot(id).expect(
+                    "block must exist: the mutation against it just succeeded under this same guard",
+                ));
+                let at = ordered.iter().position(|o| o == id).expect("a live block is ordered");
+                events.push(BlockFlow::Moved {
+                    context_id,
+                    block_id: *id,
+                    after_id: at.checked_sub(1).map(|i| ordered[i]),
+                    version,
+                    source: OpSource::Local,
+                });
+            }
+            let mut ops = SyncPayload::from_updated_snapshot(snapshots.remove(0));
+            ops.updated_snapshots.extend(snapshots);
+            Ok((ops, events, ()))
+        })
+    }
+
     /// Set the content_type hint on a block (e.g., Markdown, Svg, Abc).
     pub fn set_content_type(
         &self,

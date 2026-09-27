@@ -370,3 +370,51 @@ mod default_log_directive_tests {
         assert_eq!(default_log_directive(false), "info");
     }
 }
+
+/// `kaijutsu-server blocks repair-order`: find tool results stored before
+/// their calls in every conversation document, archived ones included, and
+/// with `apply` move them back into tick order
+/// (`kaijutsu_kernel::order_repair`). Without `apply` it opens `kernel.db`
+/// read-only and only reports. With `apply` it takes the kernel lock first,
+/// so it refuses while the service runs. Returns the number of results still
+/// misordered.
+pub fn repair_order(data_dir: &Path, context: Option<&str>, apply: bool) -> Result<usize, String> {
+    use kaijutsu_kernel::kernel_db::KernelDb;
+    use kaijutsu_types::DocKind;
+    use kaijutsu_kernel::order_repair;
+    use kaijutsu_types::{PrincipalId, WorkspaceId};
+
+    let _lock = if apply { Some(KernelLock::acquire(data_dir)?) } else { None };
+    let path = data_dir.join("kernel.db");
+    let db = if apply { KernelDb::open(&path) } else { KernelDb::open_read_only(&path) }
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let rows = db.list_documents().map_err(|e| format!("list documents: {e}"))?;
+    let handle = std::sync::Arc::new(parking_lot::Mutex::new(db));
+    let store = kaijutsu_kernel::block_store::BlockStore::with_db(handle, WorkspaceId::nil(), PrincipalId::system());
+
+    let (mut contexts, mut found, mut moved, mut remaining) = (0, 0, 0, 0);
+    for row in rows.iter().filter(|row| row.doc_kind == DocKind::Conversation) {
+        let id = row.document_id;
+        if context.is_some_and(|prefix| !id.to_hex().starts_with(prefix)) { continue; }
+        if !store.load_one_from_db(id).map_err(|e| format!("{id}: load: {e}"))? {
+            return Err(format!("{id}: listed but not loaded"));
+        }
+        let report = if apply { order_repair::repair(&store, id)? } else { order_repair::inspect(&store, id)? };
+        contexts += 1;
+        if report.misordered.is_empty() { continue; }
+        println!("{id}  {} results before their call; {} blocks in {} runs {}", report.misordered.len(),
+            report.rekeyed(), report.rekeys.len(), if apply { "re-keyed" } else { "to re-key" });
+        for (result, call) in &report.misordered {
+            println!("    result {} before call {}", result.to_key(), call.to_key());
+        }
+        for (result, call) in &report.remaining {
+            println!("    STILL before its call: result {} call {}", result.to_key(), call.to_key());
+        }
+        found += report.misordered.len();
+        moved += report.rekeyed();
+        remaining += if apply { report.remaining.len() } else { report.misordered.len() };
+    }
+    println!("{contexts} conversations, {found} results before their call, {moved} blocks {}",
+        if apply { "re-keyed" } else { "to re-key (dry run; pass --apply)" });
+    Ok(remaining)
+}

@@ -1280,6 +1280,20 @@ impl BlockDocument {
         Ok(())
     }
 
+    /// Give several blocks new order keys at once. Every block must exist and
+    /// be live; nothing changes unless all do. The caller chooses keys that
+    /// produce the order it wants (`order_repair`).
+    pub fn set_order_keys(&mut self, keys: &[(BlockId, String)]) -> Result<()> {
+        if let Some((id, _)) = keys.iter().find(|(id, _)| self.blocks.get(id).is_none_or(|b| b.is_deleted())) {
+            return Err(BlockDocumentError::BlockNotFound(*id));
+        }
+        for (id, key) in keys {
+            self.blocks.get_mut(id).expect("checked above").set_order_key(key.clone());
+        }
+        self.version += 1;
+        Ok(())
+    }
+
     // =========================================================================
     // Sync Operations
     // =========================================================================

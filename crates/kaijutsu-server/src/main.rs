@@ -111,6 +111,11 @@ enum Command {
     /// kernel.db as characters, then drop the columns that held them. Run
     /// once, with the service stopped. No-op if already melted.
     MigrateKeyring,
+    /// Block maintenance on kernel.db. Service stopped for any change.
+    Blocks {
+        #[command(subcommand)]
+        command: BlocksCommand,
+    },
     /// rc scripts. No running kernel needed.
     Rc {
         #[command(subcommand)]
@@ -137,6 +142,23 @@ enum RcCommand {
         /// flags would otherwise resolve.
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlocksCommand {
+    /// Find tool results stored before their calls (the order-key bug fixed
+    /// in 855ace8a) in every conversation, archived ones included, and move
+    /// each damaged turn back into tick order by giving its blocks fresh keys. Reports only, read-only,
+    /// unless --apply; --apply refuses while the service holds the kernel
+    /// lock. Exits nonzero while any result stays before its call.
+    RepairOrder {
+        /// Only contexts whose hex id starts with this prefix.
+        #[arg(long, value_name = "HEX")]
+        context: Option<String>,
+        /// Re-key the damaged runs. Back up kernel.db first.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -216,6 +238,13 @@ async fn async_main() -> ExitCode {
         Some(Command::ListKeys) => cmd_list_keys(),
         Some(Command::ListCharacters) => cmd_list_characters(),
         Some(Command::MigrateKeyring) => cmd_migrate_keyring(),
+        Some(Command::Blocks { command: BlocksCommand::RepairOrder { context, apply } }) => {
+            match kaijutsu_server::offline::repair_order(&kernel_data_dir(), context.as_deref(), apply) {
+                Ok(0) => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(e) => { eprintln!("blocks repair-order: {e}"); ExitCode::FAILURE }
+            }
+        }
         Some(Command::Rc { command: RcCommand::Reseed { force, dir } }) => {
             cmd_rc_reseed(force, dir, config_root, &mount)
         }

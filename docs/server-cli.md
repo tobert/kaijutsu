@@ -28,6 +28,32 @@ boot, which is the lockout path (`docs/character.md`, "Bootstrap").
 against a live root, so it is not a lockout tool — it takes the same
 `KernelLock` `kj` and the service take, and needs the service stopped.
 
+## `blocks repair-order`
+
+Repairs blocks stored out of order before `855ace8a`, when `order_midpoint`
+could return a key below its lower bound. It reads every conversation
+document, archived ones included, and finds tool results that sort before
+their call. Without `--apply` it opens `kernel.db` read-only and reports;
+it exits nonzero while any result stays before its call.
+
+```sh
+systemctl --user stop kaijutsu-server
+sqlite3 ~/.local/share/kaijutsu/kernel/kernel.db ".backup /path/to/kernel.db.bak"
+kaijutsu-server blocks repair-order            # dry run
+kaijutsu-server blocks repair-order --apply
+kaijutsu-server blocks repair-order            # expect 0
+systemctl --user start kaijutsu-server
+```
+
+`--apply` takes the `KernelLock`, so it refuses while the service runs. It
+works on runs: maximal stretches of model, tool, and system error blocks
+that carry a tick. User input, notifications, drift, and blocks without a
+tick never move, so input held during a turn stays after it. Only a run
+holding a misordered result is touched: its blocks get fresh keys in tick
+order between the run's neighbors, in one journaled mutation
+(`BlockStore::rekey_blocks`). Every block of the run is re-keyed because
+stored keys can tie. The logic is `kaijutsu_kernel::order_repair`.
+
 ## Rules
 
 - **One kernel per data directory.** The running server and `kj` both take

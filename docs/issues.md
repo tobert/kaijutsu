@@ -969,9 +969,12 @@ before their call, in 5 of 12 contexts, from 09-21 through 09-26. Calls
 inserted at one anchor also landed in reverse order. Banto's 09-21
 `read_shell_operation` results are among them, which accounts for the
 "interrupted (context was forked or pruned)" errors in its problem report:
-snapshot repair synthesized them live. Every one predates the fix. A repair
-needs a kernel-sequenced move (a new order key for the result, after its
-call) and a decision on whether to run it; zorak's larger store is unsized.
+snapshot repair synthesized them live. Every one predates the fix.
+`kaijutsu-server blocks repair-order` repairs them (`docs/server-cli.md`);
+moltar and zorak each need a run. Stored keys also tie (134 adjacent pairs on
+moltar): `order_midpoint(a, a)` appends after `a`, so an insert meant to land
+between two tied blocks lands after both. Nothing re-keys ties outside a
+damaged run.
 
 ## Async completion recovery follow-ups
 
