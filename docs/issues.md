@@ -2455,6 +2455,31 @@ the kaish lead.
 foreground result. A `run_in_background` read-only call settles through
 `run_into_blocks` and its completion notice without it.
 
+## From the kaibo review of the edit, hint, and worker changes (2026-09-27)
+
+deepseek, over 9ae1f930, 830a068a, 523a6741, cbd44c34. Fixed in the
+follow-up commit: `edit` over a dirty buffer the disk moved under, and
+`--tail 0`. Open:
+
+- **A failed flush in a file tool leaves an orphaned swap marker.**
+  `rollback_after_flush_failure` (`mcp/servers/file.rs`) deletes the document
+  but not the `dirty_file_buffers` row. After a restart the path loads as a
+  recovered swap nobody made, and `write`/`edit` refuse until `kj swap
+  ack|discard`. `mount_backend` and the editor keep both on failure; this
+  rollback is the odd one out.
+- **`flush_one` can mark a racing edit clean.** It snapshots the block,
+  awaits the write, then clears `dirty`. An editor keystroke in that window
+  stays in the block with `dirty == false` and no row, so eviction loses it.
+- **The read-only hint names `shell_write` to a seat without it.** A
+  `toolie` binds only `facade:shell`. The read-only description says the
+  same thing unconditionally. Name the write path only when the seat's
+  roster has it.
+- **No test covers a failure on one pool thread with work queued on
+  another.** The factory-panic drain test is one-thread by design now.
+  Block every thread of a three-thread pool, queue the failing factory and a
+  sibling on different threads, release, and assert the sibling settles
+  with the stop observed.
+
 ## Egress: what stays open (2026-09-21)
 
 `docs/egress.md` owns the rule: per-context rows, a reviewer-held list, refuse

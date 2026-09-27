@@ -562,6 +562,8 @@ impl KjDispatcher {
         if filtered.is_empty() {
             let msg = if snapshots.is_empty() {
                 "(no blocks)".to_string()
+            } else if matched > 0 {
+                format!("(showing the last 0 of {matched})")
             } else {
                 format!("(no blocks match the filter — {} total)", snapshots.len())
             };
@@ -2372,6 +2374,9 @@ mod tests {
         assert!(message.contains("second") && message.contains("third"), "{message}");
         assert!(message.find("second") < message.find("third"), "the tail keeps log order: {message}");
         assert!(message.contains("last 2 of 3"), "a tail must disclose what it left out: {message}");
+
+        let result = d.dispatch(&[s("block"), s("list"), s("--tail"), s("0")], &c).await;
+        assert!(result.message().contains("last 0 of 3"), "an empty tail is not a filter miss: {}", result.message());
     }
 
     #[tokio::test]

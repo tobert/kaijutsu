@@ -629,6 +629,15 @@ impl FileToolsServer {
             }
             Err(CacheReadError::Backend(e)) => return ExecResult::failure(1, e),
         };
+        // The read above records whether disk moved under a dirty buffer. A
+        // plan from that buffer would flush it over the newer disk text, so
+        // refuse before touching either; the buffer's owner resolves it.
+        if self.cache.disk_changed_since_load(&path) {
+            return ExecResult::failure(1, format!(
+                "{path}: has unsaved changes in a buffer and changed on disk since it was read; \
+                 nothing was edited. Keep the buffer with the editor's :w!, or drop it with \
+                 `kj swap discard {path}` so the disk text wins."));
+        }
 
         let plan = if let Some(anchor) = &p.anchor {
             plan_anchor_edit(&content, anchor, &p.new_string)
@@ -1220,6 +1229,36 @@ mod tests {
         assert!(text_of(&result).contains("changed while the edit was prepared"), "{}", text_of(&result));
         assert_eq!(cache.try_read_content(path).await.unwrap(), "PREFIX alpha beta gamma\n",
             "the other writer's text must survive untouched");
+    }
+
+    /// A dirty buffer whose file changed on disk is behind the disk: an edit
+    /// planned from it and flushed would overwrite the newer text. It must
+    /// refuse and leave both disk and buffer alone.
+    #[tokio::test]
+    async fn edit_refuses_a_dirty_buffer_the_disk_moved_under() {
+        let path = "/tmp/moved.txt";
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        vfs.write_all(std::path::Path::new(path), b"one two\n").await.unwrap();
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "one two\n");
+        cache.create_or_replace(path, "one two unsaved\n", PrincipalId::system()).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+        vfs.write_all(std::path::Path::new(path), b"external\n").await.unwrap();
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs.clone(), None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+
+        let result = call(&broker, "edit", serde_json::json!({
+            "path": path, "old_string": "two", "new_string": "three",
+        })).await;
+
+        assert!(result.is_error, "an edit over a stale buffer must refuse: {}", text_of(&result));
+        assert!(text_of(&result).contains("changed on disk"), "{}", text_of(&result));
+        let disk = vfs.read_all(std::path::Path::new(path)).await.unwrap();
+        assert_eq!(disk, b"external\n", "the newer disk text must survive");
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "one two unsaved\n", "the buffer must be untouched");
     }
 
     fn text_of(r: &KernelToolResult) -> String {
