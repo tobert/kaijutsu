@@ -575,23 +575,28 @@ mod tests {
         assert_eq!(drained.load(Ordering::SeqCst), THREADS, "shutdown must drain the work queued for every thread");
     }
 
+    /// The queued work must wait behind the blocked task, so it cannot run
+    /// before the stop. One thread makes that true; a wider pool would place
+    /// it on an idle thread, where it could run first.
     #[tokio::test]
     async fn a_factory_panic_during_shutdown_still_drains_accepted_work() {
-        let kernel = crate::Kernel::new_ephemeral("factory-panic-drain").await;
+        let kernel = crate::Kernel::new_ephemeral_with_threads("factory-panic-drain", 1).await;
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         kernel.spawn_runtime_task(move |_| async move {
-            entered.send(()).unwrap();
+            entered.send(std::thread::current().id()).unwrap();
             blocked.recv().unwrap();
         }).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), ready).await.unwrap().unwrap();
+        let blocked_thread = tokio::time::timeout(std::time::Duration::from_secs(3), ready).await.unwrap().unwrap();
         kernel.spawn_runtime_task(|_| -> std::future::Ready<()> { panic!("queued factory panic sentinel"); }).unwrap();
         let (finished, settled) = tokio::sync::oneshot::channel();
         let caller = std::thread::current().id();
         kernel.spawn_runtime_task(move |stop| {
             assert_ne!(std::thread::current().id(), caller, "construction stays on the kaish thread");
             let local = std::rc::Rc::new("settled");
+            let queued_on = std::thread::current().id();
             async move {
+                assert_eq!(queued_on, blocked_thread, "queued work must wait behind the blocked task");
                 assert!(stop.is_cancelled(), "queued work must receive the stopped token");
                 tokio::task::yield_now().await;
                 finished.send(*local).unwrap();
