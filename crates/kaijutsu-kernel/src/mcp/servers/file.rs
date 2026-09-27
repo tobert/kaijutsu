@@ -115,6 +115,10 @@ pub struct FileToolsServer {
     vfs: Arc<MountTable>,
     guard: Option<WorkspaceGuard>,
     notif_tx: broadcast::Sender<ServerNotification>,
+    /// Runs once between planning an edit and applying it, so a test can
+    /// write the file the way a concurrent caller would.
+    #[cfg(test)]
+    after_plan: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FileToolsServer {
@@ -132,6 +136,8 @@ impl FileToolsServer {
             vfs,
             guard,
             notif_tx,
+            #[cfg(test)]
+            after_plan: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -634,17 +640,16 @@ impl FileToolsServer {
             Ok(plan) => plan,
             Err(msg) => return ExecResult::failure(1, format!("{}: {}", path, msg)),
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_plan.lock().take() { hook(); }
 
-        let store = self.cache.block_store();
-        for op in plan.ops.iter().rev() {
-            if let Err(e) =
-                store.edit_text_as(
-                    ctx_id, &block_id, op.char_offset, &op.insert, op.char_delete,
-                    Some(tool_ctx.actor_id),
-                )
-            {
-                return ExecResult::failure(1, e.to_string());
-            }
+        // One compare-and-replace: the plan's offsets are only valid against
+        // the text it was planned from, so a file another writer changed
+        // since then is refused rather than edited at the wrong place.
+        if let Err(e) = self.cache.block_store().replace_text_if_unchanged_as(
+            ctx_id, &block_id, &content, &plan.expected, Some(tool_ctx.actor_id),
+        ) {
+            return ExecResult::failure(1, format!("{}: {}", path, e));
         }
 
         if let Err(e) = self.cache.mark_dirty(&path) {
@@ -680,13 +685,14 @@ impl FileToolsServer {
             }
         };
         if updated != plan.expected {
+            let line = updated.lines().zip(plan.expected.lines()).take_while(|(a, b)| a == b).count() + 1;
             return ExecResult::failure(
                 1,
                 format!(
-                    "edit verification FAILED for {}: the file does not match the \
-                     requested change (the edit was misapplied). Re-read the file \
-                     before further edits.",
-                    path
+                    "edit applied, but {} read back differs from it starting at line {}: \
+                     another writer changed it, or the write did not land as planned. \
+                     Re-read the file before further edits.",
+                    path, line
                 ),
             );
         }
@@ -1184,6 +1190,36 @@ mod tests {
             performer,
             "the current performer, rather than the file hydrator, owns the live edit"
         );
+    }
+
+    /// An edit planned against text another writer has since changed must
+    /// refuse and leave that writer's text alone, not apply its offsets to
+    /// the newer text.
+    #[tokio::test]
+    async fn edit_refuses_when_the_file_changed_after_it_was_planned() {
+        let path = "/tmp/race.txt";
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        cache.create_or_replace(path, "alpha beta gamma\n", PrincipalId::system()).await.unwrap();
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let (ctx_id, block_id) = cache.try_get_or_load(path).await.unwrap();
+        let writer = cache.block_store().clone();
+        *server.after_plan.lock() = Some(Box::new(move || {
+            writer.edit_text(ctx_id, &block_id, 0, "PREFIX ", 0).unwrap();
+        }));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+
+        let result = call(&broker, "edit", serde_json::json!({
+            "path": path, "old_string": "gamma", "new_string": "delta",
+        })).await;
+
+        assert!(result.is_error, "a stale edit must refuse: {}", text_of(&result));
+        assert!(text_of(&result).contains("changed while the edit was prepared"), "{}", text_of(&result));
+        assert_eq!(cache.try_read_content(path).await.unwrap(), "PREFIX alpha beta gamma\n",
+            "the other writer's text must survive untouched");
     }
 
     fn text_of(r: &KernelToolResult) -> String {
