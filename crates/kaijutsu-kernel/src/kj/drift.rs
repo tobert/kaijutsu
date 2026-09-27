@@ -37,7 +37,9 @@ pub(crate) struct DriftArgs {
 
 #[derive(Subcommand, Debug)]
 enum DriftCommand {
-    /// Send content to a target context, delivered immediately. With
+    /// Send content to a target context now: it lands in the target's log,
+    /// and a turn running there reads it after its next tool round. It
+    /// never starts or extends a turn. With
     /// --summarize, LLM-distill the caller's whole context instead of
     /// sending literal content. With --stage, queue it for a later
     /// `flush` instead of delivering now. Refuses an archived or concluded

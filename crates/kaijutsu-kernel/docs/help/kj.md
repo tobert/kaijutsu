@@ -29,7 +29,8 @@ kj drift pull approach-b "summarize what you tried"
 ### Share a Finding
 
 ```bash
-# Send a concrete finding (no LLM, fast — delivered immediately)
+# Send a concrete finding (no LLM; lands in the target's log now, and a
+# running turn there reads it after its next tool round)
 kj drift push main "retry logic in client.rs:142 drops errors silently"
 ```
 
