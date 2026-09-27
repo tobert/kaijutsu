@@ -1,0 +1,23 @@
+[package]
+name = "kaijutsu-acp-fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Scenario tests that drive an ACP agent over stdio and check the workspace it leaves behind"
+
+[[bin]]
+name = "acp-fleet"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# A plain ACP client: std threads and newline-delimited JSON-RPC, with no
+# kaijutsu crate underneath, so it can drive any ACP agent command.
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

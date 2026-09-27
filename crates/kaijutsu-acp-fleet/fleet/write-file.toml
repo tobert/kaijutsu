@@ -1,0 +1,18 @@
+description = "A model turn writes a file by a relative path, so the file lands in the session cwd."
+
+[[model]]
+tool_calls = [
+  { name = "write", input = { path = "notes/fleet.txt", content = "written by the fleet\n" } },
+]
+
+[[model]]
+text = "wrote it"
+
+[[prompt]]
+text = "write the file"
+text_contains = ["wrote it"]
+tool_calls = [{ title = "write", status = "completed" }]
+
+[[verify]]
+path = "notes/fleet.txt"
+equals = "written by the fleet\n"

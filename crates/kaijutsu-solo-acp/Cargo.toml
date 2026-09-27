@@ -10,6 +10,12 @@ description = "All-in-one ACP v1 agent: a private kaijutsu kernel in-process, se
 name = "kaijutsu-solo-acp"
 path = "src/main.rs"
 
+[[test]]
+# The ACP scenario fleet (`docs/acp-fleet.md`) runs every scenario against
+# this binary: `cargo test -p kaijutsu-solo-acp --features test-mock --test acp_fleet`.
+name = "acp_fleet"
+required-features = ["test-mock"]
+
 [lints]
 workspace = true
 
@@ -47,6 +53,7 @@ tracing-subscriber.workspace = true
 whoami.workspace = true
 
 [dev-dependencies]
+kaijutsu-acp-fleet = { path = "../kaijutsu-acp-fleet" }
 # Signals, for the tests that prove an interrupted run still removes its
 # temporary state.
 libc = "0.2"

@@ -2484,6 +2484,35 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   sibling on different threads, release, and assert the sibling settles
   with the stop observed.
 
+## ACP fleet: what slice 1 left open (2026-09-27)
+
+The fleet (`docs/acp-fleet.md`) runs Harbor-shaped scenarios against
+`kaijutsu-solo-acp` with the scripted mock model. Amy: "some of those acp
+sessions can use modified rc too, maybe a more yolo mode for when it's
+contained in docker for simulations with no access to my ~." Open:
+
+- **A contained yolo mode.** Scenarios running in a container with no
+  access to the host home can take a permissive rc and gate, and verifiers
+  can then run scripts (host exec) rather than only declarative checks.
+  Decide the container boundary first; outside it, verifiers stay
+  declarative.
+- **A failed follow-up turn has no structured ACP signal.** After a
+  permission answer the kernel starts a follow-up turn; when it fails, the
+  wire carries only agent text "stream error: …", and the runner matches
+  that text.
+- **The permission request's title is the advisory hook's reason** ("lfm2d
+  cannot score this call…"), not the command asked about.
+- **A missed expectation waits out the timeout.** A broken `text_contains`
+  took 128 s to fail; the runner should fail when the turn ends without the
+  text.
+- **Mock replies a scenario never used go unreported.**
+- `solo_acp_stdio.rs` still has its own client; move it onto the fleet's.
+  Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
+- The shipped `gate.toml` names a tailnet classifier, so solo runs
+  (`solo_acp_stdio.rs`, bench) reach the network at every shell_write
+  (inferred from about 10 s of per-run timing). The fleet's default gate
+  drops `[classifier]`.
+
 ## Egress: what stays open (2026-09-21)
 
 `docs/egress.md` owns the rule: per-context rows, a reviewer-held list, refuse

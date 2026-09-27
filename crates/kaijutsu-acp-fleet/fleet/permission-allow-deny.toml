@@ -1,0 +1,44 @@
+description = "A gated shell command asks the client; allow runs it, deny leaves the workspace untouched."
+
+# No [classifier] url, so the advisory hook asks at once instead of reaching
+# for a network classifier; every shell_write statement is uncovered and asks.
+gate = """
+[global]
+"""
+
+# Prompt 1: the call is refused as pending, the turn ends, the client allows,
+# the command runs, and a follow-up turn reads the result.
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir granted" } }]
+[[model]]
+text = "waiting on the reviewer"
+[[model]]
+text = "granted exists now"
+
+# Prompt 2: the same shape, answered deny.
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir refused" } }]
+[[model]]
+text = "waiting on the reviewer again"
+[[model]]
+text = "refused was not made"
+
+[[prompt]]
+text = "make the granted directory"
+permissions = ["allow"]
+text_contains = ["waiting on the reviewer", "granted exists now"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj" }]
+
+[[prompt]]
+text = "make the refused directory"
+permissions = ["deny"]
+text_contains = ["waiting on the reviewer again", "refused was not made"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "granted"
+exists = true
+
+[[verify]]
+path = "refused"
+exists = false

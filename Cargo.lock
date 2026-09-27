@@ -6433,6 +6433,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaijutsu-acp-fleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "kaijutsu-agent-tools"
 version = "0.1.0"
 dependencies = [
@@ -6847,6 +6858,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kaijutsu-acp",
+ "kaijutsu-acp-fleet",
  "kaijutsu-client",
  "kaijutsu-kernel",
  "kaijutsu-server",

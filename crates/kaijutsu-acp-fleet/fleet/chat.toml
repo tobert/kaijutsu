@@ -1,0 +1,9 @@
+description = "A plain chat turn: the model's text reaches the client and the turn ends cleanly."
+
+[[model]]
+text = "fleet mock speaking"
+
+[[prompt]]
+text = "say something"
+text_contains = ["fleet mock speaking"]
+tool_calls = []
