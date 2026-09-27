@@ -962,8 +962,17 @@ refused. Left from the rename:
 inserted between two others sorted before its anchor (`855ace8a`). The
 likeliest victim is a tool result sorted before its call, which hydration
 repairs by synthesizing an "interrupted" result and dropping the real one.
-Nothing re-sorts blocks already stored, and no verb moves a block. A scan
-for results that sort before their `tool_call_id` would size it.
+Nothing re-sorts blocks already stored, and no verb moves a block.
+
+Sized on moltar 2026-09-27 (backup of the 09:49 deploy, scratch scanner over
+`load_one_from_db` + `blocks_ordered`): 58 of 747 tool results (7.8%) sort
+before their call, in 5 of 12 contexts, from 09-21 through 09-26. Calls
+inserted at one anchor also landed in reverse order. Banto's 09-21
+`read_shell_operation` results are among them, which accounts for the
+"interrupted (context was forked or pruned)" errors in its problem report:
+snapshot repair synthesized them live. Every one predates the fix. A repair
+needs a kernel-sequenced move (a new order key for the result, after its
+call) and a decision on whether to run it; zorak's larger store is unsized.
 
 ## Async completion recovery follow-ups
 
@@ -2428,6 +2437,23 @@ history must not be quoted. Open:
 - **A kaish lexer rejection degrades the gate to the no-plan fallback**
   (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
   lexer bug is kaish's (`gotcha_kaish` in memory has the shape).
+
+## kaish `env` takes its command's flags as its own (2026-09-21, kaish)
+
+`env A=1 make -C dir app` fails: `env: error: unexpected argument '-C'
+found`. `EnvArgs::args` in kaish's `tools/builtin/env.rs` (pinned rev
+ad293823) is not `trailing_var_arg`, so clap parses every hyphen word after
+the command as an env flag. Parsing should stop at the first word that is
+neither an env flag nor `VAR=value`. The binder may already have split
+`-C` into `flags` before `to_argv`, so the fix may need that layer too.
+Workaround: `export` the variables, `cd`, then run the command. Belongs to
+the kaish lead.
+
+## A background read-only shell refusal carries no `shell_write` hint (2026-09-27)
+
+`name_the_write_path` (`runtime/tool_command.rs`) appends the hint only to a
+foreground result. A `run_in_background` read-only call settles through
+`run_into_blocks` and its completion notice without it.
 
 ## Egress: what stays open (2026-09-21)
 
