@@ -76,6 +76,9 @@ enum BlockCommand {
         /// Filter by status: pending|running|waiting|done|error|draft
         #[arg(long)]
         status: Option<String>,
+        /// Show only the newest N blocks that pass the filters, in log order
+        #[arg(long, value_name = "N")]
+        tail: Option<usize>,
     },
     /// Inspect a single block's metadata.
     Inspect {
@@ -323,7 +326,8 @@ impl KjDispatcher {
                 kind,
                 role,
                 status,
-            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), caller),
+                tail,
+            } => self.block_list(context.as_deref(), kind.as_deref(), role.as_deref(), status.as_deref(), tail, caller),
             BlockCommand::Inspect {
                 block_id,
                 context,
@@ -504,6 +508,7 @@ impl KjDispatcher {
         kind_arg: Option<&str>,
         role_arg: Option<&str>,
         status_arg: Option<&str>,
+        tail: Option<usize>,
         caller: &KjCaller,
     ) -> KjResult {
         let ctx_id = {
@@ -532,7 +537,7 @@ impl KjDispatcher {
             Err(e) => return KjResult::Err(e),
         };
 
-        let filtered: Vec<_> = snapshots
+        let mut filtered: Vec<_> = snapshots
             .iter()
             .filter(|b| {
                 kf.is_none_or(|k| b.kind == k)
@@ -540,6 +545,10 @@ impl KjDispatcher {
                     && sf.is_none_or(|s| b.status == s)
             })
             .collect();
+        let matched = filtered.len();
+        if let Some(n) = tail {
+            filtered.drain(..matched.saturating_sub(n));
+        }
 
         // For-loop iteration payload: JSON array of block id strings so
         // `for b in $(kj block list); do echo $b; done` walks ids directly.
@@ -561,11 +570,14 @@ impl KjDispatcher {
         // A filter that narrows the result must say so — a short listing and
         // a filtered listing must not look identical (same disclosure rule
         // `kj roster list` follows for hidden rows).
-        let mut out = if filtered.len() != snapshots.len() {
-            format!("{} of {} blocks matched the filter\n", filtered.len(), snapshots.len())
+        let mut out = if matched != snapshots.len() {
+            format!("{} of {} blocks matched the filter\n", matched, snapshots.len())
         } else {
             String::new()
         };
+        if filtered.len() != matched {
+            out.push_str(&format!("showing the last {} of {}\n", filtered.len(), matched));
+        }
         for b in &filtered {
             let mut line = format!(
                 "{}  {}/{}  [{}]  {}",
@@ -2341,6 +2353,25 @@ mod tests {
             "a narrowed listing must disclose the unfiltered total: {}",
             result.message()
         );
+    }
+
+    #[tokio::test]
+    async fn block_list_tail_shows_the_newest_matches_and_says_so() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        for text in ["first", "second", "third"] {
+            insert_text_block(&d, ctx, text);
+        }
+
+        let result = d.dispatch(&[s("block"), s("list"), s("--tail"), s("2")], &c).await;
+        assert!(result.is_ok(), "{}", result.message());
+        let message = result.message();
+        assert!(!message.contains("first"), "the oldest block is past the tail: {message}");
+        assert!(message.contains("second") && message.contains("third"), "{message}");
+        assert!(message.find("second") < message.find("third"), "the tail keeps log order: {message}");
+        assert!(message.contains("last 2 of 3"), "a tail must disclose what it left out: {message}");
     }
 
     #[tokio::test]
