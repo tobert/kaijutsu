@@ -3076,10 +3076,18 @@ impl Broker {
         cancel: &CancellationToken,
     ) -> ShellHookVerdict {
         let params = Self::shell_write_hook_params(command);
-        match self
+        let outcome = match self
             .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None, cancel)
             .await
         {
+            Ok(PhaseOutcome::Continue) => match self.ask_tier_ask(command, &params, ctx, cancel).await {
+                Ok(None) => Ok(PhaseOutcome::Continue),
+                Ok(Some(outcome)) => Ok(outcome),
+                Err(e) => Err(e),
+            },
+            other => other,
+        };
+        match outcome {
             Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
                 emit_short_circuit_attribution(McpHookPhase::PreCall, &hook_id);
@@ -3099,6 +3107,58 @@ impl Broker {
             }
             Err(e) => ShellHookVerdict::Denied(e),
         }
+    }
+
+    /// The gate policy's ask-tier statements in `command`, described for an
+    /// ask. `None` when none is ask-tier, or when the program does not plan,
+    /// the config does not load, or a statement is deny-tier: PreCall
+    /// decides those cases itself.
+    async fn ask_tier_description(&self, command: &str, ctx: &CallContext) -> Option<String> {
+        let statements = kaish_kernel::ast::plan::plan_program(command).ok()?;
+        let load = self.gate_config_load().await;
+        let config = load.as_ref().ok()?;
+        let context_type = self.context_type_for(ctx).await;
+        let layers = crate::kj::gate_policy::Layers { config, context_type: context_type.as_deref() };
+        let policy = crate::kj::gate_policy::evaluate_planned(&statements, layers);
+        if policy.verdict() == approval_ledger::types::AskVerdict::Deny {
+            return None;
+        }
+        policy.describe_asks_planned(&statements)
+    }
+
+    /// Open the ask for an ask-tier statement on the RPC shell paths.
+    ///
+    /// These paths never reach the shell gate, which asks for the tier on
+    /// the `shell_write` tool path, so the ask opens here, once the hooks
+    /// have let the call proceed: a hook's deny refuses without asking a
+    /// human first. `None` means no ask-tier statement, or a human already
+    /// allowed it. See `docs/gate-policy-tuning.md`, "Settled while
+    /// reviewing".
+    async fn ask_tier_ask(
+        &self,
+        command: &str,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+        cancel: &CancellationToken,
+    ) -> McpResult<Option<PhaseOutcome>> {
+        let Some(description) = self.ask_tier_description(command, ctx).await else {
+            return Ok(None);
+        };
+        let hook_id = HookId(GATE_POLICY_SUBJECT.into());
+        let spec = AskSpec { description: Some(description) };
+        Ok(match self
+            .run_permission_ask(&hook_id, &spec, params, ctx, McpHookPhase::PreCall, &PhasePayload::None, None, cancel)
+            .await?
+        {
+            PermissionAskOutcome::Proceed => None,
+            PermissionAskOutcome::Denied { reason, ask } => Some(PhaseOutcome::Deny { hook_id, reason, ask }),
+            PermissionAskOutcome::Unavailable { reason, ask } => {
+                Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask })
+            }
+            PermissionAskOutcome::Pending { reason, ask } => {
+                Some(PhaseOutcome::GatePending { hook_id, reason, ask })
+            }
+        })
     }
 
     /// Run `PreCall` against `command` the way [`Self::shell_pre_call_hooks`]
@@ -3133,6 +3193,15 @@ impl Broker {
         let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
             else { inherit_hook_depth(0, evaluation).await };
         match result? {
+            PhaseEval::DryRun(report) if report.outcome == DryRunOutcome::WouldProceed => {
+                match self.ask_tier_description(command, ctx).await {
+                    Some(description) => {
+                        let hook_id = HookId(GATE_POLICY_SUBJECT.into());
+                        Ok(self.dry_run_ask(&hook_id, description, &params, ctx).await)
+                    }
+                    None => Ok(report),
+                }
+            }
             PhaseEval::DryRun(report) => Ok(report),
             // Unreachable by construction, and an error rather than a
             // fallback: a verdict reaching this path would mean the
@@ -10515,6 +10584,70 @@ mod tests {
             .await
             .expect("the tiers must read allow,ask,score,allow");
         assert!(!result.is_error);
+    }
+
+    /// On the RPC shell paths an ask-tier statement asks with no hook
+    /// installed, and the ask names the tier's layer and key. A statement no
+    /// key covers still runs there.
+    ///
+    /// Falsified by leaving the ask tier to the hooks: `git push` proceeds.
+    #[tokio::test]
+    async fn an_ask_tier_statement_asks_on_the_rpc_shell_path_with_no_hook() {
+        let (broker, _kernel, kj, _dir) =
+            wired_kaish_broker_with_gate_toml("rpc-ask-tier", "[global]\nask = [\"git push\"]\n").await;
+        let ctx = approval_call_context(&kj, "rpc-ask-tier");
+        let db = kj.kernel_db();
+
+        match broker.shell_pre_call_hooks("echo hi", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("an uncovered statement with no hook must proceed, got {other:?}"),
+        }
+        assert!(db.lock().list_pending_asks().unwrap().is_empty());
+
+        let report = broker
+            .shell_pre_call_hooks_dry_run("git push origin main", &ctx, &CancellationToken::new())
+            .await
+            .expect("a dry run reports");
+        assert_eq!(report.outcome, DryRunOutcome::WouldAsk, "{report:?}");
+        assert!(db.lock().list_pending_asks().unwrap().is_empty(), "a dry run asks nobody");
+
+        match broker.shell_pre_call_hooks("echo hi; git push origin main", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(_) => {}
+            other => panic!("an ask-tier statement must ask, got {other:?}"),
+        }
+        let pending = db.lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1);
+        let description = &pending[0].description;
+        assert!(
+            description.contains("global config asks git push") && description.contains("git push origin main"),
+            "the ask names the layer, the key, and the statement: {description}"
+        );
+
+        answer_pending_ask(db.clone(), true);
+        match broker.shell_pre_call_hooks("echo hi; git push origin main", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("the allowed retry must proceed, got {other:?}"),
+        }
+        assert!(db.lock().list_pending_asks().unwrap().is_empty(), "an answered ask is not asked again");
+    }
+
+    /// A hook's deny refuses an ask-tier statement on the RPC shell path
+    /// without asking a human first.
+    ///
+    /// Falsified by opening the tier ask before the hooks: a pending ask is
+    /// left behind for a command the hook refused.
+    #[tokio::test]
+    async fn a_hook_deny_outranks_the_ask_tier_on_the_rpc_shell_path() {
+        let (broker, _kernel, kj, _dir) =
+            wired_kaish_broker_with_gate_toml("rpc-ask-tier-deny", "[global]\nask = [\"git push\"]\n").await;
+        let ctx = approval_call_context(&kj, "rpc-ask-tier-deny");
+        push_shell_write_hook(&broker, "no-push", HookAction::Deny("no pushing".into())).await;
+
+        match broker.shell_pre_call_hooks("git push origin main", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => assert!(err.to_string().contains("no pushing"), "{err}"),
+            other => panic!("the hook's deny must refuse, got {other:?}"),
+        }
+        assert!(kj.kernel_db().lock().list_pending_asks().unwrap().is_empty(), "nobody is asked");
     }
 
     /// A file that does not parse is a fault: the call is refused as gate

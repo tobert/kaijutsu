@@ -203,6 +203,31 @@ impl PolicyEvaluation {
         })
     }
 
+    /// The ask description for a planned program's ask-tier statements,
+    /// naming each layer, key, and statement. `None` when no statement is
+    /// ask-tier.
+    pub(crate) fn describe_asks_planned(&self, statements: &[PlannedStatement]) -> Option<String> {
+        let parts: Vec<String> = self
+            .per_statement
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| match v {
+                PolicyVerdict::Ask(d) => Some(match statements.get(i) {
+                    Some(s) => format!(
+                        "{} asks {} — statement #{} (`{}`)",
+                        d.layer,
+                        d.key,
+                        s.index,
+                        truncate_for_reason(&s.plan.rendered)
+                    ),
+                    None => format!("{} asks {} — statement #{i}", d.layer, d.key),
+                }),
+                _ => None,
+            })
+            .collect();
+        (!parts.is_empty()).then(|| format!("gate policy: {}", parts.join("; ")))
+    }
+
     fn describe_with(&self, allow: bool, name: impl Fn(usize) -> String) -> String {
         let parts: Vec<String> = self
             .per_statement

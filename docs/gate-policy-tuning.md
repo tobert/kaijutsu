@@ -154,9 +154,9 @@ on the ask they answered. Exact text, exact authorization.
   `docs/kaish-integration.md`). The refusal names the layer and key. Leaves a durable row
   when it happens inside `run_gate`.
 - **Ask** (a statement the config marks ask-tier) — never auto-allowed by a
-  lower layer; the existing ask machinery of each stack does the asking, and
-  in the hook stack the tier is firm rather than advisory (the mechanism
-  follows below). A tier a hook could vote down is not a tier.
+  lower layer. `run_gate` asks on the `shell_write` tool path; on the RPC
+  shell paths broker PreCall opens the ask before any hook runs (see
+  "Settled while reviewing"). A tier a hook could vote down is not a tier.
 
 **A tier allow is not a capability grant.** `require_cap` and the loadout
 run exactly as before; the evaluator decides whether an *ask* fires, never
@@ -553,20 +553,16 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   breaks between PreCall (which refused on it) and the hook run stamps
   `score` everywhere and logs an error — the enforcing pinch points reload
   and fail closed either side of it.
-- **The `ask` tier on the RPC shell paths rides the hook stack.** Those
-  paths evaluate PreCall and never open the shell gate, so an ask-tier
-  statement there is asked only when an installed hook exits 3 for it. No
-  shipped hook does, so today the RPC paths run an ask-tier statement
-  without asking. The MCP `shell_write` path asks through `run_gate`
-  regardless. Whether PreCall should open its own ask for an ask-tier
-  statement when no hook does is the open question below.
+- **The `ask` tier on the RPC shell paths asks at PreCall.** Those paths
+  never open the shell gate, so `Broker::shell_pre_call_hooks` opens the ask
+  itself for an ask-tier statement, after the hooks let the call proceed,
+  so a hook's deny refuses without asking anyone first. The ask names each
+  layer, key, and statement ("gate policy: global config asks git push —
+  statement #0 (`git push origin main`)"). An allowed retry proceeds. A hook
+  that asks about the same statement asks separately; no shipped hook does. The `shell_write` tool path asks through `run_gate` instead, so it
+  never asks twice for the tier.
 
 ## Open questions
-- **Should broker PreCall open an ask for an ask-tier statement itself?**
-  Today the ask tier is firm through `run_gate` (MCP `shell_write`) and
-  through a hook's exit 3 when one is installed. A PreCall-owned ask would make the tier firm on the RPC paths with no hook
-  installed, at the cost of a second ask on the MCP path, which already
-  double-asks when a hook escalates ahead of the shell gate.
 - **shell-guard's interpreter lists.** They are opacity rules, not risk
   tiers, and stay a structural hook in v1. Whether `deny = ["sh", "bash",
   …]` in `gate.toml` eventually replaces the jq is a later call — one

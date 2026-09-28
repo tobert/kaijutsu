@@ -2330,16 +2330,12 @@ classifier that did not come back"). A replacement arrives as an rc pre_call
 hook (`docs/gate-policy-tuning.md`, "Verdicts"). These gaps outlived the old
 one:
 
-- **The ask tier on the RPC shell paths needs a hook.** Those paths evaluate
-  broker PreCall and never open the shell gate, so with no hook installed an
-  ask-tier statement (`kj rc add`, `git push`) typed at an app or tui shell
-  runs without asking. MCP and ACP `shell_write` still ask through
-  `run_gate`. `docs/gate-policy-tuning.md`, "Open questions", asks whether
-  PreCall should open the ask itself.
-- **The gate's own ask does not name the tier key.** An ask-tier statement's
-  ask is titled `shell_write: 1 statement(s) — <command>`; the removed hook
-  said "ask tier on". The approver cannot tell a configured ask from an
-  uncovered one without `kj ledger rules`.
+- **The shell gate's ask does not name the tier key.** On the `shell_write`
+  tool path an ask-tier statement's ask is titled `shell_write: 1
+  statement(s) — <command>`. The RPC shell paths name the layer and key
+  (`describe_asks_planned`); `run_gate` could use the same text. Until then
+  the approver cannot tell a configured ask from an uncovered one there
+  without `kj ledger rules`.
 - **`clause` drops redirects.** `KJ_TOOL_PLAN`'s `commands[].clause`
   (`kj/plan_clauses.rs`) excludes redirects, so a scorer reading it sees
   `kj block list` for `kj block list > ~/.bashrc`. Score
