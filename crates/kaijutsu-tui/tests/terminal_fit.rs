@@ -348,15 +348,22 @@ fn the_wheel_as_arrows_leaves_the_tail_and_q_returns() {
     wheel_up(&session);
     wait_for_scrolled(&session, "after three Up");
 
-    let after = session.screen_text();
     // One wheel tick is three `Up` presses and moves the screen three lines:
-    // the arrows scroll the view, they do not walk a cursor up it.
-    assert_eq!(
+    // the arrows scroll the view, they do not walk a cursor up it. The hint
+    // appears on the first press, so wait for all three to land rather than
+    // reading the frame between them.
+    let three = session.wait_until(Duration::from_secs(5), |screen| {
+        let rows: Vec<String> =
+            screen.rows(0, screen.size().1).take(TRANSCRIPT_ROWS).map(|l| l.trim_end().to_string()).collect();
+        rows_shifted_up(&before, &rows) == Some(3)
+    });
+    assert!(
+        three,
+        "the transcript did not scroll three lines (shifted {:?}): {}",
         rows_shifted_up(&before, &transcript_rows(&session)),
-        Some(3),
-        "the transcript did not scroll three lines: {}",
         session.dump("scrolled")
     );
+    let after = session.screen_text();
     assert!(
         compose_row(&after).is_some(),
         "the draft is drawn live while scrolled: {}",
