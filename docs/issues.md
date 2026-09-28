@@ -2330,6 +2330,10 @@ classifier that did not come back"). A replacement arrives as an rc pre_call
 hook (`docs/gate-policy-tuning.md`, "Verdicts"). These gaps outlived the old
 one:
 
+- **`kj ledger list` shows a gate-policy ask's ORIGIN as `hook`.** The
+  RPC-path tier ask (`Broker::ask_tier_ask`) opens through
+  `run_permission_ask`, which records a hook origin; the description names
+  the gate policy. Seen live on moltar, 2026-09-28.
 - **The shell gate's ask does not name the tier key.** On the `shell_write`
   tool path an ask-tier statement's ask is titled `shell_write: 1
   statement(s) — <command>`. The RPC shell paths name the layer and key
