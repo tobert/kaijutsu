@@ -7,12 +7,10 @@
 //! every expectation that did not hold. See `docs/acp-fleet.md`.
 //!
 //! - [`client`]: a reusable ACP v1 client over a child process's stdio.
-//! - [`classifier`]: a scripted classifier for the gate's advisory hook.
 //! - [`container`]: the podman commands contained scenarios run with.
 //! - [`scenario`]: the scenario file format.
 //! - [`run`]: runs one scenario and judges it.
 
-pub mod classifier;
 pub mod client;
 pub mod container;
 pub mod run;

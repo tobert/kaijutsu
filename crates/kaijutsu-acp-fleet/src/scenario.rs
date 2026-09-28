@@ -13,7 +13,6 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::classifier::ClassifierSpec;
 use crate::client::PermissionAnswer;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -25,17 +24,12 @@ pub struct Scenario {
     #[serde(default)]
     pub mode: Mode,
     /// The gate policy the agent runs under. Default in host mode: the
-    /// shipped policy without its `[classifier]` table. Default in contained
-    /// mode: every uncovered statement is allowed.
+    /// shipped policy. Default in contained mode: every uncovered statement
+    /// is allowed.
     #[serde(default)]
     pub gate: Option<String>,
-    /// A mock classifier for the gate's advisory hook. Host mode only; the
-    /// runner sets `[classifier] url` in the gate policy to reach it.
-    #[serde(default)]
-    pub classifier: Option<ClassifierSpec>,
     /// rc files installed over the seeded rc tree, by path relative to it
-    /// (`--rc-overlay`). In contained mode these are added to the overlay
-    /// that turns the classifier hook off.
+    /// (`--rc-overlay`). A scenario installs a pre_call hook this way.
     #[serde(default)]
     pub rc: BTreeMap<String, String>,
     /// Files written into the workspace before the agent starts, by
@@ -188,12 +182,6 @@ impl Scenario {
         }
         for path in self.rc.keys() {
             workspace_relative(path).context("an [rc] path is relative to the rc tree")?;
-        }
-        if let Some(classifier) = &self.classifier {
-            if self.mode == Mode::Contained {
-                bail!("[classifier] needs host mode: a contained agent has no network to reach it");
-            }
-            classifier.check()?;
         }
         for (n, prompt) in self.prompt.iter().enumerate() {
             if let Some(titles) = &prompt.permission_titles
@@ -399,12 +387,6 @@ text = "go"
         assert!(refusal(&text).contains("scripts never run on the host"), "{}", refusal(&text));
         let contained = format!("mode = \"contained\"\n{MINIMAL}\n[[verify]]\nscript = \"true\"\n");
         Scenario::parse(&contained, "contained").unwrap();
-    }
-
-    #[test]
-    fn a_classifier_is_refused_in_contained_mode() {
-        let text = format!("mode = \"contained\"\n{MINIMAL}\n[classifier]\nverdict = \"informative\"\n");
-        assert!(refusal(&text).contains("needs host mode"), "{}", refusal(&text));
     }
 
     #[test]

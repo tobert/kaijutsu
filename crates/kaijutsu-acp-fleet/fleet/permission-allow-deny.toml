@@ -1,7 +1,6 @@
 description = "A gated shell command asks the client; allow runs it, deny leaves the workspace untouched."
 
-# No [classifier] url, so the advisory hook asks at once instead of reaching
-# for a network classifier; every shell_write statement is uncovered and asks.
+# An empty policy: every shell_write statement is uncovered and asks.
 gate = """
 [global]
 """

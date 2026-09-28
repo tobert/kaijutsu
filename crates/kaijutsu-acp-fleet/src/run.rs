@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-use crate::classifier::MockClassifier;
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
 use crate::scenario::{Mode, Prompt, Scenario, Verify, workspace_relative};
@@ -183,11 +182,9 @@ fn drive(
     if scenario.mode == Mode::Contained {
         container::preflight()?;
     }
-    let classifier = scenario.classifier.as_ref().map(MockClassifier::start).transpose()?;
-    let gate = gate_policy(scenario, classifier.as_ref().map(MockClassifier::url))?;
-    std::fs::write(scratch.fleet.join("gate.toml"), gate).context("write the gate policy")?;
-    let overlay = rc_overlay(scenario);
-    for (path, body) in &overlay {
+    std::fs::write(scratch.fleet.join("gate.toml"), gate_policy(scenario)).context("write the gate policy")?;
+    let overlay = &scenario.rc;
+    for (path, body) in overlay {
         let target = scratch.fleet.join("rc").join(workspace_relative(path)?);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -243,9 +240,6 @@ fn drive(
         Ok(_) => {}
         Err(error) => failures.push(format!("{error:#}")),
     }
-    if let (Some(mock), Some(spec)) = (&classifier, &scenario.classifier) {
-        failures.extend(spec.judge(&mock.scored()));
-    }
     failures.extend(verify_workspace(&scenario.verify, &scratch.workspace));
     for (n, check) in scenario.verify.iter().enumerate() {
         if let Some(script) = &check.script {
@@ -264,29 +258,6 @@ fn drive(
     Ok(())
 }
 
-/// The rc overlay files: in contained mode, the one that turns the classifier
-/// hook off, then the scenario's own, which win on the same path.
-fn rc_overlay(scenario: &Scenario) -> std::collections::BTreeMap<String, String> {
-    let mut overlay = std::collections::BTreeMap::new();
-    if scenario.mode == Mode::Contained {
-        overlay.insert(YOLO_HOOK_PATH.to_string(), YOLO_HOOK.to_string());
-    }
-    overlay.extend(scenario.rc.clone());
-    overlay
-}
-
-/// The rc script that installs the classifier hook, relative to the rc tree.
-pub const YOLO_HOOK_PATH: &str = "lib/create/S50-lfm2d.kai";
-
-/// What contained mode puts at [`YOLO_HOOK_PATH`]: the hook's mode is off and
-/// no hook is installed.
-pub const YOLO_HOOK: &str = "\
-# Contained ACP fleet (docs/acp-fleet.md): the classifier hook is off. The
-# agent runs in a container with no network and no host home, under a gate
-# that allows every uncovered statement.
-kj context set . --env LFM2D_MODE=off
-";
-
 /// The gate policy a contained scenario runs under when it names none: every
 /// statement no key covers runs, with no ask.
 pub const YOLO_GATE: &str = "\
@@ -295,20 +266,13 @@ pub const YOLO_GATE: &str = "\
 uncovered = \"allow\"
 ";
 
-/// The gate policy for a run: the scenario's, or the mode's default, with
-/// `[classifier] url` pointing at the mock classifier when there is one.
-fn gate_policy(scenario: &Scenario, classifier_url: Option<&str>) -> Result<String> {
-    let text = match (&scenario.gate, scenario.mode) {
+/// The gate policy for a run: the scenario's, or the mode's default.
+fn gate_policy(scenario: &Scenario) -> String {
+    match (&scenario.gate, scenario.mode) {
         (Some(gate), _) => gate.clone(),
-        (None, Mode::Host) => default_gate()?,
+        (None, Mode::Host) => SHIPPED_GATE.to_string(),
         (None, Mode::Contained) => YOLO_GATE.to_string(),
-    };
-    let Some(url) = classifier_url else { return Ok(text) };
-    let mut policy: toml::Table = text.parse().context("parse the scenario's gate policy")?;
-    let mut table = toml::Table::new();
-    table.insert("url".to_string(), toml::Value::String(url.to_string()));
-    policy.insert("classifier".to_string(), toml::Value::Table(table));
-    toml::to_string(&policy).context("write the gate policy")
+    }
 }
 
 fn converse(
@@ -345,17 +309,8 @@ fn converse(
     Ok(())
 }
 
-/// The shipped gate policy.
+/// The gate policy a host scenario runs under when it names none.
 const SHIPPED_GATE: &str = include_str!("../../../assets/defaults/gate.toml");
-
-/// The gate policy a scenario runs under when it names none: the shipped
-/// policy without its `[classifier]` table. A run then never reaches for a
-/// classifier on the network, and the advisory hook fails closed at once.
-pub fn default_gate() -> Result<String> {
-    let mut policy: toml::Table = SHIPPED_GATE.parse().context("parse the shipped gate policy")?;
-    policy.remove("classifier");
-    toml::to_string(&policy).context("write the default gate policy")
-}
 
 /// The text the ACP bridge sends as an agent message when a model turn fails
 /// outside a prompt, such as a follow-up turn started by a permission answer.
@@ -523,41 +478,25 @@ mod tests {
     }
 
     #[test]
-    fn the_classifier_url_is_written_into_the_scenarios_gate() {
-        let s = scenario("gate = \"[global]\\nallow = [\\\"mkdir\\\"]\\n\"");
-        let policy: toml::Table = gate_policy(&s, Some("http://127.0.0.1:9")).unwrap().parse().unwrap();
-        assert_eq!(policy["classifier"]["url"].as_str(), Some("http://127.0.0.1:9"));
-        assert_eq!(policy["global"]["allow"][0].as_str(), Some("mkdir"), "the scenario's tiers are kept");
-    }
-
-    #[test]
     fn each_mode_has_its_own_default_gate() {
-        let host: toml::Table = gate_policy(&scenario(""), None).unwrap().parse().unwrap();
-        assert!(host.contains_key("global") && !host.contains_key("classifier"), "{host:#?}");
-        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\""), None).unwrap().parse().unwrap();
+        assert_eq!(gate_policy(&scenario("")), SHIPPED_GATE);
+        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\"")).parse().unwrap();
         assert_eq!(contained["global"]["uncovered"].as_str(), Some("allow"));
-    }
-
-    #[test]
-    fn contained_mode_turns_the_hook_off_unless_the_scenario_says_otherwise() {
-        assert!(rc_overlay(&scenario("")).is_empty(), "host mode installs no overlay by default");
-        let contained = rc_overlay(&scenario("mode = \"contained\""));
-        assert!(contained[YOLO_HOOK_PATH].contains("LFM2D_MODE=off"), "{contained:#?}");
-        let own = rc_overlay(&scenario("mode = \"contained\"\n[rc]\n\"lib/create/S50-lfm2d.kai\" = \"mine\""));
-        assert_eq!(own[YOLO_HOOK_PATH], "mine");
+        let own = scenario("gate = \"[global]\\nallow = [\\\"mkdir\\\"]\\n\"");
+        assert_eq!(gate_policy(&own), "[global]\nallow = [\"mkdir\"]\n");
     }
 
     #[test]
     fn tool_output_and_permission_titles_are_checked() {
         let p = prompt(
             "tool_calls = [{ title = \"shell\", output_contains = \"shell_write\" }]\n\
-             permissions = [\"deny\"]\npermission_titles = [\"says destructive\"]",
+             permissions = [\"deny\"]\npermission_titles = [\"ask tier\"]",
         );
         let response = json!({"stopReason": "end_turn"});
         let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "shell",
             "content": [{"type": "content", "content": {"type": "text", "text": "external commands are disabled"}}]}})];
         let permissions = [PermissionRecord {
-            params: json!({"toolCall": {"title": "no classifier configured"}}),
+            params: json!({"toolCall": {"title": "fleet hook asks"}}),
             answer: Some(PermissionAnswer::Deny),
             option_id: Some("deny".into()),
             problem: None,
@@ -565,7 +504,7 @@ mod tests {
         let seen = Seen { response: &response, updates: &updates, permissions: &permissions };
         let failures = check_prompt("p", &p, &seen).join("\n");
         assert!(failures.contains("output contains") && failures.contains("external commands are disabled"), "{failures}");
-        assert!(failures.contains("title does not contain \"says destructive\""), "{failures}");
+        assert!(failures.contains("title does not contain \"ask tier\""), "{failures}");
     }
 
     #[test]
@@ -575,15 +514,6 @@ mod tests {
         let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "write", "status": "failed"}})];
         let seen = Seen { response: &response, updates: &updates, permissions: &[] };
         assert_eq!(check_prompt("p", &p, &seen).len(), 1);
-    }
-
-    #[test]
-    fn the_default_gate_keeps_the_shipped_tiers_and_drops_the_classifier() {
-        let policy: toml::Table = default_gate().unwrap().parse().unwrap();
-        assert!(!policy.contains_key("classifier"), "{policy:#?}");
-        let shipped: toml::Table = SHIPPED_GATE.parse().unwrap();
-        assert_eq!(policy.get("global"), shipped.get("global"));
-        assert_eq!(policy.get("context_type"), shipped.get("context_type"));
     }
 
     #[test]

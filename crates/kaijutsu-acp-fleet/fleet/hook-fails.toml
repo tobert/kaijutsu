@@ -1,0 +1,25 @@
+description = "A pre_call hook that fails fails closed: the call is denied with no ask, and the command never ran."
+
+# Any exit other than 0 (proceed) or 3 (ask) denies. This body runs a
+# command that does not exist, so it exits 127.
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-hook"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+no-such-command-in-the-fleet
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir crashed" } }]
+[[model]]
+text = "refused"
+
+[[prompt]]
+text = "make the crashed directory"
+text_contains = ["refused"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "fleet-hook" }]
+
+[[verify]]
+path = "crashed"
+exists = false

@@ -1,4 +1,4 @@
-description = "Gate tiers hold around the classifier: allow runs with no ask and no score, deny refuses with no ask, and ask asks even when the classifier would allow."
+description = "Gate tiers hold around a pre_call hook: allow runs with no ask and never reaches the hook, deny refuses before it, and ask asks after the hook proceeds."
 
 gate = """
 [global]
@@ -7,9 +7,16 @@ ask = ["mv"]
 deny = ["dd"]
 """
 
-[classifier]
-verdict = "informative"
-expect_unscored = ["mkdir tier-allowed", "dd if=seed.txt of=copy.txt", "mv seed.txt moved.txt"]
+# The hook proceeds and records each command it sees: only the ask-tier
+# statement reaches it.
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-hook"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+echo $KJ_TOOL_ARGS | jq -r '.command' >> hook-saw.txt
+exit 0
+"""
 
 [files]
 "seed.txt" = "seed\n"
@@ -44,7 +51,7 @@ tool_calls = [{ title = "shell_write", status = "failed", output_contains = "glo
 [[prompt]]
 text = "move the seed"
 permissions = ["deny"]
-permission_titles = ["ask tier"]
+permission_titles = ["shell_write: 1 statement(s) — mv seed.txt moved.txt"]
 text_contains = ["left it alone"]
 tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
 
@@ -63,3 +70,7 @@ equals = "seed\n"
 [[verify]]
 path = "moved.txt"
 exists = false
+
+[[verify]]
+path = "hook-saw.txt"
+equals = "mv seed.txt moved.txt\n"

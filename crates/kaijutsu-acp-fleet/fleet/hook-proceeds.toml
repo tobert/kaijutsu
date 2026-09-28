@@ -1,0 +1,36 @@
+description = "A pre_call hook that exits 0 lets the call through to the gate: the only ask is the gate's uncovered tier, and allowing it runs the command."
+
+# A hook may raise an ask and never lower one (docs/gate-policy-tuning.md,
+# "Verdicts"), so under the shipped tiers an uncovered statement still asks
+# after the hook proceeds. The hook records what it saw, so the run proves
+# it fired.
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-hook"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+echo $KJ_TOOL_ARGS | jq -r '.command' >> hook-saw.txt
+exit 0
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir benign" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "made it"
+
+[[prompt]]
+text = "make the benign directory"
+permissions = ["allow"]
+permission_titles = ["shell_write: 1 statement(s) — mkdir benign"]
+text_contains = ["made it"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj" }]
+
+[[verify]]
+path = "benign"
+exists = true
+
+[[verify]]
+path = "hook-saw.txt"
+contains = "mkdir benign"

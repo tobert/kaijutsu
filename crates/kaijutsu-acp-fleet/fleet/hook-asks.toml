@@ -1,0 +1,31 @@
+description = "A pre_call hook that exits 3 raises an ask carrying its stderr; deny means the command never ran."
+
+# The hook is installed the way a replacement classifier would ship: an rc
+# create script adds a global pre_call hook whose body is an rc file.
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-hook"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+cmd="$(echo $KJ_TOOL_ARGS | jq -r '.command')"
+echo "fleet hook asks about: $cmd" >&2
+exit 3
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "left it alone"
+
+[[prompt]]
+text = "make the doomed directory"
+permissions = ["deny"]
+permission_titles = ["fleet hook asks about: mkdir doomed"]
+text_contains = ["left it alone"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "doomed"
+exists = false
