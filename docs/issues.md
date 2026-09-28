@@ -2463,17 +2463,6 @@ deepseek, over 9ae1f930, 830a068a, 523a6741, cbd44c34. Fixed in the
 follow-up commit: `edit` over a dirty buffer the disk moved under, and
 `--tail 0`. Open:
 
-- **A failed flush in a file tool leaves an orphaned swap marker.**
-  `rollback_after_flush_failure` (`mcp/servers/file.rs`) deletes the document
-  but not the `dirty_file_buffers` row. After a restart the path loads as a
-  recovered swap nobody made, and `write`/`edit` refuse until `kj swap
-  ack|discard`. `mount_backend` and the editor keep both on failure; this
-  rollback is the odd one out. With an editor session pinning the document
-  the rollback is refused and only logged, so the failed edit stays in the
-  dirty buffer and the next `:w` writes it (gemini review, same day).
-- **`flush_one` can mark a racing edit clean.** It snapshots the block,
-  awaits the write, then clears `dirty`. An editor keystroke in that window
-  stays in the block with `dirty == false` and no row, so eviction loses it.
 - **The read-only hint names `shell_write` to a seat without it.** A
   `toolie` binds only `facade:shell`. The read-only description says the
   same thing unconditionally. Name the write path only when the seat's
@@ -2483,6 +2472,17 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   Block every thread of a three-thread pool, queue the failing factory and a
   sibling on different threads, release, and assert the sibling settles
   with the stop observed.
+
+## A failed write truncates the file first (2026-09-28)
+
+`LocalBackend` has no `write_all` of its own, so it uses the `VfsOps` default:
+truncate or create, then `write`. A `write` that fails after the truncate (a
+full disk, a permission change, an I/O error) leaves the real file empty. The
+file cache's rollback then puts the buffer back to its earlier text, but disk
+no longer holds it, and the next read reloads the empty file. Write to a
+temporary file in the same directory and rename it over the target, keeping
+the mode. The fault-injection backend (`vfs/backends/faulty.rs`) shows the
+truncated state in its tests.
 
 ## ACP fleet: what stays open (2026-09-27)
 

@@ -101,13 +101,31 @@ failure rollback in `mount_backend.rs`, a binary write dropping a stale text
 shadow) still dropped a pinned entry outright, pulling the buffer out from
 under an open editor session. Both functions now refuse on a pinned entry
 instead of removing it, naming the path and the number of sessions holding it
-open. A caller in a rollback or best-effort position (mount_backend's
-flush-failure and binary-write paths) treats the refusal as informational —
+open. A caller in a best-effort position (mount_backend's binary-write
+paths) treats the refusal as informational —
 `tracing::warn!` and move on, since the entry surviving under a live session
 is the correct outcome, not a failure of the caller's own operation.
 `kj swap discard` on a path with an open editor session is the one
 production-reachable case today, and it now reports the refusal instead of
 silently orphaning the session's buffer.
+
+**A flush marks a buffer clean only if no edit arrived after it read the
+buffer.** Each entry counts its `mark_dirty` calls. `flush_one` records the
+count with the text it writes. If the count has moved when the write lands,
+the entry stays dirty and keeps its `dirty_file_buffers` row, so eviction
+cannot drop an editor keystroke that arrived during the write.
+
+**A writer whose flush fails takes its own text back out of the buffer.**
+The file tools' `write` and `edit`, and the shell's write, append, and patch
+through `mount_backend`, read the buffer (`mark_buffer`) before changing it. On a
+failed flush, `roll_back_failed_write` compare-and-replaces the written text
+with the earlier text and marks the entry clean if it was clean before and no
+other edit marked it since. This works under an editor pin, so the session's
+next `:w` cannot write an edit the tool reported as failed, and it leaves no
+swap marker behind. A path that was not cached before the write loses its
+entry and document instead. When the buffer changed after the write, the
+rollback refuses, the text stays as unsaved work, and the tool's failure
+message says so.
 
 **The rule-4 swap check must run before every mutation, cold cache or warm,
 and on every mutation path — not just `create_or_replace`'s.** A kaibo

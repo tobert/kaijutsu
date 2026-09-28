@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::file_tools::{
     FileDocumentCache, WorkspaceGuard, CacheReadError,
+    cache::BufferMark,
     path::resolve_str,
     hashline::line_hash,
     vfs_walker::VfsWalkerAdapter,
@@ -484,32 +485,23 @@ impl McpServerLike for FileToolsServer {
 }
 
 impl FileToolsServer {
-    /// Roll the cache back after a flush failure: drop the in-memory entry
-    /// and its shadow document (`invalidate_document`) so the next load
-    /// starts fresh instead of re-adopting the phantom, never-flushed edit —
-    /// see `write_file`'s and `apply_edit_plan`'s call sites for the failure
-    /// this exists to unwind.
-    ///
-    /// Refuses to delete a **recovered, unacknowledged swap**'s document.
-    /// `create_or_replace` and `apply_edit_plan`'s `refuse_if_swap_recovered`
-    /// check already keep a swap-recovered entry from reaching this call in
-    /// every production path today (kaibo review of
-    /// `d45e0484`/`4369bd77`/`f02f3688`, "BUG 3": deleting the document here
-    /// is exactly how a recovered swap used to be lost) — this check holds
-    /// that invariant directly, at the one place a rollback can delete a
-    /// document, rather than trusting every future caller to have checked
-    /// upstream.
-    fn rollback_after_flush_failure(&self, op: &str, path: &str) {
-        if self.cache.swap_recovered(path) {
-            tracing::warn!(
-                "{op} {path}: flush failed but the entry is a recovered, unacknowledged \
-                 swap — leaving its document in place rather than deleting it \
-                 (docs/file-buffers.md)"
-            );
-            return;
-        }
-        if let Err(inv_err) = self.cache.invalidate_document(path) {
-            tracing::warn!("{op} {path}: failed to roll back cache after flush failure: {inv_err}");
+    /// Take a write whose flush failed back out of the cache
+    /// (`FileDocumentCache::roll_back_failed_write`) and say how that went,
+    /// for the tool's failure message. A rollback that cannot happen leaves
+    /// the write's text in the buffer as unsaved work, and the message says so.
+    fn roll_back_failed_flush(
+        &self,
+        path: &str,
+        before: Option<BufferMark>,
+        written: &str,
+        actor: kaijutsu_types::PrincipalId,
+    ) -> String {
+        match self.cache.roll_back_failed_write(path, before, written, actor) {
+            Ok(()) => "The file buffer no longer holds it.".to_string(),
+            Err(e) => {
+                tracing::warn!("{path}: rollback after a failed flush: {e}");
+                format!("The rollback did not happen: {e}")
+            }
         }
     }
 
@@ -533,6 +525,10 @@ impl FileToolsServer {
         }
 
         let existed = self.cache.exists(&path).await;
+        let before = match self.cache.mark_buffer(&path) {
+            Ok(before) => before,
+            Err(e) => return ExecResult::failure(1, e),
+        };
         match self.cache.create_or_replace(&path, &content, actor).await {
             Ok(_) => {
                 if let Err(e) = self.cache.mark_dirty(&path) {
@@ -542,10 +538,10 @@ impl FileToolsServer {
                     );
                 }
                 if let Err(e) = self.cache.flush_one(&path).await {
-                    self.rollback_after_flush_failure("write", &path);
+                    let rollback = self.roll_back_failed_flush(&path, before, &content, actor);
                     return ExecResult::failure(
                         1,
-                        format!("wrote the document but failed to flush {}: {}", path, e),
+                        format!("failed to write {}: {}. {}", path, e, rollback),
                     );
                 }
                 ExecResult::success(format!(
@@ -652,6 +648,10 @@ impl FileToolsServer {
         #[cfg(test)]
         if let Some(hook) = self.after_plan.lock().take() { hook(); }
 
+        let before = match self.cache.mark_buffer(&path) {
+            Ok(before) => before,
+            Err(e) => return ExecResult::failure(1, e),
+        };
         // One compare-and-replace: the plan's offsets are only valid against
         // the text it was planned from, so a file another writer changed
         // since then is refused rather than edited at the wrong place.
@@ -668,10 +668,10 @@ impl FileToolsServer {
             );
         }
         if let Err(e) = self.cache.flush_one(&path).await {
-            self.rollback_after_flush_failure("edit", &path);
+            let rollback = self.roll_back_failed_flush(&path, before, &plan.expected, tool_ctx.actor_id);
             return ExecResult::failure(
                 1,
-                format!("edited the document but failed to flush {}: {}", path, e),
+                format!("failed to write the edit to {}: {}. {}", path, e, rollback),
             );
         }
 
@@ -1259,6 +1259,86 @@ mod tests {
         let disk = vfs.read_all(std::path::Path::new(path)).await.unwrap();
         assert_eq!(disk, b"external\n", "the newer disk text must survive");
         assert_eq!(cache.try_read_content(path).await.unwrap(), "one two unsaved\n", "the buffer must be untouched");
+    }
+
+    /// A broker over a `/tmp` whose writes the test can fail, with `path`
+    /// already on disk holding `content`.
+    async fn broker_with_faulty_file(
+        path: &str,
+        content: &str,
+    ) -> (
+        Arc<Broker>,
+        Arc<FileDocumentCache>,
+        Arc<MountTable>,
+        Arc<parking_lot::Mutex<KernelDb>>,
+        Arc<crate::vfs::backends::faulty::Faults>,
+    ) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        let (backend, faults) = crate::vfs::backends::faulty::FaultyBackend::new();
+        vfs.mount("/tmp", backend).await;
+        vfs.write_all(std::path::Path::new(path), content.as_bytes()).await.unwrap();
+        let db = test_kernel_db();
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), db.clone()));
+        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs.clone(), None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+        (broker, cache, vfs, db, faults)
+    }
+
+    /// A write whose flush fails leaves no swap marker behind: after a
+    /// restart, a marker would recover the failed text as unsaved work and
+    /// block later writes until someone ran `kj swap`.
+    #[tokio::test]
+    async fn a_failed_write_flush_leaves_no_swap_marker() {
+        let path = "/tmp/flushfail.txt";
+        let (broker, cache, _vfs, db, faults) = broker_with_faulty_file(path, "disk\n").await;
+        faults.fail_writes(true);
+
+        let result = call(&broker, "write", serde_json::json!({ "path": path, "content": "never landed\n" })).await;
+
+        assert!(result.is_error, "a write whose flush fails must fail: {}", text_of(&result));
+        assert!(
+            db.lock().list_dirty_file_buffers().unwrap().is_empty(),
+            "a rolled-back write must not leave a swap marker"
+        );
+        faults.fail_writes(false);
+        assert!(
+            !cache.try_read_content(path).await.unwrap().contains("never landed"),
+            "a later read must not serve text that never reached disk"
+        );
+    }
+
+    /// An editor session pins its buffer. An `edit` whose flush fails must
+    /// still take its text back out of that buffer, or the session's next
+    /// `:w` writes the edit the tool reported as failed.
+    #[tokio::test]
+    async fn a_failed_edit_flush_under_an_open_editor_takes_the_edit_back() {
+        let path = "/tmp/pinned.txt";
+        let (broker, cache, vfs, db, faults) = broker_with_faulty_file(path, "alpha\n").await;
+        cache.try_get_or_load(path).await.unwrap();
+        cache.pin(path).unwrap();
+        faults.fail_writes(true);
+
+        let result = call(&broker, "edit", serde_json::json!({
+            "path": path, "old_string": "alpha", "new_string": "beta",
+        })).await;
+
+        assert!(result.is_error, "an edit whose flush fails must fail: {}", text_of(&result));
+        assert!(
+            db.lock().get_dirty_file_buffer(path).unwrap().is_none(),
+            "the rolled-back buffer holds no unsaved work"
+        );
+        faults.fail_writes(false);
+        // The session's `:w`. The failed write truncated the file first, so
+        // the W12 guard may refuse; either way nothing may write the edit.
+        match cache.flush_one_guarded(path, false).await {
+            Ok(()) | Err(crate::file_tools::cache::FlushError::DiskChanged { .. }) => {}
+            Err(e) => panic!("the session's :w failed: {e}"),
+        }
+        let disk = vfs.read_all(std::path::Path::new(path)).await.unwrap();
+        assert_ne!(disk, b"beta\n", "the failed edit must never reach disk through the editor");
+        assert!(!cache.try_read_content(path).await.unwrap().contains("beta"));
     }
 
     fn text_of(r: &KernelToolResult) -> String {

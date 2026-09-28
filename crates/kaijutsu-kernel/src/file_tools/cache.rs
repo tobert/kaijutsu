@@ -145,6 +145,18 @@ struct CachedFileDoc {
     /// because more than one session can bind the same path (two `vi`
     /// windows on one file). `pin`/`unpin` maintain it; it starts at 0.
     pin_count: u32,
+    /// How many times [`mark_dirty`](FileDocumentCache::mark_dirty) has run on
+    /// this entry. A flush or a rollback marks the entry clean only when this
+    /// has not moved since it read the buffer; a newer edit keeps it dirty.
+    marks: u64,
+}
+
+/// A cached buffer as a writer found it before changing it, so a failed flush
+/// can put it back. See [`FileDocumentCache::roll_back_failed_write`].
+pub(crate) struct BufferMark {
+    text: String,
+    marks: u64,
+    dirty: bool,
 }
 
 /// Cache that maps VFS files to kernel documents.
@@ -525,6 +537,7 @@ impl FileDocumentCache {
                             disk_changed_since_load: false,
                             swap_recovered: true,
                             pin_count: 0,
+                            marks: 0,
                         },
                     );
                     return Ok((ctx_id, existing_block_id));
@@ -561,6 +574,7 @@ impl FileDocumentCache {
                     disk_changed_since_load: false,
                     swap_recovered: false,
                     pin_count: 0,
+                    marks: 0,
                 },
             );
         }
@@ -724,6 +738,7 @@ impl FileDocumentCache {
             let mut cache = self.cache.write();
             cache.get_mut(&ctx_id).map(|entry| {
                 entry.dirty = true;
+                entry.marks += 1;
                 (entry.context_id, entry.loaded_generation)
             })
         };
@@ -762,7 +777,7 @@ impl FileDocumentCache {
     /// flush, and is not the bug.
     pub async fn flush_one(&self, path: &str) -> Result<(), FlushError> {
         let ctx_id = file_context_id(path);
-        let block_id = {
+        let (block_id, marks) = {
             let cache = self.cache.read();
             match cache.get(&ctx_id) {
                 Some(entry) if entry.swap_recovered => {
@@ -770,7 +785,7 @@ impl FileDocumentCache {
                         path: path.to_string(),
                     });
                 }
-                Some(entry) if entry.dirty => entry.block_id,
+                Some(entry) if entry.dirty => (entry.block_id, entry.marks),
                 Some(_) => return Ok(()), // cached, not dirty: nothing to flush
                 None => {
                     return Err(FlushError::NotCached {
@@ -798,31 +813,136 @@ impl FileDocumentCache {
             .await
             .map_err(|e| FlushError::Backend(format!("failed to flush {}: {}", path, e)))?;
 
-        // Disk holds the content now — the swap marker's job is done. Clear
-        // it before touching the in-memory entry so a crash in between still
-        // leaves nothing behind that would announce a swap that no longer
-        // exists. Bubbled, not swallowed: mark_dirty bubbles the same class
-        // of error, and a lingering row here would misreport this path as an
-        // unacknowledged swap on the next cold start.
-        self.db.lock().clear_dirty_file_buffer(path).map_err(|e| {
-            FlushError::Backend(format!(
-                "flush_one({path}): flushed to disk but failed to clear the swap marker: {e}"
-            ))
-        })?;
-
         // Stamp the post-flush generation so our own write isn't later mistaken
-        // for an external change and needlessly reloaded.
+        // for an external change and needlessly reloaded. An edit that landed
+        // during the write keeps the entry dirty, but disk still holds what
+        // this flush wrote, so the stamp applies either way.
         let generation = self.vfs.getattr(vfs_path).await.ok().map(|a| a.generation);
-        {
-            let mut cache = self.cache.write();
-            if let Some(entry) = cache.get_mut(&ctx_id) {
-                entry.dirty = false;
-                entry.loaded_generation = generation;
-                entry.disk_changed_since_load = false;
-            }
-        }
+        self.settle_clean(path, marks, Some(generation))
+            .map_err(|e| FlushError::Backend(format!("flush_one({path}): flushed to disk but {e}")))
+    }
 
+    /// Mark `path` clean and drop its swap marker, unless a
+    /// [`mark_dirty`](Self::mark_dirty) landed after the caller read `marks`.
+    /// That newer edit stays dirty and keeps its marker, so eviction cannot
+    /// drop it. `stamp` sets `loaded_generation` after a write reached disk.
+    ///
+    /// The marker is cleared first, so a crash leaves no marker for text that
+    /// disk already holds. If a newer edit then shows up, its marker is
+    /// recorded again: `mark_dirty` may have written it before the clear.
+    /// A marker error is returned, because a lingering marker misreports a
+    /// swap and a missing one loses unsaved work.
+    fn settle_clean(&self, path: &str, marks: u64, stamp: Option<Option<u64>>) -> Result<(), String> {
+        let ctx_id = file_context_id(path);
+        self.db
+            .lock()
+            .clear_dirty_file_buffer(path)
+            .map_err(|e| format!("failed to clear the swap marker: {e}"))?;
+        let still_dirty = {
+            let mut cache = self.cache.write();
+            match cache.get_mut(&ctx_id) {
+                Some(entry) => {
+                    if let Some(generation) = stamp {
+                        entry.loaded_generation = generation;
+                        entry.disk_changed_since_load = false;
+                    }
+                    if entry.marks == marks {
+                        entry.dirty = false;
+                        None
+                    } else {
+                        Some((entry.context_id, entry.loaded_generation))
+                    }
+                }
+                None => None,
+            }
+        };
+        if let Some((entry_ctx_id, loaded_generation)) = still_dirty {
+            self.db
+                .lock()
+                .record_dirty_file_buffer(path, entry_ctx_id, loaded_generation)
+                .map_err(|e| format!("failed to keep the swap marker of a newer edit: {e}"))?;
+        }
         Ok(())
+    }
+
+    /// Read `path`'s buffer before a write changes it, for
+    /// [`roll_back_failed_write`](Self::roll_back_failed_write). `None` when
+    /// the path is not cached.
+    pub(crate) fn mark_buffer(&self, path: &str) -> Result<Option<BufferMark>, String> {
+        let ctx_id = file_context_id(path);
+        let Some((block_id, marks, dirty)) =
+            self.cache.read().get(&ctx_id).map(|e| (e.block_id, e.marks, e.dirty))
+        else {
+            return Ok(None);
+        };
+        let text = self
+            .block_store
+            .block_snapshots(ctx_id)
+            .map_err(|e| format!("failed to read the buffer of {path}: {e}"))?
+            .into_iter()
+            .find(|s| s.id == block_id)
+            .map(|s| s.content)
+            .ok_or_else(|| format!("the buffer of {path} has no text block"))?;
+        Ok(Some(BufferMark { text, marks, dirty }))
+    }
+
+    /// Take a write whose flush failed back out of `path`'s buffer, so no
+    /// later read or editor `:w` serves text that never reached disk.
+    ///
+    /// `before` is the buffer as [`mark_buffer`](Self::mark_buffer) read it
+    /// ahead of the write, and `written` is the text the write left. The
+    /// buffer goes back to `before` only if it still holds `written`, and it
+    /// is marked clean only if it was clean before and no other edit marked
+    /// it since. This works under an editor pin and keeps the document. A
+    /// path that was not cached before the write loses its entry and
+    /// document, and the next read loads it from disk.
+    ///
+    /// Errors when the rollback cannot happen: a recovered swap, a pinned
+    /// entry the write created, or a buffer another writer changed after
+    /// the write. The buffer then keeps the write's text as unsaved work.
+    pub(crate) fn roll_back_failed_write(
+        &self,
+        path: &str,
+        before: Option<BufferMark>,
+        written: &str,
+        actor: PrincipalId,
+    ) -> Result<(), String> {
+        if self.swap_recovered(path) {
+            return Err(format!("{path} is a recovered swap; it stays as it was"));
+        }
+        let ctx_id = file_context_id(path);
+        let Some(before) = before else {
+            let only_this_write =
+                self.cache.read().get(&ctx_id).is_some_and(|e| e.marks == 1 && e.pin_count == 0);
+            if !only_this_write {
+                return Err(format!(
+                    "another writer opened {path} during the write; its buffer keeps this write's text as unsaved work"
+                ));
+            }
+            self.invalidate_document(path)?;
+            self.db
+                .lock()
+                .clear_dirty_file_buffer(path)
+                .map_err(|e| format!("dropped the buffer of {path} but failed to clear its swap marker: {e}"))?;
+            return Ok(());
+        };
+        let block_id = self
+            .cache
+            .read()
+            .get(&ctx_id)
+            .map(|e| e.block_id)
+            .ok_or_else(|| format!("{path} left the file cache during the write"))?;
+        self.block_store
+            .replace_text_if_unchanged_as(ctx_id, &block_id, written, &before.text, Some(actor))
+            .map_err(|e| {
+                format!("the buffer of {path} changed after the write, so it keeps this write's text as unsaved work: {e}")
+            })?;
+        if before.dirty {
+            return Ok(());
+        }
+        // This write's own mark_dirty is the one expected since `before`.
+        self.settle_clean(path, before.marks + 1, None)
+            .map_err(|e| format!("{path}: rolled the buffer back but {e}"))
     }
 
     /// Flush a single file, refusing when disk moved under the buffer since it
@@ -1032,6 +1152,7 @@ impl FileDocumentCache {
                     disk_changed_since_load: false,
                     swap_recovered: false,
                     pin_count: 0,
+                    marks: 0,
                 },
             );
         }
@@ -1204,6 +1325,48 @@ mod tests {
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = FileDocumentCache::new(blocks, vfs.clone(), tmp_db());
         (vfs, cache)
+    }
+
+    /// An edit that lands while a flush is writing an older snapshot stays
+    /// dirty with its swap marker: the flush wrote the text before it, and
+    /// marking the entry clean would let eviction drop the newer text.
+    #[tokio::test]
+    async fn an_edit_during_a_flush_stays_dirty() {
+        let path = "/tmp/racing.txt";
+        let vfs = Arc::new(MountTable::new());
+        let (backend, faults) = crate::vfs::backends::faulty::FaultyBackend::new();
+        vfs.mount("/tmp", backend).await;
+        let cache = Arc::new(FileDocumentCache::new(shared_block_store(PrincipalId::system()), vfs.clone(), tmp_db()));
+        let actor = PrincipalId::new();
+        cache.create_or_replace(path, "one", actor).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+        cache.flush_one(path).await.unwrap();
+
+        cache.create_or_replace(path, "two", actor).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+        faults.pause_next_write();
+        let flushing = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.flush_one(path).await }
+        });
+        faults.paused().await;
+        cache.create_or_replace(path, "three", actor).await.unwrap();
+        cache.mark_dirty(path).unwrap();
+        faults.release();
+        flushing.await.unwrap().unwrap();
+
+        assert_eq!(vfs.read_all(std::path::Path::new(path)).await.unwrap(), b"two");
+        assert!(
+            cache.db.lock().get_dirty_file_buffer(path).unwrap().is_some(),
+            "the edit the flush did not write keeps its swap marker"
+        );
+        cache.flush_one(path).await.unwrap();
+        assert_eq!(
+            vfs.read_all(std::path::Path::new(path)).await.unwrap(),
+            b"three",
+            "the next flush must still write the racing edit"
+        );
+        assert!(cache.db.lock().get_dirty_file_buffer(path).unwrap().is_none());
     }
 
     #[tokio::test]

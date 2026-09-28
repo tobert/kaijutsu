@@ -3,6 +3,8 @@
 //! Backends implement [`VfsOps`] for different storage types.
 
 mod cas;
+#[cfg(test)]
+pub(crate) mod faulty;
 mod local;
 mod memory;
 mod roster;

@@ -26,6 +26,7 @@ use kaish_kernel::{
 use kaijutsu_types::PrincipalId;
 
 use crate::file_tools::path::resolve_str;
+use crate::file_tools::cache::BufferMark;
 use crate::file_tools::{CacheReadError, FileDocumentCache};
 use crate::vfs::{FileType, MountTable, SetAttr, VfsError, VfsOps};
 
@@ -97,6 +98,26 @@ impl MountBackend {
             docs_tools,
             actor,
             read_only: true,
+        }
+    }
+
+    /// Take a write whose flush failed back out of the file cache
+    /// (`FileDocumentCache::roll_back_failed_write`) and return the error to
+    /// report. A rollback that cannot happen leaves the text in the buffer as
+    /// unsaved work, and the error says so.
+    fn roll_back_failed_flush(
+        &self,
+        key: &str,
+        before: Option<BufferMark>,
+        written: &str,
+        flush_err: crate::file_tools::cache::FlushError,
+    ) -> BackendError {
+        match self.file_cache.roll_back_failed_write(key, before, written, self.actor) {
+            Ok(()) => BackendError::Io(flush_err.to_string()),
+            Err(e) => {
+                tracing::warn!("{key}: rollback after a failed flush: {e}");
+                BackendError::Io(format!("{flush_err}. The rollback did not happen: {e}"))
+            }
         }
     }
 
@@ -346,22 +367,17 @@ impl KernelBackend for MountBackend {
             }
         }
 
+        let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
         self.file_cache
             .create_or_replace(&key, text, self.actor)
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         // Write-through: external tools (cargo, git) read the real filesystem.
-        // If the flush fails, roll the edit back out of the cache so a later
-        // read can't serve content that never reached disk — crash, don't
-        // corrupt. A pinned entry (an open editor session) refuses the rollback
-        // instead: the flush failure is still reported below, but a live
-        // session's buffer is never evicted to satisfy this write's cleanup.
+        // A failed flush takes the text back out of the cache, so no later
+        // read or editor `:w` serves content that never reached disk.
         if let Err(e) = self.file_cache.flush_one(&key).await {
-            if let Err(inv_err) = self.file_cache.invalidate(&key) {
-                tracing::warn!("mount_backend write rollback: {inv_err}");
-            }
-            return Err(BackendError::Io(e.to_string()));
+            return Err(self.roll_back_failed_flush(&key, before, text, e));
         }
         Ok(())
     }
@@ -402,18 +418,14 @@ impl KernelBackend for MountBackend {
             }
         };
         let combined = format!("{existing}{suffix}");
+        let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
         self.file_cache
             .create_or_replace(&key, &combined, self.actor)
             .await
             .map_err(BackendError::Io)?;
         self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
         if let Err(e) = self.file_cache.flush_one(&key).await {
-            // See write()'s flush-failure arm: a pinned entry (C) refuses the
-            // rollback; the flush failure below is still reported either way.
-            if let Err(inv_err) = self.file_cache.invalidate(&key) {
-                tracing::warn!("mount_backend append rollback: {inv_err}");
-            }
-            return Err(BackendError::Io(e.to_string()));
+            return Err(self.roll_back_failed_flush(&key, before, &combined, e));
         }
         Ok(())
     }
@@ -460,18 +472,14 @@ impl KernelBackend for MountBackend {
         }
 
         if writable {
+            let before = self.file_cache.mark_buffer(&key).map_err(BackendError::Io)?;
             self.file_cache
                 .create_or_replace(&key, &text, self.actor)
                 .await
                 .map_err(BackendError::Io)?;
             self.file_cache.mark_dirty(&key).map_err(BackendError::Io)?;
             if let Err(e) = self.file_cache.flush_one(&key).await {
-                // See write()'s flush-failure arm: a pinned entry (C) refuses
-                // the rollback; the flush failure below is still reported.
-                if let Err(inv_err) = self.file_cache.invalidate(&key) {
-                    tracing::warn!("mount_backend patch rollback: {inv_err}");
-                }
-                return Err(BackendError::Io(e.to_string()));
+                return Err(self.roll_back_failed_flush(&key, before, &text, e));
             }
             Ok(())
         } else {
@@ -912,6 +920,75 @@ mod tests {
         ));
 
         MountBackend::new(mount_table, docs, file_cache, performer)
+    }
+
+    /// A MountBackend over a `/tmp` whose writes the test can fail, with the
+    /// file cache and its swap-marker database exposed.
+    async fn faulty_mount_backend() -> (
+        MountBackend,
+        Arc<FileDocumentCache>,
+        Arc<parking_lot::Mutex<KernelDb>>,
+        Arc<crate::vfs::backends::faulty::Faults>,
+    ) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-faulty").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+        let mount_table = Arc::new(MountTable::new());
+        let (vfs_backend, faults) = crate::vfs::backends::faulty::FaultyBackend::new();
+        mount_table.mount("/tmp", vfs_backend).await;
+        let db = test_kernel_db();
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), db.clone()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache.clone(), PrincipalId::system());
+        (backend, file_cache, db, faults)
+    }
+
+    /// A write, append, or patch whose flush fails takes its text back out
+    /// of the cache: no swap marker is left to recover it as unsaved work,
+    /// and the next write is not refused as an unacknowledged swap.
+    #[tokio::test]
+    async fn a_failed_flush_leaves_no_swap_and_the_next_write_lands() {
+        let (backend, cache, db, faults) = faulty_mount_backend().await;
+        let file = Path::new("/tmp/flush.txt");
+        backend.write(file, b"one\n", WriteMode::Overwrite).await.unwrap();
+
+        faults.fail_writes(true);
+        assert!(backend.write(file, b"two\n", WriteMode::Overwrite).await.is_err());
+        assert!(backend.append(file, b"more\n").await.is_err());
+        faults.fail_writes(false);
+
+        assert!(db.lock().list_dirty_file_buffers().unwrap().is_empty(), "no swap marker may survive a rolled-back flush");
+        let text = cache.try_read_content("/tmp/flush.txt").await.unwrap();
+        assert!(!text.contains("two") && !text.contains("more"), "a failed write must not stay in the cache: {text:?}");
+        backend.write(file, b"three\n", WriteMode::Overwrite).await.expect("the next write must land");
+        assert_eq!(backend.read(file, None).await.unwrap(), b"three\n");
+    }
+
+    /// Under an editor pin, a failed flush still takes its text back, so the
+    /// session's next `:w` cannot write it.
+    #[tokio::test]
+    async fn a_failed_flush_under_a_pin_takes_its_text_back() {
+        let (backend, cache, db, faults) = faulty_mount_backend().await;
+        let file = Path::new("/tmp/pinned.txt");
+        backend.write(file, b"one\n", WriteMode::Overwrite).await.unwrap();
+        cache.pin("/tmp/pinned.txt").unwrap();
+
+        faults.fail_writes(true);
+        assert!(backend.write(file, b"two\n", WriteMode::Overwrite).await.is_err());
+        faults.fail_writes(false);
+
+        assert!(db.lock().get_dirty_file_buffer("/tmp/pinned.txt").unwrap().is_none());
+        match cache.flush_one_guarded("/tmp/pinned.txt", false).await {
+            Ok(()) | Err(crate::file_tools::cache::FlushError::DiskChanged { .. }) => {}
+            Err(e) => panic!("the session's :w failed: {e}"),
+        }
+        assert_ne!(backend.read(file, None).await.unwrap(), b"two\n", "the failed write must never reach disk");
     }
 
     #[tokio::test]
