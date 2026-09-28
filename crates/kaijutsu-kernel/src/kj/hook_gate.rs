@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn a_shell_write_hook_ask_carries_the_command_as_exec_source() {
         let params = call("shell_write", serde_json::json!({ "command": " dd if=/dev/zero of=${DEV} \n" }));
-        let spec = build_hook_gate_spec("lfm2d-advisory", "d".into(), &params);
+        let spec = build_hook_gate_spec("risk-advisory", "d".into(), &params);
         assert_eq!(spec.exec_source.as_deref(), Some("dd if=/dev/zero of=${DEV}"));
         assert_eq!(spec.planned.len(), 1, "the planned statements ride the spec for the env snapshot");
     }

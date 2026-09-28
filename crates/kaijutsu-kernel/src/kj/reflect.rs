@@ -3,7 +3,7 @@
 //! actually type. Kaijutsu's own domain judgment — how bad a clause is,
 //! which clauses are overridden, which extra non-`kj` clauses round out a
 //! test corpus — is not this module's business; that lives beside whatever
-//! probe consumes reflection (`examples/lfm2d-probe/corpus.rs`).
+//! consumes reflection.
 
 /// One addressable `kj <path>` leaf as clap sees it: the path, its aliases,
 /// its reflected `about`, and every required argument along the way.

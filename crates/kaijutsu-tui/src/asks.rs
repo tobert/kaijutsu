@@ -891,7 +891,7 @@ mod tests {
     fn the_ledger_row_count_is_width_independent() {
         let rows = vec![
             pending("p1", "kaijutsu"),
-            pending("p2", "lfm2d"),
+            pending("p2", "scorer"),
             answered("a1", "kaijutsu", RedeemedMark::Never),
         ];
         let rendered_40 = render_ledger(&rows, "", 0, 40, &Palette::builtin()).len();
@@ -933,7 +933,7 @@ mod tests {
     fn the_ledger_view_carries_both_sections_and_the_key_line() {
         let rows = vec![
             pending("p1", "kaijutsu"),
-            pending("p2", "lfm2d"),
+            pending("p2", "scorer"),
             answered("a1", "kaijutsu", RedeemedMark::At("13:58".to_string())),
         ];
         let lines = render_ledger(&rows, "", 0, 100, &Palette::builtin());
@@ -966,15 +966,15 @@ mod tests {
 
     #[test]
     fn a_filter_narrows_both_sections() {
-        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "lfm2d")];
-        let visible = filtered_rows(&rows, "lfm2d");
+        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "scorer")];
+        let visible = filtered_rows(&rows, "scorer");
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].request_id(), "p2");
     }
 
     #[test]
     fn an_empty_filter_admits_everything() {
-        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "lfm2d")];
+        let rows = vec![pending("p1", "kaijutsu"), pending("p2", "scorer")];
         assert_eq!(filtered_rows(&rows, "").len(), 2);
     }
 

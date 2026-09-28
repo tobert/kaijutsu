@@ -1,11 +1,9 @@
 //! Read-only classification for a `kj` invocation reaching the shell.
 //!
-//! `lfm2d-advisory` (`assets/defaults/rc/lib/hooks/lfm2d.kai`) scores a
-//! `shell_write` command through a classifier that over-escalates on ordinary
-//! reads. The escalation is not uniform: `kj block read <id>` scored
-//! `situation-normal` while `kj block list` scored `informative`, and anything
-//! but `informative` escalates, so a verb named `read` asked a human for
-//! permission to read. A declared class beats tuning: every `kj` verb declares
+//! A risk classifier behind a pre_call hook over-escalates on ordinary reads,
+//! and not uniformly: one read verb scores benign while another does not, so
+//! a verb named `read` asks a human for permission to read. A declared class
+//! beats tuning: every `kj` verb declares
 //! its own effect (`kj/effect.rs`), and a call whose effect is
 //! [`Effect::Read`] is allowed by the gate policy evaluator, so a program made
 //! only of such calls never reaches a hook. A program that mixes one with

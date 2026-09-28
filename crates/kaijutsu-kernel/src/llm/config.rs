@@ -406,7 +406,7 @@ pub struct ResolvedSlot {
     pub extra: Option<String>,
 }
 
-/// Configuration for the lfm2d embedding service (`embedding_config` singleton).
+/// Configuration for the HTTP embedding service (`embedding_config` singleton).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingModelConfig {
     pub enabled: bool,

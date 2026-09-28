@@ -240,37 +240,15 @@ pub fn default_rc_dir() -> PathBuf {
     .host_dir(kaijutsu_types::paths::RC_ROOT)
 }
 
-/// Pre-seed `rc_root` from the embedded defaults, deny host execution, and
-/// leave every `create/S50-lfm2d.kai` present but empty.
-///
-/// A test kernel must never reach a network classifier, and the seed
-/// installs that hook on every seat that holds a shell — `default` included,
-/// which is what every test context is. The file stays present so the
-/// server's install-if-absent seed at startup leaves it alone (it names the
-/// file as diverged rather than restoring it); it is empty so the create
-/// lifecycle runs nothing for it. A test that wants a hook pushes one onto
-/// the broker's table directly.
+/// Pre-seed `rc_root` from the embedded defaults and deny host execution.
+/// No seed reaches the network (`seed_scripts`, `no_seed_reaches_the_network`),
+/// so a test kernel's create lifecycle stays local. A test that wants a hook
+/// pushes one onto the broker's table directly.
 ///
 /// Fails loudly: a half-seeded test tree is a test that lies.
 fn seed_ephemeral_rc(rc_root: &Path) {
     kaijutsu_kernel::seed_scripts::ensure_rc_seed_files(rc_root)
         .expect("seed the ephemeral rc tree");
-    let prefix = format!("{}/", kaijutsu_types::paths::RC_ROOT);
-    for (canonical, _) in kaijutsu_kernel::seed_scripts::seed_files() {
-        if !canonical.ends_with("/create/S50-lfm2d.kai") {
-            continue;
-        }
-        let rel = canonical
-            .strip_prefix(&prefix)
-            .expect("every seed path lives under the rc root");
-        let path = rc_root.join(rel);
-        // A composed seed is a symlink to the shared body; replace the link
-        // itself, never write through it into `lib`.
-        if fs::symlink_metadata(&path).is_ok() {
-            fs::remove_file(&path).expect("remove the seeded scorer link");
-        }
-        fs::write(&path, "").expect("blank the seeded scorer");
-    }
     set_ephemeral_host_exec(rc_root, false);
 }
 
@@ -1340,10 +1318,6 @@ mod tests {
                     principal_id: principal, name: "signal-test".into(), created_at: 1,
                     retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
                 }).unwrap();
-                db.set_embedding_config(&kaijutsu_kernel::kernel_db::EmbeddingConfigRow {
-                    enabled: false, endpoint: "http://127.0.0.1:9".into(), timeout_ms: 100,
-                    max_in_flight: 1, max_context_bytes: 2048,
-                }).unwrap();
                 drop(db);
                 let shared = crate::rpc::create_shared_kernel(None,
                     &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir), &[]).await.unwrap();
@@ -1399,50 +1373,6 @@ mod tests {
         assert!(envelope.is_error());
         assert_eq!(envelope.exit_code, Some(130));
         assert!(!envelope.stdout.contains("never"));
-    }
-
-    /// A test kernel must never reach a network classifier. The embedded
-    /// seed installs the lfm2d advisory hook on every seat that holds a
-    /// shell, so an ephemeral config pre-seeds its rc tree and leaves every
-    /// `S50-lfm2d.kai` present but EMPTY: present, so the server's own
-    /// install-if-absent seed leaves it alone (naming it as diverged);
-    /// empty, so the create lifecycle runs nothing for it.
-    ///
-    /// Falsified by dropping the blanking: the file holds the seed body and
-    /// the dry-run wire tests see `lfm2d-advisory` fire on a `default`
-    /// context.
-    #[test]
-    fn an_ephemeral_config_carries_no_network_scorer() {
-        let config = SshServerConfig::ephemeral(0);
-        let rc_root = config
-            .config_mounts
-            .host_dir(kaijutsu_types::paths::RC_ROOT);
-        let blanked: Vec<PathBuf> = kaijutsu_kernel::seed_scripts::seed_files()
-            .into_iter()
-            .map(|(canonical, _)| canonical)
-            .filter(|p| p.ends_with("/create/S50-lfm2d.kai"))
-            .map(|p| rc_root.join(p.trim_start_matches(&format!("{}/", kaijutsu_types::paths::RC_ROOT))))
-            .collect();
-        assert!(
-            blanked.len() >= 3,
-            "the seed installs the scorer on at least coder, mcp and default: {blanked:?}"
-        );
-        for path in &blanked {
-            let body = fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("{} must exist in an ephemeral tree: {e}", path.display()));
-            assert!(body.is_empty(), "{} must be blank, got {body:?}", path.display());
-        }
-        // The server's startup seed must not bring the hook back.
-        let report = kaijutsu_kernel::seed_scripts::reseed_rc_files(&rc_root, false).unwrap();
-        assert_eq!(report.written, 0, "nothing is absent after the pre-seed: {report:?}");
-        for path in &blanked {
-            let rel = path.strip_prefix(&rc_root).unwrap().to_string_lossy().to_string();
-            assert!(
-                report.diverged.iter().any(|d| d == &rel),
-                "the blanked {rel} must be named as diverged, not silently kept: {report:?}"
-            );
-            assert!(fs::read_to_string(path).unwrap().is_empty(), "{rel} was restored");
-        }
     }
 
     /// An `Instant` far enough in the past that any real `Instant::now()`

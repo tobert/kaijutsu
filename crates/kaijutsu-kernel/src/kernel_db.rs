@@ -2629,8 +2629,10 @@ impl KernelDb {
             [], |row| row.get(0),
         )?;
         if legacy_embedding {
+            // The builtin-model row names no service endpoint and there is no
+            // default to supply, so the rebuilt table starts empty.
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch("ALTER TABLE embedding_config RENAME TO embedding_config_legacy;
+            tx.execute_batch("DROP TABLE embedding_config;
                 CREATE TABLE embedding_config (
                     id INTEGER NOT NULL PRIMARY KEY DEFAULT 1 CHECK (id = 1),
                     enabled INTEGER NOT NULL DEFAULT 1,
@@ -2639,19 +2641,30 @@ impl KernelDb {
                     max_in_flight INTEGER NOT NULL CHECK (max_in_flight > 0),
                     max_context_bytes INTEGER NOT NULL CHECK (max_context_bytes > 0)
                 );")?;
-            tx.execute("INSERT INTO embedding_config
-                SELECT id, enabled, ?1, 30000, 2, max_tokens * 4 FROM embedding_config_legacy",
-                [crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT])?;
-            tx.execute_batch("DROP TABLE embedding_config_legacy;")?;
             tx.commit()?;
-            tracing::info!("migrated builtin embedding configuration to the default lfm2d service");
+            tracing::warn!("dropped the builtin-model embedding configuration; the semantic index \
+                is off until embedding_config names an embedding service (docs/synthesis.md)");
         }
         for retired in crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
-            let moved = conn.execute("UPDATE embedding_config SET endpoint = ?1 WHERE endpoint = ?2",
-                [crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT, retired])?;
-            if moved > 0 {
-                tracing::info!(from = retired, to = crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT,
-                    "moved a retired factory embedding endpoint to the current default");
+            let removed = conn.execute("DELETE FROM embedding_config WHERE endpoint = ?1", [retired])?;
+            if removed > 0 {
+                tracing::warn!(endpoint = retired,
+                    "removed a retired factory embedding endpoint; the semantic index is off until \
+                     embedding_config names an embedding service (docs/synthesis.md)");
+            }
+        }
+        let (hook_id, hook_path) = RETIRED_CLASSIFIER_HOOK;
+        let removed = conn.execute(
+            "DELETE FROM hooks WHERE hook_id = ?1 AND action_kind = 'kaish_path' AND action_kaish_path = ?2",
+            [hook_id, hook_path],
+        )?;
+        if removed > 0 {
+            tracing::warn!(hook_id, "removed the retired classifier pre_call hook");
+        }
+        for key in RETIRED_CLASSIFIER_ENV {
+            let removed = conn.execute("DELETE FROM context_env WHERE key = ?1", [key])?;
+            if removed > 0 {
+                tracing::info!(key, contexts = removed, "removed a retired classifier env var");
             }
         }
         let alters = [
@@ -7247,6 +7260,14 @@ pub struct ModelAliasRow {
     pub model: String,
 }
 
+/// The retired risk classifier's global pre_call hook: its id and the body
+/// path its rc installed. Opening a DB removes a row matching both.
+pub(crate) const RETIRED_CLASSIFIER_HOOK: (&str, &str) = ("lfm2d-advisory", "/config/rc/lib/hooks/lfm2d.kai");
+
+/// Per-context env keys the retired classifier's rc exported. Opening a DB
+/// removes them; nothing reads them.
+pub(crate) const RETIRED_CLASSIFIER_ENV: &[&str] = &["LFM2D_MODE", "LFM2D_BENIGN_LABEL"];
+
 /// The singleton `embedding_config` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfigRow {
@@ -8570,8 +8591,11 @@ mod tests {
         assert!(KernelDb::open(&path).unwrap().unpublished_approval_pairs().unwrap().is_empty());
     }
 
+    /// The builtin-model shape carries no service endpoint and the kernel
+    /// ships no default one, so the rebuild leaves the table empty: the
+    /// semantic index stays off until an operator writes an endpoint.
     #[test]
-    fn legacy_embedding_config_migrates_to_service_and_preserves_disable() {
+    fn legacy_embedding_config_migrates_to_an_unconfigured_service() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kernel.db");
         {
@@ -8579,51 +8603,87 @@ mod tests {
             db.conn.execute_batch("DROP TABLE embedding_config;
                 CREATE TABLE embedding_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL,
                     model_dir TEXT NOT NULL, dimensions INTEGER NOT NULL, max_tokens INTEGER NOT NULL);
-                INSERT INTO embedding_config VALUES (1, 0, '/old/model', 384, 123);").unwrap();
+                INSERT INTO embedding_config VALUES (1, 1, '/old/model', 384, 123);").unwrap();
         }
         let db = KernelDb::open(&path).unwrap();
-        let row = db.get_embedding_config().unwrap().unwrap();
-        assert!(!row.enabled);
-        assert_eq!(row.endpoint, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
-        assert_eq!(row.max_context_bytes, 492);
-        assert_eq!(row.timeout_ms, 30_000);
-        let mut edited = row;
-        edited.endpoint = "unix:///tmp/lfm2d.sock".into();
-        db.set_embedding_config(&edited).unwrap();
+        assert_eq!(db.get_embedding_config().unwrap(), None);
+        let configured = EmbeddingConfigRow {
+            enabled: true, endpoint: "unix:///tmp/embed.sock".into(),
+            timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
+        };
+        db.set_embedding_config(&configured).unwrap();
         drop(db);
-        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(edited));
+        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(configured));
     }
 
-    /// lfm2d-1 never served an embedder (no `--embedder-dir`), so a kernel
-    /// still on that factory default logged "discovery returned no embedding
-    /// model" on every start. The default moved to lfm2d-system1; a row still
-    /// holding a retired default follows it, an operator's endpoint does not.
+    /// A row holding a former factory endpoint was seeded, not chosen, and
+    /// the kernel no longer ships a default: opening removes it, so the
+    /// index reports "no embedding service configured" instead of probing a
+    /// retired host at every boot. An operator's endpoint survives.
     #[test]
-    fn retired_factory_embedding_endpoint_follows_the_new_default() {
+    fn retired_factory_embedding_endpoints_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kernel.db");
-        let retired = crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS[0];
-        assert_ne!(retired, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
-        {
-            let db = KernelDb::open(&path).unwrap();
-            db.set_embedding_config(&EmbeddingConfigRow {
-                enabled: false,
-                endpoint: retired.into(),
-                timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
-            })
-            .unwrap();
+        for retired in crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
+            {
+                let db = KernelDb::open(&path).unwrap();
+                db.set_embedding_config(&EmbeddingConfigRow {
+                    enabled: true, endpoint: (*retired).into(),
+                    timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
+                })
+                .unwrap();
+            }
+            assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), None, "{retired}");
         }
-        let db = KernelDb::open(&path).unwrap();
-        let row = db.get_embedding_config().unwrap().unwrap();
-        assert_eq!(row.endpoint, crate::seed_backends::FACTORY_EMBEDDING_ENDPOINT);
-        assert!(!row.enabled, "only the endpoint moves");
-        assert_eq!(row.timeout_ms, 1234, "only the endpoint moves");
+        let own = EmbeddingConfigRow {
+            enabled: true, endpoint: "http://embedder.example:8088".into(),
+            timeout_ms: 1234, max_in_flight: 2, max_context_bytes: 2048,
+        };
+        KernelDb::open(&path).unwrap().set_embedding_config(&own).unwrap();
+        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(own));
+    }
 
-        let mut edited = row;
-        edited.endpoint = "http://my-own-lfm2d:8088".into();
-        db.set_embedding_config(&edited).unwrap();
+    /// The retired classifier's global pre_call hook row and the per-context
+    /// env its rc exported are removed at open. A hook with the same id that
+    /// runs a different body, and every other env key, stay.
+    #[test]
+    fn retired_classifier_hook_and_env_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let (hook_id, hook_path) = RETIRED_CLASSIFIER_HOOK;
+        let context_id = {
+            let db = KernelDb::open(&path).unwrap();
+            let ws_id = setup_test_db(&db);
+            let ctx = make_context_row(Some("retired-classifier"));
+            insert_context_with_doc(&db, &ctx, ws_id);
+            let mut hook = minimal_hook_row(hook_id, "pre_call", 0);
+            hook.match_tool = Some("shell_write".into());
+            hook.action_kind = "kaish_path".into();
+            hook.action_kaish_path = Some(hook_path.into());
+            hook.action_log_target = None;
+            hook.action_log_level = None;
+            db.insert_hook(&hook).unwrap();
+            db.insert_hook(&minimal_hook_row("operator-hook", "pre_call", 0)).unwrap();
+            for key in RETIRED_CLASSIFIER_ENV {
+                db.set_context_env(ctx.context_id, key, "escalate").unwrap();
+            }
+            db.set_context_env(ctx.context_id, "EDITOR", "vim").unwrap();
+            ctx.context_id
+        };
+        let db = KernelDb::open(&path).unwrap();
+        let hooks: Vec<String> = db.load_all_hooks().unwrap().into_iter().map(|h| h.hook_id).collect();
+        assert_eq!(hooks, vec!["operator-hook".to_string()]);
+        let env: Vec<String> = db.get_context_env(context_id).unwrap().into_iter().map(|e| e.key).collect();
+        assert_eq!(env, vec!["EDITOR".to_string()]);
         drop(db);
-        assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(edited));
+
+        let db = KernelDb::open(&path).unwrap();
+        let mut same_id_other_body = minimal_hook_row(hook_id, "pre_call", 0);
+        same_id_other_body.action_kind = "kaish_path".into();
+        same_id_other_body.action_kaish_path = Some("/config/rc/lib/hooks/mine.kai".into());
+        db.insert_hook(&same_id_other_body).unwrap();
+        drop(db);
+        assert_eq!(KernelDb::open(&path).unwrap().load_all_hooks().unwrap().len(), 2);
     }
 
     #[test]

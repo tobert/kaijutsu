@@ -5,7 +5,7 @@
 //!
 //! `beat-this` runs inference through RTen, a pure-Rust runtime for ONNX
 //! models. Its `ort` feature is disabled, so no external ONNX Runtime library
-//! is required. Semantic embeddings use the separate lfm2d service.
+//! is required. Semantic embeddings use a separate HTTP embedding service.
 //!
 //! The kernel never touches audio hardware here — this is pure offline CPU
 //! analysis (decode via symphonia, resample via rubato, infer via rten),

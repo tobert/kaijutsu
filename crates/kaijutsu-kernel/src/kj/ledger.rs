@@ -478,7 +478,7 @@ enum SignalCommand {
         /// caller with arbitrarily long or `"`-laden text needs nothing
         /// beyond passing `$var` here — there is no `--stdin` on this verb.
         statement: String,
-        /// Who produced this signal, e.g. `lfm2d`.
+        /// Who produced this signal, e.g. `scorer`.
         #[arg(long = "source-id")]
         source_id: Option<String>,
         /// Which model scored it, e.g. `kube_ordinal_v8` — read from the
@@ -2641,7 +2641,7 @@ mod tests {
             s("add"),
             s(statement),
             s("--source-id"),
-            s("lfm2d"),
+            s("scorer"),
             s("--model-id"),
             s("kube_ordinal_v8"),
             s("--weight-hash"),
@@ -2679,7 +2679,7 @@ mod tests {
         assert!(row.decided_by.is_none(), "log-only: no human decided this");
         assert_eq!(row.decided_option.as_deref(), Some("auto_allow"));
         assert!(
-            row.auto_reason.as_deref().unwrap_or_default().contains("lfm2d"),
+            row.auto_reason.as_deref().unwrap_or_default().contains("scorer"),
             "auto_reason must name the classifier source: {:?}",
             row.auto_reason
         );

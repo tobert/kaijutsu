@@ -469,12 +469,11 @@ mod tests {
 
     use super::*;
 
-    /// Guarantee pinned by Amy's ruling (2026-08-17, lfm2d log-only): a
-    /// classifier signal is advisory forever — `rules::redeem` composes
+    /// A classifier signal is advisory forever — `rules::redeem` composes
     /// coverage from `approval_rules` alone, and a signal, even one
     /// carrying `verdict: allow` on the exact statement digest a redemption
     /// asks about, must never be read as coverage. This creates an ask via
-    /// [`create_auto_allowed_ask`] (the log-only path this ruling protects)
+    /// [`create_auto_allowed_ask`] (the log-only path this guarantee protects)
     /// with an `allow`-verdict signal on `digest-signal-only`, and confirms
     /// `redeem` still reports `Uncovered` for that digest — there is no
     /// `approval_rules` row, only a signal, and the two must never be
@@ -485,8 +484,8 @@ mod tests {
         let mut ask = ask_with_statement("digest-signal-only", VarBinding::Bound, "rm target");
         ask.signals = vec![NewSignal {
             source_kind: SignalSourceKind::Classifier,
-            source_id: Some("lfm2d".into()),
-            model_id: Some("kube_ordinal_v8".into()),
+            source_id: Some("scorer".into()),
+            model_id: Some("risk-v1".into()),
             weight_hash: Some("abc123".into()),
             stmt_seq: Some(0),
             cmd_seq: None,
@@ -494,7 +493,7 @@ mod tests {
             score: Some(0.9),
             verdict: SignalVerdict::Allow,
         }];
-        create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+        create_auto_allowed_ask(&conn, &ask, "scorer:risk-v1 (log-only)").unwrap();
 
         let coverage = redeem(&conn, &["digest-signal-only"], "rm target", None, None).unwrap();
         assert!(

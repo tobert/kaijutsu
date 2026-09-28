@@ -17,10 +17,7 @@
 //!
 //! ## The content-addressed unit is the STATEMENT, not the ask (2026-08-14)
 //!
-//! Amy's ruling, carried here because it explains the whole shape:
-//! *"that's why we have lfm2d in the works, to reduce that fatigue while
-//! providing some adaptable guardrails."* Generalization granularity IS
-//! the point of a rule — a digest keyed on a whole (possibly
+//! Generalization granularity IS the point of a rule — a digest keyed on a whole (possibly
 //! multi-statement) ask only ever matches a verbatim repeat of that exact
 //! ask (`ls` and `ls; pwd` are unrelated asks under that scheme), which is
 //! allowlist fatigue in a new costume. A digest keyed on one statement

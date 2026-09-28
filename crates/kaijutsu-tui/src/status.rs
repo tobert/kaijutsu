@@ -2,7 +2,7 @@
 //! right.
 //!
 //! ```text
-//! 0 kaijutsu*  1 kaish@  2 lfm2d  3 exo   │  -- NORMAL --  17.3/128k  91%  4m
+//! 0 kaijutsu*  1 kaish@  2 scout  3 exo   │  -- NORMAL --  17.3/128k  91%  4m
 //! ```
 //!
 //! Left to right: the rank (seat digits, `*` current, `@` activity, `!` an
@@ -155,7 +155,7 @@ pub(crate) fn format_age(age: Duration) -> String {
     }
 }
 
-/// One seat in the rank: `2 lfm2d@`.
+/// One seat in the rank: `2 scout@`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeatCell {
     pub digit: usize,

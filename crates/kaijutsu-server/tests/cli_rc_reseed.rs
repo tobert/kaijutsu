@@ -151,3 +151,26 @@ fn explicit_dir_wins_over_config_root() {
         config_root.join("rc").display()
     );
 }
+
+/// A retired seed still on disk is named by a plain reseed and left alone;
+/// `--force` removes it and says so.
+#[test]
+fn reseed_names_a_retired_seed_and_force_removes_it() {
+    let xdg = Xdg::new();
+    let dir = xdg.path().join("rc");
+    let dir_arg = dir.to_str().unwrap();
+    let rel = kaijutsu_kernel::seed_scripts::RETIRED_RC_SEEDS[0];
+    let retired = dir.join(rel);
+    std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+    std::fs::write(&retired, "kj context set . --env RETIRED=1\n").unwrap();
+
+    let out = xdg.run(&["rc", "reseed", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("retired") && stdout(&out).contains(rel), "{}", stdout(&out));
+    assert!(retired.exists(), "a plain reseed leaves a retired seed alone");
+
+    let out = xdg.run(&["rc", "reseed", "--force", "--dir", dir_arg]);
+    assert!(out.status.success(), "reseed --force failed: {}", stderr(&out));
+    assert!(stdout(&out).contains("removed") && stdout(&out).contains(rel), "{}", stdout(&out));
+    assert!(!retired.exists(), "--force removes a retired seed");
+}

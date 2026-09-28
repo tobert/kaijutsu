@@ -95,8 +95,7 @@ fn character(principal_id: PrincipalId, name: &str) -> CharacterRow {
 }
 
 /// Install a `PreCall` hook that turns every `shell_write` in `ctx` into a
-/// pending ask, the way the lfm2d scorer does for a seat whose shell is
-/// watched — `gate_executes_wire.rs`'s `install_ask_hook_on_worker`, scoped
+/// pending ask, the way an rc pre_call hook that exits 3 does — `gate_executes_wire.rs`'s `install_ask_hook_on_worker`, scoped
 /// by a caller-chosen id so two installs in one test don't collide.
 async fn install_ask_hook(server: &SharedKernel, ctx: ContextId, id: &str) {
     server

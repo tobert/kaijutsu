@@ -219,8 +219,8 @@ mod tests {
     fn display_names_the_ask_once_and_omits_it_when_absent() {
         let pending = Refusal {
             kind: RefusalKind::Pending,
-            reason: "gate for lfm2d-advisory is waiting on a human".to_string(),
-            subject: "lfm2d-advisory".to_string(),
+            reason: "gate for risk-advisory is waiting on a human".to_string(),
+            subject: "risk-advisory".to_string(),
             ask: Some(AskRef {
                 request_id: "01a05d19-0000-7000-8000-000000000000".to_string(),
                 status: AskStatus::Pending,
@@ -234,8 +234,8 @@ mod tests {
 
         let unavailable = Refusal {
             kind: RefusalKind::GateUnavailable,
-            reason: "gate for lfm2d-advisory had nothing to answer it".to_string(),
-            subject: "lfm2d-advisory".to_string(),
+            reason: "gate for risk-advisory had nothing to answer it".to_string(),
+            subject: "risk-advisory".to_string(),
             ask: None,
             remedy: None,
         };

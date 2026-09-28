@@ -30,7 +30,6 @@ use std::time::Duration;
 async fn boot_refreshes_the_roster_without_a_reader() {
     let tmp = tempfile::tempdir().unwrap();
 
-    support::disable_embeddings(tmp.path());
     support::init_root(tmp.path(), "tester");
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,
@@ -69,7 +68,6 @@ async fn boot_refreshes_the_roster_without_a_reader() {
 async fn dropping_the_shared_kernel_cancels_the_refresh_loop() {
     let tmp = tempfile::tempdir().unwrap();
 
-    support::disable_embeddings(tmp.path());
     support::init_root(tmp.path(), "tester");
     let shared = kaijutsu_server::rpc::create_shared_kernel(
         None,

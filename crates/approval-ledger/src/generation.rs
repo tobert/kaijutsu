@@ -212,7 +212,7 @@ mod tests {
             &request_id,
             &crate::types::NewSignal {
                 source_kind: crate::types::SignalSourceKind::Classifier,
-                source_id: Some("lfm2d".into()),
+                source_id: Some("scorer".into()),
                 model_id: None,
                 weight_hash: None,
                 stmt_seq: None,

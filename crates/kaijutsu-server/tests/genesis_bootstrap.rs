@@ -20,7 +20,6 @@ async fn start(dir: &std::path::Path) -> Result<kaijutsu_server::SharedKernel, c
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kernel_without_a_root_character_refuses_to_start() {
     let tmp = tempfile::tempdir().unwrap();
-    support::disable_embeddings(tmp.path());
 
     let Err(error) = start(tmp.path()).await else {
         panic!("a kernel with no root character must refuse to start");
@@ -40,7 +39,6 @@ async fn a_kernel_without_a_root_character_refuses_to_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_creates_the_root_context_once() {
     let tmp = tempfile::tempdir().unwrap();
-    support::disable_embeddings(tmp.path());
     let amy = support::init_root(tmp.path(), "amy");
 
     let shared = start(tmp.path()).await.expect("a kernel with a root character starts");
@@ -76,7 +74,6 @@ async fn startup_refuses_incomplete_orphan_recovery_and_retries_without_partial_
 
 async fn failed_orphan_boot(fault: &str) {
     let tmp = tempfile::tempdir().unwrap();
-    support::disable_embeddings(tmp.path());
     let amy = support::init_root(tmp.path(), "amy");
     let shared = start(tmp.path()).await.unwrap();
     let context = shared.kernel_db.lock().get_character(amy).unwrap().unwrap().root_ctx.unwrap();

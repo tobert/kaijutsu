@@ -56,13 +56,6 @@ pub(crate) struct ContextShellInputs {
     /// `curl_tool` so the shell's `curl` reaches only what this context's
     /// list names.
     pub egress_hosts: Vec<String>,
-    /// The host of `[classifier] url` in `gate.toml`, handed to `curl_tool`
-    /// beside `egress_hosts` — the one host every context reaches beyond its
-    /// own rows (`docs/egress.md`, "The classifier host"). `None` with no
-    /// `[classifier]` section or an unreadable/unparseable `gate.toml`: the
-    /// gate itself already refuses every gated shell submission on a bad
-    /// file, so shell construction does not fail a second time on it.
-    pub classifier_host: Option<String>,
 }
 
 impl ContextShellInputs {
@@ -87,11 +80,7 @@ impl ContextShellInputs {
                 .map_err(|error| anyhow::anyhow!("read context_egress for {context}: {error}"))?;
             (cwd, exports, egress_hosts)
         };
-        let classifier_host = crate::kj::gate_policy::load_config(kernel.vfs())
-            .await
-            .ok()
-            .and_then(|config| config.classifier().map(|c| c.host().to_string()));
-        Ok(Self { cwd, exports, external_exec, egress_hosts, classifier_host })
+        Ok(Self { cwd, exports, external_exec, egress_hosts })
     }
 
     pub fn environment(&self) -> std::collections::HashMap<String, String> {
@@ -158,7 +147,6 @@ impl EmbeddedKaish {
         // list").
         let inputs = ContextShellInputs::load(dispatcher.kernel(), context_id, read_only, cwd.clone()).await?;
         let egress_hosts = inputs.egress_hosts.clone();
-        let classifier_host = inputs.classifier_host.clone();
         let configure_tools =
             move |scm: SessionContextMap,
                   _sid: SessionId,
@@ -187,10 +175,7 @@ impl EmbeddedKaish {
                 ));
                 // The read-only interpreter replaces curl with an explicit
                 // refusal after tool registration.
-                tools.register(crate::runtime::curl_tool::curl_tool(
-                    &egress_hosts,
-                    classifier_host.as_deref(),
-                ));
+                tools.register(crate::runtime::curl_tool::curl_tool(&egress_hosts));
                 // Read-only `git` (`runtime/git_tool.rs`): registered only
                 // here, so only a `ShellPolicy::ReadOnly` shell ever sees it.
                 // The writable shell keeps host `git` reachable through
@@ -971,78 +956,6 @@ mod tests {
             .await
             .unwrap();
         assert!(allowed.ok(), "granting 127.0.0.1 must let curl reach the mock server: {}", allowed.err);
-        assert_eq!(allowed.text_out(), "ok");
-
-        server.await.unwrap();
-    }
-
-    /// `docs/egress.md`, "The classifier host": an empty egress list still
-    /// reaches the host of `[classifier] url` in `gate.toml` — the escape
-    /// hatch the lfm2d pre-call hook needs from an otherwise-empty context.
-    /// Driven through a real context shell, matching
-    /// `context_curl_reaches_loopback_only_after_the_context_grants_it`
-    /// above; no `add_context_egress` row here, since the whole point is
-    /// that the classifier host opens without one.
-    ///
-    /// Multi-thread runtime: see that test's own note.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_curl_reaches_the_configured_classifier_host_with_an_empty_egress_list() {
-        use tokio::io::AsyncWriteExt;
-
-        let d = Arc::new(test_dispatcher().await);
-        d.set_self_arc();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .await
-                .unwrap();
-            stream.shutdown().await.unwrap();
-        });
-        let url = format!("http://127.0.0.1:{port}/");
-
-        // Override the seeded default gate.toml with one whose classifier
-        // points at the mock server — `MountTable::mount` replaces the
-        // existing `/config/kernel` mount.
-        let config_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config_dir.path().join(crate::kj::gate_policy::GATE_CONFIG_FILE),
-            format!("[classifier]\nurl = \"http://127.0.0.1:{port}\"\n"),
-        )
-        .unwrap();
-        assert!(
-            d.kernel()
-                .mount(
-                    kaijutsu_types::paths::CONFIG_ROOT,
-                    crate::vfs::LocalBackend::new(config_dir.path()),
-                )
-                .await,
-            "the test kernel must accept a /config/kernel remount"
-        );
-
-        let principal = PrincipalId::new();
-        let ctx = register_context(&d, Some("curl-classifier"), None, principal);
-        let identity = ShellIdentity {
-            requester: principal, performer: principal, reviewer: None,
-            context: ctx, session: SessionId::new(),
-        };
-
-        let kaish = EmbeddedKaish::for_context(
-            &d, "curl-classifier", identity, ShellPolicy::Agent, ShellCwd::Context,
-            None, Arc::new(NoopBlockSource),
-        ).await.unwrap();
-        let allowed = kaish
-            .execute_with_options(&format!("curl {url}"), ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert!(
-            allowed.ok(),
-            "an empty egress list must still reach the configured classifier host: {}",
-            allowed.err
-        );
         assert_eq!(allowed.text_out(), "ok");
 
         server.await.unwrap();

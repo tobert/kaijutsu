@@ -1183,7 +1183,7 @@ mod tests {
         let d = test_dispatcher_rc().await;
         let c = test_caller();
         let s = |v: &str| v.to_string();
-        let path = "/config/rc/lib/hooks/lfm2d.kai";
+        let path = "/config/rc/lib/hooks/shell-guard.kai";
 
         let listed = |result: KjResult| match result {
             KjResult::Ok { message, .. } => message,

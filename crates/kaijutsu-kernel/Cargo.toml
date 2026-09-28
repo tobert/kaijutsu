@@ -161,7 +161,7 @@ russh-sftp.workspace = true
 # `kj audio beats` — Beat This! (ISMIR 2024) beat/downbeat tracking, pure Rust
 # (rten inference, symphonia decode, rubato resample). Default features only —
 # the `ort` feature (external ONNX Runtime) is not enabled. Beat analysis is the
-# kernel's in-process model consumer; semantic embeddings use the lfm2d service.
+# kernel's in-process model consumer; semantic embeddings use an HTTP embedding service.
 beat-this = "1.0"
 
 # Backs `KernelDb::temporary()` (kernel_db.rs) — optional so a production

@@ -1,5 +1,5 @@
-//! Factory LLM configuration — the backends, their known context windows, the
-//! defaults, and the embedding config a fresh kernel is born with.
+//! Factory LLM configuration — the backends, their known context windows, and
+//! the defaults a fresh kernel is born with.
 //!
 //! The backend analogue of [`crate::seed_presets`]: an idempotent floor
 //! ([`ensure_factory_backends`], insert-only-if-absent, so an operator's edits
@@ -27,6 +27,8 @@
 //! - **No tunables we haven't decided on.** `max_tokens` is real (16384, sized
 //!   for V4 reasoning tokens counting against the output budget); temperature
 //!   / top_p / effort / thinking_* stay NULL, meaning "provider default".
+//! - **No embedding service.** `embedding_config` is operator data; with no
+//!   row the semantic index stays off and boot says so (`docs/synthesis.md`).
 //!
 //! Model ids are **undated on purpose**. Dated ids get retired out from under
 //! us — `claude-sonnet-4-20250514` and `claude-opus-4-20250514` both 404 today,
@@ -37,7 +39,7 @@
 use kaijutsu_types::{BackendId, PrincipalId};
 
 use crate::kernel_db::{
-    BackendModelRow, BackendRow, EmbeddingConfigRow, KernelDb, KernelDbResult, LlmDefaultsRow,
+    BackendModelRow, BackendRow, KernelDb, KernelDbResult, LlmDefaultsRow,
 };
 
 /// A factory backend definition.
@@ -134,16 +136,14 @@ const FACTORY_MAX_TOKENS: i64 = 16384;
 /// than through this default.
 const FACTORY_EFFORT: &str = "max";
 
-/// lfm2d-system1 serves LFM2.5-Embedding-350M on `/embed` (lfm2d `f6fd4bb`,
-/// 2026-09-24). Changing the service's checkpoint changes the vector space;
-/// the index pins the discovered weight hash, so it refuses a mixed space.
-pub(crate) const FACTORY_EMBEDDING_ENDPOINT: &str = "http://lfm2d-system1.taila4abc.ts.net:8088";
-
-/// Earlier factory defaults. A kernel whose row still holds one of these
-/// never chose it, so the additive migrations move it to the current
-/// default. lfm2d-1 serves the frozen classifier heads and never had an
-/// embedder: discovery there fails with "no embedding model".
-pub(crate) const RETIRED_FACTORY_EMBEDDING_ENDPOINTS: &[&str] = &["http://lfm2d-1.taila4abc.ts.net:8088"];
+/// Endpoints earlier kernels seeded into `embedding_config`. The kernel ships
+/// no embedding endpoint now, so a row still holding one of these was never
+/// an operator's choice: opening the DB removes it and the semantic index
+/// stays off until an operator configures a service.
+pub(crate) const RETIRED_FACTORY_EMBEDDING_ENDPOINTS: &[&str] = &[
+    "http://lfm2d-1.taila4abc.ts.net:8088",
+    "http://lfm2d-system1.taila4abc.ts.net:8088",
+];
 
 /// True when `name` is a factory backend name. Not a hard reservation — an
 /// operator may absolutely re-point `anthropic` at a gateway — but
@@ -194,18 +194,16 @@ pub fn ensure_factory_backends(db: &mut KernelDb, created_by: PrincipalId) -> Ke
     if db.get_llm_defaults()?.is_none() {
         db.set_llm_defaults(&factory_defaults())?;
     }
-    if db.get_embedding_config()?.is_none() {
-        db.set_embedding_config(&factory_embedding())?;
-    }
 
     Ok(created)
 }
 
 /// Force-restore the factory floor from the embedded definitions: every
-/// factory backend, its model rows, the defaults row, and the embedding row
-/// are overwritten. Backends the operator added are left alone — this restores
-/// the floor, it does not wipe the room. Aliases and casts are untouched
-/// because the floor never had any: they are operator data end to end.
+/// factory backend, its model rows, and the defaults row are overwritten.
+/// Backends the operator added are left alone — this restores the floor, it
+/// does not wipe the room. Aliases, casts, and the embedding service are
+/// untouched because the floor never had any: they are operator data end to
+/// end.
 ///
 /// Returns how many factory backends were restored.
 pub fn reseed_factory_backends(
@@ -228,7 +226,6 @@ pub fn reseed_factory_backends(
         }
     }
     db.set_llm_defaults(&factory_defaults())?;
-    db.set_embedding_config(&factory_embedding())?;
     Ok(FACTORY_BACKENDS.len())
 }
 
@@ -244,14 +241,6 @@ fn factory_defaults() -> LlmDefaultsRow {
         effort: Some(FACTORY_EFFORT.to_string()),
         thinking_budget: None,
         thinking_style: None,
-    }
-}
-
-fn factory_embedding() -> EmbeddingConfigRow {
-    EmbeddingConfigRow {
-        enabled: true,
-        endpoint: FACTORY_EMBEDDING_ENDPOINT.to_string(),
-        timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
     }
 }
 

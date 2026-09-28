@@ -133,9 +133,11 @@ enum Command {
 enum RcCommand {
     /// Install the embedded rc scripts into the rc tree. Installs anything
     /// absent and names anything present that differs from its embedded
-    /// default, leaving it alone; --force overwrites those instead.
+    /// default, or that a retired default left behind, leaving it alone;
+    /// --force overwrites the first and removes the second instead.
     Reseed {
-        /// Also overwrite files that differ from their embedded default.
+        /// Also overwrite files that differ from their embedded default and
+        /// remove retired defaults.
         #[arg(long, short = 'f')]
         force: bool,
         /// Seed this directory instead of the /config/rc tree the path
@@ -348,6 +350,22 @@ fn cmd_rc_reseed(
                     println!("  {path}");
                 }
                 println!("\nPass --force to overwrite them with the embedded defaults.");
+            }
+            if !r.retired.is_empty() {
+                println!(
+                    "\n{} retired default(s) are still installed and were left alone:",
+                    r.retired.len()
+                );
+                for path in &r.retired {
+                    println!("  {path}");
+                }
+                println!("\nPass --force to remove them, or delete them by hand.");
+            }
+            if !r.removed.is_empty() {
+                println!("\n{} retired default(s) removed:", r.removed.len());
+                for path in &r.removed {
+                    println!("  {path}");
+                }
             }
             ExitCode::SUCCESS
         }

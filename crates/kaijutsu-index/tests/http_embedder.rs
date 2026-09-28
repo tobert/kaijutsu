@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use kaijutsu_index::{Embedder, EmbeddingPurpose, Lfm2dEmbedder};
+use kaijutsu_index::{Embedder, EmbeddingPurpose, HttpEmbedder};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -55,7 +55,7 @@ async fn mock_service(responses: Vec<String>) -> (String, tokio::task::JoinHandl
 async fn service_preserves_purpose_order_and_normalization() {
     for purpose in [EmbeddingPurpose::Query, EmbeddingPurpose::Document] {
         let (endpoint, server) = service("[[3,4,0],[0,0,2]]", HASH).await;
-        let client = Lfm2dEmbedder::connect(&endpoint, Duration::from_secs(2), 2).await.unwrap();
+        let client = HttpEmbedder::connect(&endpoint, Duration::from_secs(2), 2).await.unwrap();
         let vectors = client.embed_batch(&["first", "second"], purpose).await.unwrap();
         assert_eq!(vectors, vec![vec![0.6, 0.8, 0.0], vec![0.0, 0.0, 1.0]]);
         assert_eq!(client.dimensions(), 3);
@@ -75,7 +75,7 @@ async fn service_refuses_malformed_or_changed_profile_results() {
         ("[[1,0,0]]", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     ] {
         let (endpoint, server) = service(body, hash).await;
-        let client = Lfm2dEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
+        let client = HttpEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
         assert!(client.embed("text", EmbeddingPurpose::Document).await.is_err(), "accepted {body} / {hash}");
         server.await.unwrap();
     }
@@ -86,7 +86,7 @@ async fn service_refuses_unavailable_endpoint() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    assert!(Lfm2dEmbedder::connect(&endpoint, Duration::from_millis(100), 1).await.is_err());
+    assert!(HttpEmbedder::connect(&endpoint, Duration::from_millis(100), 1).await.is_err());
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn service_chunks_batches_and_preserves_input_order() {
         embedding_response(&serde_json::to_string(&vec![vec![1, 0, 0]; 32]).unwrap(), HASH),
         embedding_response("[[0,1,0]]", HASH),
     ]).await;
-    let client = Lfm2dEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
+    let client = HttpEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
     let inputs: Vec<String> = (0..33).map(|i| format!("input {i}")).collect();
     let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
     let vectors = client.embed_batch(&refs, EmbeddingPurpose::Document).await.unwrap();
@@ -113,7 +113,7 @@ async fn service_refuses_ambiguous_discovery_missing_identity_and_http_errors() 
         r#"[{"id":"a","kind":"embedder","hidden_size":3}]"#.into(),
     ] {
         let (endpoint, server) = mock_service(vec![response(&body)]).await;
-        assert!(Lfm2dEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.is_err());
+        assert!(HttpEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.is_err());
         server.await.unwrap();
     }
     for reply in [response("[[1,0,0]]"),
@@ -121,7 +121,7 @@ async fn service_refuses_ambiguous_discovery_missing_identity_and_http_errors() 
         "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".into(),
     ] {
         let (endpoint, server) = mock_service(vec![discovery(), reply]).await;
-        let client = Lfm2dEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
+        let client = HttpEmbedder::connect(&endpoint, Duration::from_secs(2), 1).await.unwrap();
         assert!(client.embed("input", EmbeddingPurpose::Document).await.is_err());
         server.await.unwrap();
     }
@@ -145,7 +145,7 @@ async fn service_request_deadline_includes_waiting_for_capacity() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(first);
     });
-    let client = std::sync::Arc::new(Lfm2dEmbedder::connect(&endpoint, Duration::from_millis(100), 1).await.unwrap());
+    let client = std::sync::Arc::new(HttpEmbedder::connect(&endpoint, Duration::from_millis(100), 1).await.unwrap());
     let (a, b) = tokio::time::timeout(Duration::from_millis(170), async {
         tokio::join!(client.embed("first", EmbeddingPurpose::Document), client.embed("second", EmbeddingPurpose::Document))
     }).await.expect("queue time must be covered by the request deadline");
@@ -156,9 +156,18 @@ async fn service_request_deadline_includes_waiting_for_capacity() {
 
 #[tokio::test]
 async fn service_refuses_endpoint_prefix_instead_of_silently_discarding_it() {
-    let error = match Lfm2dEmbedder::connect("http://127.0.0.1:9/prefix", Duration::from_millis(100), 1).await {
+    let error = match HttpEmbedder::connect("http://127.0.0.1:9/prefix", Duration::from_millis(100), 1).await {
         Ok(_) => panic!("a prefixed endpoint must be rejected"),
         Err(error) => error.to_string(),
     };
     assert!(error.contains("root URL"), "reject the path before making a request: {error}");
+}
+
+#[tokio::test]
+async fn service_errors_name_the_embedding_service() {
+    let error = match HttpEmbedder::connect("ftp://127.0.0.1:9/", Duration::from_millis(100), 1).await {
+        Ok(_) => panic!("a non-HTTP endpoint must be rejected"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("embedding service: "), "errors say which service failed: {error}");
 }

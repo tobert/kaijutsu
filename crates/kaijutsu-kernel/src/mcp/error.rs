@@ -396,7 +396,7 @@ mod tests {
     fn a_pending_gate_says_it_is_waiting_exactly_once() {
         let outcome = pending_outcome();
         let rendered = McpError::gate_pending(
-            Some(HookId("lfm2d-advisory".to_string())),
+            Some(HookId("risk-advisory".to_string())),
             outcome.ask.clone(),
             outcome.ask_summary(),
         )
@@ -408,7 +408,7 @@ mod tests {
             "each layer must add new information, not restate the last: {rendered}"
         );
         // The three facts a reader needs, each present once.
-        assert!(rendered.contains("lfm2d-advisory"), "names the hook: {rendered}");
+        assert!(rendered.contains("risk-advisory"), "names the hook: {rendered}");
         assert!(rendered.contains("01a03e66"), "names the ask: {rendered}");
         assert!(rendered.contains("kj ledger allow"), "says what to do: {rendered}");
         assert!(
@@ -426,7 +426,7 @@ mod tests {
     fn a_pending_gate_hands_back_the_ask_id_structurally() {
         let outcome = pending_outcome();
         let err = McpError::gate_pending(
-            Some(HookId("lfm2d-advisory".to_string())),
+            Some(HookId("risk-advisory".to_string())),
             outcome.ask.clone(),
             outcome.ask_summary(),
         );
@@ -434,7 +434,7 @@ mod tests {
         let refusal = err.as_refusal().expect("a gate refusal is a refusal");
         assert_eq!(refusal.ask_id(), Some(ASK), "the handle, not the prose");
         assert_eq!(refusal.kind, RefusalKind::Pending);
-        assert_eq!(refusal.subject, "lfm2d-advisory");
+        assert_eq!(refusal.subject, "risk-advisory");
         assert_eq!(
             refusal.ask.as_ref().map(|a| a.status),
             Some(AskStatus::Pending),
@@ -480,7 +480,7 @@ mod tests {
             reason: "the ledger could not be reached".to_string(),
         };
         let rendered = McpError::gate_unavailable(
-            Some(HookId("lfm2d-advisory".to_string())),
+            Some(HookId("risk-advisory".to_string())),
             None,
             outcome.ask_summary(),
         )
@@ -502,14 +502,14 @@ mod tests {
     /// composing.
     #[test]
     fn only_a_pending_gate_settles_blocks_to_waiting() {
-        let hook = || Some(HookId("lfm2d-advisory".to_string()));
+        let hook = || Some(HookId("risk-advisory".to_string()));
 
         assert_eq!(
             McpError::gate_pending(hook(), None, "r".into()).settled_block_status(),
             Status::Waiting
         );
         assert_eq!(
-            McpError::denied_by_hook(HookId("lfm2d-advisory".to_string()))
+            McpError::denied_by_hook(HookId("risk-advisory".to_string()))
                 .settled_block_status(),
             Status::Error,
             "someone said no"

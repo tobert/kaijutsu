@@ -57,7 +57,7 @@ pub fn create_ask_recorded<E: From<LedgerError>>(
 /// this function only decides who gets credit for the ALLOW.
 ///
 /// `auto_reason` names the source that auto-allowed this ask (e.g.
-/// `"lfm2d:kube_ordinal_v8 (log-only)"`) and lands on both the `approvals`
+/// `"scorer:risk-v1 (log-only)"`) and lands on both the `approvals`
 /// row's `auto_reason` column and the `approval_events` "decided" row's
 /// `auto_reason` — an audit read can tell "a human said yes"
 /// (`decided_by` set, `auto_reason` NULL) from "a classifier auto-allowed
@@ -1093,8 +1093,8 @@ mod tests {
     fn classifier_signal() -> NewSignal {
         NewSignal {
             source_kind: SignalSourceKind::Classifier,
-            source_id: Some("lfm2d".into()),
-            model_id: Some("kube_ordinal_v8".into()),
+            source_id: Some("scorer".into()),
+            model_id: Some("risk-v1".into()),
             weight_hash: Some("abc123".into()),
             stmt_seq: Some(0),
             cmd_seq: None,
@@ -1109,14 +1109,14 @@ mod tests {
         let conn = open_memory();
         let mut ask = minimal_ask();
         ask.signals = vec![classifier_signal()];
-        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+        let request_id = create_auto_allowed_ask(&conn, &ask, "scorer:risk-v1 (log-only)").unwrap();
 
         let row = get_approval(&conn, &request_id).unwrap().expect("row must exist");
         assert_eq!(row.status, ApprovalStatus::Allowed);
         assert!(row.status.is_allowed());
         assert!(row.decided_by.is_none(), "no human decided this — decided_by must stay NULL");
         assert_eq!(row.decided_option.as_deref(), Some("auto_allow"));
-        assert_eq!(row.auto_reason.as_deref(), Some("lfm2d:kube_ordinal_v8 (log-only)"));
+        assert_eq!(row.auto_reason.as_deref(), Some("scorer:risk-v1 (log-only)"));
         assert!(row.decided_at.is_some());
     }
 
@@ -1125,13 +1125,13 @@ mod tests {
         let conn = open_memory();
         let mut ask = minimal_ask();
         ask.signals = vec![classifier_signal()];
-        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+        let request_id = create_auto_allowed_ask(&conn, &ask, "scorer:risk-v1 (log-only)").unwrap();
 
         let signals = list_signals(&conn, &request_id).unwrap();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].source_kind, SignalSourceKind::Classifier);
-        assert_eq!(signals[0].source_id.as_deref(), Some("lfm2d"));
-        assert_eq!(signals[0].model_id.as_deref(), Some("kube_ordinal_v8"));
+        assert_eq!(signals[0].source_id.as_deref(), Some("scorer"));
+        assert_eq!(signals[0].model_id.as_deref(), Some("risk-v1"));
         assert_eq!(signals[0].weight_hash.as_deref(), Some("abc123"));
         assert_eq!(signals[0].label.as_deref(), Some("situation-normal"));
         assert_eq!(signals[0].verdict, SignalVerdict::Escalate);
@@ -1148,13 +1148,13 @@ mod tests {
         let conn = open_memory();
         let mut ask = minimal_ask();
         ask.signals = vec![classifier_signal()];
-        let request_id = create_auto_allowed_ask(&conn, &ask, "lfm2d:kube_ordinal_v8 (log-only)").unwrap();
+        let request_id = create_auto_allowed_ask(&conn, &ask, "scorer:risk-v1 (log-only)").unwrap();
 
         let events = list_events(&conn, &request_id).unwrap();
         assert_eq!(events.len(), 1, "creation and decision are ONE event, not two: {events:?}");
         assert_eq!(events[0].kind, EventKind::Decided);
         assert!(events[0].actor.is_none(), "no human actor decided this");
-        assert_eq!(events[0].auto_reason.as_deref(), Some("lfm2d:kube_ordinal_v8 (log-only)"));
+        assert_eq!(events[0].auto_reason.as_deref(), Some("scorer:risk-v1 (log-only)"));
         assert_eq!(events[0].decided_option.as_deref(), Some("auto_allow"));
     }
 

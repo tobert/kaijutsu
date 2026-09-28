@@ -2479,7 +2479,7 @@ mod tests {
             tool: "shell_write".into(),
             arguments: serde_json::json!({ "command": "kj block list; kj ledger list" }),
         };
-        let spec = crate::kj::hook_gate::build_hook_gate_spec("lfm2d-advisory", "d".into(), &params);
+        let spec = crate::kj::hook_gate::build_hook_gate_spec("risk-advisory", "d".into(), &params);
 
         let outcome =
             run_gate(d.kernel(), &caller, spec, d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;

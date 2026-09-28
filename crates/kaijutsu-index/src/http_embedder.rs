@@ -1,4 +1,5 @@
-//! lfm2d embedding service adapter.
+//! HTTP embedding service client: `GET /v1/models` discovery, `POST /embed`
+//! requests. See `docs/synthesis.md`, "Embedding service".
 use crate::{Embedder, EmbeddingPurpose, IndexError};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -14,7 +15,7 @@ struct Model {
 
 /// Pins the discovered model for this client's lifetime. Restart the index to
 /// adopt a changed model; mixing vector spaces would corrupt similarity scores.
-pub struct Lfm2dEmbedder {
+pub struct HttpEmbedder {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     model: String,
@@ -25,10 +26,10 @@ pub struct Lfm2dEmbedder {
 }
 
 fn failure(error: impl std::fmt::Display) -> IndexError {
-    IndexError::Embedding(format!("lfm2d: {error}"))
+    IndexError::Embedding(format!("embedding service: {error}"))
 }
 
-impl Lfm2dEmbedder {
+impl HttpEmbedder {
     pub async fn connect(endpoint: &str, timeout: Duration, max_in_flight: usize) -> Result<Self, IndexError> {
         if timeout.is_zero() || max_in_flight == 0 {
             return Err(failure("timeout and request concurrency must be positive"));
@@ -101,13 +102,13 @@ impl Lfm2dEmbedder {
 }
 
 #[async_trait]
-impl Embedder for Lfm2dEmbedder {
+impl Embedder for HttpEmbedder {
     fn model_name(&self) -> &str { &self.model }
     fn revision(&self) -> &str { &self.revision }
     fn dimensions(&self) -> usize { self.dimensions }
     async fn embed_batch(&self, texts: &[&str], purpose: EmbeddingPurpose) -> Result<Vec<Vec<f32>>, IndexError> {
         let mut vectors = Vec::with_capacity(texts.len());
-        // lfm2d embeds each input independently; chunking preserves that
+        // The service embeds each input independently; chunking preserves that
         // contract and bounds each request's service occupancy.
         for chunk in texts.chunks(32) {
             vectors.extend(self.request(chunk, purpose).await?);

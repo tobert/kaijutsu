@@ -153,7 +153,30 @@ pub struct RcSeedReport {
     /// which is exactly the question worth answering when an rc root is
     /// pointed somewhere other than its default.
     pub diverged: Vec<String>,
+    /// Retired seed paths ([`RETIRED_RC_SEEDS`]) still present and left
+    /// alone. Always empty with `force`, which removes them instead.
+    pub retired: Vec<String>,
+    /// Retired seed paths this reseed removed. Always empty without `force`.
+    pub removed: Vec<String>,
 }
+
+/// Paths, relative to the rc root, that earlier seeds installed and the
+/// embedded set no longer carries. Install-if-absent cannot see them, so
+/// [`reseed_rc_files`] names each one still present and removes it under
+/// `force`. These installed the retired risk-classifier pre_call hook
+/// (`docs/gate-policy-tuning.md`).
+pub const RETIRED_RC_SEEDS: &[&str] = &[
+    "coder/create/S50-lfm2d.kai",
+    "default/create/S50-lfm2d.kai",
+    "director/create/S50-lfm2d.kai",
+    "director/create/S51-lfm2d-observe.kai",
+    "lib/create/S50-lfm2d.kai",
+    "lib/hooks/lfm2d.kai",
+    "mcp/create/S50-lfm2d.kai",
+    "root/create/S50-lfm2d.kai",
+    "root/create/S51-lfm2d-observe.kai",
+    "toolie/create/S50-lfm2d.kai",
+];
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
 /// `/config/rc`).
@@ -172,7 +195,9 @@ pub struct RcSeedReport {
 /// removed and recreated rather than written through, because writing through
 /// a link would edit the shared body instead of restoring the link.
 ///
-/// `force` does not delete anything the embedded set does not name, so a
+/// A retired seed ([`RETIRED_RC_SEEDS`]) still present is named in
+/// [`RcSeedReport::retired`] and left alone; with `force` it is removed and
+/// named in [`RcSeedReport::removed`]. `force` deletes nothing else, so a
 /// script you added yourself is never touched. Use `git diff` to see what a
 /// forced reseed changed.
 ///
@@ -233,6 +258,20 @@ pub fn reseed_rc_files(
             None => std::fs::write(&dest, content)?,
         }
     }
+    for rel in RETIRED_RC_SEEDS {
+        let dest = root.join(rel);
+        if std::fs::symlink_metadata(&dest).is_err() {
+            continue;
+        }
+        if force {
+            std::fs::remove_file(&dest)?;
+            report.removed.push(rel.to_string());
+        } else {
+            report.retired.push(rel.to_string());
+        }
+    }
+    report.retired.sort();
+    report.removed.sort();
     Ok(report)
 }
 
@@ -834,17 +873,12 @@ mod tests {
     }
 
     /// Every seat whose `create/S10-binding.kai` grants exec-capable
-    /// authority — `"*"`, `"exec"`, or `"facade:shell"` — also ships the two
-    /// scripts that score a shell command before it runs: `S45-shell-guard.kai`
-    /// and `S50-lfm2d.kai`. A binding that grants exec but skips them is a
-    /// seat where a shell command runs with no advisory scoring at all.
-    ///
-    /// No seat is excluded: `director` scores its shell like every other
-    /// exec-granting seat, in `log` mode (`S51-lfm2d-observe.kai`, checked
-    /// below) rather than `escalate` — it is the operator's own console, and
-    /// an escalation raised against it has no second seat to answer it.
+    /// authority — `"*"`, `"exec"`, or `"facade:shell"` — also ships
+    /// `S45-shell-guard.kai`, the pre_call hook that denies a command handing
+    /// text to a second shell. A binding that grants exec but skips it is a
+    /// seat where `sh -c` runs past the gate unseen.
     #[test]
-    fn every_exec_granting_seat_ships_the_shell_scoring_scripts() {
+    fn every_exec_granting_seat_ships_the_shell_guard() {
         let seeds = seed_files();
         let by_path: std::collections::HashMap<&str, &str> =
             seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
@@ -887,7 +921,7 @@ mod tests {
             if !grants_exec {
                 continue;
             }
-            for required in ["S45-shell-guard.kai", "S50-lfm2d.kai"] {
+            for required in ["S45-shell-guard.kai"] {
                 let want = format!("{RC_VFS_ROOT}/{ty}/create/{required}");
                 if !by_path.contains_key(want.as_str()) {
                     missing.push(want);
@@ -897,48 +931,87 @@ mod tests {
 
         assert!(
             missing.is_empty(),
-            "exec-granting seats missing shell-scoring scripts: {missing:#?}"
+            "exec-granting seats missing the shell guard: {missing:#?}"
         );
     }
 
-    /// `director` scores its shell in `log` mode, never `escalate`: it is
-    /// the operator's own console, and an escalation raised against it has
-    /// no second seat to answer it (S50 exports the seat default,
-    /// `escalate`; `S51-lfm2d-observe.kai` overrides it). The override must
-    /// sort after S50 or it has nothing to override — this pins both the
-    /// mode and the ordering, so a rename or reorder fails loudly instead of
-    /// silently putting director back into `escalate`.
+    /// A test kernel seeds this tree (`SshServerConfig::ephemeral`), and a
+    /// test kernel must never reach the network. No seed body registers or
+    /// calls `curl`; an rc hook that needs the network is an operator's own
+    /// file, not a default.
     #[test]
-    fn director_overrides_lfm2d_to_log_mode_after_s50() {
-        let seeds = seed_files();
-        let by_path: std::collections::HashMap<&str, &str> =
-            seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
-
-        let s50 = format!("{RC_VFS_ROOT}/director/create/S50-lfm2d.kai");
-        assert!(
-            by_path.contains_key(s50.as_str()),
-            "director must ship S50-lfm2d.kai like every exec-granting seat"
-        );
-
-        let prefix = format!("{RC_VFS_ROOT}/director/create/S5");
-        let mut observe_scripts: Vec<&str> = by_path
-            .keys()
-            .copied()
-            .filter(|p| p.starts_with(&prefix) && *p != s50.as_str())
+    fn no_seed_reaches_the_network() {
+        let reaching: Vec<String> = seed_files()
+            .into_iter()
+            .filter(|(_, body)| {
+                body.lines().any(|line| {
+                    let code = line.split('#').next().unwrap_or("");
+                    code.contains("kaish-tools curl") || code.contains("curl ")
+                })
+            })
+            .map(|(path, _)| path)
             .collect();
-        observe_scripts.sort_unstable();
+        assert!(reaching.is_empty(), "seeds that reach the network: {reaching:#?}");
+    }
 
-        let overriding = observe_scripts.into_iter().find(|p| *p > s50.as_str());
-        let Some(path) = overriding else {
-            panic!(
-                "director ships no script sorting after S50-lfm2d.kai to override its \
-                 `escalate` default to `log`"
-            );
-        };
-        let body = by_path[path];
-        assert!(
-            body.contains("LFM2D_MODE=log"),
-            "{path} sorts after S50-lfm2d.kai but does not set LFM2D_MODE=log: {body}"
-        );
+    /// Plant every retired seed path: a link where the seed shipped one, a
+    /// file otherwise.
+    fn plant_retired(root: &std::path::Path) {
+        for rel in RETIRED_RC_SEEDS {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if rel.starts_with("lib/") || rel.contains("/S51-") {
+                std::fs::write(&path, "kj context set . --env RETIRED=1\n").unwrap();
+            } else {
+                std::os::unix::fs::symlink("../../lib/create/retired.kai", &path).unwrap();
+            }
+        }
+    }
+
+    /// A retired seed is no longer embedded, so install-if-absent never
+    /// sees it. Without `force` a reseed names every retired entry still
+    /// present and leaves it alone.
+    #[test]
+    fn reseed_names_retired_seeds_still_present() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_rc_seed_files(dir.path()).unwrap();
+        plant_retired(dir.path());
+        let report = reseed_rc_files(dir.path(), false).unwrap();
+        let mut want: Vec<String> = RETIRED_RC_SEEDS.iter().map(|p| p.to_string()).collect();
+        want.sort();
+        assert_eq!(report.retired, want);
+        assert!(report.removed.is_empty());
+        for rel in RETIRED_RC_SEEDS {
+            assert!(std::fs::symlink_metadata(dir.path().join(rel)).is_ok(), "{rel} was left alone");
+        }
+    }
+
+    /// With `force` a reseed removes every retired entry, links and files
+    /// alike, and names what it removed. Nothing else is touched.
+    #[test]
+    fn reseed_force_removes_retired_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_rc_seed_files(dir.path()).unwrap();
+        plant_retired(dir.path());
+        let mine = dir.path().join("coder/create/S60-mine.kai");
+        std::fs::write(&mine, "kj context set . --env MINE=1\n").unwrap();
+        let report = reseed_rc_files(dir.path(), true).unwrap();
+        assert_eq!(report.removed.len(), RETIRED_RC_SEEDS.len(), "{report:?}");
+        assert!(report.retired.is_empty());
+        for rel in RETIRED_RC_SEEDS {
+            assert!(std::fs::symlink_metadata(dir.path().join(rel)).is_err(), "{rel} was removed");
+        }
+        assert!(mine.exists(), "a script the seed never named stays");
+        assert_eq!(reseed_rc_files(dir.path(), false).unwrap().retired, Vec::<String>::new());
+    }
+
+    /// A retired path is never also a live seed; reseed would remove what
+    /// it just installed.
+    #[test]
+    fn no_retired_seed_is_embedded() {
+        let seeds: Vec<String> = seed_files().into_iter().filter_map(|(p, _)| rc_relpath(&p).map(str::to_string)).collect();
+        for rel in RETIRED_RC_SEEDS {
+            assert!(!seeds.iter().any(|s| s == rel), "{rel} is both retired and embedded");
+        }
     }
 }

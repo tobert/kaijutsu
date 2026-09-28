@@ -381,7 +381,7 @@ impl Seats {
     }
 
     /// Make every shell submission from the worker seat ask a human, the
-    /// way the lfm2d hook does for a seat that scores its shell. Scoped to
+    /// way an rc pre_call hook that exits 3 does. Scoped to
     /// the worker context so the approver's `kj ledger` answers, which
     /// take the same `shell_execute` path, are not gated by it.
     async fn install_ask_hook_on_worker(&self) {

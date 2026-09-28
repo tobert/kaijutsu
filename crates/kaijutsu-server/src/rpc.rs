@@ -1475,7 +1475,7 @@ async fn connect_semantic_index(
     documents: SharedBlockStore,
     flows: kaijutsu_kernel::flows::SharedBlockFlowBus,
 ) -> Option<Arc<kaijutsu_index::SemanticIndex>> {
-    match kaijutsu_index::Lfm2dEmbedder::connect(
+    match kaijutsu_index::HttpEmbedder::connect(
         &emb_config.endpoint,
         std::time::Duration::from_millis(emb_config.timeout_ms),
         emb_config.max_in_flight,
@@ -2121,6 +2121,12 @@ pub async fn create_shared_kernel(
                 }
             }
         });
+    } else {
+        log::warn!(
+            "semantic index off: kernel.db has no enabled embedding_config row naming an \
+             embedding service; semantic search and `kj synth` report unavailable \
+             (docs/synthesis.md, \"Embedding service\")"
+        );
     }
 
     // Drive the roster's scheduled-periodic reconcile (`roster_sources`
@@ -10943,10 +10949,6 @@ mod semantic_search_tests {
         tokio::task::LocalSet::new().run_until(async {
             let dir = tempfile::tempdir().unwrap();
             let db = KernelDb::open(dir.path().join("kernel.db")).unwrap();
-            db.set_embedding_config(&kaijutsu_kernel::kernel_db::EmbeddingConfigRow {
-                enabled: false, endpoint: "http://127.0.0.1:9".into(),
-                timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048,
-            }).unwrap();
             // create_shared_kernel refuses to start without a live root
             // character (docs/character.md, "Bootstrap: the person creates
             // themself") — seed one directly, the way `kaijutsu-server init`

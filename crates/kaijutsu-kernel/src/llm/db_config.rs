@@ -485,10 +485,22 @@ mod tests {
     }
 
     #[test]
-    fn embedding_config_reads_service_defaults() {
+    fn the_floor_configures_no_embedding_service() {
         let db = seeded_db();
-        let emb = load_embedding_config(&db).unwrap().expect("floor seeds embedding");
-        assert_eq!(emb.endpoint, "http://lfm2d-system1.taila4abc.ts.net:8088");
+        assert_eq!(db.get_embedding_config().unwrap(), None);
+        assert!(load_embedding_config(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_configured_embedding_service_reads_back() {
+        let db = seeded_db();
+        db.set_embedding_config(&EmbeddingConfigRow {
+            enabled: true, endpoint: "http://embedder.example:8088".into(),
+            timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
+        })
+        .unwrap();
+        let emb = load_embedding_config(&db).unwrap().expect("configured and enabled");
+        assert_eq!(emb.endpoint, "http://embedder.example:8088");
         assert_eq!(emb.timeout_ms, 30_000);
         assert_eq!(emb.max_in_flight, 2);
         assert_eq!(emb.max_context_bytes, 2048);
@@ -497,9 +509,11 @@ mod tests {
     #[test]
     fn disabled_embedding_reads_as_none() {
         let db = seeded_db();
-        let mut row = db.get_embedding_config().unwrap().unwrap();
-        row.enabled = false;
-        db.set_embedding_config(&row).unwrap();
+        db.set_embedding_config(&EmbeddingConfigRow {
+            enabled: false, endpoint: "http://embedder.example:8088".into(),
+            timeout_ms: 30_000, max_in_flight: 2, max_context_bytes: 2048,
+        })
+        .unwrap();
         assert!(load_embedding_config(&db).unwrap().is_none());
     }
 
@@ -567,16 +581,15 @@ mod tests {
     }
 
     #[test]
-    fn embedding_defaults_survive_a_reseed_with_the_expected_shape() {
+    fn reseed_leaves_the_embedding_service_alone() {
         let mut db = seeded_db();
-        db.set_embedding_config(&EmbeddingConfigRow {
+        let own = EmbeddingConfigRow {
             enabled: false,
             endpoint: "http://localhost:9".into(),
             timeout_ms: 7, max_in_flight: 1, max_context_bytes: 9,
-        })
-        .unwrap();
+        };
+        db.set_embedding_config(&own).unwrap();
         reseed_factory_backends(&mut db, PrincipalId::system()).unwrap();
-        let emb = load_embedding_config(&db).unwrap().expect("reseed re-enables");
-        assert_eq!(emb.endpoint, "http://lfm2d-system1.taila4abc.ts.net:8088");
+        assert_eq!(db.get_embedding_config().unwrap(), Some(own));
     }
 }

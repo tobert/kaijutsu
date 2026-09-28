@@ -3,7 +3,6 @@
 //! temporary `$HOME`, with no server running.
 
 mod common;
-mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -59,15 +58,12 @@ impl Home {
         (path, fingerprint)
     }
 
-    /// `init` the root character, then disable the embedding service so a
-    /// `kj` boot never reaches the network — the same fixture every other
-    /// ephemeral test kernel in this crate uses
-    /// (`ssh.rs::an_ephemeral_config_carries_no_network_scorer`).
+    /// `init` the root character. A fresh kernel configures no embedding
+    /// service, so a `kj` boot never reaches the network.
     fn bootstrap(&self, root_name: &str) {
         let (key, _) = self.write_pubkey("laptop");
         let out = self.run(&["init", "--as", root_name, "--key", key.to_str().unwrap()]);
         assert!(out.status.success(), "init failed: {}", stderr(&out));
-        support::disable_embeddings(&self.kernel_dir());
     }
 
     fn character_names(&self) -> Vec<String> {

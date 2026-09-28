@@ -42,7 +42,7 @@
 //! **Structural refusals veto allows.** An allow from a family rule, a
 //! config layer or the builtin layer covers a *key*, never arguments, so a redirect, a
 //! background flag, a heredoc or a non-plain argument drops the statement
-//! to `Uncovered` and it meets the classifier and the gate as usual. A deny
+//! to `Uncovered` and it meets the pre_call hooks and the gate as usual. A deny
 //! or an ask fires regardless of structure. A command whose arguments the
 //! evaluator cannot read as plain text has no key at all and is
 //! `Uncovered`, which fails toward the default: ask — or toward the
@@ -265,8 +265,7 @@ impl TierVerdict {
 }
 
 /// What a section does with a statement no key covers. `Ask` is the
-/// default and today's behavior: the statement meets the classifier and the
-/// gate. `Allow` is the sandbox posture — see [`GateConfig::uncovered_for`].
+/// default: the statement meets the pre_call hooks and the gate. `Allow` is the sandbox posture — see [`GateConfig::uncovered_for`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UncoveredTier {
     #[default]
@@ -283,7 +282,7 @@ impl UncoveredTier {
             "allow" => Ok(Self::Allow),
             other => Err(format!(
                 "`{other}` is not an uncovered tier — `ask` (the default: a statement no key \
-                 covers meets the classifier and the gate) or `allow` (a sandboxed or throwaway \
+                 covers meets the pre_call hooks and the gate) or `allow` (a sandboxed or throwaway \
                  kernel, where no ask reaches a human)"
             )),
         }
@@ -320,35 +319,11 @@ impl TierTable {
     }
 }
 
-/// The parsed `gate.toml`: the global tier, one tier per context type, and
-/// the classifier host (`docs/egress.md`, "The classifier host").
+/// The parsed `gate.toml`: the global tier and one tier per context type.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GateConfig {
     global: TierTable,
     context_types: BTreeMap<String, TierTable>,
-    classifier: Option<ClassifierConfig>,
-}
-
-/// `[classifier] url` in `gate.toml`: the one host every context reaches
-/// beyond its own `context_egress` rows, for the lfm2d pre-call hook
-/// (`docs/egress.md`, "The classifier host").
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClassifierConfig {
-    url: String,
-    host: String,
-}
-
-impl ClassifierConfig {
-    /// The configured URL with any trailing slash stripped, so a caller
-    /// appends a path directly (`{url}/v1/cascade`).
-    pub(crate) fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// The URL's host, for the egress rule every context's shell consults.
-    pub(crate) fn host(&self) -> &str {
-        &self.host
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -358,14 +333,6 @@ struct GateToml {
     global: TierToml,
     #[serde(default)]
     context_type: BTreeMap<String, TierToml>,
-    #[serde(default)]
-    classifier: Option<ClassifierToml>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClassifierToml {
-    url: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -428,7 +395,6 @@ impl GateConfig {
         let mut config = GateConfig {
             global: Self::table_from(&raw.global, "[global]")?,
             context_types: BTreeMap::new(),
-            classifier: Self::classifier_from(raw.classifier.as_ref())?,
         };
         for (context_type, tier) in &raw.context_type {
             let section = format!("[context_type.{context_type}]");
@@ -437,20 +403,6 @@ impl GateConfig {
                 .insert(context_type.clone(), Self::table_from(tier, &section)?);
         }
         Ok(config)
-    }
-
-    /// Parse `[classifier] url`. Absent is `None` — the hook cannot reach a
-    /// classifier and fails closed (`docs/egress.md`, "The classifier
-    /// host").
-    fn classifier_from(raw: Option<&ClassifierToml>) -> Result<Option<ClassifierConfig>, GateConfigError> {
-        let Some(raw) = raw else { return Ok(None) };
-        parse_classifier_url(&raw.url).map(Some).map_err(|why| {
-            GateConfigError::Parse(format!(
-                "[classifier] url: `{}` — {why}; example:\n[classifier]\n\
-                 url = \"http://lfm2d-1.taila4abc.ts.net:8088\"",
-                raw.url
-            ))
-        })
     }
 
     fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
@@ -522,13 +474,6 @@ impl GateConfig {
     /// what `kj ledger rules` states plainly.
     pub(crate) fn allows_uncovered(&self, context_type: Option<&str>) -> bool {
         self.uncovered_for(context_type).0 == UncoveredTier::Allow
-    }
-
-    /// `[classifier] url` in force, or `None` with no section — the hook
-    /// cannot reach a classifier and fails closed (`docs/egress.md`, "The
-    /// classifier host").
-    pub(crate) fn classifier(&self) -> Option<&ClassifierConfig> {
-        self.classifier.as_ref()
     }
 
     /// The config entries in force for a caller of `context_type`, for
@@ -615,39 +560,6 @@ fn normalize_config_key(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Validate and normalize a `[classifier] url` value: an `http` or `https`
-/// scheme, a host, no userinfo, and no query or fragment. A trailing slash
-/// is stripped so the hook can append a path directly (`{url}/v1/cascade`).
-///
-/// `reqwest::Url` — the `url` crate's own type, re-exported rather than
-/// added as a second direct dependency — already ships in this workspace
-/// through `reqwest`, kaijutsu-kernel's existing HTTP dependency.
-fn parse_classifier_url(raw: &str) -> Result<ClassifierConfig, String> {
-    let trimmed = raw.trim();
-    let url = reqwest::Url::parse(trimmed).map_err(|e| format!("not a URL: {e}"))?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(format!("scheme must be http or https, not `{}`", url.scheme()));
-    }
-    let Some(host) = url.host_str() else {
-        return Err("has no host".to_string());
-    };
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("must not carry userinfo (a `user@` or `user:pass@` prefix)".to_string());
-    }
-    if url.query().is_some() {
-        return Err("must not carry a query string".to_string());
-    }
-    if url.fragment().is_some() {
-        return Err("must not carry a fragment".to_string());
-    }
-    let host = host.to_string();
-    let mut normalized = url.to_string();
-    if normalized.ends_with('/') {
-        normalized.pop();
-    }
-    Ok(ClassifierConfig { url: normalized, host })
-}
-
 /// Read, parse and validate `/config/kernel/gate.toml`. An absent file (or
 /// no `/config/kernel` mount) is the empty config; any other failure is an
 /// error the caller must refuse on.
@@ -686,8 +598,8 @@ pub(crate) struct Layers<'a> {
 
 impl Layers<'_> {
     /// The decision the uncovered tier contributes, or `None` when the tier
-    /// is `ask` — today's default, where an uncovered statement meets the
-    /// classifier and the gate. `key` names what was allowed.
+    /// is `ask` — the default, where an uncovered statement meets the
+    /// pre_call hooks and the gate. `key` names what was allowed.
     fn uncovered_allow(&self, key: impl FnOnce() -> String) -> Option<Decision> {
         match self.config.uncovered_for(self.context_type) {
             (UncoveredTier::Allow, section) => Some(Decision {
@@ -953,8 +865,8 @@ fn statement_verdict(statement: &PlannedStatement, layers: Layers<'_>) -> Policy
         // literals, and a function definition whose body runs nothing all
         // plan this way. It rests on kaish collecting every nested command,
         // including one inside an assignment value, a test operand or a
-        // redirect target, so a commandless statement invokes nothing the
-        // classifier or a hook would have judged. A statement that has
+        // redirect target, so a commandless statement invokes nothing a
+        // hook would have judged. A statement that has
         // commands is decided per command and keeps that verdict, so this
         // reason never names the wrong thing.
         PolicyVerdict::Uncovered if statement.plan.commands.is_empty() => {
@@ -1263,7 +1175,7 @@ mod tests {
         assert_eq!(e.per_statement[0], PolicyVerdict::Uncovered);
     }
 
-    /// The `--help` rule, mirroring `contrib/lfm2d-ladder-check.kai`: help
+    /// The `--help` rule: help
     /// is the last word with no flag before it. `--content --help` binds
     /// help as a VALUE and writes for real; it must stay uncovered.
     #[test]
@@ -1482,61 +1394,14 @@ deny = ["kj context create"]
         );
     }
 
-    // ── [classifier] ───────────────────────────────────────────────
-
+    /// A `[classifier]` section is an unknown section like any other: the
+    /// load fails naming it, so a host file still carrying one is fixed
+    /// rather than half-read.
     #[test]
-    fn no_classifier_section_is_none() {
-        assert_eq!(config(EXAMPLE).classifier(), None);
-    }
-
-    #[test]
-    fn a_good_classifier_url_parses_with_its_host() {
-        let cfg = config("[classifier]\nurl = \"http://lfm2d-1.taila4abc.ts.net:8088\"\n");
-        let c = cfg.classifier().expect("must parse");
-        assert_eq!(c.url(), "http://lfm2d-1.taila4abc.ts.net:8088");
-        assert_eq!(c.host(), "lfm2d-1.taila4abc.ts.net");
-    }
-
-    #[test]
-    fn a_trailing_slash_is_stripped_so_a_path_can_be_appended() {
-        let cfg = config("[classifier]\nurl = \"http://lfm2d-1.taila4abc.ts.net:8088/\"\n");
-        assert_eq!(
-            cfg.classifier().expect("must parse").url(),
-            "http://lfm2d-1.taila4abc.ts.net:8088"
-        );
-    }
-
-    #[test]
-    fn a_loopback_classifier_url_parses_with_a_loopback_host() {
-        let cfg = config("[classifier]\nurl = \"http://127.0.0.1:8088\"\n");
-        assert_eq!(cfg.classifier().expect("must parse").host(), "127.0.0.1");
-    }
-
-    #[test]
-    fn each_bad_classifier_url_shape_fails_the_load_naming_the_section() {
-        let bad = [
-            ("not a url at all", "not a URL"),
-            ("ftp://lfm2d-1.taila4abc.ts.net:8088", "scheme"),
-            ("http://user:pass@lfm2d-1.taila4abc.ts.net:8088", "userinfo"),
-            ("http://lfm2d-1.taila4abc.ts.net:8088?x=1", "query"),
-            ("http://lfm2d-1.taila4abc.ts.net:8088#frag", "fragment"),
-        ];
-        for (raw, expect) in bad {
-            let toml = format!("[classifier]\nurl = \"{raw}\"\n");
-            let err = GateConfig::parse(&toml).unwrap_err();
-            let GateConfigError::Parse(m) = err else { panic!("{err:?}") };
-            assert!(
-                m.contains("[classifier] url") && m.contains(expect) && m.contains("example"),
-                "{raw}: {m}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_unknown_classifier_key_fails_the_load() {
-        let err =
-            GateConfig::parse("[classifier]\nurl = \"http://x\"\nextra = \"y\"\n").unwrap_err();
-        assert!(matches!(err, GateConfigError::Parse(ref m) if m.contains("extra")), "{err:?}");
+    fn a_classifier_section_fails_the_load_as_an_unknown_section() {
+        let err = GateConfig::parse("[classifier]\nurl = \"http://127.0.0.1:8088\"\n").unwrap_err();
+        assert!(matches!(err, GateConfigError::Parse(ref m) if m.contains("classifier")), "{err:?}");
+        assert!(err.to_string().contains("kj config reset gate.toml"), "{err}");
     }
 
     // ── config layers ───────────────────────────────────────────────

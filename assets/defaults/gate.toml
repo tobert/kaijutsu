@@ -11,7 +11,7 @@
 #
 # allow covers a key, never arguments: a redirect, a background flag, a
 # heredoc or a substituted argument drops the statement back to the
-# classifier and the gate. ask is firm — no lower layer can allow it.
+# pre_call hooks and the gate. ask is firm — no lower layer can allow it.
 # deny refuses at broker PreCall and inside the shell gate.
 #
 # A file that does not parse refuses every gated shell submission until it
@@ -23,23 +23,14 @@
 # work you are ready to discard. It removes the human from the loop for
 # that section: every statement no key covers runs, redirects, heredocs and
 # substituted arguments included. No PreCall hook sees a program the tier
-# allows outright, so the scorer and the shell-escape guard never run on
-# one; a mixed program, where one statement is ask-tier or deny-tier, still
-# meets the hooks. Explicit ask and deny keys still fire, and a learned
+# allows outright, so the shell-escape guard never runs on one; a mixed
+# program, where one statement is ask-tier or deny-tier, still meets the
+# hooks. Explicit ask and deny keys still fire, and a learned
 # ledger rule still outranks it. `kj ledger rules` states the posture when
 # it is on.
 #
 #   [context_type.coder]
 #   uncovered = "allow"   # sandboxed benchmark kernels only
-#
-# [classifier] url is the one host every context reaches beyond its own
-# egress rows (docs/egress.md, "The classifier host"): the lfm2d pre-call
-# hook's target. http or https, a host, no userinfo, no query or fragment;
-# a trailing slash is stripped. Absent means no classifier is reachable —
-# the hook fails closed.
-
-[classifier]
-url = "http://lfm2d-1.taila4abc.ts.net:8088"
 
 [global]
 allow = [

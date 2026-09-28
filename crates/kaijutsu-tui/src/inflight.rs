@@ -299,7 +299,7 @@ mod tests {
             8,
             Status::Waiting,
             c.id,
-            "gate for lfm2d-advisory is waiting on a human: ask 01a0686d-895e-7b31-aa17-e497ed849f67 (pending) — nothing was run.",
+            "gate for risk-advisory is waiting on a human: ask 01a0686d-895e-7b31-aa17-e497ed849f67 (pending) — nothing was run.",
             0,
         );
         let entries = entries([&c, &r].into_iter(), 3_600_000);
