@@ -60,7 +60,8 @@ An ACP trial also carries the driven-worker verdict line, if one exists
 (classify_run's `verdict`/`verdict_reason`, from
 `contrib/bench/rc-variants/coder-driven`'s `RESULT: done|blocked|gave up`
 convention), and three shell-command counts the A/B compares:
-`shell_tool_calls_total`, `shell_tool_calls_foreground_true`, and
+`shell_tool_calls_total`, `shell_tool_calls_foreground_true`,
+`shell_tool_calls_run_in_background_true`, and
 `shell_tool_calls_kj_wait_invocations` (literal "kj wait" occurrences in
 shell/shell_write command text). All null with
 `shell_tool_calls_raw_input_reason` set when no shell/shell_write call
@@ -270,6 +271,7 @@ def _base_row(trial_dir: Path) -> dict[str, Any]:
         "verdict_reason": None,
         "shell_tool_calls_total": None,
         "shell_tool_calls_foreground_true": None,
+        "shell_tool_calls_run_in_background_true": None,
         "shell_tool_calls_kj_wait_invocations": None,
         "shell_tool_calls_raw_input_reason": None,
         "failure_detail": None,
@@ -350,6 +352,7 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
         row["verdict_reason"] = acp["verdict_reason"]
         row["shell_tool_calls_total"] = acp["shell_tool_calls_total"]
         row["shell_tool_calls_foreground_true"] = acp["shell_tool_calls_foreground_true"]
+        row["shell_tool_calls_run_in_background_true"] = acp["shell_tool_calls_run_in_background_true"]
         row["shell_tool_calls_kj_wait_invocations"] = acp["shell_tool_calls_kj_wait_invocations"]
         row["shell_tool_calls_raw_input_reason"] = acp["shell_tool_calls_raw_input_reason"]
         row["failure_detail"] = acp["failure_detail"]
@@ -467,6 +470,7 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "tool_calls_total",
         "shell_tool_calls_total",
         "shell_tool_calls_foreground_true",
+        "shell_tool_calls_run_in_background_true",
         "shell_tool_calls_kj_wait_invocations",
         "permission_requests",
         "asks_orphaned",

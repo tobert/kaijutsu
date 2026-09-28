@@ -95,7 +95,7 @@ KNOWN_SESSION_UPDATES = frozenset(
 
 # kaijutsu's gate-wait tool result text. Two markers because the wording
 # observed differs by tool: shell_write's gate message puts the ask id in
-# a trailing "(ask <id>, pending)"; lfm2d-advisory's puts it right after
+# a trailing "(ask <id>, pending)"; a pre_call hook's puts it right after
 # "is waiting on its reviewer: ask <id> (pending)". Both sentences contain
 # "nothing was run"; one shell_write variant (seen with tool status
 # "completed", not "failed") contains only that phrase, without "is
@@ -328,13 +328,15 @@ class ToolCallState:
 
 def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallState]) -> dict[str, Any]:
     """Shell/shell_write call counts an A/B compares: total calls, how many
-    passed `foreground: true`, and how many literal "kj wait" invocations
-    appear in their command text.
+    passed `foreground: true` (the flag earlier runs recorded), how many
+    passed `run_in_background: true` (the flag current runs record), and how
+    many literal "kj wait" invocations appear in their command text.
 
     All three read `rawInput` off each call's `ToolCallState` (captured only
     at the `tool_call` event that creates it — see that class's docstring).
-    `foreground` rides `rawInput` only when the model set it to `true`;
-    absent means the tool's own default, `false`, not an unknown. A real
+    Each flag counts only an explicit `true`: an absent flag means that
+    run's tool default, which differs between the two flags, so neither
+    count infers a default. A real
     absence of shell calls is a genuine 0, not null. Null-with-a-reason is
     reserved for when the count truly cannot be read: no shell/shell_write
     call carried any `rawInput` at all.
@@ -345,6 +347,7 @@ def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallSt
         return {
             "shell_tool_calls_total": 0,
             "shell_tool_calls_foreground_true": 0,
+            "shell_tool_calls_run_in_background_true": 0,
             "shell_tool_calls_kj_wait_invocations": 0,
             "shell_tool_calls_raw_input_reason": None,
         }
@@ -355,12 +358,16 @@ def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallSt
         return {
             "shell_tool_calls_total": total,
             "shell_tool_calls_foreground_true": None,
+            "shell_tool_calls_run_in_background_true": None,
             "shell_tool_calls_kj_wait_invocations": None,
             "shell_tool_calls_raw_input_reason": reason,
         }
 
     foreground_true = sum(
         1 for tid in with_raw_input if tool_states[tid].raw_input.get("foreground") is True
+    )
+    run_in_background_true = sum(
+        1 for tid in with_raw_input if tool_states[tid].raw_input.get("run_in_background") is True
     )
     kj_wait_invocations = sum(
         tool_states[tid].raw_input.get("command", "").count("kj wait")
@@ -379,6 +386,7 @@ def shell_command_stats(tool_order: list[str], tool_states: dict[str, ToolCallSt
     return {
         "shell_tool_calls_total": total,
         "shell_tool_calls_foreground_true": foreground_true,
+        "shell_tool_calls_run_in_background_true": run_in_background_true,
         "shell_tool_calls_kj_wait_invocations": kj_wait_invocations,
         "shell_tool_calls_raw_input_reason": reason,
     }
@@ -1163,6 +1171,7 @@ def format_text(report: dict[str, Any]) -> str:
         f"verdict: {report['verdict']} {report['verdict_reason'] or ''}".rstrip(),
         f"shell_tool_calls_total: {report['shell_tool_calls_total']} "
         f"(foreground_true={report['shell_tool_calls_foreground_true']}, "
+        f"run_in_background_true={report['shell_tool_calls_run_in_background_true']}, "
         f"kj_wait_invocations={report['shell_tool_calls_kj_wait_invocations']}"
         + (
             f", {report['shell_tool_calls_raw_input_reason']}"

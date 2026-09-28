@@ -165,7 +165,7 @@ def main() -> int:
                 "tools/call",
                 {
                     "name": "shell",
-                    "arguments": {"command": command, "foreground": True},
+                    "arguments": {"command": command},
                 },
             )
             text = tool_text(result)

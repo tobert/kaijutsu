@@ -73,9 +73,14 @@ The report also carries the driven-worker A/B fields, both independent of
   a verdict beyond `final_message`'s 2000-character tail is still found.
   Null when no worker in this run used the convention.
 - `shell_tool_calls_total`, `shell_tool_calls_foreground_true`,
+  `shell_tool_calls_run_in_background_true`,
   `shell_tool_calls_kj_wait_invocations`: counted from the `shell` and
   `shell_write` tool calls' `rawInput` (present on the `tool_call` event
-  that creates each call, never on a later `tool_call_update`).
+  that creates each call, never on a later `tool_call_update`). Runs before
+  2026-09-26 record `foreground`, whose default was background; later runs
+  record `run_in_background`, whose default is foreground. Each count is of
+  an explicit `true` only, so compare the two eras by what they measure,
+  not by column.
   `shell_tool_calls_raw_input_reason` explains a null count — a real
   absence of shell calls is reported as `0`, never as a null.
 
@@ -127,7 +132,8 @@ why (including the distinct ids seen, when ambiguous) — never reported as
 zero.
 
 Each ACP row also carries `verdict`, `verdict_reason`,
-`shell_tool_calls_total`, `shell_tool_calls_foreground_true`, and
+`shell_tool_calls_total`, `shell_tool_calls_foreground_true`,
+`shell_tool_calls_run_in_background_true`, and
 `shell_tool_calls_kj_wait_invocations` from `classify_run`'s analysis (see
 above); a non-ACP row leaves them null. Totals add `verdict_present` and
 three agreement counts against Harbor's own `reward >= 1.0`:

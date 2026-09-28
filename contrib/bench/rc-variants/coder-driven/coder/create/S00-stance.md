@@ -10,11 +10,11 @@ You are coding here. Work in this order:
 Stay inside the files the brief gives you; read anything. When the work needs
 an edit outside them, stop and report.
 
-Pass `foreground: true` for a command whose output you need now and that
-finishes within a couple of minutes. Past the tool timeout — 120 seconds for
-`shell`, 315 for `shell_write` — it returns an error and no output, so give a
-long build or suite `foreground: false` and read it with
-`kj wait --operation <id>`. A result with an `operation_id` and no output means
+A command runs in the foreground by default; use that for output you need
+now from a command that finishes within a couple of minutes. Past the tool
+timeout — 120 seconds for `shell`, 315 for `shell_write` — it returns an error
+and no output, so give a long build or suite `run_in_background: true` and
+read it with `kj wait --operation <id>`. A result with an `operation_id` and no output means
 nothing has been read yet.
 
 Output is capped at 8192 bytes, keeping 1024 of head and 512 of tail.

@@ -446,7 +446,7 @@ class TestAnalyzeRunHelpers(unittest.TestCase):
                 "t1",
                 status="failed",
                 text=(
-                    "gate for lfm2d-advisory is waiting on its reviewer: "
+                    "gate for risk-advisory is waiting on its reviewer: "
                     "ask deadbeef-0000-0000-0000-000000000001 (pending)"
                 ),
             ),
@@ -684,6 +684,23 @@ class TestShellCommandStats(unittest.TestCase):
         self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 2)
         self.assertIsNone(report["shell_tool_calls_raw_input_reason"])
 
+    def test_run_in_background_true_counted_from_raw_input(self):
+        events = [
+            tool_call(
+                "t1", kind="execute", title="shell",
+                raw_input={"command": "cargo build", "run_in_background": True},
+            ),
+            tool_call_update("t1", status="completed", text="ok"),
+            tool_call(
+                "t2", kind="edit", title="shell_write",
+                raw_input={"command": "ls", "run_in_background": False},
+            ),
+            tool_call_update("t2", status="completed", text="ok"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["shell_tool_calls_run_in_background_true"], 1)
+        self.assertEqual(report["shell_tool_calls_foreground_true"], 0)
+
     def test_absent_foreground_is_not_counted_as_true(self):
         events = [
             tool_call("t1", kind="execute", title="shell", raw_input={"command": "ls"}),
@@ -697,6 +714,7 @@ class TestShellCommandStats(unittest.TestCase):
         report = cr.analyze_run(events, base_summary())
         self.assertEqual(report["shell_tool_calls_total"], 0)
         self.assertEqual(report["shell_tool_calls_foreground_true"], 0)
+        self.assertEqual(report["shell_tool_calls_run_in_background_true"], 0)
         self.assertEqual(report["shell_tool_calls_kj_wait_invocations"], 0)
         self.assertIsNone(report["shell_tool_calls_raw_input_reason"])
 
@@ -708,6 +726,7 @@ class TestShellCommandStats(unittest.TestCase):
         report = cr.analyze_run(events, base_summary())
         self.assertEqual(report["shell_tool_calls_total"], 1)
         self.assertIsNone(report["shell_tool_calls_foreground_true"])
+        self.assertIsNone(report["shell_tool_calls_run_in_background_true"])
         self.assertIsNone(report["shell_tool_calls_kj_wait_invocations"])
         self.assertIsNotNone(report["shell_tool_calls_raw_input_reason"])
 

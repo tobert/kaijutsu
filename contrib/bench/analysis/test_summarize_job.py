@@ -294,6 +294,7 @@ class TestVerdictAndShellStats(unittest.TestCase):
             self.assertIsNone(row["verdict_reason"])
             self.assertEqual(row["shell_tool_calls_total"], 2)
             self.assertEqual(row["shell_tool_calls_foreground_true"], 1)
+            self.assertEqual(row["shell_tool_calls_run_in_background_true"], 0)
             self.assertEqual(row["shell_tool_calls_kj_wait_invocations"], 1)
             self.assertIsNone(row["shell_tool_calls_raw_input_reason"])
 

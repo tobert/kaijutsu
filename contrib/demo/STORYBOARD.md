@@ -36,7 +36,7 @@ makes a local/tenchi coder viable).
    flags; scope cwd to demo/). Performer = coder, reviewer = amy → the sheet's
    decision keys are LIVE for Amy (unlike a self-performed ask).
 3. Prompt the coder: "write demo/hello.py that prints hello, then delete it,
-   then run it." The delete (a shell_write / rm) trips the lfm2d-advisory gate.
+   then run it." The delete (a shell_write / rm) is uncovered, so the gate asks.
 4. Ask sheet raises → Amy **denies** the delete (`d`). Coder proceeds to run.
 5. The run's result **drifts back** to the director context.
 6. Room pull-back: switchboard/console glow with the traffic.

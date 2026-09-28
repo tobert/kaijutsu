@@ -20,7 +20,7 @@ showed (2026-09-18)" and `~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`.
 
 The coder type's other `create` scripts are untouched and still run: the kaish
 primer, tool binding, recall, handoff, cache breakpoint, datetime, build cache,
-shell guard, and the lfm2d advisory. So are `coder/fork/` and `coder/drift/`.
+and shell guard. So are `coder/fork/` and `coder/drift/`.
 Every `.kai` in the directory runs in lexical filename order, so `S00-base.kai`
 still precedes `S00-stance.kai`.
 
@@ -109,5 +109,6 @@ match means the turn ended without a verdict, which is itself the measurement.
 - **It assumes a driver.** A person sitting with a coder context is told their
   questions will not be answered and that they read only the final message.
   Both are false for a directly driven seat.
-- **The shell guidance is a prompt, not a policy change.** `foreground`
-  still defaults to false, and the timeouts are unchanged.
+- **The shell guidance is a prompt, not a policy change.**
+  `run_in_background` still defaults to false, and the timeouts are
+  unchanged.
