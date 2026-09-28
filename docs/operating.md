@@ -67,6 +67,15 @@ shape, and the rows it writes before the restart are the ones that fail to
 decode. `SCHEMA` and `apply_additive_migrations` stay the mechanism; there is
 no migration framework.
 
+A deploy does not touch the host rc tree or `/config/kernel`. Run
+`kaijutsu-server rc reseed` with the service stopped: it installs new seeds,
+names files that differ from theirs, and names retired defaults still
+installed. `--force` overwrites the first and removes the second; to keep
+your own edits, delete the named retired files by hand instead. A
+`gate.toml` section the kernel no longer reads fails the load and refuses
+every gated shell submission, naming the section; delete it from
+`~/.config/kaijutsu/config/kernel/gate.toml` before the restart.
+
 ## The MCP binary
 
 `~/bin/kaijutsu-mcp` is a symlink into `target/debug`. Never copy over it.
@@ -95,17 +104,15 @@ stdio: `initialize`, `initialized`, `register_session`, then `tools/call`.
 A `register_session` with a label another live session holds conflicts;
 pick a fresh label.
 
-The lfm2d advisory gate escalates most `kj` writes from an MCP seat
-(create, rename, retag, resume, rebind, and today `handoff note`). An
-approval executes: `kj ledger allow <id>` runs the stored command in the
+The gate asks before a `kj` write from an MCP seat that no `gate.toml` key
+covers (rename, retag, resume, rebind). An approval executes: `kj ledger allow <id>` runs the stored command in the
 ask's context. Chain with `&&` inside one command; `;` trips the
 shell-escape guard. The performing character cannot approve its own ask. Its assigned reviewer
 can answer from the same context; external model leads need a credential bound
 to their own character. See `docs/approval-identity.md`.
 
 `kj context create --type <t>` is how to probe a type's rc. A reseed seeds
-from the **binary**, so build first. Ephemeral test kernels blank every
-S50 scorer.
+from the **binary**, so build first.
 
 ## Builds beside a live kernel
 

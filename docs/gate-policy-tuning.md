@@ -27,7 +27,7 @@ each reading a different store, and they do not agree:
 | Checker | Reads | Where consulted |
 |---|---|---|
 | PreCall exemption | const tables, `kj/readonly.rs` | broker PreCall only (`mcp/broker.rs`, `evaluate_phase_with_mode`) |
-| Hook exemptions | jq filters over `KJ_TOOL_PLAN` | `assets/defaults/rc/lib/hooks/lfm2d.kai` |
+| Hook exemptions | jq filters over `KJ_TOOL_PLAN` | the risk-classifier hook body under `assets/defaults/rc/lib/hooks/` (since removed) |
 | Rules redeem | `approval_rules` (SQLite, digest-keyed) | `run_gate` (`kj/gate.rs`), which both ask origins already flow through: the shell gate (`mcp/servers/shell.rs:497`) and hook escalation (`mcp/broker.rs:2323`) |
 
 The consequences, each observed live rather than predicted:
@@ -47,9 +47,7 @@ The consequences, each observed live rather than predicted:
   copy of the same rule — `kj/readonly.rs` module doc already flags the
   `kj ledger` duplication as "can go when that hook is next edited").
 - **The friction is real**: `kj handoff note` escalates from MCP seats and a
-  same-seat answer is refused, so every note needs a second seat
-  (`docs/issues.md`, "The lfm2d gate escalates `kj handoff note` from the
-  MCP shell").
+  same-seat answer is refused, so every note needs a second seat.
 
 ## The design: one evaluator, layered stores
 
@@ -137,8 +135,8 @@ positional token)**.
 A family key classifies the verb; it cannot see the arguments. So every
 Allow from layers 1-3 and every *family* rule in layer 4 inherits the six
 conditions: a redirect, a background flag, a heredoc, or a non-plain
-argument drops the statement to Uncovered and it meets the classifier and
-the gate as usual. `kj handoff note 'x' > ~/.bashrc` is not an allowed
+argument drops the statement to Uncovered and it meets the pre_call hooks
+and the gate as usual. `kj handoff note 'x' > ~/.bashrc` is not an allowed
 `handoff note`; it is an uncovered statement with a redirect.
 
 A digest-keyed rule is the exception, and it is today's behavior kept
@@ -158,7 +156,7 @@ on the ask they answered. Exact text, exact authorization.
 - **Ask** (a statement the config marks ask-tier) — never auto-allowed by a
   lower layer; the existing ask machinery of each stack does the asking, and
   in the hook stack the tier is firm rather than advisory (the mechanism
-  follows below). A tier the classifier could vote down is not a tier.
+  follows below). A tier a hook could vote down is not a tier.
 
 **A tier allow is not a capability grant.** `require_cap` and the loadout
 run exactly as before; the evaluator decides whether an *ask* fires, never
@@ -166,9 +164,9 @@ whether a verb exists for this seat. `kj drive` in the allow tier still
 needs `Capability::Drive`.
 
 **Scope boundary: the evaluator governs shell submissions, not kj-verb
-dispatch.** A `kj` call made *inside* a hook body or another kj verb (the
-lfm2d hook's own `kj ledger signal add`, `lfm2d.kai:320`) reaches the
-kernel through the `KjDispatcher`, which never passes through broker
+dispatch.** A `kj` call made *inside* a hook body or another kj verb (a
+scoring hook's own `kj ledger signal add`) reaches the kernel through the
+`KjDispatcher`, which never passes through broker
 PreCall or `run_gate`. A deny tier on `kj ledger signal add` catches a
 `shell_write` submission containing that text; it does not, and cannot, block
 the hook's audit call. That path keeps its own controls (`require_cap`).
@@ -176,28 +174,23 @@ the hook's audit call. That path keeps its own controls (`require_cap`).
 To make Ask firm in the hook stack, `KJ_TOOL_PLAN` grows a per-command tier
 field beside `kj_readonly` — `allow` / `ask` / `score`, computed by the same
 evaluator when the broker builds the plan (`mcp/broker.rs`, `run_kaish_hook`), so
-there is one classification with two consumers. The lfm2d hook follows two
-rules:
+there is one classification with two consumers. No shipped hook scores
+commands. An rc hook that does should follow two rules:
 
-- an `ask`-tier clause exits 3 naming the tier, regardless of the
-  classifier's verdict — a tier the classifier could vote down is not a
-  tier;
+- an `ask`-tier clause exits 3 naming the tier, regardless of its own
+  verdict — a tier a hook could vote down is not a tier;
 - anything else is scored **whole**. The broker skip only fires for a program
   where *every* command is Allow; a mixed program
-  (`kj block list; rm -rf /tmp/x`) reaches the hook, and the hook sends the
-  raw `shell_write` command to the classifier as one clause, with no clause
-  dropped and no exemption. A program that bundles a `kj` read with other
-  commands goes through full classification. Known cost: the classifier
-  escalates on reads (`kj block read` measured `situation-normal` 0.791,
-  `kj/readonly.rs:6`), so such a program asks a human until the classifier
-  improves.
+  (`kj block list; rm -rf /tmp/x`) reaches the hook, which should score the
+  raw `shell_write` command as submitted, with no clause dropped and no
+  exemption.
 
-The hook fails closed. In `escalate` mode a call it cannot score — no
-classifier URL, no `curl` tool, the classifier unreachable or its response
-unreadable, the ledger write refused — exits 3, and the ask's description
-names the failure. It never denies on a failure: a deny would stop every seat
-for the length of a classifier outage. `log` mode observes only; there the
-same failure writes a trace block and the call proceeds.
+The broker fails a hook closed: exit 0 proceeds, 3 asks with the stderr
+tail as the description, and any other exit denies (`mcp/broker.rs`,
+`classify_kaish_hook_exit`). A scoring hook that cannot reach its service
+should exit 3 rather than fail, so an outage asks a human instead of
+stopping every seat; `crates/kaijutsu-acp-fleet/fleet/hook-*.toml` pins the
+three outcomes.
 
 ## The file
 
@@ -252,18 +245,7 @@ allow = [
   "kj fork",             # a fork copies this seat's own performer and type
   "kj drive",            # runs a turn on a lane this seat directs
 ]
-
-[classifier]
-url = "http://lfm2d-1.taila4abc.ts.net:8088"
 ```
-
-**`[classifier] url`** is the one host every context reaches beyond its own
-`context_egress` rows (`docs/egress.md`, "The classifier host"): the lfm2d
-pre-call hook's target. `http` or `https`, a host, no userinfo, no query or
-fragment; a trailing slash is stripped so the hook can append a path
-directly. Absent means no classifier is reachable and the hook fails
-closed. The kernel hands the same URL to the hook (`KJ_GATE_CLASSIFIER_URL`)
-and to the egress rule (`runtime/curl_tool.rs`), so the two read one value.
 
 Unknown sections or verdict words fail the load loudly, naming the section
 and key (a TOML syntax error names the line) —
@@ -306,8 +288,7 @@ a global sandbox can be withheld from one context type with
 **Set it only where the work is disposable**: a benchmark container, a
 throwaway kernel. It removes the human from the loop for that context type.
 It also removes every PreCall hook: broker PreCall skips hooks for a program
-it allows outright, so the scorer and the shell-escape guard never run on
-one. That is consistent with the design — the gate is an ergonomic nudge
+it allows outright, so the shell-escape guard never runs on one. That is consistent with the design — the gate is an ergonomic nudge
 inside one trust boundary, not a security boundary
 (`docs/instrument-design.md`, "Many hands, one trust boundary") — and it is
 the reason the setting is explicit, per section, and absent from the shipped
@@ -417,8 +398,8 @@ Every `kj` verb declares its effect in code, on the verb itself:
 `Effect::Read | Write | Destroy`, an exhaustive match per subcommand enum
 (`kj/effect.rs` is the reference). The builtin tier is that declaration:
 
-- `Read` is allowed by construction. The verb never meets the classifier
-  or the gate. `kj/readonly.rs` keeps the five structural conditions (name
+- `Read` is allowed by construction. The verb never meets a hook or the
+  gate. `kj/readonly.rs` keeps the five structural conditions (name
   exactly `kj`, no redirect, no background, no heredoc, plain arguments)
   and asks `classify()` for the sixth.
 - `Write` and `Destroy` meet the gate like any other statement, and the
@@ -442,11 +423,11 @@ verb's effect:
 - **The `--help` rule** is a flag pattern (last word `--help`/`-h`, no
   intervening flag), not a verb. It moves into the evaluator as a
   structural rule in slice 2, with a Rust test for the `--content --help`
-  bypass that `contrib/lfm2d-ladder-check.kai` asserts today.
+  bypass.
 
 ## What gets deleted
 
-- The three jq exemptions in `assets/defaults/rc/lib/hooks/lfm2d.kai`
+- The three jq exemptions in the classifier hook body
   (`--help`, `kj ledger`, `kj_readonly`), the hook's per-command clause split,
   and its allow-tier clause drop — deleted. The broker skip keeps all-Allow
   programs away from hooks, and the `--help` pattern lives in the evaluator as
@@ -475,15 +456,11 @@ unreleased one:
 4. **Retired by the verb class.** The builtin tier is each verb's declared
    `Effect` (§Builtin tier); the corpus `gate` field and the readonly tables
    it replaced are gone.
-5. **First tuning pass.** Three tests run the shipped `lfm2d.kai` through a
-   real `shell_write` call (`mcp/broker.rs`, the `..._real_lfm2d_hook...`
-   tests): an all-Allow program never reaches the hook, an ask-tier clause
-   escalates before the classifier is contacted, and a mixed program's raw
-   command reaches a loopback mock classifier whole. Still open:
-   `kj handoff note` in the global allow tier closes `docs/issues.md`, "The
-   lfm2d gate escalates `kj handoff note` from the MCP shell" — its option 1,
-   arrived at through the general mechanism instead of a scorer special
-   case.
+5. **First tuning pass — superseded.** Its tests ran the shipped
+   classifier hook through a real `shell_write` call; the hook is removed.
+   `an_allow_tier_program_skips_the_hooks` (`mcp/broker.rs`) keeps the
+   all-Allow skip, and `fleet/gate-tiers.toml` keeps the tier order around a
+   hook. `kj handoff note` sits in the global allow tier.
 6. **The uncovered tier — shipped.** `uncovered = "ask" | "allow"` on
    `[global]` and each `[context_type.<type>]` (§The uncovered tier), decided
    last and reported as its own layer in `kj ledger rules`; a
@@ -497,14 +474,13 @@ The repo's own standard — a test that cannot fail is not a test:
 1. Corpus `gate` exhaustiveness (slice 4): the equality assertion above,
    beside `every_live_leaf_has_an_entry`.
 2. Mixed-program hook behavior: a program with one allow-tier and one
-   score-tier clause reaches the hook, and the classifier receives the raw
-   command whole (`mcp/broker.rs`,
-   `a_mixed_program_reaches_the_classifier_whole_in_the_real_lfm2d_hook`).
+   score-tier clause reaches the hook with its raw command whole in
+   `KJ_TOOL_ARGS` (`mcp/broker.rs`, the `KJ_TOOL_PLAN` tests).
 3. Structural veto on family allows (slice 3): a family allow on
    `kj handoff note` does not cover `kj handoff note 'x' > ~/.bashrc` — the
    redirect drops it to Uncovered.
 4. The `--help` bypass in Rust (slice 2): `kj rc add <path> --content
-   --help` is not help, mirroring `contrib/lfm2d-ladder-check.kai`.
+   --help` is not help.
 5. Guarantee-4 carve-out (slice 3): a family allow learned under label A
    covers the same key under label B with no `LabelMismatch`, beside the
    digest-rule test that pins the opposite (`rules.rs:526`).
@@ -578,17 +554,16 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   and fail closed either side of it.
 - **The `ask` tier on the RPC shell paths rides the hook stack.** Those
   paths evaluate PreCall and never open the shell gate, so an ask-tier
-  statement there is asked only when the lfm2d hook is installed and in
-  `escalate` mode (in `log` mode it records a trace and proceeds). The MCP
-  `shell_write` path asks through `run_gate` regardless. Whether PreCall
-  should open its own ask for an ask-tier statement when no hook does is
-  the open question below.
+  statement there is asked only when an installed hook exits 3 for it. No
+  shipped hook does, so today the RPC paths run an ask-tier statement
+  without asking. The MCP `shell_write` path asks through `run_gate`
+  regardless. Whether PreCall should open its own ask for an ask-tier
+  statement when no hook does is the open question below.
 
 ## Open questions
 - **Should broker PreCall open an ask for an ask-tier statement itself?**
   Today the ask tier is firm through `run_gate` (MCP `shell_write`) and
-  through the lfm2d hook's exit 3 (every path, escalate mode only). A
-  PreCall-owned ask would make the tier firm on the RPC paths with no hook
+  through a hook's exit 3 when one is installed. A PreCall-owned ask would make the tier firm on the RPC paths with no hook
   installed, at the cost of a second ask on the MCP path, which already
   double-asks when a hook escalates ahead of the shell gate.
 - **shell-guard's interpreter lists.** They are opacity rules, not risk
@@ -608,6 +583,5 @@ name `gate_policy` is the sanctioned exception, visible only in source.
 Recorded elsewhere and deliberately untouched here: background execution
 gating (`mcp/servers/shell.rs:433`), ask TTL and `kj ledger cancel`
 (`docs/issues.md`), hook stdout plumbing ("The escalation seat"), and
-redirects in scored clauses ("The scorer cannot see a redirect, only the
-exemption can") — the evaluator changes who asks, never what the classifier
-sees.
+redirects in scored clauses ("What a replacement risk scorer inherits") —
+the evaluator changes who asks, never what a hook sees.

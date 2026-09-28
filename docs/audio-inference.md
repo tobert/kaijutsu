@@ -1,7 +1,7 @@
 # Offline audio inference: cost and placement
 
 Evaluation as of September 17, 2026. Execution still lives in the kernel;
-placement in lfm2d or another process is undecided. Amy's scope: "for now
+placement in another process is undecided. Amy's scope: "for now
 we'll evaluate kaijutsu's tradeoffs, and decide later about the new home."
 
 ## The performance this serves
@@ -47,7 +47,7 @@ cancellation for slower work such as `kj audio beats` — see `docs/issues.md`,
 for each invocation. `beat-this` 1.0.0 uses RTen 0.24.0 for CPU inference,
 Symphonia for decoding, and Rubato for resampling. These are unconditional
 kernel dependencies. There is no `ort`/`ort-sys` dependency or external
-ONNX Runtime library. Semantic embeddings already use the lfm2d service.
+ONNX Runtime library. Semantic embeddings already use a separate HTTP embedding service.
 
 The graphs are not loaded at kernel startup and there is no resident model
 cache. The installed full beat graph is 83,162,650 bytes (79.3 MiB); the
@@ -155,7 +155,7 @@ job protocol.
 
 A bounded executor could initially remain in process; a process boundary
 would be needed for hard termination of inference that cannot cooperate
-with cancel. Whether lfm2d should host the computation, and how the tool
+with cancel. Whether another process should host the computation, and how the tool
 should be packaged, remain separate decisions. No verb is removed here.
 
 Before expanding music inference, define admission limits, oversized-input

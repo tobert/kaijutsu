@@ -934,7 +934,7 @@ Each slice is independently shippable and leaves the tree green.
    surface must be incapable of a write (the verb declares `Effect::Read`
    and the class match is exhaustive, `kj/effect.rs`); `note` is not
    `ConfigWrite`-gated, since leaving a note is ordinary authoring and the
-   gate would route every handoff through the lfm2d escalation; no
+   gate would route every handoff through an ask; no
    character fails loudly and names `kj character create`; `played_by`
    is set by `register_session` with `kj context create --as`, except for a
    root character, which cannot be cast. The window

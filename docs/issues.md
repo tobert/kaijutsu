@@ -237,9 +237,6 @@ covering 2026-09-22. Open, most costly first:
   assigned reviewer; nothing else stood in the way. The director stance now says to run the answer
   as a command of its own. Whether `echo`/`printf` without a redirect earn a
   builtin key is open.
-- **lfm2d escalates a coder's `cargo check` and `git diff`.** Scored
-  situation-normal, escalated anyway; `2>/dev/null` on a read also became an
-  ask. Tune through `docs/gate-policy-tuning.md`, as for `kj handoff note`.
 - **Offline `kj` takes 44 s to boot.** Inferred, unprofiled:
   `BlockStore::load_from_db` decodes every document snapshot serially under
   the `KernelDb` mutex. Profile before changing it.
@@ -272,8 +269,6 @@ hit the 50-iteration cap). The coder's two `cargo test` asks went to banto,
 which answered them from inside `kj wait`; two banto asks reached the lead.
 Open, most costly first:
 
-- **lfm2d still escalates `cargo test`** at situation-normal 0.90. Same entry
-  as 09-22; now it costs one banto answer instead of a stall.
 - **A `</think>` tag leaks into qwen model text** (coder block #25). The
   provider does not strip it on every path.
 - **Banto's `shell` tool times out at 120 s inside `kj wait`.** Its wait asked
@@ -653,10 +648,6 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   writes still is not what `runtime/llm_stream.rs` reads (see its own
   "Consent setting ownership" TODO there), so this remains open for anyone
   who needs it per-context or mid-run.
-- **Boot spends about 1.8 s probing an unreachable embedding host**
-  (`kaijutsu-server/src/rpc.rs`, "Embedding service unavailable"; the endpoint
-  comes from `seed_backends.rs`). In a sandbox that is most of the boot. Give
-  the probe a short connect timeout or let a caller skip the semantic index.
 - **A process the model spawns can read the kernel's environment through
   `/proc/<pid>/environ`** when it runs as root, which is usual in task
   containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
@@ -853,8 +844,8 @@ has an extractive `best_sentence` that could produce one without a model.
   `Thinking` block settles, the kernel computes one line and stores it on
   the block, published on `BlockSnapshot` as a new field and through the
   change feed. Start extractive (`best_sentence` over the block, capped),
-  which is synchronous and free; a model-written summary, lfm2d or a
-  flash-tier cloud model, is a later swap behind the same field and can be
+  which is synchronous and free; a model-written summary, a small local
+  model or a flash-tier cloud model, is a later swap behind the same field and can be
   driven by rc. Display only: the summary never enters hydration.
 - **The app folds locally.** A completed thinking block reads as collapsed
   on hydrate, and a block that completes while watched folds a second or two
@@ -939,21 +930,6 @@ async it should go as soon as possible and not have a new turn queued";
   joins turn tasks rather than aborting them, so nothing skips the close
   today; after a future abort path, the context's next turn would panic
   at `open_ingress`.
-
-## Model shell backgrounding: `run_in_background` (Amy, 2026-09-26)
-
-Amy: "keep the foreground flag, we'll probably reverse its wording soon so
-it's default background: false". The shell tools now take
-`run_in_background` (default `false`); an old `foreground` argument is
-refused. Left from the rename:
-
-- `contrib/bench/analysis/classify_run.py` and `summarize_job.py` count
-  `shell_tool_calls_foreground_true` by reading `foreground` from recorded
-  transcripts. New runs carry `run_in_background`; teach the scripts both
-  keys before comparing a new run against the 09-18 baselines.
-- `contrib/bench/rc-variants/coder-driven/` still tells the model to pass
-  `foreground: true`, which is now refused. It is the variant the 09-18
-  baseline measured; update it before running it again.
 
 ## Blocks stored out of order before 855ace8a (2026-09-26)
 
@@ -1040,7 +1016,7 @@ covers the path. If Amy's character is a root with no reviewer, the ask below
 may now be answerable. The open question is then whether the app still gets a
 distinct performer character for a clearer audit record.
 
-Verified live on 2026-09-12. A `shell_write` in the app that trips the `lfm2d-advisory`
+Verified live on 2026-09-12. A `shell_write` in the app that trips the
 gate raises an ask whose requester, performer, and reviewer are all `amy`
 (the app authenticates as Amy). `AskDetail::can_review` requires
 `principal == reviewer && principal != actor`, so it returns false: the ask
@@ -1321,7 +1297,7 @@ classification needs its own fixtures.
 `coder/create/S15-recall.kai` and `S16-handoff.kai` inject the fleet memory
 index and the calling character's last twelve handoff notes into every
 coder. A coder driven on a two-file fixture read the lead's note "no ask
-expected" and reported the lfm2d escalations it met as a possible
+expected" and reported the gate asks it met as a possible
 regression — a concern the note caused, not the task. The broad loadout
 also lists 96 tools in `<situation>`, 45 of them `bevy_brp`. Both are
 per-turn cost on a delegated lane that needs neither; whether a delegated
@@ -1372,22 +1348,6 @@ tool calls start Running, but `kj block status` can set Pending explicitly.
 Define what a copied Pending tool call means before adding queued execution to
 forks; the model's repaired wire pair does not change that durable status.
 
-## The lfm2d gate escalates `kj handoff note` from the MCP shell (2026-09-07)
-
-`kj handoff note` and `kj context create --type coder` from an `mcp` seat
-raise an lfm2d advisory ask scored `escalate` even at 0.76-0.82
-`situation-normal`, because the seat's `LFM2D_BENIGN_LABEL=informative` is the
-only passing label, and same-seat answer is refused — every note needs a
-second seat. 2026-09-24: the same holds for `kj drive <ctx> <prompt>` (0.81)
-and for `kj context create … ; kj cast show …`; the same `create` alone, and
-`kj drive <ctx> --prompt …`, passed.
-
-**Decided (Amy, 2026-09-08): fix it through the general gate-policy
-mechanism**, not a one-off exemption. `docs/gate-policy-tuning.md` (designed
-2026-09-08, unbuilt) lists `kj handoff note` as its first tuning-pass entry in
-the global allow tier and names this issue by title to close when slice 5
-ships. Delete this entry then.
-
 ## A client can resume into an archived context (2026-09-09)
 
 Sequence from the journal: an MCP session's context was archived by another
@@ -1413,9 +1373,7 @@ ran is right and only the stored text is wrong. `kaish_kernel::plan_program`
 renders the command faithfully (checked in a throwaway test);
 `hook_gate.rs`'s `shell_source` stores `command.trim()`; the ledger crate
 stores and reads the column verbatim. Where `nonexistent-zz` becomes
-`none` is not yet found. Same probe: the lfm2d advisory both auto-allowed
-the command (ask `…a5a5…`, `decided: auto_allow`) and escalated it as
-data-critical 0.539 (ask `…a5c1…`); two ledger rows for one statement.
+`none` is not yet found.
 
 ## Character: two hand tasks for Amy (rollout in `docs/character.md`)
 
@@ -1463,21 +1421,6 @@ before the block it edits exists. Fix: reserve the seq at entry-construction
 time; `journal_op` uses the pre-reserved number instead of deriving one — a
 change to the journaling contract.
 
-## The scorer cannot see a redirect, only the exemption can (2026-09-01)
-
-Closing the `--help`/`ledger` redirect hole (`9f426c9c`) made those reach the
-classifier instead of skipping it — but the classifier never sees the
-redirect: `clause` (built in `items_filter`) deliberately excludes redirects,
-so `kj block list > ~/.bashrc` still auto-allows on a clause reading
-`kj block list`. `docs/gate-policy-tuning.md` names this out of scope for the
-evaluator work ("the evaluator changes who asks, never what the classifier
-sees") and cites this entry by title — still open. Three ways to close it, in
-increasing cost: append redirects to the scored clause (cheapest, moves the
-corpus and escalation rates — re-run `contrib/kj-corpus.json` first); a
-standing rule on redirect targets; or treat `has_redirect` as escalate-worthy
-on its own (safest, blunt). Not urgent — `is_read_only_kj` already refuses a
-redirect for the table it governs, so exposure is `--help`/`kj ledger` only.
-
 ## Codex app-server: attaching to a shared daemon over stdio (2026-09-01)
 
 From a sibling session's bridge work, not yet folded into
@@ -1501,13 +1444,6 @@ From a sibling session's bridge work, not yet folded into
   TUI can share it. The kernel backend dials `ws://` only, so it cannot
   reach that unit; a unix-socket `JsonlTransport` is the small fix, the
   stdio proxy above the general one.
-
-## Checked-in gate probe corpus is stale
-
-`contrib/kj-corpus.json` predates current prompt help and some context commands.
-The removed context-deletion row is deleted, but the remaining snapshot needs
-regeneration and policy review against the live reflection in
-`examples/lfm2d-probe`. Treat it as a probe artifact, not current command help.
 
 ## Context retention and index eligibility (Amy, 2026-09-18)
 
@@ -1533,8 +1469,9 @@ and stale search entries. Do not present archive as a don't-index guarantee.
 **Automatic synthesis remains disabled** (`spawn_index_watcher` receives
 `None` for `on_indexed`; keep this title stable for its re-enable condition).
 Unchanged manual synthesis now reuses a hash of its exact input and embedding
-profile, survives restart, and accepts `--force`. lfm2d replaces builtin
-embedding inference; see `docs/synthesis.md` for its configuration and contract.
+profile, survives restart, and accepts `--force`. An HTTP embedding service
+replaces builtin embedding inference; see `docs/synthesis.md` for its
+configuration and contract.
 
 Changed contexts still embed every selected block plus gist/keyword candidates.
 Next: per-block vector reuse and coalescing changed refreshes before enabling
@@ -1573,14 +1510,15 @@ requiring an index entry unconditionally would break them. Add deterministic
 race tests covering eviction during inference and between DB/cache publication.
 Found in kaibo's synthesis review (GLM-5.3 via Crusoe).
 
-## Embedding and classifier service configuration should share backend rows
+## Embedding service configuration has no `kj` verb
 
-The existing `embedding_config` singleton is the kernel's sole embedding
-configuration source (`llm/db_config.rs::load_embedding_config`); the
-classifier hook uses its own lfm2d URL. Move both into backend rows with an
-embedding/classifier kind and shared endpoint ownership. This depends on
-the active kj verb-class lane because it changes the registry and backend
-administration. It does not block the synthesis service branch.
+The `embedding_config` singleton is the kernel's sole embedding configuration
+source (`llm/db_config.rs::load_embedding_config`), and the kernel ships no
+endpoint: a fresh kernel's semantic index is off until an operator writes the
+row with `sqlite3` while the kernel is stopped (`docs/synthesis.md`). Give it
+an administration path, probably a backend row with an embedding kind so the
+endpoint has one owner beside the LLM backends. That changes the registry and
+backend administration, so it belongs with the kj verb-class work.
 
 ## The terminal client — `kaijutsu-tui` follow-ups (first cut shipped 2026-09-02)
 
@@ -1723,18 +1661,6 @@ loudly on a cross-mount absolute target.
   informs connected clients; there is no dedicated context mailbox routing or
   automatic wake for a kernel model assigned to review a coder. A directing
   model currently reads the coder's response and uses `kj ledger list|show`.
-
-## The scorer and the snapshot (2026-09-02)
-
-**Shipped:** the lfm2d hook now reads `$s.plan.rendered` for `clause`
-(`assets/defaults/rc/lib/hooks/lfm2d.kai:66`) instead of rebuilding it in jq.
-
-**Still open:** substituting values into the scored clause before scoring.
-Measured 2026-09-02: an unexpanded variable scores as a middle guess
-(`chmod -R 777 ${DIR}` 26% vs `/` 97% vs a tmp path 3%). Proposed: score a
-second, kaish-rendered *expanded* view beside the unexpanded one, take max
-severity — parse-time substitution with a supplied map, not execution. An ask
-to the kaish lead, not ours to build.
 
 ## The Claude Code advisory hook forwards to the kernel (2026-09-02, shipped; open follow-ups)
 
@@ -2397,48 +2323,37 @@ Per-subscription bounded queues, `subSeq` and the lag kick shipped. Open:
   `update.rs:1586`) are dormant defence-in-depth; remove once real flights
   show them firing zero times.
 
-## lfm2d escalation: the shell gate that scores `shell_write` (wired 2026-08-24)
+## What a replacement risk scorer inherits (2026-09-28)
 
-The hook body (`assets/defaults/rc/lib/hooks/lfm2d.kai`) re-derives each
-secondary signal's verdict, exempts read-only `kj` and `kj ledger`, and
-requires ladder position 0 plus a label match before auto-allowing.
-No self-approval is canonical in `docs/approval-identity.md`;
-approval-executes is canonical in `docs/gate-resume.md`; the layered policy
-tiers are `docs/gate-policy-tuning.md`. Old measurements in this entry's
-history must not be quoted. Open:
+The risk classifier and its rc hook are removed (`docs/devlog.md`, "The
+classifier that did not come back"). A replacement arrives as an rc pre_call
+hook (`docs/gate-policy-tuning.md`, "Verdicts"). These gaps outlived the old
+one:
 
-- **Our `kj` verbs never reach the classifier as reads.** Every verb
-  declares `Effect::Read | Write | Destroy` in code (`kj/effect.rs`); Read
-  skips scoring by construction
-  and the classifier is not expected to learn kj vocabulary. Writes still
-  score until the gate-policy tiers land.
-- **Widen the probe with real traffic** (`LFM2D_MODE=log` for an interval)
-  and **whether to enable an auto-allow band at all** — both Amy's call.
+- **The ask tier on the RPC shell paths needs a hook.** Those paths evaluate
+  broker PreCall and never open the shell gate, so with no hook installed an
+  ask-tier statement (`kj rc add`, `git push`) typed at an app or tui shell
+  runs without asking. MCP and ACP `shell_write` still ask through
+  `run_gate`. `docs/gate-policy-tuning.md`, "Open questions", asks whether
+  PreCall should open the ask itself.
+- **The gate's own ask does not name the tier key.** An ask-tier statement's
+  ask is titled `shell_write: 1 statement(s) — <command>`; the removed hook
+  said "ask tier on". The approver cannot tell a configured ask from an
+  uncovered one without `kj ledger rules`.
+- **`clause` drops redirects.** `KJ_TOOL_PLAN`'s `commands[].clause`
+  (`kj/plan_clauses.rs`) excludes redirects, so a scorer reading it sees
+  `kj block list` for `kj block list > ~/.bashrc`. Score
+  `KJ_TOOL_ARGS.command` whole, or append redirects to the clause.
+- **Variables reach a scorer unexpanded.** `chmod -R 777 ${DIR}` scores as a
+  guess. `KJ_TOOL_PLAN.env` carries the values; parse-time substitution with
+  a supplied map would be a kaish request.
 - **A reformulated command does not carry its pending ask forward.** A
-  `retry-after-ask` ledger row is the minimum (a measurement, not a
-  control). Unbuilt.
-- **The hook's own `kj ledger` exemption is a second statement of
-  `is_gate_exempt_kj`** (`assets/defaults/rc/lib/hooks/lfm2d.kai`,
-  exemption 2) and reads the second word, so a root flag ahead of the verb
-  defeats it; the evaluator already skips PreCall for an exempt program.
-  Amy, 2026-09-21: "anything that doesn't precisely match the allowlist
-  should go to the classifier whole, no modification. if a model bundles kj
-  with other stuff, it has to go through full classification." and "raw
-  command goes to the classifier. we'll dial in the classifier over time."
-  So the hook sends the raw `shell_write` command as one clause: the
-  per-command split, the allow-tier drop and all three jq exemptions go, with
-  the `contrib/lfm2d-ladder-check.kai` copy. The ask tier stays firm. Two
-  tests already run the shipped hook body (`mcp/broker.rs`, the
-  `..._real_lfm2d_hook...` tests); the mixed-program test reads the
-  `/v1/cascade` body from a loopback mock, which waits on per-context egress
-  (`docs/egress.md`). Known cost: the classifier reads a plain `kj` read as
-  risky, so a mixed program asks a human until the classifier improves.
-- **The hook's `n_clauses -eq 0` exit cannot be reached.** The broker skips
-  hooks for an all-allow program using the same evaluator that stamps the
-  hook's tiers, so the allow-tier drop never empties the list.
-- **A kaish lexer rejection degrades the gate to the no-plan fallback**
-  (~16x noisier). `contrib/kai-parse-check.sh` guards our own corpus; the
-  lexer bug is kaish's (`gotcha_kaish` in memory has the shape).
+  `retry-after-ask` ledger row is the minimum (a measurement, not a control).
+- **A kaish lexer rejection degrades the gate to the no-plan fallback.**
+  `contrib/kai-parse-check.sh` guards our own corpus; the lexer bug is kaish's.
+- **`plan_clauses::render_clauses` has no caller outside its tests**, and the
+  module doc names a `kaijutsu-mcp` consumer that does not exist. Delete it
+  or give the next scorer a reason to call it.
 
 ## kaish `env` takes its command's flags as its own (2026-09-21, kaish)
 
@@ -2488,21 +2403,17 @@ truncated state in its tests.
 
 The fleet (`docs/acp-fleet.md`) runs Harbor-shaped scenarios against
 `kaijutsu-solo-acp` with the scripted mock model: host scenarios test that
-the gate and classifier hold, and contained ones run a permissive ("yolo")
+the gate and pre_call hooks hold, and contained ones run a permissive ("yolo")
 kernel in podman with no network and only the workspace writable. Amy:
 "some of those acp sessions can use modified rc too, maybe a more yolo mode
 for when it's contained in docker". Open:
 
-- **The mock classifier speaks lfm2d's protocol** (`src/classifier.rs`).
-  Amy: lfm2d is "going to change soon to use a system[12] model thing we
-  invented recently that's a smarter lfm2d". Replace that module when it
-  lands; scenarios use a generic `[classifier]` key.
-- **A benign verdict never lowers an ask** (`docs/gate-policy-tuning.md`,
+- **A hook's exit 0 never lowers an ask** (`docs/gate-policy-tuning.md`,
   "Verdicts"); an uncovered command still gets the gate's own ask. Whether
-  a classifier-deferring tier should exist is Amy's call.
+  a hook-deferring tier should exist is Amy's call.
 - **A failed follow-up turn has no structured ACP signal.** The runner
   matches agent text "stream error: …".
-- **The permission request's title is the advisory hook's reason**, not
+- **A hook-raised permission request's title is the hook's stderr**, not
   the command asked about.
 - **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
   prompt. Mock replies a scenario never used go unreported.
@@ -2510,9 +2421,6 @@ for when it's contained in docker". Open:
   `--pids-limit`.
 - `solo_acp_stdio.rs` still has its own client; move it onto the fleet's.
   Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
-- The shipped `gate.toml` names a tailnet classifier, so solo runs outside
-  the fleet (`solo_acp_stdio.rs`, bench) reach the network at every
-  shell_write (inferred from about 10 s of per-run timing).
 
 ## Egress: what stays open (2026-09-21)
 
@@ -2526,10 +2434,6 @@ through the same path over time so we can monitor/classify/constrain." Open:
   classifier later but for now we'll rely on allowlist or yolo for curl." The
   plan evaluator sees `curl <url>` as a command; an approval has no way to
   reach the tool at connect time. Needs a design conversation.
-- **A context created before this change still carries an unused
-  `LFM2D_URL` env row.** `lib/create/S50-lfm2d.kai` no longer writes it, and
-  the hook body reads `KJ_GATE_CLASSIFIER_URL` instead, so the leftover row
-  is inert — nothing reads it — but nothing clears it either.
 - **Nothing records a request.** Monitoring is part of the goal; no span or
   ledger row names the host a context reached or was refused.
 
@@ -2598,8 +2502,8 @@ See `docs/audio-inference.md` for methodology and placement tradeoffs.
 Define bounded admission, input limits, and cancellation semantics before
 expanding this workload. Results currently name a mutable host path and
 model family, without audio or weight hashes; caching or durable musical
-use needs immutable provenance. Executor placement, including possible
-lfm2d ownership, remains undecided. Hardware timing stays with audiod.
+use needs immutable provenance. Executor placement, including a separate
+inference service, remains undecided. Hardware timing stays with audiod.
 
 Amy's workload is near-term musical decisions on a shared pulse, with
 seconds available for models and media transfer. Evaluate readiness across

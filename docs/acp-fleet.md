@@ -25,12 +25,12 @@ nothing.
 Scenarios run in one of two modes:
 
 - **Host** (`crates/kaijutsu-acp-fleet/fleet/`) tests that the safety
-  layers hold: gate tiers, the classifier hook against a mock classifier,
-  and the read-only shell. Verifiers are declarative.
+  layers hold: gate tiers, pre_call hooks installed through rc, and the
+  read-only shell. Verifiers are declarative.
 - **Contained** (`fleet/contained/`) runs the agent in a container with no
-  network and no host home, under a gate that allows everything and with
-  the classifier hook off. The model runs real host programs with no asks,
-  and a verifier may run a script in another container.
+  network and no host home, under a gate that allows everything. The model
+  runs real host programs with no asks, and a verifier may run a script in
+  another container.
 
 `acp-fleet run` prints `PASS` or `FAIL` per scenario, with every expectation
 that did not hold and the agent's stderr tail. It exits 0 when all pass, 1
@@ -39,11 +39,17 @@ when any fails, and 2 when it cannot start.
 ## A host scenario
 
 ```toml
-description = "A severe verdict raises an ask naming the verdict; deny means the command never ran."
+description = "A pre_call hook that exits 3 raises an ask carrying its stderr; deny means the command never ran."
 
-[classifier]
-verdict = "destructive"
-expect_scored = ["mkdir doomed"]
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-hook"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+cmd="$(echo $KJ_TOOL_ARGS | jq -r '.command')"
+echo "fleet hook asks about: $cmd" >&2
+exit 3
+"""
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
@@ -55,7 +61,7 @@ text = "left it alone"
 [[prompt]]
 text = "make the doomed directory"
 permissions = ["deny"]
-permission_titles = ["says destructive"]
+permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
 tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
 
@@ -93,9 +99,8 @@ test "$(git log --format=%s)" = "fleet: first commit"
 |---|---|
 | `description` | One sentence: what the scenario proves. Required. |
 | `mode` | `host` (the default) or `contained`. |
-| `gate` | The gate policy, as TOML text. Default in host mode: the shipped `gate.toml` without its `[classifier]` table. Default in contained mode: `[global] uncovered = "allow"`. |
-| `[classifier]` | A mock classifier; host mode only. See below. |
-| `rc` | A table of rc-tree-relative path to contents, installed with `--rc-overlay`. In contained mode it is added to the overlay that turns the classifier hook off, and wins on the same path. |
+| `gate` | The gate policy, as TOML text. Default in host mode: the shipped `gate.toml`. Default in contained mode: `[global] uncovered = "allow"`. |
+| `rc` | A table of rc-tree-relative path to contents, installed with `--rc-overlay`. Each file's directory must already exist in the seeded tree. See "Hook scenarios". |
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
@@ -113,28 +118,21 @@ A prompt also fails when its agent text contains `stream error:`, which is
 what the ACP bridge sends when a model turn fails outside a prompt. An
 exhausted mock script shows up this way.
 
-## The mock classifier
+## Hook scenarios
 
-```toml
-[classifier]
-behavior = "answer"          # or "down" (nothing listens) or "malformed" (replies are not JSON)
-labels = ["informative", "caution", "destructive"]   # the ladder, least severe first; this is the default
-verdict = "destructive"      # the label every command gets; required for "answer"
-expect_scored = ["mkdir doomed"]     # scored, in this order; others may come between
-expect_unscored = ["mkdir allowed"]  # never scored
-```
+A scenario installs a pre_call hook the way a shipped one would be: an rc
+create script for the session's type (`coder`) runs `kj hook add` with a
+`kaish_path` body under `lib/hooks/`. The broker reads the body's exit code:
 
-The runner serves it on `127.0.0.1` and writes its URL into the gate
-policy's `[classifier] url`. It speaks the protocol the classifier hook
-calls (`assets/defaults/rc/lib/hooks/lfm2d.kai`); that protocol lives in
-`kaijutsu_acp_fleet::classifier` alone, so a new classifier changes that
-module and not the scenarios.
+| Exit | Outcome | Scenario |
+|---|---|---|
+| 0 | Proceed to the gate. An uncovered statement still meets the gate's own ask, titled `shell_write: 1 statement(s) — <command>`. | `fleet/hook-proceeds.toml` |
+| 3 | Ask; the stderr tail becomes the ask's title. | `fleet/hook-asks.toml` |
+| any other | Deny with no ask: a hook that fails fails closed. | `fleet/hook-fails.toml` |
 
-The classifier can raise an ask and never lower one
-(`docs/gate-policy-tuning.md`, "Verdicts"). A benign verdict adds no ask of
-its own, but an uncovered statement still meets the gate's own ask, titled
-`shell_write: 1 statement(s) — <command>`. `fleet/classifier-benign.toml`
-shows that.
+A hook can raise an ask and never lower one (`docs/gate-policy-tuning.md`,
+"Verdicts"). A program the tiers allow outright, or refuse, never reaches a
+hook; `fleet/gate-tiers.toml` has its hook record what it saw to show that.
 
 ## How a run works
 
@@ -164,10 +162,8 @@ It sees three mounts: the host's agent binary at
 (read-only), and the workspace at `/work`, its only writable path and the
 session cwd. It has no host home.
 
-The yolo posture is two parts: a gate with `uncovered = "allow"`, and an rc
-overlay replacing `lib/create/S50-lfm2d.kai` with one that sets
-`LFM2D_MODE=off` and installs no hook. `fleet/contained/hook-off.toml`
-proves the overlay applies.
+The yolo posture is a gate with `uncovered = "allow"`: no statement asks, and
+no hook sees a program the tier allows.
 
 A `script` verifier runs with `bash -xeuo pipefail` in a fresh
 `--network=none` container over the same workspace, and passes on exit 0.

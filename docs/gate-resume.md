@@ -145,8 +145,8 @@ kaijutsu meaning lives one layer up, in `kj/gate.rs`.
       │            │            │
       │            │            └────────────► approval_options   (the choices
       │            │                                               offered)
-      │            └───────────────────────► approval_signals  (lfm2d /
-      │                                                         classifier reads)
+      │            └───────────────────────► approval_signals  (classifier
+      │                                                         reads)
       ├──────────────────────────────────► approval_events   (append-only audit:
       │                                     created/claimed/decided/expired/
       │                                     abandoned/redeemed)
@@ -796,15 +796,14 @@ names cannot collide with any target. A restore failure prevents execution.
 
 Cwd and durable exports are read under one database lock. Storage faults refuse
 before recording an ask, including dry-run audit asks. The hook plan reader also
-reports a capture failure before running the classifier. Construction initializes
+reports a capture failure before running any hook body. Construction initializes
 kaish at the selected cwd, then validates that directory in its VFS namespace;
 there is no second database restore that can select a newer cwd.
 
 **Both consumers use the same input rules** (Amy: the classifier "should see
 the same data"). The broker's `KJ_TOOL_PLAN` includes `env: [{name, value|null}]`
 beside `statements`. Hook classification and ask creation are independent
-snapshots; intervening durable changes can affect the later one. The lfm2d scorer
-still does not substitute the environment into its clauses; see `docs/issues.md`.
+snapshots; intervening durable changes can affect the later one.
 
 **The human sees the values on the ask's `description`, not on the
 statement rendering.** `approval_statements` is content-addressed and

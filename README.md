@@ -203,7 +203,7 @@ Pure layout/geometry helpers for the time well context browser.
 
 ### kaijutsu-index
 
-Semantic vector indexing through the lfm2d embedding service, with local
+Semantic vector indexing through an HTTP embedding service, with local
 HNSW nearest-neighbor search, density-based clustering, and persistent
 keyword/gist synthesis. Kaijutsu owns content selection and caching; the
 service owns model loading and inference. Query/document purpose, model

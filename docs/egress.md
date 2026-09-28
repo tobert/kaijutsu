@@ -39,18 +39,12 @@ kernel's own SSH port and local model servers, so a context gets it only when
 its list says so. Tests that stand up a local mock server add `127.0.0.1` to
 the test context's list.
 
-## The classifier host
+## Hooks reach only their context's list
 
-The lfm2d pre-call hook runs in a snapshot of the calling context's shell and
-calls the classifier with `curl`. A context with an empty list must still be
-gated, so every context reaches one host beyond its own rows: the host of
-`[classifier] url` in `/config/kernel/gate.toml`. No host is named in code.
-With no `[classifier]` section nothing is added, the hook cannot reach a
-classifier, and it fails closed: in `escalate` mode the call becomes an ask
-that names the failure (`docs/gate-policy-tuning.md`, "Verdicts").
-
-The kernel hands the hook the same URL, so the hook and the egress rule read
-one value.
+A pre_call hook body runs in a snapshot of the calling context's shell, so
+its `curl` reaches exactly the hosts that context's list names. No host opens
+for every context. An rc hook that needs a network service must have that
+host on the list of each context it gates, or fail closed without it.
 
 ## Who changes the list
 

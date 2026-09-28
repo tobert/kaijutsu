@@ -7266,7 +7266,7 @@ pub(crate) const RETIRED_CLASSIFIER_HOOK: (&str, &str) = ("lfm2d-advisory", "/co
 
 /// Per-context env keys the retired classifier's rc exported. Opening a DB
 /// removes them; nothing reads them.
-pub(crate) const RETIRED_CLASSIFIER_ENV: &[&str] = &["LFM2D_MODE", "LFM2D_BENIGN_LABEL"];
+pub(crate) const RETIRED_CLASSIFIER_ENV: &[&str] = &["LFM2D_MODE", "LFM2D_BENIGN_LABEL", "LFM2D_URL"];
 
 /// The singleton `embedding_config` row.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -46,8 +46,8 @@ silently yields `application/octet-stream`.
 
 ## `kaijutsu-index` — semantic index
 
-Embeds through an asynchronous `Embedder` trait, with lfm2d as the default
-adapter. Query/document purpose, normalization, and model revision are
+Embeds through an asynchronous `Embedder` trait, with `HttpEmbedder` as the
+adapter for a configured embedding service. Query/document purpose, normalization, and model revision are
 explicit. HNSW stores vectors; SQLite stores slot mappings, the embedding
 profile, and synthesis results. Service requests hold no storage locks.
 `BlockSource` and `StatusReceiver` let the kernel/server provide snapshots

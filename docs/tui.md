@@ -372,7 +372,7 @@ other change does.
   ╰──────────────────────────────────────────────────────────────────────────╯
 
   ❯ and getattr? _                                                  -- INSERT --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
+  0 kaijutsu*  1 kaish@  2 scout  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
 ```
 
 Rules the figure carries:
@@ -430,7 +430,7 @@ Rules the figure carries:
   ❯ and getattr? the symlink case too, and whether rename shares the
     cause — run vfs::unlink_symlink before touching rename_
 
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- INSERT --  17.3/128k  91%  4m
+  0 kaijutsu*  1 kaish@  2 scout  3 exo        │  -- INSERT --  17.3/128k  91%  4m
 ```
 
 Compose is a modalkit `VimMachine` over the kernel-owned input block
@@ -538,7 +538,7 @@ Rules the figure carries:
   show it is vfs::unlink_symlink; run that before touching rename.
 
   ❯                                                                -- NORMAL --
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
+  0 kaijutsu*  1 kaish@  2 scout  3 exo        │  -- NORMAL --  17.3/128k  91%  4m
 ```
 
 …and once the block completes, scrollback holds one line in its place:
@@ -901,7 +901,7 @@ the transcript simply gets fewer or more rows on the next frame.
   ACTIVE
   0 kaijutsu   ● coder    running  4s    cargo test -p kaijutsu-kernel vfs::
   1 kaish      @ coder    idle     2m    arithmetic: `test` is back, `[` stays banned
-  2 lfm2d        toolie   idle    41m    export plan waits on Amy's go
+  2 scout        toolie   idle    41m    export plan waits on Amy's go
   3 exo          coder    idle     3h    daily written, 2026-08-30
   RECENT
     kaibo-batch  mcp      idle     1d    OpenAI Files→Batch still 404s
@@ -1004,7 +1004,7 @@ and the `redeemed:` field.
   LEDGER                                                    pending 2   answered today 7
   PENDING
   ! 01a04eb6   12s   kaijutsu   coder    shell_write   git worktree remove --force ~/src/wt/kaish-arith
-  ! 01a04ec1    4m   lfm2d      toolie   file:write    ~/exomemory/lfm2d/work-machine-export.md
+  ! 01a04ec1    4m   scout      toolie   file:write    ~/exomemory/scout/work-machine-export.md
   ANSWERED
     01a04eaa  13:58   kaijutsu   allow once     amy   redeemed 13:58   git worktree remove …
     01a04e91  11:20   exo        deny           amy   —                cat /config/kernel/backends.toml
@@ -1038,7 +1038,7 @@ Rules the figure carries:
 Screen's window list, with kaijutsu's facts on the right:
 
 ```text
-  0 kaijutsu*  1 kaish@  2 lfm2d  3 exo  │  -- NORMAL --  17.3/128k  91%  4m  17.3 ●
+  0 kaijutsu*  1 kaish@  2 scout  3 exo  │  -- NORMAL --  17.3/128k  91%  4m  17.3 ●
 ```
 
 Left to right: the rank (ring 0, seat digits, `*` current, `@` activity, `!`

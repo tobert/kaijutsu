@@ -3144,3 +3144,45 @@ attaches only after the join.
 
 Credits: Claude Opus 5.5; kaibo (DeepSeek) reviewed the identity and
 registration changes.
+
+## The classifier that did not come back (September 28)
+
+lfm2d went down and Amy called it: "is down and not coming back. We should
+probably start removing it. We're gonna replace it with something else soon,
+still via rc mostly." The name covered two services, and they parted ways.
+
+The risk classifier went entirely: its pre_call hook body and every
+`S50-lfm2d`/`S51-lfm2d-observe` seed, `gate.toml`'s `[classifier]` section,
+`KJ_GATE_CLASSIFIER_URL`, the egress exception that opened its host to every
+context, the probe example, and the probe's clause corpus. What stays is the
+seam a replacement plugs into: kaish pre_call hooks (0 proceed, 3 ask,
+anything else deny), ledger signals and `kj ledger signal add`, gate tiers, and
+`KJ_TOOL_PLAN`. A `[classifier]` table left in a host's `gate.toml` now fails
+the load like any unknown section, loudly, rather than being half-read.
+
+The embedder "will be back, basically same api", so it was generalized rather
+than removed: `HttpEmbedder` speaks `/v1/models` and `/embed` at whatever URL
+`embedding_config` names. The kernel ships no endpoint. A fresh kernel's index
+is off and boot says so; a row holding a former factory endpoint is removed at
+open for the same reason, and an operator's own endpoint survives. Test
+kernels no longer probe the network at boot, so their `disable_embeddings`
+step went too.
+
+Deployed hosts carried the classifier in files and rows that a reseed could
+not see. Install-if-absent never learns that a seed stopped shipping a file,
+so `rc reseed` gained a retired list: it names each retired file still on disk
+and removes them under `--force`. Opening `kernel.db` removes the global
+`lfm2d-advisory` hook row, matched on id and body path, and the three
+per-context env keys the old rc exported.
+
+The acp-fleet's mock classifier gave way to generic hook scenarios: a tiny rc
+hook that asks, one that proceeds, and one that crashes. The last one checked
+a claim before relying on it. The broker maps any exit other than 0 or 3 to a
+deny, so a failing hook fails closed. Removing the hook also surfaced a gap it
+had been covering: on the RPC shell paths the ask tier is enforced only by a
+hook's exit 3, so with none installed an ask-tier statement typed at an app
+shell runs. `docs/issues.md`, "What a replacement risk scorer inherits",
+carries it with the other gaps a replacement scorer inherits.
+
+Credits: Claude Opus 5.5.
+

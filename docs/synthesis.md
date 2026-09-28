@@ -1,42 +1,59 @@
 # Semantic indexing and synthesis
 
-Kaijutsu selects content, searches vectors, and computes synthesis. lfm2d
-loads models and performs embedding inference. There is no builtin embedding
-model or silent model fallback. Audio inference remains a separate subsystem.
+Kaijutsu selects content, searches vectors, and computes synthesis. An HTTP
+embedding service loads models and performs embedding inference. There is no
+builtin embedding model or silent model fallback. Audio inference remains a
+separate subsystem.
 
 ## Embedding service
 
-The kernel DB's singleton `embedding_config` selects the service:
+The kernel DB's singleton `embedding_config` selects the service. A fresh
+kernel has no row: the semantic index is off, boot logs "semantic index off",
+and `kj synth` and semantic search report the index unavailable. Configure a
+service with the kernel stopped, then start it:
 
-| Field | Default | Meaning |
+```sh
+sqlite3 ~/.local/share/kaijutsu/kernel/kernel.db \
+  "INSERT INTO embedding_config (id, enabled, endpoint, timeout_ms, max_in_flight, max_context_bytes)
+   VALUES (1, 1, 'http://embedder.example:8088', 30000, 2, 2048)
+   ON CONFLICT(id) DO UPDATE SET endpoint = excluded.endpoint, enabled = 1"
+```
+
+| Field | Suggested | Meaning |
 |---|---|---|
-| enabled | 1 | Initialize semantic indexing at startup |
-| endpoint | `http://lfm2d-system1.taila4abc.ts.net:8088` | HTTP(S) root or `unix:///absolute/socket/path` |
+| enabled | 1 | Initialize semantic indexing at startup; 0 leaves the index off |
+| endpoint | none | HTTP(S) root or `unix:///absolute/socket/path` |
 | timeout_ms | 30000 | Request deadline, including queue time |
 | max_in_flight | 2 | Maximum concurrent service requests per client |
 | max_context_bytes | 2048 | UTF-8 byte budget of the search projection |
 
-Startup discovers exactly one embedder from `GET /v1/models`. Its model id,
-weight hash, and hidden size pin the client's vector space. `POST /embed`
-uses document purpose for indexed text and all synthesis candidates, query
-purpose for searches. Batches contain at most 32 inputs. lfm2d embeds each
-input independently; changing that numerical contract requires a profile
-change. Every response must carry matching model id and weight hash headers,
-correct cardinality and dimensions, finite components, and a nonzero norm.
-The adapter L2-normalizes accepted vectors before returning them. HTTP endpoints
-must name the service root; path prefixes are rejected rather than discarded.
+`kj backend reseed` does not touch this row. No `kj` verb writes it yet; see
+`docs/issues.md`, "Embedding service configuration has no `kj` verb".
 
-Service failures return errors and preserve prior synthesis. Failure to
-connect at startup logs the problem and leaves the semantic index unavailable;
-restart after repairing the endpoint. Discovery can delay startup by up to
-`timeout_ms` (30 seconds by default) when the service is unreachable. `kj synth` and semantic search report unavailability; search does not return
-an empty success when the index is absent.
-There is no automatic reconnection or alternate model selection.
+The client is `kaijutsu_index::HttpEmbedder`. Startup discovers exactly one
+embedder from `GET /v1/models`. Its model id, weight hash, and hidden size pin
+the client's vector space. `POST /embed` uses document purpose for indexed
+text and all synthesis candidates, query purpose for searches. Batches contain
+at most 32 inputs. The service embeds each input independently; changing that
+numerical contract requires a profile change. Every response must carry
+matching model id and weight hash headers, correct cardinality and
+dimensions, finite components, and a nonzero norm. The adapter L2-normalizes
+accepted vectors before returning them. HTTP endpoints must name the service
+root; path prefixes are rejected rather than discarded.
 
-Opening an old builtin-model configuration migrates it to the default service,
-preserves `enabled`, and converts its index budget from the old four-bytes-per-
-token estimate. Model files and declared dimensions are no longer kernel
-configuration: lfm2d owns them. Operator service settings survive later opens.
+Service failures return errors and preserve prior synthesis. The index
+attaches in the background once the service answers; boot never waits on it.
+A failure to connect logs the problem and leaves the semantic index
+unavailable; restart after repairing the endpoint. `kj synth` and semantic
+search report unavailability; search does not return an empty success when
+the index is absent. There is no automatic reconnection or alternate model
+selection.
+
+Opening a kernel DB removes an `embedding_config` row that still holds an
+old builtin-model configuration or an endpoint an earlier kernel seeded by
+default; the index is then off until an operator configures a service. An
+operator's own endpoint survives later opens. Model files and declared
+dimensions are not kernel configuration: the service owns them.
 
 ## Cache identity and concurrency
 
@@ -55,7 +72,7 @@ gist or keyword list. Bulk synthesis exits 1 when any context fails.
 The global persisted embedding profile invalidates the HNSW graph and synthesis
 on model changes, even when there are no indexed contexts. It currently covers
 model id, weight hash, dimensions, and kaijutsu's purpose/normalization contract.
-lfm2d does not yet advertise a full tokenizer/preprocessing profile digest;
+The service does not yet advertise a full tokenizer/preprocessing profile digest;
 changing those without changing weights requires clearing the derived index.
 Service contract feedback is recorded in exomemory.
 
