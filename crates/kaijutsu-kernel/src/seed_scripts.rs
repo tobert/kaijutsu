@@ -198,7 +198,7 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
 /// A retired seed ([`RETIRED_RC_SEEDS`]) still present is named in
 /// [`RcSeedReport::retired`] and left alone; with `force` it is removed and
 /// named in [`RcSeedReport::removed`]. `force` deletes nothing else, so a
-/// script you added yourself is never touched. Use `git diff` to see what a
+/// script you added under any other path is never touched. Use `git diff` to see what a
 /// forced reseed changed.
 ///
 /// Per the crash-over-corruption stance this surfaces I/O errors rather than

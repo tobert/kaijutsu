@@ -78,7 +78,7 @@ use super::effect::{classify, Effect};
 ///    turns any command into a filesystem write (module doc, "The redirect
 ///    hole this closes").
 /// 3. `cmd.background` is false. A backgrounded call has left the
-///    classifier's control by the time anyone could act on its answer.
+///    gate's control by the time anyone could act on its answer.
 /// 4. `cmd.heredocs` is empty. A heredoc body is data the command consumes,
 ///    outside the argv this function inspects at all.
 /// 5. Every argument is [`PlannedValue::Plain`]. kaish carries no redaction

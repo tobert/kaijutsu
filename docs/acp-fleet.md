@@ -128,11 +128,13 @@ create script for the session's type (`coder`) runs `kj hook add` with a
 |---|---|---|
 | 0 | Proceed to the gate. An uncovered statement still meets the gate's own ask, titled `shell_write: 1 statement(s) — <command>`. | `fleet/hook-proceeds.toml` |
 | 3 | Ask; the stderr tail becomes the ask's title. | `fleet/hook-asks.toml` |
+| 124 | The body timed out: ask. | none |
 | any other | Deny with no ask: a hook that fails fails closed. | `fleet/hook-fails.toml` |
 
 A hook can raise an ask and never lower one (`docs/gate-policy-tuning.md`,
-"Verdicts"). A program the tiers allow outright, or refuse, never reaches a
-hook; `fleet/gate-tiers.toml` has its hook record what it saw to show that.
+"Verdicts"). A fault running the body asks, and a `kaish_path` body that
+cannot be read denies. A program the tiers allow outright, or refuse, never
+reaches a hook; `fleet/gate-tiers.toml` has its hook record what it saw to show that.
 
 ## How a run works
 

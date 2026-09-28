@@ -435,7 +435,7 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
         });
     }
 
-    // Why the gate escalated, capped: the classifier's note is useful but
+    // Why the gate escalated, capped: the hook's or gate's note is useful but
     // secondary to the plan, so it sits below it and never crowds the
     // statement off the top. It scrolls with the rest of the body.
     if !ask.description.is_empty() {

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 pub enum Effect {
     /// No side effect anywhere: not the kernel database, not the host
     /// filesystem, not a remote, not a peer. Skips the shell gate and the
-    /// classifier by construction.
+    /// pre_call hooks by construction.
     Read,
     /// Changes state that can be changed back. Meets the gate like any
     /// other statement.

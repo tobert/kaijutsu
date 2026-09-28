@@ -2803,8 +2803,7 @@ impl Broker {
         // `clause` (docs/gate-policy-tuning.md): the text
         // a classifier scores for that command, from
         // `kj::plan_clauses::command_clause_texts` — the one place the cut
-        // between statement and command is decided, shared with
-        // kaijutsu-mcp's advisory scorer. A statement whose arguments are
+        // between statement and command is decided. A statement whose arguments are
         // not all plain is not cut, and every command in it carries the
         // whole statement's rendering, because that is the string the
         // classifier will see for it. Additive.

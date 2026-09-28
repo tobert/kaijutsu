@@ -3177,8 +3177,8 @@ per-context env keys the old rc exported.
 
 The acp-fleet's mock classifier gave way to generic hook scenarios: a tiny rc
 hook that asks, one that proceeds, and one that crashes. The last one checked
-a claim before relying on it. The broker maps any exit other than 0 or 3 to a
-deny, so a failing hook fails closed. Removing the hook also surfaced a gap it
+a claim before relying on it. The broker denies any exit other than 0, 3, or
+124 (a timeout, which asks), so a failing hook fails closed. Removing the hook also surfaced a gap it
 had been covering: on the RPC shell paths the ask tier is enforced only by a
 hook's exit 3, so with none installed an ask-tier statement typed at an app
 shell runs. `docs/issues.md`, "What a replacement risk scorer inherits",

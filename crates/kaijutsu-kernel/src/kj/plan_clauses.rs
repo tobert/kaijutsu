@@ -5,13 +5,9 @@
 //! is judged as one string. This module is the single place that decides
 //! where a statement is cut, so every consumer sends the same text.
 //!
-//! Two consumers share it:
-//!
-//! - `mcp/broker.rs` mirrors each command's clause onto the `KJ_TOOL_PLAN`
-//!   JSON twin as `commands[].clause`, so a hook body reads a field instead
-//!   of re-deriving the cut in `jq`.
-//! - `kaijutsu-mcp`'s advisory scorer renders the same clauses for a Claude
-//!   Code `Bash` call.
+//! `mcp/broker.rs` mirrors each command's clause onto the `KJ_TOOL_PLAN` JSON
+//! twin as `commands[].clause`, so a hook body reads a field instead of
+//! re-deriving the cut in `jq`.
 //!
 //! ## The cut
 //!

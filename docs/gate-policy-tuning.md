@@ -186,8 +186,9 @@ commands. An rc hook that does should follow two rules:
   exemption.
 
 The broker fails a hook closed: exit 0 proceeds, 3 asks with the stderr
-tail as the description, and any other exit denies (`mcp/broker.rs`,
-`classify_kaish_hook_exit`). A scoring hook that cannot reach its service
+tail as the description, 124 (the body timed out) asks, and any other exit
+denies (`mcp/broker.rs`, `classify_kaish_hook_exit`). A fault running the
+body asks; a `kaish_path` body that cannot be read denies. A scoring hook that cannot reach its service
 should exit 3 rather than fail, so an outage asks a human instead of
 stopping every seat; `crates/kaijutsu-acp-fleet/fleet/hook-*.toml` pins the
 three outcomes.

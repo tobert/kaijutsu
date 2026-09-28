@@ -2351,9 +2351,8 @@ one:
   `retry-after-ask` ledger row is the minimum (a measurement, not a control).
 - **A kaish lexer rejection degrades the gate to the no-plan fallback.**
   `contrib/kai-parse-check.sh` guards our own corpus; the lexer bug is kaish's.
-- **`plan_clauses::render_clauses` has no caller outside its tests**, and the
-  module doc names a `kaijutsu-mcp` consumer that does not exist. Delete it
-  or give the next scorer a reason to call it.
+- **`plan_clauses::render_clauses` has no caller outside its tests.** Delete
+  it or give the next scorer a reason to call it.
 
 ## kaish `env` takes its command's flags as its own (2026-09-21, kaish)
 

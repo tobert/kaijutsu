@@ -79,7 +79,8 @@ remain unchanged. Before creating new contexts on an existing host tree:
 
    For composed instructions, install both script and data links beside each
    other. `$0` is the invoked link path, not its resolved target. Reseed does
-   not invent wrappers for custom data or remove retired host files.
+   not invent wrappers for custom data. It names retired defaults still
+   installed and removes them only under `--force`.
 4. Create a fresh context and inspect `kj context prompt` and `kj ledger runs`.
    Re-running all create scripts can also rebind tools and reload observations.
 

@@ -1618,8 +1618,8 @@ pub async fn create_shared_kernel(
         kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         // Seed the LLM configuration floor — backends, their known context
-        // windows, the `--model` aliases, the defaults, and the embedding
-        // model. Same absent-only floor pattern as the presets above, and the
+        // windows, the `--model` aliases, and the defaults. Same absent-only
+        // floor pattern as the presets above, and the
         // successor to seeding `models.toml` into the kernel. Fail loud: a
         // kernel with no backends hangs its first turn on "no provider
         // configured", which is a far worse diagnostic than this error.
@@ -2123,9 +2123,9 @@ pub async fn create_shared_kernel(
         });
     } else {
         log::warn!(
-            "semantic index off: kernel.db has no enabled embedding_config row naming an \
-             embedding service; semantic search and `kj synth` report unavailable \
-             (docs/synthesis.md, \"Embedding service\")"
+            "semantic index off: no enabled embedding_config row was loaded from kernel.db \
+             (an error above names a failed read); semantic search and `kj synth` report \
+             unavailable (docs/synthesis.md, \"Embedding service\")"
         );
     }
 

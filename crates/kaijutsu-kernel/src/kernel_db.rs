@@ -938,8 +938,7 @@ CREATE TABLE IF NOT EXISTS context_env (
 CREATE INDEX IF NOT EXISTS idx_ctx_env ON context_env(context_id);
 
 -- Which hosts a context's shell may reach over the network. `docs/egress.md`
--- owns the rule; an empty list reaches nothing but the built-in classifier
--- host `runtime/curl_tool.rs` keeps outside the rows.
+-- owns the rule; an empty list reaches nothing.
 CREATE TABLE IF NOT EXISTS context_egress (
     context_id BLOB NOT NULL REFERENCES contexts(context_id) ON DELETE CASCADE,
     host       TEXT NOT NULL,
@@ -2615,8 +2614,9 @@ impl KernelDb {
     }
 
     /// Column backfills and guarded configuration migrations for existing DBs.
-    /// The embedding table rebuild is transactional and preserves enablement
-    /// and the projection budget while replacing obsolete model settings.
+    /// A builtin-model `embedding_config` is replaced by an empty service
+    /// table, and a row holding a retired factory endpoint is removed: the
+    /// kernel ships no endpoint to put in its place.
     /// The project's stance is "schema is truth, bump = wipe", but a single
     /// `ADD COLUMN ... DEFAULT 0` is cheap and spares a live kernel a wipe.
     /// Each ALTER is guarded: a "duplicate column" error on a fresh DB (the
@@ -2651,20 +2651,6 @@ impl KernelDb {
                 tracing::warn!(endpoint = retired,
                     "removed a retired factory embedding endpoint; the semantic index is off until \
                      embedding_config names an embedding service (docs/synthesis.md)");
-            }
-        }
-        let (hook_id, hook_path) = RETIRED_CLASSIFIER_HOOK;
-        let removed = conn.execute(
-            "DELETE FROM hooks WHERE hook_id = ?1 AND action_kind = 'kaish_path' AND action_kaish_path = ?2",
-            [hook_id, hook_path],
-        )?;
-        if removed > 0 {
-            tracing::warn!(hook_id, "removed the retired classifier pre_call hook");
-        }
-        for key in RETIRED_CLASSIFIER_ENV {
-            let removed = conn.execute("DELETE FROM context_env WHERE key = ?1", [key])?;
-            if removed > 0 {
-                tracing::info!(key, contexts = removed, "removed a retired classifier env var");
             }
         }
         let alters = [
@@ -2753,6 +2739,28 @@ impl KernelDb {
         // Review has no configured default; the lineage root holds that
         // authority (`docs/approval-identity.md`).
         conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
+        Self::remove_retired_classifier(conn)?;
+        Ok(())
+    }
+
+    /// Remove the retired risk classifier's global pre_call hook row and the
+    /// per-context env its rc exported. Runs after the column backfills,
+    /// because the hook match names `action_kaish_path`.
+    fn remove_retired_classifier(conn: &Connection) -> KernelDbResult<()> {
+        let (hook_id, hook_path) = RETIRED_CLASSIFIER_HOOK;
+        let removed = conn.execute(
+            "DELETE FROM hooks WHERE hook_id = ?1 AND action_kind = 'kaish_path' AND action_kaish_path = ?2",
+            [hook_id, hook_path],
+        )?;
+        if removed > 0 {
+            tracing::warn!(hook_id, "removed the retired classifier pre_call hook");
+        }
+        for key in RETIRED_CLASSIFIER_ENV {
+            let removed = conn.execute("DELETE FROM context_env WHERE key = ?1", [key])?;
+            if removed > 0 {
+                tracing::info!(key, contexts = removed, "removed a retired classifier env var");
+            }
+        }
         Ok(())
     }
 
@@ -8641,6 +8649,20 @@ mod tests {
         };
         KernelDb::open(&path).unwrap().set_embedding_config(&own).unwrap();
         assert_eq!(KernelDb::open(&path).unwrap().get_embedding_config().unwrap(), Some(own));
+    }
+
+    /// A DB whose `hooks` table predates `action_kaish_path` still opens:
+    /// the retired-hook cleanup runs after the column backfill it names.
+    #[test]
+    fn retired_classifier_cleanup_opens_a_hooks_table_without_kaish_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.conn.execute_batch("ALTER TABLE hooks DROP COLUMN action_kaish_path").unwrap();
+        }
+        let db = KernelDb::open(&path).expect("a legacy hooks table must still open");
+        assert!(db.load_all_hooks().unwrap().is_empty());
     }
 
     /// The retired classifier's global pre_call hook row and the per-context
