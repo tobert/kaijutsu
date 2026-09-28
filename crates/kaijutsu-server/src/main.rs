@@ -132,9 +132,9 @@ enum Command {
 #[derive(Subcommand)]
 enum RcCommand {
     /// Install the embedded rc scripts into the rc tree. Installs anything
-    /// absent and names anything present that differs from its embedded
-    /// default, or that a retired default left behind, leaving it alone;
-    /// --force overwrites the first and removes the second instead.
+    /// absent, and names files that differ from their default and retired
+    /// defaults still installed, leaving both alone; --force overwrites the
+    /// first and removes the second.
     Reseed {
         /// Also overwrite files that differ from their embedded default and
         /// remove retired defaults.
