@@ -2326,6 +2326,46 @@ Per-subscription bounded queues, `subSeq` and the lag kick shipped. Open:
   `update.rs:1586`) are dormant defence-in-depth; remove once real flights
   show them firing zero times.
 
+## Approval paths: the burn-down (2026-09-29)
+
+Map and reasoning: https://claude.ai/artifact/QzzA5UzbszV8y67sw3S3XB
+("Kaijutsu Gate Paths"). Three evaluators of different depth decide, and
+two consumers act on an answer with different checks. Amy: "let's record
+and burn down all the approval options". Delete each line as it ships.
+
+- **F1** Approving an ask runs `exec_source` in the worker
+  (`approval_resume.rs`) without re-running `gate_policy::evaluate` or the
+  PreCall hooks the ask stopped; the retry path re-runs both.
+- **F2** The worker always builds `ShellPolicy::Agent`, so an approved
+  read-only `shell` hook ask runs with writes.
+- **F3** PreCall (`evaluate_planned`) reads no ledger: a learned allow never
+  outranks a config deny through a real call, and on the RPC shell paths a
+  remembered deny does nothing unless something asks.
+- **F4** `kj ledger forget` checks no identity and is builtin-allowed with the
+  rest of `kj ledger`: a model can erase a human's deny.
+- **F5** File and block tools pass no gate tier; a file write to
+  `/config/rc` does what ask-tier `kj rc add` does. `WorkspaceGuard`
+  fails open on a database error.
+- **F6** kaijutsu-mcp submits as a model but gets path C's lenient posture:
+  uncovered statements run without an ask.
+- **F7** ACP prompts show only the description (200-char prefix, hook
+  stderr); an ask unanswered for 30 s is never offered again.
+- **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
+  auto-allows leave no row; a dry run with no reviewer records nothing;
+  the ORIGIN column is narrower than `shell_gate`.
+- **F9** `ask_tier_description` swallows a config load error (`.ok()?`) and
+  lets an ask-tier statement run.
+- **F10** A redeeming retry restores cwd but not the env the reviewer saw.
+- **F11** Approving a streaming RPC ask authors a Model-role pair and can
+  wake the model (inferred).
+- **F12** Digest `--remember` rules do not cross paths (`hook:v1:` vs
+  `shell-stmt:v1:`).
+- **F13** A dry-run row is answerable between create and abandon; `kj cc
+  send` through `shell_write` asks twice, unlinked.
+- **Tests** A fleet conformance matrix: each property (deny wins, learned
+  allow wins, uncovered asks a model, approval runs what was shown, every
+  refusal leaves a row) against each entry path.
+
 ## What a replacement risk scorer inherits (2026-09-28)
 
 The risk classifier and its rc hook are removed (`docs/devlog.md`, "The
