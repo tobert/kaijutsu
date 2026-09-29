@@ -2339,8 +2339,6 @@ and burn down all the approval options". Delete each line as it ships.
 - **F1** Approving an ask runs `exec_source` in the worker
   (`approval_resume.rs`) without re-running `gate_policy::evaluate` or the
   PreCall hooks the ask stopped; the retry path re-runs both.
-- **F2** The worker always builds `ShellPolicy::Agent`, so an approved
-  read-only `shell` hook ask runs with writes.
 - **F3** PreCall (`evaluate_planned`) reads no ledger: a learned allow never
   outranks a config deny through a real call, and on the RPC shell paths a
   remembered deny does nothing unless something asks.

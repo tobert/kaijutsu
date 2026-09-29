@@ -54,9 +54,24 @@ struct ExecutableAsk {
     cwd: Option<String>,
     actor: PrincipalId,
     reviewer: PrincipalId,
+    /// Whether the tool the ask was raised on is the read-only `shell`.
+    read_only: bool,
     /// The denial as the model reads it on the output block's stderr. Short
     /// on purpose — `kj ledger show <id>` is where the whole ask lives.
     denial: String,
+}
+
+/// Whether an approved ask runs read-only: an ask runs under the policy of
+/// the tool it was raised on, so an approval never widens what the call
+/// could do. A shell-gate ask comes from `shell_write`; a hook ask names its
+/// tool. Any other tool carrying a source is refused rather than guessed.
+fn runs_read_only(origin: approval_ledger::types::Origin, tool: Option<&str>) -> Result<bool, String> {
+    use approval_ledger::types::Origin;
+    match (origin, tool) {
+        (Origin::ShellGate, None | Some("shell_write")) | (Origin::Hook, Some("shell_write")) => Ok(false),
+        (Origin::Hook, Some("shell")) => Ok(true),
+        (origin, tool) => Err(format!("no shell policy for a {origin:?} ask on tool {tool:?}")),
+    }
 }
 
 fn approval_pair(
@@ -572,7 +587,8 @@ async fn act_on_executable_answer(
             requester: principal_id, performer: ask.actor, reviewer: Some(ask.reviewer),
             context: context_id, session: session_id,
         },
-        ShellPolicy::Agent, ShellCwd::Captured(ask.cwd.as_ref().map(std::path::PathBuf::from)),
+        if ask.read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
+        ShellCwd::Captured(ask.cwd.as_ref().map(std::path::PathBuf::from)),
         dispatcher.semantic_index(),
         dispatcher.block_source(),
         ).await
@@ -905,6 +921,15 @@ async fn run_delivery(
                 woken.insert(answer.request_id.clone());
                 continue;
             };
+            let read_only = match row.exec_source.as_ref().map(|_| runs_read_only(row.origin, row.tool.as_deref())) {
+                Some(Err(error)) => {
+                    tracing::error!("gate-resume: ask {}: {error}; nothing was run", answer.request_id);
+                    woken.insert(answer.request_id.clone());
+                    continue;
+                }
+                Some(Ok(read_only)) => read_only,
+                None => false,
+            };
             let executable = row.exec_source.clone().map(|source| {
                 let denial = match row.decided_option.as_deref() {
                     Some("cancel") => format!("cancelled by {who} — nothing was run"),
@@ -917,6 +942,7 @@ async fn run_delivery(
                     cwd: row.cwd.clone(),
                     actor,
                     reviewer,
+                    read_only,
                     denial,
                 }
             });
@@ -1119,6 +1145,51 @@ mod lifetime_tests {
         (receipt.command_block_id, receipt.output_block_id)
     }
 
+    /// An approved ask runs under the shell policy it was raised under: a
+    /// hook ask on the read-only `shell` tool stays read-only when the
+    /// worker runs it, so the reviewer's "allow" never grants writes the
+    /// call could not make. Falsified by running every ask as `Agent`.
+    #[tokio::test]
+    async fn an_approved_read_only_shell_ask_runs_read_only() {
+        use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
+        use approval_ledger::{ask::create_ask, decide::{decide, DecideInput}, types::{NewAsk, Origin}};
+        let dispatcher = Arc::new(test_dispatcher_persistent().await);
+        dispatcher.set_self_arc();
+        let kernel = dispatcher.kernel();
+        kernel.broker().set_kj_dispatcher(&dispatcher).await;
+        let dir = tempfile::tempdir().unwrap();
+        kernel.mount("/policy-probe", crate::vfs::LocalBackend::new(dir.path())).await;
+        let source = "echo written > /policy-probe/file";
+        let actor = PrincipalId::new();
+        let reviewer = PrincipalId::new();
+        let context = register_context(&dispatcher, Some("read-only-ask"), None, actor);
+        kernel.kernel_db().lock().update_context_review(context, Some(actor), Some(reviewer)).unwrap();
+        kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
+        let db = kernel.kernel_db().clone();
+        let request = create_ask(db.lock().conn_for_ledger(), &NewAsk {
+            context_id: context.as_bytes().to_vec(), actor_id: actor.as_bytes().to_vec(),
+            reviewer_id: reviewer.as_bytes().to_vec(), principal_id: actor.as_bytes().to_vec(),
+            origin: Origin::Hook, instance: Some("builtin.shell".into()), tool: Some("shell".into()),
+            hook_id: Some("asks-on-shell".into()),
+            description: "a hook asked about a read-only call".into(), statements: vec![], authorized_label: None,
+            rc_run_id: None, expires_at: None, options: vec![], signals: vec![], cwd: None,
+            exec_source: Some(source.into()), exec_stdin: None, continuation_epoch: None, env: vec![],
+        }).unwrap();
+        decide(db.lock().conn_for_ledger(), &request, DecideInput { allow: true, ..Default::default() }).unwrap();
+        let answer = db.lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
+        let row = db.lock().get_approval(&request).unwrap().unwrap();
+        let read_only = runs_read_only(row.origin, row.tool.as_deref()).expect("a shell ask has a policy");
+        assert!(read_only);
+        let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, read_only, denial: "not denied".into() };
+        let stop = tokio_util::sync::CancellationToken::new();
+        act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
+        assert!(!dir.path().join("file").exists(), "an approved read-only ask must not write");
+        assert_eq!(runs_read_only(Origin::Hook, Some("shell_write")), Ok(false));
+        assert_eq!(runs_read_only(Origin::ShellGate, None), Ok(false));
+        assert!(runs_read_only(Origin::Hook, Some("write")).is_err(), "an unknown tool with a source is refused");
+        kernel.shutdown_runtime_worker().await.ok();
+    }
+
     #[tokio::test]
     async fn claimed_completion_retains_delivery_without_replaying_source() {
         use crate::kj::test_helpers::{test_dispatcher_persistent, register_context};
@@ -1148,7 +1219,7 @@ mod lifetime_tests {
             }).unwrap();
             decide(db.lock().conn_for_ledger(), &request, DecideInput { allow: true, ..Default::default() }).unwrap();
             let answer = db.lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
-            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, denial: "not denied".into() };
+            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, read_only: false, denial: "not denied".into() };
             let key = Source::Approval(request.clone());
             let stop = tokio_util::sync::CancellationToken::new();
             db.lock().conn_for_ledger().execute_batch("CREATE TRIGGER reject_notice_owner BEFORE INSERT ON execution_notifications
@@ -1335,7 +1406,7 @@ mod lifetime_tests {
                 }).unwrap();
             }
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
-            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, denial: "not denied".into() };
+            let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None, actor, reviewer, read_only: false, denial: "not denied".into() };
             let stop = tokio_util::sync::CancellationToken::new();
             assert!(matches!(act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await, ExecAction::Deferred),
                 "an early answer cannot take execution from a caller still publishing its pair");
@@ -1443,7 +1514,7 @@ mod lifetime_tests {
             }).unwrap();
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
             let scanned = ExecutableAsk { source: source.into(), stdin: None, cwd: None,
-                actor, reviewer, denial: "not denied".into() };
+                actor, reviewer, read_only: false, denial: "not denied".into() };
             let (command, output) = test_pair(kernel, context, actor, source);
             let owner = if changed_performer { crate::PairOwner::Turn } else { crate::PairOwner::Session };
             kernel.kernel_db().lock().link_ask_blocks(&request, &command, &output, owner).unwrap();
@@ -1499,7 +1570,7 @@ mod lifetime_tests {
             }).unwrap();
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
             let ask = ExecutableAsk { source: source.into(), stdin: None, cwd: None,
-                actor, reviewer, denial: "not denied".into() };
+                actor, reviewer, read_only: false, denial: "not denied".into() };
             if fault == "setup" {
                 kernel.kernel_db().lock().conn_for_ledger().execute_batch(
                     "CREATE TRIGGER reject_approved_receipt BEFORE INSERT ON shell_operations
@@ -1613,7 +1684,7 @@ mod lifetime_tests {
                 ..Default::default()
             }).unwrap(); }
             let answer = kernel.kernel_db().lock().undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request).unwrap();
-            let ask = ExecutableAsk { source: "echo must-not-run".into(), stdin: None, cwd: None, actor, reviewer,
+            let ask = ExecutableAsk { source: "echo must-not-run".into(), stdin: None, cwd: None, actor, reviewer, read_only: false,
                 denial: "denied; nothing ran".into() };
             kernel.blocks().arm_accept_fault(1);
             let stop = tokio_util::sync::CancellationToken::new();
@@ -1720,7 +1791,7 @@ mod lifetime_tests {
                 db.undelivered_answers().unwrap().into_iter().find(|a| a.request_id == request_id).unwrap()
             };
             let ask = ExecutableAsk { source: "echo approved-once".into(), stdin: None, cwd: None,
-                actor, reviewer, denial: "not denied".into() };
+                actor, reviewer, read_only: false, denial: "not denied".into() };
             let before = kernel.blocks().block_snapshots(context).unwrap();
             if fault == "context" {
                 kernel.kernel_db().lock().conn_for_ledger().execute_batch(
