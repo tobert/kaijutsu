@@ -2407,8 +2407,7 @@ for when it's contained in docker". Open:
   prompt. Mock replies a scenario never used go unreported.
 - **Nothing notices a stale fleet image**, and contained runs set no
   `--pids-limit`.
-- `solo_acp_stdio.rs` still has its own client; move it onto the fleet's.
-  Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
+- Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
 
 ## Egress: what stays open (2026-09-21)
 

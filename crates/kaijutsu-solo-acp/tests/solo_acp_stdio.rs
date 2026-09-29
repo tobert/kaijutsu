@@ -5,12 +5,9 @@
 //! mock backend (`KJ_MOCK_SCRIPT_DIR`, one script file per model name), so a
 //! turn runs end to end with no provider and no spend.
 //!
-//! Framing is newline-delimited JSON-RPC 2.0 — what the
-//! `agent-client-protocol` crate's `Stdio` transport reads and writes
-//! (`stdio.rs`, `BufReader::new(stdin).lines()`). The client side is
-//! hand-rolled here rather than taken from that crate: the tests need to
-//! assert on raw notification shapes and on what does NOT appear on stdout,
-//! which a typed client hides.
+//! The client is the ACP fleet's (`kaijutsu_acp_fleet::client`,
+//! `docs/acp-fleet.md`): it exposes raw notification shapes and counts what
+//! reaches stdout, which a typed client hides.
 //!
 //! Scratch state lives under `/home/atobey/src/bench-work/solo/` — a real
 //! disk, and under `$HOME/src`, which is the kernel's read-write VFS mount
@@ -18,15 +15,13 @@
 //! cwd outside that mount is read-only to the model, so the file-writing
 //! test would fail for a reason that has nothing to do with this binary.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use kaijutsu_acp_fleet::client::{self, AcpClient, AgentCommand};
+use serde_json::Value;
 
 /// The binary under test, built by cargo for this test target.
 const BIN: &str = env!("CARGO_BIN_EXE_kaijutsu-solo-acp");
@@ -57,302 +52,78 @@ fn mock_scripts(case: &str) -> PathBuf {
         .join(case)
 }
 
-
-/// A running `kaijutsu-solo-acp`, with its stdout and stderr drained by
-/// reader threads so neither pipe can fill and deadlock the child.
-struct Agent {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    lines: Receiver<String>,
-    stderr: Arc<Mutex<String>>,
-    /// Bytes the agent has written to stdout. stdout is the ACP wire, so a
-    /// run that was never asked anything must leave this at zero.
-    seen_stdout: Arc<AtomicUsize>,
-    next_id: i64,
-    /// `session/update` notifications, in arrival order.
-    updates: Vec<Value>,
-    /// How many `session/request_permission` requests we answered.
-    permissions: usize,
+/// The binary with the mock backend and the scripted model `case`.
+fn mock_command(case: &str) -> AgentCommand {
+    AgentCommand::new(BIN)
+        .arg("--backend-kind")
+        .arg("mock")
+        .arg("--model")
+        .arg("solo-mock")
+        .env("KJ_MOCK_SCRIPT_DIR", mock_scripts(case))
+        // The default state directory is a temp dir; keep it off the
+        // host's small /tmp tmpfs.
+        .env("TMPDIR", scratch_dir("tmp"))
+        .env("RUST_LOG", "info")
 }
 
-impl Agent {
-    /// Spawn the binary with the mock backend and a scripted model.
-    fn spawn_mock(case: &str) -> Self {
-        Self::spawn_mock_with(case, &[])
-    }
-
-    /// Spawn the binary with the mock backend, plus extra flags.
-    fn spawn_mock_with(case: &str, extra: &[&str]) -> Self {
-        Self::build(case, None, extra)
-    }
-
-    /// Spawn the binary from a chosen launch directory, which is what the
-    /// default workspace mount is about.
-    fn spawn_mock_from(case: &str, cwd: &Path, extra: &[&str]) -> Self {
-        Self::build(case, Some(cwd), extra)
-    }
-
-    fn build(case: &str, cwd: Option<&Path>, extra: &[&str]) -> Self {
-        let mut command = Command::new(BIN);
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
-        command
-            .arg("--backend-kind")
-            .arg("mock")
-            .arg("--model")
-            .arg("solo-mock")
-            .args(extra)
-            .env("KJ_MOCK_SCRIPT_DIR", mock_scripts(case))
-            // The default state directory is a temp dir; keep it off the
-            // host's small /tmp tmpfs.
-            .env("TMPDIR", scratch_dir("tmp"))
-            .env("RUST_LOG", "info");
-        Self::spawn(command)
-    }
-
-    fn spawn(mut command: Command) -> Self {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {BIN}: {e}"));
-
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, lines) = channel();
-        let seen_stdout = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&seen_stdout);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) => {
-                        counter.fetch_add(line.len() + 1, Ordering::SeqCst);
-                        if tx.send(line).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            }
-        });
-
-        let stderr_pipe = child.stderr.take().expect("piped stderr");
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
-                let mut held = sink.lock().expect("stderr sink poisoned");
-                held.push_str(&line);
-                held.push('\n');
-            }
-        });
-
-        Self {
-            stdin: child.stdin.take(),
-            child,
-            lines,
-            stderr,
-            seen_stdout,
-            next_id: 1,
-            updates: Vec::new(),
-            permissions: 0,
-        }
-    }
-
-    fn stderr(&self) -> String {
-        self.stderr.lock().expect("stderr sink poisoned").clone()
-    }
-
-    fn send(&mut self, message: &Value) {
-        let stdin = self.stdin.as_mut().expect("stdin still open");
-        writeln!(stdin, "{message}").expect("write a request");
-        stdin.flush().expect("flush a request");
-    }
-
-    /// Send a request and return its result, answering anything the agent
-    /// asks us in the meantime.
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-
-        let deadline = Instant::now() + REPLY_TIMEOUT;
-        loop {
-            let message = self.next_message(deadline, method);
-            if message.get("id").and_then(Value::as_i64) == Some(id)
-                && message.get("method").is_none()
-            {
-                if let Some(error) = message.get("error") {
-                    panic!("{method} failed: {error}\n--- stderr ---\n{}", self.stderr());
-                }
-                return message.get("result").cloned().unwrap_or(Value::Null);
-            }
-            self.dispatch(message);
-        }
-    }
-
-    /// Read one JSON message, failing loudly on a timeout or a dead child.
-    fn next_message(&mut self, deadline: Instant, waiting_for: &str) -> Value {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match self.lines.recv_timeout(remaining) {
-            Ok(line) => serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("stdout line is not JSON: {line:?} ({e})")),
-            Err(RecvTimeoutError::Timeout) => panic!(
-                "timed out waiting for {waiting_for}\n--- stderr ---\n{}",
-                self.stderr()
-            ),
-            Err(RecvTimeoutError::Disconnected) => panic!(
-                "the agent closed stdout while we waited for {waiting_for}\n--- stderr ---\n{}",
-                self.stderr()
-            ),
-        }
-    }
-
-    /// Record a notification, or answer a request the agent sent us. An
-    /// unanswered request would wedge the turn, so every method gets a
-    /// reply — an error reply for anything this client does not implement.
-    fn dispatch(&mut self, message: Value) {
-        let Some(method) = message.get("method").and_then(Value::as_str) else {
-            // A response to a request we are no longer waiting for.
-            return;
-        };
-        let method = method.to_string();
-        let Some(id) = message.get("id").cloned() else {
-            if method == "session/update" {
-                self.updates
-                    .push(message.get("params").cloned().unwrap_or(Value::Null));
-            }
-            return;
-        };
-        if method == "session/request_permission" {
-            self.permissions += 1;
-            let option = message
-                .pointer("/params/options/0/optionId")
-                .and_then(Value::as_str)
-                .unwrap_or("allow")
-                .to_string();
-            self.send(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {"outcome": {"outcome": "selected", "optionId": option}},
-            }));
-            return;
-        }
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": format!("test client does not implement {method}")},
-        }));
-    }
-
-    fn initialize(&mut self) -> Value {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {},
-                "clientInfo": {"name": "solo-acp-test", "version": "0"},
-            }),
-        )
-    }
-
-    fn new_session(&mut self, cwd: &Path) -> String {
-        let result = self.request("session/new", json!({"cwd": cwd, "mcpServers": []}));
-        result
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("session/new returned no sessionId: {result}"))
-            .to_string()
-    }
-
-    fn prompt(&mut self, session: &str, text: &str) -> Value {
-        self.request(
-            "session/prompt",
-            json!({
-                "sessionId": session,
-                "prompt": [{"type": "text", "text": text}],
-            }),
-        )
-    }
-
-    /// Every `agent_message_chunk` text seen so far, joined.
-    fn agent_text(&self) -> String {
-        self.updates
-            .iter()
-            .filter(|params| {
-                params.pointer("/update/sessionUpdate").and_then(Value::as_str)
-                    == Some("agent_message_chunk")
-            })
-            .filter_map(|params| {
-                params
-                    .pointer("/update/content/text")
-                    .and_then(Value::as_str)
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Close stdin and wait for the process to exit, the way an ACP client
-    /// shutting down does.
-    fn close_stdin_and_wait(&mut self, within: Duration) -> std::process::ExitStatus {
-        drop(self.stdin.take());
-        self.wait_for_exit("stdin EOF", within)
-    }
-
-    /// Send a signal to the running agent, the way a service manager or a
-    /// Ctrl-C does.
-    fn signal(&self, signal: i32) {
-        let pid = self.child.id() as i32;
-        // SAFETY: `kill(2)` on a child this process spawned and has not
-        // reaped; an invalid pid would only return an error we ignore.
-        let sent = unsafe { libc::kill(pid, signal) };
-        assert_eq!(sent, 0, "kill({pid}, {signal}) failed");
-    }
-
-    fn wait_for_exit(&mut self, after: &str, within: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + within;
-        loop {
-            match self.child.try_wait().expect("poll the child") {
-                Some(status) => return status,
-                None if Instant::now() > deadline => {
-                    let _ = self.child.kill();
-                    panic!(
-                        "the agent did not exit within {within:?} of {after}\n\
-                         --- stderr ---\n{}",
-                        self.stderr()
-                    );
-                }
-                None => std::thread::sleep(Duration::from_millis(50)),
-            }
-        }
-    }
-
-    fn stdout_bytes(&self) -> usize {
-        self.seen_stdout.load(Ordering::SeqCst)
-    }
-
-    /// Wait until the agent's stderr contains `needle`.
-    fn wait_for_stderr(&self, needle: &str, within: Duration) {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            if self.stderr().contains(needle) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!(
-            "{needle:?} never appeared on stderr within {within:?}\n--- stderr ---\n{}",
-            self.stderr()
-        );
-    }
+fn spawn(command: AgentCommand) -> AcpClient {
+    AcpClient::spawn(&command, REPLY_TIMEOUT).unwrap_or_else(|e| panic!("spawn {BIN}: {e:#}"))
 }
 
-impl Drop for Agent {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+/// Spawn the binary with the mock backend and a scripted model.
+fn spawn_mock(case: &str) -> AcpClient {
+    spawn_mock_with(case, &[])
+}
+
+/// Spawn the binary with the mock backend, plus extra flags.
+fn spawn_mock_with(case: &str, extra: &[&str]) -> AcpClient {
+    spawn(extra.iter().fold(mock_command(case), |c, a| c.arg(*a)))
+}
+
+/// Spawn the binary from a chosen launch directory, which is what the
+/// default workspace mount is about.
+fn spawn_mock_from(case: &str, cwd: &Path, extra: &[&str]) -> AcpClient {
+    spawn(extra.iter().fold(mock_command(case), |c, a| c.arg(*a)).cwd(cwd))
+}
+
+/// `initialize`, then `session/new` at `cwd`; the session id.
+fn open_session(agent: &mut AcpClient, cwd: &Path) -> String {
+    agent.initialize().expect("initialize");
+    agent.new_session(cwd).expect("session/new")
+}
+
+/// Send one prompt and return its response.
+fn prompt(agent: &mut AcpClient, session: &str, text: &str) -> Value {
+    agent.prompt(session, text).unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+/// Every `agent_message_chunk` text seen so far, joined.
+fn agent_text(agent: &AcpClient) -> String {
+    client::agent_text(agent.updates())
+}
+
+/// Close stdin, the way an ACP client shutting down does, and wait for the
+/// exit.
+fn close_stdin_and_wait(agent: &mut AcpClient, within: Duration) -> std::process::ExitStatus {
+    agent.shutdown(within).unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+fn wait_for_exit(agent: &mut AcpClient, after: &str, within: Duration) -> std::process::ExitStatus {
+    agent.wait_exit(after, within).unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+fn wait_for_stderr(agent: &AcpClient, needle: &str, within: Duration) {
+    agent.wait_for_stderr(needle, within).unwrap_or_else(|e| panic!("{e:#}"));
+}
+
+/// Send a signal to the running agent, the way a service manager or a
+/// Ctrl-C does.
+fn signal(agent: &AcpClient, signal: i32) {
+    let pid = agent.pid() as i32;
+    // SAFETY: `kill(2)` on a child this process spawned and has not
+    // reaped; an invalid pid would only return an error we check.
+    let sent = unsafe { libc::kill(pid, signal) };
+    assert_eq!(sent, 0, "kill({pid}, {signal}) failed");
 }
 
 /// The state directory the binary reports at startup, so a test can watch
@@ -367,7 +138,7 @@ fn state_dir_from(stderr: &str) -> PathBuf {
 }
 
 /// Poll until `check` passes, failing loudly with stderr on timeout.
-fn wait_for(label: &str, agent: &Agent, mut check: impl FnMut() -> bool) {
+fn wait_for(label: &str, agent: &AcpClient, mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if check() {
@@ -384,37 +155,36 @@ fn wait_for(label: &str, agent: &Agent, mut check: impl FnMut() -> bool) {
 #[test]
 fn a_prompt_runs_a_turn_and_ends_it() {
     let cwd = scratch_dir("chat-cwd");
-    let mut agent = Agent::spawn_mock("chat");
+    let mut agent = spawn_mock("chat");
 
-    let init = agent.initialize();
+    let init = agent.initialize().expect("initialize");
     assert_eq!(
         init.get("protocolVersion").and_then(Value::as_u64),
         Some(1),
         "we speak ACP v1: {init}"
     );
 
-    let session = agent.new_session(&cwd);
-    let response = agent.prompt(&session, "say something");
+    let session = agent.new_session(&cwd).expect("session/new");
+    let response = prompt(&mut agent, &session, "say something");
     assert_eq!(
         response.get("stopReason").and_then(Value::as_str),
         Some("end_turn"),
         "a scripted turn ends cleanly: {response}"
     );
     assert!(
-        agent.agent_text().contains("solo mock speaking"),
+        agent_text(&agent).contains("solo mock speaking"),
         "the model's text reached the client as a chunk; saw {:?}",
-        agent.agent_text()
+        agent_text(&agent)
     );
 }
 
 #[test]
 fn a_file_tool_call_writes_inside_the_session_cwd() {
     let cwd = scratch_dir("file-cwd");
-    let mut agent = Agent::spawn_mock("file");
+    let mut agent = spawn_mock("file");
 
-    agent.initialize();
-    let session = agent.new_session(&cwd);
-    let response = agent.prompt(&session, "write the file");
+    let session = open_session(&mut agent, &cwd);
+    let response = prompt(&mut agent, &session, "write the file");
     assert_eq!(
         response.get("stopReason").and_then(Value::as_str),
         Some("end_turn"),
@@ -474,14 +244,13 @@ impl Drop for Outside {
 #[test]
 fn a_named_mount_makes_a_directory_writable() {
     let outside = Outside::new("mounted");
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "file",
         &["--mount", outside.path().to_str().expect("utf-8 path")],
     );
 
-    agent.initialize();
-    let session = agent.new_session(outside.path());
-    let response = agent.prompt(&session, "write the file");
+    let session = open_session(&mut agent, outside.path());
+    let response = prompt(&mut agent, &session, "write the file");
     assert_eq!(
         response.get("stopReason").and_then(Value::as_str),
         Some("end_turn"),
@@ -508,11 +277,10 @@ fn an_unmounted_directory_stays_read_only() {
     // Launched from the crate directory (under $HOME/src, already writable),
     // so the default cwd mount adds nothing and this session cwd is reached
     // only through the read-only root.
-    let mut agent = Agent::spawn_mock("file");
+    let mut agent = spawn_mock("file");
 
-    agent.initialize();
-    let session = agent.new_session(outside.path());
-    agent.prompt(&session, "write the file");
+    let session = open_session(&mut agent, outside.path());
+    prompt(&mut agent, &session, "write the file");
 
     assert!(
         !outside.wrote(),
@@ -523,11 +291,10 @@ fn an_unmounted_directory_stays_read_only() {
 #[test]
 fn the_launch_cwd_is_mounted_by_default() {
     let outside = Outside::new("launch-cwd");
-    let mut agent = Agent::spawn_mock_from("file", outside.path(), &[]);
+    let mut agent = spawn_mock_from("file", outside.path(), &[]);
 
-    agent.initialize();
-    let session = agent.new_session(outside.path());
-    agent.prompt(&session, "write the file");
+    let session = open_session(&mut agent, outside.path());
+    prompt(&mut agent, &session, "write the file");
 
     assert!(
         outside.wrote(),
@@ -540,11 +307,10 @@ fn the_launch_cwd_is_mounted_by_default() {
 #[test]
 fn no_cwd_mount_leaves_the_launch_directory_read_only() {
     let outside = Outside::new("no-cwd-mount");
-    let mut agent = Agent::spawn_mock_from("file", outside.path(), &["--no-cwd-mount"]);
+    let mut agent = spawn_mock_from("file", outside.path(), &["--no-cwd-mount"]);
 
-    agent.initialize();
-    let session = agent.new_session(outside.path());
-    agent.prompt(&session, "write the file");
+    let session = open_session(&mut agent, outside.path());
+    prompt(&mut agent, &session, "write the file");
 
     assert!(
         !outside.wrote(),
@@ -655,7 +421,7 @@ fn a_named_gate_policy_lands_in_this_kernels_config() {
     let body = "[global]\nallow = [\n  \"ls\",\n]\n";
     std::fs::write(&policy, body).expect("write the gate policy");
 
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "chat",
         &[
             "--state-dir",
@@ -666,7 +432,7 @@ fn a_named_gate_policy_lands_in_this_kernels_config() {
     );
     // The policy is installed once the kernel is up, which `initialize`
     // proves.
-    agent.initialize();
+    agent.initialize().expect("initialize");
 
     let installed = state.join("config").join("kernel").join("gate.toml");
     wait_for("the gate policy to be installed", &agent, || {
@@ -678,7 +444,7 @@ fn a_named_gate_policy_lands_in_this_kernels_config() {
         "the policy is copied verbatim"
     );
 
-    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(status.code(), Some(0));
     assert!(state.is_dir(), "a named state directory survives the exit");
 }
@@ -717,7 +483,7 @@ fn an_rc_overlay_marker_reaches_the_contexts_system_instructions() {
     let marker = "MARKER-rc-overlay-test-3f9c7a21-unique-instruction-sentence";
     write_marker_overlay(&overlay, marker);
 
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "chat",
         &[
             "--state-dir",
@@ -726,14 +492,14 @@ fn an_rc_overlay_marker_reaches_the_contexts_system_instructions() {
             overlay.to_str().expect("utf-8 overlay path"),
         ],
     );
-    agent.initialize();
+    agent.initialize().expect("initialize");
     let cwd = scratch_dir("rc-overlay-cwd");
     // `session/new` runs the create lifecycle synchronously, so the
     // instructions are already durable blocks once this returns; no prompt
     // is needed.
-    let session = agent.new_session(&cwd);
+    let session = agent.new_session(&cwd).expect("session/new");
 
-    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
 
     let context_id = kaijutsu_types::ContextId::parse(&session)
@@ -822,22 +588,22 @@ const SERVING: &str = "serving ACP v1 on stdio";
 
 #[test]
 fn a_signal_removes_the_temp_state_before_exiting() {
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        let mut agent = Agent::spawn_mock("chat");
-        agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let mut agent = spawn_mock("chat");
+        wait_for_stderr(&agent, SERVING, Duration::from_secs(60));
         let state = state_dir_from(&agent.stderr());
         assert!(state.is_dir(), "{} exists while serving", state.display());
 
-        agent.signal(signal);
-        let status = agent.wait_for_exit("the signal", Duration::from_secs(30));
+        signal(&agent, sig);
+        let status = wait_for_exit(&mut agent, "the signal", Duration::from_secs(30));
         assert!(
             status.code().is_some(),
-            "signal {signal}: the agent exits rather than dying on the signal: {status:?}"
+            "signal {sig}: the agent exits rather than dying on the signal: {status:?}"
         );
         assert_eq!(
             agent.stdout_bytes(),
             0,
-            "signal {signal}: nothing was asked, so stdout must have stayed empty"
+            "signal {sig}: nothing was asked, so stdout must have stayed empty"
         );
         wait_for("the temp state directory to be removed", &agent, || {
             !state.exists()
@@ -848,14 +614,14 @@ fn a_signal_removes_the_temp_state_before_exiting() {
 #[test]
 fn a_signal_leaves_a_named_state_directory_alone() {
     let state = scratch_dir("signal-state").join("state");
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "chat",
         &["--state-dir", state.to_str().expect("utf-8 state path")],
     );
-    agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+    wait_for_stderr(&agent, SERVING, Duration::from_secs(60));
 
-    agent.signal(libc::SIGTERM);
-    agent.wait_for_exit("the signal", Duration::from_secs(30));
+    signal(&agent, libc::SIGTERM);
+    wait_for_exit(&mut agent, "the signal", Duration::from_secs(30));
     assert!(
         state.join("kernel.db").is_file(),
         "a named state directory is the operator's, never ours to remove"
@@ -866,11 +632,11 @@ fn a_signal_leaves_a_named_state_directory_alone() {
 /// non-zero, and still take its temp state with it.
 #[test]
 fn a_kernel_that_fails_while_serving_exits_and_cleans_up() {
-    let mut agent = Agent::spawn_mock_with("chat", &["--fail-kernel-after-serving"]);
-    agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+    let mut agent = spawn_mock_with("chat", &["--fail-kernel-after-serving"]);
+    wait_for_stderr(&agent, SERVING, Duration::from_secs(60));
     let state = state_dir_from(&agent.stderr());
 
-    let status = agent.wait_for_exit("the kernel failure", Duration::from_secs(30));
+    let status = wait_for_exit(&mut agent, "the kernel failure", Duration::from_secs(30));
     assert_eq!(
         status.code(),
         Some(1),
@@ -891,11 +657,11 @@ fn a_kernel_that_fails_while_serving_exits_and_cleans_up() {
 /// must not leave the ACP client waiting on a kernel that no longer exists.
 #[test]
 fn a_kernel_panic_while_serving_exits_and_cleans_up() {
-    let mut agent = Agent::spawn_mock_with("chat", &["--panic-kernel-after-serving"]);
-    agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+    let mut agent = spawn_mock_with("chat", &["--panic-kernel-after-serving"]);
+    wait_for_stderr(&agent, SERVING, Duration::from_secs(60));
     let state = state_dir_from(&agent.stderr());
 
-    let status = agent.wait_for_exit("the kernel panic", Duration::from_secs(30));
+    let status = wait_for_exit(&mut agent, "the kernel panic", Duration::from_secs(30));
     assert_eq!(
         status.code(),
         Some(1),
@@ -970,20 +736,10 @@ fn proc_environ_is_unreadable_to_same_uid_readers() {
     }
 
     let sentinel = format!("SOLO_ACP_PROC_ENVIRON_SENTINEL_{}", std::process::id());
-    let mut command = Command::new(BIN);
-    command
-        .arg("--backend-kind")
-        .arg("mock")
-        .arg("--model")
-        .arg("solo-mock")
-        .env("KJ_MOCK_SCRIPT_DIR", mock_scripts("chat"))
-        .env("TMPDIR", scratch_dir("tmp"))
-        .env("RUST_LOG", "info")
-        .env(&sentinel, "leaked-if-this-is-readable");
-    let agent = Agent::spawn(command);
-    agent.wait_for_stderr(SERVING, Duration::from_secs(60));
+    let agent = spawn(mock_command("chat").env(&sentinel, "leaked-if-this-is-readable"));
+    wait_for_stderr(&agent, SERVING, Duration::from_secs(60));
 
-    let pid = agent.child.id();
+    let pid = agent.pid();
     let environ_path = format!("/proc/{pid}/environ");
     match std::fs::read(&environ_path) {
         Err(e) => {
@@ -1011,13 +767,13 @@ fn proc_environ_is_unreadable_to_same_uid_readers() {
 #[test]
 fn max_tokens_overrides_the_written_defaults_row() {
     let state = scratch_dir("max-tokens-state").join("state");
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "chat",
         &["--state-dir", state.to_str().expect("utf-8 state path"), "--max-tokens", "4096"],
     );
-    agent.initialize();
+    agent.initialize().expect("initialize");
 
-    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(status.code(), Some(0));
 
     let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
@@ -1038,13 +794,13 @@ fn max_tokens_overrides_the_written_defaults_row() {
 #[test]
 fn without_max_tokens_the_factory_ceiling_stands_in_the_written_defaults_row() {
     let state = scratch_dir("max-tokens-default-state").join("state");
-    let mut agent = Agent::spawn_mock_with(
+    let mut agent = spawn_mock_with(
         "chat",
         &["--state-dir", state.to_str().expect("utf-8 state path")],
     );
-    agent.initialize();
+    agent.initialize().expect("initialize");
 
-    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(status.code(), Some(0));
 
     let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
@@ -1058,13 +814,13 @@ fn without_max_tokens_the_factory_ceiling_stands_in_the_written_defaults_row() {
 
 #[test]
 fn stdin_eof_exits_clean_and_removes_the_temp_state() {
-    let mut agent = Agent::spawn_mock("chat");
-    agent.initialize();
+    let mut agent = spawn_mock("chat");
+    agent.initialize().expect("initialize");
 
     let state = state_dir_from(&agent.stderr());
     assert!(state.is_dir(), "{} should exist while serving", state.display());
 
-    let status = agent.close_stdin_and_wait(Duration::from_secs(60));
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
     assert_eq!(
         status.code(),
         Some(0),

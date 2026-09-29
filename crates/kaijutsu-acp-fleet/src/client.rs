@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -124,6 +125,9 @@ pub struct AcpClient {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     stderr: Arc<Mutex<String>>,
+    /// Bytes the agent has written to stdout, counted as the reader thread
+    /// reads them, whether or not a caller has handled them yet.
+    stdout_bytes: Arc<AtomicUsize>,
     next_id: i64,
     timeout: Duration,
     policy: PermissionPolicy,
@@ -155,9 +159,12 @@ impl AcpClient {
 
         let stdout = child.stdout.take().context("the child has no piped stdout")?;
         let (tx, lines) = channel();
+        let stdout_bytes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&stdout_bytes);
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { return };
+                counter.fetch_add(line.len() + 1, Ordering::SeqCst);
                 if tx.send(line).is_err() {
                     return;
                 }
@@ -180,6 +187,7 @@ impl AcpClient {
             child,
             lines,
             stderr,
+            stdout_bytes,
             next_id: 1,
             timeout,
             policy: PermissionPolicy::default(),
@@ -210,6 +218,31 @@ impl AcpClient {
         let lines: Vec<&str> = all.lines().collect();
         let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
         lines[start..].join("\n")
+    }
+
+    /// The agent's process id: the `podman` client's in contained mode.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Bytes the agent has written to stdout so far. stdout is the ACP wire,
+    /// so an agent that was never asked anything leaves this at zero.
+    pub fn stdout_bytes(&self) -> usize {
+        self.stdout_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Wait up to `within` for `needle` to appear on the agent's stderr.
+    pub fn wait_for_stderr(&self, needle: &str, within: Duration) -> Result<()> {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.stderr().contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!("{needle:?} never appeared on the agent's stderr within {within:?}\n--- agent stderr ---\n{}", self.stderr());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// `session/update` params, in arrival order.
@@ -433,6 +466,12 @@ impl AcpClient {
     /// `within` for the agent to exit. Kill it if it does not.
     pub fn shutdown(&mut self, within: Duration) -> Result<ExitStatus> {
         drop(self.stdin.take());
+        self.wait_exit("stdin closing", within)
+    }
+
+    /// Wait up to `within` for the agent to exit on its own, after `after`
+    /// (a signal, a failure it was told to stage). Kill it if it does not.
+    pub fn wait_exit(&mut self, after: &str, within: Duration) -> Result<ExitStatus> {
         let deadline = Instant::now() + within;
         loop {
             if let Some(status) = self.child.try_wait().context("poll the agent")? {
@@ -442,7 +481,7 @@ impl AcpClient {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 bail!(
-                    "the agent did not exit within {within:?} of stdin closing; killed it\n\
+                    "the agent did not exit within {within:?} of {after}; killed it\n\
                      --- agent stderr (tail) ---\n{}",
                     self.stderr_tail()
                 );

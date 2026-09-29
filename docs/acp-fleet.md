@@ -177,3 +177,5 @@ command. It is never skipped.
 The client in `kaijutsu_acp_fleet::client` is independent of kaijutsu. It
 spawns any ACP agent command and exposes the raw `session/update`
 notifications, so other tests can drive an agent with it directly.
+`crates/kaijutsu-solo-acp/tests/solo_acp_stdio.rs` uses it for the binary's
+own boot, mount, signal, and exit tests.
