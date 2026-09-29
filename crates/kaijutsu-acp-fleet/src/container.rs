@@ -1,7 +1,7 @@
 //! The podman commands contained scenarios run with.
 //!
-//! A contained agent runs as `podman run -i --rm --network=none` in the
-//! fleet image (`contrib/Containerfile.fleet`). It sees three mounts and
+//! A contained agent runs as `podman run -i --rm --network=none
+//! --pids-limit=512` in the fleet image (`contrib/Containerfile.fleet`). It sees three mounts and
 //! nothing else of the host: the agent binary (read-only), the scenario's
 //! fleet files — mock script, gate policy, rc overlay — (read-only), and the
 //! workspace, its only writable path. Script verifiers run in a fresh
@@ -10,9 +10,10 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::client::AgentCommand;
 
@@ -29,8 +30,28 @@ pub const FLEET: &str = "/fleet";
 /// Where the agent binary is mounted, read-only.
 pub const AGENT: &str = "/opt/kaijutsu/kaijutsu-solo-acp";
 
-/// Fail, naming the build command, unless podman runs and has the image.
+/// The most processes and threads one container may hold. A contained
+/// agent uses about 70 on a 24-core host; the limit stops a runaway command
+/// from exhausting the host's.
+pub const PIDS_LIMIT: u32 = 512;
+
+/// The Containerfile this crate was built with. The image carries a copy at
+/// [`IMAGE_CONTAINERFILE`], and [`preflight`] refuses an image whose copy
+/// differs.
+pub const CONTAINERFILE: &str = include_str!("../../../contrib/Containerfile.fleet");
+
+/// Where the image keeps the copy of the Containerfile it was built from.
+pub const IMAGE_CONTAINERFILE: &str = "/opt/kaijutsu/Containerfile.fleet";
+
+/// Fail, naming the build command, unless podman runs and has the image, and
+/// the image was built from the current `contrib/Containerfile.fleet`. The
+/// answer is computed once per process.
 pub fn preflight() -> Result<()> {
+    static CHECKED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    CHECKED.get_or_init(|| check_image().map_err(|e| format!("{e:#}"))).clone().map_err(|e| anyhow!(e))
+}
+
+fn check_image() -> Result<()> {
     let status = Command::new("podman")
         .args(["image", "exists", IMAGE])
         .stdout(Stdio::null())
@@ -39,6 +60,26 @@ pub fn preflight() -> Result<()> {
         .with_context(|| format!("run podman, which contained scenarios need; install it, then run `{BUILD_COMMAND}`"))?;
     if !status.success() {
         bail!("the image {IMAGE} is missing; build it from the repository root with `{BUILD_COMMAND}`");
+    }
+    let copy = Command::new("podman")
+        .args(["run", "--rm", "--network=none", IMAGE, "cat", IMAGE_CONTAINERFILE])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("read {IMAGE_CONTAINERFILE} from the image {IMAGE}"))?;
+    // An image with no copy predates the check; it is stale too.
+    let in_image = if copy.status.success() { String::from_utf8_lossy(&copy.stdout).into_owned() } else { String::new() };
+    check_containerfile(&in_image)
+}
+
+/// Fail unless `in_image`, the image's copy of its Containerfile, is the one
+/// this crate was built with.
+fn check_containerfile(in_image: &str) -> Result<()> {
+    if in_image != CONTAINERFILE {
+        bail!(
+            "the image {IMAGE} is stale: it was not built from the current contrib/Containerfile.fleet; \
+             rebuild it from the repository root with `{BUILD_COMMAND}`"
+        );
     }
     Ok(())
 }
@@ -52,6 +93,7 @@ pub fn agent_command(agent: &Path, workspace: &Path, fleet: &Path, name: &str, a
         .arg("--rm")
         .arg("--init")
         .arg("--network=none")
+        .arg(format!("--pids-limit={PIDS_LIMIT}"))
         .arg("--name")
         .arg(name)
         .arg("-v")
@@ -99,6 +141,7 @@ pub fn run_script(workspace: &Path, script: &str, name: &str, within: Duration) 
     let mut child = Command::new("podman")
         .args(["run", "--rm", "--init", "--network=none", "--name", name, "-v"])
         .arg(format!("{}:{WORKSPACE}:rw", workspace.display()))
+        .arg(format!("--pids-limit={PIDS_LIMIT}"))
         .args(["-w", WORKSPACE, IMAGE, "bash", "-xeuo", "pipefail", "-c", script])
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
@@ -121,4 +164,38 @@ pub fn run_script(workspace: &Path, script: &str, name: &str, within: Duration) 
     let output = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
     Ok(ScriptRun { success: status.success(), code: status.code(), output })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(command: &AgentCommand) -> Vec<String> {
+        command.args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn the_agent_container_limits_its_process_count() {
+        let command = agent_command(Path::new("/a"), Path::new("/w"), Path::new("/f"), "n", &[]);
+        let args = args(&command);
+        let image = args.iter().position(|a| a == IMAGE).expect("the image is named");
+        assert!(args[..image].contains(&format!("--pids-limit={PIDS_LIMIT}")), "{args:?}");
+    }
+
+    #[test]
+    fn an_image_built_from_this_containerfile_is_current() {
+        check_containerfile(CONTAINERFILE).unwrap();
+    }
+
+    #[test]
+    fn an_image_built_from_another_containerfile_is_stale() {
+        let error = format!("{:#}", check_containerfile("FROM somewhere-else\n").unwrap_err());
+        assert!(error.contains("stale") && error.contains(BUILD_COMMAND), "{error}");
+    }
+
+    #[test]
+    fn an_image_with_no_containerfile_copy_is_stale() {
+        let error = format!("{:#}", check_containerfile("").unwrap_err());
+        assert!(error.contains("stale") && error.contains(BUILD_COMMAND), "{error}");
+    }
 }

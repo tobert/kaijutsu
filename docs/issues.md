@@ -2448,8 +2448,6 @@ for when it's contained in docker". Open:
   the command asked about.
 - **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
   prompt. Mock replies a scenario never used go unreported.
-- **Nothing notices a stale fleet image**, and contained runs set no
-  `--pids-limit`.
 - Add the `kaijutsu-acp --connect` agent.
 - **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
   the kernel's `turn_interrupted=true` log line from stderr. The bridge's

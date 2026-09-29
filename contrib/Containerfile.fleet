@@ -19,3 +19,7 @@ RUN git config --system user.name "acp fleet" \
  && git config --system --add safe.directory '*'
 
 RUN mkdir -p /opt/kaijutsu /work /fleet
+
+# The fleet refuses an image whose copy of this file differs from the one it
+# was built with, so a stale image fails loudly. Keep this step last.
+COPY Containerfile.fleet /opt/kaijutsu/Containerfile.fleet

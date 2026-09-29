@@ -193,8 +193,10 @@ reply for it; `fleet/permission-allow-deny.toml` shows the whole shape.
 
 ## Contained mode
 
-The agent runs as `podman run -i --rm --init --network=none` in the
-`kaijutsu-fleet` image (`contrib/Containerfile.fleet`, Arch with `git`).
+The agent runs as `podman run -i --rm --init --network=none
+--pids-limit=512` in the `kaijutsu-fleet` image
+(`contrib/Containerfile.fleet`, Arch with `git`). A contained agent uses
+about 70 processes and threads on a 24-core host.
 It sees three mounts: the host's agent binary at
 `/opt/kaijutsu/kaijutsu-solo-acp` (read-only), the fleet files at `/fleet`
 (read-only), and the workspace at `/work`, its only writable path and the
@@ -204,11 +206,16 @@ The yolo posture is a gate with `uncovered = "allow"`: no statement asks, and
 no hook sees a program the tier allows.
 
 A `script` verifier runs with `bash -xeuo pipefail` in a fresh
-`--network=none` container over the same workspace, and passes on exit 0.
+`--network=none --pids-limit=512` container over the same workspace, and
+passes on exit 0.
 Scripts never run on the host; the loader refuses a `script` in host mode.
 
-With no podman or no image, a contained scenario fails and names the build
-command. It is never skipped.
+With no podman, no image, or a stale image, a contained scenario fails and
+names the build command. It is never skipped. The image keeps a copy of the
+Containerfile it was built from at `/opt/kaijutsu/Containerfile.fleet`; an
+image whose copy differs from `contrib/Containerfile.fleet` as the fleet was
+compiled is stale. Rebuild after editing the Containerfile. A newer
+`archlinux:latest` does not make the image stale.
 
 The client in `kaijutsu_acp_fleet::client` is independent of kaijutsu. It
 spawns any ACP agent command and exposes the raw `session/update`
