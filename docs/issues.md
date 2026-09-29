@@ -2447,7 +2447,14 @@ for when it's contained in docker". Open:
 - **A hook-raised permission request's title is the hook's stderr**, not
   the command asked about.
 - **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
-  prompt. Mock replies a scenario never used go unreported.
+  prompt. Mock replies a scenario never used go unreported. The wait has no
+  explicit replacement today: ACP v1 has no idle notification, and the
+  bridge reports turn completion only for the interactive turn a
+  `session/prompt` waits on (`crates/kaijutsu-acp/src/session.rs`). A
+  follow-up turn started by a permission answer or a background completion
+  ends with no ACP message. Replacing the wait needs the bridge to say so,
+  for example with an extension notification or `_meta` on a
+  `usage_update`; that is a design choice.
 - Add the `kaijutsu-acp --connect` agent.
 - **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
   the kernel's `turn_interrupted=true` log line from stderr. The bridge's
