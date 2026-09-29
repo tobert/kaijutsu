@@ -581,10 +581,12 @@ pub(crate) async fn run_gate_recorded(
     //    with the answer already given and no way for a reviewer to stop it by
     //    answering again.
     //
-    //    Strictly after the rules, so a DENY rule added since the answer
-    //    still wins. Single-use by construction: `redeem_ask` succeeds for
-    //    exactly one caller, so an approval authorizes one execution and
-    //    never becomes a standing permission — that is what rules are for.
+    //    Only an ask with no stored command is redeemed here (a `kj` verb
+    //    whose caller re-runs itself). An ask with a stored command runs
+    //    once in the approval worker, which is the only place it runs.
+    //    Single-use by construction: `redeem_ask` succeeds for exactly one
+    //    caller, so an approval authorizes one execution and never becomes
+    //    a standing permission — that is what rules are for.
     // Result-review answers belong to a retained execution owner. An identical
     // later result must not collect that owner's answer through this retry path.
     if matches!(verdict, AskVerdict::Escalate) && spec.origin != Origin::HookResult {
@@ -598,8 +600,13 @@ pub(crate) async fn run_gate_recorded(
                 let Some((request_id, status)) = found else { return Ok(None); };
                 let row = db.get_approval(&request_id)?
                     .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
-                let held = db.approval_pair_expected(&request_id)?
-                    && (row.exec_source.is_some() || !db.approval_pair_ready(&request_id)?);
+                // An allowed ask with a stored command runs only in the
+                // approval worker, with the values its reviewer saw; a retry
+                // never spends it. A denial reaches the retry as a denial. A
+                // paired caller's answer waits for its pair.
+                let held = (row.exec_source.is_some() && status.is_allowed())
+                    || (db.approval_pair_expected(&request_id)?
+                        && (row.exec_source.is_some() || !db.approval_pair_ready(&request_id)?));
                 if held { return Ok(Some((request_id, status, row, true))); }
                 Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false)))
             };
@@ -614,9 +621,14 @@ pub(crate) async fn run_gate_recorded(
             }
         };
         match answered {
-            Ok(Some((request_id, _, _, true))) => {
-                return GateOutcome::unavailable_without_row(format!(
-                    "Approval {request_id} belongs to its original invocation. No new command ran. Inspect it with kj ledger show {request_id}."));
+            Ok(Some((request_id, _, row, true))) => {
+                return GateOutcome::unavailable_without_row(if row.exec_source.is_some() {
+                    format!("Approval {request_id} runs its command once, in the approval worker. \
+                             No new command ran. Inspect it with kj ledger show {request_id}.")
+                } else {
+                    format!("Approval {request_id} belongs to its original invocation. No new command ran. \
+                             Inspect it with kj ledger show {request_id}.")
+                });
             }
             Ok(Some((request_id, status, row, false))) => {
                 approval_span.record("ask.id", request_id.as_str());
@@ -1220,6 +1232,30 @@ mod tests {
             assert_eq!(approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &id).unwrap().is_some(), !executable,
                 "only a non-executable answer is released back to retry after publication");
         }
+    }
+
+    /// An approved ask with a stored command runs once, in the approval
+    /// worker, with the cwd, env, and shell policy the reviewer saw. A retry
+    /// of the same command never spends that answer, paired or not, so the
+    /// retry cannot run it with values changed since the ask.
+    ///
+    /// Falsified by letting an unpaired retry redeem the answer: the retry
+    /// comes back Allowed and the row is redeemed.
+    #[tokio::test]
+    async fn a_retry_never_runs_an_approved_command() {
+        let d = gate_dispatcher().await;
+        let caller = registered_caller(&d);
+        let spec = || crate::kj::shell_gate::build_shell_gate_spec("rm -rf ${DIR}").unwrap();
+        let first = run_gate(d.kernel(), &caller, spec(), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        assert_eq!(first.verdict, GateVerdict::Pending);
+        let id = first.ask.unwrap().request_id;
+        answer(&d, &id, true);
+        let retry = run_gate(d.kernel(), &caller, spec(), d.kernel.ledger_flows(), &crate::kj::gate_policy::no_config()).await;
+        assert_eq!(retry.verdict, GateVerdict::Unavailable, "{}", retry.reason);
+        assert!(retry.reason.contains(&id) && retry.reason.contains("approval worker"), "{}", retry.reason);
+        assert!(approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &id).unwrap().is_none(),
+            "the answer stays for the worker");
+        assert_eq!(d.kernel_db.lock().undelivered_answers().unwrap().len(), 1);
     }
 
     #[tokio::test]

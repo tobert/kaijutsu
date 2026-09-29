@@ -3362,8 +3362,9 @@ mod tests {
             "{}",
             result.message()
         );
-        let redeemed = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
-        assert!(redeemed.allowed(), "the answered ask is still redeemed once: {}", redeemed.reason);
+        let retry = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
+        assert!(retry.reason.contains("approval worker"), "the approved command is the worker's: {}", retry.reason);
+        assert!(d.kernel_db.lock().redeem_ask(&request_id).unwrap(), "the worker spends the answer once");
         let again = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
         assert_eq!(again.verdict, crate::kj::gate::GateVerdict::Pending, "no rule was learned");
     }

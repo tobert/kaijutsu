@@ -3110,16 +3110,15 @@ impl Broker {
     }
 
     /// The gate policy's ask-tier statements in `command`, described for an
-    /// ask. `Ok(None)` when none is ask-tier, or a statement is deny-tier
-    /// (PreCall refused those already). `Err` when the program does not
-    /// plan or the config does not load: the gate cannot say what the
-    /// program asks, so the call is refused.
+    /// ask. `Ok(None)` when none is ask-tier, a statement is deny-tier
+    /// (PreCall refused those already), or the program does not plan: the
+    /// executor parses with the same kaish parser, so it runs nothing and
+    /// reports the parse error itself. `Err` when the config does not load,
+    /// so the call is refused.
     async fn ask_tier_description(&self, command: &str, ctx: &CallContext) -> Result<Option<String>, String> {
-        let statements = kaish_kernel::ast::plan::plan_program(command)
-            .map_err(|errors| {
-                let errors: Vec<String> = errors.iter().map(|e| e.format(command)).collect();
-                format!("the gate cannot plan this program:\n{}", errors.join("\n"))
-            })?;
+        let Ok(statements) = kaish_kernel::ast::plan::plan_program(command) else {
+            return Ok(None);
+        };
         let load = self.gate_config_load().await;
         let config = load.as_ref().map_err(|e| e.to_string())?;
         let context_type = self.context_type_for(ctx).await;
@@ -3137,8 +3136,7 @@ impl Broker {
     /// the `shell_write` tool path, so the ask opens here, once the hooks
     /// have let the call proceed: a hook's deny refuses without asking a
     /// human first. `None` means no ask-tier statement, or a human already
-    /// allowed it. A program that does not plan, or a config that stopped
-    /// loading, is gate unavailable. See `docs/gate-policy-tuning.md`,
+    /// allowed it. A config that stopped loading is gate unavailable. See `docs/gate-policy-tuning.md`,
     /// "Settled while reviewing".
     async fn ask_tier_ask(
         &self,
@@ -10639,8 +10637,10 @@ mod tests {
 
         answer_pending_ask(db.clone(), true);
         match broker.shell_pre_call_hooks("echo hi; git push origin main", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
-            other => panic!("the allowed retry must proceed, got {other:?}"),
+            ShellHookVerdict::Denied(err) => {
+                assert!(err.to_string().contains("approval worker"), "the approved command runs in the worker: {err}");
+            }
+            other => panic!("a retry must leave the approved command to the worker, got {other:?}"),
         }
         assert!(db.lock().list_pending_asks().unwrap().is_empty(), "an answered ask is not asked again");
     }
@@ -10679,21 +10679,6 @@ mod tests {
             other => panic!("a config broken mid-call must refuse, got {other:?}"),
         }
         assert!(kj.kernel_db().lock().list_pending_asks().unwrap().is_empty(), "nobody is asked");
-    }
-
-    /// A program the gate cannot plan is refused on the RPC shell path, as
-    /// it is on the `shell_write` tool path, with the parse failure named.
-    ///
-    /// Falsified by reading "does not plan" as "nothing asks": it proceeds.
-    #[tokio::test]
-    async fn the_rpc_shell_path_refuses_a_program_that_does_not_plan() {
-        let (broker, _kernel, kj, _dir) =
-            wired_kaish_broker_with_gate_toml("rpc-no-plan", "[global]\nask = [\"git push\"]\n").await;
-        let ctx = approval_call_context(&kj, "rpc-no-plan");
-        match broker.shell_pre_call_hooks("echo 'unterminated", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Denied(err) => assert!(err.to_string().contains("cannot plan"), "{err}"),
-            other => panic!("an unplanned program must refuse, got {other:?}"),
-        }
     }
 
     /// A hook's deny refuses an ask-tier statement on the RPC shell path

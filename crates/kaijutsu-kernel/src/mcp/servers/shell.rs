@@ -564,6 +564,22 @@ mod tests {
     /// that ask directly — no poll loop, no spawned task — the way a human
     /// running `kj ledger allow` would from another shell, then retry the
     /// same call to redeem it.
+    /// The sandbox posture: every uncovered statement is allowed without an
+    /// ask, for tests whose subject is what happens after the gate.
+    async fn allow_uncovered(d: &crate::kj::KjDispatcher) {
+        use crate::vfs::VfsOps;
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"),
+            b"[global]\nuncovered = \"allow\"\n").await.unwrap();
+    }
+
+    /// An approved `shell_write` ask runs in the approval worker, never in
+    /// the caller's retry: the retry is refused and the answer stays for the
+    /// worker.
+    fn assert_retry_leaves_it_to_the_worker(err: &McpError) {
+        assert!(err.is_refusal(RefusalKind::GateUnavailable), "{err:?}");
+        assert!(err.to_string().contains("approval worker"), "{err}");
+    }
+
     fn answer_pending_ask(
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
         allow: bool,
@@ -654,15 +670,21 @@ mod tests {
         );
 
         answer_pending_ask(d.kernel_db().clone(), true);
-
-        let result = broker
+        let retry = broker
             .call_tool(call_write("echo hello-shell-write"), &cc, CancellationToken::new())
             .await
-            .expect("shell_write call should succeed once the pending ask is answered");
+            .expect_err("the approved command runs in the approval worker, not in a retry");
+        assert_retry_leaves_it_to_the_worker(&retry);
+
+        allow_uncovered(&d).await;
+        let result = broker
+            .call_tool(call_write("echo hello-shell-write-allowed"), &cc, CancellationToken::new())
+            .await
+            .expect("an allowed shell_write call runs through the broker");
 
         assert!(!result.is_error, "echo should not be an error");
         let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
-        assert!(out.contains("hello-shell-write"), "stdout missing, got: {out:?}");
+        assert!(out.contains("hello-shell-write-allowed"), "stdout missing, got: {out:?}");
     }
 
     /// The gate's deadline must be ordered under the broker's, so an
@@ -707,8 +729,8 @@ mod tests {
     /// — `run_gate` never waits): a rename of the old
     /// `shell_write_with_no_answer_escalates_and_times_out_refusing_the_call`,
     /// which pinned a wait that no longer exists.
-    /// The POST-gate half of the same rule: a program that parses, gets
-    /// approved, and is then refused by kaish's validator.
+    /// The POST-gate half of the same rule: a program that parses, passes
+    /// the gate, and is then refused by kaish's validator.
     ///
     /// The pre-gate test below cannot reach this branch — an unparseable
     /// program never builds a gate spec, so it never gets as far as
@@ -730,11 +752,7 @@ mod tests {
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(reviewer));
         let bad = "break";
-
-        let _ = broker
-            .call_tool(call_write(bad), &cc, CancellationToken::new())
-            .await;
-        answer_pending_ask(d.kernel_db().clone(), true);
+        allow_uncovered(&d).await;
 
         let result = broker
             .call_tool(call_write(bad), &cc, CancellationToken::new())
@@ -886,7 +904,7 @@ mod tests {
     /// ask with no special-casing by origin: one answering surface for
     /// every gated producer. No concurrency needed any more: the first call
     /// escalates and returns with the ask already durable, `kj ledger`
-    /// answers it directly, and the retry redeems the answer.
+    /// answers it directly, and the answer waits for the approval worker.
     #[tokio::test]
     async fn kj_ledger_answers_a_shell_write_ask_like_a_cc_send_ask() {
         let (broker, d) = wired().await;
@@ -941,18 +959,14 @@ mod tests {
             )
             .await;
         assert!(allow.is_ok(), "kj ledger allow must answer a shell_write ask: {allow:?}");
+        let answers = d.kernel_db().lock().undelivered_answers().unwrap();
+        assert!(answers.iter().any(|a| a.request_id == request_id), "the answer waits for the worker");
 
-        let result = broker
-            .call_tool(
-                call_write("echo answered-like-cc-send"),
-                &cc,
-                CancellationToken::new(),
-            )
+        let retry = broker
+            .call_tool(call_write("echo answered-like-cc-send"), &cc, CancellationToken::new())
             .await
-            .expect("shell_write call should succeed once kj ledger allows it");
-        assert!(!result.is_error);
-        let out = body_of(&result)["stdout"].as_str().unwrap_or_default().to_string();
-        assert!(out.contains("answered-like-cc-send"), "stdout missing, got: {out:?}");
+            .expect_err("the approved command runs in the approval worker, not in a retry");
+        assert_retry_leaves_it_to_the_worker(&retry);
     }
 
     #[tokio::test]
@@ -976,71 +990,6 @@ mod tests {
         assert!(!result.is_error, "{result:?}");
         assert_eq!(body_of(&result)["stdout"].as_str().unwrap().trim(), "/working");
         d.kernel().shutdown_runtime_worker().await.unwrap();
-    }
-
-    /// **The unresolvable-pin refusal.** The context's cwd at ask time is a
-    /// directory that does not exist. The ask escalates and is approved
-    /// exactly as normal, but redemption must refuse LOUDLY rather than
-    /// fall back to running in the context's current cwd — an approval
-    /// authorizes the operation it was asked about, and a pin that no
-    /// longer resolves means that operation cannot honestly be run at all.
-    ///
-    /// Falsified by deleting the `kaish.try_set_cwd` check in `call_tool`
-    /// (letting `opts.with_cwd` carry the dead pin straight into
-    /// `execute_with_options` unchecked): the call succeeded instead of
-    /// refusing — `kaish` accepted the nonexistent cwd silently and ran
-    /// `echo` anyway, which is precisely the silent-fallback failure this
-    /// refusal exists to prevent. Reverted.
-    #[tokio::test]
-    async fn a_pin_that_no_longer_resolves_refuses_loudly_not_a_fallback() {
-        let (broker, d) = wired().await;
-        let principal = PrincipalId::new();
-        let reviewer = PrincipalId::new();
-        let ctx_id = crate::kj::test_helpers::register_rooted_context(&d, Some("dead-pin"), principal);
-        {
-            let db = d.kernel_db().lock();
-            db.upsert_context_shell(&ContextShellRow {
-                context_id: ctx_id,
-                cwd: Some("/this/directory/does/not/exist/kaijutsu-gate-pin-test".to_string()),
-                updated_at: 0,
-            })
-            .unwrap();
-        }
-        let mut binding = ContextToolBinding::new();
-        binding.grant(Capability::Facade("shell_write".into()));
-        broker.set_binding(ctx_id, binding).await.unwrap();
-        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
-            .with_actor(principal, Some(reviewer));
-
-        let pending = broker
-            .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
-            .await
-            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
-        assert!(
-            pending.is_refusal(RefusalKind::Pending),
-            "an uncovered submission escalates to an open ask: {pending:?}"
-        );
-
-        answer_pending_ask(d.kernel_db().clone(), true);
-
-        let err = broker
-            .call_tool(call_write("echo should-not-run"), &cc, CancellationToken::new())
-            .await
-            .expect_err("a pin that no longer resolves must refuse, never fall back to the \
-                         context's current cwd");
-        match err {
-            McpError::Protocol(msg) => {
-                assert!(
-                    msg.contains("no longer resolves"),
-                    "refusal must name the unresolvable-pin condition: {msg}"
-                );
-                assert!(
-                    msg.contains("nothing was run"),
-                    "refusal must say nothing ran: {msg}"
-                );
-            }
-            other => panic!("expected a Protocol refusal, got {other:?}"),
-        }
     }
 
     /// A `kj` verb's structured `.data` must survive into the tool result's
@@ -1573,21 +1522,11 @@ mod tests {
         let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
             .with_actor(principal, Some(reviewer));
 
-        let pending = broker
-            .call_tool(call_write("id"), &cc, CancellationToken::new())
-            .await
-            .expect_err("an uncovered submission must escalate and return immediately, nothing run");
-        assert!(
-            pending.is_refusal(RefusalKind::Pending),
-            "an uncovered submission escalates to an open ask: {pending:?}"
-        );
-
-        answer_pending_ask(d.kernel_db().clone(), true);
-
+        allow_uncovered(&d).await;
         let result = broker
             .call_tool(call_write("id"), &cc, CancellationToken::new())
             .await
-            .expect("shell_write call should succeed once the pending ask is answered");
+            .expect("an allowed shell_write call runs");
         assert!(!result.is_error, "`id` should run and exit 0: {result:?}");
         let out = streams_of(&result);
         assert!(
@@ -1788,9 +1727,7 @@ mod tests {
                     .with_actor(principal, Some(PrincipalId::new()));
                 let code = "export TOOL_STATE=kept; echo $TOOL_STATE";
                 if !read_only {
-                    let pending = broker.call_tool(call_write(code), &cc, CancellationToken::new()).await.unwrap_err();
-                    assert!(matches!(pending, McpError::Refused(ref r) if r.kind == RefusalKind::Pending));
-                    answer_pending_ask(d.kernel_db().clone(), true);
+                    allow_uncovered(&d).await;
                 }
                 let mut params = if read_only { call(code) } else { call_write(code) };
                 params.arguments["run_in_background"] = run_in_background.into();

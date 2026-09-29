@@ -320,6 +320,27 @@ mod tests {
         }
     }
 
+    /// An approval's captured cwd that no longer resolves refuses loudly and
+    /// never falls back to the context's current cwd: the approval
+    /// authorized running there, and nowhere else.
+    #[tokio::test]
+    async fn a_captured_cwd_that_no_longer_resolves_refuses() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let context = register_context(&d, Some("dead-pin"), None, principal);
+        let dead = "/this/directory/does/not/exist/kaijutsu-gate-pin-test";
+        let result = EmbeddedKaish::for_context(&d, "dead-pin", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context, session: SessionId::new(),
+        }, ShellPolicy::Agent, ShellCwd::Captured(Some(dead.into())), None, Arc::new(NoopBlockSource)).await;
+        let error = match result {
+            Ok(_) => panic!("a dead captured cwd must refuse construction"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("no longer resolves") && error.contains("nothing was run"), "{error}");
+    }
+
     #[tokio::test]
     async fn contextual_shell_reports_unavailable_cwd() {
         let d = Arc::new(test_dispatcher().await);

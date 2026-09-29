@@ -2351,11 +2351,14 @@ and burn down all the approval options". Delete each line as it ships.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
   auto-allows leave no row; a dry run with no reviewer records nothing;
   the ORIGIN column is narrower than `shell_gate`.
-- **F10** A redeeming retry restores cwd but not the env the reviewer saw.
 - **F11** Approving a streaming RPC ask authors a Model-role pair and can
   wake the model (inferred).
 - **F12** Digest `--remember` rules do not cross paths (`hook:v1:` vs
   `shell-stmt:v1:`).
+- **F9 (kept open)** A program the planner rejects proceeds on the RPC
+  shell paths to kaish, which reports the parse error in its own block.
+  Safe while the planner and the executor share kaish's parser; a
+  divergence (see "A kaish lexer rejection degrades the gate") reopens it.
 - **F13** A dry-run row is answerable between create and abandon; `kj cc
   send` through `shell_write` asks twice, unlinked.
 - **Tests** The ACP part of the conformance matrix ships in
