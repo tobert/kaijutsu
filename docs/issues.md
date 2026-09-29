@@ -2387,17 +2387,6 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
   sibling on different threads, release, and assert the sibling settles
   with the stop observed.
 
-## A failed write truncates the file first (2026-09-28)
-
-`LocalBackend` has no `write_all` of its own, so it uses the `VfsOps` default:
-truncate or create, then `write`. A `write` that fails after the truncate (a
-full disk, a permission change, an I/O error) leaves the real file empty. The
-file cache's rollback then puts the buffer back to its earlier text, but disk
-no longer holds it, and the next read reloads the empty file. Write to a
-temporary file in the same directory and rename it over the target, keeping
-the mode. The fault-injection backend (`vfs/backends/faulty.rs`) shows the
-truncated state in its tests.
-
 ## ACP fleet: what stays open (2026-09-27)
 
 The fleet (`docs/acp-fleet.md`) runs Harbor-shaped scenarios against
@@ -2483,7 +2472,7 @@ ceiling that fails loud, or CAS routing like `RenderCue`'s `casHash`.
 `write` (`sftp.rs:566-576`) does one `getattr` for both the generation guard
 and the APPEND offset, so two cross-session appenders can both read gen=N
 and lose an update. Wants an atomic append: `VfsOps` has no append
-primitive (`write_all` is truncate+rewrite, `vfs/ops.rs:158`), which would
+primitive (`write_all` replaces the whole file), which would
 also make `>>` and jsonl logs cheap. `opendir` materializes a whole
 `readdir` per handle (no pagination); the post-write re-getattr race is
 accepted in code (`sftp.rs:585`).

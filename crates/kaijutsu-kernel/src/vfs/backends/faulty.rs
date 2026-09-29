@@ -3,7 +3,8 @@
 //! Only `write` is intercepted: `write_all` (the file cache's flush path)
 //! reaches it after its truncate or create, so a paused flush holds between
 //! reading the buffer and landing it on disk, and a failed flush leaves the
-//! file truncated or missing, as a real I/O error would.
+//! file truncated or missing. That is the default `write_all`'s failure;
+//! `LocalBackend` replaces the file whole and keeps the earlier contents.
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};

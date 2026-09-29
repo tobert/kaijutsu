@@ -269,6 +269,62 @@ impl LocalBackend {
     }
 
     /// Convert std::fs::Metadata to FileAttr.
+    /// The blocking body of [`VfsOps::write_all`]; `target` is already
+    /// resolved, so a live link has become its target and a link still here
+    /// is dangling.
+    fn replace_file(target: &Path, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mode = match std::fs::symlink_metadata(target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} is a dangling link; refusing to write through it", target.display()),
+                ));
+            }
+            Ok(meta) if !meta.is_file() => {
+                let mut file = std::fs::OpenOptions::new().write(true).open(target)?;
+                return file.write_all(data);
+            }
+            Ok(meta) => Some(meta.permissions().mode() & 0o7777),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no parent directory", target.display()),
+            ));
+        };
+        std::fs::create_dir_all(parent)?;
+        let temp = parent.join(format!(
+            ".{}.kj-{}",
+            name.to_string_lossy(),
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(&temp)?;
+            if let Some(mode) = mode {
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            file.write_all(data)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, target)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written?;
+        // The rename is durable once the directory is synced.
+        std::fs::File::open(parent)?.sync_all()
+    }
+
     fn metadata_to_attr(meta: &std::fs::Metadata) -> FileAttr {
         let kind = if meta.is_dir() {
             FileType::Directory
@@ -408,6 +464,25 @@ impl VfsOps for LocalBackend {
         file.flush().await.map_err(VfsError::from)?;
 
         Ok(data.len() as u32)
+    }
+
+    /// Replaces the whole file, so a write that fails partway leaves the
+    /// earlier contents on disk. The bytes go to a temporary file in the same
+    /// directory, which takes the old file's mode, is synced, and is renamed
+    /// over the target. A write through a link replaces the link's target.
+    ///
+    /// A device or FIFO is written where it is: it has no contents to lose.
+    /// A directory the kernel cannot write fails the write, even when the file
+    /// itself is writable, because the temporary file has nowhere to go.
+    /// Replacing a file detaches it from its other hard links.
+    async fn write_all(&self, path: &Path, data: &[u8]) -> VfsResult<()> {
+        self.check_writable()?;
+        let full_path = self.resolve(path).await?;
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || Self::replace_file(&full_path, &data))
+            .await
+            .map_err(|e| VfsError::other(format!("write_all: blocking task join failed: {e}")))?
+            .map_err(VfsError::from)
     }
 
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
@@ -694,6 +769,80 @@ mod tests {
         let backend = LocalBackend::new("/dev");
         let error = backend.write(Path::new("full"), 0, b"must reach the host").await
             .expect_err("buffered acceptance must not hide a failed host write");
+        assert!(error.to_string().contains("No space left"), "{error}");
+    }
+
+    /// `write_all` puts a new file in place of the old one and never rewrites
+    /// the old one's bytes, so a write that fails partway leaves the earlier
+    /// contents on disk. A reader that opened the old file keeps reading the
+    /// old contents. Falsified by truncating and rewriting in place.
+    #[tokio::test]
+    async fn write_all_replaces_the_file_instead_of_rewriting_it() {
+        use std::io::{Read, Seek};
+        let (backend, dir) = setup().await;
+        std::fs::write(dir.path().join("notes.txt"), b"earlier contents").unwrap();
+        let mut earlier = std::fs::File::open(dir.path().join("notes.txt")).unwrap();
+
+        backend.write_all(Path::new("notes.txt"), b"new").await.unwrap();
+
+        let mut seen = String::new();
+        earlier.rewind().unwrap();
+        earlier.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "earlier contents", "the old file was rewritten in place");
+        assert_eq!(std::fs::read(dir.path().join("notes.txt")).unwrap(), b"new");
+    }
+
+    /// The replacement keeps the file's mode, and the temporary file does not
+    /// outlive the write.
+    #[tokio::test]
+    async fn write_all_keeps_the_mode_and_leaves_no_temporary_file() {
+        let (backend, dir) = setup().await;
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        backend.write_all(Path::new("run.sh"), b"#!/bin/sh\necho hi\n").await.unwrap();
+
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("run.sh")]);
+    }
+
+    /// A new file appears whole, with its missing parents created, as before.
+    #[tokio::test]
+    async fn write_all_creates_a_missing_file_and_its_parents() {
+        let (backend, dir) = setup().await;
+        backend.write_all(Path::new("a/b/new.txt"), b"fresh").await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a/b/new.txt")).unwrap(), b"fresh");
+    }
+
+    /// Through a live link the target is replaced and the link stays a link.
+    #[tokio::test]
+    async fn write_all_through_a_link_replaces_the_target() {
+        let (backend, dir) = setup().await;
+        std::fs::write(dir.path().join("target.txt"), b"old").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.path().join("link")).unwrap();
+
+        backend.write_all(Path::new("link"), b"new").await.unwrap();
+
+        assert!(std::fs::symlink_metadata(dir.path().join("link")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(dir.path().join("target.txt")).unwrap(), b"new");
+    }
+
+    /// A device has no contents to lose and cannot be renamed over, so it is
+    /// written where it is: `/dev/full` reports its own failure, not one from
+    /// creating a temporary file in `/dev`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_all_writes_a_device_in_place() {
+        let backend = LocalBackend::new("/dev");
+        backend.write_all(Path::new("null"), b"discarded").await.unwrap();
+        let error = backend.write_all(Path::new("full"), b"must reach the host").await
+            .expect_err("/dev/full refuses every write");
         assert!(error.to_string().contains("No space left"), "{error}");
     }
 
