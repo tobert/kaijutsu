@@ -65,6 +65,8 @@ pub enum PermissionAnswer {
     Deny,
     /// Answer with the `cancelled` outcome.
     Cancel,
+    /// Send no response yet; answer later with [`AcpClient::release_held`].
+    Hold,
 }
 
 impl PermissionAnswer {
@@ -73,6 +75,7 @@ impl PermissionAnswer {
             Self::Allow => "allow",
             Self::Deny => "deny",
             Self::Cancel => "cancel",
+            Self::Hold => "hold",
         }
     }
 }
@@ -135,6 +138,9 @@ pub struct AcpClient {
     permissions: Vec<PermissionRecord>,
     /// Responses that arrived while we waited for a different id.
     parked: Vec<Value>,
+    /// Permission requests answered [`PermissionAnswer::Hold`], oldest
+    /// first: the JSON-RPC id and the index of their record.
+    held: VecDeque<(Value, usize)>,
     /// Print every message in both directions to stderr.
     trace: bool,
 }
@@ -194,6 +200,7 @@ impl AcpClient {
             updates: Vec::new(),
             permissions: Vec::new(),
             parked: Vec::new(),
+            held: VecDeque::new(),
             trace: false,
         })
     }
@@ -350,7 +357,7 @@ impl AcpClient {
     /// request ended without what the caller waited for.
     pub fn pump_until(
         &mut self,
-        request: i64,
+        request: Option<i64>,
         what: &str,
         within: Duration,
         done: impl Fn(&[Value]) -> bool,
@@ -360,7 +367,7 @@ impl AcpClient {
             if done(&self.updates) {
                 return Ok(());
             }
-            if let Some(response) = self.parked.iter().find(|m| response_id(m) == Some(request)) {
+            if let Some(response) = self.parked.iter().find(|m| request.is_some() && response_id(m) == request) {
                 bail!(
                     "the request ended before {what}: {response}\n--- agent stderr (tail) ---\n{}",
                     self.stderr_tail()
@@ -420,6 +427,10 @@ impl AcpClient {
         if method == "session/request_permission" {
             let (outcome, record) = self.answer_permission(params);
             self.permissions.push(record);
+            let Some(outcome) = outcome else {
+                self.held.push_back((id, self.permissions.len() - 1));
+                return Ok(());
+            };
             return self.send(&json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}}));
         }
         self.send(&json!({
@@ -429,35 +440,41 @@ impl AcpClient {
         }))
     }
 
-    fn answer_permission(&mut self, params: Value) -> (Value, PermissionRecord) {
+    /// The outcome to send for a request, or `None` to hold it.
+    fn answer_permission(&mut self, params: Value) -> (Option<Value>, PermissionRecord) {
         let answer = match &mut self.policy {
             PermissionPolicy::Queue(queue) => queue.pop_front(),
             PermissionPolicy::Always(answer) => Some(*answer),
         };
-        let cancelled = json!({"outcome": "cancelled"});
         let mut record = PermissionRecord { params, answer, option_id: None, problem: None };
-        let prefix = match answer {
-            None => {
-                record.problem = Some("no permission answer was queued for this request".into());
-                return (cancelled, record);
-            }
-            Some(PermissionAnswer::Cancel) => return (cancelled, record),
-            Some(PermissionAnswer::Allow) => "allow",
-            Some(PermissionAnswer::Deny) => "reject",
+        let Some(answer) = answer else {
+            record.problem = Some("no permission answer was queued for this request".into());
+            return (Some(json!({"outcome": "cancelled"})), record);
         };
-        match select_option(&record.params, prefix) {
-            Some(option) => {
-                record.option_id = Some(option.clone());
-                (json!({"outcome": "selected", "optionId": option}), record)
-            }
-            None => {
-                record.problem = Some(format!(
-                    "the request offered no option whose kind starts with {prefix:?}: {}",
-                    record.params.get("options").unwrap_or(&Value::Null)
-                ));
-                (cancelled, record)
-            }
+        if answer == PermissionAnswer::Hold {
+            return (None, record);
         }
+        let outcome = outcome_for(answer, &mut record);
+        (Some(outcome), record)
+    }
+
+    /// How many permission requests are held unanswered.
+    pub fn held_count(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Answer the oldest held permission request with `answer`, which must
+    /// not be [`PermissionAnswer::Hold`]. The answer and any problem applying
+    /// it replace the ones on the request's record.
+    pub fn release_held(&mut self, answer: PermissionAnswer) -> Result<()> {
+        if answer == PermissionAnswer::Hold {
+            bail!("release_held needs an answer, not another hold");
+        }
+        let (id, index) = self.held.pop_front().context("no permission request is held")?;
+        let record = &mut self.permissions[index];
+        record.answer = Some(answer);
+        let outcome = outcome_for(answer, record);
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": outcome}}))
     }
 
     pub fn initialize(&mut self) -> Result<Value> {
@@ -533,6 +550,32 @@ impl Drop for AcpClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The outcome that gives `answer` to the request `record` holds, noting on
+/// `record` the option chosen or why none could be. `Hold` has no outcome and
+/// is answered `cancelled`.
+fn outcome_for(answer: PermissionAnswer, record: &mut PermissionRecord) -> Value {
+    let cancelled = json!({"outcome": "cancelled"});
+    let prefix = match answer {
+        PermissionAnswer::Cancel | PermissionAnswer::Hold => return cancelled,
+        PermissionAnswer::Allow => "allow",
+        PermissionAnswer::Deny => "reject",
+    };
+    match select_option(&record.params, prefix) {
+        Some(option) => {
+            record.option_id = Some(option.clone());
+            record.problem = None;
+            json!({"outcome": "selected", "optionId": option})
+        }
+        None => {
+            record.problem = Some(format!(
+                "the request offered no option whose kind starts with {prefix:?}: {}",
+                record.params.get("options").unwrap_or(&Value::Null)
+            ));
+            cancelled
+        }
     }
 }
 
@@ -658,6 +701,22 @@ mod tests {
         assert_eq!(select_option(&params, "allow").as_deref(), Some("yes"));
         assert_eq!(select_option(&params, "reject").as_deref(), Some("no"));
         assert_eq!(select_option(&json!({"options": []}), "allow"), None);
+    }
+
+    #[test]
+    fn a_released_answer_selects_its_option_and_clears_nothing_else() {
+        let mut record = PermissionRecord {
+            params: json!({"options": [
+                {"optionId": "yes", "kind": "allow_once"},
+                {"optionId": "no", "kind": "reject_once"},
+            ]}),
+            answer: Some(PermissionAnswer::Hold),
+            option_id: None,
+            problem: None,
+        };
+        assert_eq!(outcome_for(PermissionAnswer::Deny, &mut record), json!({"outcome": "selected", "optionId": "no"}));
+        assert_eq!(record.option_id.as_deref(), Some("no"));
+        assert_eq!(outcome_for(PermissionAnswer::Hold, &mut record), json!({"outcome": "cancelled"}));
     }
 
     #[test]

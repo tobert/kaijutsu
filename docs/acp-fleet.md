@@ -4,6 +4,7 @@
 cargo build -j 4 -p kaijutsu-solo-acp --features test-mock
 cargo run -j 4 -p kaijutsu-acp-fleet -- run            # every host scenario
 cargo run -j 4 -p kaijutsu-acp-fleet -- run crates/kaijutsu-acp-fleet/fleet/chat.toml --trace
+cargo run -j 4 -p kaijutsu-acp-fleet -- run crates/kaijutsu-acp-fleet/fleet/approval
 
 # contained scenarios need podman and the fleet image
 podman build -t kaijutsu-fleet -f contrib/Containerfile.fleet contrib
@@ -104,13 +105,16 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
-| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `deny`, or `cancel`. The prompt must raise exactly this many. |
+| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `deny`, `cancel`, or `hold`. The prompt must raise exactly this many. `hold` sends no response until a later prompt's `release`. |
+| `prompt.release` | Answers for requests earlier prompts held, oldest first, sent once this prompt's turn ends: `allow`, `deny`, or `cancel`. |
+| `prompt.wait_for_text` | After the turn ends, wait until the prompt's agent text contains this, before the quiet wait. For a message that comes later than the quiet wait, such as a permission timeout. |
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including text from follow-up turns. |
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains`. |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
+| `known_gap` | `{ finding = "F2", fails = ["verify escaped"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
 
 Unknown keys are refused, so a misspelled expectation fails the load instead
 of checking nothing. Paths must stay inside the workspace or rc tree.
@@ -136,6 +140,39 @@ A hook can raise an ask and never lower one (`docs/gate-policy-tuning.md`,
 "Verdicts"). A fault running the body asks, and a `kaish_path` body that
 cannot be read denies. A program the tiers allow outright, or refuse, never
 reaches a hook; `fleet/gate-tiers.toml` has its hook record what it saw to show that.
+
+## The approval matrix
+
+`fleet/approval/` runs each approval property through ACP, one scenario
+per property and entry path, against `docs/issues.md`, "Approval paths:
+the burn-down". Path A is `shell_write`, path B is the read-only `shell`,
+and the ACP prompt is `session/request_permission`.
+
+| Property | Path A | Path B | ACP prompt |
+|---|---|---|---|
+| (a) A config deny refuses and leaves a row | gap F8 | gap F8 | |
+| (b) A learned allow outranks a config deny | not reachable | not reachable | |
+| (c) An uncovered statement asks a model | pass | read-only by design | |
+| (d) An approval runs what was shown | pass | gap F2 | |
+| (e) A deny the ask stopped still wins | gap F1 (hook) | | |
+| (f) A model cannot forget a human's rule | not reachable | | |
+| (g) An unanswered prompt is offered again | | | gap F7 |
+
+```toml
+known_gap = { finding = "F2", fails = ["verify escaped"] }
+```
+
+A scenario with a `known_gap` reports `GAP` while the finding holds. It
+fails when no failure matches `fails`, which means the finding no longer
+reproduces: remove the marker and the finding's line. Any failure that no
+`fails` substring matches, and any error that stops the run, still fails
+it.
+
+Not reachable through ACP: a standing rule comes only from
+`kj ledger allow|deny --remember`, and the bridge offers only allow once and
+reject once. No ACP client can create a human rule, so (b), (f), and the
+rule form of (e) need another surface. The RPC shells (path C) and
+kaijutsu-mcp (path D) have no ACP entry.
 
 ## Cancel scenarios
 

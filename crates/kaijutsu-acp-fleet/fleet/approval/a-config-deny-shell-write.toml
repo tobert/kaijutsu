@@ -1,0 +1,37 @@
+description = "Property (a), path A: a config deny refuses a shell_write with no ask and leaves a denied ledger row."
+
+known_gap = { finding = "F8", fails = ["prompt 2: expected tool calls"] }
+
+gate = """
+[global]
+deny = ["dd"]
+"""
+
+[files]
+"seed.txt" = "seed\n"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "dd if=seed.txt of=copy.txt" } }]
+[[model]]
+text = "refused"
+
+# The model reads the ledger back. The listing call is itself allowed, so a
+# denied row can only be the refusal's.
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "kj ledger list --history --status denied" } }]
+[[model]]
+text = "listed"
+
+[[prompt]]
+text = "copy with dd"
+text_contains = ["refused"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }]
+
+[[prompt]]
+text = "show the denied asks"
+text_contains = ["listed"]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "dd if=seed.txt of=copy.txt" }]
+
+[[verify]]
+path = "copy.txt"
+exists = false

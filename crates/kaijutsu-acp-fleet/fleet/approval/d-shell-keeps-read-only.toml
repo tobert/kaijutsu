@@ -1,0 +1,31 @@
+description = "Property (d), path B: an approved hook ask on the read-only shell runs with the read-only policy it was asked under, so a write stays refused."
+
+known_gap = { finding = "F2", fails = ["verify escaped"] }
+
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell","hook_id":"fleet-shell-ask"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
+"""
+"lib/hooks/fleet.kai" = """
+cmd="$(echo $KJ_TOOL_ARGS | jq -r '.command')"
+echo "fleet hook asks about: $cmd" >&2
+exit 3
+"""
+
+[[model]]
+tool_calls = [{ name = "shell", input = { command = "mkdir escaped" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "after the approval"
+
+[[prompt]]
+text = "make the escaped directory"
+permissions = ["allow"]
+permission_titles = ["fleet hook asks about: mkdir escaped"]
+text_contains = ["asked"]
+tool_calls = [{ title = "shell" }, { title = "kj" }]
+
+[[verify]]
+path = "escaped"
+exists = false

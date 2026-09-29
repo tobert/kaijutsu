@@ -11,13 +11,18 @@
 //!
 //! `cargo test -p kaijutsu-solo-acp --features test-mock --test acp_fleet -- --ignored`
 //!
+//! The approval conformance matrix lives in its `approval/` directory and
+//! has its own test, so it runs beside the host scenarios. A scenario that
+//! marks a known gap must fail in the ways it names, and fails the test when
+//! the gap no longer reproduces.
+//!
 //! `acp-fleet run` runs the same scenarios by hand, one report line each.
 
 use std::path::PathBuf;
 
 use kaijutsu_acp_fleet::run::{RunConfig, run_file};
 use kaijutsu_acp_fleet::scenario::{Mode, Scenario};
-use kaijutsu_acp_fleet::{CONTAINED_DIR, DEFAULT_SCRATCH, FLEET_DIR, scenario};
+use kaijutsu_acp_fleet::{APPROVAL_DIR, CONTAINED_DIR, DEFAULT_SCRATCH, FLEET_DIR, scenario};
 
 /// Run every scenario in `dir`, each of which must declare `mode`.
 fn run_all(dir: &str, mode: Mode) {
@@ -50,6 +55,11 @@ fn run_all(dir: &str, mode: Mode) {
 #[test]
 fn every_fleet_scenario_passes() {
     run_all(FLEET_DIR, Mode::Host);
+}
+
+#[test]
+fn every_approval_scenario_holds() {
+    run_all(APPROVAL_DIR, Mode::Host);
 }
 
 #[test]

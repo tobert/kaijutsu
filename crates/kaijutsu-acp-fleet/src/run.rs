@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
-use crate::scenario::{Cancel, Mode, Prompt, Scenario, Verify, workspace_relative};
+use crate::scenario::{Cancel, KnownGap, Mode, Prompt, Scenario, Verify, workspace_relative};
 
 /// How long the update stream must stay silent after a prompt's response
 /// before the prompt is judged. Permission requests, and the follow-up turns
@@ -60,6 +60,10 @@ pub struct Outcome {
     /// Every expectation that did not hold, or the error that stopped the run.
     /// Empty means the scenario passed.
     pub failures: Vec<String>,
+    /// The finding the scenario reproduces, when it declares a known gap.
+    pub known_gap: Option<String>,
+    /// Failures the known gap accounts for; they do not fail the scenario.
+    pub excused: Vec<String>,
     pub elapsed: Duration,
     /// The agent's stderr tail, kept when the scenario failed.
     pub stderr_tail: String,
@@ -88,6 +92,8 @@ pub fn run_file(path: &Path, config: &RunConfig) -> Outcome {
         Err(error) => Outcome {
             name,
             failures: vec![format!("{error:#}")],
+            known_gap: None,
+            excused: Vec::new(),
             elapsed: started.elapsed(),
             stderr_tail: String::new(),
             kept: None,
@@ -98,33 +104,73 @@ pub fn run_file(path: &Path, config: &RunConfig) -> Outcome {
 pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outcome {
     let started = Instant::now();
     let mut failures = Vec::new();
+    // Errors that stopped the run. A known gap never excuses one.
+    let mut errors = Vec::new();
     let mut stderr_tail = String::new();
     let scratch = match Scratch::create(&config.scratch_root, name) {
         Ok(scratch) => Some(scratch),
         Err(error) => {
-            failures.push(format!("{error:#}"));
+            errors.push(format!("{error:#}"));
             None
         }
     };
     if let Some(scratch) = &scratch
         && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail)
     {
-        failures.push(format!("{error:#}"));
+        errors.push(format!("{error:#}"));
     }
     let kept = match scratch {
         Some(scratch) if config.keep => Some(scratch.root.clone()),
         Some(scratch) => {
             if let Err(error) = std::fs::remove_dir_all(&scratch.root) {
-                failures.push(format!("remove the scratch directory {}: {error}", scratch.root.display()));
+                errors.push(format!("remove the scratch directory {}: {error}", scratch.root.display()));
             }
             None
         }
         None => None,
     };
+    let Judged { mut failures, excused } = if errors.is_empty() {
+        judge_gap(scenario.known_gap.as_ref(), failures)
+    } else {
+        Judged { failures, excused: Vec::new() }
+    };
+    failures.extend(errors);
     if failures.is_empty() {
         stderr_tail.clear();
     }
-    Outcome { name: name.to_string(), failures, elapsed: started.elapsed(), stderr_tail, kept }
+    Outcome {
+        name: name.to_string(),
+        failures,
+        known_gap: scenario.known_gap.as_ref().map(|g| g.finding.clone()),
+        excused,
+        elapsed: started.elapsed(),
+        stderr_tail,
+        kept,
+    }
+}
+
+/// Failures sorted by whether a known gap accounts for them.
+pub struct Judged {
+    pub failures: Vec<String>,
+    pub excused: Vec<String>,
+}
+
+/// Excuse the failures `gap` names. A gap that caused no failure is itself a
+/// failure: the finding no longer reproduces, so the marker must go.
+pub fn judge_gap(gap: Option<&KnownGap>, failures: Vec<String>) -> Judged {
+    let Some(gap) = gap else {
+        return Judged { failures, excused: Vec::new() };
+    };
+    let (excused, mut failures): (Vec<String>, Vec<String>) =
+        failures.into_iter().partition(|f| gap.fails.iter().any(|needle| f.contains(needle.as_str())));
+    if excused.is_empty() {
+        failures.push(format!(
+            "known gap {} no longer reproduces: none of {:?} failed. If {} is fixed, remove [known_gap] \
+             and its line in docs/issues.md",
+            gap.finding, gap.fails, gap.finding
+        ));
+    }
+    Judged { failures, excused }
 }
 
 struct Scratch {
@@ -301,6 +347,15 @@ fn converse(
             cancel_mid_call(agent, &session, id, cancel, workspace_host, timeout).with_context(|| label.clone())?;
         }
         let response = agent.wait_response(id, "session/prompt").with_context(|| label.clone())?;
+        for answer in &prompt.release {
+            agent.release_held((*answer).into()).with_context(|| format!("{label}: release a held permission request"))?;
+        }
+        if let Some(needle) = &prompt.wait_for_text {
+            let what = format!("agent text containing {needle:?}");
+            agent
+                .pump_until(None, &what, timeout, |updates| client::agent_text(&updates[updates_before..]).contains(needle.as_str()))
+                .with_context(|| label.clone())?;
+        }
         // A gate ask does not hold the turn open: the tool call is refused as
         // pending, the turn ends, and the permission request follows. An
         // answer can start a follow-up model turn. Waiting for silence also
@@ -338,7 +393,7 @@ fn cancel_mid_call(
 ) -> Result<()> {
     let title = cancel.after_tool_call.as_str();
     let what = format!("a {title:?} tool call in progress, to cancel");
-    agent.pump_until(prompt, &what, timeout, |updates| {
+    agent.pump_until(Some(prompt), &what, timeout, |updates| {
         client::tool_calls(updates).iter().any(|c| c.title == title && c.status.as_deref() == Some("in_progress"))
     })?;
     let mark = agent.stderr().len();
@@ -484,7 +539,7 @@ pub fn verify_workspace(checks: &[Verify], workspace: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scenario::Scenario;
+    use crate::scenario::{KnownGap, Scenario};
     use serde_json::json;
 
     fn prompt(extra: &str) -> Prompt {
@@ -526,6 +581,40 @@ mod tests {
         let failures = check_prompt("p", &p, &seen);
         assert_eq!(failures.len(), 1, "{failures:#?}");
         assert!(failures[0].contains("a model turn failed"), "{failures:#?}");
+    }
+
+    fn gap(fails: &[&str]) -> KnownGap {
+        KnownGap { finding: "F2".into(), fails: fails.iter().map(|f| f.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_gap_that_reproduces_excuses_only_its_own_failures() {
+        let judged = judge_gap(Some(&gap(&["verify escaped"])), vec!["verify escaped: expected exists = false".into()]);
+        assert_eq!(judged.failures, Vec::<String>::new());
+        assert_eq!(judged.excused.len(), 1);
+    }
+
+    #[test]
+    fn a_gap_that_no_longer_reproduces_fails_and_says_to_remove_the_marker() {
+        let judged = judge_gap(Some(&gap(&["verify escaped"])), Vec::new());
+        assert_eq!(judged.failures.len(), 1, "{:?}", judged.failures);
+        assert!(judged.failures[0].contains("F2") && judged.failures[0].contains("known_gap"), "{:?}", judged.failures);
+    }
+
+    #[test]
+    fn a_failure_the_gap_does_not_name_still_fails() {
+        let judged = judge_gap(
+            Some(&gap(&["verify escaped"])),
+            vec!["verify escaped: expected exists = false".into(), "prompt 1: expected stopReason".into()],
+        );
+        assert_eq!(judged.failures, vec!["prompt 1: expected stopReason".to_string()]);
+    }
+
+    #[test]
+    fn with_no_gap_every_failure_stands() {
+        let judged = judge_gap(None, vec!["a".into()]);
+        assert_eq!(judged.failures, vec!["a".to_string()]);
+        assert!(judged.excused.is_empty());
     }
 
     fn scenario(text: &str) -> Scenario {

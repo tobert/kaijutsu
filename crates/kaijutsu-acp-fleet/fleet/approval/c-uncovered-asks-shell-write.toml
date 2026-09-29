@@ -1,0 +1,24 @@
+description = "Property (c), path A: an uncovered shell_write statement asks when a model is acting, and nothing runs until the answer."
+
+# An empty policy: no tier covers mkdir.
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir uncovered" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "left it alone"
+
+[[prompt]]
+text = "make the uncovered directory"
+permissions = ["deny"]
+permission_titles = ["shell_write: 1 statement(s) — mkdir uncovered"]
+text_contains = ["asked", "left it alone"]
+tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+
+[[verify]]
+path = "uncovered"
+exists = false

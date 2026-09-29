@@ -44,6 +44,22 @@ pub struct Scenario {
     /// Checks on the workspace after the agent exits.
     #[serde(default)]
     pub verify: Vec<Verify>,
+    /// A finding this scenario reproduces until it is fixed. The scenario
+    /// must then fail, and only in the ways `fails` names.
+    #[serde(default)]
+    pub known_gap: Option<KnownGap>,
+}
+
+/// A recorded finding (`docs/issues.md`) the scenario fails on today.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnownGap {
+    /// The finding's id, such as `F2`.
+    pub finding: String,
+    /// Substrings of the failures the finding causes. A scenario with a known
+    /// gap passes only when at least one failure matches and every failure
+    /// matches one of these.
+    pub fails: Vec<String>,
 }
 
 /// One model reply. Either `text` and/or `tool_calls`, or raw `events`.
@@ -98,6 +114,15 @@ pub struct Prompt {
     /// When present, send `session/cancel` during this prompt's turn.
     #[serde(default)]
     pub cancel: Option<Cancel>,
+    /// Answers for permission requests earlier prompts answered `hold`,
+    /// oldest first, given once this prompt's turn has ended.
+    #[serde(default)]
+    pub release: Vec<Answer>,
+    /// After the turn ends, wait until the agent's text for this prompt
+    /// contains this, before the quiet wait. For a message that arrives
+    /// later than the quiet wait allows, such as a permission timeout.
+    #[serde(default)]
+    pub wait_for_text: Option<String>,
 }
 
 /// When to send `session/cancel` during a prompt, and what to do after the
@@ -135,6 +160,8 @@ pub enum Answer {
     Allow,
     Deny,
     Cancel,
+    /// Leave the request unanswered until a later prompt's `release`.
+    Hold,
 }
 
 impl From<Answer> for PermissionAnswer {
@@ -143,6 +170,7 @@ impl From<Answer> for PermissionAnswer {
             Answer::Allow => PermissionAnswer::Allow,
             Answer::Deny => PermissionAnswer::Deny,
             Answer::Cancel => PermissionAnswer::Cancel,
+            Answer::Hold => PermissionAnswer::Hold,
         }
     }
 }
@@ -197,10 +225,23 @@ impl Scenario {
         for path in self.files.keys() {
             workspace_relative(path)?;
         }
+        if let Some(gap) = &self.known_gap
+            && (gap.finding.trim().is_empty() || gap.fails.is_empty() || gap.fails.iter().any(|f| f.trim().is_empty()))
+        {
+            bail!("[known_gap] needs a `finding` and at least one non-empty `fails` substring");
+        }
         for path in self.rc.keys() {
             workspace_relative(path).context("an [rc] path is relative to the rc tree")?;
         }
+        let mut held = 0;
         for (n, prompt) in self.prompt.iter().enumerate() {
+            if prompt.release.contains(&Answer::Hold) {
+                bail!("[[prompt]] {}: `release` answers held requests; `hold` is not an answer there", n + 1);
+            }
+            if prompt.release.len() > held {
+                bail!("[[prompt]] {}: `release` has {} answers, but earlier prompts hold only {held}", n + 1, prompt.release.len());
+            }
+            held = held - prompt.release.len() + prompt.permissions.iter().filter(|a| **a == Answer::Hold).count();
             if let Some(release) = prompt.cancel.as_ref().and_then(|c| c.release.as_ref()) {
                 workspace_relative(release).with_context(|| format!("[[prompt]] {}: `cancel.release`", n + 1))?;
             }
@@ -422,6 +463,15 @@ text = "go"
             "text = \"say hi\"\ncancel = { after_tool_call = \"shell_write\", release = \"../go\" }",
         );
         assert!(refusal(&text).contains("cancel.release"), "{}", refusal(&text));
+    }
+
+    #[test]
+    fn a_release_needs_an_earlier_hold() {
+        let text = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\nrelease = [\"allow\"]");
+        assert!(refusal(&text).contains("hold only 0"), "{}", refusal(&text));
+        let held = format!("{}\n[[prompt]]\ntext = \"later\"\nrelease = [\"allow\"]\n",
+            MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\npermissions = [\"hold\"]"));
+        Scenario::parse(&held, "held").unwrap();
     }
 
     #[test]

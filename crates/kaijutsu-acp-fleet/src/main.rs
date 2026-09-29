@@ -73,10 +73,17 @@ fn real_main() -> Result<bool> {
     config.trace = trace;
 
     let mut failed = 0;
+    let mut gaps = 0;
     for file in &files {
         let outcome = run_file(file, &config);
         let seconds = outcome.elapsed.as_secs_f64();
-        if outcome.passed() {
+        if outcome.passed() && let Some(finding) = &outcome.known_gap {
+            gaps += 1;
+            println!("GAP  {} ({finding}, {seconds:.1}s)", outcome.name);
+            for excused in &outcome.excused {
+                println!("  - {}", excused.replace('\n', "\n    "));
+            }
+        } else if outcome.passed() {
             println!("PASS {} ({seconds:.1}s)", outcome.name);
         } else {
             failed += 1;
@@ -92,7 +99,7 @@ fn real_main() -> Result<bool> {
             println!("  kept {}", kept.display());
         }
     }
-    println!("{} passed, {failed} failed", files.len() - failed);
+    println!("{} passed ({gaps} as known gaps), {failed} failed", files.len() - failed);
     Ok(failed == 0)
 }
 

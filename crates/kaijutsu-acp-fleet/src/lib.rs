@@ -19,6 +19,10 @@ pub mod scenario;
 /// The host-mode scenarios shipped with this crate.
 pub const FLEET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet");
 
+/// The approval conformance matrix: host-mode scenarios, one per approval
+/// property and entry path, some marking a known gap.
+pub const APPROVAL_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/approval");
+
 /// The contained-mode scenarios shipped with this crate.
 pub const CONTAINED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/contained");
 

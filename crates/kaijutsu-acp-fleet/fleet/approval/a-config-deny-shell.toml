@@ -1,0 +1,31 @@
+description = "Property (a), path B: a config deny refuses a read-only shell call with no ask and leaves a denied ledger row."
+
+known_gap = { finding = "F8", fails = ["prompt 2: expected tool calls"] }
+
+gate = """
+[global]
+deny = ["cat"]
+"""
+
+[files]
+"seed.txt" = "seed\n"
+
+[[model]]
+tool_calls = [{ name = "shell", input = { command = "cat seed.txt" } }]
+[[model]]
+text = "refused"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "kj ledger list --history --status denied" } }]
+[[model]]
+text = "listed"
+
+[[prompt]]
+text = "read the seed"
+text_contains = ["refused"]
+tool_calls = [{ title = "shell", status = "failed", output_contains = "global config denies cat" }]
+
+[[prompt]]
+text = "show the denied asks"
+text_contains = ["listed"]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "cat seed.txt" }]

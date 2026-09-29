@@ -2360,9 +2360,14 @@ and burn down all the approval options". Delete each line as it ships.
   `shell-stmt:v1:`).
 - **F13** A dry-run row is answerable between create and abandon; `kj cc
   send` through `shell_write` asks twice, unlinked.
-- **Tests** A fleet conformance matrix: each property (deny wins, learned
-  allow wins, uncovered asks a model, approval runs what was shown, every
-  refusal leaves a row) against each entry path.
+- **Tests** The ACP part of the conformance matrix ships in
+  `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
+  approval matrix"); scenarios marked `known_gap` name F1, F2, F7, and F8.
+  Open: no ACP client can create a standing rule, because the bridge offers
+  only allow once and reject once, never `--remember`. A learned allow over
+  a config deny (F3), a model forgetting a human's rule (F4), and a deny
+  rule added between ask and answer (F1) need that option or another
+  surface. Paths C and D need a harness of their own.
 
 ## What a replacement risk scorer inherits (2026-09-28)
 

@@ -1,0 +1,38 @@
+description = "Property (e), path A: a deny that an ask stopped from running still wins when the ask is approved; the approval answers only the ask."
+
+known_gap = { finding = "F1", fails = ["verify stopped"] }
+
+# Two pre_call hooks on shell_write, lower priority first: the first asks,
+# which stops the chain before the second, which denies.
+[rc]
+"coder/create/S60-fleet-hook.kai" = """
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-ask","priority":10}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet-ask.kai"}'
+kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-deny","priority":20}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet-deny.kai"}'
+"""
+"lib/hooks/fleet-ask.kai" = """
+cmd="$(echo $KJ_TOOL_ARGS | jq -r '.command')"
+echo "fleet hook asks about: $cmd" >&2
+exit 3
+"""
+"lib/hooks/fleet-deny.kai" = """
+echo "fleet hook denies" >&2
+exit 1
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir stopped" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "after the approval"
+
+[[prompt]]
+text = "make the stopped directory"
+permissions = ["allow"]
+permission_titles = ["fleet hook asks about: mkdir stopped"]
+text_contains = ["asked"]
+tool_calls = [{ title = "shell_write" }, { title = "kj" }]
+
+[[verify]]
+path = "stopped"
+exists = false

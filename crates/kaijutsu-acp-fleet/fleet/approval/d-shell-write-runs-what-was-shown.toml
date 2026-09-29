@@ -1,0 +1,49 @@
+description = "Property (d), path A: an approved shell_write ask runs the command it showed, in the cwd and with the env it recorded, though both changed before the answer."
+
+gate = """
+[global]
+allow = ["mkdir", "cd", "export"]
+"""
+
+# Prompt 1: set a cwd and a variable, then an uncovered statement asks. The
+# client holds the permission request unanswered.
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir sub" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "cd sub" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "export SHOWN=shown-value" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "echo $SHOWN > out.txt" } }]
+[[model]]
+text = "asked"
+
+# Prompt 2: change both before the answer, then the client allows the held
+# request. The approved command runs and its result arrives as a notice.
+# Prompt 2 started after the ask's continuation window, so no follow-up model
+# turn runs (docs/gate-resume.md, "Still open").
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "export SHOWN=drifted" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "cd .." } }]
+[[model]]
+text = "drifted"
+
+[[prompt]]
+text = "write the variable into sub"
+permissions = ["hold"]
+permission_titles = ["echo $SHOWN > out.txt\n\nNOTE: at ask time SHOWN="]
+text_contains = ["asked"]
+
+[[prompt]]
+text = "change the variable and leave sub"
+release = ["allow"]
+text_contains = ["drifted"]
+
+[[verify]]
+path = "sub/out.txt"
+equals = "shown-value\n"
+
+[[verify]]
+path = "out.txt"
+exists = false

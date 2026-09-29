@@ -1,0 +1,26 @@
+description = "Property (g), ACP prompt: a permission request the client never answers times out, and the ask is offered again."
+
+known_gap = { finding = "F7", fails = ["expected 2 permission request(s), got 1", "verify offered"] }
+
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir offered" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "allowed on the second offer"
+
+# The first request is held until the bridge gives up on it (30 s); the
+# second offer of the same ask is answered allow.
+[[prompt]]
+text = "make the offered directory"
+permissions = ["hold", "allow"]
+wait_for_text = "timed out waiting for the client; ask remains pending"
+text_contains = ["asked"]
+
+[[verify]]
+path = "offered"
+exists = true
