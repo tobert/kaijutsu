@@ -21,13 +21,11 @@ work. `docs/audio-inference.md` records the workload and measured costs.
    settlement, with the old path removed. These are the means of playing
    the instrument, so verify them through the actual client as well as unit
    tests.
-2. **Prove different producer speeds on one pulse.** Build a deterministic
-   integration scenario using controlled producers and a controllable clock:
-   fast, delayed, failed, and completed after their basis changes. Assert
-   that the shared timeline advances while work is pending, valid results
-   commit once, stale or superseded completions cannot overwrite accepted
-   work, and a missed commitment uses its declared fallback. Use barriers
-   and explicit completion delivery, not wall-clock sleeps or hosted models.
+2. **Prove different producer speeds on one pulse.** Done:
+   `crates/kaijutsu-server/tests/timeline_commitment_wire.rs` drives
+   controlled producers against manual beats through the SSH client. Fast,
+   slow, obsolete, and failed producers share one pulse; stale output never
+   commits; a failed producer plays its declared fallback once.
 3. **Align execution with that proof.** Audit admission through completion
    and commitment against exact work ownership and intended musical time.
    Keep slow preparation outside timeline locks; give attempts bounded
@@ -35,10 +33,12 @@ work. `docs/audio-inference.md` records the workload and measured costs.
    cancellation/shutdown behavior. Preserve
    a small synchronous commit step. Use existing runtime and resolver seams;
    delete superseded paths as the scenario starts passing.
-4. **Expose the feedback needed to play.** Record intended musical time,
-   queue/compute/transfer duration, readiness, basis validity, and final
-   disposition. A player should be able to distinguish committed work,
-   obsolete work, a failure, and a declared fallback. Measure under overlap
+4. **Expose the feedback needed to play.** `kj transport work --track`
+   reports each attempt's intended tick, admission, start, readiness, basis
+   validity, and disposition (committed, fallback with its reason,
+   cancelled, superseded). Open: the estimate beside the measured compute
+   time, a readable view for a player, and queue and transfer durations
+   once media delivery is in the scenario. Measure under overlap
    before choosing lead-time targets; avoid turning unmeasured percentiles
    into guarantees.
 5. **Exercise replacement, then extract.** Run the same scenario with one
