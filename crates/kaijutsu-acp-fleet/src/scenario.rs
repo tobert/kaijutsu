@@ -95,6 +95,23 @@ pub struct Prompt {
     /// When present, the tool calls this prompt must show, exactly and in order.
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallExpect>>,
+    /// When present, send `session/cancel` during this prompt's turn.
+    #[serde(default)]
+    pub cancel: Option<Cancel>,
+}
+
+/// When to send `session/cancel` during a prompt, and what to do after the
+/// agent confirms it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cancel {
+    /// Cancel once a tool call with this title is reported `in_progress`.
+    pub after_tool_call: String,
+    /// A workspace-relative file to write once the agent confirms the
+    /// cancel. A command that waits for it is still running when the
+    /// cancel lands.
+    #[serde(default)]
+    pub release: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -184,6 +201,9 @@ impl Scenario {
             workspace_relative(path).context("an [rc] path is relative to the rc tree")?;
         }
         for (n, prompt) in self.prompt.iter().enumerate() {
+            if let Some(release) = prompt.cancel.as_ref().and_then(|c| c.release.as_ref()) {
+                workspace_relative(release).with_context(|| format!("[[prompt]] {}: `cancel.release`", n + 1))?;
+            }
             if let Some(titles) = &prompt.permission_titles
                 && titles.len() != prompt.permissions.len()
             {
@@ -393,6 +413,15 @@ text = "go"
     fn an_rc_path_outside_the_rc_tree_is_refused() {
         let text = format!("{MINIMAL}\n[rc]\n\"../escape.kai\" = \"x\"\n");
         assert!(refusal(&text).contains("rc tree"), "{}", refusal(&text));
+    }
+
+    #[test]
+    fn a_cancel_release_outside_the_workspace_is_refused() {
+        let text = MINIMAL.replace(
+            "text = \"say hi\"",
+            "text = \"say hi\"\ncancel = { after_tool_call = \"shell_write\", release = \"../go\" }",
+        );
+        assert!(refusal(&text).contains("cancel.release"), "{}", refusal(&text));
     }
 
     #[test]

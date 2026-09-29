@@ -10,12 +10,12 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
-use crate::scenario::{Mode, Prompt, Scenario, Verify, workspace_relative};
+use crate::scenario::{Cancel, Mode, Prompt, Scenario, Verify, workspace_relative};
 
 /// How long the update stream must stay silent after a prompt's response
 /// before the prompt is judged. Permission requests, and the follow-up turns
@@ -225,7 +225,7 @@ fn drive(
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &session_cwd, config.timeout, failures);
+    let result = converse(&mut agent, scenario, &session_cwd, &scratch.workspace, config.timeout, failures);
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
     let shutdown = agent.shutdown(Duration::from_secs(60));
@@ -275,10 +275,13 @@ fn gate_policy(scenario: &Scenario) -> String {
     }
 }
 
+/// `workspace` is the session cwd as the agent sees it; `workspace_host` is
+/// the same directory on this host.
 fn converse(
     agent: &mut AcpClient,
     scenario: &Scenario,
     workspace: &Path,
+    workspace_host: &Path,
     timeout: Duration,
     failures: &mut Vec<String>,
 ) -> Result<()> {
@@ -293,7 +296,11 @@ fn converse(
         agent.set_permission_policy(PermissionPolicy::Queue(answers));
         let updates_before = agent.updates().len();
         let permissions_before = agent.permissions().len();
-        let response = agent.prompt(&session, &prompt.text).with_context(|| label.clone())?;
+        let id = agent.start_prompt(&session, &prompt.text).with_context(|| label.clone())?;
+        if let Some(cancel) = &prompt.cancel {
+            cancel_mid_call(agent, &session, id, cancel, workspace_host, timeout).with_context(|| label.clone())?;
+        }
+        let response = agent.wait_response(id, "session/prompt").with_context(|| label.clone())?;
         // A gate ask does not hold the turn open: the tool call is refused as
         // pending, the turn ends, and the permission request follows. An
         // answer can start a follow-up model turn. Waiting for silence also
@@ -305,6 +312,54 @@ fn converse(
             permissions: &agent.permissions()[permissions_before..],
         };
         failures.extend(check_prompt(&label, prompt, &seen));
+    }
+    Ok(())
+}
+
+/// What the solo agent's kernel logs once an interrupt has marked a running
+/// turn to stop. `session/cancel` is a notification, so ACP gives the client
+/// no acknowledgment to wait on. The bridge's own "soft interrupt sent" line
+/// does not serve: it also appears when no turn was running.
+pub const CANCEL_CONFIRMED: &str = "turn_interrupted=true";
+
+/// What the kernel logs when an interrupt found no running turn.
+pub const CANCEL_FOUND_NOTHING: &str = "turn_interrupted=false";
+
+/// Wait for `cancel.after_tool_call` to be in progress, send
+/// `session/cancel`, wait for the agent to confirm it, then write
+/// `cancel.release` so a command waiting on it can finish.
+fn cancel_mid_call(
+    agent: &mut AcpClient,
+    session: &str,
+    prompt: i64,
+    cancel: &Cancel,
+    workspace_host: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let title = cancel.after_tool_call.as_str();
+    let what = format!("a {title:?} tool call in progress, to cancel");
+    agent.pump_until(prompt, &what, timeout, |updates| {
+        client::tool_calls(updates).iter().any(|c| c.title == title && c.status.as_deref() == Some("in_progress"))
+    })?;
+    let mark = agent.stderr().len();
+    agent.cancel(session)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let since = agent.stderr().get(mark..).map(str::to_string).unwrap_or_default();
+        if since.contains(CANCEL_CONFIRMED) {
+            break;
+        }
+        if since.contains(CANCEL_FOUND_NOTHING) {
+            bail!("session/cancel found no running turn while {title:?} was in progress\n--- agent stderr (tail) ---\n{}", agent.stderr_tail());
+        }
+        if Instant::now() > deadline {
+            bail!("the agent did not confirm session/cancel within {timeout:?}\n--- agent stderr (tail) ---\n{}", agent.stderr_tail());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(release) = &cancel.release {
+        let target = workspace_host.join(workspace_relative(release)?);
+        std::fs::write(&target, "").with_context(|| format!("write the release file {}", target.display()))?;
     }
     Ok(())
 }

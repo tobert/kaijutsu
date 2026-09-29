@@ -233,9 +233,16 @@ impl AcpClient {
 
     /// Wait up to `within` for `needle` to appear on the agent's stderr.
     pub fn wait_for_stderr(&self, needle: &str, within: Duration) -> Result<()> {
+        self.wait_for_stderr_since(0, needle, within)
+    }
+
+    /// Wait up to `within` for `needle` to appear on the agent's stderr after
+    /// its first `mark` bytes; take `mark` from `stderr().len()` before the
+    /// action whose effect it reports.
+    pub fn wait_for_stderr_since(&self, mark: usize, needle: &str, within: Duration) -> Result<()> {
         let deadline = Instant::now() + within;
         loop {
-            if self.stderr().contains(needle) {
+            if self.stderr().get(mark..).is_some_and(|tail| tail.contains(needle)) {
                 return Ok(());
             }
             if Instant::now() > deadline {
@@ -333,6 +340,37 @@ impl AcpClient {
                     "the agent closed stdout after {what}\n--- agent stderr (tail) ---\n{}",
                     self.stderr_tail()
                 ),
+            }
+        }
+    }
+
+    /// Read and handle messages until `done` holds for the updates seen so
+    /// far, which it is also checked against before reading. Fails after
+    /// `within`, or when the response to `request` arrives first: the
+    /// request ended without what the caller waited for.
+    pub fn pump_until(
+        &mut self,
+        request: i64,
+        what: &str,
+        within: Duration,
+        done: impl Fn(&[Value]) -> bool,
+    ) -> Result<()> {
+        let deadline = Instant::now() + within;
+        loop {
+            if done(&self.updates) {
+                return Ok(());
+            }
+            if let Some(response) = self.parked.iter().find(|m| response_id(m) == Some(request)) {
+                bail!(
+                    "the request ended before {what}: {response}\n--- agent stderr (tail) ---\n{}",
+                    self.stderr_tail()
+                );
+            }
+            let message = self.next_message(deadline, what)?;
+            if response_id(&message).is_some() {
+                self.parked.push(message);
+            } else {
+                self.dispatch(message)?;
             }
         }
     }

@@ -109,6 +109,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including text from follow-up turns. |
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains`. |
+| `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
 
 Unknown keys are refused, so a misspelled expectation fails the load instead
@@ -135,6 +136,41 @@ A hook can raise an ask and never lower one (`docs/gate-policy-tuning.md`,
 "Verdicts"). A fault running the body asks, and a `kaish_path` body that
 cannot be read denies. A program the tiers allow outright, or refuse, never
 reaches a hook; `fleet/gate-tiers.toml` has its hook record what it saw to show that.
+
+## Cancel scenarios
+
+```toml
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "while ! [[ -f release ]]; do sleep 0.05; done; echo finished > finished.txt" } }]
+[[model]]
+text = "a fresh turn after the cancel"
+
+[[prompt]]
+text = "wait for the release file"
+cancel = { after_tool_call = "shell_write", release = "release" }
+stop_reason = "cancelled"
+tool_calls = [{ title = "shell_write", status = "completed" }]
+
+[[prompt]]
+text = "are you still there"
+text_contains = ["a fresh turn after the cancel"]
+```
+
+The runner waits for the named tool call to be reported `in_progress`, sends
+`session/cancel`, waits for the kernel to confirm it stopped a running turn,
+and only then writes `release`. The scripted command waits for that file,
+so the cancel always lands while the call runs, with no timing guess.
+
+`session/cancel` is a soft interrupt: the running tool call finishes, and
+the turn ends before its next model call, with `stopReason: cancelled`. The
+second prompt gets the reply the cancelled turn did not take, so a turn that
+kept going, or one still holding the context, fails the scenario
+(`fleet/cancel.toml`).
+
+ACP gives no acknowledgment of a `session/cancel`, so the runner reads the
+confirmation from the agent's stderr: the kernel's `turn_interrupted=true`.
+`turn_interrupted=false` fails the prompt at once: the cancel found no
+running turn.
 
 ## How a run works
 

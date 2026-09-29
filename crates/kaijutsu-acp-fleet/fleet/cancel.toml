@@ -1,0 +1,32 @@
+description = "session/cancel during a running shell_write ends the turn cancelled once the command finishes; no further model call runs, and the next prompt gets a fresh turn."
+
+# The scripted command uses only kaish builtins (`[[`, `sleep`, `echo`), so
+# allowing uncovered statements lets it run with no ask and no host program.
+gate = """
+[global]
+uncovered = "allow"
+"""
+
+# The command waits for `release`, which the runner writes only after the
+# agent confirms the interrupt, so the cancel always lands mid-call.
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "while ! [[ -f release ]]; do sleep 0.05; done; echo finished > finished.txt" } }]
+# A soft cancel stops before the next model call, so this reply belongs to
+# prompt 2. A turn that kept going after the cancel would take it here.
+[[model]]
+text = "a fresh turn after the cancel"
+
+[[prompt]]
+text = "wait for the release file"
+cancel = { after_tool_call = "shell_write", release = "release" }
+stop_reason = "cancelled"
+tool_calls = [{ title = "shell_write", status = "completed" }]
+
+[[prompt]]
+text = "are you still there"
+text_contains = ["a fresh turn after the cancel"]
+tool_calls = []
+
+[[verify]]
+path = "finished.txt"
+equals = "finished\n"

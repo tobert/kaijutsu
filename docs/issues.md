@@ -2410,7 +2410,17 @@ for when it's contained in docker". Open:
   prompt. Mock replies a scenario never used go unreported.
 - **Nothing notices a stale fleet image**, and contained runs set no
   `--pids-limit`.
-- Add a `session/cancel` scenario and the `kaijutsu-acp --connect` agent.
+- Add the `kaijutsu-acp --connect` agent.
+- **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
+  the kernel's `turn_interrupted=true` log line from stderr. The bridge's
+  own "soft interrupt sent" line does not serve: `interruptContext` answers
+  `success` when it only closed a continuation (`turn_interrupted ||
+  continuation_closed`, `crates/kaijutsu-server/src/rpc.rs`), so the line
+  also appears when no turn was running. The bridge should log, or return,
+  which one happened.
+- **A gated `shell_write` is announced `in_progress`** before the gate
+  refuses it as pending, so "in progress" on the wire does not mean the
+  command is running.
 
 ## Egress: what stays open (2026-09-21)
 
