@@ -1524,17 +1524,12 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once\n");
     assert!(ask.exec_source.is_none(), "a result review must never authorize execution of its original command");
     assert_eq!(ask.origin.as_str(), "hook_result");
-    s.answer(&ask.request_id, allow).await;
     if twice {
-        wait_for("the second result review", || {
-            s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
-                .any(|ask| ask.hook_id.as_deref() == Some("second-review"))
-        }).await;
-        let second = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()
-            .find(|ask| ask.hook_id.as_deref() == Some("second-review")).unwrap();
-        assert_ne!(second.request_id, ask.request_id);
-        s.answer(&second.request_id, true).await;
+        // The chain collapses to one ask: the second review adds its reason
+        // to the first review's ask and never opens its own.
+        assert!(ask.description.contains("Second result review"), "{}", ask.description);
     }
+    s.answer(&ask.request_id, allow).await;
     wait_for("reviewed operation completion", || {
         s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap().completed_at.is_some()
     }).await;
@@ -1619,7 +1614,7 @@ fn kaish_result_hook_escalation_resumes_after_approval() {
 }
 
 #[test]
-fn sequential_result_reviews_keep_the_same_hook_snapshot() {
+fn sequential_result_reviews_collapse_to_one_ask() {
     run_local(result_review_case(false, true, false, true));
 }
 

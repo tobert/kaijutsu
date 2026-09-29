@@ -1948,6 +1948,8 @@ mod tests {
         use crate::mcp::{HookAction, HookBody, HookEntry, HookId, GlobPattern, AskSpec};
         for run_in_background in [true, false] {
             for decision in ["deny", "allow", "cancel", "shutdown", "panic"] {
+                // The whole chain runs before its one ask, so a hook after
+                // the reviewer that panics does so before anyone is asked.
                 let allow = decision == "allow";
                 let (broker, d) = wired().await;
                 let principal = PrincipalId::new();
@@ -1978,6 +1980,18 @@ mod tests {
                 let cancel = CancellationToken::new();
                 let result = tokio::time::timeout(std::time::Duration::from_secs(5),
                     broker.call_tool(params, &cc, cancel.clone())).await.expect("review releases the tool call");
+                if decision == "panic" {
+                    if run_in_background {
+                        let operation = body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned();
+                        let state = wait_for_operation(&d, context, &operation).await;
+                        assert!(state.envelope.unwrap().is_error(), "a panicking hook settles the operation as an error");
+                    } else {
+                        assert!(result.is_err(), "a panicking hook fails the call: {result:?}");
+                    }
+                    assert!(d.kernel_db().lock().list_pending_asks().unwrap().is_empty(), "nobody is asked");
+                    assert!(d.kernel().shutdown_runtime_worker().await.is_err(), "the panic is reported at shutdown");
+                    continue;
+                }
                 let operation = if run_in_background {
                     Some(body_of(&result.unwrap())["operation_id"].as_str().unwrap().to_owned())
                 } else {

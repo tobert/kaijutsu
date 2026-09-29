@@ -2336,9 +2336,6 @@ Map and reasoning: https://claude.ai/artifact/QzzA5UzbszV8y67sw3S3XB
 two consumers act on an answer with different checks. Amy: "let's record
 and burn down all the approval options". Delete each line as it ships.
 
-- **F1** Approving an ask runs `exec_source` in the worker
-  (`approval_resume.rs`) without re-running `gate_policy::evaluate` or the
-  PreCall hooks the ask stopped; the retry path re-runs both.
 - **F3** PreCall (`evaluate_planned`) reads no ledger: a learned allow never
   outranks a config deny through a real call, and on the RPC shell paths a
   remembered deny does nothing unless something asks.
@@ -2363,12 +2360,13 @@ and burn down all the approval options". Delete each line as it ships.
   send` through `shell_write` asks twice, unlinked.
 - **Tests** The ACP part of the conformance matrix ships in
   `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
-  approval matrix"); scenarios marked `known_gap` name F1, F2, F7, and F8.
+  approval matrix"); scenarios marked `known_gap` name F7 and F8.
   Open: no ACP client can create a standing rule, because the bridge offers
   only allow once and reject once, never `--remember`. A learned allow over
-  a config deny (F3), a model forgetting a human's rule (F4), and a deny
-  rule added between ask and answer (F1) need that option or another
-  surface. Paths C and D need a harness of their own.
+  a config deny (F3) and a model forgetting a human's rule (F4) need that
+  option. Paths C and D need a harness of their own. A rule added between
+  an ask and its answer does not reach that approval: Amy, "the policy at
+  the time the command was first evaluated should cover its lifetime".
 
 ## What a replacement risk scorer inherits (2026-09-28)
 

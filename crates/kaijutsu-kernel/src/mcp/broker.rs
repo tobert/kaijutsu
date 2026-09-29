@@ -329,6 +329,15 @@ fn unreadable_hook_body_reason(path: &str, err: &str) -> String {
 }
 
 /// The phase's result when the walk ended without a terminal outcome.
+/// Add a hook's ask to the chain's one ask: the first asking hook owns it,
+/// and each later one adds its reason.
+fn add_escalation(escalation: &mut Option<(HookId, String)>, hook_id: &HookId, description: String) {
+    match escalation {
+        None => *escalation = Some((hook_id.clone(), description)),
+        Some((_, merged)) => merged.push_str(&format!("\nalso asked by hook `{hook_id}`: {description}")),
+    }
+}
+
 fn no_hook_matched(mode: PhaseMode) -> PhaseEval {
     match mode {
         PhaseMode::Enforce => PhaseEval::Enforced(PhaseOutcome::Continue),
@@ -2055,6 +2064,12 @@ impl Broker {
             PhasePayload::Result(_, review) | PhasePayload::Error(_, review) => *review,
             PhasePayload::None => None,
         };
+        // The chain runs to the end and collapses to at most one ask: the
+        // first asking hook owns it and later asks add their reasons. A deny
+        // or fault anywhere ends the chain before anyone is asked. A short
+        // circuit still needs the pending ask answered first: a hook that
+        // replaces the result does not skip its review.
+        let mut escalation: Option<(HookId, String)> = None;
         for (_idx, entry) in ordered {
             if cancel.is_cancelled() {
                 return Err(McpError::Cancelled);
@@ -2131,6 +2146,9 @@ impl Broker {
                 }
                 HookAction::ShortCircuit(result) => {
                     if mode == PhaseMode::DryRun {
+                        if let Some((ask_hook, description)) = escalation.take() {
+                            return Ok(PhaseEval::DryRun(self.dry_run_ask(&ask_hook, description, params, ctx).await));
+                        }
                         // Nothing gate-shaped happened, so there is nothing
                         // to record — only the fact that the command would
                         // not have run.
@@ -2145,50 +2163,22 @@ impl Broker {
                             ask: None,
                         }));
                     }
+                    if let Some((ask_hook, description)) = escalation.take() {
+                        match self.settle_escalation(ask_hook, description, params, ctx, phase, &payload, review, cancel).await? {
+                            PhaseOutcome::Continue => {}
+                            refused => return Ok(PhaseEval::Enforced(refused)),
+                        }
+                    }
                     return Ok(PhaseEval::Enforced(PhaseOutcome::ShortCircuit {
                         hook_id: entry.id,
                         result,
                     }));
                 }
                 HookAction::Ask(spec) => {
-                    if mode == PhaseMode::DryRun {
-                        // The gate is never reached in dry run: opening one
-                        // mints a pending row nobody can usefully answer,
-                        // and redeeming an answer already given would spend
-                        // it on a call that is not happening.
-                        let description = spec.description.clone().unwrap_or_else(|| {
-                            format!("{}.{}", params.instance, params.tool)
-                        });
-                        return Ok(PhaseEval::DryRun(
-                            self.dry_run_ask(&entry.id, description, params, ctx).await,
-                        ));
-                    }
-                    match self.run_permission_ask(
-                        &entry.id, &spec, params, ctx, phase, &payload, review, cancel,
-                    ).await? {
-                        PermissionAskOutcome::Proceed => {}
-                        PermissionAskOutcome::Denied { reason, ask } => {
-                            return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
-                                hook_id: entry.id,
-                                reason,
-                                ask,
-                            }));
-                        }
-                        PermissionAskOutcome::Unavailable { reason, ask } => {
-                            return Ok(PhaseEval::Enforced(PhaseOutcome::GateUnavailable {
-                                hook_id: entry.id,
-                                reason,
-                                ask,
-                            }));
-                        }
-                        PermissionAskOutcome::Pending { reason, ask } => {
-                            return Ok(PhaseEval::Enforced(PhaseOutcome::GatePending {
-                                hook_id: entry.id,
-                                reason,
-                                ask,
-                            }));
-                        }
-                    }
+                    let description = spec.description.clone().unwrap_or_else(|| {
+                        format!("{}.{}", params.instance, params.tool)
+                    });
+                    add_escalation(&mut escalation, &entry.id, description);
                 }
                 HookAction::Invoke(body) => match body {
                     HookBody::Builtin { name, hook } => {
@@ -2223,14 +2213,15 @@ impl Broker {
                                 early_gate_config.as_ref(),
                             )
                             .await?;
-                        if let Some(eval) = self
-                            .resolve_kaish_hook_outcome_in_mode(
-                                mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
-                                cancel,
-                            )
-                            .await?
-                        {
-                            return Ok(eval);
+                        if cancel.is_cancelled() {
+                            return Err(McpError::Cancelled);
+                        }
+                        match outcome {
+                            KaishHookOutcome::Continue => {}
+                            KaishHookOutcome::Escalate(description) => add_escalation(&mut escalation, &entry.id, description),
+                            KaishHookOutcome::Deny(reason) => {
+                                return Ok(self.phase_deny(mode, entry.id, reason, params, ctx).await);
+                            }
                         }
                     }
                     HookBody::KaishPath(path) => {
@@ -2269,20 +2260,72 @@ impl Broker {
                                 early_gate_config.as_ref(),
                             )
                             .await?;
-                        if let Some(eval) = self
-                            .resolve_kaish_hook_outcome_in_mode(
-                                mode, entry.id.clone(), outcome, params, ctx, phase, &payload, review,
-                                cancel,
-                            )
-                            .await?
-                        {
-                            return Ok(eval);
+                        if cancel.is_cancelled() {
+                            return Err(McpError::Cancelled);
+                        }
+                        match outcome {
+                            KaishHookOutcome::Continue => {}
+                            KaishHookOutcome::Escalate(description) => add_escalation(&mut escalation, &entry.id, description),
+                            KaishHookOutcome::Deny(reason) => {
+                                return Ok(self.phase_deny(mode, entry.id, reason, params, ctx).await);
+                            }
                         }
                     }
                 },
             }
         }
-        Ok(no_hook_matched(mode))
+        let Some((hook_id, description)) = escalation else {
+            return Ok(no_hook_matched(mode));
+        };
+        if mode == PhaseMode::DryRun {
+            // The gate is never reached in dry run: opening one mints a
+            // pending row nobody can usefully answer, and redeeming an
+            // answer already given would spend it on a call that is not
+            // happening.
+            return Ok(PhaseEval::DryRun(self.dry_run_ask(&hook_id, description, params, ctx).await));
+        }
+        Ok(PhaseEval::Enforced(
+            self.settle_escalation(hook_id, description, params, ctx, phase, &payload, review, cancel).await?,
+        ))
+    }
+
+    /// Open the chain's one ask, or collect the answer already given.
+    /// `Continue` means a human allowed it.
+    async fn settle_escalation(
+        &self,
+        hook_id: HookId,
+        description: String,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+        phase: McpHookPhase,
+        payload: &PhasePayload<'_>,
+        review: Option<&dyn ResultReview>,
+        cancel: &CancellationToken,
+    ) -> McpResult<PhaseOutcome> {
+        let spec = AskSpec { description: Some(description) };
+        Ok(match self.run_permission_ask(&hook_id, &spec, params, ctx, phase, payload, review, cancel).await? {
+            PermissionAskOutcome::Proceed => PhaseOutcome::Continue,
+            PermissionAskOutcome::Denied { reason, ask } => PhaseOutcome::Deny { hook_id, reason, ask },
+            PermissionAskOutcome::Unavailable { reason, ask } => {
+                PhaseOutcome::GateUnavailable { hook_id, reason, ask }
+            }
+            PermissionAskOutcome::Pending { reason, ask } => PhaseOutcome::GatePending { hook_id, reason, ask },
+        })
+    }
+
+    /// A hook's deny, as the phase's mode reports it.
+    async fn phase_deny(
+        &self,
+        mode: PhaseMode,
+        hook_id: HookId,
+        reason: String,
+        params: &KernelCallParams,
+        ctx: &CallContext,
+    ) -> PhaseEval {
+        if mode == PhaseMode::DryRun {
+            return PhaseEval::DryRun(self.dry_run_deny(&hook_id, reason, params, ctx).await);
+        }
+        PhaseEval::Enforced(PhaseOutcome::Deny { hook_id, reason, ask: None })
     }
 
     /// Record the ask a dry-run gate crossing would have raised, and report
@@ -2400,43 +2443,6 @@ impl Broker {
             reason,
         )
         .await
-    }
-
-    /// [`Self::resolve_kaish_hook_outcome`], mode-aware. In dry run the
-    /// escalation branch never reaches the gate: an `Escalate` is recorded
-    /// and reported instead.
-    async fn resolve_kaish_hook_outcome_in_mode(
-        &self,
-        mode: PhaseMode,
-        hook_id: HookId,
-        outcome: KaishHookOutcome,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-        phase: McpHookPhase,
-        payload: &PhasePayload<'_>,
-        review: Option<&dyn ResultReview>,
-        cancel: &CancellationToken,
-    ) -> McpResult<Option<PhaseEval>> {
-        if cancel.is_cancelled() {
-            return Err(McpError::Cancelled);
-        }
-        if mode == PhaseMode::Enforce {
-            return Ok(self
-                .resolve_kaish_hook_outcome(
-                    hook_id, outcome, params, ctx, phase, payload, review, cancel,
-                )
-                .await?
-                .map(PhaseEval::Enforced));
-        }
-        Ok(match outcome {
-            KaishHookOutcome::Continue => None,
-            KaishHookOutcome::Deny(reason) => Some(PhaseEval::DryRun(
-                self.dry_run_deny(&hook_id, reason, params, ctx).await,
-            )),
-            KaishHookOutcome::Escalate(description) => Some(PhaseEval::DryRun(
-                self.dry_run_ask(&hook_id, description, params, ctx).await,
-            )),
-        })
     }
 
     /// Record a durable ask with the phase's authority. PreCall approval can
@@ -2984,52 +2990,6 @@ impl Broker {
             .await
             .map_err(|e| e.to_string())?;
         String::from_utf8(bytes).map_err(|e| e.to_string())
-    }
-
-    /// Turn a `KaishHookOutcome` into a terminal `PhaseOutcome`, or `None`
-    /// to let `evaluate_phase` continue to the next hook entry. Shared by
-    /// `HookBody::Kaish` and `HookBody::KaishPath` — the two differ only
-    /// in where the body text came from; once it has run, the exit-code
-    /// handling documented on `KaishHookOutcome` is identical.
-    async fn resolve_kaish_hook_outcome(
-        &self,
-        hook_id: HookId,
-        outcome: KaishHookOutcome,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-        phase: McpHookPhase,
-        payload: &PhasePayload<'_>,
-        review: Option<&dyn ResultReview>,
-        cancel: &CancellationToken,
-    ) -> McpResult<Option<PhaseOutcome>> {
-        if cancel.is_cancelled() {
-            return Err(McpError::Cancelled);
-        }
-        Ok(match outcome {
-            KaishHookOutcome::Continue => None,
-            KaishHookOutcome::Deny(reason) => {
-                Some(PhaseOutcome::Deny { hook_id, reason, ask: None })
-            }
-            KaishHookOutcome::Escalate(description) => {
-                let ask_spec = AskSpec {
-                    description: Some(description),
-                };
-                match self.run_permission_ask(
-                    &hook_id, &ask_spec, params, ctx, phase, payload, review, cancel,
-                ).await? {
-                    PermissionAskOutcome::Proceed => None,
-                    PermissionAskOutcome::Denied { reason, ask } => {
-                        Some(PhaseOutcome::Deny { hook_id, reason, ask })
-                    }
-                    PermissionAskOutcome::Unavailable { reason, ask } => {
-                        Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask })
-                    }
-                    PermissionAskOutcome::Pending { reason, ask } => {
-                        Some(PhaseOutcome::GatePending { hook_id, reason, ask })
-                    }
-                }
-            }
-        })
     }
 
     // ── Direct kaish exec paths take the hook path (docs/gate-and-shell-
@@ -10643,6 +10603,43 @@ mod tests {
             other => panic!("a retry must leave the approved command to the worker, got {other:?}"),
         }
         assert!(db.lock().list_pending_asks().unwrap().is_empty(), "an answered ask is not asked again");
+    }
+
+    /// The hook chain runs to the end and collapses to at most one ask. A
+    /// deny anywhere in the chain refuses before anyone is asked, even when
+    /// an earlier hook asked, so a human never approves what a later guard
+    /// refuses. Several asking hooks open one ask that names each of them.
+    ///
+    /// Falsified by stopping the chain at the first ask: the deny never
+    /// runs, and a pending ask is left for a command the guard refuses.
+    #[tokio::test]
+    async fn the_hook_chain_collapses_to_one_ask_and_a_later_deny_wins() {
+        let (broker, _kernel, kj, _dir) = wired_kaish_broker_with_gate_toml("one-ask", "").await;
+        let ctx = approval_call_context(&kj, "one-ask");
+        let db = kj.kernel_db();
+        push_shell_write_hook(&broker, "scorer", HookAction::Ask(AskSpec { description: Some("scorer is unsure".into()) })).await;
+        push_shell_write_hook(&broker, "second-opinion", HookAction::Ask(AskSpec { description: Some("second opinion is unsure".into()) })).await;
+
+        match broker.shell_pre_call_hooks("echo hi", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => assert!(err.is_refusal(RefusalKind::Pending), "{err:?}"),
+            other => panic!("the asking hooks must ask, got {other:?}"),
+        }
+        let pending = db.lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1, "one ask for the whole chain");
+        assert!(
+            pending[0].description.contains("scorer is unsure") && pending[0].description.contains("second opinion is unsure"),
+            "the one ask names every asking hook: {}", pending[0].description
+        );
+
+        push_shell_write_hook(&broker, "escape-guard", HookAction::Deny("no inline shells".into())).await;
+        match broker.shell_pre_call_hooks("echo again", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => {
+                assert!(err.is_refusal(RefusalKind::Denied), "{err:?}");
+                assert!(err.to_string().contains("no inline shells"), "{err}");
+            }
+            other => panic!("a later deny must refuse, got {other:?}"),
+        }
+        assert_eq!(db.lock().list_pending_asks().unwrap().len(), 1, "nobody is asked about a refused command");
     }
 
     /// A `gate.toml` that stops loading after PreCall read it refuses the call

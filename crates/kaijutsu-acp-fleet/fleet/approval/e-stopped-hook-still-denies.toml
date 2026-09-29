@@ -1,7 +1,5 @@
 description = "Property (e), path A: a deny that an ask stopped from running still wins when the ask is approved; the approval answers only the ask."
 
-known_gap = { finding = "F1", fails = ["verify stopped"] }
-
 # Two pre_call hooks on shell_write, lower priority first: the first asks,
 # which stops the chain before the second, which denies.
 [rc]
