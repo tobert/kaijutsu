@@ -2345,8 +2345,7 @@ and burn down all the approval options". Delete each line as it ships.
   outranks a config deny through a real call, and on the RPC shell paths a
   remembered deny does nothing unless something asks.
 - **F5** File and block tools pass no gate tier; a file write to
-  `/config/rc` does what ask-tier `kj rc add` does. `WorkspaceGuard`
-  fails open on a database error.
+  `/config/rc` does what ask-tier `kj rc add` does.
 - **F6** kaijutsu-mcp submits as a model but gets path C's lenient posture:
   uncovered statements run without an ask.
 - **F7** ACP prompts show only the description (200-char prefix, hook
@@ -2354,8 +2353,6 @@ and burn down all the approval options". Delete each line as it ships.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
   auto-allows leave no row; a dry run with no reviewer records nothing;
   the ORIGIN column is narrower than `shell_gate`.
-- **F9** `ask_tier_description` swallows a config load error (`.ok()?`) and
-  lets an ask-tier statement run.
 - **F10** A redeeming retry restores cwd but not the env the reviewer saw.
 - **F11** Approving a streaming RPC ask authors a Model-role pair and can
   wake the model (inferred).
