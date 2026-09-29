@@ -241,6 +241,72 @@ pub fn format_track_table(rows: &[TrackListRow]) -> String {
     lines.join("\n")
 }
 
+/// Render `kj transport work` as a table, one row per attempt, oldest first.
+///
+/// MARGIN is how many ticks before START the result was ready. BASIS says
+/// whether the context the result was prepared against still held when it
+/// was checked. OUTCOME is the disposition, or the readiness of open work.
+pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String {
+    use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason, Readiness};
+    if statuses.is_empty() {
+        return "(no work)".to_string();
+    }
+    let tick = |t: Option<kaijutsu_types::Tick>| t.map(|t| t.get().to_string()).unwrap_or_else(|| "—".to_string());
+    let mut lines = vec![format!(
+        "{:>8}  {:>8}  {:>4}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
+        "START", "PREPARE", "EST", "STARTED", "READY", "MARGIN", "TRY", "BASIS", "OUTCOME",
+    )];
+    for s in statuses {
+        let margin = s.ready_at.map(|r| format!("{:+}", (s.start - r).get())).unwrap_or_else(|| "—".to_string());
+        let basis = match s.valid {
+            Some(true) => "held",
+            Some(false) => "changed",
+            None => "—",
+        };
+        let outcome = match &s.disposition {
+            Some(Disposition::Committed { .. }) => "committed".to_string(),
+            Some(Disposition::Cancelled) => "cancelled".to_string(),
+            Some(Disposition::Superseded { .. }) => "superseded".to_string(),
+            Some(Disposition::Fallback { reason, policy, .. }) => {
+                let reason = match reason {
+                    FallbackReason::ResolveFailed => "resolve failed",
+                    FallbackReason::InvalidBasis => "basis changed",
+                    FallbackReason::DeadlineMissed => "deadline missed",
+                };
+                let policy = match policy {
+                    Fallback::Skip => "skip",
+                    Fallback::UseLastGood => "last good",
+                    Fallback::Literal(_) => "literal",
+                };
+                match &s.error {
+                    Some(error) => format!("fallback: {reason}, {policy}: {error}"),
+                    None => format!("fallback: {reason}, {policy}"),
+                }
+            }
+            None => match s.readiness {
+                Readiness::Queued => "queued",
+                Readiness::Running => "running",
+                Readiness::Ready => "ready",
+                Readiness::Failed => "failed",
+            }
+            .to_string(),
+        };
+        lines.push(format!(
+            "{:>8}  {:>8}  {:>4}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
+            s.start.get(),
+            s.prepare_at.get(),
+            s.estimate.get(),
+            tick(s.started_at),
+            tick(s.ready_at),
+            margin,
+            s.attempt,
+            basis,
+            outcome,
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Render a 16-byte OTel trace id as 32 lowercase hex chars (no dashes) —
 /// the canonical W3C `trace-id` text form a trace viewer expects.
 pub(crate) fn hex32(bytes: [u8; 16]) -> String {
@@ -474,6 +540,65 @@ pub fn format_drift_queue(items: &[crate::drift::StagedDrift]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn work(start: i64, ready_at: Option<i64>, valid: Option<bool>, disposition: Option<kaijutsu_hyoushigi::Disposition>) -> kaijutsu_hyoushigi::WorkStatus {
+        use kaijutsu_hyoushigi::{Readiness, WorkId};
+        use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
+        kaijutsu_hyoushigi::WorkStatus {
+            id: WorkId(uuid::Uuid::nil()),
+            track: TrackId::solo(),
+            played_by: PrincipalId::beat(),
+            start: Tick::new(start),
+            admitted_at: Tick::new(start - 20),
+            estimate: TickDelta::new(3),
+            prepare_at: Tick::new(start - 6),
+            attempt: 1,
+            started_at: Some(Tick::new(start - 6)),
+            ready_at: ready_at.map(Tick::new),
+            readiness: if ready_at.is_some() { Readiness::Ready } else { Readiness::Running },
+            predicted: None,
+            actual: None,
+            valid,
+            error: None,
+            settled_at: None,
+            disposition,
+        }
+    }
+
+    /// A player reads each attempt's intended tick, its estimate, how many
+    /// ticks early it was ready, whether its basis held, and what became of
+    /// it, without decoding JSON.
+    #[test]
+    fn work_table_names_margin_basis_and_outcome() {
+        use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason};
+        let committed = work(100, Some(95), Some(true), Some(Disposition::Committed {
+            content: kaijutsu_hyoushigi::ContentRef::of(b"A", "text/plain"),
+        }));
+        let late = work(120, None, None, Some(Disposition::Fallback {
+            reason: FallbackReason::DeadlineMissed, policy: Fallback::UseLastGood, content: None,
+        }));
+        let mut failed = work(140, None, None, Some(Disposition::Fallback {
+            reason: FallbackReason::ResolveFailed, policy: Fallback::Skip, content: None,
+        }));
+        failed.error = Some("parse error".into());
+        let changed = work(160, Some(150), Some(false), Some(Disposition::Fallback {
+            reason: FallbackReason::InvalidBasis, policy: Fallback::Skip, content: None,
+        }));
+        let running = work(180, None, None, None);
+
+        let table = super::format_work_table(&[committed, late, failed, changed, running]);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 6, "{table}");
+        for heading in ["START", "PREPARE", "EST", "READY", "MARGIN", "BASIS", "OUTCOME"] {
+            assert!(lines[0].contains(heading), "{table}");
+        }
+        assert!(lines[1].contains("+5") && lines[1].contains("held") && lines[1].ends_with("committed"), "{table}");
+        assert!(lines[2].ends_with("fallback: deadline missed, last good"), "{table}");
+        assert!(lines[3].ends_with("fallback: resolve failed, skip: parse error"), "{table}");
+        assert!(lines[4].contains("changed") && lines[4].ends_with("fallback: basis changed, skip"), "{table}");
+        assert!(lines[5].ends_with("running"), "{table}");
+        assert_eq!(super::format_work_table(&[]), "(no work)");
+    }
 
 
     /// The age column exists because finding "what is stale enough to

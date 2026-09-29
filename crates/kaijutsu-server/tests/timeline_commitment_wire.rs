@@ -39,7 +39,16 @@ async fn work_status(kj: &kaijutsu_client::KernelHandle, context: kaijutsu_types
         "transport".into(), "work".into(), "--track".into(), track.as_str().into(),
     ]).await.unwrap();
     assert_eq!(result.exit_code, 0, "{}", result.stderr);
-    serde_json::from_value(result.data.expect("structured work status")).unwrap()
+    eprintln!("{}", result.stdout);
+    let statuses: Vec<kaijutsu_hyoushigi::WorkStatus> = serde_json::from_value(result.data.expect("structured work status")).unwrap();
+    if statuses.is_empty() {
+        assert_eq!(result.stdout.trim(), "(no work)");
+    } else {
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert!(lines[0].contains("OUTCOME"), "a player reads a table:\n{}", result.stdout);
+        assert_eq!(lines.len(), statuses.len() + 1, "one row per attempt:\n{}", result.stdout);
+    }
+    statuses
 }
 
 #[test]

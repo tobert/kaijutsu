@@ -1,7 +1,7 @@
 //! Observable ownership and disposition of admitted timeline work.
 
 use serde::{Deserialize, Serialize};
-use kaijutsu_types::{PrincipalId, Tick, TrackId};
+use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
 
 use crate::{ContentRef, ContextHash, Fallback};
 
@@ -33,6 +33,11 @@ pub struct WorkStatus {
     pub played_by: PrincipalId,
     pub start: Tick,
     pub admitted_at: Tick,
+    /// The resolver's cost estimate, in ticks at admission's tick rate.
+    pub estimate: TickDelta,
+    /// The tick preparation was planned to begin: the estimate's lead before
+    /// `start`, or admission for work that prepares at once.
+    pub prepare_at: Tick,
     pub attempt: u32,
     pub started_at: Option<Tick>,
     pub ready_at: Option<Tick>,

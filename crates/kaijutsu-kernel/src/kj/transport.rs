@@ -197,8 +197,10 @@ enum TransportCommand {
     /// scheduler snapshot (playhead/beat/attachment truth), so a track shows as
     /// `dormant` when it's in the DB but nothing has re-attached it this session.
     List,
-    /// Show pending work and the most recent 256 dispositions as JSON. This
-    /// process-local history resets when the timeline is removed or the process restarts.
+    /// Show pending work and the most recent 256 dispositions: each attempt's
+    /// intended tick, estimate, readiness, margin, basis, and outcome. The
+    /// structured result carries the same statuses as JSON. This process-local
+    /// history resets when the timeline is removed or the process restarts.
     Work {
         /// Track whose intended times, readiness, validity, and outcomes to read.
         #[arg(long)]
@@ -303,8 +305,9 @@ impl KjDispatcher {
                 return KjResult::Err(format!("kj transport work: track '{}' is not armed", track.as_str()));
             };
             let statuses = timeline.lock().statuses();
+            let text = super::format::format_work_table(&statuses);
             let data = serde_json::to_value(statuses).expect("work status is serializable");
-            return KjResult::ok_with_data(serde_json::to_string_pretty(&data).expect("work status is JSON"), data);
+            return KjResult::ok_with_data(text, data);
         }
 
         // Driving the beat (play/pause/stop/tempo/ooda) is gated on `transport`.

@@ -36,9 +36,12 @@ work. `docs/audio-inference.md` records the workload and measured costs.
 4. **Expose the feedback needed to play.** `kj transport work --track`
    reports each attempt's intended tick, admission, start, readiness, basis
    validity, and disposition (committed, fallback with its reason,
-   cancelled, superseded). Open: the estimate beside the measured compute
-   time, a readable view for a player, and queue and transfer durations
-   once media delivery is in the scenario. Measure under overlap
+   cancelled, superseded), with the estimate and planned preparation tick
+   beside them, as a table and as JSON. Open: the timeline observes
+   readiness only on a pulse, so true compute time must come from the
+   producer (a measured duration on `Resolution`); queue and transfer
+   durations wait for media delivery in the scenario; no client shows
+   work yet. Measure under overlap
    before choosing lead-time targets; avoid turning unmeasured percentiles
    into guarantees.
 5. **Exercise replacement, then extract.** Run the same scenario with one

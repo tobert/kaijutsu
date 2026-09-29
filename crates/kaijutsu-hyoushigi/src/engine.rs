@@ -109,10 +109,7 @@ struct Scheduled {
     observed_at: Tick,
     cell: Cell,
     start: Tick,
-    speculate_at: Tick,
     commit_deadline: Tick,
-    /// `estimate_cost` in ticks — the budget threshold for re-speculation.
-    est_cost: TickDelta,
     resolution: Option<crate::resolver::Resolution>,
     /// Set once a squash re-speculated; the next commit check is at `start` and
     /// is the last — diverge there and the fallback fires.
@@ -123,7 +120,7 @@ impl Scheduled {
     /// The tick at which this cell's next lifecycle action is due, if any.
     fn next_at(&self) -> Option<Tick> {
         match self.cell.state {
-            CellState::Pending => Some(self.speculate_at),
+            CellState::Pending => Some(self.status.prepare_at),
             CellState::Speculating => Some(self.start),
             CellState::Speculated | CellState::Failed => Some((if self.final_attempt {
                 self.start
@@ -257,7 +254,7 @@ impl Timeline {
         drop(old.work);
         drop(old.resolver);
         let idx = self.future.iter().position(|s| s.status.id == by).expect("replacement was admitted");
-        if self.future[idx].speculate_at <= self.playhead {
+        if self.future[idx].status.prepare_at <= self.playhead {
             self.speculate(idx);
         }
         Ok(by)
@@ -270,11 +267,11 @@ impl Timeline {
         self.clock = clock;
     }
 
-    /// TEST-ONLY: the `speculate_at` tick of the Nth open-future cell, so a test
+    /// TEST-ONLY: the `prepare_at` tick of the Nth open-future cell, so a test
     /// can assert [`set_clock`](Self::set_clock) re-derived the speculation lead.
     #[cfg(any(test, feature = "test-util"))]
     pub fn scheduled_speculate_at(&self, idx: usize) -> Option<Tick> {
-        self.future.get(idx).map(|s| s.speculate_at)
+        self.future.get(idx).map(|s| s.status.prepare_at)
     }
 
     /// TEST-ONLY: the timeline's current speculation [`TickClock`], so a kernel/
@@ -340,7 +337,7 @@ impl Timeline {
     }
 
     /// Schedule a deferred cell. Derives its lead time from `estimate_cost`:
-    /// `speculate_at = start − beats_for(estimate × safety)`,
+    /// `prepare_at = start − beats_for(estimate × safety)`,
     /// `commit_deadline = start − commit_margin`.
     pub fn schedule(&mut self, cell: Cell) -> Result<WorkId, ScheduleError> {
         self.schedule_inner(cell, false, None)
@@ -392,7 +389,10 @@ impl Timeline {
         self.future.push(Scheduled {
             status: WorkStatus {
                 id, track: cell.track.clone(), played_by: cell.played_by,
-                start, admitted_at: self.playhead, attempt: 0,
+                start, admitted_at: self.playhead,
+                estimate: est_cost,
+                prepare_at: if preparing { self.playhead } else { start - lead },
+                attempt: 0,
                 started_at: None, ready_at: None, readiness: Readiness::Queued,
                 predicted: None, actual: None, valid: None, error: None,
                 settled_at: None, disposition: None,
@@ -402,16 +402,14 @@ impl Timeline {
             resolver,
             observed_at: self.playhead,
             start,
-            speculate_at: if preparing { self.playhead } else { start - lead },
             commit_deadline: start - self.clock.commit_margin,
-            est_cost,
             resolution: None,
             final_attempt: false,
             cell,
         });
         if !replacing {
             let idx = self.future.len() - 1;
-            if self.future[idx].speculate_at <= self.playhead {
+            if self.future[idx].status.prepare_at <= self.playhead {
                 self.speculate(idx);
             }
         }
@@ -559,7 +557,7 @@ impl Timeline {
         }
 
         // --- squash ---------------------------------------------------------
-        let est_cost = self.future[idx].est_cost;
+        let est_cost = self.future[idx].status.estimate;
         let budget = start - current_tick; // ticks left until the content is actually needed
         let can_respeculate = retry_allowed && !self.future[idx].final_attempt && budget >= est_cost;
 
@@ -874,6 +872,40 @@ mod tests {
             }
             _ => panic!("committed cell must be concrete"),
         }
+    }
+
+    /// Work status puts the estimate beside what happened: the estimated cost
+    /// and the tick preparation was planned for, then the ticks it started and
+    /// was ready at. A player compares them to see whether the estimate held.
+    #[test]
+    fn status_reports_the_estimate_beside_the_observed_readiness() {
+        let clock = TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(2),
+        };
+        let mut tl = Timeline::new(clock);
+        tl.register_resolver(Box::new(EchoBeat {
+            cost: Duration::from_secs(3),
+        }));
+        tl.set_ambient("beat", *b"A");
+
+        // start=100, cost 3 s at 1 tick/s, lead 6 → preparation planned at 94.
+        let id = tl.schedule(deferred_at(100, Fallback::Skip)).unwrap();
+        let queued = tl.status(id).unwrap().clone();
+        assert_eq!(queued.estimate, TickDelta::new(3));
+        assert_eq!(queued.prepare_at, Tick::new(94));
+        assert_eq!(queued.started_at, None);
+
+        tl.advance_to(Tick::new(94));
+        tl.advance_to(Tick::new(100));
+
+        let settled = tl.status(id).unwrap();
+        assert_eq!(settled.estimate, TickDelta::new(3));
+        assert_eq!(settled.prepare_at, Tick::new(94));
+        assert_eq!(settled.started_at, Some(Tick::new(94)));
+        assert_eq!(settled.ready_at, Some(Tick::new(94)));
+        assert!(matches!(settled.disposition, Some(Disposition::Committed { .. })));
     }
 
     /// SEV-2 (gemini-pro Stage-3 review): `commit_or_squash` must validate the
