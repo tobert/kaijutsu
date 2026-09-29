@@ -1,7 +1,5 @@
 description = "Property (d), path B: an approved hook ask on the read-only shell runs with the read-only policy it was asked under, so a write stays refused."
 
-known_gap = { finding = "F2", fails = ["verify escaped"] }
-
 [rc]
 "coder/create/S60-fleet-hook.kai" = """
 kj hook add pre_call '{"match_tool":"shell","hook_id":"fleet-shell-ask"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'

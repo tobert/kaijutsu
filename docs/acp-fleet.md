@@ -114,7 +114,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains`. |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
-| `known_gap` | `{ finding = "F2", fails = ["verify escaped"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
+| `known_gap` | `{ finding = "F1", fails = ["verify stopped"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
 
 Unknown keys are refused, so a misspelled expectation fails the load instead
 of checking nothing. Paths must stay inside the workspace or rc tree.
@@ -153,13 +153,13 @@ and the ACP prompt is `session/request_permission`.
 | (a) A config deny refuses and leaves a row | gap F8 | gap F8 | |
 | (b) A learned allow outranks a config deny | not reachable | not reachable | |
 | (c) An uncovered statement asks a model | pass | read-only by design | |
-| (d) An approval runs what was shown | pass | gap F2 | |
+| (d) An approval runs what was shown | pass | pass | |
 | (e) A deny the ask stopped still wins | gap F1 (hook) | | |
 | (f) A model cannot forget a human's rule | not reachable | | |
 | (g) An unanswered prompt is offered again | | | gap F7 |
 
 ```toml
-known_gap = { finding = "F2", fails = ["verify escaped"] }
+known_gap = { finding = "F1", fails = ["verify stopped"] }
 ```
 
 A scenario with a `known_gap` reports `GAP` while the finding holds. It
