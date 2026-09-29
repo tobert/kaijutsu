@@ -1238,7 +1238,10 @@ kaibo (DeepSeek) reviewing the performer-first change, 2026-09-22.
 ledger and context tests it panicked twice at "decision span", and passed
 in isolation and under `--test-threads=1`. Global or thread-local tracing
 state races with the other tests' subscribers. Seen 2026-09-22 by a lane
-running the kernel suite under host load.
+running the kernel suite under host load. 2026-09-29: fails every time with
+`cargo test -p kaijutsu-kernel --lib kj::ledger -- --test-threads=4` (3 of 3
+on moltar) and passes alone; the layer already answers
+`Interest::sometimes`, so callsite interest caching is not the whole story.
 
 ## Restart tests stop the server task, not the first kernel
 
@@ -2341,8 +2344,6 @@ and burn down all the approval options". Delete each line as it ships.
 - **F3** PreCall (`evaluate_planned`) reads no ledger: a learned allow never
   outranks a config deny through a real call, and on the RPC shell paths a
   remembered deny does nothing unless something asks.
-- **F4** `kj ledger forget` checks no identity and is builtin-allowed with the
-  rest of `kj ledger`: a model can erase a human's deny.
 - **F5** File and block tools pass no gate tier; a file write to
   `/config/rc` does what ask-tier `kj rc add` does. `WorkspaceGuard`
   fails open on a database error.

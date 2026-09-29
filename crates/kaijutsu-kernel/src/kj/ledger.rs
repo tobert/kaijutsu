@@ -405,6 +405,7 @@ enum LedgerCommand {
         command: DelegationCommand,
     },
     /// Forget a standing rule so its statement escalates to a human again.
+    /// Only the principal that made the rule can forget it.
     Forget {
         /// The rule to forget. Rule ids come from `kj ledger rules`.
         rule_id: String,
@@ -564,7 +565,7 @@ impl KjDispatcher {
             LedgerCommand::Rules { limit, since } => {
                 self.ledger_rules(limit, since.as_deref(), caller).await
             }
-            LedgerCommand::Forget { rule_id } => self.ledger_forget(&rule_id),
+            LedgerCommand::Forget { rule_id } => self.ledger_forget(caller, &rule_id),
             LedgerCommand::Runs { run_id, limit, since, context, verb } => match run_id {
                 Some(id) => self.ledger_run_show(&id),
                 None => self.ledger_runs_list(caller, limit, since.as_deref(), context.as_deref(), verb.as_deref()),
@@ -1557,16 +1558,19 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    fn ledger_forget(&self, rule_id: &str) -> KjResult {
+    fn ledger_forget(&self, caller: &KjCaller, rule_id: &str) -> KjResult {
         let result = {
             let db = self.kernel_db.lock();
-            match approval_ledger::rules::revoke(db.conn_for_ledger(), rule_id) {
+            match approval_ledger::rules::revoke(db.conn_for_ledger(), rule_id, caller.actor_id.as_bytes()) {
                 Ok(()) => KjResult::ok_with_data(
                     format!("forgot rule {rule_id} — its statement escalates to a human again"),
                     serde_json::json!({ "rule_id": rule_id }),
                 ),
                 Err(LedgerError::RuleNotFound(_)) => {
                     return KjResult::Err(format!("kj ledger: no such rule {rule_id}"));
+                }
+                Err(e @ LedgerError::NotRuleCreator(_)) => {
+                    return KjResult::Err(format!("kj ledger forget: {e}; ask the reviewer who made it"));
                 }
                 Err(e) => return KjResult::Err(format!("kj ledger forget: {e}")),
             }
@@ -3160,7 +3164,7 @@ mod tests {
             }
             other => panic!("rules must carry the rule ids: {other:?}"),
         };
-        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await;
+        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await;
         assert!(forgotten.is_ok(), "{forgotten:?}");
         let after = gate_once(&d, &c, planned_shell_spec("kj handoff note 'third'")).await;
         assert_eq!(after.verdict, crate::kj::gate::GateVerdict::Pending, "a forgotten family must not keep allowing");
@@ -3411,7 +3415,7 @@ mod tests {
             KjResult::Ok { data: Some(v), .. } => v.as_array().unwrap()[0].as_str().unwrap().to_string(),
             other => panic!("{other:?}"),
         };
-        assert!(d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await.is_ok());
+        assert!(d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await.is_ok());
         let again = gate_once(&d, &c, planned_shell_spec(source)).await;
         assert_eq!(
             again.verdict,
@@ -3684,7 +3688,7 @@ mod tests {
         };
         let rule_id = data[0].as_str().expect("a rule id string").to_string();
 
-        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &c).await;
+        let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await;
         assert!(forgotten.is_ok(), "{forgotten:?}");
 
         let rules_after = d.dispatch(&[s("ledger"), s("rules")], &c).await;
@@ -3705,6 +3709,47 @@ mod tests {
             crate::kj::gate::GateVerdict::Pending,
             "a forgotten rule sends the next ask back to a human waiting, not a ledger fault"
         );
+    }
+
+    /// Only the principal that made a rule may forget it. The performer whose
+    /// ask taught the rule cannot remove a reviewer's deny and retry: `kj
+    /// ledger` passes the gate's builtin tier, so this check is the control.
+    /// Covers an exact rule and a family rule.
+    #[tokio::test]
+    async fn only_the_rules_creator_can_forget_it() {
+        let d = test_dispatcher().await;
+        let performer = registered_caller(&d);
+        let exact = gate_once(&d, &performer, shell_spec("kaish-source", "rm -rf build")).await;
+        let exact_id = exact.ask.expect("an escalated ask has a row").request_id;
+        let family = gate_once(&d, &performer, planned_shell_spec("git push origin main")).await;
+        let family_id = family.ask.expect("an escalated ask has a row").request_id;
+        for args in [
+            vec![s("ledger"), s("deny"), exact_id, s("--remember"), s("always")],
+            vec![s("ledger"), s("deny"), family_id, s("--remember"), s("always"), s("--family")],
+        ] {
+            let taught = d.dispatch(&args, &answering_seat()).await;
+            assert!(taught.is_ok(), "{taught:?}");
+        }
+        let rule_ids: Vec<String> = match d.dispatch(&[s("ledger"), s("rules")], &performer).await {
+            KjResult::Ok { data: Some(v), .. } => {
+                v.as_array().unwrap().iter().map(|id| id.as_str().unwrap().to_string()).collect()
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(rule_ids.len(), 2, "{rule_ids:?}");
+
+        for rule_id in &rule_ids {
+            let refused = d.dispatch(&[s("ledger"), s("forget"), s(rule_id)], &performer).await;
+            assert!(!refused.is_ok(), "the performer must not forget the reviewer's rule: {refused:?}");
+            assert!(refused.message().contains("only by its creator"), "{}", refused.message());
+        }
+        let still = gate_once(&d, &performer, planned_shell_spec("git push origin main")).await;
+        assert_eq!(still.verdict, crate::kj::gate::GateVerdict::Denied, "{}", still.reason);
+
+        for rule_id in &rule_ids {
+            let forgotten = d.dispatch(&[s("ledger"), s("forget"), s(rule_id)], &answering_seat()).await;
+            assert!(forgotten.is_ok(), "{forgotten:?}");
+        }
     }
 
     #[tokio::test]

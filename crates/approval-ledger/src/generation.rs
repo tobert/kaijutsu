@@ -165,10 +165,10 @@ mod tests {
             crate::decide::DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() },
         )
         .unwrap();
-        let rule = crate::rules::learn_from_approval(&conn, &request_id, 0, crate::types::RuleScope::Always, true, None).unwrap();
+        let rule = crate::rules::learn_from_approval(&conn, &request_id, 0, crate::types::RuleScope::Always, true, Some(b"amy")).unwrap();
 
         let before = current(&conn).unwrap();
-        crate::rules::revoke(&conn, &rule.rule_id).unwrap();
+        crate::rules::revoke(&conn, &rule.rule_id, b"amy").unwrap();
         assert_eq!(current(&conn).unwrap(), before + 1, "approval_rules UPDATE (revoke) must bump exactly once");
     }
 

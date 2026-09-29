@@ -200,30 +200,36 @@ fn redeem_one(
     }
 }
 
-/// Revoke a rule of either kind (digest or family) by `rule_id`.
-/// Idempotent: revoking an already-revoked rule is a no-op success, not
-/// an error — only a `rule_id` neither table knows is
+/// Revoke a rule of either kind (digest or family) by `rule_id`, as `by`.
+/// Only the rule's creator may revoke it: a performer must not remove the
+/// deny its reviewer taught. A rule with no recorded creator cannot be
+/// revoked. Idempotent: revoking an already-revoked rule is a no-op
+/// success, not an error — only a `rule_id` neither table knows is
 /// [`LedgerError::RuleNotFound`].
-pub fn revoke(conn: &Connection, rule_id: &str) -> Result<()> {
+pub fn revoke(conn: &Connection, rule_id: &str, by: &[u8]) -> Result<()> {
+    let (created_by, revoked) = match get_rule(conn, rule_id)? {
+        Some(rule) => (rule.created_by, rule.revoked_at.is_some()),
+        None => match get_family_rule(conn, rule_id)? {
+            Some(rule) => (rule.created_by, rule.revoked_at.is_some()),
+            None => return Err(LedgerError::RuleNotFound(rule_id.to_string())),
+        },
+    };
+    if created_by.as_deref() != Some(by) {
+        return Err(LedgerError::NotRuleCreator(rule_id.to_string()));
+    }
+    if revoked {
+        return Ok(());
+    }
     let now = now_millis();
     let rows = conn.execute(
         "UPDATE approval_rules SET revoked_at = ?1 WHERE rule_id = ?2 AND revoked_at IS NULL",
         params![now, rule_id],
-    )?;
-    if rows > 0 {
-        return Ok(());
-    }
-    let rows = conn.execute(
+    )? + conn.execute(
         "UPDATE approval_rule_families SET revoked_at = ?1 WHERE rule_id = ?2 AND revoked_at IS NULL",
         params![now, rule_id],
     )?;
-    if rows > 0 {
-        return Ok(());
-    }
-    if get_rule(conn, rule_id)?.is_some() || get_family_rule(conn, rule_id)?.is_some() {
-        return Ok(()); // already revoked
-    }
-    Err(LedgerError::RuleNotFound(rule_id.to_string()))
+    debug_assert_eq!(rows, 1, "a live rule revokes exactly one row");
+    Ok(())
 }
 
 // ── Family rules ────────────────────────────────────────────────────────
@@ -567,15 +573,15 @@ mod tests {
         assert!(hit[0].as_ref().is_some_and(|r| r.allow), "{hit:?}");
         assert!(hit[1].is_none(), "an unlearned key is uncovered: {hit:?}");
 
-        let deny = learn_family_from_approval(&conn, &request_id, &["git push"], RuleScope::Always, false, None).unwrap();
+        let deny = learn_family_from_approval(&conn, &request_id, &["git push"], RuleScope::Always, false, Some(RULE_CREATOR)).unwrap();
         let hit = family_coverage(&conn, &["git push"], None, None).unwrap();
         assert!(hit[0].as_ref().is_some_and(|r| !r.allow), "deny outranks allow on one key: {hit:?}");
 
-        revoke(&conn, &deny[0].rule_id).unwrap();
-        revoke(&conn, &deny[0].rule_id).unwrap();
+        revoke(&conn, &deny[0].rule_id, RULE_CREATOR).unwrap();
+        revoke(&conn, &deny[0].rule_id, RULE_CREATOR).unwrap();
         let hit = family_coverage(&conn, &["git push"], None, None).unwrap();
         assert!(hit[0].as_ref().is_some_and(|r| r.allow), "the allow is live again: {hit:?}");
-        assert!(matches!(revoke(&conn, "no-such-rule"), Err(LedgerError::RuleNotFound(_))));
+        assert!(matches!(revoke(&conn, "no-such-rule", RULE_CREATOR), Err(LedgerError::RuleNotFound(_))));
     }
 
     /// A session-scoped family matches only the context and principal that
@@ -696,8 +702,10 @@ mod tests {
         let ask = ask_with_statement(digest, binding, label);
         let request_id = create_ask(conn, &ask).unwrap();
         decided_allowed(conn, &request_id);
-        learn_from_approval(conn, &request_id, 0, RuleScope::Always, allow, None).unwrap()
+        learn_from_approval(conn, &request_id, 0, RuleScope::Always, allow, Some(RULE_CREATOR)).unwrap()
     }
+
+    const RULE_CREATOR: &[u8] = b"amy";
 
     /// The four required coverage compositions.
     #[test]
@@ -810,7 +818,7 @@ mod tests {
         let conn = open_memory();
         let rule = make_rule(&conn, "digest-revoke", VarBinding::Bound, "rm target", true);
 
-        revoke(&conn, &rule.rule_id).unwrap();
+        revoke(&conn, &rule.rule_id, RULE_CREATOR).unwrap();
         let coverage = redeem(&conn, &["digest-revoke"], "rm target", None, None).unwrap();
         assert!(matches!(coverage.per_statement[0], StatementVerdict::Uncovered));
     }
@@ -819,14 +827,24 @@ mod tests {
     fn revoking_twice_is_idempotent() {
         let conn = open_memory();
         let rule = make_rule(&conn, "digest-revoke-2", VarBinding::Bound, "rm target", true);
-        revoke(&conn, &rule.rule_id).unwrap();
-        revoke(&conn, &rule.rule_id).unwrap();
+        revoke(&conn, &rule.rule_id, RULE_CREATOR).unwrap();
+        revoke(&conn, &rule.rule_id, RULE_CREATOR).unwrap();
+    }
+
+    #[test]
+    fn only_the_creator_revokes_a_rule() {
+        let conn = open_memory();
+        let rule = make_rule(&conn, "digest-revoke-3", VarBinding::Bound, "rm target", false);
+        assert!(matches!(revoke(&conn, &rule.rule_id, b"model").unwrap_err(), LedgerError::NotRuleCreator(_)));
+        let coverage = redeem(&conn, &["digest-revoke-3"], "rm target", None, None).unwrap();
+        assert!(matches!(coverage.per_statement[0], StatementVerdict::Deny(_)), "a refused revoke leaves the rule live");
+        revoke(&conn, &rule.rule_id, RULE_CREATOR).unwrap();
     }
 
     #[test]
     fn revoking_an_unknown_rule_is_not_found() {
         let conn = open_memory();
-        assert!(matches!(revoke(&conn, "no-such-rule").unwrap_err(), LedgerError::RuleNotFound(_)));
+        assert!(matches!(revoke(&conn, "no-such-rule", RULE_CREATOR).unwrap_err(), LedgerError::RuleNotFound(_)));
     }
 
     #[test]
@@ -836,7 +854,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2)); // distinct created_at
         let second = make_rule(&conn, "digest-list-2", VarBinding::Bound, "rm b", true);
         let revoked = make_rule(&conn, "digest-list-3", VarBinding::Bound, "rm c", true);
-        revoke(&conn, &revoked.rule_id).unwrap();
+        revoke(&conn, &revoked.rule_id, RULE_CREATOR).unwrap();
 
         let rules = list_rules_filtered(&conn, &RuleListFilter { since_ms: None, limit: 100 }).map(|(rows, _)| rows).unwrap();
         let ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
@@ -877,7 +895,7 @@ mod tests {
         set_rule_created_at(&conn, &new_rule.rule_id, 10_000);
         let revoked_rule = make_rule(&conn, "digest-revoked", VarBinding::Bound, "ok", true);
         set_rule_created_at(&conn, &revoked_rule.rule_id, 10_000);
-        revoke(&conn, &revoked_rule.rule_id).unwrap();
+        revoke(&conn, &revoked_rule.rule_id, RULE_CREATOR).unwrap();
 
         let filter = RuleListFilter { since_ms: Some(5_000), limit: 20 };
         let (rows, total) = list_rules_filtered(&conn, &filter).unwrap();

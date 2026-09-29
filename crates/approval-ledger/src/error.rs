@@ -123,6 +123,9 @@ pub enum LedgerError {
     /// No approval_rules row exists with this `rule_id`.
     #[error("rule {0} not found")]
     RuleNotFound(String),
+    /// A principal other than the rule's creator tried to revoke it.
+    #[error("rule {0} can be forgotten only by its creator")]
+    NotRuleCreator(String),
     /// A family rule was asked for with no key to learn: the ask carries
     /// no planned command (a `kj_verb`-origin ask), or the kernel found
     /// nothing keyable in it.
