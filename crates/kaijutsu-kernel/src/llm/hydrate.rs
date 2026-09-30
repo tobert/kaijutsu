@@ -325,19 +325,7 @@ impl HydrationState {
                             );
                             block.id.to_key()
                         });
-                    // A model turn stored the text it sent; replay it as sent,
-                    // so this request extends the one that turn made. Other
-                    // results: stdout lives in `content`, stderr in its own
-                    // field, merged back the way they were before stderr was
-                    // split off (stdout, then stderr).
-                    let content = match (&block.model_content, block.stderr.as_deref()) {
-                        (Some(sent), _) => sent.clone(),
-                        (None, Some(err)) if !err.is_empty() && !stdout.is_empty() => {
-                            format!("{stdout}\n{err}")
-                        }
-                        (None, Some(err)) if !err.is_empty() => err.to_string(),
-                        _ => stdout.to_string(),
-                    };
+                    let content = model_tool_result_text(block, stdout);
                     self.tool_results.push(ContentBlock::ToolResult {
                         tool_use_id,
                         content,
@@ -726,6 +714,21 @@ pub(crate) fn validate_tool_pairing(messages: &[Message]) -> LlmResult<()> {
         return Err(pairing_error(messages.len() - 1, format_args!("tool_uses {pending:?} lack adjacent tool_results")));
     }
     Ok(())
+}
+
+/// The `tool_result` text a model reads for a settled result block. A model
+/// turn stored the text it sent; replay it as sent, so a request extends the
+/// one that turn made. Other results: stdout lives in `content` (`stdout`
+/// here, after any diff projection), stderr in its own field, merged back
+/// stdout first. A turn holding on its ask reads its settled result through
+/// this too, so what it sends is what a later hydration replays.
+pub(crate) fn model_tool_result_text(block: &kaijutsu_types::BlockSnapshot, stdout: &str) -> String {
+    match (&block.model_content, block.stderr.as_deref()) {
+        (Some(sent), _) => sent.clone(),
+        (None, Some(err)) if !err.is_empty() && !stdout.is_empty() => format!("{stdout}\n{err}"),
+        (None, Some(err)) if !err.is_empty() => err.to_string(),
+        _ => stdout.to_string(),
+    }
 }
 
 #[cfg(test)]

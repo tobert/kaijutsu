@@ -2538,6 +2538,26 @@ impl KernelDb {
         )?)
     }
 
+    /// End a model turn's hold on its ask because the turn stopped waiting.
+    /// An unanswered ask is abandoned with `reason`; an answer nobody has run
+    /// is spent without running, so the approval worker never acts on it. Returns
+    /// [`HeldAskEnd::Claimed`] when the worker already owns the answer: it
+    /// is running or settling the command, and it settles the pair.
+    pub(crate) fn end_held_ask(&self, request_id: &str, reason: &str) -> KernelDbResult<HeldAskEnd> {
+        self.in_transaction(|db| {
+            let conn = db.conn_for_ledger();
+            let row = approval_ledger::ask::get_approval(conn, request_id)?
+                .ok_or_else(|| KernelDbError::Validation(format!("held ask {request_id} has no row")))?;
+            // An ordinary abandonment is terminal and never delivered, so it
+            // needs no redemption.
+            if matches!(row.status, crate::ApprovalStatus::Pending | crate::ApprovalStatus::Claimed) {
+                approval_ledger::decide::abandon(conn, request_id, Some(reason))?;
+                return Ok(HeldAskEnd::Abandoned);
+            }
+            Ok(if approval_ledger::decide::redeem_ask(conn, request_id)? { HeldAskEnd::Spent } else { HeldAskEnd::Claimed })
+        })
+    }
+
     // ========================================================================
     // Quiesce
     // ========================================================================
@@ -16128,4 +16148,15 @@ mod label_index_tests {
         KernelDb::apply_additive_migrations(&db.conn).unwrap();
         assert!(index_sql(&db).contains("archived_at IS NULL"));
     }
+}
+
+/// What ending a turn's hold did to its ask (`KernelDb::end_held_ask`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldAskEnd {
+    /// Unanswered: abandoned.
+    Abandoned,
+    /// Answered but not run: spent without running.
+    Spent,
+    /// The approval worker already claimed it and settles the pair.
+    Claimed,
 }

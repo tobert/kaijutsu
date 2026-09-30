@@ -109,6 +109,9 @@ pub(crate) struct ModelRecord<'a> {
     pub model_content: Option<&'a str>,
     /// The shell envelope the tool returned, as JSON with its output blank.
     pub envelope: Option<&'a str>,
+    /// Record both only when the result answers a provider tool call (it
+    /// carries a `tool_use_id`); clear them otherwise.
+    pub only_for_model_call: bool,
 }
 
 pub(crate) struct ToolResultUpdate<'a> {
@@ -1736,8 +1739,9 @@ impl BlockStore {
             if let Some(content) = content {
                 entry.doc.edit_text(result, 0, content, output.content.chars().count())?;
                 entry.doc.set_style_spans(result, spans.clone(), tag.clone())?;
-                entry.doc.set_model_content(result, model.model_content.map(str::to_owned))?;
-                entry.doc.set_shell_envelope(result, model.envelope.map(str::to_owned))?;
+                let applies = !model.only_for_model_call || output.tool_use_id.is_some();
+                entry.doc.set_model_content(result, model.model_content.filter(|_| applies).map(str::to_owned))?;
+                entry.doc.set_shell_envelope(result, model.envelope.filter(|_| applies).map(str::to_owned))?;
             }
             if let Some(fields) = shell {
                 entry.doc.set_stderr(result, fields.stderr)?;
@@ -5781,7 +5785,7 @@ mod tests {
         let sent = r#"{"stdout":"hi\n","exit_code":0}"#;
         let envelope = r#"{"stdout":"","status":"done","exit_code":0}"#;
         store.settle_tool_result_as(ctx, &call, &result, "hi\n",
-            ModelRecord { model_content: Some(sent), envelope: Some(envelope) }, Status::Done, false,
+            ModelRecord { model_content: Some(sent), envelope: Some(envelope), only_for_model_call: false }, Status::Done, false,
             PrincipalId::system(), None, None).unwrap();
 
         let replayed = replay_journal(&db, ctx);

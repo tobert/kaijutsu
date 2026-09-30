@@ -38,7 +38,8 @@ pub(crate) struct InterruptArgs {
     /// Cancel the current model stream and its in-flight tool calls right
     /// away. Without this flag, the turn stops before its next call to the
     /// model instead, and a tool call already running keeps going until it
-    /// finishes.
+    /// finishes. Either way, a tool call waiting for an approval stops
+    /// waiting and its ask is abandoned.
     #[arg(long)]
     immediate: bool,
 }

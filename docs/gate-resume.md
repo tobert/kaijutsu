@@ -28,6 +28,36 @@ patient hold (`kaijutsu-types/src/timeout.rs`; still read by
 continuation-admission audit, which `docs/issues.md` still points back at
 this section by name.
 
+## The turn holds
+
+**Amy's guidance, 2026-09-30.** "asks should still be async in the code but
+the conversation can block when that's most logical for the model's
+experience." A model's in-kernel turn waits for the answer to an ask its own
+tool call raised. The ask stays a durable ledger row, and nothing blocks on
+the wire: the MCP and RPC shell paths still return `Pending`.
+
+- **Where it waits.** `dispatch_recorded_tool_result`
+  (`runtime/llm_stream.rs`) registers a hold (`runtime/held_asks.rs`) before
+  publishing the `Waiting` pair, then waits. The broker's call timeout, the
+  stream deadlines, and the round count do not cover this point, so the
+  wait counts against no cap. Parallel calls join, so the turn continues
+  only when every hold has ended.
+- **Who runs it.** The approval worker stays the only executor. For a held
+  pair it runs or refuses as before, suppresses the completion notice,
+  writes no seed, starts no turn, and releases the hold. The turn reads the
+  settled result block through `llm::hydrate::model_tool_result_text`, and
+  settling a result sent to a model records that text, so hydration later
+  replays what the model read.
+- **Interrupts.** A hard or a soft interrupt ends the wait. An unanswered
+  ask is abandoned and the pair settles `Error`; an answer nobody has run is
+  spent without running. An answer the worker already claimed stays the
+  worker's: its command is cancelled and the worker settles the pair.
+- **Restart.** Holds are not durable. Boot abandons pending asks and closes
+  `Waiting` pairs, so a held call fails.
+- **Still on the older path.** Asks with no stored command, `kj cc send`,
+  the MCP `shell_write` path, and a turn-owned pair with no holder still use
+  the wake, the seed, and retry-as-delivery described below.
+
 ## Captured result review
 
 PostCall and OnError approval reviews work that already ran: execution and the
@@ -838,7 +868,8 @@ Live; reads the whole approval row, because `exec_source` decides the branch
 and the answer summary does not carry it. No `exec_source`: the old wake,
 unchanged. A denial or cancellation with a linked pair: settle the pair
 `Error` with the reason on stderr, then redeem. A `Session` pair's blocks
-are its delivery. A `Turn` pair also gets a new seed saying that the action
+are its delivery, and so are a held `Turn` pair's ("The turn holds"). An
+unheld `Turn` pair also gets a new seed saying that the action
 did not run, because its cached mailbox cannot observe the in-place edit. A
 terminal answer with no pair falls back to the wake. An allow: read liveness
 and the turn performer's assignment, then claim under the same database lock.

@@ -126,9 +126,10 @@ sent, so the prompt cache holds across turns.
 
 Results no model turn sent (user shell commands, results written before
 these fields existed) hydrate from `content` and `stderr` as before.
-Settling a result again without them, as an approval that resumes a waiting
-call does, clears both; that path already evicts the cached mailbox and
-hydrates cold. A rendering change affects only results sent after it.
+An approval that runs a model's waiting call records both again when it
+settles the result, so the turn holding on that call and a later hydration
+read the same text (`docs/gate-resume.md`, "The turn holds"). A rendering
+change affects only results sent after it.
 
 ## Input during a turn
 

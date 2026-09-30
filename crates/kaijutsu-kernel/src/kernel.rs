@@ -176,6 +176,8 @@ pub struct Kernel {
     /// Durable rc results and the live owners of post-execution write faults.
     rc_settlements: crate::rc::settlement::RcSettlements,
     turn_state: crate::runtime::turn_state::TurnState,
+    /// Model turns waiting on their own asks (`runtime/held_asks.rs`).
+    held_asks: crate::runtime::held_asks::HeldAsks,
     /// The worker pool that runs commands, model turns, rc lifecycle runs and
     /// approval delivery. Started at construction: the beat's clock thread
     /// reaches the funnel through `beat::fire_lifecycle`, and starting a thread
@@ -440,6 +442,7 @@ impl Kernel {
             },
             rc_settlements,
             turn_state: crate::runtime::turn_state::TurnState::default(),
+            held_asks: Default::default(),
             runtime_pool,
             approval_delivery: OnceLock::new(),
             runtime_worker_shutdown,
@@ -455,6 +458,9 @@ impl Kernel {
 
     /// Conversation ownership and interrupts shared by all model entry paths.
     pub fn turns(&self) -> &crate::runtime::turn_state::TurnState { &self.turn_state }
+
+    /// Model turns waiting on their own asks.
+    pub(crate) fn held_asks(&self) -> &crate::runtime::held_asks::HeldAsks { &self.held_asks }
 
     pub(crate) fn rc_settlements(&self) -> &crate::rc::settlement::RcSettlements {
         &self.rc_settlements

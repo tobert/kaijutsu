@@ -441,7 +441,7 @@ async fn act_on_executable_answer(
     let source = ask.source.as_str();
     // Linkage may have completed since the delivery scan. Read it with context
     // state and claim under one guard; never spend an answer using a stale pair.
-    let (linked, receipt, claim) = {
+    let (linked, receipt, claim, held) = {
         let db = kernel.kernel_db().lock();
         match db.approval_pair_ready(&answer.request_id) {
             Ok(true) => {}
@@ -464,6 +464,13 @@ async fn act_on_executable_answer(
                 tracing::error!(ask = %answer.request_id, %error, "invalid approval linkage; retaining the answer");
                 return ExecAction::Deferred;
             }
+        };
+        // A model turn holding on this ask reads the settled pair itself:
+        // no notice, no seed, no follow-up turn. Its token stops the
+        // command if the turn stops waiting.
+        let held = match linked {
+            Some((_, _, crate::PairOwner::Turn)) => kernel.held_asks().holder(&answer.request_id),
+            _ => None,
         };
         let receipt = match linked {
             Some((command, output, _)) => match crate::shell_operations::ShellOperationRegistry::receipt_for_pair_in(&db, context_id, &command, &output) {
@@ -489,8 +496,11 @@ async fn act_on_executable_answer(
                         && row.played_by != Some(ask.actor);
                     let claim = db.in_transaction(|db| {
                         if !db.redeem_ask(&answer.request_id)? { return Ok(false); }
-                        let suppression = linked.filter(|(_, _, owner)| *owner == crate::PairOwner::Session)
-                            .map(|_| "session observes the command result directly");
+                        let suppression = match linked {
+                            Some((_, _, crate::PairOwner::Session)) => Some("session observes the command result directly"),
+                            Some((_, _, crate::PairOwner::Turn)) if held.is_some() => Some("the holding turn reads the command result"),
+                            _ => None,
+                        };
                         super::completion_notice::reserve(db,
                             &super::completion_notice::Source::Approval(answer.request_id.clone()), suppression)?;
                         Ok(true)
@@ -507,7 +517,7 @@ async fn act_on_executable_answer(
                 }
             }
         } else { None };
-        (linked, receipt, claim)
+        (linked, receipt, claim, held)
     };
 
     // A denial runs nothing. A connected session sees its settled pair
@@ -521,16 +531,17 @@ async fn act_on_executable_answer(
             tracing::error!(ask = %answer.request_id, %error, "refusal settlement failed; retaining the answer");
             return ExecAction::Deferred;
         }
-        if owner == crate::PairOwner::Turn {
+        if owner == crate::PairOwner::Turn && held.is_none() {
             return ExecAction::Tell(unrun_turn_seed(who, answer.status, &answer.description, &output_block_id));
         }
-        // A session reads its pair directly, so settling the pair delivered
-        // the refusal; spend the answer here. (A turn's refusal seed spends
+        // A session or a holding turn reads its pair directly, so settling
+        // the pair delivered the refusal; spend the answer here. (A turn's refusal seed spends
         // it in the same acceptance as the seed block.)
         if let Err(error) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
             tracing::error!(ask = %answer.request_id, %error, "refusal settled but redemption failed");
             return ExecAction::Deferred;
         }
+        if held.is_some() { kernel.held_asks().release(&answer.request_id); }
         return ExecAction::Settled;
     }
 
@@ -564,6 +575,10 @@ async fn act_on_executable_answer(
             }
         }
         tracing::error!("gate-resume: ask {}: {reason}", answer.request_id);
+        if held.is_some() {
+            kernel.held_asks().release(&answer.request_id);
+            return ExecAction::Settled;
+        }
         return ExecAction::Tell(reason);
     }
 
@@ -607,6 +622,10 @@ async fn act_on_executable_answer(
                     return ExecAction::Tell(format!("The approved action did not run because no shell could be built: {e}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
                 }
             }
+            if held.is_some() {
+                kernel.held_asks().release(&answer.request_id);
+                return ExecAction::Settled;
+            }
             if needs_no_shell_turn_seed(linked) {
                 return ExecAction::Tell(no_shell_turn_seed(
                     who,
@@ -625,7 +644,7 @@ async fn act_on_executable_answer(
     // (`PairOwner::Session`) watches its own blocks, so a fill tells
     // nobody.
     let (receipt, tell) = match receipt {
-        Some(receipt) => (receipt, matches!(linked, Some((_, _, crate::PairOwner::Turn)))),
+        Some(receipt) => (receipt, matches!(linked, Some((_, _, crate::PairOwner::Turn))) && held.is_none()),
         None => match kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
             notify: false,
             context: context_id, principal: principal_id, actor: ask.actor, source,
@@ -657,6 +676,10 @@ async fn act_on_executable_answer(
         if let Err(error) = settle_operation_error(kernel, &receipt, reason.clone()) {
             return ExecAction::Tell(format!("{reason}. Its result could not be persisted: {error}. Inspect block {}.", output_block_id.to_key()));
         }
+        if held.is_some() {
+            kernel.held_asks().release(&answer.request_id);
+            return ExecAction::Settled;
+        }
         return if tell {
             ExecAction::Tell(format!(
                 "{who} approved the action you were waiting on: {}\n\n\
@@ -676,16 +699,36 @@ async fn act_on_executable_answer(
     // Shared capture owns unwinding after source execution can begin. Never
     // replace its captured output with a preparation-only no-run result.
     preparation.armed = false;
-    let outcome = match crate::runtime::command::run_into_blocks(
+    // A holding turn that stops waiting stops the command it waits on.
+    let run_cancel = stop.child_token();
+    if let Some(holder) = held.clone() {
+        let run_cancel = run_cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = holder.cancelled() => run_cancel.cancel(),
+                _ = run_cancel.cancelled() => {}
+            }
+        });
+    }
+    let outcome = crate::runtime::command::run_into_blocks(
         &kaish,
         source,
         &receipt,
         kernel,
         &crate::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id())
             .with_actor(ask.actor, Some(ask.reviewer)),
-        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(stop.clone()), ..Default::default() },
+        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(run_cancel.clone()), ..Default::default() },
     )
-    .await {
+    .await;
+    run_cancel.cancel();
+    if held.is_some() {
+        if let Err(error) = &outcome {
+            tracing::error!(ask = %answer.request_id, %error, "approved command settlement failed for a holding turn");
+        }
+        kernel.held_asks().release(&answer.request_id);
+        return ExecAction::Settled;
+    }
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             kernel.turns().conversations().evict(context_id);

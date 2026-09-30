@@ -1673,8 +1673,8 @@ fn make_pending_shell_receipt(
 async fn dispatch_recorded_tool_result(
     documents: &SharedBlockStore, context_id: ContextId, kernel: &Arc<Kernel>,
     tool_name: &str, input: &serde_json::Value, tool_ctx: &crate::ExecContext,
-    cancel: tokio_util::sync::CancellationToken, tool_use_id: &str,
-    call: kaijutsu_types::BlockId, turn_lease: &TurnLease,
+    cancel: tokio_util::sync::CancellationToken, stop_waiting: &tokio_util::sync::CancellationToken,
+    tool_use_id: &str, call: kaijutsu_types::BlockId, turn_lease: &TurnLease,
 ) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
     let result = documents.insert_tool_result_as(context_id, &call, Some(&call), "", Status::Running,
         None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
@@ -1710,17 +1710,77 @@ async fn dispatch_recorded_tool_result(
     }
     let record = envelope.map(|env| env.with_clean_output("").to_value().to_string());
     let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
+    // A call left waiting on its ask holds this turn until the answer is
+    // settled. Hold before publishing `Waiting`: the worker acts only on a
+    // published pair, and it must find the holder when it does.
+    let hold = match (&ask_id, settled_status) {
+        (Some(ask), Status::Waiting) => Some(kernel.held_asks().hold(ask)),
+        _ => None,
+    };
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
         crate::block_store::ModelRecord {
             model_content: (model_content != block_content).then_some(model_content.as_str()),
             envelope: record.as_deref(),
+            only_for_model_call: false,
         },
         settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
     if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
+    if let (Some(mut hold), Some(ask)) = (hold, ask_id.as_deref()) {
+        let settled = hold.wait(stop_waiting).await;
+        if !settled {
+            end_hold(kernel, context_id, call, result, ask);
+        }
+        drop(hold);
+        return Ok((held_result(documents, context_id, &result, ask, settled), result));
+    }
     let anchor = if let Some(payload) = payload {
         documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
     } else { result };
     Ok((InlineToolResult { content: model_content, is_error }, anchor))
+}
+
+/// Stop holding on `ask` because the turn was interrupted. An unanswered ask
+/// is abandoned and an unrun answer spent, and the pair settles as an error
+/// that says nothing ran. An answer the worker already claimed stays the
+/// worker's: dropping the hold stops its command, and it settles the pair.
+fn end_hold(kernel: &Arc<Kernel>, context_id: ContextId, call: kaijutsu_types::BlockId,
+    result: kaijutsu_types::BlockId, ask: &str) {
+    let reason = "The turn was interrupted while waiting for this approval; nothing ran.";
+    let ended = kernel.kernel_db().lock().end_held_ask(ask, reason);
+    match ended {
+        Ok(crate::kernel_db::HeldAskEnd::Claimed) => {}
+        Ok(_) => {
+            let mut outcome = super::command_outcome::CommandOutcome::new(super::command_outcome::CommandExecution::NotRun, 0);
+            outcome.settlement_error = Some(reason.to_owned());
+            if let Err(error) = super::command::settle_outcome(kernel, context_id, &call, &result, &outcome, None) {
+                tracing::error!(%ask, %error, "could not settle an interrupted hold's pair");
+            }
+            crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
+        }
+        Err(error) => tracing::error!(%ask, %error, "could not end an interrupted hold's ask"),
+    }
+}
+
+/// What a held call returns to the model: its settled result block, read the
+/// way hydration reads it, so a later hydration replays what was sent.
+fn held_result(documents: &SharedBlockStore, context_id: ContextId, result: &kaijutsu_types::BlockId,
+    ask: &str, settled: bool) -> InlineToolResult {
+    match documents.get_block_snapshot(context_id, result).ok().flatten() {
+        Some(block) if matches!(block.status, Status::Done | Status::Error) => {
+            let stdout = (block.content_type == kaijutsu_types::ContentType::Diff && !block.content.is_empty())
+                .then(|| crate::llm::hydrate::project_diff_for_hydration(&block.content));
+            let content = crate::llm::hydrate::model_tool_result_text(&block, stdout.as_deref().unwrap_or(&block.content));
+            InlineToolResult { content, is_error: block.is_error }
+        }
+        _ => InlineToolResult {
+            content: if settled {
+                format!("The approval worker released ask {ask} without settling this result; inspect block {}.", result.to_key())
+            } else {
+                format!("The turn was interrupted while waiting for ask {ask}.")
+            },
+            is_error: true,
+        },
+    }
 }
 
 /// An inline provider waits for this callback. Reply only after durable
@@ -1734,6 +1794,7 @@ async fn dispatch_inline_tool_result(
     input: serde_json::Value,
     tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken,
+    stop_waiting: &tokio_util::sync::CancellationToken,
     tool_use_id: &str,
     actor_principal: PrincipalId,
     turn_lease: &TurnLease,
@@ -1743,7 +1804,7 @@ async fn dispatch_inline_tool_result(
     turn_lease.track_block(call);
     *last_block_id = call;
     let (result, anchor) = dispatch_recorded_tool_result(documents, context_id, kernel, tool_name, &input,
-        tool_ctx, cancel, tool_use_id, call, turn_lease).await?;
+        tool_ctx, cancel, stop_waiting, tool_use_id, call, turn_lease).await?;
     *last_block_id = anchor;
     Ok(result)
 }
@@ -2596,6 +2657,7 @@ async fn run_llm_stream(
                         input,
                         &tool_ctx,
                         interrupt.cancel.clone(),
+                        &interrupt.stop_waiting,
                         &id,
                         actor_principal,
                         turn_lease,
@@ -3009,7 +3071,7 @@ async fn run_llm_stream(
             let interrupt = interrupt.clone();
             async move {
                 let result = dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
-                    &tool_ctx, interrupt.cancel.clone(), &tool_use_id, call, turn_lease).await;
+                    &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, &tool_use_id, call, turn_lease).await;
                 match result {
                     Ok((result, anchor)) => Ok((ContentBlock::ToolResult {
                         tool_use_id, content: result.content, is_error: result.is_error,
@@ -5010,6 +5072,7 @@ mod tool_dispatch_timeout_tests {
             serde_json::json!({}),
             &tool_ctx,
             CancellationToken::new(),
+            &CancellationToken::new(),
             "call-1",
             PrincipalId::new(),
             &kernel.turns().begin(ctx),
@@ -7236,7 +7299,7 @@ mod lifetime_tests {
         let lease = kernel.turns().begin(context);
         let result = dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel,
             "pending", serde_json::json!({}), &call, tokio_util::sync::CancellationToken::new(),
-            "pending-call", call.actor_id, &lease).await;
+            &tokio_util::sync::CancellationToken::new(), "pending-call", call.actor_id, &lease).await;
         assert!(result.is_err(), "failed ask linkage cannot acknowledge a waiting result");
         let db = kernel.blocks().db().unwrap().clone();
         let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
@@ -7278,13 +7341,13 @@ mod lifetime_tests {
             let mut anchor = after;
             let result = if inline {
                 dispatch_inline_tool_result(kernel.blocks(), context, &mut anchor, &kernel, "envelope", serde_json::json!({}),
-                    &call, lease.interrupt().cancel.clone(), "envelope-call", call.actor_id, &lease).await.unwrap()
+                    &call, lease.interrupt().cancel.clone(), &lease.interrupt().stop_waiting, "envelope-call", call.actor_id, &lease).await.unwrap()
             } else {
                 let id = kernel.blocks().insert_tool_call_as(context, None, Some(&after), "envelope", serde_json::json!({}),
                     Some(TypesToolKind::Builtin), Some(call.actor_id), Some("envelope-call".into()), None).unwrap();
                 lease.track_block(id);
                 let (result, tail) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
-                    &call, lease.interrupt().cancel.clone(), "envelope-call", id, &lease).await.unwrap();
+                    &call, lease.interrupt().cancel.clone(), &lease.interrupt().stop_waiting, "envelope-call", id, &lease).await.unwrap();
                 anchor = tail;
                 result
             };

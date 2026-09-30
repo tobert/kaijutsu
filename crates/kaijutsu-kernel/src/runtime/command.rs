@@ -144,14 +144,32 @@ fn settle_known_outcome(
         stderr.push_str(error);
     }
     let fields = crate::block_store::ShellResultFields {
-        stderr: if stderr.is_empty() { None } else { Some(stderr) },
+        stderr: if stderr.is_empty() { None } else { Some(stderr.clone()) },
         output: outcome.output_data(),
         content_type: envelope.content_type.as_deref().map_or(ContentType::Plain, ContentType::from_mime),
         exit_code: envelope.exit_code.map(|code| code.clamp(i32::MIN as i64, i32::MAX as i64) as i32),
         ephemeral: Some(envelope.ephemeral.unwrap_or(false)),
     };
+    // A result a model receives as its `tool_result` (a provider tool call,
+    // named by `tool_use_id`) records what the model reads, the same
+    // projection a turn records for a result it settles itself. A turn
+    // holding on its ask reads this block, and hydration replays it.
+    let (model_content, record) = if status != Status::Waiting {
+        // The readable output a turn builds from an envelope: stdout, then
+        // stderr and the refusal reason on their own line.
+        let mut readable = text.to_owned();
+        if !stderr.is_empty() {
+            if !readable.is_empty() && !readable.ends_with('\n') { readable.push('\n'); }
+            readable.push_str(&stderr);
+        }
+        let sent = envelope.model_text(&readable);
+        ((sent != text).then_some(sent), Some(envelope.clone().with_clean_output("").to_value().to_string()))
+    } else { (None, None) };
     documents.settle_tool_result_recorded(context_id, command_block_id, output_block_id,
-        crate::block_store::ToolResultUpdate { content: Some(text), model: Default::default(), status, is_error: status == Status::Error,
+        crate::block_store::ToolResultUpdate { content: Some(text),
+            model: crate::block_store::ModelRecord { model_content: model_content.as_deref(), envelope: record.as_deref(),
+                only_for_model_call: true },
+            status, is_error: status == Status::Error,
             author: PrincipalId::system(), ansi, shell: Some(fields) }, |db| {
             if let (Some(owner), Some(ask)) = (ask_owner, envelope.ask_id.as_deref()) {
                 db.link_ask_blocks(ask, command_block_id, output_block_id, owner)?;

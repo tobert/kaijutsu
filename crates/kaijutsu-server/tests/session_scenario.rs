@@ -539,16 +539,22 @@ fn kaijutsu_session_scenario() {
         // (`crates/kaijutsu-kernel/src/kj/gate_policy.rs`'s module doc).
         // No hook install needed: this is the kernel's real default gate
         // policy, the same one `gate_executes_wire.rs` and
-        // `user_input_identity.rs` exercise.
+        // `user_input_identity.rs` exercise. The turn holds on the ask
+        // (`docs/gate-resume.md`, "The turn holds"), so it is still running
+        // while amy reads and answers it.
         // ------------------------------------------------------------
         s.kj("kj drive banto --prompt go").await;
-        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 3 (gated statement)");
+        let raised = |a: &approval_ledger::types::ApprovalRow| a.exec_source.as_deref().unwrap_or("").contains("gate-approved-for-real");
+        wait_for("banto's gated statement to raise an ask", || {
+            s.kernel.kernel_db.lock().list_pending_asks().expect("list_pending_asks").iter().any(raised)
+        }).await;
+        assert!(s.kernel.kernel.turn_in_flight(banto_ctx), "banto's turn holds while its ask is pending");
 
         let amy_principal_id = s.amy_principal;
         let pending = s.kernel.kernel_db.lock().list_pending_asks().expect("list_pending_asks");
         let ask = pending
             .into_iter()
-            .find(|a| a.exec_source.as_deref().unwrap_or("").contains("gate-approved-for-real"))
+            .find(|a| raised(a))
             .unwrap_or_else(|| panic!("banto's gated `echo` statement must have raised a pending ask"));
         assert_eq!(
             ask.context_id,
@@ -615,21 +621,11 @@ fn kaijutsu_session_scenario() {
         .await;
 
         // ------------------------------------------------------------
-        // Turn 4: banto signs off — reached by the kernel's own automatic
-        // resume, not another explicit `kj drive`. Approving the ask opens
-        // a continuation epoch (`crates/kaijutsu-kernel/src/runtime/llm_stream.rs`'s
-        // gate-resume path) and the approved command's completion resumes
-        // banto's conversation on it directly: the mock queue's evidence
-        // (the "handoff signoff" round trip was already consumed by the
-        // time the next explicit `kj drive` ran, panicking the queue empty
-        // when this test still issued one) is what corrected this section —
-        // originally written assuming every turn boundary here was an
-        // explicit drive. `docs/approval-identity.md`, "Continuation
-        // windows and async work" names the mechanism; this scenario is the
-        // evidence that an *approval*, not only a human's own next message,
-        // is what resumes it.
+        // The same turn continues: banto reads the approved command's real
+        // output as its tool result and signs off, with no second drive and
+        // no automatic resume.
         // ------------------------------------------------------------
-        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 4 (auto-resumed signoff)");
+        expect_completed(recv_turn_event(&mut turn_rx, banto_ctx).await, "banto turn 3 (held ask, then signoff)");
 
         // A note without `--for` belongs to the performer, not the
         // requesting connection (`kj/handoff.rs`, `resolve_caller_character`).

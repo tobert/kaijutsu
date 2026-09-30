@@ -38,12 +38,6 @@
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],
   [
-    "TextStart",
-    {"TextDelta": "waiting for approval."},
-    "TextEnd",
-    {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
-  ],
-  [
     {"ToolUse": {"id": "banto-7", "name": "shell_write", "input": {"command": "kj handoff signoff 'rotating'", "run_in_background": false}}},
     {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
   ],

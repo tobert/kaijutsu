@@ -38,8 +38,10 @@
 //! decides or it is explicitly abandoned. [`REQUEST_PERMISSION_TIMEOUT`] below bounds only
 //! the outgoing `session/request_permission` call, so a wedged ACP client
 //! (stdio never reads the request) cannot leave one of this pump's spawned
-//! tasks parked forever. Answering late still works; there is no deadline
-//! to beat.
+//! tasks parked forever. When a request times out and the ask is still
+//! pending, the same task offers it again: a model turn may be holding on
+//! it (`docs/gate-resume.md`, "The turn holds"). Answering late still works;
+//! there is no deadline to beat.
 //!
 //! # Racing is fine and expected
 //!
@@ -240,34 +242,41 @@ async fn answer_ask(
     request_id: String,
     ask: AskInfo,
 ) {
-    let (options, kinds) = build_options();
     let title = if ask.description.is_empty() {
         request_id.clone()
     } else {
-        ask.description
+        ask.description.clone()
     };
-    let request = permission_request(session_id.clone(), request_id.clone(), title, options);
 
-    let decision = match tokio::time::timeout(
-        REQUEST_PERMISSION_TIMEOUT,
-        cx.send_request(request).block_task(),
-    )
-    .await
-    {
-        Ok(Ok(response)) => map_response(&response, &kinds),
-        Ok(Err(e)) => {
-            tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; leaving pending");
-            notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, &e.to_string()));
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                request = %request_id,
-                timeout = ?REQUEST_PERMISSION_TIMEOUT,
-                "permission ask timed out waiting on the client; leaving pending"
-            );
-            notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, "timed out waiting for the client"));
-            None
+    // A client that lets a request time out is offered the ask again while
+    // it is still pending: a model turn may be holding on it, and nothing
+    // else would offer it to this client again.
+    let decision = loop {
+        let (options, kinds) = build_options();
+        let request = permission_request(session_id.clone(), request_id.clone(), title.clone(), options);
+        match tokio::time::timeout(REQUEST_PERMISSION_TIMEOUT, cx.send_request(request).block_task()).await {
+            Ok(Ok(response)) => break map_response(&response, &kinds),
+            Ok(Err(e)) => {
+                tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; leaving pending");
+                notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, &e.to_string()));
+                break None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    request = %request_id,
+                    timeout = ?REQUEST_PERMISSION_TIMEOUT,
+                    "permission ask timed out waiting on the client; offering it again while pending"
+                );
+                notify_decision_failure(cx, &session_id, permission_prompt_failure_message(&request_id, "timed out waiting for the client"));
+                match ledger::show_ask_detail(kernel.actor(), ask.context_id, &request_id).await {
+                    Ok(Some(detail)) if detail.status == "pending" => continue,
+                    Ok(_) => break None,
+                    Err(error) => {
+                        tracing::warn!(request = %request_id, %error, "cannot read the ask to offer it again; leaving it pending");
+                        break None;
+                    }
+                }
+            }
         }
     };
 
