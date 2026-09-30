@@ -114,6 +114,9 @@ fn refuses_ledger_answer(argv: &[String]) -> bool {
 /// Run one `kj` verb against a stopped kernel: take the data-directory lock,
 /// boot the same kernel the service boots (minus serving), dispatch, print,
 /// settle, and report an exit code — `docs/server-cli.md`.
+/// Why a model turn driven offline does not wait on its ask.
+const OFFLINE_HOLD_REFUSAL: &str = "This kernel is running offline for one `kj` command, and nobody can answer an ask until it serves again; nothing ran.";
+
 pub async fn run_kj(args: KjRunArgs) -> ExitCode {
     let resolved_data_dir = resolve_data_dir(args.data_dir.as_deref());
     let _lock = match KernelLock::acquire(&resolved_data_dir) {
@@ -151,6 +154,10 @@ pub async fn run_kj(args: KjRunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Answers need a serving kernel's approval worker, and `kj ledger
+    // allow|deny` is refused here, so a model turn this command drives
+    // must not wait on an ask.
+    shared.kernel.refuse_holds(OFFLINE_HOLD_REFUSAL);
 
     let exit = match resolve_caller(&shared, args.as_character.as_deref(), args.context.as_deref()) {
         Ok(mut caller) => {

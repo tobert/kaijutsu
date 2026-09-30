@@ -208,6 +208,55 @@ fn drive_offline_holds_the_command_until_the_turn_completes() {
     );
 }
 
+/// Nobody can answer an ask on an offline kernel, so a model turn there
+/// does not hold on one (`docs/gate-resume.md`, "The turn holds"). The
+/// call fails at once with the reason, the turn finishes, and `kj drive`
+/// returns instead of waiting forever.
+#[test]
+fn drive_offline_fails_a_gated_call_instead_of_holding() {
+    let home = Home::new();
+    home.bootstrap("amy");
+    common::seed_mock_backend_with_model(&home.kernel_dir(), "mock-model");
+    let scripts = home.path().join("mock-scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("mock-model.json"), serde_json::json!([
+        [{"ToolUse": {"id": "offline-1", "name": "shell_write", "input": {"command": "echo offline-ran | tee marker"}}},
+         {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}],
+        ["TextStart", {"TextDelta": "understood"}, "TextEnd",
+         {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}]
+    ]).to_string()).unwrap();
+
+    assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
+    let create = home.run(&["kj", "--", "context", "create", "lane", "--type", "coder", "--as", "bob"]);
+    assert!(create.status.success(), "kj context create failed: {}", stderr(&create));
+
+    let drive = Command::new(server_bin())
+        .args(["kj", "--", "drive", "lane", "--prompt", "run it"])
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .env("KJ_MOCK_SCRIPT_DIR", &scripts)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("run kaijutsu-server");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut drive = drive;
+    let status = loop {
+        if let Some(status) = drive.try_wait().unwrap() { break status; }
+        if std::time::Instant::now() > deadline {
+            let _ = drive.kill();
+            panic!("kj drive held on an ask nobody can answer offline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(status.success(), "kj drive failed");
+
+    let list = home.run(&["kj", "--", "block", "list", "-c", "lane"]);
+    let out = stdout(&list);
+    assert!(out.contains("understood"), "the turn continued past the refused call: {out}");
+    let db = kaijutsu_kernel::KernelDb::open_read_only(home.kernel_db_path()).unwrap();
+    assert!(db.list_pending_asks().unwrap().is_empty(), "no ask is left pending offline");
+}
+
 /// `kj ledger allow|deny` would record a durable answer with no delivery
 /// worker running to act on it offline, and the next serving boot retires
 /// the ask unexecuted (`approval_resume.rs`, `recover_unpublished_pairs`).

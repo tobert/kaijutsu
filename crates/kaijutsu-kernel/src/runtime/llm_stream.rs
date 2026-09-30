@@ -1713,8 +1713,9 @@ async fn dispatch_recorded_tool_result(
     // A call left waiting on its ask holds this turn until the answer is
     // settled. Hold before publishing `Waiting`: the worker acts only on a
     // published pair, and it must find the holder when it does.
-    let hold = match (&ask_id, settled_status) {
-        (Some(ask), Status::Waiting) => Some(kernel.held_asks().hold(ask)),
+    let refusal = kernel.held_asks().refusal();
+    let hold = match (&ask_id, settled_status, refusal) {
+        (Some(ask), Status::Waiting, None) => Some(kernel.held_asks().hold(ask)),
         _ => None,
     };
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
@@ -1728,10 +1729,14 @@ async fn dispatch_recorded_tool_result(
     if let (Some(mut hold), Some(ask)) = (hold, ask_id.as_deref()) {
         let settled = hold.wait(stop_waiting).await;
         if !settled {
-            end_hold(kernel, context_id, call, result, ask);
+            end_hold(kernel, context_id, call, result, ask, INTERRUPTED_HOLD);
         }
         drop(hold);
         return Ok((held_result(documents, context_id, &result, ask, settled), result));
+    }
+    if let (Some(ask), Status::Waiting, Some(reason)) = (ask_id.as_deref(), settled_status, refusal) {
+        end_hold(kernel, context_id, call, result, ask, reason);
+        return Ok((held_result(documents, context_id, &result, ask, false), result));
     }
     let anchor = if let Some(payload) = payload {
         documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
@@ -1739,13 +1744,14 @@ async fn dispatch_recorded_tool_result(
     Ok((InlineToolResult { content: model_content, is_error }, anchor))
 }
 
-/// Stop holding on `ask` because the turn was interrupted. An unanswered ask
-/// is abandoned and an unrun answer spent, and the pair settles as an error
-/// that says nothing ran. An answer the worker already claimed stays the
+const INTERRUPTED_HOLD: &str = "The turn was interrupted while waiting for this approval; nothing ran.";
+
+/// Stop holding on `ask`, or never start, for `reason`. An unanswered ask is
+/// abandoned and an unrun answer spent, and the pair settles as an error
+/// carrying `reason`. An answer the worker already claimed stays the
 /// worker's: dropping the hold stops its command, and it settles the pair.
 fn end_hold(kernel: &Arc<Kernel>, context_id: ContextId, call: kaijutsu_types::BlockId,
-    result: kaijutsu_types::BlockId, ask: &str) {
-    let reason = "The turn was interrupted while waiting for this approval; nothing ran.";
+    result: kaijutsu_types::BlockId, ask: &str, reason: &str) {
     let ended = kernel.kernel_db().lock().end_held_ask(ask, reason);
     match ended {
         Ok(crate::kernel_db::HeldAskEnd::Claimed) => {}

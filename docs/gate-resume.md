@@ -54,6 +54,9 @@ the wire: the MCP and RPC shell paths still return `Pending`.
   worker's: its command is cancelled and the worker settles the pair.
 - **Restart.** Holds are not durable. Boot abandons pending asks and closes
   `Waiting` pairs, so a held call fails.
+- **Offline.** An offline `kj` command has no approval worker, so a model
+  turn it drives never holds: the gated call fails at once with the reason
+  (`Kernel::refuse_holds`).
 - **Still on the older path.** Asks with no stored command, `kj cc send`,
   the MCP `shell_write` path, and a turn-owned pair with no holder still use
   the wake, the seed, and retry-as-delivery described below.

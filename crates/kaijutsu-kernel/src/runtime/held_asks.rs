@@ -25,9 +25,23 @@ struct Holder {
 #[derive(Default)]
 pub struct HeldAsks {
     holders: parking_lot::Mutex<HashMap<String, Holder>>,
+    /// Set when no answer can arrive, such as on an offline kernel: a call
+    /// fails with this reason instead of holding.
+    refusal: std::sync::OnceLock<&'static str>,
 }
 
 impl HeldAsks {
+    /// Refuse every hold from now on, with `reason` as the failed call's
+    /// result.
+    pub(crate) fn refuse(&self, reason: &'static str) {
+        let _ = self.refusal.set(reason);
+    }
+
+    /// Why a call must not hold, when it must not.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        self.refusal.get().copied()
+    }
+
     /// Register a hold before the pair is published as `Waiting`, so the
     /// worker, which acts only on a released pair, always finds it.
     pub(crate) fn hold<'a>(&'a self, request_id: &str) -> HeldAsk<'a> {

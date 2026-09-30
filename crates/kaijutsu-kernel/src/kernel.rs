@@ -462,6 +462,10 @@ impl Kernel {
     /// Model turns waiting on their own asks.
     pub(crate) fn held_asks(&self) -> &crate::runtime::held_asks::HeldAsks { &self.held_asks }
 
+    /// Fail a model's gated call at once with `reason` instead of holding its
+    /// turn, for a kernel where nobody can answer an ask.
+    pub fn refuse_holds(&self, reason: &'static str) { self.held_asks.refuse(reason) }
+
     pub(crate) fn rc_settlements(&self) -> &crate::rc::settlement::RcSettlements {
         &self.rc_settlements
     }
