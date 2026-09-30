@@ -47,6 +47,9 @@ MAX_TOKENS_ENV = "KAIJUTSU_ACP_MAX_TOKENS"
 RC_OVERLAY_ENV = "KAIJUTSU_ACP_RC_OVERLAY"
 BASE_URL_ENV = "KAIJUTSU_ACP_BASE_URL"
 KEY_ENV_ENV = "KAIJUTSU_ACP_KEY_ENV"
+NO_KEY_ENV = "KAIJUTSU_ACP_NO_KEY"
+IDLE_TIMEOUT_ENV = "KAIJUTSU_ACP_IDLE_TIMEOUT"
+REQUEST_TIMEOUT_ENV = "KAIJUTSU_ACP_REQUEST_TIMEOUT"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -158,6 +161,20 @@ def _git(repo: Path, *args: str) -> str | None:
     return result.stdout.strip()
 
 
+def _positive_int(name: str, given: int | str | None, env: str | None) -> int | None:
+    """An option or its variable as a positive integer; `None` when neither is set."""
+    raw = given if given is not None else env
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} {raw!r} is not an integer.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero, got {value}.")
+    return value
+
+
 class KaijutsuSoloOptions(AcpOptions):
     """`--ak` options. Harbor's ACP options stay available underneath."""
 
@@ -233,6 +250,27 @@ class KaijutsuSoloOptions(AcpOptions):
             "it), else left off, which keeps the provider's own variable."
         ),
     )
+    no_key: bool | None = Field(
+        default=None,
+        description=(
+            "Pass --no-key, for a local server that takes no key. Needs "
+            f"base_url. Default: ${NO_KEY_ENV} set to 1, else off."
+        ),
+    )
+    idle_timeout: int | None = Field(
+        default=None,
+        description=(
+            "Seconds the model's stream may stay silent, passed to "
+            f"--idle-timeout. Default: ${IDLE_TIMEOUT_ENV}, else left off."
+        ),
+    )
+    request_timeout: int | None = Field(
+        default=None,
+        description=(
+            "Seconds one completion may take, passed to --request-timeout. "
+            f"Default: ${REQUEST_TIMEOUT_ENV}, else left off."
+        ),
+    )
     rc_overlay: str | None = Field(
         default=None,
         description=(
@@ -270,6 +308,9 @@ class KaijutsuSoloAcp(AcpAgent):
         rc_overlay: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
+        no_key: bool | str | None = None,
+        idle_timeout: int | str | None = None,
+        request_timeout: int | str | None = None,
         **kwargs: Any,
     ):
         self._local_binary = self._require_file(
@@ -337,6 +378,16 @@ class KaijutsuSoloAcp(AcpAgent):
         self._solo_args = _split_args(solo_args)
         self._base_url = base_url or os.environ.get(BASE_URL_ENV) or None
         self._api_key_env = api_key_env or os.environ.get(KEY_ENV_ENV) or None
+        no_key_raw = no_key if no_key is not None else os.environ.get(NO_KEY_ENV)
+        self._no_key = str(no_key_raw).strip().lower() in ("1", "true", "yes")
+        if self._no_key and self._api_key_env is not None:
+            raise ValueError("no_key and api_key_env contradict each other; set one.")
+        self._idle_timeout = _positive_int(
+            "idle_timeout", idle_timeout, os.environ.get(IDLE_TIMEOUT_ENV)
+        )
+        self._request_timeout = _positive_int(
+            "request_timeout", request_timeout, os.environ.get(REQUEST_TIMEOUT_ENV)
+        )
 
         # Left off the command line when unset, which is what keeps the
         # binary's own default (the factory token ceiling) in effect -- this
@@ -466,6 +517,12 @@ class KaijutsuSoloAcp(AcpAgent):
             args += ["--base-url", self._base_url]
         if self._api_key_env is not None:
             args += ["--api-key-env", self._api_key_env]
+        if self._no_key:
+            args += ["--no-key"]
+        if self._idle_timeout is not None:
+            args += ["--idle-timeout", str(self._idle_timeout)]
+        if self._request_timeout is not None:
+            args += ["--request-timeout", str(self._request_timeout)]
         if self._local_gate is not None:
             args += ["--gate-config", self.REMOTE_GATE.as_posix()]
         if self._max_tokens is not None:

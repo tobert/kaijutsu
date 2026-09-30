@@ -80,6 +80,25 @@ struct Cli {
     #[arg(long, value_name = "VAR")]
     api_key_env: Option<String>,
 
+    /// Connect with no key, for a local server that takes none.
+    /// Needs --base-url, and is refused alongside --api-key-env.
+    #[arg(long)]
+    no_key: bool,
+
+    /// Seconds the model's stream may stay silent before the turn fails.
+    /// Raise it for a slow local model that thinks before it streams, or
+    /// whose prefill of a long prompt takes a while. Must be greater than
+    /// zero. Default: the kernel's, 120.
+    #[arg(long, value_name = "SECS")]
+    idle_timeout: Option<NonZeroU64>,
+
+    /// Seconds one model completion may take in all, thinking included.
+    /// Raise it for a slow local model: at 17 tokens a second, a 16384-token
+    /// ceiling takes 16 minutes. Must be greater than zero. Default: the
+    /// kernel's, 300.
+    #[arg(long, value_name = "SECS")]
+    request_timeout: Option<NonZeroU64>,
+
     /// Character that performs the work in each ACP session. Created if it
     /// does not exist. A model turn needs a performer distinct from its
     /// reviewer, and the reviewer here is the root character `solo`.
@@ -249,6 +268,9 @@ fn run(cli: Cli) -> Result<()> {
             base_url: cli.base_url.clone(),
             model: cli.model.clone(),
             api_key_env: cli.api_key_env.clone(),
+            no_key: cli.no_key,
+            idle_timeout_secs: cli.idle_timeout.map(NonZeroU64::get),
+            request_timeout_secs: cli.request_timeout.map(NonZeroU64::get),
         },
         &RealHost,
     )?;

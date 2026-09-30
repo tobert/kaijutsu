@@ -311,8 +311,21 @@ pub struct Delta {
     /// DeepSeek thinking-mode chain-of-thought. Streams before `content`.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// vLLM's name for the same chain-of-thought.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallChunk>>,
+}
+
+impl Delta {
+    /// The chain-of-thought under either name. A server that sends both
+    /// carries the same text twice, so `reasoning_content` wins.
+    pub fn take_reasoning(&mut self) -> Option<String> {
+        let rc = self.reasoning_content.take();
+        let r = self.reasoning.take();
+        rc.or(r)
+    }
 }
 
 /// A streamed tool-call fragment. `id` and `function.name` arrive on the

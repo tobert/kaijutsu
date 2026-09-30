@@ -97,6 +97,10 @@ pub struct ModelChoice {
     /// the factory row alone, which is what keeps a provider's key file
     /// working.
     pub write_backend_row: bool,
+    /// The backend row's idle timeout. `None` keeps the kernel default.
+    pub idle_timeout_secs: Option<u64>,
+    /// The backend row's request timeout. `None` keeps the kernel default.
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// What resolution reads about the world. Injected so the rules can be
@@ -135,6 +139,12 @@ pub struct ModelFlags {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
+    /// The endpoint takes no key: a local server of our own.
+    pub no_key: bool,
+    /// Seconds a stream may go silent before the kernel gives up on it.
+    pub idle_timeout_secs: Option<u64>,
+    /// Seconds one whole completion may take.
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// Resolve the provider and model, or refuse with a message naming what to
@@ -156,11 +166,24 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         ),
     };
 
-    let api_key_env = flags
-        .api_key_env
-        .clone()
-        .or(factory.api_key_env.map(Into::into));
-    let key_optional = factory.api_key_env.is_none();
+    if flags.no_key {
+        if flags.base_url.is_none() {
+            bail!("--no-key needs --base-url: a provider's own endpoint always takes a key");
+        }
+        if flags.api_key_env.is_some() {
+            bail!("--no-key and --api-key-env contradict each other; pass one");
+        }
+    }
+
+    let api_key_env = if flags.no_key {
+        None
+    } else {
+        flags
+            .api_key_env
+            .clone()
+            .or(factory.api_key_env.map(Into::into))
+    };
+    let key_optional = flags.no_key || factory.api_key_env.is_none();
 
     // Say now that the key is missing. The alternative is a kernel that
     // starts, accepts a prompt, and fails the first turn.
@@ -188,6 +211,7 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
     // would drop that fallback.
     let write_backend_row = flags.base_url.is_some()
         || flags.api_key_env.is_some()
+        || flags.no_key
         || !kaijutsu_kernel::seed_backends::is_factory_backend_name(factory.backend);
 
     Ok(ModelChoice {
@@ -198,6 +222,8 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         api_key_env,
         key_optional,
         write_backend_row,
+        idle_timeout_secs: flags.idle_timeout_secs,
+        request_timeout_secs: flags.request_timeout_secs,
     })
 }
 
@@ -339,11 +365,54 @@ mod tests {
             base_url: Some("http://localhost:8080/v1".to_string()),
             model: Some("local-model".to_string()),
             api_key_env: Some("MY_KEY".to_string()),
+            ..ModelFlags::default()
         };
         let choice = resolve(&flags, &host).expect("a local endpoint resolves");
         assert!(choice.write_backend_row);
         assert_eq!(choice.api_key_env.as_deref(), Some("MY_KEY"));
         assert_eq!(choice.base_url.as_deref(), Some("http://localhost:8080/v1"));
+    }
+
+    #[test]
+    fn no_key_needs_no_key_and_writes_a_keyless_row() {
+        let flags = ModelFlags {
+            backend_kind: Some(BackendKind::Openai),
+            base_url: Some("http://tenchi:8000/v1".to_string()),
+            model: Some("qwen3.8-27b".to_string()),
+            no_key: true,
+            ..ModelFlags::default()
+        };
+        let choice = resolve(&flags, &FakeHost::default()).expect("a keyless endpoint resolves");
+        assert!(choice.key_optional);
+        assert_eq!(choice.api_key_env, None, "no key variable to read");
+        assert!(choice.write_backend_row);
+    }
+
+    #[test]
+    fn no_key_without_an_endpoint_is_refused() {
+        let flags = ModelFlags {
+            backend_kind: Some(BackendKind::Openai),
+            model: Some("gpt-5.6".to_string()),
+            no_key: true,
+            ..ModelFlags::default()
+        };
+        let error = resolve(&flags, &FakeHost::default()).expect_err("a hosted endpoint needs a key");
+        assert!(error.to_string().contains("--base-url"), "{error}");
+    }
+
+    #[test]
+    fn no_key_with_a_key_variable_is_refused() {
+        let flags = ModelFlags {
+            backend_kind: Some(BackendKind::Openai),
+            base_url: Some("http://tenchi:8000/v1".to_string()),
+            model: Some("qwen3.8-27b".to_string()),
+            api_key_env: Some("MY_KEY".to_string()),
+            no_key: true,
+            ..ModelFlags::default()
+        };
+        let error = resolve(&flags, &FakeHost::default().with_var("MY_KEY", "x"))
+            .expect_err("both is a contradiction");
+        assert!(error.to_string().contains("--api-key-env"), "{error}");
     }
 
     #[test]

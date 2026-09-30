@@ -242,18 +242,17 @@ HARBOR_AGENT_TIMEOUT_MULTIPLIER=1 \
   --dataset "terminal-bench@2.0" --task fix-git
 ```
 
-tenchi (the DGX Spark, vLLM serving `qwen3.8-27b`) needs no key, but
-`kaijutsu-solo-acp --backend-kind openai` refuses to start without one and
-`run-harbor.sh` scans the job for whatever key it was given. Give it a random
-throwaway token, never a short word the scan would match everywhere:
+tenchi (the DGX Spark, vLLM serving `qwen3.8-27b`) takes no key and is slow:
+about 17 tokens a second, and 25 s to prefill the coder seat. Give it its
+thinking room. `KAIJUTSU_ACP_NO_KEY=1` runs with no key and no key scan, and
+the two timeouts land on the backend row:
 
 ```bash
-key=$(mktemp); python3 -c 'import secrets; print("tenchi-unused-" + secrets.token_hex(16))' > "$key"
 KAIJUTSU_ACP_BACKEND=openai KAIJUTSU_ACP_MODEL=qwen3.8-27b \
 KAIJUTSU_ACP_BASE_URL=http://tenchi-inference.taila4abc.ts.net:8000/v1 \
-KAIJUTSU_ACP_KEY_FILE="$key" KAIJUTSU_ACP_KEY_ENV=TENCHI_API_KEY \
-HARBOR_AGENT_TIMEOUT_MULTIPLIER=2 \
-  ./contrib/bench/harbor/run-harbor.sh --job-name kj-tenchi-openssl-1 \
+KAIJUTSU_ACP_NO_KEY=1 KAIJUTSU_ACP_IDLE_TIMEOUT=600 KAIJUTSU_ACP_REQUEST_TIMEOUT=1800 \
+HARBOR_AGENT_TIMEOUT_MULTIPLIER=5 \
+  ./contrib/bench/harbor/run-harbor.sh --job-name kj-tenchi-openssl-2 \
   --dataset "terminal-bench@2.0" --task openssl-selfsigned-cert
 ```
 

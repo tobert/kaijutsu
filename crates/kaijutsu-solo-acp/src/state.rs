@@ -222,6 +222,8 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
 /// - The model rows start from the kernel's own factory floor, so a solo
 ///   kernel's providers, context windows, and tunables are the ones every
 ///   other kernel ships.
+/// - `choice.idle_timeout_secs` and `request_timeout_secs`, when given, land
+///   on the backend row, written or factory.
 /// - `max_tokens`, when given, overrides the factory output-token ceiling
 ///   (`kaijutsu_kernel::seed_backends::FACTORY_MAX_TOKENS`) in the written
 ///   defaults row. Left `None`, the factory ceiling from
@@ -263,13 +265,27 @@ pub fn prepare_rows(
             api_key_env: choice.api_key_env.clone(),
             api_key_file: None,
             key_optional: choice.key_optional,
-            request_timeout_secs: None,
-            idle_timeout_secs: None,
+            request_timeout_secs: choice.request_timeout_secs.map(|s| s as i64),
+            idle_timeout_secs: choice.idle_timeout_secs.map(|s| s as i64),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::system(),
         };
         db.upsert_backend(&row)
             .with_context(|| format!("write the {} backend row", choice.backend))?;
+    } else if choice.idle_timeout_secs.is_some() || choice.request_timeout_secs.is_some() {
+        // Change only the timeouts: the factory row keeps its key file.
+        let mut row = db
+            .get_backend_by_name(&choice.backend)
+            .with_context(|| format!("read the {} backend row", choice.backend))?
+            .with_context(|| format!("the factory floor wrote no {} row", choice.backend))?;
+        if let Some(secs) = choice.idle_timeout_secs {
+            row.idle_timeout_secs = Some(secs as i64);
+        }
+        if let Some(secs) = choice.request_timeout_secs {
+            row.request_timeout_secs = Some(secs as i64);
+        }
+        db.upsert_backend(&row)
+            .with_context(|| format!("set the {} timeouts", choice.backend))?;
     }
 
     let mut defaults = db
@@ -498,6 +514,8 @@ mod tests {
             api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
             key_optional: false,
             write_backend_row: false,
+            idle_timeout_secs: None,
+            request_timeout_secs: None,
         }
     }
 
@@ -545,6 +563,52 @@ mod tests {
         // `seed_backends::FACTORY_MAX_TOKENS` is private to that module; this
         // is docs/solo-acp.md's documented default, kept in sync by hand.
         assert_eq!(defaults.max_tokens, Some(16384));
+    }
+
+    #[test]
+    fn an_idle_timeout_on_a_factory_row_keeps_its_key_file() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        let choice = ModelChoice {
+            idle_timeout_secs: Some(900),
+            request_timeout_secs: Some(3600),
+            ..factory_choice()
+        };
+        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("prepare rows");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let row = db
+            .get_backend_by_name("deepseek")
+            .expect("read the row")
+            .expect("the factory row exists");
+        assert_eq!(row.idle_timeout_secs, Some(900));
+        assert_eq!(row.request_timeout_secs, Some(3600));
+        assert!(row.api_key_file.is_some(), "the factory key file must survive: {row:?}");
+    }
+
+    #[test]
+    fn a_written_keyless_row_carries_the_idle_timeout() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        let choice = ModelChoice {
+            backend: "gpt".to_string(),
+            kind: "openai".to_string(),
+            model: "qwen3.8-27b".to_string(),
+            base_url: Some("http://tenchi:8000/v1".to_string()),
+            api_key_env: None,
+            key_optional: true,
+            write_backend_row: true,
+            idle_timeout_secs: Some(1800),
+            request_timeout_secs: Some(2400),
+        };
+        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("prepare rows");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let row = db.get_backend_by_name("gpt").expect("read").expect("row written");
+        assert_eq!(row.idle_timeout_secs, Some(1800));
+        assert_eq!(row.request_timeout_secs, Some(2400));
+        assert!(row.key_optional);
+        assert_eq!(row.api_key_env, None);
     }
 
     #[test]

@@ -49,6 +49,8 @@ Environment (all have defaults):
   KAIJUTSU_ACP_MODEL KAIJUTSU_ACP_BACKEND (unset: kaijutsu_solo_agent.py decides)
   KAIJUTSU_ACP_BASE_URL (unset: the provider's own endpoint)
   KAIJUTSU_ACP_KEY_FILE KAIJUTSU_ACP_KEY_ENV (the variable the binary reads)
+  KAIJUTSU_ACP_NO_KEY=1 (a local server with no key; needs KAIJUTSU_ACP_BASE_URL)
+  KAIJUTSU_ACP_IDLE_TIMEOUT KAIJUTSU_ACP_REQUEST_TIMEOUT (seconds; unset: the kernel's)
   HARBOR_ENV_SH HARBOR_JOBS_DIR HARBOR_AGENT_TIMEOUT_MULTIPLIER
 USAGE
 }
@@ -107,7 +109,16 @@ export PODMAN_COMPOSE_WARNING_LOGS=false
 
 [[ -f "$KAIJUTSU_ACP_BINARY" ]] || { echo "no agent binary: $KAIJUTSU_ACP_BINARY" >&2; exit 1; }
 [[ -f "$KAIJUTSU_ACP_GATE" ]] || { echo "no gate policy: $KAIJUTSU_ACP_GATE" >&2; exit 1; }
-[[ -f "$KAIJUTSU_ACP_KEY_FILE" ]] || { echo "no key file: $KAIJUTSU_ACP_KEY_FILE" >&2; exit 1; }
+# KAIJUTSU_ACP_NO_KEY=1 runs a local server that takes no key: no key is read,
+# none is handed to Harbor, and there is nothing to scan for.
+no_key=0
+[[ "${KAIJUTSU_ACP_NO_KEY:-}" == 1 ]] && no_key=1
+if (( no_key )); then
+  [[ -n "${KAIJUTSU_ACP_BASE_URL:-}" ]] || { echo "KAIJUTSU_ACP_NO_KEY=1 needs KAIJUTSU_ACP_BASE_URL" >&2; exit 1; }
+  unset KAIJUTSU_ACP_KEY_ENV
+else
+  [[ -f "$KAIJUTSU_ACP_KEY_FILE" ]] || { echo "no key file: $KAIJUTSU_ACP_KEY_FILE" >&2; exit 1; }
+fi
 # Provenance should name one path, not one path plus how this script spelled it.
 KAIJUTSU_ACP_BINARY="$(realpath -- "$KAIJUTSU_ACP_BINARY")"
 KAIJUTSU_ACP_GATE="$(realpath -- "$KAIJUTSU_ACP_GATE")"
@@ -122,28 +133,38 @@ if [[ -e "$job_dir" ]]; then
 fi
 mkdir -p "$HARBOR_JOBS_DIR"
 
-# The scan pattern is read from a mode-600 file of our own rather than
-# /dev/stdin, so "could not supply the pattern" is distinguishable from
-# "could not search".
-scan_dir="$(umask 077; mktemp -d "${HARBOR_JOBS_DIR}/.keyscan-${job_name}.XXXXXX")"
-pattern_file="${scan_dir}/pattern"
-cleanup() { rm -f -- "$pattern_file"; rmdir -- "$scan_dir" 2>/dev/null || true; }
-trap cleanup EXIT
+key_args=()
+if (( ! no_key )); then
+  # The scan pattern is read from a mode-600 file of our own rather than
+  # /dev/stdin, so "could not supply the pattern" is distinguishable from
+  # "could not search".
+  scan_dir="$(umask 077; mktemp -d "${HARBOR_JOBS_DIR}/.keyscan-${job_name}.XXXXXX")"
+  pattern_file="${scan_dir}/pattern"
+  cleanup() { rm -f -- "$pattern_file"; rmdir -- "$scan_dir" 2>/dev/null || true; }
+  trap cleanup EXIT
 
-# Read the key into the environment and into the pattern file. Never echoed,
-# never on a command line: only its variable NAME travels, inside a Harbor env
-# template. xtrace is already refused above; belt and braces here.
-{ set +x; } 2>/dev/null
-printf -v "$KAIJUTSU_ACP_KEY_ENV" '%s' "$(< "$KAIJUTSU_ACP_KEY_FILE")"
-export "${KAIJUTSU_ACP_KEY_ENV?}"
-[[ -n "${!KAIJUTSU_ACP_KEY_ENV}" ]] || { echo "key file is empty: $KAIJUTSU_ACP_KEY_FILE" >&2; exit 1; }
-( umask 077; printf '%s\n' "${!KAIJUTSU_ACP_KEY_ENV}" > "$pattern_file" )
+  # Read the key into the environment and into the pattern file. Never echoed,
+  # never on a command line: only its variable NAME travels, inside a Harbor env
+  # template. xtrace is already refused above; belt and braces here.
+  { set +x; } 2>/dev/null
+  printf -v "$KAIJUTSU_ACP_KEY_ENV" '%s' "$(< "$KAIJUTSU_ACP_KEY_FILE")"
+  export "${KAIJUTSU_ACP_KEY_ENV?}"
+  [[ -n "${!KAIJUTSU_ACP_KEY_ENV}" ]] || { echo "key file is empty: $KAIJUTSU_ACP_KEY_FILE" >&2; exit 1; }
+  ( umask 077; printf '%s\n' "${!KAIJUTSU_ACP_KEY_ENV}" > "$pattern_file" )
 
-# KAIJUTSU_ACP_KEY_ENV also reaches the adapter, which passes it to the binary
-# as --api-key-env: the variable Harbor puts in the container is the one the
-# kernel reads, whatever the provider calls its own.
-export KAIJUTSU_ACP_BINARY KAIJUTSU_ACP_GATE KAIJUTSU_ACP_RUST_LOG KAIJUTSU_ACP_KEY_ENV
+  # KAIJUTSU_ACP_KEY_ENV also reaches the adapter, which passes it to the
+  # binary as --api-key-env: the variable Harbor puts in the container is the
+  # one the kernel reads, whatever the provider calls its own.
+  export KAIJUTSU_ACP_KEY_ENV
+  key_args=(--ae "${KAIJUTSU_ACP_KEY_ENV}=\${${KAIJUTSU_ACP_KEY_ENV}}")
+else
+  export KAIJUTSU_ACP_NO_KEY
+fi
+
+export KAIJUTSU_ACP_BINARY KAIJUTSU_ACP_GATE KAIJUTSU_ACP_RUST_LOG
 [[ -n "${KAIJUTSU_ACP_BASE_URL:-}" ]] && export KAIJUTSU_ACP_BASE_URL
+[[ -n "${KAIJUTSU_ACP_IDLE_TIMEOUT:-}" ]] && export KAIJUTSU_ACP_IDLE_TIMEOUT
+[[ -n "${KAIJUTSU_ACP_REQUEST_TIMEOUT:-}" ]] && export KAIJUTSU_ACP_REQUEST_TIMEOUT
 [[ -n "${KAIJUTSU_ACP_MODEL:-}" ]] && export KAIJUTSU_ACP_MODEL
 [[ -n "${KAIJUTSU_ACP_BACKEND:-}" ]] && export KAIJUTSU_ACP_BACKEND
 export PYTHONPATH="${here}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -157,7 +178,7 @@ args=(
   -o "$HARBOR_JOBS_DIR"
   --job-name "$job_name"
   --agent-timeout-multiplier "$HARBOR_AGENT_TIMEOUT_MULTIPLIER"
-  --ae "${KAIJUTSU_ACP_KEY_ENV}=\${${KAIJUTSU_ACP_KEY_ENV}}"
+  "${key_args[@]}"
   -y
 )
 if [[ -n "$task_path" ]]; then
@@ -203,13 +224,21 @@ cat > "${job_dir}/kaijutsu-job-provenance.json" <<JSON
   "agent_timeout_multiplier": "${HARBOR_AGENT_TIMEOUT_MULTIPLIER}",
   "binary": "${KAIJUTSU_ACP_BINARY}",
   "gate": "${KAIJUTSU_ACP_GATE}",
-  "key_env": "${KAIJUTSU_ACP_KEY_ENV}",
+  "key_env": "${KAIJUTSU_ACP_KEY_ENV:-}",
+  "no_key": ${no_key},
+  "idle_timeout": "${KAIJUTSU_ACP_IDLE_TIMEOUT:-}",
+  "request_timeout": "${KAIJUTSU_ACP_REQUEST_TIMEOUT:-}",
   "backend": "${KAIJUTSU_ACP_BACKEND:-}",
   "model": "${KAIJUTSU_ACP_MODEL:-}",
   "base_url": "${KAIJUTSU_ACP_BASE_URL:-}",
   "harbor_exit": ${status}
 }
 JSON
+
+if (( no_key )); then
+  echo "key scan: skipped, no key was used (${job_dir})" >&2
+  exit "$status"
+fi
 
 # grep exits 0 (match), 1 (no match), >1 (error). Only 1 is "clean": an error
 # reported as clean is the worst outcome here, so it aborts and says why.

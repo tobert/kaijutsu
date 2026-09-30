@@ -68,6 +68,9 @@ file the backend row names. It never belongs in this file.
 | `--base-url <url>` | An OpenAI-compatible endpoint of your own. |
 | `--model <id>` | The model every turn uses. Default: `deepseek-v4-flash` or `claude-sonnet-5`; the `openai` provider ships no model id, so it needs this flag. |
 | `--api-key-env <VAR>` | The variable holding the key. The key itself is never a command-line argument. |
+| `--no-key` | Connect with no key, for a local server that takes none. Needs `--base-url`; refused alongside `--api-key-env`. |
+| `--idle-timeout <SECS>` | Seconds the model's stream may stay silent before the turn fails, written onto the backend row. Default: the kernel's, 120. |
+| `--request-timeout <SECS>` | Seconds one completion may take in all, thinking included, written onto the backend row. Default: the kernel's, 300. A slow local model needs both raised: tenchi decodes about 17 tokens a second, so a 16384-token ceiling takes 16 minutes. |
 | `--character <name>` | The performer each session's context is played by. Default `solo-coder`, created if absent. |
 | `--context-type <type>` | The rc bundle each session's context runs. Default `coder`. |
 | `--mount <dir>` | Mount a host directory read-write at the same path inside the kernel, so the model's file tools may write there. Repeatable. |
@@ -151,9 +154,10 @@ Each step fails loudly, with what it was doing:
 4. Make `solo` the root character and bind that key to it. `solo` owns the
    bridge's connection and is the reviewer every approval resolves to.
 5. Seed the factory backends, then point the model defaults at the chosen
-   provider and model. The factory row is left alone unless `--base-url` or
-   `--api-key-env` says something different, which is what keeps a provider's
-   key file working. `--max-tokens` overrides the factory output-token
+   provider and model. The factory row is left alone unless `--base-url`,
+   `--api-key-env`, or `--no-key` says something different, which is what
+   keeps a provider's key file working. The two timeouts change only their
+   own columns of the factory row. `--max-tokens` overrides the factory output-token
    ceiling in this same defaults row; left out, the factory ceiling stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews

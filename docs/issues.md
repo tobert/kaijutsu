@@ -655,15 +655,6 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
 From the Qwen runs on current main (2026-09-30, `docs/benchmarks.md`, "Qwen
 on current main"):
 
-- **vLLM's `delta.reasoning` is dropped, so a thinking model looks idle.**
-  The OpenAI `Delta` reads only `reasoning_content`
-  (`crates/kaijutsu-kernel/src/llm/openai/types.rs`), and tenchi's vLLM streams
-  Qwen's thinking as `reasoning`. The first inference of a tenchi run failed
-  with `LLM stream idle for 120s` though prefill took about 25 s. Accept the
-  `reasoning` field, and let `kaijutsu-solo-acp` set the backend's idle
-  timeout (it writes `idle_timeout_secs: None`, `crates/kaijutsu-solo-acp/src/state.rs`).
-  `--backend-kind openai` also refuses to start with no key, so a keyless
-  local server needs a throwaway token.
 - **A deleted working directory wedges every shell call.** After `rm -rf` of
   the context's cwd, `shell` and `shell_write` fail with "context cwd … is
   unavailable" before running anything, `cd /app` included

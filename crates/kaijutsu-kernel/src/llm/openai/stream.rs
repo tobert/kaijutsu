@@ -2,8 +2,8 @@
 //!
 //! OpenAI-style streaming does *not* bracket content blocks the way
 //! Anthropic does (`content_block_start` / `_stop`). Instead each chunk's
-//! `delta` carries whichever of `reasoning_content` / `content` /
-//! `tool_calls` is active. This state machine reconstructs the bracketed
+//! `delta` carries whichever of `reasoning_content` (vLLM: `reasoning`) /
+//! `content` / `tool_calls` is active. This state machine reconstructs the bracketed
 //! `*Start` / `*Delta` / `*End` lifecycle kaijutsu's block writer expects
 //! by tracking *which* block is currently open and closing it when the
 //! active field changes:
@@ -139,12 +139,12 @@ impl StateMachine {
 
     fn on_choice(&mut self, choice: ChunkChoice, out: &mut Vec<StreamEvent>) {
         let ChunkChoice {
-            delta,
+            mut delta,
             finish_reason,
         } = choice;
 
-        // reasoning_content → Thinking block.
-        if let Some(rc) = delta.reasoning_content.filter(|s| !s.is_empty()) {
+        // reasoning_content or reasoning → Thinking block.
+        if let Some(rc) = delta.take_reasoning().filter(|s| !s.is_empty()) {
             if self.phase != Phase::Thinking {
                 self.close_open_block(out);
                 out.push(StreamEvent::ThinkingStart);
@@ -362,6 +362,56 @@ data: [DONE]
                         reasoning_tokens: 6,
                     })),
                 },
+            ]
+        );
+    }
+
+    /// vLLM streams reasoning as `delta.reasoning` (tenchi's Qwen).
+    const VLLM_REASONING_THEN_TEXT: &str = "\
+data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"reasoning\":\"We\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"reasoning\":\" need\"},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+
+    #[tokio::test]
+    async fn vllm_reasoning_field_streams_as_thinking() {
+        let events = run(VLLM_REASONING_THEN_TEXT).await;
+        assert_eq!(
+            &events[..6],
+            &[
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta("We".into()),
+                StreamEvent::ThinkingDelta(" need".into()),
+                StreamEvent::ThinkingEnd { signature: None },
+                StreamEvent::TextStart,
+                StreamEvent::TextDelta("hi".into()),
+            ]
+        );
+    }
+
+    /// A server that sends the same text under both names shows it once.
+    #[tokio::test]
+    async fn reasoning_under_both_names_is_not_doubled() {
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\",\"reasoning\":\"hmm\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        assert_eq!(
+            &events[..3],
+            &[
+                StreamEvent::ThinkingStart,
+                StreamEvent::ThinkingDelta("hmm".into()),
+                StreamEvent::ThinkingEnd { signature: None },
             ]
         );
     }
