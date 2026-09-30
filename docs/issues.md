@@ -2367,6 +2367,20 @@ and burn down all the approval options". Delete each line as it ships.
   cannot cover it and the read-only exemption misses it, so a model's
   structured `kj … --tail 5` asks. Needs the literal value from kaish, a
   shared interface.
+- **A model's turn holds on its own ask (Amy, 2026-09-30).** "asks should
+  still be async in the code but the conversation can block when that's
+  most logical for the model's experience." Only the in-kernel model turn
+  holds; the MCP and RPC shell paths stay non-blocking. The turn waits for
+  every ask its tool calls raised, and the model reads the real output (or
+  the denial) as its tool result in the same turn. A restart fails the held
+  call. Wall-clock and iteration caps do not count the wait. This replaces
+  the seed notification, the follow-up turn, retry-as-delivery, and step 2b
+  in `run_gate`. In progress.
+- **The approval surfaces arm late (Amy, 2026-09-30).** Typing must not
+  answer an ask that pops up mid-keystroke. The tui and app show an ask
+  disarmed, with visual feedback, and arm it about 100 ms after it appears;
+  each keystroke while disarmed pushes arming out by about 200 ms. The
+  kernel does not change an ask's state on input.
 - **Posture direction (Amy, 2026-09-30).** Ship a constrained, efficient
   setup: every tool call asks until a human `--remember`s it, and loosening
   is always the user's explicit choice. A banto:coder swarm states at
