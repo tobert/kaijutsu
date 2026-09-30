@@ -2336,13 +2336,14 @@ Map and reasoning: https://claude.ai/artifact/QzzA5UzbszV8y67sw3S3XB
 two consumers act on an answer with different checks. Amy: "let's record
 and burn down all the approval options". Delete each line as it ships.
 
-- **F3** PreCall (`evaluate_planned`) reads no ledger: a learned allow never
-  outranks a config deny through a real call, and on the RPC shell paths a
-  remembered deny does nothing unless something asks.
 - **F5** File and block tools pass no gate tier; a file write to
   `/config/rc` does what ask-tier `kj rc add` does.
-- **F6** kaijutsu-mcp submits as a model but gets path C's lenient posture:
-  uncovered statements run without an ask.
+- **F6** On the RPC shell paths an uncovered statement asks unless the
+  actor is a live root character. kaijutsu-mcp authenticates with Amy's
+  agent key, so Claude Code there acts as Amy and runs uncovered statements
+  without an ask. Closing it needs the bridge identity
+  (`docs/character.md`, "The bridge identity: a key per model character")
+  and a `[context_type.mcp]` allow tier wide enough for daily reads.
 - **F7** ACP prompts show only the description (200-char prefix, hook
   stderr); an ask unanswered for 30 s is never offered again.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
@@ -2358,15 +2359,34 @@ and burn down all the approval options". Delete each line as it ships.
   divergence (see "A kaish lexer rejection degrades the gate") reopens it.
 - **F13** A dry-run row is answerable between create and abandon; `kj cc
   send` through `shell_write` asks twice, unlinked.
+- **F14** An ask answered `kj ledger allow <id> --remember` never runs.
+  Learning a rule inserts an `approval_redemptions` row
+  (`approval-ledger/src/rules.rs`, `learn_from_approval`), and the worker's
+  `undelivered_answers` skips redeemed asks. Since the worker became the
+  only consumer (6ae6d8ff), nothing runs the approved command and no
+  follow-up turn starts. This hits the ACP, tui, and app "always" answers.
+  A `--remember` the ledger refuses (a free variable) redeems nothing, so
+  that ask runs. `fleet/approval/d-always-allow-runs-the-command.toml`.
+- **F15** The gate reads kaish's `PlannedValue::Plain`, the literal as it
+  renders on a command line, as an argv value (`kj/readonly.rs`,
+  `resolved_kj_args`; `gate_policy.rs`, `command_keys`). Structured `kj`
+  quotes every argument, and kaish renders a quoted number with its quotes,
+  so `kj wait --timeout "0"` classifies as `'0'` and fails. A config allow
+  cannot cover it and the read-only exemption misses it, so a model's
+  structured `kj … --tail 5` asks. Needs the literal value from kaish, a
+  shared interface.
+- **F16** A model's RPC shell that runs the `shell_write` tool asks twice:
+  once at PreCall for the uncovered `shell_write` statement, then in the
+  tool's own gate for its command. The shipped `gate.toml` could allow
+  `shell_write`, since the tool gates itself; Amy's call.
 - **Tests** The ACP part of the conformance matrix ships in
   `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
-  approval matrix"); scenarios marked `known_gap` name F7 and F8.
-  Open: no ACP client can create a standing rule, because the bridge offers
-  only allow once and reject once, never `--remember`. A learned allow over
-  a config deny (F3) and a model forgetting a human's rule (F4) need that
-  option. Paths C and D need a harness of their own. A rule added between
-  an ask and its answer does not reach that approval: Amy, "the policy at
-  the time the command was first evaluated should cover its lifetime".
+  approval matrix"); scenarios marked `known_gap` name F7, F8, and F14.
+  The ACP bridge offers "always allow" and "always deny", so rule scenarios
+  run through ACP. Paths C and D need a harness of their own. A rule added
+  between an ask and its answer does not reach that approval: Amy, "the
+  policy at the time the command was first evaluated should cover its
+  lifetime"; `e-rule-added-after-ask-leaves-it-alone.toml` holds it.
 
 ## What a replacement risk scorer inherits (2026-09-28)
 

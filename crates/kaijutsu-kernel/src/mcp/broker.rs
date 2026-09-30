@@ -2009,7 +2009,16 @@ impl Broker {
                 config,
                 context_type: context_type.as_deref(),
             };
-            let policy = crate::kj::gate_policy::evaluate_planned(&statements, layers);
+            let policy = match self.program_policy(command, &statements, ctx, layers).await {
+                Ok(policy) => policy,
+                Err(reason) => {
+                    return Ok(PhaseEval::Enforced(PhaseOutcome::GateUnavailable {
+                        hook_id: HookId(GATE_POLICY_SUBJECT.into()),
+                        reason,
+                        ask: None,
+                    }));
+                }
+            };
             match policy.verdict() {
                 approval_ledger::types::AskVerdict::Allow => {
                     return Ok(no_hook_matched(mode));
@@ -3069,12 +3078,14 @@ impl Broker {
         }
     }
 
-    /// The gate policy's ask-tier statements in `command`, described for an
-    /// ask. `Ok(None)` when none is ask-tier, a statement is deny-tier
-    /// (PreCall refused those already), or the program does not plan: the
+    /// The gate policy's asking statements in `command`, described for an
+    /// ask: ask-tier statements, and uncovered ones unless the actor is a
+    /// live root character (`Broker::actor_is_root`). `Ok(None)` when none asks,
+    /// the program is allowed or denied (PreCall decided those already), or
+    /// the program does not plan: the
     /// executor parses with the same kaish parser, so it runs nothing and
     /// reports the parse error itself. `Err` when the config does not load,
-    /// so the call is refused.
+    /// or the actor's sheet does not read, so the call is refused.
     async fn ask_tier_description(&self, command: &str, ctx: &CallContext) -> Result<Option<String>, String> {
         let Ok(statements) = kaish_kernel::ast::plan::plan_program(command) else {
             return Ok(None);
@@ -3083,11 +3094,51 @@ impl Broker {
         let config = load.as_ref().map_err(|e| e.to_string())?;
         let context_type = self.context_type_for(ctx).await;
         let layers = crate::kj::gate_policy::Layers { config, context_type: context_type.as_deref() };
-        let policy = crate::kj::gate_policy::evaluate_planned(&statements, layers);
-        if policy.verdict() == approval_ledger::types::AskVerdict::Deny {
+        let policy = self.program_policy(command, &statements, ctx, layers).await?;
+        if policy.verdict() != approval_ledger::types::AskVerdict::Escalate {
             return Ok(None);
         }
-        Ok(policy.describe_asks_planned(&statements))
+        let uncovered_asks = !self.actor_is_root(ctx).await?;
+        Ok(policy.describe_asks_planned(&statements, uncovered_asks))
+    }
+
+    /// Whether `ctx`'s actor is a live root character: a person's hands, so
+    /// an uncovered statement runs without an ask. Any other actor, including
+    /// a principal with no sheet, takes a model's posture. With no dispatcher
+    /// wired there are no sheets, so no actor is a root. `Err` when the sheet
+    /// does not read.
+    async fn actor_is_root(&self, ctx: &CallContext) -> Result<bool, String> {
+        let Some(dispatcher) = self.kj_dispatcher().await else {
+            return Ok(false);
+        };
+        let db = dispatcher.kernel_db().lock();
+        match db.get_character(ctx.actor_id) {
+            Ok(sheet) => Ok(sheet.is_some_and(|s| s.root && s.retired_at.is_none())),
+            Err(e) => Err(format!("gate policy could not read the actor's character sheet: {e} (fail-closed)")),
+        }
+    }
+
+    /// The gate policy over a planned program at full depth, composed the
+    /// way `run_gate` composes it: learned exact rules, family rules, then
+    /// the config and builtin tiers. With no dispatcher wired there is no
+    /// ledger, and the config and builtin tiers decide alone.
+    async fn program_policy(
+        &self,
+        command: &str,
+        statements: &[kaish_kernel::PlannedStatement],
+        ctx: &CallContext,
+        layers: crate::kj::gate_policy::Layers<'_>,
+    ) -> Result<crate::kj::gate_policy::PolicyEvaluation, String> {
+        let Some(dispatcher) = self.kj_dispatcher().await else {
+            return Ok(crate::kj::gate_policy::evaluate_planned(statements, layers));
+        };
+        let spec = crate::kj::shell_gate::build_shell_gate_spec_with_stdin(command, None)
+            .map_err(|e| e.to_string())?;
+        let context = ctx.context_id.as_bytes().to_vec();
+        let principal = ctx.principal_id.as_bytes().to_vec();
+        let db = dispatcher.kernel_db().lock();
+        crate::kj::gate_policy::evaluate(db.conn_for_ledger(), &spec, Some(&context), Some(&principal), layers)
+            .map_err(|e| format!("gate policy could not read its rules: {e} (fail-closed — a ledger fault, not a decision)"))
     }
 
     /// Open the ask for an ask-tier statement on the RPC shell paths.
@@ -9293,7 +9344,9 @@ mod tests {
     /// stops denying) or never (the dry-run half reports a would-deny).
     #[tokio::test]
     async fn kj_hook_mode_says_dryrun_only_in_a_dry_run() {
-        let (broker, _kj, ctx) = dry_run_fixture("dry-run-mode-var").await;
+        let (broker, kj, ctx) = dry_run_fixture("dry-run-mode-var").await;
+        // A person's posture, so an uncovered `echo` meets the hook.
+        seat_a_root(&kj, &ctx);
         push_shell_write_hook(
             &broker,
             "mode-check",
@@ -10560,7 +10613,7 @@ mod tests {
 
     /// On the RPC shell paths an ask-tier statement asks with no hook
     /// installed, and the ask names the tier's layer and key. A statement no
-    /// key covers still runs there.
+    /// key covers still runs there when a root character acts.
     ///
     /// Falsified by leaving the ask tier to the hooks: `git push` proceeds.
     #[tokio::test]
@@ -10568,6 +10621,7 @@ mod tests {
         let (broker, _kernel, kj, _dir) =
             wired_kaish_broker_with_gate_toml("rpc-ask-tier", "[global]\nask = [\"git push\"]\n").await;
         let ctx = approval_call_context(&kj, "rpc-ask-tier");
+        seat_a_root(&kj, &ctx);
         let db = kj.kernel_db();
 
         match broker.shell_pre_call_hooks("echo hi", &ctx, &CancellationToken::new()).await {
@@ -10603,6 +10657,108 @@ mod tests {
             other => panic!("a retry must leave the approved command to the worker, got {other:?}"),
         }
         assert!(db.lock().list_pending_asks().unwrap().is_empty(), "an answered ask is not asked again");
+    }
+
+    /// Teach a standing rule the way a reviewer does: raise a shell-gate ask
+    /// for `command` in `ctx`'s seat, then answer it with `--remember always`.
+    async fn teach_rule(kj: &crate::kj::KjDispatcher, ctx: &CallContext, command: &str, allow: bool, family: bool) {
+        let mut caller = crate::kj::test_helpers::test_caller();
+        caller.principal_id = ctx.principal_id;
+        caller.actor_id = ctx.actor_id;
+        caller.reviewer_id = ctx.reviewer_id;
+        caller.context_id = Some(ctx.context_id);
+        let spec = crate::kj::shell_gate::build_shell_gate_spec(command).unwrap();
+        let asked = crate::kj::gate::run_gate(kj.kernel(), &caller, spec, kj.kernel().ledger_flows(),
+            &crate::kj::gate_policy::no_config()).await;
+        let id = asked.ask.expect("an uncovered command asks").request_id;
+        let reviewer = crate::kj::test_helpers::test_caller().with_actor(ctx.reviewer_id.unwrap(), None);
+        let mut argv = vec!["ledger".to_string(), (if allow { "allow" } else { "deny" }).into(), id,
+            "--remember".into(), "always".into()];
+        if family { argv.push("--family".into()); }
+        let taught = kj.dispatch(&argv, &reviewer).await;
+        assert!(taught.is_ok() && !taught.message().contains("NOT remembered"), "{taught:?}");
+    }
+
+    /// PreCall reads the learned rules, so a human's rule decides before the
+    /// config: a learned allow outranks a config deny, and a remembered deny
+    /// refuses on the RPC shell path, where nothing asks about an uncovered
+    /// statement a root character runs.
+    ///
+    /// Falsified by evaluating PreCall without the ledger: the config deny
+    /// refuses the allowed command, and the denied family proceeds.
+    #[tokio::test]
+    async fn precall_reads_the_learned_rules() {
+        let (broker, _kernel, kj, _dir) =
+            wired_kaish_broker_with_gate_toml("learned-rules", "[global]\ndeny = [\"git push\"]\n").await;
+        let ctx = approval_call_context(&kj, "learned-rules");
+        seat_a_root(&kj, &ctx);
+
+        teach_rule(&kj, &ctx, "git push origin main", true, false).await;
+        match broker.shell_pre_call_hooks("git push origin main", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("a learned allow outranks a config deny, got {other:?}"),
+        }
+        match broker.shell_pre_call_hooks("git push origin other", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => assert!(err.is_refusal(RefusalKind::Denied), "{err:?}"),
+            other => panic!("the config deny still covers other pushes, got {other:?}"),
+        }
+
+        teach_rule(&kj, &ctx, "git fetch origin", false, true).await;
+        match broker.shell_pre_call_hooks("git fetch upstream", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Denied(err) => {
+                assert!(err.is_refusal(RefusalKind::Denied), "{err:?}");
+                assert!(err.to_string().contains("git fetch"), "the refusal names the rule: {err}");
+            }
+            other => panic!("a remembered family deny refuses on the RPC path, got {other:?}"),
+        }
+    }
+
+    /// On the RPC shell paths, posture follows the actor's character sheet:
+    /// an uncovered statement a live root character runs goes ahead, and one
+    /// from any other actor asks, as it would on the `shell_write` tool. A
+    /// model character is not a root, and neither is a principal with no
+    /// sheet, such as Claude Code on a key of its own through kaijutsu-mcp.
+    /// The client's `user_initiated` flag plays no part.
+    ///
+    /// Falsified by letting every RPC caller run uncovered statements, or by
+    /// treating a retired root as a live one.
+    #[tokio::test]
+    async fn an_uncovered_statement_asks_unless_a_root_character_acts() {
+        let (broker, _kernel, kj, _dir) = wired_kaish_broker_with_gate_toml("posture", "").await;
+        let ctx = approval_call_context(&kj, "posture");
+        let db = kj.kernel_db();
+
+        let asks = |verdict: ShellHookVerdict, who: &str| match verdict {
+            ShellHookVerdict::Denied(err) => assert!(err.is_refusal(RefusalKind::Pending), "{who}: {err:?}"),
+            other => panic!("{who}: an uncovered statement asks, got {other:?}"),
+        };
+        asks(broker.shell_pre_call_hooks("touch notes.txt", &ctx, &CancellationToken::new()).await, "no sheet");
+        let pending = db.lock().list_pending_asks().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].description.contains("touch notes.txt"), "{}", pending[0].description);
+        assert!(pending[0].description.contains("not a root character"), "{}", pending[0].description);
+
+        seat_a_root(&kj, &ctx);
+        match broker.shell_pre_call_hooks("touch other.txt", &ctx, &CancellationToken::new()).await {
+            ShellHookVerdict::Proceed => {}
+            other => panic!("a root character's uncovered statement runs, got {other:?}"),
+        }
+
+        db.lock().retire_character(ctx.actor_id, 1).unwrap();
+        asks(broker.shell_pre_call_hooks("touch third.txt", &ctx, &CancellationToken::new()).await, "retired root");
+    }
+
+    /// Give `ctx`'s actor a live root character sheet: a person's hands.
+    fn seat_a_root(kj: &crate::kj::KjDispatcher, ctx: &CallContext) {
+        let db = kj.kernel_db();
+        let db = db.lock();
+        match db.get_character(ctx.actor_id).unwrap() {
+            Some(_) => db.update_character_root(ctx.actor_id, true).unwrap(),
+            None => db.insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: ctx.actor_id, name: format!("root-{}", ctx.actor_id), created_at: 0,
+                retired_at: None, handoff_ctx: None, root_ctx: None, root: true,
+            }).unwrap(),
+        }
     }
 
     /// The hook chain runs to the end and collapses to at most one ask. A

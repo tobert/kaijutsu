@@ -203,25 +203,23 @@ impl PolicyEvaluation {
         })
     }
 
-    /// The ask description for a planned program's ask-tier statements,
-    /// naming each layer, key, and statement. `None` when no statement is
-    /// ask-tier.
-    pub(crate) fn describe_asks_planned(&self, statements: &[PlannedStatement]) -> Option<String> {
+    /// The ask description for a planned program's asking statements,
+    /// naming each layer, key, and statement: the ask-tier ones, and with
+    /// `uncovered_asks` the ones no layer covers. `None` when none asks.
+    pub(crate) fn describe_asks_planned(&self, statements: &[PlannedStatement], uncovered_asks: bool) -> Option<String> {
+        let name = |i: usize| match statements.get(i) {
+            Some(s) => format!("statement #{} (`{}`)", s.index, truncate_for_reason(&s.plan.rendered)),
+            None => format!("statement #{i}"),
+        };
         let parts: Vec<String> = self
             .per_statement
             .iter()
             .enumerate()
             .filter_map(|(i, v)| match v {
-                PolicyVerdict::Ask(d) => Some(match statements.get(i) {
-                    Some(s) => format!(
-                        "{} asks {} — statement #{} (`{}`)",
-                        d.layer,
-                        d.key,
-                        s.index,
-                        truncate_for_reason(&s.plan.rendered)
-                    ),
-                    None => format!("{} asks {} — statement #{i}", d.layer, d.key),
-                }),
+                PolicyVerdict::Ask(d) => Some(format!("{} asks {} — {}", d.layer, d.key, name(i))),
+                PolicyVerdict::Uncovered if uncovered_asks => {
+                    Some(format!("no layer covers {} and the actor is not a root character", name(i)))
+                }
                 _ => None,
             })
             .collect();
@@ -972,14 +970,15 @@ fn keyed_command_verdict(cmd: &PlannedCommand, layers: Layers<'_>) -> PolicyVerd
         for (layer, table) in tables {
             if let Some((key, verdict)) = table.lookup(&keys.candidates) {
                 let decision = Decision { layer, key };
-                return match verdict {
-                    TierVerdict::Deny => PolicyVerdict::Deny(decision),
-                    TierVerdict::Ask => PolicyVerdict::Ask(decision),
-                    TierVerdict::Allow if keys.structural_ok => {
-                        PolicyVerdict::Allow(vec![decision])
-                    }
-                    TierVerdict::Allow => PolicyVerdict::Uncovered,
-                };
+                match verdict {
+                    TierVerdict::Deny => return PolicyVerdict::Deny(decision),
+                    TierVerdict::Ask => return PolicyVerdict::Ask(decision),
+                    TierVerdict::Allow if keys.structural_ok => return PolicyVerdict::Allow(vec![decision]),
+                    // An allow that cannot cover this command decides
+                    // nothing, so the builtin layer still can: `--help` on
+                    // an allowed verb stays help.
+                    TierVerdict::Allow => break,
+                }
             }
         }
     }
@@ -1198,6 +1197,27 @@ mod tests {
     fn a_substituted_argument_drops_the_statement_to_uncovered() {
         let e = unconfigured("kj ledger allow $(cat /tmp/id)");
         assert_eq!(e.per_statement[0], PolicyVerdict::Uncovered);
+    }
+
+    /// A config allow that cannot cover a command leaves the builtin layer
+    /// to decide it: allowing `kj context create` must not make
+    /// `kj context create --help` ask when no config names it. A config ask or
+    /// deny still decides first.
+    ///
+    /// Falsified by returning uncovered from a config allow that fails
+    /// the structural check, skipping the builtin layer.
+    #[test]
+    fn a_config_allow_does_not_take_help_away() {
+        let cfg = config("[global]\nallow = [\"kj context create\"]\n[context_type.director]\nallow = [\"kj context create\"]\n");
+        for context_type in [None, Some("director")] {
+            assert_eq!(builtin_key_of(&first_verdict("kj context create --help", &cfg, context_type)), "kj context --help",
+                "{context_type:?}");
+        }
+        assert_eq!(first_verdict("kj context create x > /tmp/x", &cfg, None), PolicyVerdict::Uncovered,
+            "a redirect still keeps the allow from covering, and no builtin covers it");
+        let asks = config("[global]\nask = [\"kj context create\"]\n");
+        assert!(matches!(first_verdict("kj context create --help", &asks, None), PolicyVerdict::Ask(_)),
+            "an ask is firm");
     }
 
     /// The `--help` rule: help

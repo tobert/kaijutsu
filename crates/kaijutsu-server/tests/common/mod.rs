@@ -364,6 +364,22 @@ pub async fn start_server_with_kernel_handle() -> (SocketAddr, kaijutsu_server::
     (addr, kernel)
 }
 
+/// Write the shipped `gate.toml` into `config`'s kernel config with `keys`
+/// added to its global allow tier. For a test whose model or sheetless
+/// credential runs setup verbs such as `kj context create`: those are
+/// uncovered, so they would ask, and the ask is not what the test is about.
+#[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
+pub fn allow_in_shipped_gate(config: &kaijutsu_server::SshServerConfig, keys: &[&str]) {
+    let path = config.config_mounts.host_dir(kaijutsu_types::paths::CONFIG_ROOT).join("gate.toml");
+    std::fs::create_dir_all(path.parent().expect("gate.toml has a parent dir")).expect("create the kernel config dir");
+    let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/defaults/gate.toml"))
+        .expect("read the shipped gate.toml");
+    let global = "[global]\nallow = [\n";
+    assert_eq!(shipped.matches(global).count(), 1, "the shipped gate.toml carries one global allow tier");
+    let added: String = keys.iter().map(|k| format!("  {k:?},\n")).collect();
+    std::fs::write(&path, shipped.replacen(global, &format!("{global}{added}"), 1)).expect("write gate.toml");
+}
+
 /// Run `code` through `shell_execute` and poll until its output block
 /// reaches a terminal status, timing out after `timeout_ms`.
 ///

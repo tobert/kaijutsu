@@ -1565,6 +1565,17 @@ pub(crate) mod test_helpers {
         }
     }
 
+    /// A new live root character: a person's hands, whose uncovered shell
+    /// statements run without an ask. For tests that are not about the ask.
+    pub fn root_character(dispatcher: &KjDispatcher) -> PrincipalId {
+        let principal = PrincipalId::new();
+        dispatcher.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: principal, name: format!("root-{principal}"), created_at: 0, retired_at: None,
+            handoff_ctx: None, root_ctx: None, root: true,
+        }).unwrap();
+        principal
+    }
+
     /// Register a context in both KernelDb and DriftRouter.
     pub fn register_context(
         dispatcher: &KjDispatcher,

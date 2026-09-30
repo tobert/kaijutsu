@@ -117,7 +117,8 @@ mod tests {
         let requester = PrincipalId::new();
         let context = crate::kj::test_helpers::register_context(&dispatcher, Some("streaming-owner"), None, requester);
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
-        (dispatcher, ShellIdentity { requester, performer: PrincipalId::new(), reviewer: None,
+        let performer = crate::kj::test_helpers::root_character(&dispatcher);
+        (dispatcher, ShellIdentity { requester, performer, reviewer: None,
             context, session: kaijutsu_types::SessionId::new() })
     }
 

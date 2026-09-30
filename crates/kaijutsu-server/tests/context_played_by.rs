@@ -99,6 +99,7 @@ fn create_context_leaves_played_by_null_for_a_characterless_principal() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral(addr.port());
+        common::allow_in_shipped_gate(&config, &["kj context create"]); // model credentials create their own contexts in setup
         config.auth_db_path = Some(auth_db_path);
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {

@@ -561,6 +561,19 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   statement #0 (`git push origin main`)"). An allowed retry proceeds. A hook
   that asks about the same statement asks separately; no shipped hook does. The `shell_write` tool path asks through `run_gate` instead, so it
   never asks twice for the tier.
+- **On the RPC shell paths, an uncovered statement asks unless the actor
+  is a live root character.** A root has no model, so its uncovered
+  statements run as typed; any other actor, including a principal with no
+  character sheet, gets the ask it would get on `shell_write`. The actor is
+  the connection's character; the client's `user_initiated` flag controls
+  presentation only (`docs/approval-identity.md`). PreCall composes every
+  layer the way `run_gate` does: exact and family rules from the ledger,
+  then the config and builtin tiers. A learned allow outranks a config deny
+  there, and a remembered deny refuses with nobody asked.
+- **A config allow that cannot cover a command decides nothing.** When a
+  redirect or an argv that does not classify keeps an allow from covering,
+  the builtin layer still decides, so `kj context create --help` stays help
+  under an allow for `kj context create`.
 
 ## Open questions
 - **shell-guard's interpreter lists.** They are opacity rules, not risk

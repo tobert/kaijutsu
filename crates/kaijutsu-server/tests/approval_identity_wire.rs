@@ -58,6 +58,7 @@ fn amy_default_and_director_delegation_route_approval_over_the_wire() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
+        common::allow_in_shipped_gate(&config, &["kj context create"]); // model credentials create their own contexts in setup
         let amy = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().unwrap().join("kernel.db"))
             .unwrap()
             .get_character_by_name("amy")

@@ -155,6 +155,7 @@ async fn two_connections(mock_llm: bool) -> TwoConnections {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut config = SshServerConfig::ephemeral(addr.port());
+    common::allow_in_shipped_gate(&config, &["kj context create"]); // model credentials create their own contexts in setup
     config.auth_db_path = Some(auth_db_path);
     if mock_llm && let Some(ref data_dir) = config.data_dir {
         seed_mock_backend_with_model(data_dir, "mock-model");
@@ -540,6 +541,8 @@ fn a_model_credential_that_is_neither_actor_nor_reviewer_cannot_answer() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral(addr.port());
+        // `shell_write` gates itself, so the one ask is the tool's.
+        common::allow_in_shipped_gate(&config, &["kj context create", "shell_write"]);
         config.auth_db_path = Some(auth_db_path);
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {

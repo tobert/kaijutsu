@@ -129,6 +129,11 @@ async fn seats() -> Seats {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut config = SshServerConfig::ephemeral(addr.port());
+    // The worker is a model, so its uncovered statements ask at PreCall.
+    // These tests are about the hooks and reviews after that, so the
+    // commands they run are covered; a redirect still keeps a command
+    // uncovered, which the PreCall cases use to reach the hook chain.
+    common::allow_in_shipped_gate(&config, &["kj context create", "echo", "seq", "tee", "ls", "false"]);
     config.auth_db_path = Some(auth_db_path);
     let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
     let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
@@ -521,7 +526,8 @@ fn shutdown_joins_pre_call_kaish_hook_before_the_target_runs() {
         let context = s.worker;
         let request = tokio::task::spawn_local(async move {
             submitter.shell_execute(
-                "echo pre-call-target-must-not-run",
+                // Uncovered, so PreCall runs its hooks.
+                "printf pre-call-target-must-not-run",
                 context,
                 true,
             ).await
@@ -541,7 +547,7 @@ fn shutdown_joins_pre_call_kaish_hook_before_the_target_runs() {
             .expect_err("pre-call cancellation must reach the waiting shell submitter");
         assert!(error.to_string().contains("cancelled"), "{error}");
         let operation = s.kernel.kernel.shell_operations().list_for_context(s.worker).unwrap()
-            .into_iter().find(|operation| operation.source == "echo pre-call-target-must-not-run")
+            .into_iter().find(|operation| operation.source == "printf pre-call-target-must-not-run")
             .expect("the retained pre-call shell operation");
         let command_block_id = operation.receipt.command_block_id;
         assert!(operation.completed_at.is_some(), "shutdown must settle the retained operation");
@@ -1478,8 +1484,8 @@ async fn result_review_case(on_error: bool, allow: bool, script: bool, twice: bo
     let s = seats().await;
     let marker = scratch.marker();
     let code = if on_error {
-        format!("echo once >> '{}'; if [[ nope -gt 2 ]]; then echo unexpected; fi", marker.display())
-    } else { format!("echo once >> '{}'", marker.display()) };
+        format!("echo once | tee -a '{}'; if [[ nope -gt 2 ]]; then echo unexpected; fi", marker.display())
+    } else { format!("echo once | tee -a '{}'", marker.display()) };
     let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut hooks = s.kernel.kernel.broker().hooks().write().await;
     let table = if on_error { &mut hooks.on_error } else { &mut hooks.post_call };
@@ -1572,20 +1578,19 @@ fn result_review_checkpoint_failure_refuses_without_publishing_an_ask() {
              BEGIN SELECT RAISE(ABORT, 'injected review link fault'); END;"
         ).unwrap();
         s.worker_kj.join_context(s.worker, "review-checkpoint").await.unwrap();
-        let submission = s.worker_kj.shell_submit(&format!("echo once >> '{}'; echo captured", marker.display()), s.worker, true).await.unwrap();
+        let submission = s.worker_kj.shell_submit(&format!("echo once | tee -a '{}'; echo captured", marker.display()), s.worker, true).await.unwrap();
         wait_for("checkpoint refusal settlement", || {
             s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap().completed_at.is_some()
         }).await;
-        let argv = ["wait", "--operation", &submission.operation_id, "--timeout", "0", &s.worker.to_hex()].into_iter().map(str::to_owned).collect::<Vec<_>>();
-        let result = s.approver_kj.execute_kj_quiet(s.approver, &argv).await.unwrap();
-        let data = result.data.unwrap();
-        assert_eq!(data["state"]["envelope"]["status"], "error");
-        assert!(data["state"]["envelope"]["error"].as_str().unwrap().contains("injected review link fault"));
-        assert!(data["state"]["receipt"]["ask_id"].is_null());
+        let state = s.kernel.kernel.shell_operations().get(&submission.operation_id, s.worker).unwrap().unwrap();
+        let envelope = serde_json::to_value(state.envelope.expect("a settled operation has an envelope")).unwrap();
+        assert_eq!(envelope["status"], "error");
+        assert!(envelope["error"].as_str().unwrap().contains("injected review link fault"), "{envelope}");
+        assert!(state.receipt.ask_id.is_none());
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "once\n");
         let captured = s.kernel.kernel.shell_operations().outcome(&submission.operation_id, s.worker).unwrap().unwrap();
         let kaijutsu_kernel::runtime::command_outcome::CommandExecution::Completed(raw) = captured.execution else { panic!("lost captured execution") };
-        assert_eq!(raw.text_out(), "captured\n");
+        assert_eq!(raw.text_out(), "once\ncaptured\n", "tee echoes the marker line");
         assert_eq!(conn.query_row(
             "SELECT count(*) FROM approvals WHERE origin='hook_result'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
         conn.execute_batch("DROP TRIGGER fail_review_link").unwrap();
@@ -1833,8 +1838,15 @@ fn streaming_hooks_replace_output_in_every_phase() {
                 action: HookAction::ShortCircuit(kaijutsu_kernel::mcp::KernelToolResult::text("settled stream")),
             });
             drop(hooks);
-            let code = format!("echo once >> '{}'; echo raw; echo warning >&2; {}", marker.display(),
-                if phase == "error" { "if [[ nope -gt 2 ]]; then echo unexpected; fi" } else { "false" });
+            let tail = if phase == "error" { "if [[ nope -gt 2 ]]; then echo unexpected; fi" } else { "false" };
+            // PreCall hooks run only for a program that asks, so the pre case
+            // keeps its redirects uncovered; the others write stderr with a
+            // covered `ls` of a missing path.
+            let code = if phase == "pre" {
+                format!("echo once >> '{}'; echo raw; echo warning >&2; {tail}", marker.display())
+            } else {
+                format!("echo once | tee -a '{0}'; echo raw; ls '{0}.missing'; {tail}", marker.display())
+            };
             let id = s.worker_kj.execute(&code).await.unwrap();
             assert_eq!(streaming_output(&mut rx, id).await, ("settled stream".into(), String::new(), 0), "{phase}");
             if phase == "pre" { assert!(!marker.exists()); }
@@ -1865,7 +1877,7 @@ fn streaming_result_reviews_wait_for_answer_or_interrupt_without_reexecution() {
                 });
             }
             drop(hooks);
-            let id = s.worker_kj.execute(&format!("echo once >> '{}'; echo captured", marker.display())).await.unwrap();
+            let id = s.worker_kj.execute(&format!("echo once | tee -a '{}'; echo captured", marker.display())).await.unwrap();
             wait_for("stream result review", || s.kernel.kernel_db.lock().list_pending_asks().unwrap().iter()
                 .any(|ask| ask.hook_id.as_deref() == Some("stream-review"))).await;
             let ask = s.kernel.kernel_db.lock().list_pending_asks().unwrap().into_iter()

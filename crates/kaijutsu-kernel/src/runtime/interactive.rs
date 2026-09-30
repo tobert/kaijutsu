@@ -168,7 +168,7 @@ mod tests {
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
         kernel.vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), b"[global]\n").await.unwrap();
         let requester = PrincipalId::new();
-        let performer = PrincipalId::new();
+        let performer = crate::kj::test_helpers::root_character(&dispatcher);
         let context = crate::kj::test_helpers::register_context(&dispatcher, Some("interactive-owner"), None, requester);
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         (dispatcher, ShellIdentity { requester, performer, reviewer: None,
@@ -272,10 +272,8 @@ mod tests {
             identity.reviewer = Some(crate::kj::test_helpers::test_reviewer_principal());
             let kernel = dispatcher.kernel();
             let context = identity.context;
-            kernel.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
-                principal_id: identity.performer, name: "atomic-session-actor".into(), created_at: 0,
-                retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
-            }).unwrap();
+            // A model performer: a root cannot be one.
+            kernel.kernel_db().lock().update_character_root(identity.performer, false).unwrap();
             kernel.kernel_db().lock().update_context_review(context, Some(identity.performer), identity.reviewer).unwrap();
             kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
                 id: HookId("pending-session".into()), match_instance: None, match_tool: None,

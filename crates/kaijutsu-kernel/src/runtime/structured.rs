@@ -159,7 +159,7 @@ mod tests {
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
         // Let this fixture exercise PreCall; the shipped allow tier skips it.
         kernel.vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), b"[global]\n").await.unwrap();
-        let requester = PrincipalId::new();
+        let requester = crate::kj::test_helpers::root_character(&dispatcher);
         let context = crate::kj::test_helpers::register_context(&dispatcher, Some("structured-lifetime"), None, requester);
         kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
         (dispatcher, ShellIdentity { requester, performer: requester, reviewer: None,
@@ -323,7 +323,7 @@ mod tests {
         dispatcher.set_self_arc();
         let kernel = dispatcher.kernel();
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
-        let who = PrincipalId::new();
+        let who = crate::kj::test_helpers::root_character(&dispatcher);
         let context = crate::kj::test_helpers::register_context(&dispatcher, Some("here"), None, who);
         let target = crate::kj::test_helpers::register_context(&dispatcher, Some("there"), None, who);
         kernel.blocks().create_document(context, crate::block_store::DocumentKind::Conversation, None).unwrap();

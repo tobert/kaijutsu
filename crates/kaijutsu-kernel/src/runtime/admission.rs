@@ -78,7 +78,8 @@ mod tests {
             dispatcher.set_self_arc();
             let kernel = dispatcher.kernel();
             kernel.broker().set_kj_dispatcher(&dispatcher).await;
-            let principal = PrincipalId::new();
+            // A root character, so every path runs the uncovered `echo`.
+            let principal = crate::kj::test_helpers::root_character(&dispatcher);
             let context = register_context(&dispatcher, Some("admitted-before-archive"), None, principal);
             kernel.blocks().create_document(context, crate::DocumentKind::Conversation, None).unwrap();
             let identity = ShellIdentity { requester: principal, performer: principal, reviewer: None,
