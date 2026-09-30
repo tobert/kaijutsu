@@ -122,7 +122,11 @@ blank. Hydration replays `model_content` verbatim when it is set, and
 otherwise `content`, which for a clean success is what the turn sent; it
 skips an Error child whose result carries `model_content` (`llm/hydrate.rs`,
 the `(Tool, ToolResult)` arm). The next request extends the one the turn
-sent, so the prompt cache holds across turns.
+sent, so the prompt cache holds across turns. The results of an inference's
+calls sit together after its last block, in call order, placed before any
+call runs (`runtime/llm_stream.rs`, `place_running_result`), so an inference
+that made several calls hydrates as one assistant message and one result
+message, as the turn sent them.
 
 Results no model turn sent (user shell commands, results written before
 these fields existed) hydrate from `content` and `stderr` as before.

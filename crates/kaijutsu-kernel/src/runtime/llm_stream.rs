@@ -1684,32 +1684,40 @@ struct PendingCall {
     unparsed: Option<String>,
 }
 
-/// Answer a call whose arguments did not parse with its error result, placed
-/// and settled the way a dispatched call's result is, so the block log holds
-/// the calls and answers in the order the provider sent the calls.
+/// Settle the placed answer of a call whose arguments did not parse with its
+/// error, the way a dispatched call's result is settled.
 fn answer_unparsed_call(
-    documents: &SharedBlockStore, context_id: ContextId, tool_use_id: &str,
-    call: kaijutsu_types::BlockId, detail: String, turn_lease: &TurnLease,
+    documents: &SharedBlockStore, context_id: ContextId,
+    call: kaijutsu_types::BlockId, answer: kaijutsu_types::BlockId, detail: String,
 ) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
-    let answer = documents.insert_tool_result_as(context_id, &call, Some(&call), "", Status::Running,
-        None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
-    turn_lease.track_block(answer);
     documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
         Status::Error, true, PrincipalId::system(), None, None)?;
     Ok((InlineToolResult { content: detail, is_error: true }, answer))
 }
 
-/// Execute a recorded model call only after its Running result exists. Both
-/// ordinary and inline providers use this content projection and settlement.
+/// Place a model call's Running result after `after`. A batch places every
+/// result, in call order, after the inference's last block before any call
+/// runs, so the log holds the calls and then their answers, as the next request sends
+/// them, and hydration rebuilds that request exactly.
+fn place_running_result(
+    documents: &SharedBlockStore, context_id: ContextId, call: kaijutsu_types::BlockId,
+    after: kaijutsu_types::BlockId, tool_use_id: &str, turn_lease: &TurnLease,
+) -> crate::block_store::BlockStoreResult<kaijutsu_types::BlockId> {
+    let result = documents.insert_tool_result_as(context_id, &call, Some(&after), "", Status::Running,
+        None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
+    turn_lease.track_block(result);
+    Ok(result)
+}
+
+/// Execute a recorded model call only after its Running result exists
+/// (`place_running_result`). Both ordinary and inline providers use this
+/// content projection and settlement.
 async fn dispatch_recorded_tool_result(
     documents: &SharedBlockStore, context_id: ContextId, kernel: &Arc<Kernel>,
     tool_name: &str, input: &serde_json::Value, tool_ctx: &crate::ExecContext,
     cancel: tokio_util::sync::CancellationToken, stop_waiting: &tokio_util::sync::CancellationToken,
-    tool_use_id: &str, call: kaijutsu_types::BlockId, turn_lease: &TurnLease,
+    call: kaijutsu_types::BlockId, result: kaijutsu_types::BlockId,
 ) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
-    let result = documents.insert_tool_result_as(context_id, &call, Some(&call), "", Status::Running,
-        None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
-    turn_lease.track_block(result);
     tokio::task::yield_now().await;
 
     let mut tool_ctx = tool_ctx.clone();
@@ -1915,8 +1923,9 @@ async fn dispatch_inline_tool_result(
         input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(tool_use_id.to_owned()), None)?;
     turn_lease.track_block(call);
     *last_block_id = call;
+    let placed = place_running_result(documents, context_id, call, call, tool_use_id, turn_lease)?;
     let (result, anchor) = dispatch_recorded_tool_result(documents, context_id, kernel, tool_name, &input,
-        tool_ctx, cancel, stop_waiting, tool_use_id, call, turn_lease).await?;
+        tool_ctx, cancel, stop_waiting, call, placed).await?;
     *last_block_id = anchor;
     Ok(result)
 }
@@ -3157,21 +3166,28 @@ async fn run_llm_stream(
             })
             .collect();
 
+        // Every Running result lands, in call order, after the last block the
+        // inference streamed, before any call runs (`place_running_result`).
+        let mut placed = Vec::with_capacity(tool_calls.len());
+        let mut after = last_block_id;
+        for pending in &tool_calls {
+            after = place_running_result(&documents, context_id, pending.call, after, &pending.id, turn_lease)?;
+            placed.push(after);
+        }
+
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
         // leave side effects without their final result.
-        let futures = tool_calls.into_iter().map(|PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }| {
+        let futures = tool_calls.into_iter().zip(placed).map(|(PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }, placed)| {
             let kernel = kernel.clone();
             let documents = documents.clone();
             let tool_ctx = tool_ctx.clone();
             let interrupt = interrupt.clone();
             async move {
                 let result = match unparsed {
-                    Some(detail) => answer_unparsed_call(&documents, context_id, &tool_use_id, call, detail,
-                        turn_lease),
+                    Some(detail) => answer_unparsed_call(&documents, context_id, call, placed, detail),
                     None => dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
-                        &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, &tool_use_id, call,
-                        turn_lease).await,
+                        &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, call, placed).await,
                 };
                 match result {
                     Ok((result, anchor)) => Ok((ContentBlock::ToolResult {
@@ -4433,12 +4449,10 @@ mod publish_tests {
     }
 
     /// A cut-off call alone and beside a call that parsed, in either stream
-    /// order. The request after them carries the calls and their answers in
-    /// the order the provider sent the calls, and so does hydration from the
-    /// block log. A lone call hydrates to exactly the request the turn sent.
-    /// Two or more calls hydrate as one assistant/tool-result pair per call
-    /// (`docs/issues.md`, "Parallel tool calls hydrate as separate pairs"), so
-    /// for those only the order is compared.
+    /// order, and two calls that parsed. The request after them carries the
+    /// calls and their answers in the order the provider sent the calls, and
+    /// hydration from the block log rebuilds exactly that request, so the
+    /// prompt cache holds across turns.
     #[tokio::test]
     async fn a_cut_off_call_keeps_its_stream_order_live_and_hydrated() {
         use crate::llm::{ContentBlock, MessageContent};
@@ -4456,6 +4470,11 @@ mod publish_tests {
                         vec!["call_truncated", "call_parsed"]),
                     ("cut off last", vec![parsed(), truncated_write_call()],
                         vec!["call_parsed", "call_truncated"]),
+                    ("two parsed", vec![parsed(), crate::llm::StreamEvent::ToolUse {
+                        id: "call_second".into(),
+                        name: "missing_tool".into(),
+                        input: serde_json::json!({}),
+                    }], vec!["call_parsed", "call_second"]),
                 ];
                 for (shape, mut calls, order) in cases {
                     let kernel = Arc::new(Kernel::new_ephemeral("cut-off-order").await);
@@ -4521,12 +4540,9 @@ mod publish_tests {
                     let rehydrated = crate::llm::hydrate_from_blocks(&blocks);
                     assert_eq!(ids(&rehydrated, false), order, "{shape}: hydrated call order");
                     assert_eq!(ids(&rehydrated, true), order, "{shape}: hydrated answer order");
-                    if order.len() == 1 {
-                        let live = serde_json::to_value(request).unwrap();
-                        let replayed =
-                            serde_json::to_value(&rehydrated[..request.len()]).unwrap();
-                        assert_eq!(live, replayed, "{shape}: live and rehydrated differ");
-                    }
+                    let live = serde_json::to_value(request).unwrap();
+                    let replayed = serde_json::to_value(&rehydrated[..request.len()]).unwrap();
+                    assert_eq!(live, replayed, "{shape}: live and rehydrated differ");
                 }
             })
             .await;
@@ -7540,8 +7556,9 @@ mod lifetime_tests {
                 let id = kernel.blocks().insert_tool_call_as(context, None, Some(&after), "envelope", serde_json::json!({}),
                     Some(TypesToolKind::Builtin), Some(call.actor_id), Some("envelope-call".into()), None).unwrap();
                 lease.track_block(id);
+                let placed = place_running_result(kernel.blocks(), context, id, id, "envelope-call", &lease).unwrap();
                 let (result, tail) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
-                    &call, lease.interrupt().cancel.clone(), &lease.interrupt().stop_waiting, "envelope-call", id, &lease).await.unwrap();
+                    &call, lease.interrupt().cancel.clone(), &lease.interrupt().stop_waiting, id, placed).await.unwrap();
                 anchor = tail;
                 assert_eq!(*tool_call.lock().unwrap(), Some(id), "the broker is told which model call it answers");
                 result
