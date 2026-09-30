@@ -1,0 +1,27 @@
+description = "A background command's completion notice starts a turn after session/prompt has returned, which Harbor never reads."
+
+# Harbor ends the run when session/prompt returns, so the follow-up turn's
+# text is lost to it. The quiet wait still sees it, which text_contains checks.
+known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
+
+# Harbor runs a task in a throwaway container, under a gate that asks nothing.
+gate = """
+[global]
+uncovered = "allow"
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "sleep 1; echo done > bg.txt", run_in_background = true } }]
+[[model]]
+text = "started it"
+# Only the completion notice starts this turn.
+[[model]]
+text = "the background job finished"
+
+[[prompt]]
+text = "write bg.txt in the background"
+text_contains = ["started it", "the background job finished"]
+
+[[verify]]
+path = "bg.txt"
+equals = "done\n"

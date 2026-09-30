@@ -117,6 +117,17 @@ pub struct PermissionRecord {
     pub option_id: Option<String>,
     /// Why the answer could not be applied as the policy asked, if it could not.
     pub problem: Option<String>,
+    /// How many `session/update` notifications had arrived when this request
+    /// did: its position in the update stream.
+    pub updates_seen: usize,
+}
+
+/// Where in the message stream something arrived: how many
+/// `session/update` notifications and permission requests came before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Arrival {
+    pub updates: usize,
+    pub permissions: usize,
 }
 
 /// One tool call as the update stream last described it: the `tool_call`
@@ -146,8 +157,9 @@ pub struct AcpClient {
     policy: PermissionPolicy,
     updates: Vec<Value>,
     permissions: Vec<PermissionRecord>,
-    /// Responses that arrived while we waited for a different id.
-    parked: Vec<Value>,
+    /// Responses that arrived while we waited for a different id, each with
+    /// where it arrived.
+    parked: Vec<(Value, Arrival)>,
     /// Permission requests answered [`PermissionAnswer::Hold`], oldest
     /// first: the JSON-RPC id and the index of their record.
     held: VecDeque<(Value, usize)>,
@@ -299,19 +311,35 @@ impl AcpClient {
     /// Wait for the response to request `id`, answering anything the agent
     /// asks in the meantime. A JSON-RPC error response is an `Err`.
     pub fn wait_response(&mut self, id: i64, waiting_for: &str) -> Result<Value> {
-        if let Some(pos) = self.parked.iter().position(|m| response_id(m) == Some(id)) {
-            let message = self.parked.remove(pos);
-            return self.result_of(message, waiting_for);
+        self.wait_response_at(id, waiting_for).map(|(result, _)| result)
+    }
+
+    /// [`Self::wait_response`], and where in the stream the response arrived:
+    /// the updates and permission requests before it.
+    pub fn wait_response_at(&mut self, id: i64, waiting_for: &str) -> Result<(Value, Arrival)> {
+        if let Some(pos) = self.parked.iter().position(|(m, _)| response_id(m) == Some(id)) {
+            let (message, arrival) = self.parked.remove(pos);
+            return Ok((self.result_of(message, waiting_for)?, arrival));
         }
         let deadline = Instant::now() + self.timeout;
         loop {
             let message = self.next_message(deadline, waiting_for)?;
             match response_id(&message) {
-                Some(got) if got == id => return self.result_of(message, waiting_for),
-                Some(_) => self.parked.push(message),
+                Some(got) if got == id => return Ok((self.result_of(message, waiting_for)?, self.arrival())),
+                Some(_) => self.park(message),
                 None => self.dispatch(message)?,
             }
         }
+    }
+
+    /// Where the next message would arrive.
+    pub fn arrival(&self) -> Arrival {
+        Arrival { updates: self.updates.len(), permissions: self.permissions.len() }
+    }
+
+    fn park(&mut self, message: Value) {
+        let arrival = self.arrival();
+        self.parked.push((message, arrival));
     }
 
     fn result_of(&self, message: Value, waiting_for: &str) -> Result<Value> {
@@ -347,7 +375,7 @@ impl AcpClient {
                     let message: Value = serde_json::from_str(&line)
                         .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))?;
                     if response_id(&message).is_some() {
-                        self.parked.push(message);
+                        self.park(message);
                     } else {
                         self.dispatch(message)?;
                     }
@@ -390,7 +418,7 @@ impl AcpClient {
             if done(self) {
                 return Ok(());
             }
-            if let Some(response) = self.parked.iter().find(|m| request.is_some() && response_id(m) == request) {
+            if let Some((response, _)) = self.parked.iter().find(|(m, _)| request.is_some() && response_id(m) == request) {
                 bail!(
                     "the request ended before {what}: {response}\n--- agent stderr (tail) ---\n{}",
                     self.stderr_tail()
@@ -414,7 +442,7 @@ impl AcpClient {
             let message: Value = serde_json::from_str(&line)
                 .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))?;
             if response_id(&message).is_some() {
-                self.parked.push(message);
+                self.park(message);
             } else {
                 self.dispatch(message)?;
             }
@@ -485,7 +513,7 @@ impl AcpClient {
             PermissionPolicy::Queue(queue) => queue.pop_front(),
             PermissionPolicy::Always(answer) => Some(*answer),
         };
-        let mut record = PermissionRecord { params, answer, option_id: None, problem: None };
+        let mut record = PermissionRecord { params, answer, option_id: None, problem: None, updates_seen: self.updates.len() };
         let Some(answer) = answer else {
             record.problem = Some("no permission answer was queued for this request".into());
             return (Some(json!({"outcome": "cancelled"})), record);
@@ -536,12 +564,23 @@ impl AcpClient {
 
     /// Open a session rooted at `cwd` and return its id.
     pub fn new_session(&mut self, cwd: &Path) -> Result<String> {
-        let result = self.request("session/new", json!({"cwd": cwd, "mcpServers": []}))?;
+        let result = self.open_session(cwd)?;
         result
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("session/new returned no sessionId: {result}"))
+    }
+
+    /// Open a session rooted at `cwd` and return the whole `session/new`
+    /// result, which a caller reads `sessionId`, `models`, and
+    /// `configOptions` from.
+    pub fn open_session(&mut self, cwd: &Path) -> Result<Value> {
+        let result = self.request("session/new", json!({"cwd": cwd, "mcpServers": []}))?;
+        if result.get("sessionId").and_then(Value::as_str).is_none() {
+            bail!("session/new returned no sessionId: {result}");
+        }
+        Ok(result)
     }
 
     /// Send a prompt and return its id; pair with [`Self::wait_response`].
@@ -764,6 +803,7 @@ mod tests {
             answer: Some(PermissionAnswer::Hold),
             option_id: None,
             problem: None,
+            updates_seen: 0,
         };
         assert_eq!(outcome_for(PermissionAnswer::Deny, &mut record), json!({"outcome": "selected", "optionId": "no"}));
         assert_eq!(record.option_id.as_deref(), Some("no"));

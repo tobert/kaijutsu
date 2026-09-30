@@ -1,0 +1,17 @@
+description = "A foreground command past its own timeout_ms is killed, and the call reports what it printed with a line naming the limit; the turn goes on."
+
+# Harbor runs a task in a throwaway container, under a gate that asks nothing.
+gate = """
+[global]
+uncovered = "allow"
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "echo started; sleep 30; echo never", timeout_ms = 500 } }]
+[[model]]
+text = "it timed out"
+
+[[prompt]]
+text = "run the slow command"
+text_contains = ["it timed out"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = ["started", "killed after timeout_ms 500"] }]

@@ -2530,11 +2530,34 @@ for when it's contained in docker". Open:
     the context goes idle, with follow-up turns included, so Harbor
     sees the whole run. A model's own ask no longer starts a follow-up
     turn: the turn holds on it, inside the prompt.
+- **Harbor shape** (`docs/acp-fleet.md`, "Harbor shape"): every fleet
+  scenario is checked for what Harbor reads. Open findings:
+  - **H1: a permission request names the ask, not the tool call.** Its
+    `toolCall.toolCallId` is the ledger request id, which no `tool_call`
+    announced, so Harbor never attaches the request to its step. The
+    ledger row does not record the tool call that raised it, and the
+    `Refusal` carrying the ask id reaches the bridge only as prose. Fix in
+    the kernel: record the call block on the ask and return it from
+    `kj ledger show`; the bridge then names `update::tool_call_id(block)`.
+    Listed in `SHAPE_GAPS`.
+  - **H2: a background completion starts a turn after `session/prompt`
+    returns.** Harbor ends the run at the response and never sees it; the
+    job's own `shell` call is still `in_progress` then. The planned opt-in
+    flag above closes it. `harbor-background-after-response.toml`,
+    `contained/background.toml`.
+  - **H3: no cost is reported.** `usage_update` carries only the context
+    fill, and only when the model's window is known (none for the mock),
+    and the prompt response has no `usage`. The kernel keeps no price
+    table or cumulative cost. `harbor-usage-cost.toml`.
+  - **No model selection.** `session/new` offers no `models` or model
+    `configOptions`, so a Harbor run given a model fails before its
+    prompt. The bench names the model at launch.
 - **A failed follow-up turn has no structured ACP signal.** The runner
   matches agent text "stream error: …".
 - **A hook-raised permission request's title is the hook's stderr**, not
   the command asked about.
-- **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
+- **The fleet's cargo test takes about 110 s** (host and approval
+  scenarios run as two tests at once), mostly a 3 s quiet wait after each
   prompt. Mock replies a scenario never used go unreported. ACP v1 has no
   idle notification, and the bridge reports turn completion only for the
   interactive turn a `session/prompt` waits on
@@ -2560,7 +2583,10 @@ for when it's contained in docker". Open:
   the bridge does not offer it again (`answer_ask` in
   `crates/kaijutsu-acp/src/permission.rs`), so a turn holding on it waits
   until `session/cancel`. Seen when a fleet run answered a second offer
-  `cancelled`: the prompt never returned.
+  `cancelled`: the prompt never returned. Harbor answers every request
+  `cancelled` when run with `HARBOR_ACP_PERMISSION_MODE=deny`
+  (`acp_runner.py` 342–343), so under a gate that asks, such a run
+  holds until Harbor's agent timeout.
 
 ## Egress: what stays open (2026-09-21)
 

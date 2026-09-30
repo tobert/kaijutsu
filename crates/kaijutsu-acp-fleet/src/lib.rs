@@ -10,11 +10,13 @@
 //! - [`container`]: the podman commands contained scenarios run with.
 //! - [`scenario`]: the scenario file format.
 //! - [`run`]: runs one scenario and judges it.
+//! - [`shape`]: the Harbor-shape invariants every transcript is checked for.
 
 pub mod client;
 pub mod container;
 pub mod run;
 pub mod scenario;
+pub mod shape;
 
 /// The host-mode scenarios shipped with this crate.
 pub const FLEET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet");

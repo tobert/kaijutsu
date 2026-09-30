@@ -101,6 +101,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `gate` | The gate policy, as TOML text. Default in host mode: the shipped `gate.toml`. Default in contained mode: `[global] uncovered = "allow"`. |
 | `rc` | A table of rc-tree-relative path to contents, installed with `--rc-overlay`. Each file's directory must already exist in the seeded tree. See "Hook scenarios". |
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
+| `session_cwd` | A workspace-relative directory `session/new` names as the session cwd. The agent still launches in the workspace root. Default: the workspace root. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
@@ -110,7 +111,8 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including any that arrive during the quiet wait. |
-| `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains`. |
+| `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains` (one substring, or a list that must all appear). |
+| `prompt.reports_cost` | `true`: the last `usage_update` before the response must carry `cost` in USD. See "Harbor shape". |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
 | `known_gap` | `{ finding = "F8", fails = ["prompt 2: expected tool calls"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
@@ -118,9 +120,70 @@ test "$(git log --format=%s)" = "fleet: first commit"
 Unknown keys are refused, so a misspelled expectation fails the load instead
 of checking nothing. Paths must stay inside the workspace or rc tree.
 
+Every scenario is also checked for the Harbor shape; see "Harbor shape".
+
 A prompt also fails when its agent text contains `stream error:`, which is
 what the ACP bridge sends when a model turn fails outside a prompt. An
 exhausted mock script shows up this way.
+
+## Harbor shape
+
+Harbor, the Terminal-Bench harness, runs an ACP agent through one
+`session/prompt` and builds its trajectory from the `session/update`
+stream. After every scenario, host and contained, the runner checks the
+whole transcript for what Harbor reads (`crates/kaijutsu-acp-fleet/src/shape.rs`).
+A failure starts `harbor shape <invariant>:` and ends with the offending
+event. The line numbers are Harbor at `9b16836`, cloned in
+`~/src/research/harbor`: `acp_runner.py` is
+`src/harbor/agents/installed/acp_runner.py`, and `acp.py` is its sibling.
+
+| Invariant | What must hold | Harbor source |
+|---|---|---|
+| `agent-info` | `initialize` returns `agentInfo` with a name and version. | `acp_runner.py` 699–700 records it in the run summary. |
+| `tool-call-first` | Every `toolCallId` is first seen in a `tool_call`, never in a `tool_call_update`. | `acp.py` 1384–1389 names the call from its first event (`_resolve_tool_name`, 321–330). |
+| `tool-call-unique` | No two `tool_call`s announce the same id. | `acp.py` 1386 and 196–209 group every event by id. |
+| `tool-call-title` | The announcing `tool_call` has a title, and no update clears it. | `acp.py` 321–330: with kind `other`, the title is the function name. |
+| `tool-call-input` | The `tool_call` or a later update carries `rawInput`, a JSON object. | `acp.py` 1398–1400 and 313–318: `rawInput` becomes the call's arguments. |
+| `tool-call-settles` | Every call announced during a prompt is `completed` or `failed` when its response arrives. | `acp.py` 1408–1409 closes a step on `completed`; the run ends at the response. |
+| `permission-allow-option` | Every permission request offers `allow_once` or `allow_always`. | `acp_runner.py` 345–356 picks the first; with none it answers `cancelled`. |
+| `permission-tool-call` | A permission request's `toolCall.toolCallId` names a call a `tool_call` announced before it. | `acp.py` 1314–1325 and 1391–1396 attach the request to that call's step. |
+| `stop-reason` | The prompt response's `stopReason` is one ACP v1 defines. | `acp_runner.py` 804–808 records the response. |
+| `run-ends-at-response` | No model work (message, thought, `tool_call`, `tool_call_update`) or permission request arrives after a prompt's response. | `acp_runner.py` 804–808: the prompt's return ends the run and closes the agent. |
+| `usage-cost` | A `usage_update.cost`, when present, is `{currency: "USD", amount: <number>}`. | `acp.py` 1431–1440 and 1642–1647. |
+
+`prompt.reports_cost` goes further: a cost must arrive before the response
+(`acp_runner.py` 361–362 keeps the last `usage_update`; `acp.py` 1642–1647
+reads its cost). Harbor also reads `usage` from the prompt response
+(`acp.py` 1649–1659); ACP v1 puts that field behind an unstable feature,
+and the bridge does not send it.
+
+An invariant the agent breaks wherever it applies is listed in `SHAPE_GAPS`
+in `crates/kaijutsu-acp-fleet/src/run.rs`, with its finding. Its failures
+are excused, and the scenario reports `GAP`. A scenario that exercised it
+with no failure fails, and names the line to remove. A gap particular to a
+scenario uses `known_gap` instead:
+
+```toml
+known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
+```
+
+The findings, H1–H3, are in `docs/issues.md`, "ACP fleet: what stays
+open". Scenarios for the rest of what Harbor needs:
+
+| Scenario | What it shows |
+|---|---|
+| `harbor-session-cwd.toml` | A relative path resolves in the `session/new` cwd, not the launch directory (`acp_runner.py` 716–717). |
+| `harbor-shell-timeout.toml` | A command past its `timeout_ms` is killed; the call fails with what it printed and `killed after timeout_ms 500`. |
+| `harbor-truncated-tool-call.toml` | A call whose arguments were cut off at `max_tokens` fails with the reason, and the turn goes on. |
+| `harbor-usage-cost.toml` | Gap H3: no cost is reported. |
+| `harbor-background-after-response.toml` | Gap H2: a background completion starts a turn after the response. |
+
+Model selection is not checked. Harbor sets a model only when it is run
+with one (`acp_runner.py` 721–760), through `session/new`'s `models` or a
+`configOptions` entry of category `model`. The bridge advertises neither,
+so a Harbor run given a model fails with "ACP agent did not advertise a
+model-selection mechanism". Name the model through the agent's launch
+arguments instead, as `contrib/bench/harbor/` does.
 
 ## Hook scenarios
 

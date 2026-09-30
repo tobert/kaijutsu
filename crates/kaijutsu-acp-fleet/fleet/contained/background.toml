@@ -2,6 +2,10 @@ description = "Contained yolo: a background shell_write finishes after the turn 
 
 mode = "contained"
 
+# The follow-up turn starts after session/prompt returned, which Harbor
+# never reads (docs/acp-fleet.md, "Harbor shape").
+known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
+
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "sleep 1; git --version > git-version.txt", run_in_background = true } }]
 [[model]]

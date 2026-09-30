@@ -36,6 +36,12 @@ pub struct Scenario {
     /// workspace-relative path.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    /// A workspace-relative directory `session/new` names as the session
+    /// cwd. The agent is still launched in the workspace root, so a relative
+    /// path the model uses resolves here only if the session cwd is honored.
+    /// Default: the workspace root.
+    #[serde(default)]
+    pub session_cwd: Option<String>,
     /// The scripted model's replies, consumed in order across all prompts.
     #[serde(default)]
     pub model: Vec<ModelTurn>,
@@ -111,6 +117,10 @@ pub struct Prompt {
     /// When present, the tool calls this prompt must show, exactly and in order.
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallExpect>>,
+    /// The last `usage_update` before the prompt's response must carry a
+    /// cost in USD, which is where Harbor reads a run's cost from.
+    #[serde(default)]
+    pub reports_cost: bool,
     /// When present, send `session/cancel` during this prompt's turn.
     #[serde(default)]
     pub cancel: Option<Cancel>,
@@ -209,9 +219,26 @@ pub struct ToolCallExpect {
     /// The call's last reported status, such as `completed` or `failed`.
     #[serde(default)]
     pub status: Option<String>,
-    /// A substring of the call's reported output text.
+    /// A substring of the call's reported output text, or a list of them.
     #[serde(default)]
-    pub output_contains: Option<String>,
+    pub output_contains: Option<Substrings>,
+}
+
+/// One substring, or several that must all appear.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Substrings {
+    One(String),
+    All(Vec<String>),
+}
+
+impl Substrings {
+    pub fn all(&self) -> &[String] {
+        match self {
+            Self::One(one) => std::slice::from_ref(one),
+            Self::All(all) => all,
+        }
+    }
 }
 
 /// A check on the workspace after the run: a `path` with at least one of
@@ -251,6 +278,9 @@ impl Scenario {
         }
         for path in self.files.keys() {
             workspace_relative(path)?;
+        }
+        if let Some(cwd) = &self.session_cwd {
+            workspace_relative(cwd).context("`session_cwd`")?;
         }
         if let Some(gap) = &self.known_gap
             && (gap.finding.trim().is_empty() || gap.fails.is_empty() || gap.fails.iter().any(|f| f.trim().is_empty()))
@@ -527,6 +557,26 @@ text = "go"
         let escape = held("{ wait_for = \"../x\" }");
         assert!(refusal(&escape).contains("inside the workspace"), "{}", refusal(&escape));
         Scenario::parse(&held("{ write = \"go\", wait_for = \"done\" }"), "on_hold").unwrap();
+    }
+
+    #[test]
+    fn output_contains_takes_one_substring_or_several() {
+        let text = |value: &str| {
+            format!("description = \"d\"\n[[prompt]]\ntext = \"go\"\ntool_calls = [{{ title = \"t\", output_contains = {value} }}]\n")
+        };
+        let one = Scenario::parse(&text("\"a\""), "one").unwrap();
+        let calls = one.prompt[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].output_contains.as_ref().unwrap().all(), ["a".to_string()]);
+        let many = Scenario::parse(&text("[\"a\", \"b\"]"), "many").unwrap();
+        let calls = many.prompt[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].output_contains.as_ref().unwrap().all(), ["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_session_cwd_outside_the_workspace_is_refused() {
+        let text = format!("session_cwd = \"../elsewhere\"\n{MINIMAL}");
+        assert!(refusal(&text).contains("session_cwd"), "{}", refusal(&text));
+        Scenario::parse(&format!("session_cwd = \"task\"\n{MINIMAL}"), "cwd").unwrap();
     }
 
     #[test]

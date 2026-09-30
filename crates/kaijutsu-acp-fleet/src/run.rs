@@ -16,6 +16,14 @@ use serde_json::Value;
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
 use crate::scenario::{Answer, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative};
+use crate::shape::{self, PromptWire, Transcript};
+
+/// Harbor-shape invariants the agent breaks wherever they apply, each with
+/// the finding in `docs/issues.md`, "ACP fleet: what stays open" that
+/// records it. A failure of one is excused and the scenario reports `GAP`.
+/// A scenario that exercises one with no failure fails: the finding no
+/// longer reproduces, so its line here must go.
+pub const SHAPE_GAPS: &[(&str, &str)] = &[("H1", shape::PERMISSION_TOOL_CALL)];
 
 /// How long the update stream must stay silent after a prompt's response
 /// before the prompt is judged. A model's turn holds on its own ask, so its
@@ -62,8 +70,9 @@ pub struct Outcome {
     /// Every expectation that did not hold, or the error that stopped the run.
     /// Empty means the scenario passed.
     pub failures: Vec<String>,
-    /// The finding the scenario reproduces, when it declares a known gap.
-    pub known_gap: Option<String>,
+    /// The findings the scenario reproduces: its own known gap, and any
+    /// Harbor-shape gap in [`SHAPE_GAPS`] it exercised.
+    pub known_gaps: Vec<String>,
     /// Failures the known gap accounts for; they do not fail the scenario.
     pub excused: Vec<String>,
     pub elapsed: Duration,
@@ -94,7 +103,7 @@ pub fn run_file(path: &Path, config: &RunConfig) -> Outcome {
         Err(error) => Outcome {
             name,
             failures: vec![format!("{error:#}")],
-            known_gap: None,
+            known_gaps: Vec::new(),
             excused: Vec::new(),
             elapsed: started.elapsed(),
             stderr_tail: String::new(),
@@ -109,6 +118,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
     // Errors that stopped the run. A known gap never excuses one.
     let mut errors = Vec::new();
     let mut stderr_tail = String::new();
+    let mut transcript = None;
     let scratch = match Scratch::create(&config.scratch_root, name) {
         Ok(scratch) => Some(scratch),
         Err(error) => {
@@ -117,7 +127,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         }
     };
     if let Some(scratch) = &scratch
-        && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail)
+        && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail, &mut transcript)
     {
         errors.push(format!("{error:#}"));
     }
@@ -131,11 +141,22 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         }
         None => None,
     };
-    let Judged { mut failures, excused } = if errors.is_empty() {
+    let mut shape_excused = Vec::new();
+    let mut known_gaps: Vec<String> = scenario.known_gap.iter().map(|g| g.finding.clone()).collect();
+    if errors.is_empty()
+        && let Some(transcript) = &transcript
+    {
+        let shape = judge_shape(&shape::check(transcript), SHAPE_GAPS);
+        failures.extend(shape.failures);
+        shape_excused = shape.excused;
+        known_gaps.extend(shape.gaps);
+    }
+    let Judged { mut failures, mut excused } = if errors.is_empty() {
         judge_gap(scenario.known_gap.as_ref(), failures)
     } else {
         Judged { failures, excused: Vec::new() }
     };
+    excused.extend(shape_excused);
     failures.extend(errors);
     if failures.is_empty() {
         stderr_tail.clear();
@@ -143,12 +164,45 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
     Outcome {
         name: name.to_string(),
         failures,
-        known_gap: scenario.known_gap.as_ref().map(|g| g.finding.clone()),
+        known_gaps,
         excused,
         elapsed: started.elapsed(),
         stderr_tail,
         kept,
     }
+}
+
+/// The Harbor-shape verdict after [`SHAPE_GAPS`] is applied.
+pub struct ShapeJudged {
+    /// Failures no gap excuses, and gaps that no longer reproduce.
+    pub failures: Vec<String>,
+    pub excused: Vec<String>,
+    /// The findings whose failures were excused.
+    pub gaps: Vec<String>,
+}
+
+/// Sort Harbor-shape failures by whether a gap in `gaps`, as
+/// `(finding, invariant)`, accounts for them. A gap whose invariant was
+/// exercised with no failure is itself a failure.
+pub fn judge_shape(checks: &[shape::Check], gaps: &[(&str, &str)]) -> ShapeJudged {
+    let mut judged = ShapeJudged { failures: Vec::new(), excused: Vec::new(), gaps: Vec::new() };
+    for check in checks {
+        let gap = gaps.iter().find(|(_, invariant)| *invariant == check.invariant);
+        match gap {
+            None => judged.failures.extend(check.failures.iter().cloned()),
+            Some((finding, _)) if !check.failures.is_empty() => {
+                judged.excused.extend(check.failures.iter().cloned());
+                judged.gaps.push(finding.to_string());
+            }
+            Some((finding, invariant)) if check.exercised => judged.failures.push(format!(
+                "known shape gap {finding} ({invariant}) no longer reproduces: this scenario exercised it and it \
+                 held. If {finding} is fixed, remove it from SHAPE_GAPS in crates/kaijutsu-acp-fleet/src/run.rs \
+                 and its line in docs/issues.md"
+            )),
+            Some(_) => {}
+        }
+    }
+    judged
 }
 
 /// Failures sorted by whether a known gap accounts for them.
@@ -219,6 +273,7 @@ fn drive(
     config: &RunConfig,
     failures: &mut Vec<String>,
     stderr_tail: &mut String,
+    transcript: &mut Option<Transcript>,
 ) -> Result<()> {
     for (path, body) in &scenario.files {
         let target = scratch.workspace.join(workspace_relative(path)?);
@@ -277,10 +332,20 @@ fn drive(
             (command, PathBuf::from(container::WORKSPACE))
         }
     };
+    let session_cwd = match &scenario.session_cwd {
+        Some(relative) => {
+            let relative = workspace_relative(relative)?;
+            let host = scratch.workspace.join(&relative);
+            std::fs::create_dir_all(&host).with_context(|| format!("create the session cwd {}", host.display()))?;
+            session_cwd.join(relative)
+        }
+        None => session_cwd,
+    };
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &session_cwd, scratch, config.timeout, failures);
+    let result = converse(&mut agent, scenario, &session_cwd, scratch, config.timeout, failures)
+        .map(|wire| *transcript = Some(wire));
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
     let shutdown = agent.shutdown(Duration::from_secs(60));
@@ -338,18 +403,21 @@ fn converse(
     scratch: &Scratch,
     timeout: Duration,
     failures: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<Transcript> {
     let init = agent.initialize()?;
     if init.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
         failures.push(format!("initialize: expected protocolVersion 1, got {init}"));
     }
-    let session = agent.new_session(workspace)?;
+    let session_new = agent.open_session(workspace)?;
+    let session = session_new["sessionId"].as_str().context("session/new returned no sessionId")?.to_string();
+    let mut prompts = Vec::new();
     for (n, prompt) in scenario.prompt.iter().enumerate() {
         let label = format!("prompt {}", n + 1);
         let answers: VecDeque<PermissionAnswer> = prompt.permissions.iter().map(|&a| a.into()).collect();
         agent.set_permission_policy(PermissionPolicy::Queue(answers));
-        let updates_before = agent.updates().len();
-        let permissions_before = agent.permissions().len();
+        let sent = agent.arrival();
+        let updates_before = sent.updates;
+        let permissions_before = sent.permissions;
         if let Some(gate) = &prompt.gate {
             let path = scratch.state.join("config").join("kernel").join("gate.toml");
             std::fs::write(&path, gate).with_context(|| format!("{label}: replace {}", path.display()))?;
@@ -360,16 +428,24 @@ fn converse(
         }
         release_holds(agent, id, prompt, updates_before, permissions_before, &scratch.workspace, timeout)
             .with_context(|| label.clone())?;
-        let response = agent.wait_response(id, "session/prompt").with_context(|| label.clone())?;
+        let (response, answered) = agent.wait_response_at(id, "session/prompt").with_context(|| label.clone())?;
         agent.pump_until_quiet(SETTLE, timeout, &label)?;
         let seen = Seen {
             response: &response,
             updates: &agent.updates()[updates_before..],
+            answered: answered.updates - updates_before,
             permissions: &agent.permissions()[permissions_before..],
         };
         failures.extend(check_prompt(&label, prompt, &seen));
+        prompts.push(PromptWire { label, sent, response, answered, ended: agent.arrival() });
     }
-    Ok(())
+    Ok(Transcript {
+        initialize: init,
+        session_new,
+        updates: agent.updates().to_vec(),
+        permissions: agent.permissions().to_vec(),
+        prompts,
+    })
 }
 
 /// Answer the requests `prompt` holds while its turn waits on them. Once
@@ -483,6 +559,8 @@ pub const FAILED_TURN_TEXT: &str = "stream error:";
 pub struct Seen<'a> {
     pub response: &'a Value,
     pub updates: &'a [Value],
+    /// How many of `updates` arrived before the response.
+    pub answered: usize,
     pub permissions: &'a [PermissionRecord],
 }
 
@@ -512,18 +590,41 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
             && calls.iter().zip(expected).all(|(call, want)| {
                 call.title == want.title
                     && want.status.as_ref().is_none_or(|s| call.status.as_ref() == Some(s))
-                    && want.output_contains.as_ref().is_none_or(|o| call.output.contains(o.as_str()))
+                    && want.output_contains.as_ref().is_none_or(|o| o.all().iter().all(|n| call.output.contains(n.as_str())))
             });
         if !matches {
             let want: Vec<String> = expected
                 .iter()
                 .map(|w| {
-                    let output = w.output_contains.as_ref().map_or(String::new(), |o| format!(", output contains {o:?}"));
+                    let output = w.output_contains.as_ref().map_or(String::new(), |o| format!(", output contains {:?}", o.all()));
                     format!("{} ({}{output})", w.title, w.status.as_deref().unwrap_or("any status"))
                 })
                 .collect();
             let outputs: Vec<&str> = calls.iter().map(|c| c.output.as_str()).collect();
             failures.push(format!("{label}: expected tool calls {want:?}, got {got:?} with outputs {outputs:?}"));
+        }
+    }
+
+    if prompt.reports_cost {
+        let cost = seen.updates[..seen.answered.min(seen.updates.len())]
+            .iter()
+            .rev()
+            .filter(|u| u.pointer("/update/sessionUpdate").and_then(Value::as_str) == Some("usage_update"))
+            .find_map(|u| u.pointer("/update/cost"));
+        let usd = cost.is_some_and(|c| {
+            c.get("currency").and_then(Value::as_str).is_some_and(|x| x.eq_ignore_ascii_case("USD"))
+                && c.get("amount").is_some_and(Value::is_number)
+        });
+        if !usd {
+            let usage = seen
+                .updates
+                .iter()
+                .filter(|u| u.pointer("/update/sessionUpdate").and_then(Value::as_str) == Some("usage_update"))
+                .count();
+            failures.push(format!(
+                "{label}: reports_cost: no usage_update before the response carries a USD cost; \
+                 {usage} usage_update(s) arrived, last cost {cost:?}"
+            ));
         }
     }
 
@@ -607,7 +708,7 @@ mod tests {
         let p = prompt("text_contains = [\"hello\"]\ntool_calls = []");
         let response = json!({"stopReason": "end_turn"});
         let updates = [chunk("hello there")];
-        let seen = Seen { response: &response, updates: &updates, permissions: &[] };
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
         assert_eq!(check_prompt("p", &p, &seen), Vec::<String>::new());
     }
 
@@ -616,7 +717,7 @@ mod tests {
         let p = prompt("text_contains = [\"absent\"]\ntool_calls = [{ title = \"write\" }]\npermissions = [\"allow\"]");
         let response = json!({"stopReason": "cancelled"});
         let updates = [chunk("hello")];
-        let seen = Seen { response: &response, updates: &updates, permissions: &[] };
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
         let failures = check_prompt("p", &p, &seen).join("\n");
         for needle in ["stopReason", "\"absent\"", "tool calls", "1 permission request(s), got 0"] {
             assert!(failures.contains(needle), "{needle} missing from:\n{failures}");
@@ -628,7 +729,7 @@ mod tests {
         let p = prompt("text_contains = [\"done\"]");
         let response = json!({"stopReason": "end_turn"});
         let updates = [chunk("done"), chunk("stream error: Model turn panicked; execution stopped")];
-        let seen = Seen { response: &response, updates: &updates, permissions: &[] };
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
         let failures = check_prompt("p", &p, &seen);
         assert_eq!(failures.len(), 1, "{failures:#?}");
         assert!(failures[0].contains("a model turn failed"), "{failures:#?}");
@@ -668,6 +769,53 @@ mod tests {
         assert!(judged.excused.is_empty());
     }
 
+    fn shape_check(invariant: &'static str, exercised: bool, failures: &[&str]) -> shape::Check {
+        shape::Check { invariant, exercised, failures: failures.iter().map(|f| f.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_shape_gap_excuses_its_invariant_and_names_its_finding() {
+        let checks = [
+            shape_check(shape::PERMISSION_TOOL_CALL, true, &["harbor shape permission-tool-call: x"]),
+            shape_check(shape::STOP_REASON, true, &["harbor shape stop-reason: y"]),
+        ];
+        let judged = judge_shape(&checks, &[("H1", shape::PERMISSION_TOOL_CALL)]);
+        assert_eq!(judged.failures, vec!["harbor shape stop-reason: y".to_string()]);
+        assert_eq!(judged.excused, vec!["harbor shape permission-tool-call: x".to_string()]);
+        assert_eq!(judged.gaps, vec!["H1".to_string()]);
+    }
+
+    #[test]
+    fn a_shape_gap_that_held_where_it_applied_fails() {
+        let checks = [shape_check(shape::PERMISSION_TOOL_CALL, true, &[])];
+        let judged = judge_shape(&checks, &[("H1", shape::PERMISSION_TOOL_CALL)]);
+        assert_eq!(judged.failures.len(), 1, "{:?}", judged.failures);
+        assert!(judged.failures[0].contains("H1") && judged.failures[0].contains("SHAPE_GAPS"), "{:?}", judged.failures);
+        assert!(judged.gaps.is_empty());
+    }
+
+    #[test]
+    fn a_shape_gap_with_nothing_to_check_says_nothing() {
+        let checks = [shape_check(shape::PERMISSION_TOOL_CALL, false, &[])];
+        let judged = judge_shape(&checks, &[("H1", shape::PERMISSION_TOOL_CALL)]);
+        assert!(judged.failures.is_empty() && judged.excused.is_empty() && judged.gaps.is_empty());
+    }
+
+    #[test]
+    fn a_missing_cost_fails_reports_cost() {
+        let p = prompt("reports_cost = true");
+        let response = json!({"stopReason": "end_turn"});
+        let usage = |cost: Value| json!({"update": {"sessionUpdate": "usage_update", "used": 1, "size": 9, "cost": cost}});
+        let updates = [usage(Value::Null)];
+        let seen = Seen { response: &response, updates: &updates, answered: 1, permissions: &[] };
+        assert!(check_prompt("p", &p, &seen).join("\n").contains("reports_cost"));
+        let updates = [usage(json!({"amount": 0.5, "currency": "USD"}))];
+        let seen = Seen { response: &response, updates: &updates, answered: 1, permissions: &[] };
+        assert_eq!(check_prompt("p", &p, &seen), Vec::<String>::new());
+        let late = Seen { response: &response, updates: &updates, answered: 0, permissions: &[] };
+        assert_eq!(check_prompt("p", &p, &late).len(), 1, "a cost after the response is one Harbor never reads");
+    }
+
     fn scenario(text: &str) -> Scenario {
         Scenario::parse(&format!("description = \"d\"\n{text}\n[[prompt]]\ntext = \"go\"\n"), "test").unwrap()
     }
@@ -695,8 +843,9 @@ mod tests {
             answer: Some(PermissionAnswer::Deny),
             option_id: Some("deny".into()),
             problem: None,
+            updates_seen: 0,
         }];
-        let seen = Seen { response: &response, updates: &updates, permissions: &permissions };
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &permissions };
         let failures = check_prompt("p", &p, &seen).join("\n");
         assert!(failures.contains("output contains") && failures.contains("external commands are disabled"), "{failures}");
         assert!(failures.contains("title does not contain \"ask tier\""), "{failures}");
@@ -707,7 +856,7 @@ mod tests {
         let p = prompt("tool_calls = [{ title = \"write\", status = \"completed\" }]");
         let response = json!({"stopReason": "end_turn"});
         let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "write", "status": "failed"}})];
-        let seen = Seen { response: &response, updates: &updates, permissions: &[] };
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
         assert_eq!(check_prompt("p", &p, &seen).len(), 1);
     }
 

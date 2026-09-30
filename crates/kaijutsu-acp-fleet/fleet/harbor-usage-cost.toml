@@ -1,0 +1,11 @@
+description = "Harbor reads a run's cost from the last usage_update's cost in USD; the agent reports none."
+
+known_gap = { finding = "H3", fails = ["prompt 1: reports_cost"] }
+
+[[model]]
+text = "fleet mock speaking"
+
+[[prompt]]
+text = "say something"
+text_contains = ["fleet mock speaking"]
+reports_cost = true

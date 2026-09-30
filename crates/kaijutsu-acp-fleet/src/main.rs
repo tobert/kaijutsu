@@ -77,9 +77,9 @@ fn real_main() -> Result<bool> {
     for file in &files {
         let outcome = run_file(file, &config);
         let seconds = outcome.elapsed.as_secs_f64();
-        if outcome.passed() && let Some(finding) = &outcome.known_gap {
+        if outcome.passed() && !outcome.known_gaps.is_empty() {
             gaps += 1;
-            println!("GAP  {} ({finding}, {seconds:.1}s)", outcome.name);
+            println!("GAP  {} ({}, {seconds:.1}s)", outcome.name, outcome.known_gaps.join(", "));
             for excused in &outcome.excused {
                 println!("  - {}", excused.replace('\n', "\n    "));
             }

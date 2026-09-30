@@ -1,0 +1,31 @@
+description = "Harbor opens its session at the task directory: session/new's cwd, not the agent's launch directory, is where a relative path resolves."
+
+# The agent launches in the workspace root; the session opens at task/.
+session_cwd = "task"
+
+# Harbor runs a task in a throwaway container, under a gate that asks nothing.
+gate = """
+[global]
+uncovered = "allow"
+"""
+
+[files]
+"task/marker.txt" = "the task directory\n"
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "cat marker.txt; echo made > made.txt" } }]
+[[model]]
+text = "read the marker"
+
+[[prompt]]
+text = "read marker.txt and make made.txt"
+text_contains = ["read the marker"]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "the task directory" }]
+
+[[verify]]
+path = "task/made.txt"
+equals = "made\n"
+
+[[verify]]
+path = "made.txt"
+exists = false

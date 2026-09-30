@@ -1,0 +1,15 @@
+description = "A tool call whose arguments were cut off at the output limit is reported failed with the reason, and the turn goes on to the model's next reply."
+
+# The provider stopped at max_tokens part-way through the call's JSON.
+[[model]]
+events = [
+  { ToolUseInvalid = { id = "fleet-cut", name = "shell_write", arguments = "{\"command\": \"echo hel", error = "EOF while parsing a string at line 1 column 21" } },
+  { Done = { stop_reason = "max_tokens", input_tokens = 1, output_tokens = 1 } },
+]
+[[model]]
+text = "I will make the call again in smaller pieces"
+
+[[prompt]]
+text = "write a very large file"
+text_contains = ["I will make the call again in smaller pieces"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "its arguments were not valid JSON" }]
