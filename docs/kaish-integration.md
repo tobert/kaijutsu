@@ -98,7 +98,10 @@ These are source observations, not promises that all paths behave alike.
   are deleted. Rc policy requires `RcAuthority`, constructed only by lifecycle
   orchestration. Missing dispatcher registration fails construction.
 - Context construction refuses a failed loadout/cwd read or an unavailable
-  persisted cwd. `ShellCwd` selects current context state or captured approval
+  persisted cwd. Nothing runs in a directory the caller did not expect. A
+  context cwd that no longer exists moves to its nearest existing ancestor
+  as the command is refused, and the refusal names it, so the next command
+  runs there instead of every later one refusing. `ShellCwd` selects current context state or captured approval
   state; a captured unset cwd stays unset. Approval paths no longer restore a
   newer context cwd before applying their pin. Gate outcomes preserve no pin
   versus captured-unset state; rule decisions use current context state. RPC

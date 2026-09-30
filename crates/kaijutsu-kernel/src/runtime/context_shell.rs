@@ -217,7 +217,30 @@ impl EmbeddedKaish {
                 if matches!(cwd, ShellCwd::Captured(_)) {
                     anyhow::bail!("approved cwd '{}' no longer resolves to a directory; nothing was run", path.display());
                 }
-                anyhow::bail!("context cwd '{}' is unavailable; set a valid cwd before executing", path.display());
+                // The context's own cwd was removed, often by the command
+                // before this one. Nothing runs in a directory the caller did
+                // not expect: move the context to the nearest ancestor that
+                // exists and refuse this command, so the next one runs there
+                // knowingly instead of every later command refusing.
+                let mut used = None;
+                for ancestor in path.ancestors().skip(1) {
+                    if kaish.try_set_cwd(ancestor.to_path_buf()).await {
+                        used = Some(ancestor.to_path_buf());
+                        break;
+                    }
+                }
+                let Some(used) = used else {
+                    anyhow::bail!("context cwd '{}' is unavailable and no ancestor resolves; set a valid cwd before executing", path.display());
+                };
+                dispatcher.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                    context_id,
+                    cwd: Some(used.to_string_lossy().into_owned()),
+                    updated_at: kaijutsu_types::now_millis() as i64,
+                }).map_err(|error| anyhow::anyhow!("persist context cwd {}: {error}", used.display()))?;
+                tracing::warn!(%context_id, missing = %path.display(), used = %used.display(),
+                    "context cwd no longer exists; moved to its nearest ancestor");
+                anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
+                    path.display(), used.display());
             }
         }
 
@@ -359,7 +382,16 @@ mod tests {
             Ok(_) => panic!("an unavailable persisted cwd must not run in a different directory"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains(missing), "{error}");
+        assert!(error.contains(missing) && error.contains("nothing was run"), "{error}");
+        // The refusal moved the context, so the next command is not refused.
+        let moved = d.kernel_db().lock().get_context_shell(ctx).unwrap().and_then(|row| row.cwd);
+        assert_eq!(moved.as_deref(), Some("/"), "the nearest ancestor that exists");
+        assert!(error.contains("now '/'"), "{error}");
+        EmbeddedKaish::for_context(&d, "missing-cwd", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await
+            .expect("the moved cwd resolves");
     }
 
     #[tokio::test]

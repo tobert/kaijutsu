@@ -1039,6 +1039,44 @@ mod tests {
         d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
+    /// A context cwd that no longer exists (the model removed it) wedges no
+    /// shell: the first call refuses, running nothing, and names the nearest
+    /// ancestor it moved the context to; the next call runs there. A
+    /// read-only shell moves it too: the move repairs state, it is not the
+    /// command's write.
+    #[tokio::test]
+    async fn a_removed_context_cwd_refuses_once_and_moves_to_its_ancestor() {
+        use crate::vfs::VfsOps;
+        let (broker, d) = wired().await;
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"),
+            b"[global]\nallow = [\"pwd\"]\n").await.unwrap();
+        d.kernel().mount("/working", crate::vfs::backends::MemoryBackend::new()).await;
+        let principal = PrincipalId::new();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("gone-cwd"), principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        binding.grant(Capability::Facade("shell_write".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let call_ctx = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+
+        for read_only in [true, false] {
+            d.kernel_db().lock().upsert_context_shell(&ContextShellRow {
+                context_id: context, cwd: Some("/working/neg/ssl".into()), updated_at: 0,
+            }).unwrap();
+            let params = || if read_only { call("pwd") } else { call_write("pwd") };
+            let refused = broker.call_tool(params(), &call_ctx, CancellationToken::new()).await
+                .expect_err("a command meant for the removed directory does not run elsewhere");
+            let message = refused.to_string();
+            assert!(message.contains("/working/neg/ssl") && message.contains("nothing was run")
+                && message.contains("now '/working'"), "read_only={read_only}: {message}");
+            let result = broker.call_tool(params(), &call_ctx, CancellationToken::new()).await.unwrap();
+            assert!(!result.is_error, "read_only={read_only}: {result:?}");
+            assert_eq!(body_of(&result)["stdout"].as_str().unwrap().trim(), "/working", "read_only={read_only}");
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
     /// A `kj` verb's structured `.data` must survive into the tool result's
     /// `structured` envelope — consumers read full context handles from `data`
     /// instead of scraping stdout (which renders short ids in a table).
