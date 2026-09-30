@@ -92,6 +92,8 @@ pub struct ModelChoice {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// The factory key file, kept when the caller named no key variable.
+    pub api_key_file: Option<String>,
     pub key_optional: bool,
     /// True when this choice needs its own backend row written. False leaves
     /// the factory row alone, which is what keeps a provider's key file
@@ -220,6 +222,10 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         model,
         base_url: flags.base_url.clone(),
         api_key_env,
+        api_key_file: (!flags.no_key && flags.api_key_env.is_none())
+            .then_some(factory.api_key_file)
+            .flatten()
+            .map(Into::into),
         key_optional,
         write_backend_row,
         idle_timeout_secs: flags.idle_timeout_secs,
@@ -371,6 +377,21 @@ mod tests {
         assert!(choice.write_backend_row);
         assert_eq!(choice.api_key_env.as_deref(), Some("MY_KEY"));
         assert_eq!(choice.base_url.as_deref(), Some("http://localhost:8080/v1"));
+    }
+
+    #[test]
+    fn an_endpoint_of_our_own_keeps_the_factory_key_file() {
+        let host = FakeHost::default().with_key_file("~/.openai-key.txt");
+        let flags = ModelFlags {
+            backend_kind: Some(BackendKind::Openai),
+            base_url: Some("https://example.test/v1".to_string()),
+            model: Some("qwen3.8-flash".to_string()),
+            ..ModelFlags::default()
+        };
+        let choice = resolve(&flags, &host).expect("the key file counts");
+        assert!(choice.write_backend_row);
+        assert_eq!(choice.api_key_file.as_deref(), Some("~/.openai-key.txt"),
+            "the row written must keep the key file resolution accepted");
     }
 
     #[test]

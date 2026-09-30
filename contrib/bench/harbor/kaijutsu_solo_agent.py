@@ -254,7 +254,7 @@ class KaijutsuSoloOptions(AcpOptions):
         default=None,
         description=(
             "Pass --no-key, for a local server that takes no key. Needs "
-            f"base_url. Default: ${NO_KEY_ENV} set to 1, else off."
+            f"base_url. Default: on when ${NO_KEY_ENV} is 1, else off."
         ),
     )
     idle_timeout: int | None = Field(
@@ -379,7 +379,8 @@ class KaijutsuSoloAcp(AcpAgent):
         self._base_url = base_url or os.environ.get(BASE_URL_ENV) or None
         self._api_key_env = api_key_env or os.environ.get(KEY_ENV_ENV) or None
         no_key_raw = no_key if no_key is not None else os.environ.get(NO_KEY_ENV)
-        self._no_key = str(no_key_raw).strip().lower() in ("1", "true", "yes")
+        # "1" only, the one value run-harbor.sh also reads as on.
+        self._no_key = no_key_raw is True or str(no_key_raw).strip() == "1"
         if self._no_key and self._api_key_env is not None:
             raise ValueError("no_key and api_key_env contradict each other; set one.")
         self._idle_timeout = _positive_int(

@@ -320,9 +320,9 @@ pub struct Delta {
 
 impl Delta {
     /// The chain-of-thought under either name. A server that sends both
-    /// carries the same text twice, so `reasoning_content` wins.
+    /// carries the same text twice, so a non-empty `reasoning_content` wins.
     pub fn take_reasoning(&mut self) -> Option<String> {
-        let rc = self.reasoning_content.take();
+        let rc = self.reasoning_content.take().filter(|s| !s.is_empty());
         let r = self.reasoning.take();
         rc.or(r)
     }

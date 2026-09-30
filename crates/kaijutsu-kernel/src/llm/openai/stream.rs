@@ -416,6 +416,23 @@ data: [DONE]
         );
     }
 
+    /// An empty `reasoning_content` beside a non-empty `reasoning` does not
+    /// hide the thinking.
+    #[tokio::test]
+    async fn an_empty_reasoning_content_does_not_shadow_reasoning() {
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\",\"reasoning\":\"We need\"},\"finish_reason\":\"stop\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        assert_eq!(
+            &events[..2],
+            &[StreamEvent::ThinkingStart, StreamEvent::ThinkingDelta("We need".into())]
+        );
+    }
+
     /// DeepSeek-V4-style providers (`reasoning_required`) mark their reasoning
     /// rehydratable: `ThinkingEnd` carries the sentinel nonce instead of `None`.
     #[tokio::test]

@@ -232,11 +232,12 @@ impl EmbeddedKaish {
                 let Some(used) = used else {
                     anyhow::bail!("context cwd '{}' is unavailable and no ancestor resolves; set a valid cwd before executing", path.display());
                 };
-                dispatcher.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
-                    context_id,
-                    cwd: Some(used.to_string_lossy().into_owned()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                }).map_err(|error| anyhow::anyhow!("persist context cwd {}: {error}", used.display()))?;
+                let newer = super::shell_state::move_missing_cwd(&dispatcher.kernel_db().lock(), context_id, path, &used)
+                    .map_err(anyhow::Error::msg)?;
+                if let Some(newer) = newer {
+                    anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
+                        path.display(), newer.display());
+                }
                 tracing::warn!(%context_id, missing = %path.display(), used = %used.display(),
                     "context cwd no longer exists; moved to its nearest ancestor");
                 anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",

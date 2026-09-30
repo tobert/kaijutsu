@@ -72,6 +72,24 @@ pub(crate) fn read_context_cwd(db: &KernelDb, context_id: ContextId) -> Result<O
     Ok(cwd)
 }
 
+/// Move a context whose cwd `missing` no longer exists to `used`, only while
+/// the stored cwd is still `missing`. Returns the stored cwd when another
+/// writer changed it first; that cwd stands and nothing is written.
+pub(crate) fn move_missing_cwd(
+    db: &KernelDb, context_id: ContextId, missing: &std::path::Path, used: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let stored = read_context_cwd(db, context_id)?;
+    if stored.as_deref() != Some(missing) {
+        return Ok(Some(stored.unwrap_or_else(kaish_kernel::home_dir)));
+    }
+    db.upsert_context_shell(&ContextShellRow {
+        context_id,
+        cwd: Some(used.to_string_lossy().into_owned()),
+        updated_at: kaijutsu_types::now_millis() as i64,
+    }).map_err(|e| format!("persist context cwd {}: {e}", used.display()))?;
+    Ok(None)
+}
+
 pub(crate) fn validate_cwd(cwd: Option<&std::path::Path>) -> Result<(), String> {
     if let Some(path) = cwd {
         if !path.is_absolute() {
@@ -86,6 +104,27 @@ mod tests {
     use super::*;
     use crate::kj::test_helpers::{register_context, test_dispatcher};
     use kaijutsu_types::PrincipalId;
+
+    #[tokio::test]
+    async fn moving_a_missing_cwd_leaves_a_newer_one_alone() {
+        let dispatcher = test_dispatcher().await;
+        let context = register_context(&dispatcher, Some("moved"), None, PrincipalId::new());
+        let db = dispatcher.kernel_db().lock();
+        let set = |cwd: &str| db.upsert_context_shell(&ContextShellRow {
+            context_id: context, cwd: Some(cwd.into()), updated_at: 0,
+        }).unwrap();
+        let (missing, used) = (std::path::Path::new("/gone/deep"), std::path::Path::new("/gone"));
+
+        set("/gone/deep");
+        assert_eq!(move_missing_cwd(&db, context, missing, used).unwrap(), None);
+        assert_eq!(read_context_cwd(&db, context).unwrap().as_deref(), Some(used));
+
+        // Another writer moved the context after the probe read it.
+        set("/newer");
+        assert_eq!(move_missing_cwd(&db, context, missing, used).unwrap().as_deref(),
+            Some(std::path::Path::new("/newer")));
+        assert_eq!(read_context_cwd(&db, context).unwrap().as_deref(), Some(std::path::Path::new("/newer")));
+    }
 
     #[tokio::test]
     async fn shell_state_rejects_relative_cwd_before_persisting_exports() {

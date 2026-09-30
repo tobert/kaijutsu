@@ -155,9 +155,9 @@ Each step fails loudly, with what it was doing:
    bridge's connection and is the reviewer every approval resolves to.
 5. Seed the factory backends, then point the model defaults at the chosen
    provider and model. The factory row is left alone unless `--base-url`,
-   `--api-key-env`, or `--no-key` says something different, which is what
-   keeps a provider's key file working. The two timeouts change only their
-   own columns of the factory row. `--max-tokens` overrides the factory output-token
+   `--api-key-env`, or `--no-key` says something different; a row written
+   without `--api-key-env` or `--no-key` keeps the provider's key file. The
+   two timeouts change only their own columns of the factory row. `--max-tokens` overrides the factory output-token
    ceiling in this same defaults row; left out, the factory ceiling stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews
