@@ -19,6 +19,25 @@ struct Holder {
     /// Cancelled when the holding turn stops waiting, so an approved command
     /// already running for it stops too.
     stopped: CancellationToken,
+    until: HoldUntil,
+}
+
+/// When the worker releases a hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldUntil {
+    /// A foreground call: once the pair is settled. The turn reads the
+    /// result, so the worker sends no completion notice.
+    Settled,
+    /// A background call: once the approved command starts, or once the
+    /// pair settles without running. Completion reaches the model through
+    /// its notice.
+    Started,
+}
+
+/// A holding turn, as the worker sees it.
+pub(crate) struct HolderView {
+    pub stopped: CancellationToken,
+    pub until: HoldUntil,
 }
 
 /// The asks model turns are holding on, keyed by request id.
@@ -44,18 +63,17 @@ impl HeldAsks {
 
     /// Register a hold before the pair is published as `Waiting`, so the
     /// worker, which acts only on a released pair, always finds it.
-    pub(crate) fn hold<'a>(&'a self, request_id: &str) -> HeldAsk<'a> {
+    pub(crate) fn hold<'a>(&'a self, request_id: &str, until: HoldUntil) -> HeldAsk<'a> {
         let (settled, rx) = tokio::sync::oneshot::channel();
         let stopped = CancellationToken::new();
-        let previous = self.holders.lock().insert(request_id.to_owned(), Holder { settled, stopped: stopped.clone() });
+        let previous = self.holders.lock().insert(request_id.to_owned(), Holder { settled, stopped: stopped.clone(), until });
         assert!(previous.is_none(), "ask {request_id} already has a holding turn");
-        HeldAsk { asks: self, request_id: request_id.to_owned(), settled: Some(rx), stopped }
+        HeldAsk { asks: self, request_id: request_id.to_owned(), settled: Some(rx), stopped, released: false }
     }
 
-    /// The token an approved command runs under while a turn holds it, or
-    /// `None` when no turn is holding this ask.
-    pub(crate) fn holder(&self, request_id: &str) -> Option<CancellationToken> {
-        self.holders.lock().get(request_id).map(|holder| holder.stopped.clone())
+    /// The turn holding this ask, or `None` when no turn is holding it.
+    pub(crate) fn holder(&self, request_id: &str) -> Option<HolderView> {
+        self.holders.lock().get(request_id).map(|holder| HolderView { stopped: holder.stopped.clone(), until: holder.until })
     }
 
     /// Tell the holding turn its pair is settled. Returns whether a turn was
@@ -68,13 +86,16 @@ impl HeldAsks {
     }
 }
 
-/// One turn's hold on one ask. Dropping it ends the hold and stops a command
-/// the worker is running for it.
+/// One turn's hold on one ask. Dropping it before the worker releases it
+/// ends the hold and stops a command the worker is running for it.
 pub(crate) struct HeldAsk<'a> {
     asks: &'a HeldAsks,
     request_id: String,
     settled: Option<tokio::sync::oneshot::Receiver<()>>,
     stopped: CancellationToken,
+    /// The worker released this hold; a background command it started
+    /// keeps running after the hold is dropped.
+    released: bool,
 }
 
 impl HeldAsk<'_> {
@@ -83,17 +104,18 @@ impl HeldAsk<'_> {
     /// caller reads the pair's state either way.
     pub(crate) async fn wait(&mut self, stop: &CancellationToken) -> bool {
         let settled = self.settled.as_mut().expect("a hold is waited once");
-        tokio::select! {
+        self.released = tokio::select! {
             biased;
             _ = settled => true,
             _ = stop.cancelled() => false,
-        }
+        };
+        self.released
     }
 }
 
 impl Drop for HeldAsk<'_> {
     fn drop(&mut self) {
-        self.stopped.cancel();
+        if !self.released { self.stopped.cancel(); }
         // Ask ids are unique and `hold` refuses a second holder, so this
         // entry can only be this hold's own.
         self.asks.holders.lock().remove(&self.request_id);
@@ -107,19 +129,22 @@ mod tests {
     #[tokio::test]
     async fn a_release_wakes_the_holder_and_ends_the_hold() {
         let asks = HeldAsks::default();
-        let mut hold = asks.hold("ask-1");
+        let mut hold = asks.hold("ask-1", HoldUntil::Settled);
         assert!(asks.holder("ask-1").is_some());
         assert!(asks.release("ask-1"));
         assert!(hold.wait(&CancellationToken::new()).await);
         assert!(asks.holder("ask-1").is_none());
+        let command = hold.stopped.clone();
+        drop(hold);
+        assert!(!command.is_cancelled(), "a released hold leaves a started command running");
         assert!(!asks.release("ask-1"), "a second release finds no holder");
     }
 
     #[tokio::test]
     async fn stopping_returns_false_and_dropping_stops_the_command() {
         let asks = HeldAsks::default();
-        let mut hold = asks.hold("ask-2");
-        let command = asks.holder("ask-2").unwrap();
+        let mut hold = asks.hold("ask-2", HoldUntil::Settled);
+        let command = asks.holder("ask-2").unwrap().stopped;
         let stop = CancellationToken::new();
         stop.cancel();
         assert!(!hold.wait(&stop).await);

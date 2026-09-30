@@ -10,6 +10,7 @@ use kaijutsu_types::ToolKind as TypesToolKind;
 use super::embedded_kaish::EmbeddedKaish;
 use super::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use super::command::CommandRunOptions;
+use super::held_asks::HoldUntil;
 
 /// Who a principal is, as a model should read it: the two sentinels, then
 /// the character sheet, then the id's short form
@@ -378,6 +379,13 @@ fn needs_no_shell_turn_seed(linked: Option<(BlockId, BlockId, crate::PairOwner)>
     !matches!(linked, Some((_, _, crate::PairOwner::Session)))
 }
 
+/// Whether a turn holding this ask reads the settled result itself, so the
+/// worker sends no notice or seed. A background hold is released when its
+/// command starts; its completion still reaches the model as a notice.
+fn reads_result(held: &Option<super::held_asks::HolderView>) -> bool {
+    held.as_ref().is_some_and(|holder| holder.until == HoldUntil::Settled)
+}
+
 /// Owns a spent approval until shared command capture takes over.
 struct ApprovalPreparation<'a> {
     kernel: &'a Arc<Kernel>,
@@ -498,7 +506,7 @@ async fn act_on_executable_answer(
                         if !db.redeem_ask(&answer.request_id)? { return Ok(false); }
                         let suppression = match linked {
                             Some((_, _, crate::PairOwner::Session)) => Some("session observes the command result directly"),
-                            Some((_, _, crate::PairOwner::Turn)) if held.is_some() => Some("the holding turn reads the command result"),
+                            Some((_, _, crate::PairOwner::Turn)) if reads_result(&held) => Some("the holding turn reads the command result"),
                             _ => None,
                         };
                         super::completion_notice::reserve(db,
@@ -644,7 +652,7 @@ async fn act_on_executable_answer(
     // (`PairOwner::Session`) watches its own blocks, so a fill tells
     // nobody.
     let (receipt, tell) = match receipt {
-        Some(receipt) => (receipt, matches!(linked, Some((_, _, crate::PairOwner::Turn))) && held.is_none()),
+        Some(receipt) => (receipt, matches!(linked, Some((_, _, crate::PairOwner::Turn))) && !reads_result(&held)),
         None => match kernel.blocks().start_shell_operation(crate::shell_operations::ShellOperationStart {
             notify: false,
             context: context_id, principal: principal_id, actor: ask.actor, source,
@@ -701,7 +709,22 @@ async fn act_on_executable_answer(
     preparation.armed = false;
     // A holding turn that stops waiting stops the command it waits on.
     let run_cancel = stop.child_token();
-    if let Some(holder) = held.clone() {
+    // A background hold is released as soon as the command starts.
+    let (job_ready, started) = match &held {
+        Some(holder) if holder.until == HoldUntil::Started => {
+            let (ready, started) = tokio::sync::oneshot::channel();
+            (Some(ready), Some(started))
+        }
+        _ => (None, None),
+    };
+    if let Some(started) = started {
+        let kernel = kernel.clone();
+        let request_id = answer.request_id.clone();
+        tokio::spawn(async move {
+            if started.await.is_ok() { kernel.held_asks().release(&request_id); }
+        });
+    }
+    if let Some(holder) = held.as_ref().map(|holder| holder.stopped.clone()) {
         let run_cancel = run_cancel.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -717,15 +740,16 @@ async fn act_on_executable_answer(
         kernel,
         &crate::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id())
             .with_actor(ask.actor, Some(ask.reviewer)),
-        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(run_cancel.clone()), ..Default::default() },
+        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(run_cancel.clone()), job_ready, ..Default::default() },
     )
     .await;
     run_cancel.cancel();
-    if held.is_some() {
+    // Released by now unless a background command never started.
+    if held.is_some() { kernel.held_asks().release(&answer.request_id); }
+    if reads_result(&held) {
         if let Err(error) = &outcome {
             tracing::error!(ask = %answer.request_id, %error, "approved command settlement failed for a holding turn");
         }
-        kernel.held_asks().release(&answer.request_id);
         return ExecAction::Settled;
     }
     let outcome = match outcome {

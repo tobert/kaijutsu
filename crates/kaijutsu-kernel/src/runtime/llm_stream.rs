@@ -1629,6 +1629,14 @@ fn pending_shell_operation_receipt(
     Ok(receipt.operation_id)
 }
 
+/// Whether a shell call asked to run in the background. A missing key
+/// defaults to `false`, matching `ShellParams`'s own default.
+fn runs_in_background(params: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(params).ok()
+        .and_then(|value| value.get("run_in_background").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 fn make_pending_shell_receipt(
     kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
     tool_ctx: &crate::ExecContext, tool_name: &str, params: &str,
@@ -1644,10 +1652,7 @@ fn make_pending_shell_receipt(
     // `run_in_background` waits for completion, so it must not mint a
     // background receipt any more than an explicit `run_in_background: false`
     // would.
-    let run_in_background = serde_json::from_str::<serde_json::Value>(params).ok()
-        .and_then(|value| value.get("run_in_background").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false);
-    if !run_in_background {
+    if !runs_in_background(params) {
         return;
     }
     match pending_shell_operation_receipt(kernel, documents, context_id, tool_ctx, params, ask_id) {
@@ -1687,8 +1692,42 @@ async fn dispatch_recorded_tool_result(
     let params = input.to_string();
     let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
         dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel).await;
+    let refusal = kernel.held_asks().refusal();
+    // A background call holds only until its answer: the worker releases
+    // it when the approved command starts, and the result is a running
+    // receipt, or the denial. Hold before the receipt publishes the
+    // operation's `Waiting` pair.
+    // The shell tool answers a gated background call with a waiting receipt
+    // and has already published the operation, so an answer can race the
+    // hold: the worker checks for a holder under the lock it claims with, so
+    // a hold registered after that claim finds the ask redeemed instead.
+    let background = matches!(tool_name, "shell" | "shell_write") && runs_in_background(&params);
+    let waiting_background = background.then(|| ShellEnvelope::from_tool_result(&content)).flatten()
+        .filter(|env| env.status == kaijutsu_types::shell_envelope::ShellStatus::Waiting)
+        .and_then(|env| env.ask_id)
+        .or_else(|| ask_id.clone().filter(|_| background && settled_status == Status::Waiting));
+    let background_hold = waiting_background.map(|ask| {
+        let hold = refusal.is_none().then(|| kernel.held_asks().hold(&ask, super::held_asks::HoldUntil::Started));
+        let claimed = kernel.kernel_db().lock().ask_redeemed(&ask).unwrap_or_else(|error| {
+            tracing::error!(%ask, %error, "could not read whether a background ask was claimed; waiting on it");
+            false
+        });
+        (ask, hold.filter(|_| !claimed))
+    });
     make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
         ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
+    if let Some((ask, hold)) = background_hold {
+        let reason = match hold {
+            Some(mut hold) => {
+                let released = hold.wait(stop_waiting).await;
+                drop(hold);
+                (!released).then_some(INTERRUPTED_HOLD)
+            }
+            // Refused, or already claimed by the worker (no reason).
+            None => refusal,
+        };
+        (content, is_error) = background_answer(kernel, documents, context_id, &ask, reason);
+    }
 
     // People read the clean output; the model reads it rendered with the facts
     // that change its next step (`ShellEnvelope::model_text`), plus the Error
@@ -1713,9 +1752,8 @@ async fn dispatch_recorded_tool_result(
     // A call left waiting on its ask holds this turn until the answer is
     // settled. Hold before publishing `Waiting`: the worker acts only on a
     // published pair, and it must find the holder when it does.
-    let refusal = kernel.held_asks().refusal();
     let hold = match (&ask_id, settled_status, refusal) {
-        (Some(ask), Status::Waiting, None) => Some(kernel.held_asks().hold(ask)),
+        (Some(ask), Status::Waiting, None) => Some(kernel.held_asks().hold(ask, super::held_asks::HoldUntil::Settled)),
         _ => None,
     };
     documents.settle_tool_result_as(context_id, &call, &result, block_content,
@@ -1764,6 +1802,34 @@ fn end_hold(kernel: &Arc<Kernel>, context_id: ContextId, call: kaijutsu_types::B
             crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows());
         }
         Err(error) => tracing::error!(%ask, %error, "could not end an interrupted hold's ask"),
+    }
+}
+
+/// What a background call that held on `ask` returns: a running receipt once
+/// the approved command started, or its operation's settled error (the
+/// denial, or why it did not run). A `reason` ends the hold first, as
+/// [`end_hold`] does for a foreground call.
+fn background_answer(kernel: &Arc<Kernel>, documents: &SharedBlockStore, context_id: ContextId,
+    ask: &str, reason: Option<&str>) -> (String, bool) {
+    let operation = match kernel.shell_operations().get_by_ask(ask, context_id) {
+        Ok(Some(operation)) => operation,
+        result => return (format!("The operation waiting on ask {ask} could not be read ({result:?})."), true),
+    };
+    let receipt = operation.receipt;
+    if let Some(reason) = reason {
+        end_hold(kernel, context_id, receipt.command_block_id, receipt.output_block_id, ask, reason);
+    }
+    let output = documents.get_block_snapshot(context_id, &receipt.output_block_id).ok().flatten();
+    match output {
+        Some(block) if block.status == Status::Error => {
+            (crate::llm::hydrate::model_tool_result_text(&block, &block.content), true)
+        }
+        _ => {
+            let mut running = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Running);
+            running.operation_id = Some(receipt.operation_id);
+            running.ask_id = Some(ask.to_owned());
+            (running.to_value().to_string(), false)
+        }
     }
 }
 

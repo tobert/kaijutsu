@@ -48,6 +48,13 @@ the wire: the MCP and RPC shell paths still return `Pending`.
   settled result block through `llm::hydrate::model_tool_result_text`, and
   settling a result sent to a model records that text, so hydration later
   replays what the model read.
+- **Background calls.** A `run_in_background` call holds only until the
+  answer: the worker releases it when the approved command starts, and the
+  model reads a running receipt, or the denial. The completion reaches the
+  model through its notice, which joins a turn still running or starts the
+  next one. The shell tool publishes the operation before the turn can
+  hold, so the worker checks for a holder under the lock it claims with,
+  and a hold registered after that claim finds the ask already redeemed.
 - **Interrupts.** A hard or a soft interrupt ends the wait. An unanswered
   ask is abandoned and the pair settles `Error`; an answer nobody has run is
   spent without running. An answer the worker already claimed stays the

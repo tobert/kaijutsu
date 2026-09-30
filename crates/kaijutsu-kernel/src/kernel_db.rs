@@ -2538,6 +2538,12 @@ impl KernelDb {
         )?)
     }
 
+    /// Whether an answer to this ask has been spent: delivered, claimed by
+    /// the approval worker, or learned from.
+    pub(crate) fn ask_redeemed(&self, request_id: &str) -> KernelDbResult<bool> {
+        Ok(approval_ledger::ask::redeemed_at(self.conn_for_ledger(), request_id)?.is_some())
+    }
+
     /// End a model turn's hold on its ask because the turn stopped waiting.
     /// An unanswered ask is abandoned with `reason`; an answer nobody has run
     /// is spent without running, so the approval worker never acts on it. Returns

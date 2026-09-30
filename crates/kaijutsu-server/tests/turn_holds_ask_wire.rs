@@ -388,3 +388,61 @@ fn a_hold_outlasts_the_tool_call_timeout() {
         h.close().await;
     });
 }
+
+fn background_shell_write(id: &str, command: &str) -> StreamEvent {
+    StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(),
+        input: serde_json::json!({ "command": command, "run_in_background": true }) }
+}
+
+/// A background call holds only until the answer: an allow returns a
+/// running receipt as soon as the command starts, and the turn continues
+/// while it runs; completion reaches the model through its notice.
+///
+/// Falsified by returning the waiting receipt at the gate: the model is
+/// asked again before anyone answers.
+#[test]
+fn an_allowed_background_call_returns_a_running_receipt() {
+    run_local(async {
+        let h = Held::new("held-bg").await;
+        let marker = h.marker("background");
+        let (sent, mut events) = h.drive(vec![
+            vec![background_shell_write("held-bg-1", &format!("echo bg-ran | tee {}", marker.display())), done("tool_use")],
+            reply("started"),
+            reply("it finished"),
+        ]).await;
+        let asks = h.wait_for_asks(1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(sent.lock().len(), 1, "a background call holds until its answer");
+        h.answer(&asks[0], true).await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let results = tool_results(&sent.lock()[1]);
+        assert!(results[0].1.contains("running in the background"), "{results:?}");
+        assert!(!results[0].2);
+        wait_for("the background command to run", || marker.exists()).await;
+        // The notice joins the running turn when the command finishes before
+        // it ends ("Input during a turn"), or starts the next one.
+        wait_for("the completion notice to reach the model", || sent.lock().iter()
+            .any(|request| serde_json::to_string(request).unwrap().contains("bg-ran"))).await;
+        h.close().await;
+    });
+}
+
+/// A denied background call returns the denial, like a foreground one.
+#[test]
+fn a_denied_background_call_returns_the_denial() {
+    run_local(async {
+        let h = Held::new("held-bg-deny").await;
+        let marker = h.marker("background-denied");
+        let (sent, mut events) = h.drive(vec![
+            vec![background_shell_write("held-bg-2", &format!("echo no | tee {}", marker.display())), done("tool_use")],
+            reply("ok"),
+        ]).await;
+        let asks = h.wait_for_asks(1).await;
+        h.answer(&asks[0], false).await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let results = tool_results(&sent.lock()[1]);
+        assert!(results[0].2 && results[0].1.contains("denied"), "{results:?}");
+        assert!(!marker.exists());
+        h.close().await;
+    });
+}
