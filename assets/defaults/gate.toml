@@ -31,6 +31,14 @@
 #
 #   [context_type.coder]
 #   uncovered = "allow"   # sandboxed benchmark kernels only
+#
+# A model that runs the `shell_write` tool from its shell asks twice: once
+# here for the `shell_write` statement, then in the tool's own gate for the
+# command it carries. Allowing the statement for a seat leaves the tool's
+# gate as the one ask. This default leaves it off so each seat opts in:
+#
+#   [context_type.coder]
+#   allow = ["shell_write"]
 
 [global]
 allow = [

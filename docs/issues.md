@@ -2375,10 +2375,16 @@ and burn down all the approval options". Delete each line as it ships.
   cannot cover it and the read-only exemption misses it, so a model's
   structured `kj … --tail 5` asks. Needs the literal value from kaish, a
   shared interface.
-- **F16** A model's RPC shell that runs the `shell_write` tool asks twice:
-  once at PreCall for the uncovered `shell_write` statement, then in the
-  tool's own gate for its command. The shipped `gate.toml` could allow
-  `shell_write`, since the tool gates itself; Amy's call.
+- **Posture direction (Amy, 2026-09-30).** Ship a constrained, efficient
+  setup: every tool call asks until a human `--remember`s it, and loosening
+  is always the user's explicit choice. A banto:coder swarm states at
+  launch whether a seat gets a shell. Smooth that choice rather than widen
+  the default. The better it works, the sooner autonomous loops start.
+  Amy is also considering one shell tool for coder, with a name that
+  tokenizes clearly for most models, in place of the `shell`/`shell_write`
+  pair. The double ask (a model's shell running `shell_write` asks for the
+  statement, then in the tool's own gate) is left as is. The shipped
+  `gate.toml` carries the per-seat allow as a commented example.
 - **Tests** The ACP part of the conformance matrix ships in
   `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
   approval matrix"); scenarios marked `known_gap` name F7, F8, and F14.
@@ -2461,30 +2467,60 @@ kernel in podman with no network and only the workspace writable. Amy:
 "some of those acp sessions can use modified rc too, maybe a more yolo mode
 for when it's contained in docker". Open:
 
-- **A hook's exit 0 never lowers an ask** (`docs/gate-policy-tuning.md`,
-  "Verdicts"); an uncovered command still gets the gate's own ask. Whether
-  a hook-deferring tier should exist is Amy's call.
+- **A hook never lowers an ask by its exit status** (Amy, 2026-09-30):
+  "a lower should be spelled out and almost impossible to do by accident."
+  Hooks moved system prompts to `kj` so a hook could say more than an exit
+  code. A lowering, if it comes, is an explicit, named verdict. It is never
+  exit 0.
+- **The bridge extends ACP along the v2 draft's shape** (Amy: "yes you can
+  extend the ACP"). The prior art, read 2026-09-30, is cloned in
+  ~/src/research: `agent-client-protocol` at `schema-v2.0.0-alpha.6`,
+  `claude-agent-acp` v0.84.0, `codex-acp`, and `harbor`. We ship
+  `agent-client-protocol` 2.0.0 and speak `schema::v1`. Namespace every
+  extension under `_meta.kaijutsu` or a `_kaijutsu/` method, advertise it in
+  `agentCapabilities._meta`, and move to the real v2 names when the crate
+  exposes them. Each item below closes a gap listed after it:
+  - *Turn state.* Every kernel turn start and end, follow-ups included,
+    emits v2's `state_update` (`running`/`idle`/`requires_action`, with
+    `stopReason` and `usage` on idle). Send it as `_kaijutsu/state_update`
+    unless the client declares support for the update variant. The fleet
+    then waits for `idle` after the last `running`. This replaces the
+    quiet wait below.
+  - *Failure.* Record `_meta.kaijutsu.failure = {kind, category, severity,
+    title, details?, retryable?}` on the `PromptResponse` and on the idle
+    update, shaped after claude-agent-acp's `sessionFailure`. `stopReason`
+    stays standard. The fleet reads `kind`, not text.
+  - *Cancel.* Split `interruptContext`'s result into `turn_interrupted` and
+    `continuation_closed` at the source, and carry them as
+    `_meta.kaijutsu.cancel` on the idle update that follows.
+  - *Permission.* Put the command in `toolCall.title`, `{command, cwd}` in
+    `rawInput`, and the hook's reason in `content`. Mirror v2's
+    `permission.subject` under `_meta.kaijutsu.permission`. Name the rule
+    in the `allow_always` label.
+  - *Harbor* has a first-class ACP adapter (`acp:<id>` or a local
+    `agent.json` with a `distribution.local` entry). Its runner treats the
+    `session/prompt` return as run end and ignores follow-up turns. It
+    auto-answers the first allow option and builds ATIF from
+    `tool_call`/`tool_call_update` by `toolCallId`, taking cost from
+    `usage_update.cost`. A kaijutsu `agent.json` is cheap to add.
+    Follow-up turns are the gap to decide on for Harbor runs.
 - **A failed follow-up turn has no structured ACP signal.** The runner
   matches agent text "stream error: …".
 - **A hook-raised permission request's title is the hook's stderr**, not
   the command asked about.
 - **The host fleet takes about 60 s**, mostly a 3 s quiet wait after each
-  prompt. Mock replies a scenario never used go unreported. The wait has no
-  explicit replacement today: ACP v1 has no idle notification, and the
-  bridge reports turn completion only for the interactive turn a
-  `session/prompt` waits on (`crates/kaijutsu-acp/src/session.rs`). A
-  follow-up turn started by a permission answer or a background completion
-  ends with no ACP message. Replacing the wait needs the bridge to say so,
-  for example with an extension notification or `_meta` on a
-  `usage_update`; that is a design choice.
+  prompt. Mock replies a scenario never used go unreported. ACP v1 has no
+  idle notification, and the bridge reports turn completion only for the
+  interactive turn a `session/prompt` waits on
+  (`crates/kaijutsu-acp/src/session.rs`). A follow-up turn started by a
+  permission answer or a background completion ends with no ACP message.
 - Add the `kaijutsu-acp --connect` agent.
 - **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
   the kernel's `turn_interrupted=true` log line from stderr. The bridge's
   own "soft interrupt sent" line does not serve: `interruptContext` answers
   `success` when it only closed a continuation (`turn_interrupted ||
   continuation_closed`, `crates/kaijutsu-server/src/rpc.rs`), so the line
-  also appears when no turn was running. The bridge should log, or return,
-  which one happened.
+  also appears when no turn was running.
 - **A gated `shell_write` is announced `in_progress`** before the gate
   refuses it as pending, so "in progress" on the wire does not mean the
   command is running.

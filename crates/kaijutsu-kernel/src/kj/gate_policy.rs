@@ -1719,6 +1719,28 @@ uncovered = "allow"
         );
     }
 
+    /// The shipped default leaves a model's `shell_write` statement to ask,
+    /// and ships the allow that removes that first ask as a commented
+    /// example: loosening is the operator's choice, per seat (F16).
+    #[test]
+    fn the_shipped_default_comments_out_the_shell_write_allow() {
+        const EXAMPLE_LINES: [&str; 2] = ["#   [context_type.coder]", "#   allow = [\"shell_write\"]"];
+        let shipped = crate::config_seed::DEFAULT_GATE_CONFIG;
+        assert!(
+            shipped.contains(&EXAMPLE_LINES.join("\n")),
+            "the shipped gate.toml must carry the shell_write example verbatim"
+        );
+        let source = "shell_write 'git commit -m \"a message\"'";
+        assert_eq!(first_verdict(source, &config(shipped), Some("coder")), PolicyVerdict::Uncovered);
+        let uncommented: String = EXAMPLE_LINES.iter().map(|l| format!("{}\n", &l[4..])).collect();
+        let v = first_verdict(source, &config(&uncommented), Some("coder"));
+        assert_eq!(
+            allow_keys(&v),
+            vec![(Layer::ContextTypeConfig("coder".to_string()), "shell_write".to_string())],
+            "got {v:?}"
+        );
+    }
+
     /// Absent is today's behavior, and the shipped default leaves it absent.
     #[test]
     fn the_shipped_default_leaves_the_uncovered_tier_at_ask() {
