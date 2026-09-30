@@ -2344,8 +2344,6 @@ and burn down all the approval options". Delete each line as it ships.
   without an ask. Closing it needs the bridge identity
   (`docs/character.md`, "The bridge identity: a key per model character")
   and a `[context_type.mcp]` allow tier wide enough for daily reads.
-- **F7** ACP prompts show only the description (200-char prefix, hook
-  stderr); an ask unanswered for 30 s is never offered again.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
   auto-allows leave no row; a dry run with no reviewer records nothing;
   the ORIGIN column is narrower than `shell_gate`.
@@ -2402,12 +2400,15 @@ and burn down all the approval options". Delete each line as it ships.
   under `with_subscriber`.
 - **Tests** The ACP part of the conformance matrix ships in
   `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
-  approval matrix"); scenarios marked `known_gap` name F7 and F8.
+  approval matrix"); scenarios marked `known_gap` name F8.
   The ACP bridge offers "always allow" and "always deny", so rule scenarios
   run through ACP. Paths C and D need a harness of their own. A rule added
   between an ask and its answer does not reach that approval: Amy, "the
   policy at the time the command was first evaluated should cover its
-  lifetime"; `e-rule-added-after-ask-leaves-it-alone.toml` holds it.
+  lifetime"; `e-rule-added-after-ask-leaves-it-alone.toml` holds it. A
+  model's turn holds on its ask, so that scenario and
+  `d-shell-write-runs-what-was-shown.toml` change state between ask and
+  answer through a sibling call in the same reply.
 
 ## What a replacement risk scorer inherits (2026-09-28)
 
@@ -2520,7 +2521,8 @@ for when it's contained in docker". Open:
     `usage_update.cost`. A kaijutsu `agent.json` is cheap to add.
     Amy, 2026-09-30: an opt-in flag holds `session/prompt` open until
     the context goes idle, with follow-up turns included, so Harbor
-    sees the whole run.
+    sees the whole run. A model's own ask no longer starts a follow-up
+    turn: the turn holds on it, inside the prompt.
 - **A failed follow-up turn has no structured ACP signal.** The runner
   matches agent text "stream error: …".
 - **A hook-raised permission request's title is the hook's stderr**, not
@@ -2529,8 +2531,11 @@ for when it's contained in docker". Open:
   prompt. Mock replies a scenario never used go unreported. ACP v1 has no
   idle notification, and the bridge reports turn completion only for the
   interactive turn a `session/prompt` waits on
-  (`crates/kaijutsu-acp/src/session.rs`). A follow-up turn started by a
-  permission answer or a background completion ends with no ACP message.
+  (`crates/kaijutsu-acp/src/session.rs`). A follow-up turn started by an
+  answer to an ask that holds no turn (no stored command, the MCP path) or
+  by a background completion ends with no ACP message. A model's own ask
+  holds `session/prompt` open, so for those prompts the quiet wait only
+  catches unexpected late messages and could shrink.
 - Add the `kaijutsu-acp --connect` agent.
 - **A `session/cancel` has no acknowledgment**, so the cancel scenario reads
   the kernel's `turn_interrupted=true` log line from stderr. The bridge's
@@ -2538,9 +2543,17 @@ for when it's contained in docker". Open:
   `success` when it only closed a continuation (`turn_interrupted ||
   continuation_closed`, `crates/kaijutsu-server/src/rpc.rs`), so the line
   also appears when no turn was running.
-- **A gated `shell_write` is announced `in_progress`** before the gate
-  refuses it as pending, so "in progress" on the wire does not mean the
-  command is running.
+- **A gated `shell_write` is announced `in_progress`**, then reported
+  `failed` with the waiting text ("nothing was run"), then `pending`,
+  before its answer settles it. Neither "in progress" nor "failed" on the
+  wire is final. An approved call's last update carries only
+  `rawOutput.exit_code`, so the client shows the waiting text as its only
+  content, though the model read the real output.
+- **A permission request answered `cancelled` leaves its ask pending**, and
+  the bridge does not offer it again (`answer_ask` in
+  `crates/kaijutsu-acp/src/permission.rs`), so a turn holding on it waits
+  until `session/cancel`. Seen when a fleet run answered a second offer
+  `cancelled`: the prompt never returned.
 
 ## Egress: what stays open (2026-09-21)
 

@@ -25,6 +25,10 @@ use serde_json::{Value, json};
 /// How many trailing stderr lines an error message carries.
 const STDERR_TAIL_LINES: usize = 40;
 
+/// How often [`AcpClient::pump_until_state`] rechecks its condition while no
+/// message arrives.
+pub const POLL: Duration = Duration::from_millis(50);
+
 /// The command that starts an ACP agent: a program, its arguments, extra
 /// environment, and the directory it is launched in.
 #[derive(Debug, Clone)]
@@ -368,9 +372,22 @@ impl AcpClient {
         within: Duration,
         done: impl Fn(&[Value]) -> bool,
     ) -> Result<()> {
+        self.pump_until_state(request, what, within, |client| done(&client.updates))
+    }
+
+    /// [`Self::pump_until`] for a condition on the whole client, such as
+    /// held permission requests, or on something outside the wire, such as a
+    /// file: `done` is also checked every [`POLL`] while no message arrives.
+    pub fn pump_until_state(
+        &mut self,
+        request: Option<i64>,
+        what: &str,
+        within: Duration,
+        mut done: impl FnMut(&Self) -> bool,
+    ) -> Result<()> {
         let deadline = Instant::now() + within;
         loop {
-            if done(&self.updates) {
+            if done(self) {
                 return Ok(());
             }
             if let Some(response) = self.parked.iter().find(|m| request.is_some() && response_id(m) == request) {
@@ -379,7 +396,23 @@ impl AcpClient {
                     self.stderr_tail()
                 );
             }
-            let message = self.next_message(deadline, what)?;
+            let now = Instant::now();
+            if now >= deadline {
+                bail!("timed out after {within:?} waiting for {what}\n--- agent stderr (tail) ---\n{}", self.stderr_tail());
+            }
+            let line = match self.lines.recv_timeout(POLL.min(deadline - now)) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => bail!(
+                    "the agent closed stdout while we waited for {what}\n--- agent stderr (tail) ---\n{}",
+                    self.stderr_tail()
+                ),
+            };
+            if self.trace {
+                eprintln!("acp-fleet <- {line}");
+            }
+            let message: Value = serde_json::from_str(&line)
+                .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))?;
             if response_id(&message).is_some() {
                 self.parked.push(message);
             } else {
@@ -464,19 +497,26 @@ impl AcpClient {
         (Some(outcome), record)
     }
 
-    /// How many permission requests are held unanswered.
-    pub fn held_count(&self) -> usize {
-        self.held.len()
+    /// How many permission requests are held unanswered, counting only those
+    /// whose record index in [`Self::permissions`] is at least `since`.
+    pub fn held_count(&self, since: usize) -> usize {
+        self.held.iter().filter(|(_, index)| *index >= since).count()
     }
 
-    /// Answer the oldest held permission request with `answer`, which must
-    /// not be [`PermissionAnswer::Hold`]. The answer and any problem applying
-    /// it replace the ones on the request's record.
-    pub fn release_held(&mut self, answer: PermissionAnswer) -> Result<()> {
+    /// Answer the oldest held permission request whose record index is at
+    /// least `since` with `answer`, which must not be
+    /// [`PermissionAnswer::Hold`]. The answer and any problem applying it
+    /// replace the ones on the request's record.
+    pub fn release_held(&mut self, since: usize, answer: PermissionAnswer) -> Result<()> {
         if answer == PermissionAnswer::Hold {
             bail!("release_held needs an answer, not another hold");
         }
-        let (id, index) = self.held.pop_front().context("no permission request is held")?;
+        let position = self
+            .held
+            .iter()
+            .position(|(_, index)| *index >= since)
+            .context("no permission request is held")?;
+        let (id, index) = self.held.remove(position).expect("the position was just found");
         let record = &mut self.permissions[index];
         record.answer = Some(answer);
         let outcome = outcome_for(answer, record);

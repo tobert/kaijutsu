@@ -1,4 +1,4 @@
-description = "Property (d), path A: an ask answered \"always allow\" through ACP runs the approved command, as an allow once does, and starts the follow-up turn."
+description = "Property (d), path A: an ask answered \"always allow\" through ACP runs the approved command, as an allow once does, and the held turn goes on."
 
 gate = """
 [global]
@@ -7,14 +7,14 @@ gate = """
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir made" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "ran once"
 
 [[prompt]]
 text = "make the made directory"
 permissions = ["allow_always"]
-text_contains = ["asked", "ran once"]
+permission_titles = ["shell_write: 1 statement(s) — mkdir made"]
+text_contains = ["ran once"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }]
 
 [[verify]]
 path = "made"

@@ -8,29 +8,23 @@ gate = """
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "noted"
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
 text = "ran it"
 
-# The request is held and answered "always allow" after prompt 2, outside
-# the ask's continuation window, so no follow-up model turn runs whatever
-# the approved command does (F14 decides whether it runs at all).
+# The client answers "always allow", which remembers an exact-text rule, and
+# the held turn runs the command.
 [[prompt]]
 text = "record a run"
-permissions = ["hold"]
+permissions = ["allow_always"]
 permission_titles = ["echo ran >> runs.txt"]
-text_contains = ["asked"]
-
-[[prompt]]
-text = "wait"
-release = ["allow_always"]
 text_contains = ["noted"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }]
 
-# An operator then denies echo in gate.toml. The learned allow still wins.
+# An operator then denies echo in gate.toml. The learned allow still wins,
+# with no ask.
 [[prompt]]
 text = "record another run"
 gate = """
@@ -42,4 +36,4 @@ tool_calls = [{ title = "shell_write", status = "completed" }]
 
 [[verify]]
 path = "runs.txt"
-contains = "ran\n"
+equals = "ran\nran\n"

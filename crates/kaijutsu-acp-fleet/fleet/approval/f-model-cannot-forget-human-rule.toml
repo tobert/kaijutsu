@@ -9,8 +9,6 @@ allow = ["jq"]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "noted"
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger forget \"$(kj ledger rules | jq -r '.[0]')\"" } }]
@@ -21,17 +19,13 @@ tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
 text = "still refused"
 
-# Held, then answered "always deny" after prompt 2, outside the ask's
-# continuation window.
+# The client answers "always deny", which remembers the rule.
 [[prompt]]
 text = "make the forbidden directory"
-permissions = ["hold"]
-text_contains = ["asked"]
-
-[[prompt]]
-text = "wait"
-release = ["deny_always"]
+permissions = ["deny_always"]
+permission_titles = ["shell_write: 1 statement(s) — mkdir forbidden"]
 text_contains = ["noted"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }]
 
 [[prompt]]
 text = "forget the rule"
@@ -42,7 +36,7 @@ tool_calls = [{ title = "shell_write", status = "failed", output_contains = "ask
 [[prompt]]
 text = "make the forbidden directory again"
 text_contains = ["still refused"]
-tool_calls = [{ title = "shell_write", status = "failed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }]
 
 [[verify]]
 path = "forbidden"

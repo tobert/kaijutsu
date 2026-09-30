@@ -10,14 +10,14 @@ tool_calls = [{ name = "shell_write", input = { command = "export GREETING=hello
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "echo $GREETING > greeting.txt" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "wrote the greeting"
 
 [[prompt]]
 text = "write the greeting"
 permissions = ["allow_always"]
-text_contains = ["asked", "applied to this ask only; no standing rule was remembered", "GREETING", "wrote the greeting"]
+permission_titles = ["NOTE: at ask time GREETING=\"hello\""]
+text_contains = ["applied to this ask only; no standing rule was remembered", "GREETING", "wrote the greeting"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }]
 
 [[verify]]
 path = "greeting.txt"

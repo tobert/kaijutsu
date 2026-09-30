@@ -55,8 +55,6 @@ exit 3
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "left it alone"
 
 [[prompt]]
@@ -64,7 +62,7 @@ text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
 
 [[verify]]
 path = "doomed"
@@ -105,17 +103,17 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
-| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until a later prompt's `release`. |
-| `prompt.release` | Answers for requests earlier prompts held, oldest first, sent once this prompt's turn ends. Any answer but `hold`. |
+| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
+| `prompt.release` | Answers for the requests this prompt holds, oldest first, sent while the prompt is open: once every held request has arrived, and after `on_hold`. Each answer after the first waits until the bridge has recorded the one before it. Any answer but `hold`. See "Held requests". |
+| `prompt.on_hold` | `{ write = "<file>", wait_for = "<path>" }`: once every held request has arrived, write the workspace file `write`, then wait for `wait_for` to exist, before sending `release`. See "Held requests". |
 | `prompt.gate` | Replace the kernel's `gate.toml` with this before sending the prompt, as an operator editing it would. Host mode only; the agent then runs with a named `--state-dir` in the scratch directory. |
-| `prompt.wait_for_text` | After the turn ends, wait until the prompt's agent text contains this, before the quiet wait. For a message that comes later than the quiet wait, such as a permission timeout. |
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
-| `prompt.text_contains` | Substrings of the agent's message text, including text from follow-up turns. |
+| `prompt.text_contains` | Substrings of the agent's message text, including any that arrive during the quiet wait. |
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains`. |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
-| `known_gap` | `{ finding = "F7", fails = ["verify offered"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
+| `known_gap` | `{ finding = "F8", fails = ["prompt 2: expected tool calls"] }`: the scenario reproduces a recorded finding. It must fail, and every failure must contain one of the `fails` substrings. See "The approval matrix". |
 
 Unknown keys are refused, so a misspelled expectation fails the load instead
 of checking nothing. Paths must stay inside the workspace or rc tree.
@@ -158,10 +156,10 @@ and the ACP prompt is `session/request_permission`.
 | (e) A later deny refuses before anyone is asked | pass (hook) | | |
 | (e′) A rule added after the ask leaves it alone | pass | | |
 | (f) A model cannot forget a human's rule | pass | | |
-| (g) An unanswered prompt is offered again | | | gap F7 |
+| (g) An unanswered prompt is offered again | | | pass |
 
 ```toml
-known_gap = { finding = "F7", fails = ["verify offered"] }
+known_gap = { finding = "F8", fails = ["prompt 2: expected tool calls"] }
 ```
 
 A scenario with a `known_gap` reports `GAP` while the finding holds. It
@@ -177,6 +175,12 @@ was first evaluated should cover its lifetime". A prompt's `gate` stands in
 for an operator editing `gate.toml`, which (b) needs: a config deny keeps
 a command from ever asking, so the rule has to be learned first. (b) runs
 its commands only under `shell_write`, so path B has no cell for it.
+
+A model's turn holds on its own ask, so it cannot change anything between
+an ask and its answer; only a sibling call in the same reply can. (d) and
+(e′) use one. In (d) a sibling changes the cwd and a variable while the
+ask is held. In (e′) two identical calls ask together, the first is
+answered "always deny", and the second is allowed after the rule exists.
 
 Path B has no rule scenarios, and the RPC shells (path C) and
 kaijutsu-mcp (path D) have no ACP entry.
@@ -224,16 +228,43 @@ files the agent reads: the mock script, the gate policy, and the rc
 overlay. The runner starts a fresh `kaijutsu-solo-acp --backend-kind mock
 --model fleet-mock --gate-config <gate>`, sends `initialize`, `session/new`
 with the workspace as cwd, then each prompt. After each prompt's response
-it waits until the update stream has been silent for 3 seconds: permission
-requests, and the follow-up turns their answers start, arrive after the
-response. It closes stdin at the end, so the agent removes its own
-temporary state, then checks the workspace and removes the scratch
-directory. `--keep` keeps it.
+it waits until the update stream has been silent for 3 seconds, which
+catches a message a prompt did not expect, such as a permission request
+or a follow-up turn from an ask that does not hold a turn. It closes stdin
+at the end, so the agent removes its own temporary state, then checks the
+workspace and removes the scratch directory. `--keep` keeps it.
 
-A gate ask does not hold the turn open. The gated call is refused as
-pending, the turn ends, and `session/request_permission` arrives. An allowed
-command runs and starts a follow-up model turn, so a scenario scripts a
-reply for it; `fleet/permission-allow-deny.toml` shows the whole shape.
+A model's gated call holds its turn (`docs/gate-resume.md`, "The turn
+holds"). The call is reported `in_progress`, then `failed` with the waiting
+text, then `pending`; `session/request_permission` arrives while
+`session/prompt` is still open. The bridge records the answer as a `kj`
+tool call, the approved command runs, the call settles `completed` or
+`failed`, and the same turn goes on with the result. A scenario scripts
+one reply after the call and no follow-up turn;
+`fleet/permission-allow-deny.toml` shows the whole shape. Since every
+permission request a model's turn raises now arrives before the response,
+the quiet wait could shrink or end at the response for such prompts; it
+stays at 3 seconds until the bridge reports turn state (`docs/issues.md`,
+"ACP fleet: what stays open").
+
+## Held requests
+
+```toml
+permissions = ["hold"]
+release = ["allow"]
+on_hold = { write = "asked", wait_for = "d-drifted" }
+```
+
+A held request gets no response until the runner sends its `release`
+answer, while the prompt is still open. The runner waits for every
+request the prompt holds, runs `on_hold`, then answers. Between two
+`release` answers it waits for the bridge's `kj` call for the first to
+complete, so the second is decided under whatever the first changed.
+`fleet/approval/d-shell-write-runs-what-was-shown.toml` uses `on_hold` to
+let a sibling call change the cwd and env after the ask exists and before
+the answer. A held request with no `release` answer is never answered:
+`fleet/approval/g-unanswered-prompt-offered-again.toml` lets the bridge
+time it out after 30 s and answers the second offer of the same ask.
 
 ## Contained mode
 

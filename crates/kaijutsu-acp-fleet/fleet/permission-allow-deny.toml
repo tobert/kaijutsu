@@ -1,16 +1,14 @@
-description = "A gated shell command asks the client; allow runs it, deny leaves the workspace untouched."
+description = "A gated shell command asks the client and the turn holds on the answer; allow runs it, deny leaves the workspace untouched, and each turn goes on only after its answer."
 
 # An empty policy: every shell_write statement is uncovered and asks.
 gate = """
 [global]
 """
 
-# Prompt 1: the call is refused as pending, the turn ends, the client allows,
-# the command runs, and a follow-up turn reads the result.
+# Prompt 1: the call asks, the turn holds, the client allows, the command
+# runs, and the same turn goes on with its result. There is no follow-up turn.
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir granted" } }]
-[[model]]
-text = "waiting on the reviewer"
 [[model]]
 text = "granted exists now"
 
@@ -18,21 +16,22 @@ text = "granted exists now"
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir refused" } }]
 [[model]]
-text = "waiting on the reviewer again"
-[[model]]
 text = "refused was not made"
 
+# The `kj` call is the ACP bridge recording the client's answer.
 [[prompt]]
 text = "make the granted directory"
 permissions = ["allow"]
-text_contains = ["waiting on the reviewer", "granted exists now"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj" }]
+permission_titles = ["shell_write: 1 statement(s) — mkdir granted"]
+text_contains = ["granted exists now"]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }]
 
 [[prompt]]
 text = "make the refused directory"
 permissions = ["deny"]
-text_contains = ["waiting on the reviewer again", "refused was not made"]
-tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+permission_titles = ["shell_write: 1 statement(s) — mkdir refused"]
+text_contains = ["refused was not made"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
 
 [[verify]]
 path = "granted"

@@ -13,16 +13,14 @@ exit 3
 [[model]]
 tool_calls = [{ name = "shell", input = { command = "mkdir escaped" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "after the approval"
 
 [[prompt]]
 text = "make the escaped directory"
 permissions = ["allow"]
 permission_titles = ["fleet hook asks about: mkdir escaped"]
-text_contains = ["asked"]
-tool_calls = [{ title = "shell" }, { title = "kj" }]
+text_contains = ["after the approval"]
+tool_calls = [{ title = "shell", status = "failed", output_contains = "read-only shell (no writes)" }, { title = "kj", status = "completed", output_contains = "allowed ask" }]
 
 [[verify]]
 path = "escaped"

@@ -4,41 +4,45 @@ gate = """
 [global]
 """
 
+# One reply makes the same call twice. The two calls run concurrently, so
+# both ask before either is answered, and the turn holds on both.
+[[model]]
+tool_calls = [
+  { name = "shell_write", input = { command = "mkdir late" } },
+  { name = "shell_write", input = { command = "mkdir late" } },
+]
+[[model]]
+text = "one refused, one ran"
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
 [[model]]
-text = "asked once"
-[[model]]
-tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
-[[model]]
-text = "asked twice"
-[[model]]
-text = "noted"
-[[model]]
-text = "noted again"
+text = "the rule refused it"
 
-# Two asks for the same command, both held. The first is answered "always
-# deny", which remembers a deny rule; only then is the second allowed. The
-# rule came after the second ask was evaluated, so the approval runs.
+# Both requests are held until both have arrived. The first is answered
+# "always deny", which remembers a deny rule; only once the bridge has
+# recorded that is the second allowed. The rule came after the second ask
+# was evaluated, so the approval runs.
 [[prompt]]
-text = "make the late directory"
-permissions = ["hold"]
-text_contains = ["asked once"]
+text = "make the late directory twice"
+permissions = ["hold", "hold"]
+release = ["deny_always", "allow"]
+permission_titles = ["mkdir late", "mkdir late"]
+text_contains = ["one refused, one ran"]
+# The two calls may ask in either order, so their statuses are not checked
+# here; `late` existing afterward is the approved one. The `kj` calls are the
+# bridge recording each answer, in the order the runner sent them.
+tool_calls = [
+  { title = "shell_write" },
+  { title = "shell_write" },
+  { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" },
+  { title = "kj", status = "completed", output_contains = "allowed ask" },
+]
 
+# The rule is in force: the same command is refused with no ask.
 [[prompt]]
 text = "make it again"
-permissions = ["hold"]
-text_contains = ["asked twice"]
-
-[[prompt]]
-text = "wait"
-release = ["deny_always"]
-text_contains = ["noted"]
-
-[[prompt]]
-text = "wait again"
-release = ["allow"]
-text_contains = ["noted again"]
+text_contains = ["the rule refused it"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }]
 
 [[verify]]
 path = "late"

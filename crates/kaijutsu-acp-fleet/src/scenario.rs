@@ -114,15 +114,17 @@ pub struct Prompt {
     /// When present, send `session/cancel` during this prompt's turn.
     #[serde(default)]
     pub cancel: Option<Cancel>,
-    /// Answers for permission requests earlier prompts answered `hold`,
-    /// oldest first, given once this prompt's turn has ended.
+    /// Answers for the requests this prompt answered `hold`, oldest first,
+    /// given while the prompt is still open: once every request it holds
+    /// has arrived, and after `on_hold`. Each answer after the first waits
+    /// until the agent has recorded the one before it. A held request with
+    /// no answer here stays unanswered.
     #[serde(default)]
     pub release: Vec<Answer>,
-    /// After the turn ends, wait until the agent's text for this prompt
-    /// contains this, before the quiet wait. For a message that arrives
-    /// later than the quiet wait allows, such as a permission timeout.
+    /// What the runner does once every request this prompt holds has
+    /// arrived, before it sends `release`.
     #[serde(default)]
-    pub wait_for_text: Option<String>,
+    pub on_hold: Option<OnHold>,
     /// Replace the kernel's `gate.toml` with this before sending the prompt,
     /// as an operator editing it would. Host mode only.
     #[serde(default)]
@@ -141,6 +143,21 @@ pub struct Cancel {
     /// cancel lands.
     #[serde(default)]
     pub release: Option<String>,
+}
+
+/// Out-of-band work while a prompt's permission requests are held: the
+/// model's turn is waiting on them, and a sibling tool call can act.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnHold {
+    /// A workspace-relative file to write, so a command that waits for it
+    /// runs only after the asks exist.
+    #[serde(default)]
+    pub write: Option<String>,
+    /// A workspace-relative path to wait for, after `write`, before the
+    /// held requests are answered.
+    #[serde(default)]
+    pub wait_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -243,7 +260,6 @@ impl Scenario {
         for path in self.rc.keys() {
             workspace_relative(path).context("an [rc] path is relative to the rc tree")?;
         }
-        let mut held = 0;
         for (n, prompt) in self.prompt.iter().enumerate() {
             if prompt.gate.is_some() && self.mode != Mode::Host {
                 bail!("[[prompt]] {}: `gate` edits the kernel's config on the host; contained scenarios cannot use it", n + 1);
@@ -251,10 +267,21 @@ impl Scenario {
             if prompt.release.contains(&Answer::Hold) {
                 bail!("[[prompt]] {}: `release` answers held requests; `hold` is not an answer there", n + 1);
             }
+            let held = prompt.permissions.iter().filter(|a| **a == Answer::Hold).count();
             if prompt.release.len() > held {
-                bail!("[[prompt]] {}: `release` has {} answers, but earlier prompts hold only {held}", n + 1, prompt.release.len());
+                bail!("[[prompt]] {}: `release` has {} answers, but this prompt holds only {held}", n + 1, prompt.release.len());
             }
-            held = held - prompt.release.len() + prompt.permissions.iter().filter(|a| **a == Answer::Hold).count();
+            if let Some(on_hold) = &prompt.on_hold {
+                if held == 0 {
+                    bail!("[[prompt]] {}: `on_hold` runs once this prompt's held requests arrive, but it holds none", n + 1);
+                }
+                if on_hold.write.is_none() && on_hold.wait_for.is_none() {
+                    bail!("[[prompt]] {}: `on_hold` needs `write`, `wait_for`, or both", n + 1);
+                }
+                for path in on_hold.write.iter().chain(&on_hold.wait_for) {
+                    workspace_relative(path).with_context(|| format!("[[prompt]] {}: `on_hold`", n + 1))?;
+                }
+            }
             if let Some(release) = prompt.cancel.as_ref().and_then(|c| c.release.as_ref()) {
                 workspace_relative(release).with_context(|| format!("[[prompt]] {}: `cancel.release`", n + 1))?;
             }
@@ -479,12 +506,27 @@ text = "go"
     }
 
     #[test]
-    fn a_release_needs_an_earlier_hold() {
+    fn a_release_answers_only_its_own_prompts_holds() {
         let text = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\nrelease = [\"allow\"]");
-        assert!(refusal(&text).contains("hold only 0"), "{}", refusal(&text));
-        let held = format!("{}\n[[prompt]]\ntext = \"later\"\nrelease = [\"allow\"]\n",
+        assert!(refusal(&text).contains("holds only 0"), "{}", refusal(&text));
+        let later = format!("{}\n[[prompt]]\ntext = \"later\"\nrelease = [\"allow\"]\n",
             MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\npermissions = [\"hold\"]"));
-        Scenario::parse(&held, "held").unwrap();
+        assert!(refusal(&later).contains("holds only 0"), "{}", refusal(&later));
+        let own = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\npermissions = [\"hold\"]\nrelease = [\"allow\"]");
+        Scenario::parse(&own, "held").unwrap();
+    }
+
+    #[test]
+    fn on_hold_needs_a_hold_and_paths_inside_the_workspace() {
+        let bare = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\non_hold = { write = \"go\" }");
+        assert!(refusal(&bare).contains("holds none"), "{}", refusal(&bare));
+        let held = |on_hold: &str| {
+            MINIMAL.replace("text = \"say hi\"", &format!("text = \"say hi\"\npermissions = [\"hold\"]\non_hold = {on_hold}"))
+        };
+        assert!(refusal(&held("{}")).contains("needs `write`"), "{}", refusal(&held("{}")));
+        let escape = held("{ wait_for = \"../x\" }");
+        assert!(refusal(&escape).contains("inside the workspace"), "{}", refusal(&escape));
+        Scenario::parse(&held("{ write = \"go\", wait_for = \"done\" }"), "on_hold").unwrap();
     }
 
     #[test]

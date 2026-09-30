@@ -15,11 +15,13 @@ use serde_json::Value;
 
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
-use crate::scenario::{Cancel, KnownGap, Mode, Prompt, Scenario, Verify, workspace_relative};
+use crate::scenario::{Answer, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative};
 
 /// How long the update stream must stay silent after a prompt's response
-/// before the prompt is judged. Permission requests, and the follow-up turns
-/// their answers start, arrive after the response.
+/// before the prompt is judged. A model's turn holds on its own ask, so its
+/// permission requests arrive before the response; the wait catches what
+/// still comes later, such as a follow-up turn from an ask that did not hold
+/// the turn, or a request a prompt expected not to raise.
 pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// The model name the agent is started with, and so the mock script's file stem.
@@ -356,20 +358,9 @@ fn converse(
         if let Some(cancel) = &prompt.cancel {
             cancel_mid_call(agent, &session, id, cancel, &scratch.workspace, timeout).with_context(|| label.clone())?;
         }
+        release_holds(agent, id, prompt, updates_before, permissions_before, &scratch.workspace, timeout)
+            .with_context(|| label.clone())?;
         let response = agent.wait_response(id, "session/prompt").with_context(|| label.clone())?;
-        for answer in &prompt.release {
-            agent.release_held((*answer).into()).with_context(|| format!("{label}: release a held permission request"))?;
-        }
-        if let Some(needle) = &prompt.wait_for_text {
-            let what = format!("agent text containing {needle:?}");
-            agent
-                .pump_until(None, &what, timeout, |updates| client::agent_text(&updates[updates_before..]).contains(needle.as_str()))
-                .with_context(|| label.clone())?;
-        }
-        // A gate ask does not hold the turn open: the tool call is refused as
-        // pending, the turn ends, and the permission request follows. An
-        // answer can start a follow-up model turn. Waiting for silence also
-        // catches a request a prompt expected not to raise.
         agent.pump_until_quiet(SETTLE, timeout, &label)?;
         let seen = Seen {
             response: &response,
@@ -379,6 +370,56 @@ fn converse(
         failures.extend(check_prompt(&label, prompt, &seen));
     }
     Ok(())
+}
+
+/// Answer the requests `prompt` holds while its turn waits on them. Once
+/// every held request has arrived, run `on_hold`, then send each `release`
+/// answer, waiting after each one but the last until the agent has recorded
+/// it: its `kj` ledger call completes. The next answer is then decided
+/// under whatever the previous one changed, such as a remembered rule.
+fn release_holds(
+    agent: &mut AcpClient,
+    request: i64,
+    prompt: &Prompt,
+    updates_before: usize,
+    permissions_before: usize,
+    workspace_host: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let holds = prompt.permissions.iter().filter(|a| **a == Answer::Hold).count();
+    if holds == 0 {
+        return Ok(());
+    }
+    let what = format!("{holds} held permission request(s)");
+    agent.pump_until_state(Some(request), &what, timeout, |a| a.held_count(permissions_before) >= holds)?;
+    if let Some(OnHold { write, wait_for }) = &prompt.on_hold {
+        if let Some(write) = write {
+            let target = workspace_host.join(workspace_relative(write)?);
+            std::fs::write(&target, "").with_context(|| format!("on_hold: write {}", target.display()))?;
+        }
+        if let Some(wait_for) = wait_for {
+            let target = workspace_host.join(workspace_relative(wait_for)?);
+            let what = format!("on_hold: {wait_for} to exist");
+            agent.pump_until_state(Some(request), &what, timeout, |_| target.exists())?;
+        }
+    }
+    for (n, answer) in prompt.release.iter().enumerate() {
+        let recorded = completed_ledger_calls(&agent.updates()[updates_before..]);
+        agent.release_held(permissions_before, (*answer).into()).context("release a held permission request")?;
+        if n + 1 < prompt.release.len() {
+            let what = format!("the agent to record release answer {}", n + 1);
+            agent.pump_until(Some(request), &what, timeout, |updates| {
+                completed_ledger_calls(&updates[updates_before..]) > recorded
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// How many `kj` tool calls in `updates` have completed: the ACP bridge
+/// reports each permission answer it records as one.
+fn completed_ledger_calls(updates: &[Value]) -> usize {
+    client::tool_calls(updates).iter().filter(|c| c.title == "kj" && c.status.as_deref() == Some("completed")).count()
 }
 
 /// What the solo agent's kernel logs once an interrupt has marked a running

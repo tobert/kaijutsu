@@ -1,44 +1,51 @@
-description = "Property (d), path A: an approved shell_write ask runs the command it showed, in the cwd and with the env it recorded, though both changed before the answer."
+description = "Property (d), path A: an approved shell_write ask runs the command it showed, in the cwd and with the env it recorded, though a sibling call changed both before the answer."
 
 gate = """
 [global]
-allow = ["mkdir", "cd", "export"]
+allow = ["mkdir", "cd", "export", "sleep"]
 """
 
-# Prompt 1: set a cwd and a variable, then an uncovered statement asks. The
-# client holds the permission request unanswered.
+# Set a cwd and a variable.
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir sub" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "cd sub" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "export SHOWN=shown-value" } }]
-[[model]]
-tool_calls = [{ name = "shell_write", input = { command = "echo $SHOWN > out.txt" } }]
-[[model]]
-text = "asked"
 
-# Prompt 2: change both before the answer, then the client allows the held
-# request. The approved command runs and its result arrives as a notice.
-# Prompt 2 started after the ask's continuation window, so no follow-up model
-# turn runs (docs/gate-resume.md, "Still open").
+# The turn holds on its own ask, so only a sibling call in the same reply can
+# change the context's cwd and env before the answer. The sibling waits for
+# the runner's `asked` file, written once the ask is offered, then leaves
+# sub, changes the variable, and makes `d-drifted` in the workspace root as
+# proof of both. The runner answers only after `d-drifted` exists.
 [[model]]
-tool_calls = [{ name = "shell_write", input = { command = "export SHOWN=drifted" } }]
+tool_calls = [
+  { name = "shell_write", input = { command = "echo $SHOWN > out.txt" } },
+  { name = "shell_write", input = { command = "while ! [[ -f ../asked ]]; do sleep 0.05; done; cd ..; export SHOWN=drifted; mkdir \"d-$SHOWN\"" } },
+]
+# The same turn then reads the context's live state: the workspace root and
+# SHOWN=drifted, which a command that ignored what the ask recorded would
+# have used.
 [[model]]
-tool_calls = [{ name = "shell_write", input = { command = "cd .." } }]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir \"after-$SHOWN\"" } }]
 [[model]]
-text = "drifted"
+text = "wrote it where it was shown"
 
 [[prompt]]
 text = "write the variable into sub"
 permissions = ["hold"]
-permission_titles = ["echo $SHOWN > out.txt\n\nNOTE: at ask time SHOWN="]
-text_contains = ["asked"]
-
-[[prompt]]
-text = "change the variable and leave sub"
 release = ["allow"]
-text_contains = ["drifted"]
+on_hold = { write = "asked", wait_for = "d-drifted" }
+permission_titles = ["echo $SHOWN > out.txt\n\nNOTE: at ask time SHOWN=\"shown-value\""]
+text_contains = ["wrote it where it was shown"]
+
+[[verify]]
+path = "d-drifted"
+exists = true
+
+[[verify]]
+path = "after-drifted"
+exists = true
 
 [[verify]]
 path = "sub/out.txt"

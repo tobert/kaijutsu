@@ -15,8 +15,6 @@ exit 3
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
 [[model]]
-text = "asked"
-[[model]]
 text = "left it alone"
 
 [[prompt]]
@@ -24,7 +22,7 @@ text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed" }, { title = "kj" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
 
 [[verify]]
 path = "doomed"
