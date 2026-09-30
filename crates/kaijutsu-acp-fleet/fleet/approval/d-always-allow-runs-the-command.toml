@@ -1,7 +1,5 @@
 description = "Property (d), path A: an ask answered \"always allow\" through ACP runs the approved command, as an allow once does, and starts the follow-up turn."
 
-known_gap = { finding = "F14", fails = ["agent text does not contain \"ran once\"", "verify made"] }
-
 gate = """
 [global]
 """

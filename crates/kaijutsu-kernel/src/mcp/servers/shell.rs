@@ -278,8 +278,9 @@ impl McpServerLike for ShellServer {
                 privileged: false,
                 cancel: cancel.clone(),
             };
-            // The gate records a durable ask without waiting. The approval
-            // driver or a matching retry consumes its answer once.
+            // The gate records a durable ask without waiting. The ask carries
+            // the command, so the approval worker runs it once when it is
+            // allowed; a retry of the same call does not.
             let gate_config =
                 crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
             let outcome = crate::kj::gate::run_gate(
@@ -558,12 +559,6 @@ mod tests {
         }
     }
 
-    /// `shell_write` is gated, and `run_gate` never waits (`docs/gate-resume.md`): a test that calls
-    /// it synchronously gets `Pending`/`GatePending` back immediately, with
-    /// nothing run, and a durable ask already sitting in the ledger. Answer
-    /// that ask directly — no poll loop, no spawned task — the way a human
-    /// running `kj ledger allow` would from another shell, then retry the
-    /// same call to redeem it.
     /// The sandbox posture: every uncovered statement is allowed without an
     /// ask, for tests whose subject is what happens after the gate.
     async fn allow_uncovered(d: &crate::kj::KjDispatcher) {
@@ -580,6 +575,11 @@ mod tests {
         assert!(err.to_string().contains("approval worker"), "{err}");
     }
 
+    /// `shell_write` is gated, and `run_gate` never waits (`docs/gate-resume.md`): a test that calls
+    /// it synchronously gets `Pending`/`GatePending` back immediately, with
+    /// nothing run, and a durable ask already sitting in the ledger. Answer
+    /// that ask directly — no poll loop, no spawned task — the way a human
+    /// running `kj ledger allow` would from another shell.
     fn answer_pending_ask(
         db: Arc<parking_lot::Mutex<crate::kernel_db::KernelDb>>,
         allow: bool,

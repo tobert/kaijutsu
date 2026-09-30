@@ -600,14 +600,7 @@ pub(crate) async fn run_gate_recorded(
                 let Some((request_id, status)) = found else { return Ok(None); };
                 let row = db.get_approval(&request_id)?
                     .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
-                // An allowed ask with a stored command runs only in the
-                // approval worker, with the values its reviewer saw; a retry
-                // never spends it. A denial reaches the retry as a denial. A
-                // paired caller's answer waits for its pair.
-                let held = (row.exec_source.is_some() && status.is_allowed())
-                    || (db.approval_pair_expected(&request_id)?
-                        && (row.exec_source.is_some() || !db.approval_pair_ready(&request_id)?));
-                if held { return Ok(Some((request_id, status, row, true))); }
+                if answer_is_held(db, &request_id, &row, status)? { return Ok(Some((request_id, status, row, true))); }
                 Ok(db.redeem_ask(&request_id)?.then_some((request_id, status, row, false)))
             };
             match caller.context_id {
@@ -673,6 +666,44 @@ pub(crate) async fn run_gate_recorded(
             Err(e) => {
                 return GateOutcome::unavailable_without_row(format!(
                     "approval gate could not check for an answer already given: {e} \
+                     (fail-closed — this is a ledger fault, not a decision)"
+                ));
+            }
+        }
+    }
+
+    // 2b. A covered call is the use of an answer that waits for it. An
+    //    allowed answer with no stored command authorizes its caller's
+    //    retry; when a rule or tier covers that retry instead, the retry
+    //    still spends the answer. Left unspent, the answer would authorize
+    //    the next identical call after a `kj ledger forget`. An answer the
+    //    approval worker or a pair owns is theirs to spend.
+    if matches!(verdict, AskVerdict::Allow) && spec.origin != Origin::HookResult {
+        let spent = {
+            let db = db.lock();
+            let spend = || -> KernelDbResult<Option<String>> {
+                let found = approval_ledger::ask::find_redeemable(
+                    db.conn_for_ledger(), &digest_refs, &spec.authorized_label,
+                    Some(context.as_slice()), Some(principal.as_slice()), caller.actor_id.as_bytes(),
+                )?;
+                let Some((request_id, status)) = found else { return Ok(None); };
+                if !status.is_allowed() { return Ok(None); }
+                let row = db.get_approval(&request_id)?
+                    .ok_or_else(|| approval_ledger::error::LedgerError::NotFound(request_id.clone()))?;
+                if answer_is_held(&db, &request_id, &row, status)? { return Ok(None); }
+                Ok(db.redeem_ask(&request_id)?.then_some(request_id))
+            };
+            spend()
+        };
+        match spent {
+            Ok(Some(request_id)) => {
+                tracing::info!(ask.spent = %request_id, "a covered call spent the answer that waited for it");
+                announce_ledger_change(db, ledger_flows);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return GateOutcome::unavailable_without_row(format!(
+                    "approval gate could not spend the answer this call uses: {e} \
                      (fail-closed — this is a ledger fault, not a decision)"
                 ));
             }
@@ -789,6 +820,21 @@ pub(crate) async fn run_gate_recorded(
             PENDING_REASON_RETRY.to_string()
         },
     }
+}
+
+/// Whether an answer belongs to someone other than a caller's retry. An
+/// allowed ask with a stored command runs only in the approval worker, with
+/// the values its reviewer saw. A paired caller's answer waits for its pair.
+/// A denial with neither reaches the retry as a denial.
+fn answer_is_held(
+    db: &KernelDb,
+    request_id: &str,
+    row: &approval_ledger::types::ApprovalRow,
+    status: ApprovalStatus,
+) -> KernelDbResult<bool> {
+    Ok((row.exec_source.is_some() && status.is_allowed())
+        || (db.approval_pair_expected(request_id)?
+            && (row.exec_source.is_some() || !db.approval_pair_ready(request_id)?)))
 }
 
 /// Record the ask [`run_gate`] would have raised, and ask nobody.

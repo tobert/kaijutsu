@@ -86,26 +86,13 @@ pub fn learn_from_approval(
         }
     }
 
-    // Learning a rule SPENDS the answer it was learned from. One human
-    // decision, one use — here the use is minting the rule rather than
-    // running the action once, and the action still proceeds because the
-    // rule now covers it.
-    //
-    // Without this the source ask sits decided and unredeemed for as long
-    // as the rule stands, because a covered call is answered by the rule
-    // and never reaches the redemption step at all. Forget the rule and
-    // that stale answer is the first thing the next identical call finds —
-    // so "forget" would not take effect, and a human decision from any
-    // time in the past would silently authorize a fresh request. Found by
-    // a test that refused to be weakened into passing.
-    //
-    // `INSERT OR IGNORE`: an ask whose answer was already delivered stays
-    // spent, and learning a rule from it is not a second use.
-    conn.execute(
-        "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
-        params![request_id],
-    )?;
-
+    // Learning a rule does not spend the answer it was learned from. The
+    // answer is still owed to its caller, and its delivery spends it: the
+    // approval worker runs a stored command once, and a caller's retry
+    // redeems an answer with no stored command (a retry that a rule covers
+    // spends it too). One human decision, one use; the rule covers later
+    // calls. A forget that lands before delivery leaves that one use in
+    // place. See `docs/gate-resume.md`.
     let rule_id = uuid::Uuid::now_v7().to_string();
     let now = now_millis();
     conn.execute(
@@ -242,9 +229,8 @@ pub fn revoke(conn: &Connection, rule_id: &str, by: &[u8]) -> Result<()> {
 /// conditions a family allow rests on are the kernel's to check before
 /// calling, since only it can plan the ask's source.
 ///
-/// Learning spends the answer it was learned from, exactly as
-/// [`learn_from_approval`] does and for the same reason: a forgotten rule
-/// must not leave a stale answer for the next identical call to find.
+/// Learning leaves the answer it was learned from for its delivery to
+/// spend, exactly as [`learn_from_approval`] does.
 pub fn learn_family_from_approval(
     conn: &Connection,
     request_id: &str,
@@ -263,11 +249,6 @@ pub fn learn_family_from_approval(
     if keys.is_empty() {
         return Err(LedgerError::NoFamilyKey(request_id.to_string()));
     }
-
-    conn.execute(
-        "INSERT OR IGNORE INTO approval_redemptions (request_id) VALUES (?1)",
-        params![request_id],
-    )?;
 
     let now = now_millis();
     let mut out = Vec::with_capacity(keys.len());
@@ -520,12 +501,115 @@ mod tests {
         decide(conn, request_id, DecideInput { allow: true, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
     }
 
+    fn decided_denied(conn: &Connection, request_id: &str) {
+        decide(conn, request_id, DecideInput { allow: false, decided_by: Some(reviewer(b"amy")), ..Default::default() }).unwrap();
+    }
+
+    /// Learn a rule of either kind from `request_id`, as `RULE_CREATOR`.
+    fn learn_either(conn: &Connection, request_id: &str, family: bool, allow: bool) -> String {
+        if family {
+            learn_family_from_approval(conn, request_id, &["rm"], RuleScope::Always, allow, Some(RULE_CREATOR)).unwrap()[0]
+                .rule_id
+                .clone()
+        } else {
+            learn_from_approval(conn, request_id, 0, RuleScope::Always, allow, Some(RULE_CREATOR)).unwrap().rule_id
+        }
+    }
+
+    fn is_undelivered(conn: &Connection, request_id: &str) -> bool {
+        crate::ask::undelivered_answers(conn).unwrap().iter().any(|a| a.request_id == request_id)
+    }
+
+    /// Learning a rule does not spend the answer it was learned from: the
+    /// answer is still owed to its caller, and the approval worker finds it
+    /// in `undelivered_answers`.
+    ///
+    /// Falsified by an `approval_redemptions` insert in either learn path:
+    /// the ask is redeemed and the worker never runs the approved command.
+    #[test]
+    fn learning_a_rule_leaves_the_answer_for_its_delivery() {
+        for family in [false, true] {
+            let conn = open_memory();
+            let request_id = create_ask(&conn, &ask_with_statement("digest-learn", VarBinding::Bound, "rm target")).unwrap();
+            decided_allowed(&conn, &request_id);
+            learn_either(&conn, &request_id, family, true);
+            assert!(crate::ask::redeemed_at(&conn, &request_id).unwrap().is_none(), "family={family}: learning spent the answer");
+            assert!(is_undelivered(&conn, &request_id), "family={family}: the worker must still see the answer");
+        }
+    }
+
+    /// Delivery spends a remembered answer once; the rule covers what
+    /// follows, and the answer authorizes nothing more.
+    #[test]
+    fn delivery_spends_a_remembered_answer_exactly_once() {
+        for family in [false, true] {
+            let conn = open_memory();
+            let ask = ask_with_statement("digest-once", VarBinding::Bound, "rm target");
+            let request_id = create_ask(&conn, &ask).unwrap();
+            decided_allowed(&conn, &request_id);
+            learn_either(&conn, &request_id, family, true);
+            assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}: delivery claims the answer");
+            assert!(!crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}: a second delivery must lose");
+            assert!(!is_undelivered(&conn, &request_id), "family={family}");
+            let found = crate::ask::find_redeemable(&conn, &["digest-once"], "rm target", None, None, &ask.actor_id).unwrap();
+            assert!(found.is_none(), "family={family}: a spent answer is not redeemable: {found:?}");
+        }
+    }
+
+    /// A forget that lands before delivery does not take the one approved
+    /// use away: the answer is still delivered, once. What the forget ends
+    /// is the rule's cover of later calls.
+    #[test]
+    fn a_forget_before_delivery_still_delivers_the_answer_exactly_once() {
+        for family in [false, true] {
+            let conn = open_memory();
+            let ask = ask_with_statement("digest-forget", VarBinding::Bound, "rm target");
+            let request_id = create_ask(&conn, &ask).unwrap();
+            decided_allowed(&conn, &request_id);
+            let rule_id = learn_either(&conn, &request_id, family, true);
+            revoke(&conn, &rule_id, RULE_CREATOR).unwrap();
+            assert!(is_undelivered(&conn, &request_id), "family={family}: the forget must not drop the answer");
+            assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}");
+            assert!(!crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}");
+            assert!(!is_undelivered(&conn, &request_id), "family={family}");
+            let found = crate::ask::find_redeemable(&conn, &["digest-forget"], "rm target", None, None, &ask.actor_id).unwrap();
+            assert!(found.is_none(), "family={family}: {found:?}");
+            let coverage = redeem(&conn, &["digest-forget"], "rm target", None, None).unwrap();
+            assert_eq!(coverage.verdict(), AskVerdict::Escalate, "family={family}: the forgotten rule covers nothing");
+            assert!(family_coverage(&conn, &["rm"], None, None).unwrap()[0].is_none(), "family={family}");
+        }
+    }
+
+    /// A deny rule learned from a denial refuses later calls, and the
+    /// denial itself still reaches its caller once.
+    #[test]
+    fn a_deny_rule_learned_from_a_denial_refuses_later_calls_and_delivers_the_denial_once() {
+        for family in [false, true] {
+            let conn = open_memory();
+            let request_id = create_ask(&conn, &ask_with_statement("digest-deny", VarBinding::Bound, "rm target")).unwrap();
+            decided_denied(&conn, &request_id);
+            learn_either(&conn, &request_id, family, false);
+            let answer = crate::ask::undelivered_answers(&conn).unwrap().into_iter().find(|a| a.request_id == request_id);
+            assert!(
+                answer.is_some_and(|a| a.status == crate::types::ApprovalStatus::Denied),
+                "family={family}: the denial is owed to its caller"
+            );
+            if family {
+                assert!(family_coverage(&conn, &["rm"], None, None).unwrap()[0].as_ref().is_some_and(|r| !r.allow));
+            } else {
+                assert_eq!(redeem(&conn, &["digest-deny"], "rm target", None, None).unwrap().verdict(), AskVerdict::Deny);
+            }
+            assert!(crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}");
+            assert!(!crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}");
+            assert!(!is_undelivered(&conn, &request_id), "family={family}");
+        }
+    }
+
     // ── family rules ────────────────────────────────────────────────
 
-    /// One row per distinct key, the answer spent (as a digest rule
-    /// spends it), and the two refusals named.
+    /// One row per distinct key, and the two refusals named.
     #[test]
-    fn learn_family_mints_one_rule_per_key_and_spends_the_answer() {
+    fn learn_family_mints_one_rule_per_key() {
         let conn = open_memory();
         let ask = ask_with_statement("digest-fam", VarBinding::Bound, "kj handoff note x");
         let request_id = create_ask(&conn, &ask).unwrap();
@@ -544,10 +628,6 @@ mod tests {
         assert_eq!(rules[0].family_key, "kj handoff note");
         assert_eq!(rules[1].family_key, "wc");
         assert_eq!(rules[0].learned_from.as_deref(), Some(request_id.as_str()));
-        assert!(
-            crate::ask::redeemed_at(&conn, &request_id).unwrap().is_some(),
-            "learning a family spends the answer it was learned from"
-        );
         assert!(matches!(
             learn_family_from_approval(&conn, &request_id, &[], RuleScope::Always, true, None),
             Err(LedgerError::NoFamilyKey(_))

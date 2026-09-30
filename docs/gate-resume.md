@@ -184,8 +184,9 @@ call    →  no rule covers it  →  create ask + persist the action  →  RETUR
                               kj ledger allow 7f3a
                                         ▼
                    the caller's NEXT attempt redeems the answer
-                   and runs the action  (2026-08-22 had the kernel
-                   run it here; see "Rescoped")
+                   and runs the action  (since slice 5, the approval
+                   worker runs an ask with a stored command here;
+                   see "Slice 5: approval executes")
                                         ▼
                         model sees the result whenever it next runs
 ```
@@ -199,8 +200,9 @@ Three rules this has to keep, and the third is what makes it safe:
    Reversed 2026-08-23. Nothing is persisted; an ask that cannot outlive the
    process is abandoned at boot instead.
 2. **An answer is single-use, and a denial is an answer.** A decided ask —
-   allowed *or* denied — is delivered to exactly one retry and is then
-   spent. Allowed authorizes one execution and never becomes a standing
+   allowed *or* denied — is delivered once and is then spent: the approval
+   worker runs an allowed ask with a stored command, and a caller's retry
+   collects any other answer (see "The subscriber, in order"). Allowed authorizes one execution and never becomes a standing
    permission; that is what rules are for (see `docs/gate-policy-tuning.md`).
 
    Denied has to be redeemable for the same reason, found while writing
@@ -223,13 +225,15 @@ Three rules this has to keep, and the third is what makes it safe:
    property of the row, not something each caller must remember after
    deciding.
 
-   And **learning a rule spends the answer it was learned from.** `kj ledger
-   allow --remember always` decides an ask *and* mints a rule; the human said
-   yes once. While the rule stands, every covered call is answered by the
-   rule and never reaches the redemption step, so without this the source ask
-   would sit decided-and-unredeemed indefinitely — and would be the first
-   thing found the moment the rule was forgotten. One decision, one use,
-   whether the use is running the action or minting the rule.
+   **Learning a rule does not spend the answer it was learned from; its
+   delivery does.** `kj ledger allow --remember always` decides an ask *and*
+   mints a rule; the human said yes once, and that yes is still owed to its
+   caller. An ask with a stored command runs once in the approval worker,
+   which spends it. An ask without one is spent by its caller's retry, and a
+   retry that a rule covers spends it too (`run_gate`, step 2b), so the
+   answer never sits unredeemed behind the rule for a later `kj ledger
+   forget` to uncover. A forget that lands before delivery leaves that one
+   use in place. One decision, one use; the rule covers the calls after it.
 
 3. **Absence of an answer is never permission.** Unchanged from today, and
    now easier to hold: nothing times out into a verdict, because nothing
@@ -284,7 +288,7 @@ cleanly:
 | What | Where it lives now | Cost |
 |---|---|---|
 | Not blocking the wire while a human thinks | shipped, slice 1 | the real driver |
-| Redeeming the answer when the caller tries again | shipped, slice 1 | one query |
+| Redeeming the answer when the caller tries again | shipped, slice 1; since slice 5 only for an ask with no stored command | one query |
 | Surviving a kernel restart between ask and answer | **deleted** | ~964 lines, and every hard problem in the design |
 
 The first two are most of the value. The third dragged in exactly-once across
@@ -409,7 +413,7 @@ is redeemable.*
 - a **denial** must be redeemable, or a denied caller loops forever minting
   duplicate asks and never learns it was denied;
 - a **rule-decided** ask (`auto_reason` set) is an audit record, not an offer;
-- **learning a rule spends the answer it was learned from.**
+- **learning a rule leaves the answer for its delivery to spend.**
 
 ## The refusal contract and approval execution
 
@@ -857,8 +861,8 @@ restore its environment, or enter its recorded directory: a `Turn` receives
 an explicit no-run seed; a `Session` pair stays settled-only.
 
 Once a seed is durable, rejected turn admission does not repeat it on later
-ledger changes. The next manual drive can read the seed. An ordinary answer
-remains unredeemed until its caller retries; delivery does not grant a second
+ledger changes. The next manual drive can read the seed. An answer with no stored
+command remains unredeemed until its caller retries; delivery does not grant a second
 execution claim.
 
 **What a crash costs.** The redemption row is claimed before the run, so a

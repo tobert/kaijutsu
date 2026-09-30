@@ -899,6 +899,11 @@ impl KjDispatcher {
         if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied) {
             match redeemed_at {
                 Some(at) => lines.push(format!("redeemed:   {at}")),
+                // An allowed stored command is the approval worker's to run;
+                // a caller's retry cannot collect it.
+                None if row.exec_source.is_some() && row.status == ApprovalStatus::Allowed => {
+                    lines.push("redeemed:   no — the approval worker has not run it yet".into())
+                }
                 None => lines.push("redeemed:   no — this answer is still redeemable".into()),
             }
         }
@@ -2069,7 +2074,10 @@ mod tests {
         }
     }
 
-    /// A `shell_write`-shaped spec with NO free variables — unlike `spec()`
+    /// A shell-gate spec with no stored command and NO free variables. With
+    /// no stored command its caller's retry redeems the answer, as a `kj`
+    /// verb's does; a real `shell_write` ask carries its command
+    /// (`planned_shell_spec`) and runs in the approval worker. Unlike `spec()`
     /// above (whose `MESSAGE` var is deliberately free so it can never be
     /// remembered, per `the_ask_message_body_is_free_so_allow_rules_cannot_learn_it`
     /// in `kj/gate.rs`), this one can actually be learned as an allow rule.
@@ -3362,6 +3370,12 @@ mod tests {
             "{}",
             result.message()
         );
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request_id)], &c).await;
+        assert!(
+            shown.message().contains("redeemed:   no — the approval worker has not run it yet"),
+            "an undelivered stored command is the worker's to run, not a retry's to collect: {}",
+            shown.message()
+        );
         let retry = gate_once(&d, &c, planned_shell_spec("kj handoff note 'x' > /tmp/out")).await;
         assert!(retry.reason.contains("approval worker"), "the approved command is the worker's: {}", retry.reason);
         assert!(d.kernel_db.lock().redeem_ask(&request_id).unwrap(), "the worker spends the answer once");
@@ -3391,12 +3405,13 @@ mod tests {
         assert!(text.contains("kj handoff note") && text.contains("global config"), "{text}");
     }
 
-    /// Learning a family spends the answer it was learned from, exactly as
-    /// a digest rule does: after `forget`, the next IDENTICAL ask must
-    /// escalate rather than redeem the human's original answer.
+    /// A family learned from an ask with a stored command leaves that
+    /// command to the approval worker: a covered call does not spend it,
+    /// a call after `forget` does not run it, and once the worker has
+    /// spent it the next IDENTICAL ask escalates again.
     ///
-    /// Falsified by dropping the `approval_redemptions` insert from
-    /// `learn_family_from_approval`: the identical ask comes back allowed.
+    /// Falsified by a covered call that redeems a stored-command answer
+    /// (the worker would never run it), or by learning that spends it.
     #[tokio::test]
     async fn forgetting_a_family_makes_the_identical_ask_escalate_again() {
         let d = test_dispatcher().await;
@@ -3411,17 +3426,28 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "{result:?}");
+        let unspent = |d: &crate::kj::KjDispatcher| {
+            approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &request_id).unwrap().is_none()
+        };
+        assert!(unspent(&d), "learning leaves the answer for the approval worker");
+        let covered = gate_once(&d, &c, planned_shell_spec(source)).await;
+        assert!(covered.allowed(), "{}", covered.reason);
+        assert!(unspent(&d), "a covered call must not spend the worker's answer");
         let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
         let rule_id = match &rules {
             KjResult::Ok { data: Some(v), .. } => v.as_array().unwrap()[0].as_str().unwrap().to_string(),
             other => panic!("{other:?}"),
         };
         assert!(d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await.is_ok());
+        let held = gate_once(&d, &c, planned_shell_spec(source)).await;
+        assert!(!held.allowed(), "the stored answer is the worker's, not this call's: {}", held.reason);
+        assert!(held.reason.contains("approval worker"), "{}", held.reason);
+        assert!(d.kernel_db.lock().redeem_ask(&request_id).unwrap(), "the worker spends the answer once");
         let again = gate_once(&d, &c, planned_shell_spec(source)).await;
         assert_eq!(
             again.verdict,
             crate::kj::gate::GateVerdict::Pending,
-            "the original answer was spent by learning the family: {}",
+            "no rule and no answer are left: {}",
             again.reason
         );
     }
@@ -3679,8 +3705,15 @@ mod tests {
         let request_id = first.ask.expect("an escalated ask has a row").request_id;
         d.dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &answering_seat())
             .await;
+        let spent = |d: &crate::kj::KjDispatcher| {
+            approval_ledger::ask::redeemed_at(d.kernel_db.lock().conn_for_ledger(), &request_id).unwrap().is_some()
+        };
+        assert!(!spent(&d), "learning leaves the answer for its caller's retry");
+        // This ask has no stored command, so its caller's retry is its one
+        // use. The rule covers the retry, and the retry spends the answer.
         let second = gate_once(&d, &c, shell_spec(label, rendered)).await;
         assert!(second.allowed());
+        assert!(spent(&d), "the covered retry must spend the answer it made unnecessary");
 
         let rules = d.dispatch(&[s("ledger"), s("rules")], &c).await;
         let data = match &rules {
@@ -3710,6 +3743,35 @@ mod tests {
             crate::kj::gate::GateVerdict::Pending,
             "a forgotten rule sends the next ask back to a human waiting, not a ledger fault"
         );
+    }
+
+    /// A forget that lands before the caller retries leaves the one approved
+    /// use in place: the retry redeems the answer, once, and the call after
+    /// it asks a human again.
+    #[tokio::test]
+    async fn a_forget_before_the_retry_still_honors_the_answer_once() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let label = "kaish-source";
+        let rendered = "echo forget-first";
+
+        let first = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+        let allowed = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("always")], &answering_seat())
+            .await;
+        assert!(allowed.is_ok(), "{allowed:?}");
+        let rule_id = match d.dispatch(&[s("ledger"), s("rules")], &c).await {
+            KjResult::Ok { data: Some(v), .. } => v[0].as_str().expect("a rule id string").to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert!(d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await.is_ok());
+
+        let retry = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert!(retry.allowed(), "the human's answer still authorizes its one use: {}", retry.reason);
+        assert_eq!(retry.ask.expect("the answered ask").request_id, request_id);
+        let after = gate_once(&d, &c, shell_spec(label, rendered)).await;
+        assert_eq!(after.verdict, crate::kj::gate::GateVerdict::Pending, "{}", after.reason);
     }
 
     /// Only the principal that made a rule may forget it. The performer whose

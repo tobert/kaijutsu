@@ -2359,14 +2359,6 @@ and burn down all the approval options". Delete each line as it ships.
   divergence (see "A kaish lexer rejection degrades the gate") reopens it.
 - **F13** A dry-run row is answerable between create and abandon; `kj cc
   send` through `shell_write` asks twice, unlinked.
-- **F14** An ask answered `kj ledger allow <id> --remember` never runs.
-  Learning a rule inserts an `approval_redemptions` row
-  (`approval-ledger/src/rules.rs`, `learn_from_approval`), and the worker's
-  `undelivered_answers` skips redeemed asks. Since the worker became the
-  only consumer (6ae6d8ff), nothing runs the approved command and no
-  follow-up turn starts. This hits the ACP, tui, and app "always" answers.
-  A `--remember` the ledger refuses (a free variable) redeems nothing, so
-  that ask runs. `fleet/approval/d-always-allow-runs-the-command.toml`.
 - **F15** The gate reads kaish's `PlannedValue::Plain`, the literal as it
   renders on a command line, as an argv value (`kj/readonly.rs`,
   `resolved_kj_args`; `gate_policy.rs`, `command_keys`). Structured `kj`
@@ -2385,9 +2377,23 @@ and burn down all the approval options". Delete each line as it ships.
   pair. The double ask (a model's shell running `shell_write` asks for the
   statement, then in the tool's own gate) is left as is. The shipped
   `gate.toml` carries the per-seat allow as a commented example.
+- **An uncollected answer with no stored command stays redeemable.** A
+  `kj` verb or non-shell hook ask is spent by its caller's retry
+  (`kj/gate.rs`, `run_gate` steps 2 and 2b). If the woken caller never
+  retries the exact call, the answer authorizes that call indefinitely;
+  after a restart `approval_resume::start` marks the backlog woken and
+  never tells the caller again. A `kj ledger forget` does not reach such an
+  answer. Bounded to the exact statements, label, context, principal, and
+  actor. Needs a decision: expire it, or have the worker spend it when the
+  caller moves on.
+- **`decision_span_keeps_the_ask_and_deciding_actor_separate` is flaky**
+  (`kj/ledger.rs`): it passes alone and fails at `expect("decision span")`
+  when run with the rest of `kj::ledger` (`--test-threads=4`, reproduced
+  twice on a953a6ab). Probably a tracing callsite-interest race
+  under `with_subscriber`.
 - **Tests** The ACP part of the conformance matrix ships in
   `crates/kaijutsu-acp-fleet/fleet/approval/` (`docs/acp-fleet.md`, "The
-  approval matrix"); scenarios marked `known_gap` name F7, F8, and F14.
+  approval matrix"); scenarios marked `known_gap` name F7 and F8.
   The ACP bridge offers "always allow" and "always deny", so rule scenarios
   run through ACP. Paths C and D need a harness of their own. A rule added
   between an ask and its answer does not reach that approval: Amy, "the

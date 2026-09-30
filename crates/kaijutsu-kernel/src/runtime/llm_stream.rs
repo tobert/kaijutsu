@@ -1502,8 +1502,8 @@ fn map_tool_dispatch_result(
         }
         // A refusal is a verdict the machinery reached, not an execution
         // failure — "Execution error" below would teach a model that an
-        // unanswered ask was a crash, and the retry that follows mints
-        // another durable ask. The kind carries a stable code, and
+        // unanswered ask was a crash, and a retry before the answer lands
+        // mints another durable ask. The kind carries a stable code, and
         // `settled_block_status` decides the blocks the same way every
         // shell path does.
         Err(e) if e.as_refusal().is_some() => {

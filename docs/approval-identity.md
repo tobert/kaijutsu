@@ -195,7 +195,9 @@ inferred from a client type.
 
 ## Persistence and replay
 
-Redemption matches the requester, performer, context, statement, and label.
+A caller's retry redeems an answer only when the requester, performer,
+context, statements, and label match. The approval worker redeems an ask
+with a stored command by its id.
 Changing performers revokes that context's learned session rules. Broader
 rules remain governed by their explicit scope. A linked model approval whose
 performer changed is consumed without execution; restoring the old performer

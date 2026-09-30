@@ -154,7 +154,7 @@ and the ACP prompt is `session/request_permission`.
 | (a) A config deny refuses and leaves a row | gap F8 | gap F8 | |
 | (b) A learned allow outranks a config deny | pass | | |
 | (c) An uncovered statement asks a model | pass | read-only by design | |
-| (d) An approval runs what was shown | pass; "always allow" gap F14 | pass | |
+| (d) An approval runs what was shown | pass, "always allow" too | pass | |
 | (e) A later deny refuses before anyone is asked | pass (hook) | | |
 | (e′) A rule added after the ask leaves it alone | pass | | |
 | (f) A model cannot forget a human's rule | pass | | |

@@ -524,8 +524,9 @@ async fn act_on_executable_answer(
         if owner == crate::PairOwner::Turn {
             return ExecAction::Tell(unrun_turn_seed(who, answer.status, &answer.description, &output_block_id));
         }
-        // A session reads its pair directly. A model's notification consumes
-        // its answer later, in the same acceptance as the notification block.
+        // A session reads its pair directly, so settling the pair delivered
+        // the refusal; spend the answer here. (A turn's refusal seed spends
+        // it in the same acceptance as the seed block.)
         if let Err(error) = kernel.kernel_db().lock().redeem_ask(&answer.request_id) {
             tracing::error!(ask = %answer.request_id, %error, "refusal settled but redemption failed");
             return ExecAction::Deferred;

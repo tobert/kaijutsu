@@ -155,8 +155,8 @@ on the ask they answered. Exact text, exact authorization.
   when it happens inside `run_gate`.
 - **Ask** (a statement the config marks ask-tier) — never auto-allowed by a
   lower layer. `run_gate` asks on the `shell_write` tool path; on the RPC
-  shell paths broker PreCall opens the ask before any hook runs (see
-  "Settled while reviewing"). A tier a hook could vote down is not a tier.
+  shell paths broker PreCall opens the ask after the hooks let the call
+  proceed (see "Settled while reviewing"). A tier a hook could vote down is not a tier.
 
 **A tier allow is not a capability grant.** `require_cap` and the loadout
 run exactly as before; the evaluator decides whether an *ask* fires, never
@@ -558,9 +558,12 @@ name `gate_policy` is the sanctioned exception, visible only in source.
   itself for an ask-tier statement, after the hooks let the call proceed,
   so a hook's deny refuses without asking anyone first. The ask names each
   layer, key, and statement ("gate policy: global config asks git push —
-  statement #0 (`git push origin main`)"). An allowed retry proceeds. A hook
-  that asks about the same statement asks separately; no shipped hook does. The `shell_write` tool path asks through `run_gate` instead, so it
-  never asks twice for the tier.
+  statement #0 (`git push origin main`)"). The ask carries the command: an
+  allowed ask runs it once in the approval worker, and a retry of the same
+  command does not run it. A hook chain that asks raises one ask of its own,
+  and the tier asks only when the chain let the call proceed, so the two
+  never both ask. The `shell_write` tool path asks
+  through `run_gate` instead, so it never asks twice for the tier.
 - **On the RPC shell paths, an uncovered statement asks unless the actor
   is a live root character.** A root has no model, so its uncovered
   statements run as typed; any other actor, including a principal with no
