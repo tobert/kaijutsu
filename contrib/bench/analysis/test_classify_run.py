@@ -653,9 +653,19 @@ class TestVerdictInAnalyzeRun(unittest.TestCase):
 
 
 class TestShellWriteCountsAsExecution(unittest.TestCase):
-    """The ACP bridge labels `shell_write` kind "edit" (its name splits to
-    `write`), but it runs a command. A completed `shell_write` after a file
-    edit is the verification `completed_verified` asks for."""
+    """`shell_write` runs a command and may change files. Older runs label it
+    kind "edit"; the bridge now says "execute". A completed `shell_write`
+    after a file edit is the verification `completed_verified` asks for."""
+
+    def test_an_execute_shell_write_still_checks_itself(self):
+        events = [
+            tool_call("s1", kind="execute", title="shell_write"),
+            tool_call_update("s1", status="completed", text="ok"),
+            message_chunk("Done."),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["turn_end_class"], "completed_verified")
+        self.assertEqual(report["turn_end_evidence"]["last_edit_tool_call_id"], "s1")
 
     def test_shell_write_after_a_file_edit_is_verified(self):
         events = [

@@ -91,6 +91,14 @@ pub fn acp_tool_status(status: Status) -> ToolCallStatus {
 /// `execute`, and an unknown MCP or builtin tool is honestly `other`.
 pub fn acp_tool_kind(kind: Option<KjToolKind>, name: Option<&str>) -> AcpToolKind {
     if let Some(name) = name {
+        // Kaijutsu's own tools by their whole name, first: `shell_write`
+        // runs a command, though its last word is `write`.
+        let bare = name.rsplit([':', '.', '/']).next().unwrap_or(name);
+        match bare {
+            "shell" | "shell_write" => return AcpToolKind::Execute,
+            "read_shell_operation" => return AcpToolKind::Read,
+            _ => {}
+        }
         // Match on the last path-ish segment so `builtin.file.read`,
         // `kaijutsu:read` and `read` all land the same way.
         let leaf = name
@@ -1172,6 +1180,19 @@ mod tests {
         assert_eq!(
             acp_tool_kind(Some(KjToolKind::Mcp), Some("ripgrep_search")),
             AcpToolKind::Search
+        );
+    }
+
+    /// Kaijutsu's own tools are named whole: `shell_write` runs a command,
+    /// it does not edit a file, and `read_shell_operation` reads.
+    #[test]
+    fn kaijutsu_tools_are_matched_by_their_whole_name() {
+        for name in ["shell", "shell_write", "kaijutsu:shell_write"] {
+            assert_eq!(acp_tool_kind(Some(KjToolKind::Builtin), Some(name)), AcpToolKind::Execute, "{name}");
+        }
+        assert_eq!(
+            acp_tool_kind(Some(KjToolKind::Builtin), Some("read_shell_operation")),
+            AcpToolKind::Read
         );
     }
 

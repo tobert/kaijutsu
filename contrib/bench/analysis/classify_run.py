@@ -613,12 +613,16 @@ def analyze_run(
 
     # --- edits and executions, for completed_verified / ended_unverified ---
     # A `shell_write` call is both an edit and an execution: it may change
-    # files, and it runs a command. The ACP bridge labels it kind "edit" (its
-    # name ends in `write`), so its title is what marks it as an execution.
-    # A completed `shell_write` therefore checks the edits before it and
-    # itself; events cannot say whether it ran a test or a `sed -i`.
+    # files, and it runs a command. The ACP bridge labels it kind "execute"
+    # (older runs say "edit"), so its title is what marks it as an edit. A completed `shell_write` therefore checks the
+    # edits before it and itself; events cannot say whether it ran a test or
+    # a `sed -i`.
     edit_ids = sorted(
-        (tid for tid in tool_order if tool_states[tid].kind == "edit"),
+        (
+            tid
+            for tid in tool_order
+            if tool_states[tid].kind == "edit" or tool_states[tid].title == "shell_write"
+        ),
         key=lambda tid: tool_states[tid].last_index,
     )
     execute_ids = [
