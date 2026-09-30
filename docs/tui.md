@@ -486,8 +486,8 @@ Rules the figure carries:
   normal mode, a bar while inserting and on the `:` bar, an underline while
   replacing; the editor's alternate screen shapes it by its own buffer's
   mode. No painted cell stands in for it, so the terminal's own cursor
-  color applies. The armed legend, the picker, an ask card and the ledger
-  hide it. The shape goes back to the terminal's default on `:q` and on
+  color applies. The armed legend, the picker, an armed ask card and the
+  ledger hide it. The shape goes back to the terminal's default on `:q` and on
   `Ctrl+Z`.
 - **The terminal cursor hides while scrolled.** The draft keeps drawing
   live off the tail — typing snaps back, so it never changes underneath —
@@ -512,8 +512,8 @@ Rules the figure carries:
   carry a literal `<`, so a paste there rides its own wire method instead
   of forwarding as keys. While the editor's own `:` line is open the tui
   refuses with a notice, since the strip draws that line in preference to
-  the kernel's refusal message. The picker, the ledger, an ask card and a
-  frozen diff refuse it with a notice — none of them is wired for one. Line
+  the kernel's refusal message. The picker, the ledger, an armed ask card
+  and a frozen diff refuse it with a notice — none of them is wired for one. Line
   endings are normalized, since terminals differ on what a pasted newline
   is. Probe: `a_bracketed_paste_lands_in_the_draft_without_submitting`.
 - There is no state past normal mode. The app's `Esc Esc` hands the
@@ -947,9 +947,21 @@ needs rather than being cropped into a fixed region.
     [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside
 ```
 
-While the card is up, `a`/`A`/`d`/`v` answer it and typed text is held:
-the draft never changes under a card, so a decision key and a typed
-letter are never confused. A `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act
+**A new card arms late.** It is drawn disarmed, its key line reading
+`arming… keys still go to the draft`, and every key goes where it would
+with no card up: a letter typed as the card appears lands in the draft,
+and `Esc` stays vi's. The card arms 100 ms after it first draws; each key
+pressed while it is disarmed moves arming to 200 ms after that key, so
+steady typing keeps it disarmed until a pause. It arms on the first frame
+drawn after that deadline (frames are 80 ms apart), so its keys are on
+screen before any key can use them. A paste counts as a key. The values
+are `kaijutsu_client::ask_arming`'s, shared with the app. The kernel sees
+none of this: the ask is pending throughout. The ledger (`Ctrl+A l`)
+opens at your request, with its keys live.
+
+While the card is armed, `a`/`A`/`d`/`v` answer it and typed text is held:
+the draft never changes under an armed card, so a decision key and a
+typed letter are never confused. A `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act
 exactly as they do with no card up — `Ctrl+A 4` still switches seats, and
 the card goes aside with the switch, since it is always the current
 context's ask; the next refresh raises it again on return. With the

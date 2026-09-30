@@ -106,7 +106,8 @@ impl ActiveInputContexts {
 /// one place that says which of them has the keyboard.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ApprovalSurfaces {
-    /// The ask sheet is showing an ask.
+    /// The ask sheet is showing an ask whose keys are armed. A disarmed
+    /// sheet is on screen but leaves the keyboard to the surface beneath.
     pub sheet: bool,
     /// The ledger ribbon is open.
     pub ribbon: bool,
@@ -246,7 +247,7 @@ pub fn sync_input_context(
     }
 
     let approval = ApprovalSurfaces {
-        sheet: sheet.up(),
+        sheet: sheet.keys_armed(),
         ribbon: ribbon.open,
     };
     let (contexts, new_grab) =

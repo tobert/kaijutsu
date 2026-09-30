@@ -398,9 +398,7 @@ pub fn handle_ledger_ribbon_actions(
                 let Some(ask) = row else {
                     continue;
                 };
-                sheet.aside.remove(&ask.request_id);
-                sheet.showing = Some(ask.request_id.clone());
-                sheet.scroll = 0;
+                sheet.open(ask.request_id.clone());
                 ribbon.open = false;
             }
 

@@ -941,6 +941,11 @@ async fn event_loop(
                     dirty = true;
                 }
                 app.screen_rows = terminal.size()?.height;
+                // A new ask card is drawn disarmed, and arms on the first
+                // frame after its hold (`App::tick_ask_arming`).
+                if app.tick_ask_arming(Instant::now()) {
+                    dirty = true;
+                }
                 if dirty {
                     dirty = false;
                     draw(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame)?;
@@ -1214,25 +1219,33 @@ async fn act(
         handle_ledger_key(bridge, app, key).await;
         return Ok(Acted::Continue);
     }
+    // An ask card owns keys only once it is armed; until then every key
+    // goes where it would with no card up, and pushes arming out
+    // (`docs/tui.md`, "Asks"). A key release is never a keystroke.
+    let card_owns_key = if key.kind == crossterm::event::KeyEventKind::Release {
+        app.ask_card_armed()
+    } else {
+        app.ask_card_takes_key(Instant::now())
+    };
     // Off the live tail the transcript owns copy mode's keys, and every
     // other key snaps it back and is then handled here as if it had been
-    // typed at the tail (`docs/tui.md`, "Scrolling is copy mode"). An ask
-    // card keeps its own a/A/d/v/Esc: the card is the more urgent surface,
-    // and the scrolled view waits under it. The `Ctrl+A` prefix is not the
+    // typed at the tail (`docs/tui.md`, "Scrolling is copy mode"). An armed
+    // ask card keeps its own a/A/d/v/Esc: the card is the more urgent
+    // surface, and the scrolled view waits under it. The `Ctrl+A` prefix is not the
     // transcript's either ([`Keys::claims`]): the chords that switch seats
     // leave the view where the reader put it, which is what makes a context
     // left scrolled still scrolled on return.
-    if app.scrolled().is_some() && app.ask_card.is_none() && !keys.claims(&key) {
+    if app.scrolled().is_some() && !card_owns_key && !keys.claims(&key) {
         if scrolled_key(app, &key, term_lock, width) == ScrolledKey::Handled {
             return Ok(Acted::Continue);
         }
         app.snap_transcript();
     }
 
-    // The ask card owns a/A/d/v/Esc and holds compose text; a `Ctrl+A`
-    // chord, `Ctrl+C` and `Ctrl+Z` act under it as they would under no card
-    // (`docs/tui.md`, "Asks").
-    let intent = if app.ask_card.is_some() {
+    // The armed ask card owns a/A/d/v/Esc and holds compose text; a
+    // `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act under it as they would under
+    // no card (`docs/tui.md`, "Asks").
+    let intent = if card_owns_key {
         match asks::route_under_card(key, keys) {
             asks::CardRoute::Card(asks::AskCardKey::Decide(decision)) => {
                 let card = app.ask_card.take().expect("checked Some above");
@@ -1546,7 +1559,7 @@ fn paste_target(app: &App) -> PasteTarget {
     if editor::route_key(app, false) == editor::KeyRoute::FullScreen {
         return PasteTarget::Refused("paste on the alternate screen is not wired; use the draft");
     }
-    if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card.is_some() {
+    if app.ledger_view.is_some() || app.picker.is_some() || app.ask_card_armed() {
         return PasteTarget::Refused("paste is not wired into this surface; Esc to the draft first");
     }
     if app.compose.command_line().is_some() { PasteTarget::CommandLine } else { PasteTarget::Draft }
@@ -1561,6 +1574,9 @@ fn paste_target(app: &App) -> PasteTarget {
 /// calls in flight.
 async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
     let text = normalize_paste(&text);
+    // A paste is typing: past a disarmed ask card it lands in the draft and
+    // pushes arming out, as a key would.
+    app.ask_card_takes_key(Instant::now());
     match paste_target(app) {
         PasteTarget::Refused(why) => app.note(why),
         PasteTarget::CommandLine => {

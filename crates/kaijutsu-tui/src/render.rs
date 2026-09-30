@@ -521,10 +521,12 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
     BandFrame { lines, cursor }
 }
 
-/// Whether an overlay owns the keyboard. The picker, an ask card and the
-/// ledger take every key while they are up, so the draft shows no cursor.
+/// Whether an overlay owns the keyboard. The picker, an armed ask card and
+/// the ledger take every key while they are up, so the draft shows no
+/// cursor; a disarmed ask card leaves the keys, and the cursor, to the
+/// draft.
 fn overlay_holds_keys(app: &App) -> bool {
-    app.picker.is_some() || app.ask_card.is_some() || app.ledger_view.is_some()
+    app.picker.is_some() || app.ask_card_armed() || app.ledger_view.is_some()
 }
 
 /// The overlay's rows: the picker, an ask card, the ledger view or the
@@ -1568,6 +1570,9 @@ mod tests {
             id,
             "one two three four five six seven eight nine ten eleven twelve thirteen",
         ));
+        let t0 = std::time::Instant::now();
+        app.tick_ask_arming(t0);
+        app.tick_ask_arming(t0 + kaijutsu_client::ASK_ARM_DELAY);
         let overlay = text_of(&overlay_lines(&mut app, 16));
         assert!(
             overlay.last().is_some_and(|l| l.contains("Esc aside")),

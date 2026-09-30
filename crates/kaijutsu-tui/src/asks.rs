@@ -106,7 +106,14 @@ pub struct AskCard<'a> {
     pub asker: Option<&'a str>,
     pub reviewer: Option<&'a str>,
     pub can_review: bool,
+    /// Whether the card's keys act yet. A disarmed card shows no keys; its
+    /// key line says keys still go to the draft.
+    pub armed: bool,
 }
+
+/// The key line of a card whose keys do not act yet. Text rather than a
+/// color, so it reads the same with `NO_COLOR`.
+pub const ARMING_KEY_LINE: &str = "  arming… keys still go to the draft";
 
 /// `⚠ ask <id>  <hook>  from <context> (<type>)`, the statement flush-left,
 /// then the key line — `docs/tui.md`'s Asks figure, verbatim.
@@ -128,7 +135,9 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
     for row in wrap_plain(card.statement, width.saturating_sub(2)) {
         lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
     }
-    let keys = if card.can_review {
+    let keys = if !card.armed {
+        ARMING_KEY_LINE
+    } else if card.can_review {
         "  [a]llow once  [A]llow always (global)  [d]eny  [v]iew ledger  Esc aside"
     } else {
         "  awaiting assigned reviewer — use kj ledger cancel or escalate  [v]iew ledger  Esc aside"
@@ -533,6 +542,41 @@ pub struct AskCardState {
     pub detail: kaijutsu_client::AskDetail,
 }
 
+/// The ask card's arming, kept beside the card for the ask it was started
+/// for. `armed` is what the last frame drew, so a key acts on the card
+/// only after the player has seen its keys (`docs/tui.md`, "Asks").
+pub struct CardArming {
+    pub request_id: String,
+    clock: kaijutsu_client::AskArming<std::time::Instant>,
+    armed: bool,
+}
+
+impl CardArming {
+    /// A card for `request_id` first drawn at `now`, disarmed.
+    pub fn shown(request_id: String, now: std::time::Instant) -> Self {
+        Self { request_id, clock: kaijutsu_client::AskArming::shown(now), armed: false }
+    }
+
+    /// Whether the last frame drew the card armed.
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Arm if the hold has passed at `now`. True when that changed.
+    pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        if !self.armed && self.clock.armed(now) {
+            self.armed = true;
+            return true;
+        }
+        false
+    }
+
+    /// A key that went past the disarmed card at `now`.
+    pub fn keystroke(&mut self, now: std::time::Instant) {
+        self.clock.keystroke(now);
+    }
+}
+
 /// The ledger view's live state (`Ctrl+A l`): every row, the cursor, and
 /// whether `/` has put it into filter-typing mode.
 #[derive(Default)]
@@ -607,6 +651,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
             asker: card.detail.actor_name.as_deref(),
             reviewer: card.detail.reviewer_name.as_deref(),
             can_review: app.principal.is_some_and(|principal| card.detail.can_review(principal)),
+            armed: app.ask_card_armed(),
         };
         return Some(render_ask_card(&view, width, &app.palette));
     }
@@ -825,12 +870,31 @@ mod tests {
             asker: Some("coder"),
             reviewer: Some("amy"),
             can_review: true,
+            armed: true,
         };
         let lines = render_ask_card(&card, 80, &Palette::builtin());
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(text[0], "⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)  asker coder  reviewer amy");
         assert_eq!(text[1], "  rm -rf ~/src/wt/kaish-arith");
         assert_eq!(text[2], "  [a]llow once  [A]llow always (global)  [d]eny  [v]iew ledger  Esc aside");
+    }
+
+    /// A card that is not armed yet shows no keys, only that typed keys
+    /// still go to the draft; the line count is the armed card's, so
+    /// arming never moves the transcript.
+    #[test]
+    fn a_disarmed_ask_card_says_so_instead_of_offering_keys() {
+        for can_review in [true, false] {
+            let card = AskCard {
+                request_id: "01a04eb6", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
+                statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, can_review, armed: false,
+            };
+            let text: Vec<String> = render_ask_card(&card, 80, &Palette::builtin()).iter().map(line_text).collect();
+            assert_eq!(text.last().map(String::as_str), Some(ARMING_KEY_LINE));
+            assert!(!text.iter().any(|line| line.contains("llow")), "{text:?}");
+            let armed = AskCard { armed: true, ..card };
+            assert_eq!(render_ask_card(&armed, 80, &Palette::builtin()).len(), text.len());
+        }
     }
 
     #[test]
@@ -844,6 +908,7 @@ mod tests {
             asker: None,
             reviewer: None,
             can_review: true,
+            armed: true,
         };
         let lines = render_ask_card(&card, 24, &Palette::builtin());
         // Header, N wrapped statement lines, key line.
@@ -854,7 +919,7 @@ mod tests {
     fn an_ask_the_viewer_cannot_review_offers_cancel_or_escalation_not_approval() {
         let card = AskCard {
             request_id: "id", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
-            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), can_review: false,
+            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), can_review: false, armed: true,
         };
         let text: Vec<String> = render_ask_card(&card, 120, &Palette::builtin())
             .iter().map(line_text).collect();
@@ -876,6 +941,7 @@ mod tests {
             asker: None,
             reviewer: None,
             can_review: true,
+            armed: true,
         };
         let narrow_rendered = render_ask_card(&card, 16, &Palette::builtin()).len();
         let wide_rendered = render_ask_card(&card, u16::MAX, &Palette::builtin()).len();

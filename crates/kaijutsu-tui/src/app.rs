@@ -196,6 +196,9 @@ pub struct App {
     /// than one at a time (`docs/tui.md`, "Asks": it draws as an overlay, it
     /// is not a queue of modals).
     pub ask_card: Option<crate::asks::AskCardState>,
+    /// The ask card's arming: whether its answer keys act yet
+    /// ([`Self::tick_ask_arming`]).
+    ask_arming: Option<crate::asks::CardArming>,
     /// The ledger view (`Ctrl+A l`), when open.
     pub ledger_view: Option<crate::asks::LedgerViewState>,
     /// The `kj` command catalog (`get_kj_command_catalog`), fetched once at
@@ -261,6 +264,7 @@ impl App {
             parked_screens: HashMap::new(),
             ask_owners: HashMap::new(),
             ask_card: None,
+            ask_arming: None,
             ledger_view: None,
             kj_catalog: Vec::new(),
             completion: None,
@@ -769,6 +773,55 @@ impl App {
             return self.ask_card.take();
         }
         None
+    }
+
+    /// Bring the ask card's arming up to `now`, before a frame is drawn.
+    /// A card not seen before starts disarmed at `now`; a disarmed card
+    /// whose hold has passed arms. True when the key line this frame draws
+    /// changed. See [`kaijutsu_client::ask_arming`] for the rule.
+    pub fn tick_ask_arming(&mut self, now: std::time::Instant) -> bool {
+        let Some(card) = self.ask_card.as_ref() else {
+            return self.ask_arming.take().is_some();
+        };
+        match self.ask_arming.as_mut() {
+            Some(arming) if arming.request_id == card.request_id => arming.tick(now),
+            _ => {
+                self.ask_arming = Some(crate::asks::CardArming::shown(card.request_id.clone(), now));
+                true
+            }
+        }
+    }
+
+    /// Whether the ask card on screen owns its keys: it is up and a frame
+    /// has drawn it armed. False while no card is up.
+    pub fn ask_card_armed(&self) -> bool {
+        match (self.ask_card.as_ref(), self.ask_arming.as_ref()) {
+            (Some(card), Some(arming)) => arming.request_id == card.request_id && arming.armed(),
+            _ => false,
+        }
+    }
+
+    /// One key pressed at `now` while a card may be up. True when the card
+    /// owns it; false when it goes where it would with no card up. A key
+    /// that goes past a disarmed card pushes its arming out.
+    pub fn ask_card_takes_key(&mut self, now: std::time::Instant) -> bool {
+        if self.ask_card.is_none() {
+            return false;
+        }
+        if self.ask_card_armed() {
+            return true;
+        }
+        let stale = self
+            .ask_arming
+            .as_ref()
+            .is_none_or(|arming| Some(&arming.request_id) != self.ask_card.as_ref().map(|card| &card.request_id));
+        if stale {
+            self.tick_ask_arming(now);
+        }
+        if let Some(arming) = self.ask_arming.as_mut() {
+            arming.keystroke(now);
+        }
+        false
     }
 
     /// Whether any tracked ask belongs to `context_id` — [`SeatCell::ask`]'s
@@ -1307,6 +1360,109 @@ mod tests {
                 redeemed_at: None, publication_abandoned: None,
             },
         }
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    /// A card that just appeared does not take keys: a keystroke meant for
+    /// the draft goes to the draft (`docs/tui.md`, "Asks").
+    #[test]
+    fn a_new_ask_card_is_disarmed_for_the_first_hundred_ms() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        assert!(app.tick_ask_arming(t0), "a new card is drawn disarmed");
+        assert!(!app.ask_card_armed());
+        assert!(!app.tick_ask_arming(t0 + ms(99)));
+        assert!(!app.ask_card_armed());
+        assert!(app.tick_ask_arming(t0 + ms(100)), "arming redraws the key line");
+        assert!(app.ask_card_armed());
+        assert!(app.ask_card_takes_key(t0 + ms(100)), "an armed card owns its keys");
+    }
+
+    #[test]
+    fn a_key_inside_the_first_hundred_ms_goes_past_the_card() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.tick_ask_arming(t0);
+        assert!(!app.ask_card_takes_key(t0 + ms(50)));
+        assert!(app.ask_card.is_some(), "the ask is still on screen, still pending");
+    }
+
+    /// Typing at 80 ms moves arming to 280 ms: a key at 250 ms still goes
+    /// past the card.
+    #[test]
+    fn typing_pushes_arming_out_and_a_key_inside_the_hold_goes_past() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.tick_ask_arming(t0);
+        assert!(!app.ask_card_takes_key(t0 + ms(80)));
+        assert!(!app.tick_ask_arming(t0 + ms(250)));
+        assert!(!app.ask_card_takes_key(t0 + ms(250)));
+    }
+
+    /// Typing at 80 ms moves arming to 280 ms: a key at 290 ms answers.
+    #[test]
+    fn typing_pushes_arming_out_and_a_key_after_the_hold_answers() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.tick_ask_arming(t0);
+        assert!(!app.ask_card_takes_key(t0 + ms(80)));
+        assert!(!app.tick_ask_arming(t0 + ms(279)));
+        assert!(app.tick_ask_arming(t0 + ms(290)));
+        assert!(app.ask_card_takes_key(t0 + ms(290)));
+    }
+
+    /// The card only arms once it has been drawn armed: a key that lands
+    /// after the deadline but before the frame that shows the keys still
+    /// goes to the draft, because the card on screen still said "arming".
+    #[test]
+    fn a_card_arms_only_when_the_frame_says_so() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.tick_ask_arming(t0);
+        assert!(!app.ask_card_takes_key(t0 + ms(150)));
+        assert!(app.tick_ask_arming(t0 + ms(160)));
+        assert!(app.ask_card_takes_key(t0 + ms(170)));
+    }
+
+    /// A key before the first frame stamps the card itself, so arming
+    /// never starts later than the first key that saw the card.
+    #[test]
+    fn a_key_before_the_first_frame_starts_the_hold() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        assert!(!app.ask_card_takes_key(t0));
+        assert!(!app.tick_ask_arming(t0 + ms(199)));
+        assert!(app.tick_ask_arming(t0 + ms(200)));
+    }
+
+    /// A different ask in the card starts disarmed again; the same ask put
+    /// back by the key path keeps its arming.
+    #[test]
+    fn each_new_ask_starts_disarmed() {
+        let (mut app, a, _b) = app_with_two();
+        let t0 = std::time::Instant::now();
+        app.ask_card = Some(ask_card("01a05d22", a));
+        app.tick_ask_arming(t0);
+        app.tick_ask_arming(t0 + ms(100));
+        let card = app.ask_card.take().expect("up");
+        app.ask_card = Some(card);
+        assert!(app.ask_card_armed(), "the same ask put back keeps its arming");
+        app.ask_card = Some(ask_card("01a05d99", a));
+        assert!(!app.ask_card_armed(), "another ask is disarmed until drawn and armed");
+        assert!(app.tick_ask_arming(t0 + ms(200)));
+        assert!(!app.ask_card_takes_key(t0 + ms(250)));
+        app.ask_card = None;
+        assert!(app.tick_ask_arming(t0 + ms(300)), "the arming goes with the card");
+        assert!(!app.ask_card_armed());
     }
 
     /// An ask answered from another surface leaves the pending set on the

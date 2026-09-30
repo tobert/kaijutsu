@@ -4,6 +4,7 @@
 //! Can connect via SSH (to remote servers) or Unix socket (for testing).
 
 pub mod actor;
+pub mod ask_arming;
 pub mod constants;
 pub mod context_create;
 pub mod context_feed;
@@ -46,6 +47,7 @@ pub use ledger::{
     AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, PendingAskPoll, RememberScope, decide_ask,
     decide_ask_remember, list_history, list_pending, poll_new_asks, show_ask, show_ask_detail,
 };
+pub use ask_arming::{ASK_ARM_DELAY, ASK_ARM_TYPING_HOLD, AskArming};
 pub use kernel_clock::{KernelClockHandle, local_epoch_ns};
 pub use key_select::{KeySelectError, resolve_key_source};
 #[cfg(feature = "cli")]

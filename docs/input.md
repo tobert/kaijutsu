@@ -99,8 +99,16 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    While either is up, `derive_contexts` returns *only* its own context
    beside `Global` and `KeyboardGrab::None` — the compose VimMachine is
    suspended, which is what holds typed text, so `a` is an allow and never
-   an `a` in the draft. The prefix still wins over both (it is in front of
-   everything), so `Ctrl+A d` stays the detach chord and is never a deny.
+   an `a` in the draft. A sheet that raises itself arms late: it shows
+   `arming… keys still go where you were typing` and does not claim the
+   keyboard until 100 ms after it appears, or 200 ms after the last key
+   pressed while it waits (`arm_ask_sheet`, values from
+   `kaijutsu_client::ask_arming`). It arms only on a frame with no key in
+   it, so its keys are drawn before any key uses them. A letter typed as
+   it appears reaches the draft through the compose grab, as if no sheet
+   were up. The ribbon's `Enter` opens a sheet with its keys live. The
+   prefix still wins over both (it is in front of everything), so
+   `Ctrl+A d` stays the detach chord and is never a deny.
    Neither raises on `Screen::Editor` or `Screen::Diff`: a vi surface owns
    the keys wherever it is live.
 

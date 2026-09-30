@@ -38,9 +38,11 @@
 //! neither; the block is shaped to take them when it does.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
+use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
-use kaijutsu_client::AskDetail;
+use kaijutsu_client::{AskArming, AskDetail};
 use kaijutsu_types::{ContextId, PrincipalId};
 
 use crate::connection::ledger::{
@@ -119,12 +121,44 @@ pub struct AskSheetState {
     pub scroll: usize,
     /// The context the sheet last looked at, to notice a switch.
     context: Option<ContextId>,
+    /// When the ask the sheet raised starts owning the keys, on `Time`'s
+    /// elapsed clock ([`arm_ask_sheet`]).
+    arming: Option<AskArming<Duration>>,
+    /// Whether the sheet's keys are live — set on a frame that draws them.
+    armed: bool,
 }
 
 impl AskSheetState {
     /// Whether the sheet has an ask to show.
     pub fn up(&self) -> bool {
         self.showing.is_some()
+    }
+
+    /// Whether the sheet owns the keyboard: an ask is up and its keys are
+    /// armed. A disarmed sheet is on screen while keys go to the surface
+    /// underneath.
+    pub fn keys_armed(&self) -> bool {
+        self.showing.is_some() && self.armed
+    }
+
+    /// Put `next` on screen as the sheet's own raise, at `now`. A raised
+    /// ask starts disarmed. `]`/`[` step with keys that are already armed
+    /// and do not come through here.
+    pub fn raise(&mut self, next: Option<String>, now: Duration) {
+        self.arming = next.as_ref().map(|_| AskArming::shown(now));
+        self.armed = false;
+        self.showing = next;
+        self.scroll = 0;
+    }
+
+    /// Open `id` at the player's own request (the ribbon's Enter). The
+    /// player chose this ask, so its keys are live at once.
+    pub fn open(&mut self, id: String) {
+        self.aside.remove(&id);
+        self.arming = None;
+        self.armed = true;
+        self.showing = Some(id);
+        self.scroll = 0;
     }
 }
 
@@ -462,6 +496,10 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
     rows
 }
 
+/// The key line of a sheet whose keys are not armed yet. It stands in for
+/// the keys, so the panel keeps its height when they arm.
+pub const SHEET_ARMING_LINE: &str = "arming… keys still go where you were typing";
+
 /// The key line, always the last row in the panel.
 ///
 /// An ask this player may not answer offers no approval keys — the sheet is
@@ -480,7 +518,7 @@ pub fn sheet_keys(can_review: bool, pending_total: usize) -> String {
 }
 
 /// Every row of the sheet, in order, for a panel this many characters wide
-/// and this many rows tall.
+/// and this many rows tall. `armed` is [`AskSheetState::keys_armed`].
 ///
 /// The key line is laid down last and the plan scrolls above it, so it never
 /// leaves the bottom edge however long the plan gets.
@@ -492,12 +530,17 @@ pub fn sheet_rows(
     cols: usize,
     rows: usize,
     scroll: usize,
+    armed: bool,
 ) -> Vec<PanelLine> {
     let head = sheet_head(ask, me, now_ms, cols);
     let body = sheet_body(ask, cols);
-    let keys = PanelLine {
-        text: truncate(&sheet_keys(me.is_some_and(|me| ask.can_review(me)), pending_total), cols),
-        tone: LineTone::Head,
+    let keys = if armed {
+        PanelLine {
+            text: truncate(&sheet_keys(me.is_some_and(|me| ask.can_review(me)), pending_total), cols),
+            tone: LineTone::Head,
+        }
+    } else {
+        PanelLine { text: truncate(SHEET_ARMING_LINE, cols), tone: LineTone::Dim }
     };
 
     // The head and the key line are never scrolled away; whatever is left
@@ -544,8 +587,7 @@ pub fn sync_ask_sheet(
         // A vi surface has the keys. Put the sheet down without putting the
         // ask aside — it is still waiting, and the hints line still says so.
         if state.showing.is_some() {
-            state.showing = None;
-            state.scroll = 0;
+            state.raise(None, time.elapsed());
         }
         if context_changed {
             state.context = current;
@@ -581,11 +623,39 @@ pub fn sync_ask_sheet(
         context_changed,
     );
     if next != state.showing {
-        state.showing = next;
-        state.scroll = 0;
+        state.raise(next, time.elapsed());
     }
     if context_changed {
         state.context = current;
+    }
+}
+
+/// Arm the raised ask's keys once its hold has passed
+/// ([`kaijutsu_client::ask_arming`]).
+///
+/// Every key pressed while the sheet is disarmed pushes arming out, and the
+/// sheet arms only on a frame with no key in it, so the frame that draws the
+/// keys comes before any key that uses them. Runs after [`sync_ask_sheet`]
+/// and before `input::context::sync_input_context`, which reads
+/// [`AskSheetState::keys_armed`]. It reads raw key presses only to time
+/// them; the dispatcher still routes every key.
+pub fn arm_ask_sheet(
+    mut keyboard: MessageReader<KeyboardInput>,
+    time: Res<Time>,
+    mut state: ResMut<AskSheetState>,
+) {
+    let pressed = keyboard.read().filter(|event| event.state.is_pressed()).count();
+    if state.showing.is_none() || state.armed {
+        return;
+    }
+    let now = time.elapsed();
+    if pressed > 0 {
+        // Moving the deadline changes nothing on screen or in the derived
+        // contexts, so it does not mark the state changed.
+        let state = state.bypass_change_detection();
+        state.arming.get_or_insert_with(|| AskArming::shown(now)).keystroke(now);
+    } else if state.arming.is_none_or(|arming| arming.armed(now)) {
+        state.armed = true;
     }
 }
 
@@ -799,6 +869,7 @@ pub fn render_ask_sheet(
         cols,
         rows,
         state.scroll,
+        state.keys_armed(),
     );
     let (glyphs, height) =
         panel::collect_panel_glyphs(&lines, &theme, font, atlas, &mut fonts.font_data_map);
@@ -871,7 +942,8 @@ impl Plugin for AskSheetPlugin {
                 Update,
                 // Before the context derivation, so the keys this frame
                 // already belong to the sheet when it raises.
-                sync_ask_sheet
+                (sync_ask_sheet, arm_ask_sheet)
+                    .chain()
                     .in_set(crate::input::InputPhase::SyncContext)
                     .before(crate::input::context::sync_input_context),
             )
@@ -955,6 +1027,146 @@ mod tests {
 
     fn text(rows: &[PanelLine]) -> String {
         rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" | ")
+    }
+
+    // ── arming ────────────────────────────────────────────────────────────
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    /// The arming system alone, over a clock the test sets.
+    fn arming_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<AskSheetState>()
+            .add_message::<bevy::input::keyboard::KeyboardInput>()
+            .add_systems(Update, arm_ask_sheet);
+        app
+    }
+
+    /// The sheet raises its own ask at `at`.
+    fn raise_at(app: &mut App, at: u64) {
+        app.world_mut().resource_mut::<Time>().advance_to(ms(at));
+        app.world_mut()
+            .resource_mut::<AskSheetState>()
+            .raise(Some(full_id("aaaa")), ms(at));
+    }
+
+    /// One frame at `at`, with a key pressed in it or not. Returns whether
+    /// the sheet owns the keys after the frame, which is what the next
+    /// frame's context derivation reads.
+    fn frame_at(app: &mut App, at: u64, key: bool) -> bool {
+        app.world_mut().resource_mut::<Time>().advance_to(ms(at));
+        if key {
+            app.world_mut()
+                .resource_mut::<Messages<bevy::input::keyboard::KeyboardInput>>()
+                .write(bevy::input::keyboard::KeyboardInput {
+                    key_code: KeyCode::KeyA,
+                    logical_key: bevy::input::keyboard::Key::Character("a".into()),
+                    state: bevy::input::ButtonState::Pressed,
+                    text: Some("a".into()),
+                    repeat: false,
+                    window: Entity::PLACEHOLDER,
+                });
+        }
+        app.update();
+        app.world().resource::<AskSheetState>().keys_armed()
+    }
+
+    /// A freshly raised ask does not own the keys; its keys arm one delay
+    /// after it appears (`docs/input.md`, "The approval surfaces").
+    #[test]
+    fn a_raised_ask_arms_one_hundred_ms_after_it_appears() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(!frame_at(&mut app, 1_000, false), "a new ask is disarmed");
+        assert!(!frame_at(&mut app, 1_099, false));
+        assert!(frame_at(&mut app, 1_100, false), "armed at 100 ms");
+    }
+
+    /// A key inside the first 100 ms is not the sheet's: the frame it lands
+    /// in derives contexts with the sheet disarmed, so it goes to the draft.
+    #[test]
+    fn a_key_inside_the_first_hundred_ms_is_not_the_sheets() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(!frame_at(&mut app, 1_050, true));
+        assert_eq!(
+            app.world().resource::<AskSheetState>().showing,
+            Some(full_id("aaaa")),
+            "the ask stays on screen, pending"
+        );
+    }
+
+    /// Typing at 80 ms moves arming to 280 ms: a key at 250 ms is still not
+    /// the sheet's.
+    #[test]
+    fn typing_holds_the_sheet_disarmed_and_a_key_inside_the_hold_passes() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(!frame_at(&mut app, 1_080, true));
+        assert!(!frame_at(&mut app, 1_200, false), "100 ms has passed, but typing held it");
+        assert!(!frame_at(&mut app, 1_250, true));
+    }
+
+    /// Typing at 80 ms moves arming to 280 ms: at 290 ms the sheet owns the
+    /// keys, so a key there answers.
+    #[test]
+    fn typing_holds_the_sheet_disarmed_and_a_key_after_the_hold_answers() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(!frame_at(&mut app, 1_080, true));
+        assert!(!frame_at(&mut app, 1_279, false));
+        assert!(frame_at(&mut app, 1_285, false));
+        assert!(frame_at(&mut app, 1_290, true), "an armed sheet stays armed through a key");
+    }
+
+    /// The sheet arms on a frame with no key in it, so the frame that
+    /// draws its keys comes before any key that uses them.
+    #[test]
+    fn the_sheet_arms_only_on_a_frame_without_a_key() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(!frame_at(&mut app, 1_150, true), "past the delay, but a key landed");
+        assert!(frame_at(&mut app, 1_166, false));
+    }
+
+    /// An ask the player opens from the ribbon is theirs to answer at once.
+    #[test]
+    fn an_ask_opened_from_the_ribbon_is_armed_at_once() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        app.world_mut().resource_mut::<AskSheetState>().open(full_id("bbbb"));
+        assert!(frame_at(&mut app, 1_010, true));
+    }
+
+    /// A different ask raised in its place starts disarmed again.
+    #[test]
+    fn each_raised_ask_starts_disarmed() {
+        let mut app = arming_app();
+        raise_at(&mut app, 1_000);
+        assert!(frame_at(&mut app, 1_100, false));
+        app.world_mut()
+            .resource_mut::<AskSheetState>()
+            .raise(Some(full_id("bbbb")), ms(1_200));
+        assert!(!frame_at(&mut app, 1_200, false));
+        assert!(frame_at(&mut app, 1_300, false));
+    }
+
+    /// Arming is presentation: the key line says the keys are not live
+    /// yet, in place of the keys, so the panel does not change height.
+    #[test]
+    fn a_disarmed_sheet_says_so_instead_of_offering_keys() {
+        let me = principal(1);
+        let a = ask("01a04eb6", Some(ctx(1)), me);
+        let disarmed = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, false);
+        let armed = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, true);
+        let last = disarmed.last().expect("rows");
+        assert_eq!(last.text, SHEET_ARMING_LINE);
+        assert_eq!(last.tone, LineTone::Dim);
+        assert!(!text(&disarmed).contains("llow"), "{}", text(&disarmed));
+        assert_eq!(disarmed.len(), armed.len());
     }
 
     // ── when the sheet raises ─────────────────────────────────────────────
@@ -1366,7 +1578,7 @@ mod tests {
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
         a.statements = (0..60).map(|i| format!("statement number {i}")).collect();
         for rows in [8usize, 14, 40] {
-            let out = sheet_rows(&a, Some(me), 0, 1, 100, rows, 0);
+            let out = sheet_rows(&a, Some(me), 0, 1, 100, rows, 0, true);
             assert!(
                 out.last().expect("rows").text.starts_with("[a]llow once"),
                 "rows={rows} got {:?}",
@@ -1382,11 +1594,11 @@ mod tests {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
         a.statements = (0..60).map(|i| format!("statement number {i}")).collect();
-        let top = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0);
+        let top = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, true);
         let joined = text(&top);
         assert!(joined.contains("\u{2191}0 \u{2193}"), "{joined}");
 
-        let scrolled = sheet_rows(&a, Some(me), 0, 1, 100, 14, 5);
+        let scrolled = sheet_rows(&a, Some(me), 0, 1, 100, 14, 5, true);
         assert!(text(&scrolled).contains("\u{2191}5 \u{2193}"), "{}", text(&scrolled));
         assert_ne!(text(&top), text(&scrolled), "j moved the plan");
 
@@ -1394,8 +1606,8 @@ mod tests {
         let limit = sheet_max_scroll(&a, Some(me), 0, 100, 14);
         assert!(limit > 0);
         assert_eq!(
-            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit)),
-            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit + 50)),
+            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit, true)),
+            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit + 50, true)),
             "scrolling past the end shows the end"
         );
     }
@@ -1410,7 +1622,7 @@ mod tests {
         a.statements = vec!["/very/long/path/".repeat(40)];
         a.cwd = Some("/another/very/long/path/".repeat(20));
         for cols in [24usize, 40, 80] {
-            for row in sheet_rows(&a, Some(me), 0, 4, cols, 30, 0) {
+            for row in sheet_rows(&a, Some(me), 0, 4, cols, 30, 0, true) {
                 assert!(
                     row.text.chars().count() <= cols,
                     "cols={cols} overflowed with {:?}",
