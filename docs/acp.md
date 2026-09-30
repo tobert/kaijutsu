@@ -392,7 +392,19 @@ as the tui and app "always" keys do, never a family rule. The rule's creator
 is this connection's principal, so only that reviewer can forget it. When the
 ledger decides the ask but refuses the rule (a statement with a free
 variable), the client gets an agent message that names the reason and says
-the answer applied to this ask only.
+the answer applied to this ask only. A `cancelled` outcome denies the ask
+with `kj ledger deny <id> --cancelled`, recorded as the decided option
+`prompt_cancelled`, so a turn holding on the ask reads the refusal and goes
+on.
+
+The request's `toolCall.toolCallId` names the model's tool call that raised
+the ask, which `kj ledger show` reports as `tool_call_block_id`. The gate
+records it with the ask, for a foreground or a background call. The request
+waits until its session has sent the `tool_call` that announces the call,
+and is sent under the session's emission lock, so it always follows that
+announcement. An ask no model call raised, or one sent to a session bound
+to another context, names the ask id instead. The ask id is always in
+`_meta.kaijutsu.askId`.
 
 **Gaps** (also in issues.md):
 

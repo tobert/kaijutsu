@@ -1714,6 +1714,7 @@ async fn dispatch_recorded_tool_result(
 
     let mut tool_ctx = tool_ctx.clone();
     tool_ctx.publishes_pair = true;
+    tool_ctx.tool_call = Some(call);
     let tool_ctx = &tool_ctx;
     let params = input.to_string();
     loop {
@@ -7503,7 +7504,7 @@ mod lifetime_tests {
     async fn ordinary_and_inline_tools_preserve_the_same_shell_projection() {
         use crate::mcp::{CallContext, ContextToolBinding, InstanceId, InstancePolicy, KernelCallParams,
             KernelTool, KernelToolResult, McpResult, McpServerLike, ServerNotification};
-        struct EnvelopeTool { id: InstanceId }
+        struct EnvelopeTool { id: InstanceId, tool_call: Arc<std::sync::Mutex<Option<BlockId>>> }
         #[async_trait::async_trait]
         impl McpServerLike for EnvelopeTool {
             fn instance_id(&self) -> &InstanceId { &self.id }
@@ -7513,6 +7514,7 @@ mod lifetime_tests {
             }
             async fn call_tool(&self, _: KernelCallParams, call: &CallContext, _: tokio_util::sync::CancellationToken) -> McpResult<KernelToolResult> {
                 assert!(call.publishes_pair, "model dispatch must declare its publication owner to the broker");
+                *self.tool_call.lock().unwrap() = call.tool_call;
                 let mut envelope = ShellEnvelope::new(kaijutsu_types::shell_envelope::ShellStatus::Done);
                 envelope.stdout = "\x1b[31mred\x1b[0m".into();
                 envelope.exit_code = Some(0);
@@ -7526,7 +7528,8 @@ mod lifetime_tests {
         for inline in [false, true] {
             let (kernel, context, after, call) = fixture(None).await;
             let instance = InstanceId::new("envelope-test");
-            kernel.broker().register(Arc::new(EnvelopeTool { id: instance.clone() }), InstancePolicy::default()).await.unwrap();
+            let tool_call = Arc::new(std::sync::Mutex::new(None));
+            kernel.broker().register(Arc::new(EnvelopeTool { id: instance.clone(), tool_call: tool_call.clone() }), InstancePolicy::default()).await.unwrap();
             kernel.broker().set_binding(context, ContextToolBinding::with_instances(vec![instance])).await.unwrap();
             let lease = kernel.turns().begin(context);
             let mut anchor = after;
@@ -7540,8 +7543,12 @@ mod lifetime_tests {
                 let (result, tail) = dispatch_recorded_tool_result(kernel.blocks(), context, &kernel, "envelope", &serde_json::json!({}),
                     &call, lease.interrupt().cancel.clone(), &lease.interrupt().stop_waiting, "envelope-call", id, &lease).await.unwrap();
                 anchor = tail;
+                assert_eq!(*tool_call.lock().unwrap(), Some(id), "the broker is told which model call it answers");
                 result
             };
+            let named = tool_call.lock().unwrap().expect("model dispatch names its call to the broker");
+            let named = kernel.blocks().get_block_snapshot(context, &named).unwrap().unwrap();
+            assert_eq!((named.kind, named.tool_name.as_deref()), (kaijutsu_types::BlockKind::ToolCall, Some("envelope")), "inline={inline}");
             assert!(!result.is_error);
             // The model reads the clean output with the facts rendered below
             // it (docs/shell-envelope.md, "What a model turn reads").

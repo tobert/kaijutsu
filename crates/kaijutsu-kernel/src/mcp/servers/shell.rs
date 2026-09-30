@@ -291,6 +291,7 @@ impl McpServerLike for ShellServer {
                 }
             };
             spec.publishes_pair = ctx.publishes_pair || parsed.run_in_background;
+            spec.tool_call = ctx.tool_call;
             let caller = crate::kj::KjCaller {
                 principal_id: ctx.principal_id,
                 actor_id: ctx.actor_id,

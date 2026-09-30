@@ -41,7 +41,7 @@
 
 use std::collections::HashSet;
 
-use kaijutsu_types::{ContextId, PrincipalId};
+use kaijutsu_types::{BlockId, ContextId, PrincipalId};
 
 use crate::actor::{ActorHandle, CallError};
 use crate::rpc::KjExecutionResult;
@@ -302,6 +302,10 @@ pub struct AskDetail {
     pub tool: Option<String>,
     pub hook_id: Option<String>,
     pub instance: Option<String>,
+    /// The model's ToolCall block whose invocation raised this ask, recorded
+    /// with the ask. `None` for an ask no model call raised, such as one
+    /// from a person's shell.
+    pub tool_call_block_id: Option<BlockId>,
     pub description: String,
     pub authorized_label: Option<String>,
     pub statements: Vec<String>,
@@ -413,6 +417,7 @@ fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
         tool: str_field("tool"),
         hook_id: str_field("hook_id"),
         instance: str_field("instance"),
+        tool_call_block_id: str_field("tool_call_block_id").and_then(|key| BlockId::from_key(&key)),
         description: str_field("description").unwrap_or_default(),
         authorized_label: str_field("authorized_label"),
         statements,
@@ -479,6 +484,23 @@ pub async fn decide_ask_remember(
     actor.execute_kj(ctx, decide_argv(request_id, allow, remember)).await
 }
 
+/// The argv `kj ledger deny <id> --cancelled` builds.
+fn cancelled_argv(request_id: &str) -> Vec<String> {
+    vec!["ledger".to_string(), "deny".to_string(), request_id.to_string(), "--cancelled".to_string()]
+}
+
+/// Deny an ask because the reviewer's prompt was cancelled rather than
+/// answered, through `kj ledger deny <id> --cancelled`. The ledger records the
+/// decided option `prompt_cancelled`. Same contract as [`decide_ask`]: a
+/// nonzero exit is a race or a refusal, not a [`CallError`].
+pub async fn deny_cancelled_ask(
+    actor: &ActorHandle,
+    ctx: ContextId,
+    request_id: &str,
+) -> Result<KjExecutionResult, CallError> {
+    actor.execute_kj(ctx, cancelled_argv(request_id)).await
+}
+
 #[cfg(test)]
 mod detail_tests {
     use super::*;
@@ -530,6 +552,11 @@ mod detail_tests {
             "instance": "kaish-1",
             "tool": "shell_write",
             "hook_id": null,
+            "tool_call_block_id": kaijutsu_types::BlockId::new(
+                ContextId::parse("0198f2b0-0000-7000-8000-000000000001").unwrap(),
+                PrincipalId::parse("0198f2b0-0000-7000-8000-000000000004").unwrap(),
+                7,
+            ).to_key(),
             "description": "rm -rf ~/src/wt/kaish-arith",
             "authorized_label": "worktree-remove",
             "statements": ["rm -rf ~/src/wt/kaish-arith"],
@@ -566,6 +593,8 @@ mod detail_tests {
         assert_eq!(detail.origin, "shell_gate");
         assert_eq!(detail.tool.as_deref(), Some("shell_write"));
         assert_eq!(detail.hook_id, None);
+        let call = detail.tool_call_block_id.expect("the fixture names its tool call");
+        assert_eq!((call.context_id, call.principal_id, call.seq), (detail.context_id.unwrap(), detail.actor_id.unwrap(), 7));
         assert_eq!(detail.description, "rm -rf ~/src/wt/kaish-arith");
         assert_eq!(detail.statements, vec!["rm -rf ~/src/wt/kaish-arith".to_string()]);
         assert_eq!(detail.exec_source.as_deref(), Some("kaish"));
@@ -632,6 +661,12 @@ mod detail_tests {
         assert!(detail.statements.is_empty());
         assert!(detail.env.is_empty());
         assert_eq!(detail.redeemed_at, None);
+        assert_eq!(detail.tool_call_block_id, None);
+    }
+
+    #[test]
+    fn a_cancelled_prompt_denies_by_name() {
+        assert_eq!(cancelled_argv("req-1"), vec!["ledger", "deny", "req-1", "--cancelled"]);
     }
 }
 

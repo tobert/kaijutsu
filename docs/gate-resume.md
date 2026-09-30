@@ -55,6 +55,12 @@ the wire: the MCP and RPC shell paths still return `Pending`.
   next one. The shell tool publishes the operation before the turn can
   hold, so the worker checks for a holder under the lock it claims with,
   and a hold registered after that claim finds the ask already redeemed.
+- **The call an ask names.** The gate records the model's ToolCall block
+  with the ask, in the transaction that creates it, and `kj ledger show`
+  reports it as `tool_call_block_id`. A client can name the call as soon
+  as the ask is visible. The pair link lands later with the `Waiting`
+  result, and for a background call it names the operation's pair, not the
+  model's call.
 - **Interrupts.** A hard or a soft interrupt ends the wait. An unanswered
   ask is abandoned and the pair settles `Error`; an answer nobody has run is
   spent without running. An answer the worker already claimed stays the

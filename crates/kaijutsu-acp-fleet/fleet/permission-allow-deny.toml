@@ -23,6 +23,7 @@ text = "refused was not made"
 text = "make the granted directory"
 permissions = ["allow"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir granted"]
+permission_tool_calls = ["shell_write"]
 text_contains = ["granted exists now"]
 tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }]
 
@@ -30,6 +31,7 @@ tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", s
 text = "make the refused directory"
 permissions = ["deny"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir refused"]
+permission_tool_calls = ["shell_write"]
 text_contains = ["refused was not made"]
 tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
 

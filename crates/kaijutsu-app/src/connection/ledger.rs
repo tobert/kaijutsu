@@ -759,6 +759,7 @@ mod tests {
             tool: None,
             hook_id: None,
             instance: None,
+            tool_call_block_id: None,
             description: format!("ask {id}"),
             authorized_label: None,
             statements: Vec::new(),

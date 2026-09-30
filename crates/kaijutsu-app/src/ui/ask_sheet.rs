@@ -1001,6 +1001,7 @@ mod tests {
             tool: Some("shell_write".into()),
             hook_id: None,
             instance: Some("kaish-1".into()),
+            tool_call_block_id: None,
             description: "rm -rf ~/src/wt/kaish-arith".into(),
             authorized_label: None,
             statements: vec!["rm -rf ~/src/wt/kaish-arith".into()],

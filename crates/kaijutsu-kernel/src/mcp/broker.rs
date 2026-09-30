@@ -2522,6 +2522,7 @@ impl Broker {
             crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params)
         };
         gate_spec.publishes_pair = ctx.publishes_pair && phase == McpHookPhase::PreCall;
+        gate_spec.tool_call = ctx.tool_call;
         let gate_config = crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await;
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
@@ -4778,7 +4779,7 @@ mod tests {
         let held = kernel.broker().bindings.write().await;
         let config = crate::kj::gate_policy::no_config();
         let gate = run_gate(kernel, &caller, GateSpec {
-            publishes_pair: false, origin: Origin::KjVerb,
+            publishes_pair: false, tool_call: None, origin: Origin::KjVerb,
             instance: "builtin.kj".into(), tool: "cc.send".into(), hook_id: None,
             description: "gate archive race".into(), authorized_label: "gate-race".into(),
             statements: vec![GatedStatement {

@@ -1,0 +1,26 @@
+description = "A gated background call's permission request names the model's own call, not the operation that runs the command."
+
+# The completion notice starts a turn after the response, which is gap H2.
+known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
+
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "sleep 1; echo done > bg.txt", run_in_background = true } }]
+[[model]]
+text = "started it"
+# Only the completion notice starts this turn.
+[[model]]
+text = "the background job finished"
+
+[[prompt]]
+text = "write bg.txt in the background"
+permissions = ["allow"]
+permission_tool_calls = ["shell_write"]
+text_contains = ["started it", "the background job finished"]
+
+[[verify]]
+path = "bg.txt"
+equals = "done\n"

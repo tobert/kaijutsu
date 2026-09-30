@@ -2559,14 +2559,6 @@ for when it's contained in docker". Open:
     turn: the turn holds on it, inside the prompt.
 - **Harbor shape** (`docs/acp-fleet.md`, "Harbor shape"): every fleet
   scenario is checked for what Harbor reads. Open findings:
-  - **H1: a permission request names the ask, not the tool call.** Its
-    `toolCall.toolCallId` is the ledger request id, which no `tool_call`
-    announced, so Harbor never attaches the request to its step. The
-    ledger row does not record the tool call that raised it, and the
-    `Refusal` carrying the ask id reaches the bridge only as prose. Fix in
-    the kernel: record the call block on the ask and return it from
-    `kj ledger show`; the bridge then names `update::tool_call_id(block)`.
-    Listed in `SHAPE_GAPS`.
   - **H2: a background completion starts a turn after `session/prompt`
     returns.** Harbor ends the run at the response and never sees it; the
     job's own `shell` call is still `in_progress` then. The planned opt-in
@@ -2606,14 +2598,6 @@ for when it's contained in docker". Open:
   wire is final. An approved call's last update carries only
   `rawOutput.exit_code`, so the client shows the waiting text as its only
   content, though the model read the real output.
-- **A permission request answered `cancelled` leaves its ask pending**, and
-  the bridge does not offer it again (`answer_ask` in
-  `crates/kaijutsu-acp/src/permission.rs`), so a turn holding on it waits
-  until `session/cancel`. Seen when a fleet run answered a second offer
-  `cancelled`: the prompt never returned. Harbor answers every request
-  `cancelled` when run with `HARBOR_ACP_PERMISSION_MODE=deny`
-  (`acp_runner.py` 342–343), so under a gate that asks, such a run
-  holds until Harbor's agent timeout.
 
 ## Egress: what stays open (2026-09-21)
 

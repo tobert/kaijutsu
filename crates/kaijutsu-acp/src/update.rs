@@ -591,6 +591,11 @@ impl UpdateMapper {
         })
     }
 
+    /// Whether this mapper has emitted the `tool_call` that announces `call`.
+    pub fn has_announced(&self, call: BlockId) -> bool {
+        self.announced.contains(&call)
+    }
+
     /// Whether the result linked to a tool call has reached the ACP mapper.
     /// Unlike message tails, tool output is a replace-style patch and needs
     /// its own delivery fence before a command prompt may finish.
@@ -1549,6 +1554,16 @@ mod tests {
         );
         b.content.push_str(" plus more");
         assert_eq!(chunk_text(&m.observe(&b)[0]), " plus more");
+    }
+
+    #[test]
+    fn a_tool_call_counts_as_announced_once_its_create_is_emitted() {
+        let mut m = mapper();
+        let mut call = block(BlockKind::ToolCall, Role::Model, "", 1);
+        call.tool_name = Some("shell_write".into());
+        assert!(!m.has_announced(call.id));
+        assert!(matches!(m.observe(&call)[0], SessionUpdate::ToolCall(_)));
+        assert!(m.has_announced(call.id));
     }
 
     #[test]

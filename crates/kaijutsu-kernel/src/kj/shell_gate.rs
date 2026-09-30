@@ -157,7 +157,7 @@ pub(crate) fn build_shell_gate_spec_with_stdin(
     }
 
     Ok(GateSpec {
-        publishes_pair: false, origin: Origin::ShellGate,
+        publishes_pair: false, tool_call: None, origin: Origin::ShellGate,
         instance: INSTANCE.into(),
         tool: TOOL.into(),
         hook_id: None,

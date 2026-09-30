@@ -23,7 +23,7 @@ use crate::shape::{self, PromptWire, Transcript};
 /// records it. A failure of one is excused and the scenario reports `GAP`.
 /// A scenario that exercises one with no failure fails: the finding no
 /// longer reproduces, so its line here must go.
-pub const SHAPE_GAPS: &[(&str, &str)] = &[("H1", shape::PERMISSION_TOOL_CALL)];
+pub const SHAPE_GAPS: &[(&str, &str)] = &[];
 
 /// How long the update stream must stay silent after a prompt's response
 /// before the prompt is judged. A model's turn holds on its own ask, so its
@@ -646,6 +646,24 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
         {
             failures.push(format!("{label}: permission request {} title does not contain {want:?}; it was {title:?}", i + 1));
         }
+        if let Some(want) = prompt.permission_tool_calls.as_ref().and_then(|calls| calls.get(i)) {
+            let id = record.params.pointer("/toolCall/toolCallId").and_then(Value::as_str).unwrap_or("");
+            let announced = seen.updates.iter().find(|u| {
+                u.pointer("/update/sessionUpdate").and_then(Value::as_str) == Some("tool_call")
+                    && u.pointer("/update/toolCallId").and_then(Value::as_str) == Some(id)
+            });
+            match announced.map(|u| u.pointer("/update/title").and_then(Value::as_str).unwrap_or("")) {
+                Some(title) if title == want => {}
+                Some(title) => failures.push(format!(
+                    "{label}: permission request {} names tool call {id:?}, titled {title:?}, not {want:?}",
+                    i + 1
+                )),
+                None => failures.push(format!(
+                    "{label}: permission request {} names tool call {id:?}, which this prompt never announced",
+                    i + 1
+                )),
+            }
+        }
     }
     failures
 }
@@ -814,6 +832,34 @@ mod tests {
         assert_eq!(check_prompt("p", &p, &seen), Vec::<String>::new());
         let late = Seen { response: &response, updates: &updates, answered: 0, permissions: &[] };
         assert_eq!(check_prompt("p", &p, &late).len(), 1, "a cost after the response is one Harbor never reads");
+    }
+
+    #[test]
+    fn a_permission_request_must_name_the_expected_tool_call() {
+        let p = prompt("permissions = [\"allow\"]\npermission_tool_calls = [\"shell_write\"]");
+        let response = json!({"stopReason": "end_turn"});
+        let updates = [
+            json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "model", "title": "shell_write"}}),
+            json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "operation", "title": "shell"}}),
+        ];
+        let request = |id: &str| [PermissionRecord {
+            params: json!({"toolCall": {"toolCallId": id, "title": "mkdir x"}}),
+            answer: Some(PermissionAnswer::Allow),
+            option_id: Some("allow".into()),
+            problem: None,
+            updates_seen: 2,
+        }];
+        let judge = |id: &str| {
+            let permissions = request(id);
+            let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &permissions };
+            check_prompt("p", &p, &seen).join("\n")
+        };
+        assert_eq!(judge("model"), "");
+        assert!(judge("operation").contains("titled \"shell\", not \"shell_write\""), "{}", judge("operation"));
+        assert!(judge("ask-1").contains("never announced"), "{}", judge("ask-1"));
+        let uneven = format!("description = \"d\"\n[[prompt]]\ntext = \"go\"\npermission_tool_calls = [\"shell_write\"]\n");
+        let error = format!("{:#}", Scenario::parse(&uneven, "test").unwrap_err());
+        assert!(error.contains("`permission_tool_calls` has 1 entries for 0"), "{error}");
     }
 
     fn scenario(text: &str) -> Scenario {

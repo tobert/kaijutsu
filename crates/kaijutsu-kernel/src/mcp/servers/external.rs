@@ -1029,6 +1029,7 @@ mod tests {
         let server = fake_server("test.ext");
         let ctx = CallContext {
             publishes_pair: false,
+            tool_call: None,
             principal_id: PrincipalId::new(),
             actor_id: PrincipalId::new(),
             reviewer_id: None,
@@ -1069,6 +1070,7 @@ mod tests {
         let server = fake_server("test.ext");
         let ctx = CallContext {
             publishes_pair: false,
+            tool_call: None,
             principal_id: PrincipalId::new(),
             actor_id: PrincipalId::new(),
             reviewer_id: None,

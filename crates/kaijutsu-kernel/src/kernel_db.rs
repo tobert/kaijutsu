@@ -537,6 +537,20 @@ pub struct QuiesceState {
 // Schema
 // ============================================================================
 
+/// Record the model's ToolCall block that raised `request`, in the
+/// transaction that creates the ask. The call must belong to the ask's context.
+pub(crate) fn record_approval_tool_call(
+    conn: &Connection, request: &str, context: ContextId, call: &BlockId,
+) -> KernelDbResult<()> {
+    if call.context_id != context {
+        return Err(KernelDbError::Validation(format!(
+            "tool call {} belongs to context {}, not the ask's context {context}", call.to_key(), call.context_id)));
+    }
+    conn.execute("INSERT INTO approval_tool_calls(request_id, block_id) VALUES (?1, ?2)",
+        rusqlite::params![request, call.to_key()])?;
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 -- ── Kernel Identity (singleton) ─────────────────────────────────
 -- One row per database. The `singleton` column + UNIQUE constraint
@@ -557,6 +571,12 @@ CREATE TABLE IF NOT EXISTS approval_pair_handoffs (
     request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
     released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0, 1)),
     abandoned_reason TEXT
+);
+
+-- The model's ToolCall block whose invocation raised an ask, recorded with it.
+CREATE TABLE IF NOT EXISTS approval_tool_calls (
+    request_id TEXT NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    block_id TEXT NOT NULL
 );
 
 -- Completion delivery is independent of the single-use execution claim.
@@ -2431,6 +2451,15 @@ impl KernelDb {
             }
             record(conn, request)
         })
+    }
+
+    /// The model's ToolCall block recorded with this ask, if a model call raised it.
+    pub(crate) fn approval_tool_call(&self, request: &str) -> KernelDbResult<Option<BlockId>> {
+        let key: Option<String> = self.conn.query_row("SELECT block_id FROM approval_tool_calls WHERE request_id=?1",
+            [request], |row| row.get(0)).optional()?;
+        key.map(|key| BlockId::from_key(&key)
+            .ok_or_else(|| KernelDbError::Validation(format!("ask {request} records a malformed tool call block {key}"))))
+            .transpose()
     }
 
     pub(crate) fn approval_pair_expected(&self, request: &str) -> KernelDbResult<bool> {

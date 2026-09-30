@@ -722,6 +722,7 @@ impl Kernel {
         .with_actor(tool_ctx.actor_id, tool_ctx.reviewer_id)
         .with_trace(TraceContext::from_current_span());
         call_ctx.publishes_pair = tool_ctx.publishes_pair;
+        call_ctx.tool_call = tool_ctx.tool_call;
         if let Some(cwd) = tool_ctx.cwd.clone() {
             call_ctx = call_ctx.with_cwd(cwd);
         }

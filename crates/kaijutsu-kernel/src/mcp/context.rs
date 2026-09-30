@@ -44,6 +44,9 @@ impl TraceContext {
 pub struct CallContext {
     /// This invocation publishes a transcript pair before approval delivery.
     pub publishes_pair: bool,
+    /// The model's ToolCall block this invocation answers. An ask the
+    /// invocation raises records it.
+    pub tool_call: Option<kaijutsu_types::BlockId>,
     /// Attribution only, never authorization (D-22).
     pub principal_id: PrincipalId,
     /// Character performing this invocation; separate from its requester.
@@ -68,6 +71,7 @@ impl CallContext {
     ) -> Self {
         Self {
             publishes_pair: false,
+            tool_call: None,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,

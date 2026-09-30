@@ -188,6 +188,9 @@ pub(crate) struct GatedStatement {
 pub(crate) struct GateSpec {
     /// The caller will publish a transcript pair before yielding this ask.
     pub publishes_pair: bool,
+    /// The model's ToolCall block whose invocation raised this ask. Recorded
+    /// with the ask, so a reviewer's client can attach the ask to that call.
+    pub tool_call: Option<kaijutsu_types::BlockId>,
     pub origin: Origin,
     /// Ledger `instance` column, e.g. `"builtin.kj"` or `"builtin.shell_write"`.
     ///
@@ -746,7 +749,14 @@ pub(crate) async fn run_gate_recorded(
         approval_span.record("reviewer.id", reviewer.to_string());
         let mut ask = ask;
         ask.reviewer_id = reviewer.as_bytes().to_vec();
-        match db.create_approval_ask_recorded(&ask, spec.publishes_pair, record) {
+        let tool_call = spec.tool_call;
+        let recorded = |conn: &rusqlite::Connection, request: &str| {
+            if let Some(call) = &tool_call {
+                crate::kernel_db::record_approval_tool_call(conn, request, context, call)?;
+            }
+            record(conn, request)
+        };
+        match db.create_approval_ask_recorded(&ask, spec.publishes_pair, recorded) {
             Ok(id) => id,
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
         }
@@ -990,7 +1000,7 @@ mod tests {
 
     fn cc_spec(target: &str) -> GateSpec {
         GateSpec {
-            publishes_pair: false, origin: Origin::KjVerb,
+            publishes_pair: false, tool_call: None, origin: Origin::KjVerb,
             instance: "builtin.kj".into(),
             tool: "cc.send".into(),
             hook_id: None,
@@ -1016,7 +1026,7 @@ mod tests {
     /// stay a pure test of `run_gate`'s composition, not of the planner.
     fn two_statement_spec(label: &str, first: &str, second: &str, second_index: usize) -> GateSpec {
         GateSpec {
-            publishes_pair: false, origin: Origin::ShellGate,
+            publishes_pair: false, tool_call: None, origin: Origin::ShellGate,
             instance: "builtin.shell_write".into(),
             tool: "shell_write".into(),
             hook_id: None,

@@ -621,6 +621,7 @@ mod tests {
             tool: Some("shell_write".into()),
             hook_id: None,
             instance: None,
+            tool_call_block_id: None,
             description: "a description".into(),
             authorized_label: None,
             statements: vec!["git worktree remove --force ~/src/wt/kaish-arith".into()],

@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
+use kaijutsu_types::{BlockId, ContextId, KernelId, PrincipalId, SessionId};
 
 /// The subset of `mcp::CallContext` that existing engine bodies read.
 ///
@@ -26,6 +26,9 @@ use kaijutsu_types::{ContextId, KernelId, PrincipalId, SessionId};
 pub struct ExecContext {
     /// The model result owner will publish its pair before approval delivery.
     pub publishes_pair: bool,
+    /// The model's ToolCall block this invocation answers. An ask the
+    /// invocation raises records it.
+    pub tool_call: Option<BlockId>,
     /// Authenticated requester. This remains the redemption identity.
     pub principal_id: PrincipalId,
     /// Character performing this invocation.
@@ -51,6 +54,7 @@ impl ExecContext {
     ) -> Self {
         Self {
             publishes_pair: false,
+            tool_call: None,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,
@@ -73,6 +77,7 @@ impl ExecContext {
     ) -> Self {
         Self {
             publishes_pair: false,
+            tool_call: None,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,
@@ -87,6 +92,7 @@ impl ExecContext {
         let principal_id = PrincipalId::new();
         Self {
             publishes_pair: false,
+            tool_call: None,
             principal_id,
             actor_id: principal_id,
             reviewer_id: None,

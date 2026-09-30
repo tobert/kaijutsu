@@ -1493,6 +1493,7 @@ mod tests {
                 tool: Some("shell_write".to_string()),
                 hook_id: None,
                 instance: None,
+                tool_call_block_id: None,
                 description: statement.to_string(),
                 authorized_label: None,
                 statements: vec![statement.to_string()],

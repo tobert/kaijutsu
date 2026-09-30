@@ -26,7 +26,9 @@
 //!    ask assigned to this connection's authenticated character is offered.
 //! 4. Otherwise the round trip is spawned (`cx.spawn`): a
 //!    `session/request_permission` call to the client, and on answer,
-//!    `kaijutsu_client::ledger::decide_ask` to write the decision back.
+//!    `kaijutsu_client::ledger::decide_ask` to write the decision back. The
+//!    request names the model's tool call that raised the ask, after the
+//!    session has announced it; a cancelled prompt denies.
 //!
 //! # The kernel is the authority, and nothing expires
 //!
@@ -68,11 +70,12 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use kaijutsu_client::ledger::{self, AskInfo, PendingAsk};
+use kaijutsu_types::{BlockId, ContextId};
 use tokio::sync::broadcast;
 
 use crate::bridge::KernelBridge;
 use crate::rank;
-use crate::session::SessionRegistry;
+use crate::session::{Session, SessionRegistry};
 use crate::AcpBridge;
 
 fn decision_failure_message(request_id: &str, verb: &str, reason: &str) -> String {
@@ -114,6 +117,12 @@ fn notify_decision_failure(cx: &ConnectionTo<Client>, session_id: &SessionId, me
 /// for the ledger ask itself (see module docs, "The kernel is the authority
 /// and the timeout").
 pub const REQUEST_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a request waits for its session to announce the tool call it
+/// names. The call block exists before its ask does, so this wait is short;
+/// past it the request goes out anyway, with a warning.
+const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
+const ANNOUNCE_POLL: Duration = Duration::from_millis(20);
 
 /// Subscribe to the kernel-wide ledger-change stream and drive the pump for
 /// the life of the connection — the `.with_spawned` task
@@ -217,6 +226,8 @@ async fn poll_ledger(
         } else {
             continue;
         };
+        let Some(session) = sessions.get(&session_id) else { continue };
+        let tool_call = tool_call_for(detail.tool_call_block_id, session.context_id);
 
         // Ours, and about to be offered exactly once.
         seen.insert(id.clone());
@@ -225,7 +236,7 @@ async fn poll_ledger(
         let cx_task = cx.clone();
         let id_task = id.clone();
         if let Err(e) = cx.spawn(async move {
-            answer_ask(&kernel, &cx_task, session_id, id_task, ask).await;
+            answer_ask(&kernel, &cx_task, &session, session_id, id_task, ask, tool_call).await;
             Ok(())
         }) {
             tracing::warn!(request = %id, error = %e, "failed to spawn permission round trip");
@@ -233,14 +244,41 @@ async fn poll_ledger(
     }
 }
 
+/// The tool call a request to a session bound to `session_context` may
+/// name: the model call that raised the ask, when that session announced
+/// it. A session bound to another context never did.
+fn tool_call_for(call: Option<BlockId>, session_context: ContextId) -> Option<BlockId> {
+    call.filter(|call| call.context_id == session_context)
+}
+
+/// Wait until `session` has announced `call`, so a request naming it
+/// arrives after the `tool_call` it names. Bounded by [`ANNOUNCE_WAIT`].
+async fn wait_until_announced(session: &Session, call: BlockId, request_id: &str) {
+    let deadline = tokio::time::Instant::now() + ANNOUNCE_WAIT;
+    while !session.mapper.lock().has_announced(call) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                request = %request_id,
+                call = %call.to_key(),
+                "the tool call this ask names was not announced in time; asking anyway"
+            );
+            return;
+        }
+        tokio::time::sleep(ANNOUNCE_POLL).await;
+    }
+}
+
 /// Run one `session/request_permission` round trip and write the answer
-/// back through `kaijutsu_client::ledger::decide_ask`.
+/// back through `kaijutsu_client::ledger::decide_ask`. The request names
+/// `tool_call` when there is one, and the ask otherwise.
 async fn answer_ask(
     kernel: &KernelBridge,
     cx: &ConnectionTo<Client>,
+    session: &Session,
     session_id: SessionId,
     request_id: String,
     ask: AskInfo,
+    tool_call: Option<BlockId>,
 ) {
     let title = if ask.description.is_empty() {
         request_id.clone()
@@ -251,10 +289,19 @@ async fn answer_ask(
     // A client that lets a request time out is offered the ask again while
     // it is still pending: a model turn may be holding on it, and nothing
     // else would offer it to this client again.
+    if let Some(call) = tool_call {
+        wait_until_announced(session, call, &request_id).await;
+    }
     let decision = loop {
         let (options, kinds) = build_options();
-        let request = permission_request(session_id.clone(), request_id.clone(), title.clone(), options);
-        match tokio::time::timeout(REQUEST_PERMISSION_TIMEOUT, cx.send_request(request).block_task()).await {
+        let request = permission_request(session_id.clone(), tool_call, &request_id, title.clone(), options);
+        // Sent under the emission lock, so any `tool_call` the mapper
+        // recorded as sent is on the wire before this request.
+        let sent = {
+            let _emission = session.emission.lock();
+            cx.send_request(request)
+        };
+        match tokio::time::timeout(REQUEST_PERMISSION_TIMEOUT, sent.block_task()).await {
             Ok(Ok(response)) => break map_response(&response, &kinds),
             Ok(Err(e)) => {
                 tracing::warn!(request = %request_id, error = %e, "permission ask errored answering the client; leaving pending");
@@ -280,17 +327,26 @@ async fn answer_ask(
         }
     };
 
-    let Some(Decision { allow, remember }) = decision else {
+    let Some(decision) = decision else {
         return;
     };
 
-    let verb = if allow { "allow" } else { "deny" };
     // The decision is authored in the work context as this connection's
     // principal, which the ledger checks is the ask's reviewer and records
     // as a remembered rule's creator. An "always" answer learns an
     // exact-text rule, the same one the tui and app "always" keys learn.
-    let scope = remember.then_some(ledger::RememberScope::Always);
-    match ledger::decide_ask_remember(kernel.actor(), ask.context_id, &request_id, allow, scope).await {
+    // A cancelled prompt is this reviewer declining to allow: the ask is
+    // denied, so a turn holding on it reads the refusal and goes on.
+    let (verb, remember, result) = match decision {
+        Decision::Allow { remember } | Decision::Deny { remember } => {
+            let allow = matches!(decision, Decision::Allow { .. });
+            let scope = remember.then_some(ledger::RememberScope::Always);
+            let result = ledger::decide_ask_remember(kernel.actor(), ask.context_id, &request_id, allow, scope).await;
+            (if allow { "allow" } else { "deny" }, remember, result)
+        }
+        Decision::Cancelled => ("deny", false, ledger::deny_cancelled_ask(kernel.actor(), ask.context_id, &request_id).await),
+    };
+    match result {
         Ok(result) if result.exit_code == 0 => {
             tracing::info!(request = %request_id, verb, remember, "ledger ask answered");
             if let Some(reason) = remember.then(|| remember_refusal(result.data.as_ref())).flatten() {
@@ -328,11 +384,12 @@ const OPT_DENY_ALWAYS: &str = "deny-always";
 type OptionKinds = [(&'static str, PermissionOptionKind); 4];
 
 /// A client's answer: allow or deny, and whether to remember it as a
-/// standing rule.
+/// standing rule, or a cancelled prompt, which denies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Decision {
-    allow: bool,
-    remember: bool,
+enum Decision {
+    Allow { remember: bool },
+    Deny { remember: bool },
+    Cancelled,
 }
 
 /// Build the fixed ACP options, plus the id→kind map [`map_response`] needs
@@ -353,44 +410,58 @@ fn build_options() -> (Vec<PermissionOption>, OptionKinds) {
     (options, kinds)
 }
 
-/// Shape the outgoing `session/request_permission`.
+/// Shape the outgoing `session/request_permission`. `toolCall.toolCallId`
+/// names the model call that raised the ask, so a client attaches the
+/// request to that call; an ask no model call raised names itself. The ask
+/// id is always in `_meta.kaijutsu.askId`.
 fn permission_request(
     session_id: SessionId,
-    tool_call_id: impl Into<agent_client_protocol::schema::v1::ToolCallId>,
+    tool_call: Option<BlockId>,
+    request_id: &str,
     title: impl Into<String>,
     options: Vec<PermissionOption>,
 ) -> RequestPermissionRequest {
+    let tool_call_id = match tool_call {
+        Some(call) => crate::update::tool_call_id(call),
+        None => request_id.to_string().into(),
+    };
+    let mut meta = serde_json::Map::new();
+    meta.insert("kaijutsu".into(), serde_json::json!({ "askId": request_id }));
     RequestPermissionRequest::new(
         session_id,
         ToolCallUpdate::new(tool_call_id, ToolCallUpdateFields::new().title(title.into())),
         options,
     )
+    .meta(meta)
 }
 
 /// Read a client's answer against the id→kind map [`build_options`] built
-/// for this ask. Anything this cannot place — a cancelled prompt, an
-/// unrecognised option id, or a future `PermissionOptionKind` variant the
-/// `#[non_exhaustive]` wire type gains later — leaves the durable ask
-/// pending. Only an option this bridge explicitly offered records a verdict.
+/// for this ask. A cancelled prompt denies. Anything else this cannot place
+/// — an unrecognised option id, a future outcome, or a future
+/// `PermissionOptionKind` variant the `#[non_exhaustive]` wire types gain
+/// later — leaves the durable ask pending. Only an option this bridge
+/// explicitly offered, or a cancellation, records a verdict.
 fn map_response(response: &RequestPermissionResponse, kinds: &OptionKinds) -> Option<Decision> {
-    let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
-        return None;
-    };
-    let id = selected.option_id.0.as_ref();
-    let (allow, remember) = match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
-        Some(PermissionOptionKind::AllowOnce) => (true, false),
-        Some(PermissionOptionKind::AllowAlways) => (true, true),
-        Some(PermissionOptionKind::RejectOnce) => (false, false),
-        Some(PermissionOptionKind::RejectAlways) => (false, true),
+    let selected = match &response.outcome {
+        RequestPermissionOutcome::Selected(selected) => selected,
+        RequestPermissionOutcome::Cancelled => return Some(Decision::Cancelled),
         _ => return None,
     };
-    Some(Decision { allow, remember })
+    let id = selected.option_id.0.as_ref();
+    match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
+        Some(PermissionOptionKind::AllowOnce) => Some(Decision::Allow { remember: false }),
+        Some(PermissionOptionKind::AllowAlways) => Some(Decision::Allow { remember: true }),
+        Some(PermissionOptionKind::RejectOnce) => Some(Decision::Deny { remember: false }),
+        Some(PermissionOptionKind::RejectAlways) => Some(Decision::Deny { remember: true }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{PermissionOptionId, SelectedPermissionOutcome};
+    use kaijutsu_types::{BlockId, ContextId, PrincipalId};
 
     fn selected(response: &str) -> RequestPermissionResponse {
         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -418,8 +489,8 @@ mod tests {
     #[test]
     fn selecting_always_remembers_the_decision() {
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&selected(OPT_ALLOW_ALWAYS), &kinds), Some(Decision { allow: true, remember: true }));
-        assert_eq!(map_response(&selected(OPT_DENY_ALWAYS), &kinds), Some(Decision { allow: false, remember: true }));
+        assert_eq!(map_response(&selected(OPT_ALLOW_ALWAYS), &kinds), Some(Decision::Allow { remember: true }));
+        assert_eq!(map_response(&selected(OPT_DENY_ALWAYS), &kinds), Some(Decision::Deny { remember: true }));
     }
 
     #[test]
@@ -441,23 +512,41 @@ mod tests {
     #[test]
     fn the_request_names_the_session_and_carries_every_option() {
         let (options, _) = build_options();
-        let req = permission_request(SessionId::new("s"), "req-1", "rm -rf /", options);
+        let req = permission_request(SessionId::new("s"), None, "req-1", "rm -rf /", options);
         assert_eq!(req.session_id, SessionId::new("s"));
-        assert_eq!(req.tool_call.tool_call_id.0.as_ref(), "req-1");
+        assert_eq!(req.tool_call.tool_call_id.0.as_ref(), "req-1", "an ask no model call raised names itself");
         assert_eq!(req.tool_call.fields.title.as_deref(), Some("rm -rf /"));
         assert_eq!(req.options.len(), 4);
     }
 
     #[test]
+    fn the_request_names_the_model_call_and_carries_the_ask_id() {
+        let (options, _) = build_options();
+        let call = BlockId::new(ContextId::new(), PrincipalId::new(), 3);
+        let req = permission_request(SessionId::new("s"), Some(call), "req-1", "mkdir x", options);
+        assert_eq!(req.tool_call.tool_call_id, crate::update::tool_call_id(call));
+        let meta = serde_json::Value::Object(req.meta.expect("the request carries its ask"));
+        assert_eq!(meta["kaijutsu"]["askId"], "req-1");
+    }
+
+    #[test]
+    fn a_call_is_named_only_to_the_session_of_its_own_context() {
+        let call = BlockId::new(ContextId::new(), PrincipalId::new(), 3);
+        assert_eq!(tool_call_for(Some(call), call.context_id), Some(call));
+        assert_eq!(tool_call_for(Some(call), ContextId::new()), None, "another session never announced it");
+        assert_eq!(tool_call_for(None, call.context_id), None);
+    }
+
+    #[test]
     fn selecting_allow_maps_to_true() {
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&selected(OPT_ALLOW), &kinds), Some(Decision { allow: true, remember: false }));
+        assert_eq!(map_response(&selected(OPT_ALLOW), &kinds), Some(Decision::Allow { remember: false }));
     }
 
     #[test]
     fn selecting_deny_maps_to_false() {
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&selected(OPT_DENY), &kinds), Some(Decision { allow: false, remember: false }));
+        assert_eq!(map_response(&selected(OPT_DENY), &kinds), Some(Decision::Deny { remember: false }));
     }
 
     #[test]
@@ -477,10 +566,10 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_prompt_leaves_the_ask_pending() {
+    fn a_cancelled_prompt_denies_the_ask() {
         let r = RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&r, &kinds), None);
+        assert_eq!(map_response(&r, &kinds), Some(Decision::Cancelled));
     }
 
     #[test]

@@ -370,6 +370,11 @@ enum LedgerCommand {
         /// with `kj ledger forget`.
         #[arg(long, requires = "remember")]
         family: bool,
+        /// The reviewer's prompt was cancelled rather than answered. Deny
+        /// the ask and record the decided option `prompt_cancelled`. Cannot
+        /// be combined with --remember.
+        #[arg(long, conflicts_with = "remember")]
+        cancelled: bool,
     },
     /// Withdraw a pending ask you performed or requested. Nothing runs.
     Cancel {
@@ -554,10 +559,10 @@ impl KjDispatcher {
             }
             LedgerCommand::Show { request_id, signals } => self.ledger_show(&request_id, signals),
             LedgerCommand::Allow { request_id, remember, family } => {
-                self.ledger_decide(&request_id, true, caller, remember, family)
+                self.ledger_decide(&request_id, true, caller, remember, family, false)
             }
-            LedgerCommand::Deny { request_id, remember, family } => {
-                self.ledger_decide(&request_id, false, caller, remember, family)
+            LedgerCommand::Deny { request_id, remember, family, cancelled } => {
+                self.ledger_decide(&request_id, false, caller, remember, family, cancelled)
             }
             LedgerCommand::Cancel { request_id } => self.ledger_cancel(&request_id, caller),
             LedgerCommand::Escalate { request_id, to } => self.ledger_escalate(&request_id, to.as_deref(), caller).await,
@@ -778,6 +783,10 @@ impl KjDispatcher {
             Ok(reason) => reason,
             Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
         };
+        let tool_call = match db.approval_tool_call(request_id) {
+            Ok(call) => call.map(|call| call.to_key()),
+            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+        };
         let completion_notification = match crate::runtime::completion_notice::summary(&db,
             &crate::runtime::completion_notice::Source::Approval(request_id.into())) {
             Ok(notice) => notice,
@@ -854,6 +863,9 @@ impl KjDispatcher {
             format!("principal:  {} ({requester_name})", Self::ledger_id_display(PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()), &row.principal_id)),
             format!("description: {}", row.description),
         ];
+        if let Some(call) = &tool_call {
+            lines.push(format!("tool_call:  {call}"));
+        }
         for s in &statements {
             lines.push(format!("statement:  {}", s.statement.rendered));
         }
@@ -957,6 +969,7 @@ impl KjDispatcher {
             "instance": row.instance,
             "tool": row.tool,
             "hook_id": row.hook_id,
+            "tool_call_block_id": tool_call,
             "description": row.description,
             "authorized_label": row.authorized_label,
             "statements": statements.iter().map(|s| s.statement.rendered.clone()).collect::<Vec<_>>(),
@@ -1189,6 +1202,7 @@ impl KjDispatcher {
         caller: &KjCaller,
         remember: Option<RememberScopeArg>,
         family: bool,
+        cancelled: bool,
     ) -> KjResult {
         let verb = if allow { "allow" } else { "deny" };
         let span = tracing::info_span!(
@@ -1346,7 +1360,11 @@ impl KjDispatcher {
                 approval_ledger::decide::DecideInput {
                     allow,
                     decided_by: Some(answerer),
-                    decided_option: Some(if allow { "allow_once" } else { "deny" }),
+                    decided_option: Some(match (allow, cancelled) {
+                        (true, _) => "allow_once",
+                        (false, true) => "prompt_cancelled",
+                        (false, false) => "deny",
+                    }),
                     remember_scope: remember.map(RememberScopeArg::as_str),
                     auto_reason: None,
                 },
@@ -2053,7 +2071,7 @@ mod tests {
 
     fn spec() -> GateSpec {
         GateSpec {
-            publishes_pair: false, origin: approval_ledger::types::Origin::KjVerb,
+            publishes_pair: false, tool_call: None, origin: approval_ledger::types::Origin::KjVerb,
             instance: "builtin.kj".into(),
             tool: "cc.send".into(),
             hook_id: None,
@@ -2086,7 +2104,7 @@ mod tests {
     /// meaningful test.
     fn shell_spec(label: &str, rendered: &str) -> GateSpec {
         GateSpec {
-            publishes_pair: false, origin: approval_ledger::types::Origin::ShellGate,
+            publishes_pair: false, tool_call: None, origin: approval_ledger::types::Origin::ShellGate,
             instance: "builtin.shell_write".into(),
             tool: "shell_write".into(),
             hook_id: None,
@@ -2420,6 +2438,54 @@ mod tests {
         d.dispatch(&[s("ledger"), s("deny"), s(&request_id)], &answering_seat())
             .await;
         let _ = gate.await;
+    }
+
+    /// A reviewer whose prompt was cancelled denies the ask, and the ledger
+    /// says the prompt was cancelled rather than answered.
+    #[tokio::test]
+    async fn a_cancelled_prompt_denies_the_ask_and_says_so() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let request = gate_once(&d, &c, spec()).await.ask.expect("a pending ask").request_id;
+        let denied = d.dispatch(&[s("ledger"), s("deny"), s(&request), s("--cancelled")], &answering_seat()).await;
+        assert!(denied.is_ok(), "{denied:?}");
+        let KjResult::Ok { data: Some(data), .. } = d.dispatch(&[s("ledger"), s("show"), s(&request)], &c).await
+        else { panic!("missing structured ask"); };
+        assert_eq!(data["status"], "denied", "{data}");
+        assert_eq!(data["decided_option"], "prompt_cancelled", "{data}");
+
+        let other = gate_once(&d, &c, spec()).await.ask.expect("a pending ask").request_id;
+        let remembered = d.dispatch(&[s("ledger"), s("deny"), s(&other), s("--cancelled"), s("--remember"), s("always")], &answering_seat()).await;
+        assert!(!remembered.is_ok(), "a cancelled prompt teaches no rule: {remembered:?}");
+    }
+
+    /// An ask a model's tool call raised names that call from the moment it
+    /// is visible, and an ask no call raised names none.
+    #[tokio::test]
+    async fn ledger_show_names_the_tool_call_that_raised_the_ask() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let context = c.context_id.expect("the test caller has a context");
+        let call = kaijutsu_types::BlockId::new(context, c.actor_id, 7);
+        let mut raised = spec();
+        raised.tool_call = Some(call);
+        let request = gate_once(&d, &c, raised).await.ask.expect("a pending ask").request_id;
+        let shown = d.dispatch(&[s("ledger"), s("show"), s(&request)], &c).await;
+        assert!(shown.message().contains(&format!("tool_call:  {}", call.to_key())), "{}", shown.message());
+        let KjResult::Ok { data: Some(data), .. } = shown else { panic!("missing structured ask"); };
+        assert_eq!(data["tool_call_block_id"].as_str(), Some(call.to_key().as_str()), "{data}");
+
+        let plain = gate_once(&d, &c, spec()).await.ask.expect("a pending ask").request_id;
+        let KjResult::Ok { data: Some(data), .. } = d.dispatch(&[s("ledger"), s("show"), s(&plain)], &c).await
+        else { panic!("missing structured ask"); };
+        assert!(data["tool_call_block_id"].is_null(), "{data}");
+
+        // A call from another context cannot name this ask; the gate records nothing.
+        let mut foreign = spec();
+        foreign.tool_call = Some(kaijutsu_types::BlockId::new(kaijutsu_types::ContextId::new(), c.actor_id, 1));
+        let refused = gate_once(&d, &c, foreign).await;
+        assert_eq!(refused.verdict, crate::kj::gate::GateVerdict::Unavailable, "{}", refused.reason);
+        assert!(refused.ask.is_none());
     }
 
     #[tokio::test]

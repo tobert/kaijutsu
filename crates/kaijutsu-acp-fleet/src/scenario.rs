@@ -108,6 +108,11 @@ pub struct Prompt {
     /// the request's title must contain.
     #[serde(default)]
     pub permission_titles: Option<Vec<String>>,
+    /// When present, one title per permission request, in order: the
+    /// request's `toolCall.toolCallId` must name a `tool_call` this prompt
+    /// announced with exactly this title.
+    #[serde(default)]
+    pub permission_tool_calls: Option<Vec<String>>,
     /// The `stopReason` the prompt must end with.
     #[serde(default = "end_turn")]
     pub stop_reason: String,
@@ -315,15 +320,17 @@ impl Scenario {
             if let Some(release) = prompt.cancel.as_ref().and_then(|c| c.release.as_ref()) {
                 workspace_relative(release).with_context(|| format!("[[prompt]] {}: `cancel.release`", n + 1))?;
             }
-            if let Some(titles) = &prompt.permission_titles
-                && titles.len() != prompt.permissions.len()
-            {
-                bail!(
-                    "[[prompt]] {}: `permission_titles` has {} entries for {} `permissions`",
-                    n + 1,
-                    titles.len(),
-                    prompt.permissions.len()
-                );
+            for (field, list) in [("permission_titles", &prompt.permission_titles), ("permission_tool_calls", &prompt.permission_tool_calls)] {
+                if let Some(list) = list
+                    && list.len() != prompt.permissions.len()
+                {
+                    bail!(
+                        "[[prompt]] {}: `{field}` has {} entries for {} `permissions`",
+                        n + 1,
+                        list.len(),
+                        prompt.permissions.len()
+                    );
+                }
             }
         }
         for (n, turn) in self.model.iter().enumerate() {

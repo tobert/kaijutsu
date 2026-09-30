@@ -29,6 +29,10 @@ pub struct Session {
     /// Shared with the pump task: the pump emits through it, the prompt
     /// handler arms echo suppression on it.
     pub mapper: Arc<Mutex<UpdateMapper>>,
+    /// Held while mapper updates are computed and sent, and while a request
+    /// that depends on them is sent: what the mapper records as sent is on
+    /// the wire before anything ordered after it. Take it before `mapper`.
+    pub emission: Mutex<()>,
     /// Exact command surface most recently advertised to this ACP session.
     /// Prompt classification never accepts a name outside this snapshot.
     commands: Mutex<Vec<KjCommandInfo>>,
@@ -49,6 +53,7 @@ impl Session {
             context_id,
             label,
             mapper: Arc::new(Mutex::new(mapper)),
+            emission: Mutex::new(()),
             commands: Mutex::new(commands),
             pump_stop,
         }
@@ -163,6 +168,7 @@ pub async fn run_pump(
     // as "nothing to baseline/emit this time" (see `fetch_usage_info`).
     let usage_info = fetch_usage_info(&bridge, &session).await;
     {
+        let _emission = session.emission.lock();
         let mut mapper = session.mapper.lock();
         let blocks = mirror.blocks();
         if replay_history {
@@ -290,6 +296,7 @@ fn apply_delivery(
     mirror: &mut ContextMirror,
     delivery: ContextDelivery,
 ) {
+    let _emission = session.emission.lock();
     for update in deliver_updates(session, session_id, mirror, delivery) {
         let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
     }
@@ -447,6 +454,7 @@ async fn catch_up(
 ) {
     let blocks = mirror.blocks();
     let usage_info = fetch_usage_info(bridge, session).await;
+    let emission = session.emission.lock();
     let updates: Vec<_> = {
         let mut mapper = session.mapper.lock();
         let live: HashSet<BlockId> = blocks.iter().map(|b| b.id).collect();
@@ -469,6 +477,7 @@ async fn catch_up(
     for update in updates {
         let _ = cx.send_notification(SessionNotification::new(session_id.clone(), update));
     }
+    drop(emission);
     tracing::warn!(
         session = %session_id,
         context = %session.context_id.short(),

@@ -1,0 +1,24 @@
+description = "A client that cancels a permission request denies the ask: the held turn reads the refusal and goes on, as under Harbor's deny mode."
+
+# Harbor's HARBOR_ACP_PERMISSION_MODE=deny answers every request `cancelled`
+# (acp_runner.py 342-343). An empty policy: every shell_write statement asks.
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir cancelled" } }]
+[[model]]
+text = "the command was refused"
+
+# The `kj` call is the ACP bridge recording the denial.
+[[prompt]]
+text = "make the cancelled directory"
+permissions = ["cancel"]
+permission_tool_calls = ["shell_write"]
+text_contains = ["the command was refused"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "(prompt_cancelled)" }, { title = "kj", status = "completed" }]
+
+[[verify]]
+path = "cancelled"
+exists = false

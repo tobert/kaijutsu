@@ -109,6 +109,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.on_hold` | `{ write = "<file>", wait_for = "<path>" }`: once every held request has arrived, write the workspace file `write`, then wait for `wait_for` to exist, before sending `release`. See "Held requests". |
 | `prompt.gate` | Replace the kernel's `gate.toml` with this before sending the prompt, as an operator editing it would. Host mode only; the agent then runs with a named `--state-dir` in the scratch directory. |
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
+| `prompt.permission_tool_calls` | One title per request, in order: the request's `toolCall.toolCallId` must name a `tool_call` this prompt announced with exactly that title. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including any that arrive during the quiet wait. |
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains` (one substring, or a list that must all appear). |
@@ -167,14 +168,19 @@ scenario uses `known_gap` instead:
 known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
 ```
 
-The findings, H1–H3, are in `docs/issues.md`, "ACP fleet: what stays
-open". Scenarios for the rest of what Harbor needs:
+`SHAPE_GAPS` is empty. The open findings, H2 and H3, are in
+`docs/issues.md`, "ACP fleet: what stays open". A permission request names
+the model's tool call that raised its ask (`docs/acp.md`, "Permission asks,
+ledger-driven"), so Harbor attaches it to that call's step. Scenarios for
+the rest of what Harbor needs:
 
 | Scenario | What it shows |
 |---|---|
 | `harbor-session-cwd.toml` | A relative path resolves in the `session/new` cwd, not the launch directory (`acp_runner.py` 716–717). |
 | `harbor-shell-timeout.toml` | A command past its `timeout_ms` is killed; the call fails with what it printed and `killed after timeout_ms 500`. |
 | `harbor-truncated-tool-call.toml` | A call whose arguments were cut off at `max_tokens` fails with the reason, and the turn goes on. |
+| `harbor-permission-cancelled.toml` | A request answered `cancelled`, as Harbor's deny mode answers every one (`acp_runner.py` 342–343), denies the ask; the held turn reads the refusal and goes on. |
+| `harbor-permission-background.toml` | A gated background call's request names the model's `shell_write` call, not the operation that runs the command. Gap H2. |
 | `harbor-usage-cost.toml` | Gap H3: no cost is reported. |
 | `harbor-background-after-response.toml` | Gap H2: a background completion starts a turn after the response. |
 
