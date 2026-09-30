@@ -1,0 +1,49 @@
+description = "Property (f), path A: a model cannot forget a deny rule a human remembered through ACP, and the rule still refuses the command afterward."
+
+# The model may read the rules and pick an id out of them without asking.
+gate = """
+[global]
+allow = ["jq"]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "noted"
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "kj ledger forget \"$(kj ledger rules | jq -r '.[0]')\"" } }]
+[[model]]
+text = "tried to forget it"
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
+[[model]]
+text = "still refused"
+
+# Held, then answered "always deny" after prompt 2, outside the ask's
+# continuation window.
+[[prompt]]
+text = "make the forbidden directory"
+permissions = ["hold"]
+text_contains = ["asked"]
+
+[[prompt]]
+text = "wait"
+release = ["deny_always"]
+text_contains = ["noted"]
+
+[[prompt]]
+text = "forget the rule"
+text_contains = ["tried to forget it"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "ask the reviewer who made it" }]
+
+# The rule answers with no ask.
+[[prompt]]
+text = "make the forbidden directory again"
+text_contains = ["still refused"]
+tool_calls = [{ title = "shell_write", status = "failed" }]
+
+[[verify]]
+path = "forbidden"
+exists = false

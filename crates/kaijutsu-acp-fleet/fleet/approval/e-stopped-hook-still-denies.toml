@@ -1,7 +1,7 @@
-description = "Property (e), path A: a deny that an ask stopped from running still wins when the ask is approved; the approval answers only the ask."
+description = "Property (e), path A: a deny later in the hook chain than an ask refuses before anyone is asked, so no approval can run what it refuses."
 
-# Two pre_call hooks on shell_write, lower priority first: the first asks,
-# which stops the chain before the second, which denies.
+# Two pre_call hooks on shell_write, lower priority first: the first asks
+# and the second denies. The chain runs to the end, and the deny wins.
 [rc]
 "coder/create/S60-fleet-hook.kai" = """
 kj hook add pre_call '{"match_tool":"shell_write","hook_id":"fleet-ask","priority":10}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet-ask.kai"}'
@@ -20,16 +20,12 @@ exit 1
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir stopped" } }]
 [[model]]
-text = "asked"
-[[model]]
-text = "after the approval"
+text = "refused"
 
 [[prompt]]
 text = "make the stopped directory"
-permissions = ["allow"]
-permission_titles = ["fleet hook asks about: mkdir stopped"]
-text_contains = ["asked"]
-tool_calls = [{ title = "shell_write" }, { title = "kj" }]
+text_contains = ["refused"]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by hook fleet-deny" }]
 
 [[verify]]
 path = "stopped"

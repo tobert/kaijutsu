@@ -384,8 +384,15 @@ ask from a shell while the ACP prompt is still up is expected: the ledger's
 ledger allow|deny` comes back `AlreadyDecided` — logged at `debug!`, not a
 failure. `PermissionOption.kind`, `AutoAllow`/`PermissionPolicy`, and
 per-ask kernel-supplied options are all gone with the old wire: the ledger
-sends no options, so every real ask gets the synthesized Allow/Deny pair
-(`build_options`).
+sends no options, so every real ask gets the same four synthesized options
+(`build_options`): Allow and Deny answer this ask, and "Always allow this
+command" and "Always deny this command" answer it with
+`kj ledger allow|deny <id> --remember always`. That learns an exact-text rule,
+as the tui and app "always" keys do, never a family rule. The rule's creator
+is this connection's principal, so only that reviewer can forget it. When the
+ledger decides the ask but refuses the rule (a statement with a free
+variable), the client gets an agent message that names the reason and says
+the answer applied to this ask only.
 
 **Gaps** (also in issues.md):
 

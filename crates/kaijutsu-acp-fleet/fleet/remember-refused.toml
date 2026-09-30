@@ -1,0 +1,24 @@
+description = "An \"always allow\" the ledger cannot remember (a free variable) still allows this ask, and the client is told no rule was remembered."
+
+gate = """
+[global]
+allow = ["export"]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "export GREETING=hello" } }]
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "echo $GREETING > greeting.txt" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "wrote the greeting"
+
+[[prompt]]
+text = "write the greeting"
+permissions = ["allow_always"]
+text_contains = ["asked", "applied to this ask only; no standing rule was remembered", "GREETING", "wrote the greeting"]
+
+[[verify]]
+path = "greeting.txt"
+equals = "hello\n"

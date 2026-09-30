@@ -1,0 +1,23 @@
+description = "Property (d), path A: an ask answered \"always allow\" through ACP runs the approved command, as an allow once does, and starts the follow-up turn."
+
+known_gap = { finding = "F14", fails = ["agent text does not contain \"ran once\"", "verify made"] }
+
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir made" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "ran once"
+
+[[prompt]]
+text = "make the made directory"
+permissions = ["allow_always"]
+text_contains = ["asked", "ran once"]
+
+[[verify]]
+path = "made"
+exists = true

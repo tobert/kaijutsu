@@ -77,6 +77,26 @@ fn decision_failure_message(request_id: &str, verb: &str, reason: &str) -> Strin
     format!("Approval {verb} for {request_id} did not apply: {reason}")
 }
 
+fn remember_failure_message(request_id: &str, verb: &str, reason: &str) -> String {
+    format!("Approval {verb} for {request_id} applied to this ask only; no standing rule was remembered: {reason}")
+}
+
+/// Why `kj ledger allow|deny --remember` decided the ask but learned no rule,
+/// read from its structured result. `None` when a rule was learned or none
+/// was asked for.
+fn remember_refusal(data: Option<&serde_json::Value>) -> Option<String> {
+    let data = data?;
+    if data.get("remembered") != Some(&serde_json::Value::Bool(false)) {
+        return None;
+    }
+    Some(
+        data.pointer("/remember_error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the ledger gave no reason")
+            .to_string(),
+    )
+}
+
 fn permission_prompt_failure_message(request_id: &str, reason: &str) -> String {
     format!("Approval prompt for {request_id} failed: {reason}; ask remains pending")
 }
@@ -251,16 +271,23 @@ async fn answer_ask(
         }
     };
 
-    let Some(allow) = decision else {
+    let Some(Decision { allow, remember }) = decision else {
         return;
     };
 
     let verb = if allow { "allow" } else { "deny" };
-    // The decision is authored in the work context. The ledger validates the
-    // reviewer actor, so a coder cannot approve its own ask from any context.
-    match ledger::decide_ask(kernel.actor(), ask.context_id, &request_id, allow).await {
+    // The decision is authored in the work context as this connection's
+    // principal, which the ledger checks is the ask's reviewer and records
+    // as a remembered rule's creator. An "always" answer learns an
+    // exact-text rule, the same one the tui and app "always" keys learn.
+    let scope = remember.then_some(ledger::RememberScope::Always);
+    match ledger::decide_ask_remember(kernel.actor(), ask.context_id, &request_id, allow, scope).await {
         Ok(result) if result.exit_code == 0 => {
-            tracing::info!(request = %request_id, verb, "ledger ask answered");
+            tracing::info!(request = %request_id, verb, remember, "ledger ask answered");
+            if let Some(reason) = remember.then(|| remember_refusal(result.data.as_ref())).flatten() {
+                tracing::info!(request = %request_id, verb, %reason, "the answer stands; no rule was remembered");
+                notify_decision_failure(cx, &session_id, remember_failure_message(&request_id, verb, &reason));
+            }
         }
         Ok(result) => {
             // A nonzero result is visible operationally. `AlreadyDecided`
@@ -281,23 +308,38 @@ async fn answer_ask(
     }
 }
 
-/// Ids for the synthesized allow/deny pair this bridge always offers: the
-/// kernel's ledger asks carry no `options` of their own today (unlike the
-/// retired `HookAction::Ask` wire, which reserved a slot for them), so this
-/// is the only shape a client is ever offered.
+/// Ids for the options this bridge always offers: the kernel's ledger asks
+/// carry no `options` of their own, so this is the only shape a client is
+/// ever offered. "Always" answers `kj ledger allow|deny --remember always`.
 const OPT_ALLOW: &str = "allow";
+const OPT_ALLOW_ALWAYS: &str = "allow-always";
 const OPT_DENY: &str = "deny";
+const OPT_DENY_ALWAYS: &str = "deny-always";
 
-/// Build the fixed ACP allow/deny option pair, plus the id→kind map
-/// [`map_response`] needs to turn a selected id back into a verdict.
-fn build_options() -> (Vec<PermissionOption>, [(&'static str, PermissionOptionKind); 2]) {
+type OptionKinds = [(&'static str, PermissionOptionKind); 4];
+
+/// A client's answer: allow or deny, and whether to remember it as a
+/// standing rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Decision {
+    allow: bool,
+    remember: bool,
+}
+
+/// Build the fixed ACP options, plus the id→kind map [`map_response`] needs
+/// to turn a selected id back into a decision.
+fn build_options() -> (Vec<PermissionOption>, OptionKinds) {
     let kinds = [
         (OPT_ALLOW, PermissionOptionKind::AllowOnce),
+        (OPT_ALLOW_ALWAYS, PermissionOptionKind::AllowAlways),
         (OPT_DENY, PermissionOptionKind::RejectOnce),
+        (OPT_DENY_ALWAYS, PermissionOptionKind::RejectAlways),
     ];
     let options = vec![
         PermissionOption::new(OPT_ALLOW, "Allow", PermissionOptionKind::AllowOnce),
+        PermissionOption::new(OPT_ALLOW_ALWAYS, "Always allow this command", PermissionOptionKind::AllowAlways),
         PermissionOption::new(OPT_DENY, "Deny", PermissionOptionKind::RejectOnce),
+        PermissionOption::new(OPT_DENY_ALWAYS, "Always deny this command", PermissionOptionKind::RejectAlways),
     ];
     (options, kinds)
 }
@@ -321,21 +363,19 @@ fn permission_request(
 /// unrecognised option id, or a future `PermissionOptionKind` variant the
 /// `#[non_exhaustive]` wire type gains later — leaves the durable ask
 /// pending. Only an option this bridge explicitly offered records a verdict.
-fn map_response(
-    response: &RequestPermissionResponse,
-    kinds: &[(&'static str, PermissionOptionKind); 2],
-) -> Option<bool> {
+fn map_response(response: &RequestPermissionResponse, kinds: &OptionKinds) -> Option<Decision> {
     let RequestPermissionOutcome::Selected(selected) = &response.outcome else {
         return None;
     };
     let id = selected.option_id.0.as_ref();
-    match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
-        Some(PermissionOptionKind::AllowOnce) | Some(PermissionOptionKind::AllowAlways) => Some(true),
-        Some(PermissionOptionKind::RejectOnce) | Some(PermissionOptionKind::RejectAlways) => {
-            Some(false)
-        }
-        _ => None,
-    }
+    let (allow, remember) = match kinds.iter().find(|(k, _)| *k == id).map(|(_, kind)| kind) {
+        Some(PermissionOptionKind::AllowOnce) => (true, false),
+        Some(PermissionOptionKind::AllowAlways) => (true, true),
+        Some(PermissionOptionKind::RejectOnce) => (false, false),
+        Some(PermissionOptionKind::RejectAlways) => (false, true),
+        _ => return None,
+    };
+    Some(Decision { allow, remember })
 }
 
 #[cfg(test)]
@@ -350,36 +390,65 @@ mod tests {
     }
 
     #[test]
-    fn build_options_offers_exactly_allow_and_deny() {
+    fn build_options_offers_once_and_always_for_allow_and_deny() {
         let (options, kinds) = build_options();
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].option_id, PermissionOptionId::new(OPT_ALLOW));
-        assert_eq!(options[0].kind, PermissionOptionKind::AllowOnce);
-        assert_eq!(options[1].option_id, PermissionOptionId::new(OPT_DENY));
-        assert_eq!(options[1].kind, PermissionOptionKind::RejectOnce);
-        assert_eq!(kinds.len(), 2);
+        let offered: Vec<(&str, PermissionOptionKind)> =
+            options.iter().map(|o| (o.option_id.0.as_ref(), o.kind)).collect();
+        assert_eq!(
+            offered,
+            vec![
+                (OPT_ALLOW, PermissionOptionKind::AllowOnce),
+                (OPT_ALLOW_ALWAYS, PermissionOptionKind::AllowAlways),
+                (OPT_DENY, PermissionOptionKind::RejectOnce),
+                (OPT_DENY_ALWAYS, PermissionOptionKind::RejectAlways),
+            ]
+        );
+        assert_eq!(kinds.len(), 4);
     }
 
     #[test]
-    fn the_request_names_the_session_and_carries_both_options() {
+    fn selecting_always_remembers_the_decision() {
+        let (_, kinds) = build_options();
+        assert_eq!(map_response(&selected(OPT_ALLOW_ALWAYS), &kinds), Some(Decision { allow: true, remember: true }));
+        assert_eq!(map_response(&selected(OPT_DENY_ALWAYS), &kinds), Some(Decision { allow: false, remember: true }));
+    }
+
+    #[test]
+    fn a_rule_the_ledger_refused_to_learn_is_reported() {
+        let refused = serde_json::json!({
+            "remembered": false,
+            "remember_error": {"message": "statement 1 has a free variable $DIR"},
+        });
+        assert_eq!(remember_refusal(Some(&refused)).as_deref(), Some("statement 1 has a free variable $DIR"));
+        let learned = serde_json::json!({"remembered": {"scope": "always", "statements": 1}});
+        assert_eq!(remember_refusal(Some(&learned)), None);
+        assert_eq!(remember_refusal(None), None);
+        assert_eq!(
+            remember_failure_message("req-1", "allow", "has a free variable"),
+            "Approval allow for req-1 applied to this ask only; no standing rule was remembered: has a free variable"
+        );
+    }
+
+    #[test]
+    fn the_request_names_the_session_and_carries_every_option() {
         let (options, _) = build_options();
         let req = permission_request(SessionId::new("s"), "req-1", "rm -rf /", options);
         assert_eq!(req.session_id, SessionId::new("s"));
         assert_eq!(req.tool_call.tool_call_id.0.as_ref(), "req-1");
         assert_eq!(req.tool_call.fields.title.as_deref(), Some("rm -rf /"));
-        assert_eq!(req.options.len(), 2);
+        assert_eq!(req.options.len(), 4);
     }
 
     #[test]
     fn selecting_allow_maps_to_true() {
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&selected(OPT_ALLOW), &kinds), Some(true));
+        assert_eq!(map_response(&selected(OPT_ALLOW), &kinds), Some(Decision { allow: true, remember: false }));
     }
 
     #[test]
     fn selecting_deny_maps_to_false() {
         let (_, kinds) = build_options();
-        assert_eq!(map_response(&selected(OPT_DENY), &kinds), Some(false));
+        assert_eq!(map_response(&selected(OPT_DENY), &kinds), Some(Decision { allow: false, remember: false }));
     }
 
     #[test]

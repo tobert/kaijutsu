@@ -59,10 +59,14 @@ impl AgentCommand {
 /// How the client answers one `session/request_permission`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionAnswer {
-    /// Select the first option whose kind starts with `allow`.
+    /// Select the option of kind `allow_once`.
     Allow,
-    /// Select the first option whose kind starts with `reject`.
+    /// Select the option of kind `allow_always`.
+    AllowAlways,
+    /// Select the option of kind `reject_once`.
     Deny,
+    /// Select the option of kind `reject_always`.
+    DenyAlways,
     /// Answer with the `cancelled` outcome.
     Cancel,
     /// Send no response yet; answer later with [`AcpClient::release_held`].
@@ -73,7 +77,9 @@ impl PermissionAnswer {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
+            Self::AllowAlways => "allow_always",
             Self::Deny => "deny",
+            Self::DenyAlways => "deny_always",
             Self::Cancel => "cancel",
             Self::Hold => "hold",
         }
@@ -558,12 +564,14 @@ impl Drop for AcpClient {
 /// is answered `cancelled`.
 fn outcome_for(answer: PermissionAnswer, record: &mut PermissionRecord) -> Value {
     let cancelled = json!({"outcome": "cancelled"});
-    let prefix = match answer {
+    let kind = match answer {
         PermissionAnswer::Cancel | PermissionAnswer::Hold => return cancelled,
-        PermissionAnswer::Allow => "allow",
-        PermissionAnswer::Deny => "reject",
+        PermissionAnswer::Allow => "allow_once",
+        PermissionAnswer::AllowAlways => "allow_always",
+        PermissionAnswer::Deny => "reject_once",
+        PermissionAnswer::DenyAlways => "reject_always",
     };
-    match select_option(&record.params, prefix) {
+    match select_option(&record.params, kind) {
         Some(option) => {
             record.option_id = Some(option.clone());
             record.problem = None;
@@ -571,7 +579,7 @@ fn outcome_for(answer: PermissionAnswer, record: &mut PermissionRecord) -> Value
         }
         None => {
             record.problem = Some(format!(
-                "the request offered no option whose kind starts with {prefix:?}: {}",
+                "the request offered no option of kind {kind:?}: {}",
                 record.params.get("options").unwrap_or(&Value::Null)
             ));
             cancelled
@@ -587,11 +595,11 @@ fn response_id(message: &Value) -> Option<i64> {
     message.get("id").and_then(Value::as_i64)
 }
 
-/// The first offered option whose `kind` starts with `prefix`.
-fn select_option(params: &Value, prefix: &str) -> Option<String> {
+/// The first offered option of kind `want`.
+fn select_option(params: &Value, want: &str) -> Option<String> {
     params.get("options")?.as_array()?.iter().find_map(|option| {
         let kind = option.get("kind")?.as_str()?;
-        if kind.starts_with(prefix) {
+        if kind == want {
             option.get("optionId")?.as_str().map(str::to_string)
         } else {
             None
@@ -696,11 +704,14 @@ mod tests {
     fn options_are_chosen_by_kind_not_position() {
         let params = json!({"options": [
             {"optionId": "no", "name": "Deny", "kind": "reject_once"},
+            {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
             {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
         ]});
-        assert_eq!(select_option(&params, "allow").as_deref(), Some("yes"));
-        assert_eq!(select_option(&params, "reject").as_deref(), Some("no"));
-        assert_eq!(select_option(&json!({"options": []}), "allow"), None);
+        assert_eq!(select_option(&params, "allow_once").as_deref(), Some("yes"));
+        assert_eq!(select_option(&params, "allow_always").as_deref(), Some("always"));
+        assert_eq!(select_option(&params, "reject_once").as_deref(), Some("no"));
+        assert_eq!(select_option(&params, "reject_always"), None);
+        assert_eq!(select_option(&json!({"options": []}), "allow_once"), None);
     }
 
     #[test]

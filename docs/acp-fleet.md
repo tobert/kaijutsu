@@ -105,8 +105,9 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
-| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `deny`, `cancel`, or `hold`. The prompt must raise exactly this many. `hold` sends no response until a later prompt's `release`. |
-| `prompt.release` | Answers for requests earlier prompts held, oldest first, sent once this prompt's turn ends: `allow`, `deny`, or `cancel`. |
+| `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until a later prompt's `release`. |
+| `prompt.release` | Answers for requests earlier prompts held, oldest first, sent once this prompt's turn ends. Any answer but `hold`. |
+| `prompt.gate` | Replace the kernel's `gate.toml` with this before sending the prompt, as an operator editing it would. Host mode only; the agent then runs with a named `--state-dir` in the scratch directory. |
 | `prompt.wait_for_text` | After the turn ends, wait until the prompt's agent text contains this, before the quiet wait. For a message that comes later than the quiet wait, such as a permission timeout. |
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
@@ -151,11 +152,12 @@ and the ACP prompt is `session/request_permission`.
 | Property | Path A | Path B | ACP prompt |
 |---|---|---|---|
 | (a) A config deny refuses and leaves a row | gap F8 | gap F8 | |
-| (b) A learned allow outranks a config deny | not reachable | not reachable | |
+| (b) A learned allow outranks a config deny | pass | | |
 | (c) An uncovered statement asks a model | pass | read-only by design | |
-| (d) An approval runs what was shown | pass | pass | |
-| (e) A deny the ask stopped still wins | pass (hook) | | |
-| (f) A model cannot forget a human's rule | not reachable | | |
+| (d) An approval runs what was shown | pass; "always allow" gap F14 | pass | |
+| (e) A later deny refuses before anyone is asked | pass (hook) | | |
+| (e′) A rule added after the ask leaves it alone | pass | | |
+| (f) A model cannot forget a human's rule | pass | | |
 | (g) An unanswered prompt is offered again | | | gap F7 |
 
 ```toml
@@ -168,10 +170,15 @@ reproduces: remove the marker and the finding's line. Any failure that no
 `fails` substring matches, and any error that stops the run, still fails
 it.
 
-Not reachable through ACP: a standing rule comes only from
-`kj ledger allow|deny --remember`, and the bridge offers only allow once and
-reject once. No ACP client can create a human rule, so (b), (f), and the
-rule form of (e) need another surface. The RPC shells (path C) and
+The answers `allow_always` and `deny_always` select ACP's "always" options,
+which remember an exact-text rule whose creator is the ACP connection's
+principal. (e′) follows Amy's ruling: "the policy at the time the command
+was first evaluated should cover its lifetime". A prompt's `gate` stands in
+for an operator editing `gate.toml`, which (b) needs: a config deny keeps
+a command from ever asking, so the rule has to be learned first. (b) runs
+its commands only under `shell_write`, so path B has no cell for it.
+
+Path B has no rule scenarios, and the RPC shells (path C) and
 kaijutsu-mcp (path D) have no ACP entry.
 
 ## Cancel scenarios

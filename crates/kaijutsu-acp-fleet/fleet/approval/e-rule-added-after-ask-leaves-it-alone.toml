@@ -1,0 +1,45 @@
+description = "Property (e), path A: the policy in force when a command was first evaluated covers its approval; a deny rule remembered after the ask does not stop the approved command."
+
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
+[[model]]
+text = "asked once"
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
+[[model]]
+text = "asked twice"
+[[model]]
+text = "noted"
+[[model]]
+text = "noted again"
+
+# Two asks for the same command, both held. The first is answered "always
+# deny", which remembers a deny rule; only then is the second allowed. The
+# rule came after the second ask was evaluated, so the approval runs.
+[[prompt]]
+text = "make the late directory"
+permissions = ["hold"]
+text_contains = ["asked once"]
+
+[[prompt]]
+text = "make it again"
+permissions = ["hold"]
+text_contains = ["asked twice"]
+
+[[prompt]]
+text = "wait"
+release = ["deny_always"]
+text_contains = ["noted"]
+
+[[prompt]]
+text = "wait again"
+release = ["allow"]
+text_contains = ["noted again"]
+
+[[verify]]
+path = "late"
+exists = true

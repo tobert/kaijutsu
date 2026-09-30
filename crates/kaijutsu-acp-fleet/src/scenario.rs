@@ -123,6 +123,10 @@ pub struct Prompt {
     /// later than the quiet wait allows, such as a permission timeout.
     #[serde(default)]
     pub wait_for_text: Option<String>,
+    /// Replace the kernel's `gate.toml` with this before sending the prompt,
+    /// as an operator editing it would. Host mode only.
+    #[serde(default)]
+    pub gate: Option<String>,
 }
 
 /// When to send `session/cancel` during a prompt, and what to do after the
@@ -155,10 +159,14 @@ fn end_turn() -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Answer {
     Allow,
+    /// Allow, and remember the answer as a standing rule.
+    AllowAlways,
     Deny,
+    /// Deny, and remember the answer as a standing rule.
+    DenyAlways,
     Cancel,
     /// Leave the request unanswered until a later prompt's `release`.
     Hold,
@@ -168,7 +176,9 @@ impl From<Answer> for PermissionAnswer {
     fn from(answer: Answer) -> Self {
         match answer {
             Answer::Allow => PermissionAnswer::Allow,
+            Answer::AllowAlways => PermissionAnswer::AllowAlways,
             Answer::Deny => PermissionAnswer::Deny,
+            Answer::DenyAlways => PermissionAnswer::DenyAlways,
             Answer::Cancel => PermissionAnswer::Cancel,
             Answer::Hold => PermissionAnswer::Hold,
         }
@@ -235,6 +245,9 @@ impl Scenario {
         }
         let mut held = 0;
         for (n, prompt) in self.prompt.iter().enumerate() {
+            if prompt.gate.is_some() && self.mode != Mode::Host {
+                bail!("[[prompt]] {}: `gate` edits the kernel's config on the host; contained scenarios cannot use it", n + 1);
+            }
             if prompt.release.contains(&Answer::Hold) {
                 bail!("[[prompt]] {}: `release` answers held requests; `hold` is not an answer there", n + 1);
             }

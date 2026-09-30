@@ -1,0 +1,45 @@
+description = "Property (b), path A: an allow a human remembered through ACP outranks a config deny added later, through a real shell_write call."
+
+# An empty policy: the first call is uncovered and asks.
+gate = """
+[global]
+"""
+
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
+[[model]]
+text = "asked"
+[[model]]
+text = "noted"
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
+[[model]]
+text = "ran it"
+
+# The request is held and answered "always allow" after prompt 2, outside
+# the ask's continuation window, so no follow-up model turn runs whatever
+# the approved command does (F14 decides whether it runs at all).
+[[prompt]]
+text = "record a run"
+permissions = ["hold"]
+permission_titles = ["echo ran >> runs.txt"]
+text_contains = ["asked"]
+
+[[prompt]]
+text = "wait"
+release = ["allow_always"]
+text_contains = ["noted"]
+
+# An operator then denies echo in gate.toml. The learned allow still wins.
+[[prompt]]
+text = "record another run"
+gate = """
+[global]
+deny = ["echo"]
+"""
+text_contains = ["ran it"]
+tool_calls = [{ title = "shell_write", status = "completed" }]
+
+[[verify]]
+path = "runs.txt"
+contains = "ran\n"

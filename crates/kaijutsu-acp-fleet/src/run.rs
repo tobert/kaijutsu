@@ -181,6 +181,9 @@ struct Scratch {
     /// What the agent reads: `mock/`, `gate.toml`, and `rc/`.
     fleet: PathBuf,
     tmp: PathBuf,
+    /// The agent's named state directory, used when a prompt edits the
+    /// kernel's config. The agent creates it.
+    state: PathBuf,
 }
 
 impl Scratch {
@@ -195,6 +198,7 @@ impl Scratch {
             workspace: root.join("workspace"),
             fleet: root.join("fleet"),
             tmp: root.join("tmp"),
+            state: root.join("state"),
             root,
             id,
         };
@@ -254,6 +258,9 @@ fn drive(
             if !overlay.is_empty() {
                 command = command.arg("--rc-overlay").arg(scratch.fleet.join("rc"));
             }
+            if scenario.prompt.iter().any(|p| p.gate.is_some()) {
+                command = command.arg("--state-dir").arg(&scratch.state);
+            }
             (command, scratch.workspace.clone())
         }
         Mode::Contained => {
@@ -271,7 +278,7 @@ fn drive(
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &session_cwd, &scratch.workspace, config.timeout, failures);
+    let result = converse(&mut agent, scenario, &session_cwd, scratch, config.timeout, failures);
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
     let shutdown = agent.shutdown(Duration::from_secs(60));
@@ -321,13 +328,12 @@ fn gate_policy(scenario: &Scenario) -> String {
     }
 }
 
-/// `workspace` is the session cwd as the agent sees it; `workspace_host` is
-/// the same directory on this host.
+/// `workspace` is the session cwd as the agent sees it.
 fn converse(
     agent: &mut AcpClient,
     scenario: &Scenario,
     workspace: &Path,
-    workspace_host: &Path,
+    scratch: &Scratch,
     timeout: Duration,
     failures: &mut Vec<String>,
 ) -> Result<()> {
@@ -342,9 +348,13 @@ fn converse(
         agent.set_permission_policy(PermissionPolicy::Queue(answers));
         let updates_before = agent.updates().len();
         let permissions_before = agent.permissions().len();
+        if let Some(gate) = &prompt.gate {
+            let path = scratch.state.join("config").join("kernel").join("gate.toml");
+            std::fs::write(&path, gate).with_context(|| format!("{label}: replace {}", path.display()))?;
+        }
         let id = agent.start_prompt(&session, &prompt.text).with_context(|| label.clone())?;
         if let Some(cancel) = &prompt.cancel {
-            cancel_mid_call(agent, &session, id, cancel, workspace_host, timeout).with_context(|| label.clone())?;
+            cancel_mid_call(agent, &session, id, cancel, &scratch.workspace, timeout).with_context(|| label.clone())?;
         }
         let response = agent.wait_response(id, "session/prompt").with_context(|| label.clone())?;
         for answer in &prompt.release {
