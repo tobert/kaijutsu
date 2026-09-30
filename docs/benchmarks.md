@@ -266,7 +266,8 @@ reasoning.
 `agent_timeout_sec`. Raise it when a run is being cut off mid-work; set it to 1
 to hold the agent to the task's own published timeout.
 
-The wrapper pins one attempt per trial and one trial at a time (`-k 1 -n 1`).
+The wrapper pins one attempt per trial (`-k 1`) and runs `HARBOR_CONCURRENCY`
+trials at once (default 1). The job provenance records both.
 Whether `harbor run -e podman` is well behaved above one concurrent trial under
 rootless podman has not been tested here.
 

@@ -31,6 +31,7 @@ here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 : "${KAIJUTSU_ACP_KEY_ENV:=DEEPSEEK_API_KEY}"
 : "${HARBOR_JOBS_DIR:=/home/atobey/src/bench-work/harbor/jobs}"
 : "${HARBOR_AGENT_TIMEOUT_MULTIPLIER:=5}"
+: "${HARBOR_CONCURRENCY:=1}"
 
 usage() {
   cat <<'USAGE'
@@ -52,6 +53,7 @@ Environment (all have defaults):
   KAIJUTSU_ACP_NO_KEY=1 (a local server with no key; needs KAIJUTSU_ACP_BASE_URL)
   KAIJUTSU_ACP_IDLE_TIMEOUT KAIJUTSU_ACP_REQUEST_TIMEOUT (seconds; unset: the kernel's)
   HARBOR_ENV_SH HARBOR_JOBS_DIR HARBOR_AGENT_TIMEOUT_MULTIPLIER
+  HARBOR_CONCURRENCY (trials at once; default 1)
 USAGE
 }
 
@@ -174,7 +176,7 @@ args=(
   -a kaijutsu_solo_agent:KaijutsuSoloAcp
   -e podman
   -k 1
-  -n 1
+  -n "$HARBOR_CONCURRENCY"
   -o "$HARBOR_JOBS_DIR"
   --job-name "$job_name"
   --agent-timeout-multiplier "$HARBOR_AGENT_TIMEOUT_MULTIPLIER"
@@ -222,6 +224,7 @@ cat > "${job_dir}/kaijutsu-job-provenance.json" <<JSON
   "tasks": [${tasks_json}],
   "harbor_version": "${harbor_version}",
   "agent_timeout_multiplier": "${HARBOR_AGENT_TIMEOUT_MULTIPLIER}",
+  "concurrency": "${HARBOR_CONCURRENCY}",
   "binary": "${KAIJUTSU_ACP_BINARY}",
   "gate": "${KAIJUTSU_ACP_GATE}",
   "key_env": "${KAIJUTSU_ACP_KEY_ENV:-}",
