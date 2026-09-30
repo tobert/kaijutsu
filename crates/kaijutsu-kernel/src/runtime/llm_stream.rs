@@ -1690,96 +1690,109 @@ async fn dispatch_recorded_tool_result(
     tool_ctx.publishes_pair = true;
     let tool_ctx = &tool_ctx;
     let params = input.to_string();
-    let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
-        dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel).await;
-    let refusal = kernel.held_asks().refusal();
-    // A background call holds only until its answer: the worker releases
-    // it when the approved command starts, and the result is a running
-    // receipt, or the denial. Hold before the receipt publishes the
-    // operation's `Waiting` pair.
-    // The shell tool answers a gated background call with a waiting receipt
-    // and has already published the operation, so an answer can race the
-    // hold: the worker checks for a holder under the lock it claims with, so
-    // a hold registered after that claim finds the ask redeemed instead.
-    let background = matches!(tool_name, "shell" | "shell_write") && runs_in_background(&params);
-    let waiting_background = background.then(|| ShellEnvelope::from_tool_result(&content)).flatten()
-        .filter(|env| env.status == kaijutsu_types::shell_envelope::ShellStatus::Waiting)
-        .and_then(|env| env.ask_id)
-        .or_else(|| ask_id.clone().filter(|_| background && settled_status == Status::Waiting));
-    let background_hold = waiting_background.map(|ask| {
-        let hold = refusal.is_none().then(|| kernel.held_asks().hold(&ask, super::held_asks::HoldUntil::Started));
-        let claimed = kernel.kernel_db().lock().ask_redeemed(&ask).unwrap_or_else(|error| {
-            tracing::error!(%ask, %error, "could not read whether a background ask was claimed; waiting on it");
-            false
+    loop {
+        let ToolDispatch { mut content, mut is_error, status: mut settled_status, payload, ask_id } =
+            dispatch_and_map_tool_result(kernel, tool_name, &params, tool_ctx, cancel.clone()).await;
+        let refusal = kernel.held_asks().refusal();
+        // A background call holds only until its answer: the worker releases
+        // it when the approved command starts, and the result is a running
+        // receipt, or the denial. Hold before the receipt publishes the
+        // operation's `Waiting` pair.
+        // The shell tool answers a gated background call with a waiting receipt
+        // and has already published the operation, so an answer can race the
+        // hold: the worker checks for a holder under the lock it claims with, so
+        // a hold registered after that claim finds the ask redeemed instead.
+        let background = matches!(tool_name, "shell" | "shell_write") && runs_in_background(&params);
+        let waiting_background = background.then(|| ShellEnvelope::from_tool_result(&content)).flatten()
+            .filter(|env| env.status == kaijutsu_types::shell_envelope::ShellStatus::Waiting)
+            .and_then(|env| env.ask_id)
+            .or_else(|| ask_id.clone().filter(|_| background && settled_status == Status::Waiting));
+        let background_hold = waiting_background.map(|ask| {
+            let hold = refusal.is_none().then(|| kernel.held_asks().hold(&ask, super::held_asks::HoldUntil::Started));
+            let claimed = kernel.kernel_db().lock().ask_redeemed(&ask).unwrap_or_else(|error| {
+                tracing::error!(%ask, %error, "could not read whether a background ask was claimed; waiting on it");
+                false
+            });
+            (ask, hold.filter(|_| !claimed))
         });
-        (ask, hold.filter(|_| !claimed))
-    });
-    make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
-        ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
-    if let Some((ask, hold)) = background_hold {
-        let reason = match hold {
-            Some(mut hold) => {
-                let released = hold.wait(stop_waiting).await;
-                drop(hold);
-                (!released).then_some(INTERRUPTED_HOLD)
-            }
-            // Refused, or already claimed by the worker (no reason).
-            None => refusal,
-        };
-        (content, is_error) = background_answer(kernel, documents, context_id, &ask, reason);
-    }
-
-    // People read the clean output; the model reads it rendered with the facts
-    // that change its next step (`ShellEnvelope::model_text`), plus the Error
-    // child's envelope for an error result. The result stores the rendered
-    // text only when it differs from the output, and keeps the shell envelope
-    // (output blank) as its record; hydration replays what the model read.
-    // Project the actual output once so both readers get clean text.
-    let envelope = ShellEnvelope::from_tool_result(&content);
-    let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
-    let ansi = crate::ansi_ingest::project(source.as_bytes());
-    let block_content = ansi.as_ref().map_or(source.as_str(), |projection| projection.text.as_str());
-    let mut model_content = match &envelope {
-        Some(env) => env.model_text(block_content),
-        None => block_content.to_owned(),
-    };
-    if let Some(payload) = &payload {
-        model_content.push_str("\n\n");
-        model_content.push_str(&kaijutsu_types::format_error_payload_for_llm(payload, &payload.summary_line()));
-    }
-    let record = envelope.map(|env| env.with_clean_output("").to_value().to_string());
-    let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
-    // A call left waiting on its ask holds this turn until the answer is
-    // settled. Hold before publishing `Waiting`: the worker acts only on a
-    // published pair, and it must find the holder when it does.
-    let hold = match (&ask_id, settled_status, refusal) {
-        (Some(ask), Status::Waiting, None) => Some(kernel.held_asks().hold(ask, super::held_asks::HoldUntil::Settled)),
-        _ => None,
-    };
-    documents.settle_tool_result_as(context_id, &call, &result, block_content,
-        crate::block_store::ModelRecord {
-            model_content: (model_content != block_content).then_some(model_content.as_str()),
-            envelope: record.as_deref(),
-            only_for_model_call: false,
-        },
-        settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
-    if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
-    if let (Some(mut hold), Some(ask)) = (hold, ask_id.as_deref()) {
-        let settled = hold.wait(stop_waiting).await;
-        if !settled {
-            end_hold(kernel, context_id, call, result, ask, INTERRUPTED_HOLD);
+        make_pending_shell_receipt(kernel, documents, context_id, tool_ctx, tool_name, &params,
+            ask_id.as_deref(), &mut content, &mut is_error, &mut settled_status);
+        if let Some((ask, hold)) = background_hold {
+            let reason = match hold {
+                Some(mut hold) => {
+                    let released = hold.wait(stop_waiting).await;
+                    drop(hold);
+                    (!released).then_some(INTERRUPTED_HOLD)
+                }
+                // Refused, or already claimed by the worker (no reason).
+                None => refusal,
+            };
+            (content, is_error) = background_answer(kernel, documents, context_id, &ask, reason);
         }
-        drop(hold);
-        return Ok((held_result(documents, context_id, &result, ask, settled), result));
+
+        // People read the clean output; the model reads it rendered with the facts
+        // that change its next step (`ShellEnvelope::model_text`), plus the Error
+        // child's envelope for an error result. The result stores the rendered
+        // text only when it differs from the output, and keeps the shell envelope
+        // (output blank) as its record; hydration replays what the model read.
+        // Project the actual output once so both readers get clean text.
+        let envelope = ShellEnvelope::from_tool_result(&content);
+        let source = envelope.as_ref().map_or_else(|| content.clone(), |env| env.readable_output());
+        let ansi = crate::ansi_ingest::project(source.as_bytes());
+        let block_content = ansi.as_ref().map_or(source.as_str(), |projection| projection.text.as_str());
+        let mut model_content = match &envelope {
+            Some(env) => env.model_text(block_content),
+            None => block_content.to_owned(),
+        };
+        if let Some(payload) = &payload {
+            model_content.push_str("\n\n");
+            model_content.push_str(&kaijutsu_types::format_error_payload_for_llm(payload, &payload.summary_line()));
+        }
+        let record = envelope.map(|env| env.with_clean_output("").to_value().to_string());
+        let styles = ansi.as_ref().map(|projection| (projection.spans.clone(), source.as_bytes()));
+        // A call left waiting on its ask holds this turn until the answer is
+        // settled. Hold before publishing `Waiting`: the worker acts only on a
+        // published pair, and it must find the holder when it does.
+        let hold = match (&ask_id, settled_status, refusal) {
+            (Some(ask), Status::Waiting, None) => Some(kernel.held_asks().hold(ask, super::held_asks::HoldUntil::Settled)),
+            _ => None,
+        };
+        documents.settle_tool_result_as(context_id, &call, &result, block_content,
+            crate::block_store::ModelRecord {
+                model_content: (model_content != block_content).then_some(model_content.as_str()),
+                envelope: record.as_deref(),
+                only_for_model_call: false,
+            },
+            settled_status, is_error, PrincipalId::system(), styles, ask_id.as_deref())?;
+        if ask_id.is_some() { crate::kj::gate::announce_ledger_change(kernel.kernel_db(), kernel.ledger_flows()); }
+        if let (Some(mut hold), Some(ask)) = (hold, ask_id.as_deref()) {
+            let settled = hold.wait(stop_waiting).await;
+            drop(hold);
+            if !settled {
+                end_hold(kernel, context_id, call, result, ask, INTERRUPTED_HOLD);
+                return Ok((held_result(documents, context_id, &result, ask, false), result));
+            }
+            // An ask with no stored command: the call itself is the delivery.
+            // An allow makes it again, and its redemption spends the answer.
+            match super::approval_resume::answer_without_command(kernel, ask) {
+                Some(Ok(())) => continue,
+                Some(Err(denial)) => {
+                    documents.settle_tool_result_as(context_id, &call, &result, &denial, Default::default(),
+                        Status::Error, true, PrincipalId::system(), None, None)?;
+                    return Ok((InlineToolResult { content: denial, is_error: true }, result));
+                }
+                None => return Ok((held_result(documents, context_id, &result, ask, true), result)),
+            }
+        }
+        if let (Some(ask), Status::Waiting, Some(reason)) = (ask_id.as_deref(), settled_status, refusal) {
+            end_hold(kernel, context_id, call, result, ask, reason);
+            return Ok((held_result(documents, context_id, &result, ask, false), result));
+        }
+        let anchor = if let Some(payload) = payload {
+            documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
+        } else { result };
+        return Ok((InlineToolResult { content: model_content, is_error }, anchor));
     }
-    if let (Some(ask), Status::Waiting, Some(reason)) = (ask_id.as_deref(), settled_status, refusal) {
-        end_hold(kernel, context_id, call, result, ask, reason);
-        return Ok((held_result(documents, context_id, &result, ask, false), result));
-    }
-    let anchor = if let Some(payload) = payload {
-        documents.insert_error_block_as(context_id, &result, &payload, payload.summary_line(), Some(PrincipalId::system()))?
-    } else { result };
-    Ok((InlineToolResult { content: model_content, is_error }, anchor))
 }
 
 const INTERRUPTED_HOLD: &str = "The turn was interrupted while waiting for this approval; nothing ran.";

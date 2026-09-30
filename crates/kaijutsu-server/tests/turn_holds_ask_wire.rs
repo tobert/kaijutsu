@@ -18,6 +18,7 @@ use std::time::Duration;
 use common::run_local;
 use kaijutsu_client::{KernelHandle, KeySource, RpcClient, ServerEvent, SshClient, SshConfig, turn_events_channel};
 use kaijutsu_kernel::llm::{ContentBlock, Message, MessageContent, MockClient, Provider, stream::StreamEvent};
+use kaijutsu_kernel::mcp::{AskSpec, GlobPattern, HookAction, HookEntry, HookId};
 use kaijutsu_server::{AuthDb, SharedKernel, SshServer, SshServerConfig};
 use kaijutsu_types::{BlockKind, ContextId, PrincipalId, Status};
 use russh::keys::{Algorithm, PrivateKey};
@@ -100,7 +101,7 @@ impl Held {
         let mut config = SshServerConfig::ephemeral(addr.port());
         // Setup runs as non-root principals, whose uncovered statements ask;
         // only the model's own calls should reach a reviewer here.
-        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive"]);
+        common::allow_in_shipped_gate(&config, &["kj context create", "kj drive", "cd"]);
         config.auth_db_path = Some(auth_db_path);
         common::seed_mock_backend_with_model(config.data_dir.as_ref().unwrap(), "mock-model");
         let (kernel_tx, kernel_rx) = tokio::sync::oneshot::channel();
@@ -143,6 +144,21 @@ impl Held {
 
     fn marker(&self, name: &str) -> PathBuf { self.scratch.path().join(name) }
 
+    /// A pre_call hook that asks before any `tool` call in this context. Its
+    /// ask stores no command: allowing it lets the call itself proceed.
+    async fn ask_before(&self, tool: &str) {
+        self.server.kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+            id: HookId(format!("held-ask-{tool}")),
+            match_instance: None,
+            match_tool: Some(GlobPattern(tool.into())),
+            match_context: Some(self.context),
+            match_principal: None,
+            action: HookAction::Ask(AskSpec { description: Some(format!("a human looks at every {tool}")) }),
+            priority: 0,
+            kaish_script_id: None,
+        });
+    }
+
     /// Script the model, subscribe to turn events, and start one drive.
     async fn drive(&self, script: Vec<Vec<StreamEvent>>) -> (Arc<parking_lot::Mutex<Vec<Vec<Message>>>>, Receiver<ServerEvent>) {
         let (mock, sent) = MockClient::new("").with_scripted_stream(script).recording_sent_messages();
@@ -168,9 +184,14 @@ impl Held {
 
     /// Answer from the reviewer's own seat, the way a human does.
     async fn answer(&self, request_id: &str, allow: bool) {
-        let verb = if allow { "allow" } else { "deny" };
+        self.answer_with(request_id, if allow { "allow" } else { "deny" }).await
+    }
+
+    /// Answer with `verb` and any flags, e.g. `allow --remember always`.
+    async fn answer_with(&self, request_id: &str, verb: &str) {
         self.reviewer_kj.join_context(self.reviewer_context, "held-review").await.unwrap();
-        self.reviewer_kj.shell_execute(&format!("kj ledger {verb} {request_id}"), self.reviewer_context, true)
+        let (verb, flags) = verb.split_once(' ').unwrap_or((verb, ""));
+        self.reviewer_kj.shell_execute(&format!("kj ledger {verb} {request_id} {flags}"), self.reviewer_context, true)
             .await.expect("shell_execute for the answer");
         wait_for("the answer to land in the ledger", || matches!(
             self.server.kernel_db.lock().get_approval(request_id).unwrap(),
@@ -443,6 +464,97 @@ fn a_denied_background_call_returns_the_denial() {
         let results = tool_results(&sent.lock()[1]);
         assert!(results[0].2 && results[0].1.contains("denied"), "{results:?}");
         assert!(!marker.exists());
+        h.close().await;
+    });
+}
+
+fn glob(id: &str, dir: &std::path::Path) -> StreamEvent {
+    StreamEvent::ToolUse { id: id.into(), name: "glob".into(),
+        input: serde_json::json!({ "pattern": "*.txt", "path": dir.display().to_string() }) }
+}
+
+/// An ask with no stored command holds the turn too. On allow, the turn
+/// makes the call itself, spending the answer; the model reads the tool's
+/// real result in the same turn.
+///
+/// Falsified by leaving such asks to the retry wake: the worker skips a wake
+/// while a turn is in flight, so a held turn would wait forever.
+#[test]
+fn an_allowed_hook_ask_on_another_tool_runs_the_call_in_the_same_turn() {
+    run_local(async {
+        let h = Held::new("held-hook").await;
+        h.ask_before("glob").await;
+        std::fs::write(h.marker("found-it.txt"), "x").unwrap();
+        // `glob` resolves paths against the context's working directory.
+        let cd = common::shell_exec_wait(&h.performer_kj, &format!("cd {}", h.scratch.path().display()), h.context).await;
+        assert_eq!(cd.2, Status::Done, "cd: {}", cd.1);
+        let (sent, mut events) = h.drive(vec![
+            vec![glob("held-glob-1", h.scratch.path()), done("tool_use")],
+            reply("listed"),
+        ]).await;
+        let asks = h.wait_for_asks(1).await;
+        assert!(h.approval(&asks[0]).exec_source.is_none(), "a hook ask on glob stores no command");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(sent.lock().len(), 1);
+        h.answer(&asks[0], true).await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let results = tool_results(&sent[1]);
+        let glob = results.iter().find(|r| r.0 == "held-glob-1").expect("the glob result");
+        assert!(!glob.2 && glob.1.contains("found-it.txt"), "the call ran after the answer: {results:?}");
+        assert!(!h.server.kernel_db.lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == asks[0]),
+            "the call spent the answer");
+        h.assert_no_seed();
+        h.assert_rehydrates_as_sent(&sent[1], "listed");
+        h.close().await;
+    });
+}
+
+/// "Always allow" on an ask with no stored command: the retry passes on the
+/// learned rule, and the held call still spends the answer, so forgetting
+/// the rule cannot leave an old answer to authorize a later call.
+#[test]
+fn an_always_allowed_hook_ask_spends_its_answer() {
+    run_local(async {
+        let h = Held::new("held-hook-always").await;
+        h.ask_before("glob").await;
+        let cd = common::shell_exec_wait(&h.performer_kj, &format!("cd {}", h.scratch.path().display()), h.context).await;
+        assert_eq!(cd.2, Status::Done, "cd: {}", cd.1);
+        let (_sent, mut events) = h.drive(vec![
+            vec![glob("held-glob-3", h.scratch.path()), done("tool_use")],
+            reply("listed"),
+        ]).await;
+        let asks = h.wait_for_asks(1).await;
+        h.answer_with(&asks[0], "allow --remember always").await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let rules = common::shell_exec_wait(&h.reviewer_kj, "kj ledger rules", h.reviewer_context).await;
+        assert!(rules.1.contains("builtin.file.glob") && rules.1.contains("user rule (always"),
+            "the answer learned a rule, so the retry passed on it: {}", rules.1);
+        assert!(!h.server.kernel_db.lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == asks[0]),
+            "the held call spent the answer the rule made unnecessary");
+        h.close().await;
+    });
+}
+
+/// A denied ask with no stored command returns the denial in the same turn.
+#[test]
+fn a_denied_hook_ask_on_another_tool_returns_the_denial() {
+    run_local(async {
+        let h = Held::new("held-hook-deny").await;
+        h.ask_before("glob").await;
+        let (sent, mut events) = h.drive(vec![
+            vec![glob("held-glob-2", h.scratch.path()), done("tool_use")],
+            reply("fine"),
+        ]).await;
+        let asks = h.wait_for_asks(1).await;
+        h.answer(&asks[0], false).await;
+        assert!(matches!(turn_end(&mut events, h.context).await, ServerEvent::TurnCompleted { .. }));
+        let results = tool_results(&sent.lock()[1]);
+        assert!(results[0].2 && results[0].1.contains("denied"), "{results:?}");
+        assert!(!h.server.kernel_db.lock().undelivered_answers().unwrap().iter().any(|a| a.request_id == asks[0]),
+            "delivering the denial spent it");
+        h.assert_no_seed();
         h.close().await;
     });
 }

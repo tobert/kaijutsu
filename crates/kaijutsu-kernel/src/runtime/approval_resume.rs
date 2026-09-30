@@ -27,6 +27,35 @@ fn answerer_name(
     kernel_db.lock().name_for(id)
 }
 
+/// What a refused call reads: who refused it and that nothing ran.
+fn denial_text(who: &str, decided_option: Option<&str>) -> String {
+    match decided_option {
+        Some("cancel") => format!("cancelled by {who} — nothing was run"),
+        Some(option) => format!("denied by {who} ({option}) — nothing was run"),
+        None => format!("denied by {who} — nothing was run"),
+    }
+}
+
+/// For a turn released from its hold on `request_id`: `None` when the ask
+/// stored a command (the worker settled its pair), `Ok` when the ask was
+/// allowed and the call should be made again, which spends the answer, and
+/// `Err` with the denial when it was refused, which this spends.
+pub(crate) fn answer_without_command(kernel: &Arc<Kernel>, request_id: &str) -> Option<Result<(), String>> {
+    let db = kernel.kernel_db().lock();
+    let row = match db.get_approval(request_id) {
+        Ok(Some(row)) => row,
+        result => return Some(Err(format!("ask {request_id} could not be read after its answer ({result:?}); nothing was run"))),
+    };
+    if row.exec_source.is_some() { return None; }
+    if row.status == crate::ApprovalStatus::Allowed { return Some(Ok(())); }
+    if let Err(error) = db.redeem_ask(request_id) {
+        tracing::error!(ask = %request_id, %error, "could not spend a refused answer a held turn read");
+    }
+    drop(db);
+    let who = answerer_name(kernel.kernel_db(), row.decided_by.as_deref());
+    Some(Err(denial_text(&who, row.decided_option.as_deref())))
+}
+
 /// What acting on one answered ask leaves for the driver to do.
 enum ExecAction {
     /// Handled to the end. The ask is redeemed and the blocks waiting on it
@@ -999,11 +1028,7 @@ async fn run_delivery(
                 None => false,
             };
             let executable = row.exec_source.clone().map(|source| {
-                let denial = match row.decided_option.as_deref() {
-                    Some("cancel") => format!("cancelled by {who} — nothing was run"),
-                    Some(option) => format!("denied by {who} ({option}) — nothing was run"),
-                    None => format!("denied by {who} — nothing was run"),
-                };
+                let denial = denial_text(&who, row.decided_option.as_deref());
                 ExecutableAsk {
                     source,
                     stdin: row.exec_stdin.clone(),
@@ -1016,6 +1041,13 @@ async fn run_delivery(
             });
 
             let executed_seed = match executable {
+                // A turn holding an ask with no stored command makes the
+                // call itself once released; nothing to wake or seed.
+                None if kernel.held_asks().release(&answer.request_id) => {
+                    woken.insert(answer.request_id.clone());
+                    delivered_this_scan += 1;
+                    continue;
+                }
                 None => None,
                 Some(ask) => {
                     match act_on_executable_answer(

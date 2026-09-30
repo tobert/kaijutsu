@@ -558,25 +558,17 @@ deepseek-v4-flash. Evidence, event logs and the code audit:
 `contrib/bench/README.md`. Amy's observation that prompted it: contexts "stop
 more readily than other agents". Open, most costly first:
 
-- **Does an approved command's output reach the model now?** In the
-  benchmark the notice said only "It has run", and the next inference still
-  believed it was blocked: 35 inferences and 1.09M input tokens against 9 and
-  173K with the commands allowed. The notice now names the command, its exit
-  and elapsed time, the filled output block, and a success's last line or a
-  failure's last 20 error lines (`executed_turn_seed`, 2026-09-23). Rerun the
-  benchmark task to see whether the spiral is gone; delete this entry if so.
-- **A turn can end before its ask is offered.** A mock turn raised an ask and
-  ended about 70 ms later; the ask-to-decision round trip measured 337 ms. The
-  ask stayed pending, the command never ran, and the ACP client saw no
-  permission request. Nothing holds the turn, or `session/prompt`, open for an
-  ask the turn raised. `contrib/bench/analysis/classify_run.py` reports these
-  as `asks_orphaned`.
-- **The waiting receipt is ambiguous.** `runtime/llm_stream.rs` returns "the
-  command has not run" with `is_error=false` and `Status::Done`; the ACP
-  status is `failed` in one phrasing and `completed` in another. A model
-  reading the text stops; one reading the status assumes it ran. The refusal
-  remedy (`kaijutsu-types/src/refusal.rs`) tells the reader to run
-  `kj ledger allow`, which a model cannot do for itself.
+- **Rerun the every-command-asks benchmark.** It spent 35 inferences and
+  1.09M input tokens against 9 and 173K with the commands allowed, mostly
+  the model hunting for output it had already produced. A model's turn now
+  holds on its ask and reads the real output as its tool result
+  (`docs/gate-resume.md`, "The turn holds"). Rerun the task, and delete this
+  entry if the spiral and `asks_orphaned` are gone.
+- **The waiting receipt is ambiguous on the non-blocking paths.** The MCP
+  and RPC shell paths still return "the command has not run" with
+  `is_error=false`; the refusal remedy (`kaijutsu-types/src/refusal.rs`)
+  tells the reader to run `kj ledger allow`, which a model cannot do for
+  itself. A model's own turn no longer reads it.
 - **A foreground command dies at the broker call timeout.** `shell` and
   `shell_write` now wait for completion by default (Amy, 2026-09-24:
   "defaulting to background was a bad idea"). The broker's call timeout is
@@ -2365,15 +2357,20 @@ and burn down all the approval options". Delete each line as it ships.
   cannot cover it and the read-only exemption misses it, so a model's
   structured `kj … --tail 5` asks. Needs the literal value from kaish, a
   shared interface.
-- **A model's turn holds on its own ask (Amy, 2026-09-30).** "asks should
-  still be async in the code but the conversation can block when that's
-  most logical for the model's experience." Only the in-kernel model turn
-  holds; the MCP and RPC shell paths stay non-blocking. The turn waits for
-  every ask its tool calls raised, and the model reads the real output (or
-  the denial) as its tool result in the same turn. A restart fails the held
-  call. Wall-clock and iteration caps do not count the wait. This replaces
-  the seed notification, the follow-up turn, retry-as-delivery, and step 2b
-  in `run_gate`. In progress.
+- **The held turn's leftovers (2026-09-30).** A model's turn now holds on
+  its own ask (`docs/gate-resume.md`, "The turn holds"). Still open:
+  - The seed and wake code for an unheld `PairOwner::Turn` pair
+    (`runtime/approval_resume.rs`: `unrun_turn_seed`,
+    `needs_no_shell_turn_seed`, the `Tell` arms, and the "Try the same
+    call again" wake) now serves only the MCP `shell_write` path's authored
+    pair, `kj cc send`, and a turn that vanished without its hold. Rename
+    the authored pair's owner so it is not mistaken for a held turn, and
+    delete what no caller reaches.
+  - `kj cc send` stores no command and refuses in prose (`kj/cc.rs`), so it
+    keeps retry-as-delivery and step 2b in `run_gate`. Give it an
+    `exec_source` and a typed refusal.
+  - ACP permission prompts show only the ask's description (a 200-character
+    prefix, or a hook's stderr), not the command asked about.
 - **Posture direction (Amy, 2026-09-30).** Ship a constrained, efficient
   setup: every tool call asks until a human `--remember`s it, and loosening
   is always the user's explicit choice. A banto:coder swarm states at

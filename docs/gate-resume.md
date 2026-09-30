@@ -64,9 +64,13 @@ the wire: the MCP and RPC shell paths still return `Pending`.
 - **Offline.** An offline `kj` command has no approval worker, so a model
   turn it drives never holds: the gated call fails at once with the reason
   (`Kernel::refuse_holds`).
-- **Still on the older path.** Asks with no stored command, `kj cc send`,
-  the MCP `shell_write` path, and a turn-owned pair with no holder still use
-  the wake, the seed, and retry-as-delivery described below.
+- **No stored command.** A hook ask on a tool other than the shell stores
+  no command. The worker releases its holder without acting; on an allow the
+  held call is made again, and its redemption spends the answer; on a
+  refusal the turn spends it and reads the denial.
+- **Still on the older path.** `kj cc send`, the MCP `shell_write` path,
+  and a turn-owned pair with no holder still use the wake, the seed, and
+  retry-as-delivery described below.
 
 ## Captured result review
 
