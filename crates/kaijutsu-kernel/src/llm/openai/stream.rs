@@ -487,6 +487,42 @@ data: [DONE]
         }
     }
 
+    /// The shape DeepSeek and other OpenAI-compatible servers send when the
+    /// output limit lands inside a call's arguments: fragments cut
+    /// mid-string, then `finish_reason: "length"`.
+    #[tokio::test]
+    async fn a_call_cut_at_the_length_limit_surfaces_invalid_then_done() {
+        let payload = "\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_cut\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"/app/solve.py\\\", \"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"content\\\": \\\"import re\"}}]},\"finish_reason\":null}]}
+
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}
+
+data: [DONE]
+
+";
+        let events = run(payload).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        match &events[0] {
+            StreamEvent::ToolUseInvalid { id, name, arguments, error } => {
+                assert_eq!(id, "call_cut");
+                assert_eq!(name, "write");
+                assert_eq!(arguments, "{\"path\": \"/app/solve.py\", \"content\": \"import re");
+                assert!(error.contains("EOF while parsing a string"), "{error}");
+            }
+            other => panic!("expected ToolUseInvalid, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::Done { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("length"))
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn two_parallel_tool_calls_flush_in_index_order() {
         let payload = "\

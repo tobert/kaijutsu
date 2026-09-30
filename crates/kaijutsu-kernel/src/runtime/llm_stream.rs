@@ -1673,6 +1673,32 @@ fn make_pending_shell_receipt(
     }
 }
 
+/// A tool call the provider sent, recorded as a durable call block and
+/// waiting for its answer. `unparsed` holds the error result for a call
+/// whose arguments did not parse; such a call never dispatches.
+struct PendingCall {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+    call: kaijutsu_types::BlockId,
+    unparsed: Option<String>,
+}
+
+/// Answer a call whose arguments did not parse with its error result, placed
+/// and settled the way a dispatched call's result is, so the block log holds
+/// the calls and answers in the order the provider sent the calls.
+fn answer_unparsed_call(
+    documents: &SharedBlockStore, context_id: ContextId, tool_use_id: &str,
+    call: kaijutsu_types::BlockId, detail: String, turn_lease: &TurnLease,
+) -> crate::block_store::BlockStoreResult<(InlineToolResult, kaijutsu_types::BlockId)> {
+    let answer = documents.insert_tool_result_as(context_id, &call, Some(&call), "", Status::Running,
+        None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(tool_use_id.to_owned()))?;
+    turn_lease.track_block(answer);
+    documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
+        Status::Error, true, PrincipalId::system(), None, None)?;
+    Ok((InlineToolResult { content: detail, is_error: true }, answer))
+}
+
 /// Execute a recorded model call only after its Running result exists. Both
 /// ordinary and inline providers use this content projection and settlement.
 async fn dispatch_recorded_tool_result(
@@ -2516,13 +2542,11 @@ async fn run_llm_stream(
 
         // Process stream events
         let mut open_content: Option<OpenContent> = None;
-        // Each pending invocation already has a durable call block.
-        let mut tool_calls: Vec<(String, String, serde_json::Value, kaijutsu_types::BlockId)> = vec![];
-        // Calls whose arguments did not parse: `(id, name, recorded input,
-        // the error result already written)`. They dispatch nothing; they ride
-        // the same assistant/tool-result pairing so the model reads its own
-        // call and the answer to it.
-        let mut invalid_tool_calls: Vec<(String, String, serde_json::Value, String)> = vec![];
+        // Each pending invocation already has a durable call block, in the
+        // order the provider sent the calls. A call whose arguments did not
+        // parse carries the error it is answered with instead of dispatching;
+        // it keeps its place so live and hydrated requests agree.
+        let mut tool_calls: Vec<PendingCall> = vec![];
         // Collect text output for conversation history
         let mut assistant_text = String::new();
         // Collect thinking output for in-call continuity (A3), one
@@ -2692,7 +2716,7 @@ async fn run_llm_stream(
                         input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal), Some(id.clone()), None)?;
                     turn_lease.track_block(call);
                     last_block_id = call;
-                    tool_calls.push((id, name, input, call));
+                    tool_calls.push(PendingCall { id, name, input, call, unparsed: None });
                 }
 
                 StreamEvent::ToolUseInvalid { id, name, arguments, error } => {
@@ -2719,17 +2743,8 @@ async fn run_llm_stream(
                         &name, input.clone(), Some(TypesToolKind::Builtin), Some(actor_principal),
                         Some(id.clone()), None)?;
                     turn_lease.track_block(call);
-                    let answer = documents.insert_tool_result_as(context_id, &call, Some(&call),
-                        "", Status::Running, None, Some(TypesToolKind::Builtin),
-                        Some(PrincipalId::system()), Some(id.clone()))?;
-                    turn_lease.track_block(answer);
-                    // Settle the pair rather than writing the result alone:
-                    // the call block reaches a final status the same way every
-                    // other dispatched call does.
-                    documents.settle_tool_result_as(context_id, &call, &answer, &detail, Default::default(),
-                        Status::Error, true, PrincipalId::system(), None, None)?;
-                    last_block_id = answer;
-                    invalid_tool_calls.push((id, name, input, detail));
+                    last_block_id = call;
+                    tool_calls.push(PendingCall { id, name, input, call, unparsed: Some(detail) });
                 }
 
                 StreamEvent::InlineToolUse { id, name, input } => {
@@ -3022,7 +3037,7 @@ async fn run_llm_stream(
         // A call whose arguments did not parse counts here: it dispatches
         // nothing, but its error result is the model's turn back, and it is
         // the one message about a response the output limit cut off.
-        if tool_calls.is_empty() && invalid_tool_calls.is_empty() {
+        if tool_calls.is_empty() {
             // The output ceiling cut this inference off before the model
             // reached a tool call, so the turn has nothing to act on and
             // nobody to ask — a driven worker has no human to say "continue".
@@ -3134,29 +3149,29 @@ async fn run_llm_stream(
         // assistant turn carries it and the reply below answers it.
         let assistant_tool_uses: Vec<ContentBlock> = tool_calls
             .iter()
-            .map(|(id, name, input, _)| ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
+            .map(|pending| ContentBlock::ToolUse {
+                id: pending.id.clone(),
+                name: pending.name.clone(),
+                input: pending.input.clone(),
             })
-            .chain(invalid_tool_calls.iter().map(|(id, name, input, _)| ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            }))
             .collect();
 
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
         // leave side effects without their final result.
-        let futures = tool_calls.into_iter().map(|(tool_use_id, tool_name, input, call)| {
+        let futures = tool_calls.into_iter().map(|PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }| {
             let kernel = kernel.clone();
             let documents = documents.clone();
             let tool_ctx = tool_ctx.clone();
             let interrupt = interrupt.clone();
             async move {
-                let result = dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
-                    &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, &tool_use_id, call, turn_lease).await;
+                let result = match unparsed {
+                    Some(detail) => answer_unparsed_call(&documents, context_id, &tool_use_id, call, detail,
+                        turn_lease),
+                    None => dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
+                        &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, &tool_use_id, call,
+                        turn_lease).await,
+                };
                 match result {
                     Ok((result, anchor)) => Ok((ContentBlock::ToolResult {
                         tool_use_id, content: result.content, is_error: result.is_error,
@@ -3175,15 +3190,6 @@ async fn run_llm_stream(
             let (content, anchor) = result?;
             tool_results.push(content);
             last_block_id = anchor;
-        }
-        // The error results for calls that never dispatched, in the same order
-        // as their tool uses above.
-        for (tool_use_id, _, _, detail) in std::mem::take(&mut invalid_tool_calls) {
-            tool_results.push(ContentBlock::ToolResult {
-                tool_use_id,
-                content: detail,
-                is_error: true,
-            });
         }
 
         // Add assistant message with tool uses to conversation. Preserve
@@ -4421,6 +4427,106 @@ mod publish_tests {
                     1,
                     "one call, one answer"
                 );
+            })
+            .await;
+    }
+
+    /// A cut-off call alone and beside a call that parsed, in either stream
+    /// order. The request after them carries the calls and their answers in
+    /// the order the provider sent the calls, and so does hydration from the
+    /// block log. A lone call hydrates to exactly the request the turn sent.
+    /// Two or more calls hydrate as one assistant/tool-result pair per call
+    /// (`docs/issues.md`, "Parallel tool calls hydrate as separate pairs"), so
+    /// for those only the order is compared.
+    #[tokio::test]
+    async fn a_cut_off_call_keeps_its_stream_order_live_and_hydrated() {
+        use crate::llm::{ContentBlock, MessageContent};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let parsed = || crate::llm::StreamEvent::ToolUse {
+                    id: "call_parsed".into(),
+                    name: "missing_tool".into(),
+                    input: serde_json::json!({}),
+                };
+                let cases: Vec<(&str, Vec<crate::llm::StreamEvent>, Vec<&str>)> = vec![
+                    ("cut off alone", vec![truncated_write_call()], vec!["call_truncated"]),
+                    ("cut off first", vec![truncated_write_call(), parsed()],
+                        vec!["call_truncated", "call_parsed"]),
+                    ("cut off last", vec![parsed(), truncated_write_call()],
+                        vec!["call_parsed", "call_truncated"]),
+                ];
+                for (shape, mut calls, order) in cases {
+                    let kernel = Arc::new(Kernel::new_ephemeral("cut-off-order").await);
+                    let mut completed = kernel.turn_flows().subscribe("turn.completed");
+                    calls.push(crate::llm::StreamEvent::Done {
+                        stop_reason: Some("length".into()),
+                        input_tokens: Some(10),
+                        output_tokens: Some(1024),
+                        extra: None,
+                    });
+                    let finish = vec![
+                        crate::llm::StreamEvent::TextStart,
+                        crate::llm::StreamEvent::TextDelta("retrying".into()),
+                        crate::llm::StreamEvent::TextEnd,
+                        crate::llm::StreamEvent::Done {
+                            stop_reason: Some("end_turn".into()),
+                            input_tokens: Some(20),
+                            output_tokens: Some(5),
+                            extra: None,
+                        },
+                    ];
+                    let (mock, sent) = MockClient::new("unused")
+                        .with_scripted_stream(vec![calls, finish])
+                        .recording_sent_messages();
+                    let (documents, ctx, _player) = drive_turn_with(
+                        TurnOrigin::Interactive,
+                        kernel.clone(),
+                        Provider::Mock(mock),
+                        |_| {},
+                    )
+                    .await;
+                    match completed.try_recv().expect("the turn completes").payload {
+                        TurnFlow::Completed { reason, .. } => {
+                            assert_eq!(reason, TurnStopReason::EndTurn, "{shape}")
+                        }
+                        other => panic!("{shape}: expected Completed, got {other:?}"),
+                    }
+
+                    let ids = |messages: &[crate::llm::Message], results: bool| -> Vec<String> {
+                        messages
+                            .iter()
+                            .filter_map(|m| match &m.content {
+                                MessageContent::Blocks(blocks) => Some(blocks),
+                                MessageContent::Text(_) => None,
+                            })
+                            .flatten()
+                            .filter_map(|b| match b {
+                                ContentBlock::ToolUse { id, .. } if !results => Some(id.clone()),
+                                ContentBlock::ToolResult { tool_use_id, .. } if results => {
+                                    Some(tool_use_id.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    let sent = sent.lock();
+                    assert_eq!(sent.len(), 2, "{shape}: one inference after the calls");
+                    let request = &sent[1];
+                    assert_eq!(ids(request, false), order, "{shape}: calls in stream order");
+                    assert_eq!(ids(request, true), order, "{shape}: answers in stream order");
+
+                    let blocks = documents.block_snapshots(ctx).unwrap();
+                    let rehydrated = crate::llm::hydrate_from_blocks(&blocks);
+                    assert_eq!(ids(&rehydrated, false), order, "{shape}: hydrated call order");
+                    assert_eq!(ids(&rehydrated, true), order, "{shape}: hydrated answer order");
+                    if order.len() == 1 {
+                        let live = serde_json::to_value(request).unwrap();
+                        let replayed =
+                            serde_json::to_value(&rehydrated[..request.len()]).unwrap();
+                        assert_eq!(live, replayed, "{shape}: live and rehydrated differ");
+                    }
+                }
             })
             .await;
     }

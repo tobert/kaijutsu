@@ -22,7 +22,7 @@
 //! content_block_delta (input_json_delta)      (append partial_json)
 //! content_block_stop                          ToolUse { id, name, input }
 //! message_delta                               (capture stop_reason + usage, no emit)
-//! message_stop                                Done { ... }
+//! message_stop                                (close open blocks), Done { ... }
 //! error                                       Error(String)
 //! ping                                        (no emit)
 //! ```
@@ -69,12 +69,9 @@ enum BlockState {
 /// State-machine driver. Takes a [`ClaudeSseEvent`], updates internal
 /// state, and returns zero or more [`StreamEvent`]s to forward.
 ///
-/// Most SSE events produce 0 or 1 kaijutsu events; the only 2-event
-/// case is `content_block_stop` for a tool_use block (emits a single
-/// `ToolUse` event from accumulated state) where the next iteration
-/// might need to close another open block first — but Anthropic only
-/// opens one block at a time per index, so single-event emission is
-/// sufficient.
+/// Most SSE events produce 0 or 1 kaijutsu events. `message_stop` is the
+/// exception: it closes every block still open, in index order, and then
+/// emits `Done`.
 #[derive(Debug, Default)]
 pub struct StateMachine {
     blocks: HashMap<usize, BlockState>,
@@ -101,9 +98,8 @@ impl StateMachine {
     /// Process one SSE event, returning the corresponding
     /// [`StreamEvent`]s.
     ///
-    /// Returns a `Vec` rather than an `Option` to leave room for future
-    /// multi-emit events (e.g. emitting a `Done` synthesized from
-    /// `message_stop` + remembered usage). Phase 2 only emits 0 or 1.
+    /// Returns a `Vec` because `message_stop` can emit the closing events
+    /// of blocks left open before its `Done`.
     pub fn step(&mut self, event: ClaudeSseEvent) -> Vec<StreamEvent> {
         match event {
             ClaudeSseEvent::MessageStart(p) => {
@@ -124,6 +120,13 @@ impl StateMachine {
                 vec![]
             }
             ClaudeSseEvent::MessageStop => {
+                // Close any block the message left open, in index order, so a
+                // tool call without its `content_block_stop` still reaches the
+                // runtime instead of vanishing with the state machine.
+                let mut open: Vec<usize> = self.blocks.keys().copied().collect();
+                open.sort_unstable();
+                let mut out: Vec<StreamEvent> =
+                    open.into_iter().flat_map(|index| self.on_block_stop(index)).collect();
                 let extra = (self.cache_read_input_tokens > 0
                     || self.cache_creation_input_tokens > 0)
                     .then_some({
@@ -134,12 +137,13 @@ impl StateMachine {
                             },
                         )
                     });
-                vec![StreamEvent::Done {
+                out.push(StreamEvent::Done {
                     stop_reason: self.stop_reason.clone(),
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
                     extra,
-                }]
+                });
+                out
             }
             ClaudeSseEvent::Error(e) => vec![StreamEvent::Error(format!(
                 "{}: {}",
@@ -549,5 +553,86 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
             }
             other => panic!("expected ToolUseInvalid, got {other:?}"),
         }
+    }
+
+    /// The shape Anthropic sends when `max_tokens` lands inside a tool call's
+    /// arguments: the block closes on a fragment cut mid-string, then the
+    /// message stops with `max_tokens`.
+    const TOOL_USE_CUT_AT_MAX_TOKENS: &str = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-haiku-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}
+
+event: content_block_start
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_cut\",\"name\":\"write\",\"input\":{}}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"/app/solve.py\\\", \"}}
+
+event: content_block_delta
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"content\\\": \\\"import re\"}}
+
+event: content_block_stop
+data: {\"type\":\"content_block_stop\",\"index\":0}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4096}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+
+    #[tokio::test]
+    async fn a_call_cut_at_max_tokens_surfaces_invalid_then_done() {
+        let events = run(TOOL_USE_CUT_AT_MAX_TOKENS).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        match &events[0] {
+            StreamEvent::ToolUseInvalid { id, name, arguments, error } => {
+                assert_eq!(id, "toolu_cut");
+                assert_eq!(name, "write");
+                assert_eq!(arguments, "{\"path\": \"/app/solve.py\", \"content\": \"import re");
+                assert!(error.contains("EOF while parsing a string"), "{error}");
+            }
+            other => panic!("expected ToolUseInvalid, got {other:?}"),
+        }
+        match &events[1] {
+            StreamEvent::Done { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("max_tokens"))
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// A message that stops with a block still open must not lose that block.
+    /// A tool call the model made and never saw closed is still its call: it
+    /// surfaces before `Done`, as `ToolUseInvalid` when its arguments are cut.
+    #[tokio::test]
+    async fn message_stop_closes_blocks_left_open() {
+        let payload = TOOL_USE_CUT_AT_MAX_TOKENS.replace(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "",
+        );
+        assert_ne!(payload, TOOL_USE_CUT_AT_MAX_TOKENS, "the fixture lost its block stop");
+        let payload = payload.replacen(
+            "event: content_block_start",
+            "event: content_block_start\n\
+             data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+             event: content_block_start",
+            1,
+        );
+        let events = run(&payload).await;
+        assert!(
+            matches!(events.first(), Some(StreamEvent::TextStart)),
+            "{events:?}"
+        );
+        let tail: Vec<_> = events[1..].iter().collect();
+        assert!(
+            matches!(tail.as_slice(), [
+                StreamEvent::ToolUseInvalid { id, .. },
+                StreamEvent::TextEnd,
+                StreamEvent::Done { .. },
+            ] if id == "toolu_cut"),
+            "open blocks close in index order before Done: {events:?}"
+        );
     }
 }

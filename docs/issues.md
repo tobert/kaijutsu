@@ -1934,6 +1934,23 @@ A writer-side queue needs a separate design with drift and peer tool calls
 as concrete consumers. See `docs/conversation-session.md`, "Out of scope
 for Slice A". `AGENTS.md` already describes the absence of this queue.
 
+## Parallel tool calls hydrate as separate pairs
+
+An inference that makes two or more tool calls sends the next request as one
+assistant message with every call and one user message with every result.
+The block log holds each result directly after its own call
+(`dispatch_recorded_tool_result` inserts it after the call block), so
+`hydrate_from_blocks` rebuilds one assistant/tool-result pair per call. The
+next turn's request then differs from the one the turn sent, and the prompt
+cache misses from that point. A call whose arguments did not parse follows
+the same placement. The test
+`a_cut_off_call_keeps_its_stream_order_live_and_hydrated`
+(`runtime/llm_stream.rs`) compares the whole request only for a lone call.
+Placing every result after the batch's last call, in call order, would make
+the two agree; it changes block order for every multi-call inference and
+needs its own tests. See `docs/conversation-session.md`, "Tool results
+replay as sent".
+
 ## Duplicate tool calls can execute before the next send refuses them
 
 `process_llm_stream` collects `StreamEvent::ToolUse` events in a vector but

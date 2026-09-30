@@ -2988,6 +2988,19 @@ in exactly the case the fix was for. A live probe then showed DeepSeek accepting
 the corrected requests and a turn finishing that used to end at its first
 inference.
 
+A later audit of the cut-off-call path, provider by provider, found the fix
+held for Anthropic's `max_tokens` shape and the OpenAI-compatible `length`
+shape (DeepSeek, Qwen, local servers); the Codex app-server hands over
+arguments it already parsed. Two edges remained. The Anthropic parser dropped
+any block still open at `message_stop`, so a call without its
+`content_block_stop` vanished; it now closes open blocks in index order before
+`Done`. And a cut-off call was answered at stream time and appended after the
+parsed calls, so a request carried the calls out of the order the model made
+them; it now waits in the same ordered batch and is answered where a
+dispatched call would be. Checking that against hydration showed a wider,
+older gap — every multi-call inference hydrates as one pair per call — which
+is open in `docs/issues.md`.
+
 The lesson that outlasts the numbers: one attempt per task is noisy. Rerunning
 arm A's six losses with only the turn-loop fix solved five, and only one of the
 five was the fix. `docs/benchmarks.md` records that beside the rows, so a later
