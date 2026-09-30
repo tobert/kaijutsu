@@ -42,6 +42,9 @@ pub(crate) struct ToolCommand {
     pub stdin: Option<String>,
     pub background: bool,
     pub read_only: bool,
+    /// How long a waiting command may run before it is killed. A background
+    /// command is not bound by it.
+    pub timeout: std::time::Duration,
 }
 
 impl ToolCommand {
@@ -60,6 +63,19 @@ impl ToolCommand {
         let read_only = self.read_only;
         let task_cancel = if background { CancellationToken::new() } else { cancel.child_token() };
         let cancel_guard = task_cancel.clone().drop_guard();
+        // A waiting command is killed at its limit, and the model reads what
+        // it printed until then with a line saying so.
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let limit = self.timeout;
+        let max_limit = self.kernel.timeouts().shell_command_max;
+        let timer = (!background).then(|| {
+            let (timed_out, stop) = (timed_out.clone(), task_cancel.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(limit).await;
+                timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                stop.cancel();
+            })
+        });
         let span = tracing::Span::current();
         let hook_depth = crate::mcp::broker::current_hook_depth();
         let slot = self.slot;
@@ -127,10 +143,14 @@ impl ToolCommand {
                 Err(McpError::Refused(refusal))
             }
             result = completed => {
+                if let Some(timer) = timer { timer.abort(); }
                 let outcome = result.map_err(|_| McpError::Protocol("runtime worker stopped before completion".into()))?
                     .map_err(McpError::Protocol)?;
                 if let Some(refusal) = outcome.refusal() { return Err(McpError::Refused(refusal.clone())); }
                 let mut envelope = outcome.envelope();
+                if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                    name_the_timeout(&mut envelope, limit, max_limit);
+                }
                 if read_only { name_the_write_path(&mut envelope); }
                 Ok(shell_envelope_to_tool_result(envelope))
             }
@@ -348,4 +368,15 @@ mod setup_tests {
         }
     }
 
+}
+
+/// Mark a command killed at its limit: an error, with a last stderr line
+/// naming the limit and the ways to get more time.
+fn name_the_timeout(envelope: &mut ShellEnvelope, limit: std::time::Duration, max: std::time::Duration) {
+    envelope.status = ShellStatus::Error;
+    if !envelope.stderr.is_empty() && !envelope.stderr.ends_with('\n') { envelope.stderr.push('\n'); }
+    envelope.stderr.push_str(&format!(
+        "killed after timeout_ms {}: pass a larger timeout_ms (at most {}) or run_in_background: true",
+        limit.as_millis(), max.as_millis()
+    ));
 }

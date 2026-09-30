@@ -569,16 +569,15 @@ more readily than other agents". Open, most costly first:
   `is_error=false`; the refusal remedy (`kaijutsu-types/src/refusal.rs`)
   tells the reader to run `kj ledger allow`, which a model cannot do for
   itself. A model's own turn no longer reads it.
-- **A foreground command dies at the broker call timeout.** `shell` and
-  `shell_write` now wait for completion by default (Amy, 2026-09-24:
-  "defaulting to background was a bad idea"). The broker's call timeout is
-  120 s for `shell` and 315 s for `shell_write` (`mcp/policy.rs`); on expiry
-  the model gets a `Timeout` error with no partial output, and the command
-  is cancelled (`runtime/tool_command.rs`, the foreground `task_cancel`).
-  A long `cargo test` must pass `foreground: false`, which the tool
-  description says but a model has to anticipate. Still open: a larger
-  `call_timeout` for coder seats and partial output on timeout. Banto's
-  `kj wait <lane> --timeout 240` through `shell` hits the same 120 s ceiling.
+- **A client's own deadline may cut a long shell call short.** A model's
+  in-kernel shell call now runs under its `timeout_ms` (10 minutes by
+  default, at most an hour), is killed at it with its partial output, and
+  the broker and kaish's watchdog sit above the maximum
+  (`TimeoutPolicy::shell_command_*`). Calls that arrive over RPC, such as
+  kaijutsu-mcp's `shell` or a client's `kj` (`gate::CLIENT_CALL`, 330 s),
+  still carry the client's fixed deadline; check each path against the new
+  maximum. The rest of the `timeout::gate` ladder waits on Slice 5 of
+  `docs/gate-resume.md`.
 - **Any text with no tool call ends the turn** (`runtime/llm_stream.rs`, "no
   tool calls this iteration"). There is no completion command, no check of
   unfinished plan items and no continuation nudge. Direction from Amy: "a done
@@ -632,17 +631,6 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   truncated the `write` call on `regex-log`. `kaijutsu-solo-acp --max-tokens
   <N>` (2026-09-18, `docs/solo-acp.md`) lets a benchmark operator raise it;
   every other caller of the factory default is unchanged.
-- **The iteration cap assumes a human is present.** `sqlite-with-gcov` stopped
-  at "Paused after 50 agentic iteration(s) (consent: collaborative). Send a
-  follow-up to continue". A driven worker has nobody to send one. The cap and
-  consent mode want a per-context or per-type setting that a driver can choose;
-  today consent is kernel-wide. `kaijutsu-solo-acp --consent autonomous`
-  (2026-09-18, `docs/solo-acp.md`) lets a solo kernel's own operator choose the
-  wider cap at boot, through the same kernel-wide setting
-  (`Kernel::set_consent_mode`) — the per-context row `kj context set --consent`
-  writes still is not what `runtime/llm_stream.rs` reads (see its own
-  "Consent setting ownership" TODO there), so this remains open for anyone
-  who needs it per-context or mid-run.
 - **A process the model spawns can read the kernel's environment through
   `/proc/<pid>/environ`** when it runs as root, which is usual in task
   containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
@@ -2371,6 +2359,11 @@ and burn down all the approval options". Delete each line as it ships.
     `exec_source` and a typed refusal.
   - ACP permission prompts show only the ask's description (a 200-character
     prefix, or a hook's stderr), not the command asked about.
+- **One shell per seat (Amy, 2026-09-30).** "I've watched the models fumble
+  the 2 tools ... contexts that have shell that is RO and those that have
+  RW, but not put both shells and make the model decide." A seat binds a
+  read-only or a read-write shell, never both. After the Terminal-Bench
+  baseline, so its effect is measurable.
 - **Posture direction (Amy, 2026-09-30).** Ship a constrained, efficient
   setup: every tool call asks until a human `--remember`s it, and loosening
   is always the user's explicit choice. A banto:coder swarm states at

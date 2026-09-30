@@ -239,6 +239,16 @@ pub struct TimeoutPolicy {
     /// `mcp::servers::external`.
     pub mcp_connect_timeout: Duration,
 
+    /// How long a foreground `shell` or `shell_write` command runs when its
+    /// call names no `timeout_ms`. The command is killed at the limit and
+    /// its partial output returned.
+    pub shell_command_default: Duration,
+
+    /// The longest `timeout_ms` a shell call may ask for. A larger value is
+    /// refused, naming this one. The broker's call timeout for the shell
+    /// instances and kaish's request watchdog sit above it, as backstops.
+    pub shell_command_max: Duration,
+
     /// Default `call_timeout` seeded into a fresh `InstancePolicy` at server
     /// registration. Per-instance overrides via the `policy_admin` MCP
     /// server continue to work.
@@ -276,10 +286,10 @@ impl TimeoutPolicy {
 impl Default for TimeoutPolicy {
     fn default() -> Self {
         Self {
-            // Generous cap — interactive shell sessions can run cargo builds,
-            // git clones, etc. without surprising the user. Catches true
-            // wedges, not normal long-running commands.
-            kaish_request_timeout: Duration::from_secs(1800),
+            // A backstop above the longest shell command a call may ask for:
+            // catches true wedges, and never cuts a command short of its own
+            // limit, which returns partial output.
+            kaish_request_timeout: Duration::from_secs(3600 + 60),
             // Tighter per-call overrides for non-interactive paths:
             rc_script_timeout: Duration::from_secs(30),
             hook_body_timeout: Duration::from_secs(15),
@@ -288,6 +298,11 @@ impl Default for TimeoutPolicy {
             llm_idle_timeout: Duration::from_secs(120),
             mcp_connect_timeout: Duration::from_secs(10),
             mcp_call_timeout_default: Duration::from_secs(120),
+            // Builds and test suites take minutes. Claude Code's shell
+            // defaults to 2 minutes with a 10-minute cap; a benchmark task
+            // runs for up to an hour, and its harness bounds the whole run.
+            shell_command_default: Duration::from_secs(600),
+            shell_command_max: Duration::from_secs(3600),
             // A human answering from another surface (a different shell,
             // another client) needs real minutes; a turn must not hang
             // indefinitely on an unanswered prompt either.

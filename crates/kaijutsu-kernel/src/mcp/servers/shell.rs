@@ -58,6 +58,30 @@ pub struct ShellParams {
     /// shell operation API.
     #[serde(default)]
     pub run_in_background: bool,
+    /// Milliseconds a command that waits may run before it is killed; what
+    /// it printed until then is returned. Defaults to 600000 (10 minutes),
+    /// at most 3600000 (1 hour). For longer work, pass
+    /// `run_in_background: true`.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The limit a waiting command runs under: the call's `timeout_ms`, or the
+/// kernel's default. Zero, or more than the kernel's maximum, is refused
+/// with the maximum rather than adjusted.
+pub(crate) fn resolve_command_timeout(
+    timeout_ms: Option<u64>,
+    policy: &kaijutsu_types::TimeoutPolicy,
+) -> Result<std::time::Duration, String> {
+    let max_ms = policy.shell_command_max.as_millis() as u64;
+    match timeout_ms {
+        None => Ok(policy.shell_command_default),
+        Some(0) => Err("timeout_ms must be at least 1".to_string()),
+        Some(ms) if ms > max_ms => Err(format!(
+            "timeout_ms {ms} is more than the maximum of {max_ms}; pass run_in_background: true for longer work"
+        )),
+        Some(ms) => Ok(std::time::Duration::from_millis(ms)),
+    }
 }
 
 // The kaish-language guidance (word-splitting, globs, `case`/`esac`,
@@ -350,10 +374,13 @@ impl McpServerLike for ShellServer {
         .await
         .map_err(|e| McpError::Protocol(format!("materialize context shell: {e}")))?;
 
+        let timeout = resolve_command_timeout(parsed.timeout_ms, dispatcher.kernel().timeouts())
+            .map_err(|message| McpError::InvalidParams(serde::de::Error::custom(message)))?;
         crate::runtime::tool_command::ToolCommand {
             slot, admission,
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
             code: parsed.command, stdin: parsed.stdin, background: parsed.run_in_background, read_only: self.read_only,
+            timeout,
         }.execute(cancel).await
     }
 
@@ -638,6 +665,57 @@ mod tests {
         assert!(out.contains("hello-shell"), "stdout missing, got: {out:?}");
     }
 
+    /// A foreground command that outlives its `timeout_ms` is killed, and
+    /// the model reads what it printed before that, with a line naming the
+    /// limit and how to ask for more.
+    #[tokio::test]
+    async fn a_command_past_its_timeout_is_killed_with_partial_output() {
+        let (broker, d) = wired().await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("sh"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await.unwrap();
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id())
+            .with_actor(principal, Some(PrincipalId::new()));
+        let mut params = call("echo before-the-limit; sleep 30; echo after-the-limit");
+        params.arguments["timeout_ms"] = serde_json::json!(500);
+        let started = std::time::Instant::now();
+        let result = broker.call_tool(params, &cc, CancellationToken::new()).await
+            .expect("a timed-out command is a result, not a fault");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the limit stopped it: {:?}", started.elapsed());
+        let body = body_of(&result);
+        assert!(result.is_error, "{body}");
+        assert!(body["stdout"].as_str().unwrap_or_default().contains("before-the-limit"), "{body}");
+        assert!(!body["stdout"].as_str().unwrap_or_default().contains("after-the-limit"), "{body}");
+        let stderr = body["stderr"].as_str().unwrap_or_default();
+        assert!(stderr.contains("timeout_ms") && stderr.contains("500"), "names the limit: {body}");
+    }
+
+    /// A timeout above the kernel's maximum is refused with the maximum, not
+    /// silently lowered.
+    #[test]
+    fn a_timeout_above_the_maximum_is_refused() {
+        let policy = kaijutsu_types::TimeoutPolicy::default();
+        let max_ms = policy.shell_command_max.as_millis() as u64;
+        assert_eq!(resolve_command_timeout(None, &policy).unwrap(), policy.shell_command_default);
+        assert_eq!(resolve_command_timeout(Some(max_ms), &policy).unwrap(), policy.shell_command_max);
+        let error = resolve_command_timeout(Some(max_ms + 1), &policy).unwrap_err();
+        assert!(error.contains(&max_ms.to_string()), "{error}");
+        assert!(resolve_command_timeout(Some(0), &policy).is_err());
+    }
+
+    /// The broker and kaish's watchdog are backstops: both sit above the
+    /// longest timeout a call may ask for, so the call's own limit fires
+    /// first and returns partial output.
+    #[test]
+    fn backstops_sit_above_the_longest_command_timeout() {
+        let policy = kaijutsu_types::TimeoutPolicy::default();
+        assert!(policy.shell_command_default >= std::time::Duration::from_secs(600));
+        assert!(policy.kaish_request_timeout > policy.shell_command_max);
+        assert!(crate::mcp::InstancePolicy::shell_call_timeout(&policy) > policy.shell_command_max);
+    }
+
     /// The mirror on the hot side: `facade:shell_write` alone must let the
     /// model run a command through the mutating tool, under its new name.
     /// Director explicitly holds both facades post-flag-day (the operator's
@@ -687,38 +765,6 @@ mod tests {
         assert!(out.contains("hello-shell-write-allowed"), "stdout missing, got: {out:?}");
     }
 
-    /// The gate's deadline must be ordered under the broker's, so an
-    /// unanswered gate returns the gate's honest reason rather than a generic
-    /// MCP timeout. This USED to be a clamp computed by hand right here
-    /// (`min(gate_wait, mcp_call_timeout_default - 5s)`); it is now enforced
-    /// by the shared `kaijutsu_types::timeout::gate` ladder —
-    /// `effective_gate_wait()` on the kernel side, `gate::BROKER_CALL` as
-    /// this instance's `InstancePolicy` cap (`for_kernel_gated`, NOT the
-    /// generic `mcp_call_timeout_default` every other instance uses).
-    ///
-    /// Asserts the ordering rather than a literal duration, so retuning
-    /// either bound cannot quietly invert it. `gate_ladder_fires_caller_first`
-    /// (`kaijutsu-types::timeout`) pins the ladder's constants in isolation;
-    /// this is the integration check that the call site here actually reads
-    /// through it rather than reintroducing a local clamp.
-    #[test]
-    fn the_gate_deadline_is_ordered_under_the_broker_call_timeout() {
-        let t = kaijutsu_types::TimeoutPolicy::default();
-        let effective = t.effective_gate_wait();
-        assert!(
-            effective < kaijutsu_types::timeout::gate::BROKER_CALL,
-            "the gate must resolve BEFORE the broker cancels the call, or its reason is lost \
-             (effective gate wait {:?}, broker cap {:?})",
-            effective,
-            kaijutsu_types::timeout::gate::BROKER_CALL
-        );
-        assert!(
-            kaijutsu_types::timeout::gate::MAX_KERNEL_WAIT
-                < kaijutsu_types::timeout::gate::BROKER_CALL,
-            "if this fails the ladder became a no-op and this test stopped testing anything — \
-             the gate ceiling caught up with (or passed) the broker cap it's supposed to clear"
-        );
-    }
 
     /// **Slice 1 spec test.** An uncovered `shell_write` submission escalates
     /// and returns IMMEDIATELY, refusing — proven through the real
