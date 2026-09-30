@@ -2509,7 +2509,9 @@ for when it's contained in docker". Open:
     auto-answers the first allow option and builds ATIF from
     `tool_call`/`tool_call_update` by `toolCallId`, taking cost from
     `usage_update.cost`. A kaijutsu `agent.json` is cheap to add.
-    Follow-up turns are the gap to decide on for Harbor runs.
+    Amy, 2026-09-30: an opt-in flag holds `session/prompt` open until
+    the context goes idle, with follow-up turns included, so Harbor
+    sees the whole run.
 - **A failed follow-up turn has no structured ACP signal.** The runner
   matches agent text "stream error: …".
 - **A hook-raised permission request's title is the hook's stderr**, not
