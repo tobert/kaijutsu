@@ -55,9 +55,16 @@ into the environment, runs one trial at a time under podman (`-e podman -k 1
 the key.
 
 Environment variables with defaults: `KAIJUTSU_ACP_BINARY`, `KAIJUTSU_ACP_GATE`,
-`KAIJUTSU_ACP_MODEL`, `KAIJUTSU_ACP_BACKEND`, `KAIJUTSU_ACP_RUST_LOG`,
-`KAIJUTSU_ACP_KEY_FILE`, `KAIJUTSU_ACP_KEY_ENV`, `HARBOR_ENV_SH`,
-`HARBOR_JOBS_DIR`, `HARBOR_AGENT_TIMEOUT_MULTIPLIER`. `--ak key=value` sets the
+`KAIJUTSU_ACP_MODEL`, `KAIJUTSU_ACP_BACKEND`, `KAIJUTSU_ACP_BASE_URL`,
+`KAIJUTSU_ACP_RUST_LOG`, `KAIJUTSU_ACP_KEY_FILE`, `KAIJUTSU_ACP_KEY_ENV`,
+`HARBOR_ENV_SH`, `HARBOR_JOBS_DIR`, `HARBOR_AGENT_TIMEOUT_MULTIPLIER`.
+
+`KAIJUTSU_ACP_KEY_ENV` names the variable the key travels in, and the adapter
+passes the same name to the binary as `--api-key-env`, so a provider the
+kernel does not ship (Qwen on Alibaba, a local vLLM) reads its key from the
+variable Harbor put in the container. `KAIJUTSU_ACP_BASE_URL` becomes
+`--base-url`. `docs/benchmarks.md`, "Qwen on Alibaba, and tenchi", has both
+command lines. `--ak key=value` sets the
 same things per run; `harbor agent schema kaijutsu_solo_agent:KaijutsuSoloAcp`
 prints them. `job.yaml` is the same job as a config file, for `harbor run -c`.
 

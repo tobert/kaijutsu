@@ -612,18 +612,27 @@ def analyze_run(
             spilled_last_two.append({"tool_call_id": tool_call_id, "matched_markers": hits})
 
     # --- edits and executions, for completed_verified / ended_unverified ---
+    # A `shell_write` call is both an edit and an execution: it may change
+    # files, and it runs a command. The ACP bridge labels it kind "edit" (its
+    # name ends in `write`), so its title is what marks it as an execution.
+    # A completed `shell_write` therefore checks the edits before it and
+    # itself; events cannot say whether it ran a test or a `sed -i`.
     edit_ids = sorted(
         (tid for tid in tool_order if tool_states[tid].kind == "edit"),
         key=lambda tid: tool_states[tid].last_index,
     )
-    execute_ids = [tid for tid in tool_order if tool_states[tid].kind == "execute"]
+    execute_ids = [
+        tid
+        for tid in tool_order
+        if tool_states[tid].kind == "execute" or tool_states[tid].title in SHELL_TOOL_TITLES
+    ]
     last_edit_id = edit_ids[-1] if edit_ids else None
     successful_execution_after_edit = False
     if last_edit_id is not None:
         last_edit_index = tool_states[last_edit_id].last_index
         for tool_call_id in execute_ids:
             state = tool_states[tool_call_id]
-            if state.last_index <= last_edit_index:
+            if state.last_index < last_edit_index:
                 continue
             if state.status != "completed":
                 continue

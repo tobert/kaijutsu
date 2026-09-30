@@ -48,9 +48,14 @@ Linux x86_64, rootless podman, `uv`, bash 4.4 or later, Python 3.12 or later.
 that keeps it there:
 
 ```bash
-uv tool install harbor          # 0.23.0
+source /home/atobey/src/bench-work/harbor/env.sh
+uv tool install --python 3.12 'harbor==0.23.0'
 harbor --version
 ```
+
+Pin 0.23.0: `kaijutsu_solo_agent.py` subclasses Harbor's `AcpAgent` and checks
+its model-name split against Harbor's own, so a newer Harbor is a deliberate
+upgrade, not a side effect of reinstalling.
 
 `env.sh` exports `UV_TOOL_DIR`, `UV_TOOL_BIN_DIR`, `HARBOR_HOME`,
 `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `DOCKER_CONFIG`, `DOCKER_HOST`, and a `PATH`
@@ -64,7 +69,23 @@ put it on `PATH` under that name, and point it at podman's socket:
 
 ```bash
 systemctl --user enable --now podman.socket
-# DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock in env.sh
+# in env.sh:
+# DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+# PODMAN_COMPOSE_PROVIDER=<bench-work>/harbor/uv-tool-bin/docker-compose
+```
+
+Name the provider with `PODMAN_COMPOSE_PROVIDER`. A host that also has the
+distribution's `podman-compose` installed (moltar does, 1.6.0) otherwise
+depends on `PATH` order to pick the right one. `podman compose version` must
+print `Docker Compose version v5.x`, not `podman-compose`.
+
+Check the setup without spending tokens: the `oracle` agent runs the task's
+own solution.
+
+```bash
+harbor run --dataset "terminal-bench@2.0" -i fix-git -a oracle -e podman \
+  -o /home/atobey/src/bench-work/harbor/jobs --job-name tb2-fix-git-oracle -y
+# 26 s on moltar, reward 1.0
 ```
 
 `PODMAN_COMPOSE_WARNING_LOGS=false` is exported by `run-harbor.sh`. Without it
@@ -100,13 +121,20 @@ account, not a long-lived one.
 
 ## Building the binaries
 
+Build from a clean detached worktree, not the shared checkout. Other players'
+uncommitted edits would otherwise land in the binary, and `BUILD_INFO.json`
+would record it as dirty.
+
 ```bash
-contrib/bench/build-static.sh
+git worktree add --detach ~/src/wt/kj-bench-build HEAD
+WORKTREE=~/src/wt/kj-bench-build contrib/bench/build-static.sh
 ```
 
 It needs rootless podman and nothing else: the worktree is mounted read-only,
 cargo runs inside the container, and every artifact lands under `WORK_ROOT`
 (default `/home/atobey/src/bench-work/dist`). `WORKTREE` names the source tree.
+`CARGO_BUILD_JOBS` (default 4) caps cargo's parallelism; a cold build took
+12.5 minutes at 4 jobs on moltar (2026-09-30).
 
 Output is `$WORK_ROOT/out/kaijutsu-solo-acp`, `kaijutsu-server`, and
 `kaijutsu-acp`, stripped, plus
@@ -189,11 +217,51 @@ Settings ride environment variables, each of which has a matching
 | `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
 | `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |
 | `KAIJUTSU_ACP_BACKEND` | `backend_kind` | The provider. Unset: `deepseek`. |
+| `KAIJUTSU_ACP_BASE_URL` | `base_url` | `--base-url URL`, an OpenAI-compatible endpoint. Unset: the provider's own. |
+| `KAIJUTSU_ACP_KEY_FILE`, `KAIJUTSU_ACP_KEY_ENV` | `api_key_env` (the variable name) | The key's file, and the variable it travels in. The adapter passes the name as `--api-key-env`. Default `~/.deepseek-key` in `DEEPSEEK_API_KEY`. |
 | `KAIJUTSU_ACP_RUST_LOG` | `rust_log` | Default `info`. Below `info` the run keeps no token record. |
 | `KAIJUTSU_ACP_BINARY`, `KAIJUTSU_ACP_GATE` | `binary_path`, `gate_config_path` | The uploaded binary and gate policy. |
 
 `harbor agent schema kaijutsu_solo_agent:KaijutsuSoloAcp` prints them, with
 `PYTHONPATH` on `contrib/bench/harbor`.
+
+### Qwen on Alibaba, and tenchi
+
+Neither is a factory backend. Both are OpenAI-compatible, so a run names the
+`openai` provider, the endpoint, and the variable the key travels in. The
+Alibaba workspace endpoint is the one crush uses; read it from there rather
+than writing it into this repository:
+
+```bash
+# Qwen 3.8 flash on Alibaba Model Studio
+KAIJUTSU_ACP_BACKEND=openai KAIJUTSU_ACP_MODEL=qwen3.8-flash \
+KAIJUTSU_ACP_BASE_URL="$(jq -r .providers.alibaba.base_url ~/.config/crush/crush.json)" \
+KAIJUTSU_ACP_KEY_FILE=~/.alibaba-inference-key.txt KAIJUTSU_ACP_KEY_ENV=ALIBABA_API_KEY \
+HARBOR_AGENT_TIMEOUT_MULTIPLIER=1 \
+  ./contrib/bench/harbor/run-harbor.sh --job-name kj-qwen-fixgit-1 \
+  --dataset "terminal-bench@2.0" --task fix-git
+```
+
+tenchi (the DGX Spark, vLLM serving `qwen3.8-27b`) needs no key, but
+`kaijutsu-solo-acp --backend-kind openai` refuses to start without one and
+`run-harbor.sh` scans the job for whatever key it was given. Give it a random
+throwaway token, never a short word the scan would match everywhere:
+
+```bash
+key=$(mktemp); python3 -c 'import secrets; print("tenchi-unused-" + secrets.token_hex(16))' > "$key"
+KAIJUTSU_ACP_BACKEND=openai KAIJUTSU_ACP_MODEL=qwen3.8-27b \
+KAIJUTSU_ACP_BASE_URL=http://tenchi-inference.taila4abc.ts.net:8000/v1 \
+KAIJUTSU_ACP_KEY_FILE="$key" KAIJUTSU_ACP_KEY_ENV=TENCHI_API_KEY \
+HARBOR_AGENT_TIMEOUT_MULTIPLIER=2 \
+  ./contrib/bench/harbor/run-harbor.sh --job-name kj-tenchi-openssl-1 \
+  --dataset "terminal-bench@2.0" --task openssl-selfsigned-cert
+```
+
+Rootless task containers on moltar reach both: the tailnet name resolves
+inside the container. The kernel drops the factory `effort = max` on either
+endpoint with a warning (`effort has no sink on a non-hosted, non-DeepSeek
+OpenAI-compatible endpoint`), so these runs use each model's default
+reasoning.
 
 `HARBOR_AGENT_TIMEOUT_MULTIPLIER` (default 5) multiplies each task's own
 `agent_timeout_sec`. Raise it when a run is being cut off mid-work; set it to 1
@@ -227,7 +295,7 @@ pass after a turn that fell over.
 
 | Class | What ended the turn |
 |---|---|
-| `completed_verified` | `end_turn`, and a command ran successfully after the last edit |
+| `completed_verified` | `end_turn`, and a command ran successfully after the last edit. A `shell_write` call counts as both an edit and a command, so a run whose last call is a completed `shell_write` lands here; events cannot tell a test run from a `sed -i` |
 | `ended_unverified` | `end_turn`, with no edit or nothing run after it |
 | `yielded_on_ask` | the last tool result was a gate waiting on its reviewer |
 | `yielded_on_async` | the last tool result left an operation nobody awaited |
@@ -350,6 +418,9 @@ took the balance from $60.07 to $56.21.
 Per-run token counts come from `summarize_job.py`, which reads the kernel log.
 They are exact; only the dollar figure is a bound.
 
+Qwen runs on Alibaba bill against Amy's plan, and no dollar figure was taken
+for them; use the token counts. tenchi costs nothing but time.
+
 ## Recorded baselines
 
 One row per recorded job. `Binary → commit` is the trial provenance's
@@ -365,6 +436,8 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-18 | `ctl-tb2-miniswe` (control) | mini-swe-agent as Harbor installs it | deepseek/deepseek-v4-flash | step limit 100, cost limit $0.25 per task, multiplier 1, ran beside arm A | 20 (tb2-subset) | 18 (0.90) | 1.79M | n/a | n/a | 2 | n/a |
 | 2026-09-26 | `kj-tb2-render-envelope` | `bc27a61f…` → `855ace8a` | deepseek-v4-flash | shipped coder, autonomous, 32768 ceiling, multiplier 1, shell results as the JSON envelope, ran beside the plain arm | 20 (tb2-subset) | 16 (0.80) | 4.35M | 0 | 0 | 5 | no verdict line in this arm |
 | 2026-09-26 | `kj-tb2-render-plain` | `01f5b424…` → `0e88658c` | deepseek-v4-flash | same, shell results as plain text (`model_text`) | 20 (tb2-subset) | 17 (0.85) | 3.40M | 0 | 0 | 4 | no verdict line in this arm |
+| 2026-09-30 | `kj-qwen-fixgit-1`, `kj-qwen-pair-1`, `kj-qwen-sqlite-1` | `4bd76664…` → `12ed6d76` | qwen3.8-flash (Alibaba) | shipped coder, yolo sandbox gate, factory 16K ceiling, effort dropped, multiplier 1, moltar | 4 (fix-git, openssl-selfsigned-cert, fix-code-vulnerability, sqlite-with-gcov) | 4 | 0.96M | 0 | 0 | 0 | no verdict line |
+| 2026-09-30 | `kj-tenchi-openssl-1` | `4bd76664…` → `12ed6d76` | qwen3.8-27b (tenchi vLLM) | same, multiplier 2 | 1 (openssl-selfsigned-cert) | 0 | n/a | 0 | 0 | 1 | first inference failed: `LLM stream idle for 120s` |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -432,6 +505,72 @@ What is supported:
   rendering is the kernel default from here (Amy, 2026-09-27: freeze the
   plain, and "we'll dial in the plain outputs even more over time").
 
+### Qwen on current main (2026-09-30)
+
+The first runs since the turn started holding on its own ask and the
+iteration cap went away. Under the yolo gate nothing asks, so these runs
+exercise the turn loop, the shell and the tools, not the approval path.
+
+| Task | Reward | Class | Inferences | Tool calls (shell) | Tokens in / out | Trial time |
+|---|---|---|---|---|---|---|
+| fix-git | 1.0 | `completed_verified` | 38 | 43 (37) | 791K / 20K | 427 s |
+| fix-code-vulnerability | 1.0 | `completed_verified` | 16 | 22 (16) | 323K / 5K | 139 s |
+| openssl-selfsigned-cert | 1.0 | `completed_verified` | 26 | 25 (21) | 539K / 13K | 273 s |
+| sqlite-with-gcov | 1.0 | `agent_timeout` | 70 | 98 (87) | 2.12M / 35K | 941 s, agent cut off at the task's 900 s |
+| openssl-selfsigned-cert on tenchi | 0.0 | `provider_failure` | 0 | 0 | — | 154 s |
+
+Against `kj-tb2-render-plain` on DeepSeek flash, Qwen used fewer tokens on
+fix-code-vulnerability (328K against 1.0M) and sqlite-with-gcov (2.16M against
+5.5M), and more on fix-git (811K against 630K) and openssl-selfsigned-cert
+(552K against 522K); fix-git took three times as long (427 s against 136 s).
+One sample each; read it as "the harness works with Qwen", not as a
+comparison.
+
+What the runs showed, beyond the pass rate:
+
+- **sqlite-with-gcov was solved and still timed out.** The build and the
+  coverage run finished early enough for the verifier; the model kept
+  polishing (probing which `PATH` directories were writable) until Harbor's
+  900 s limit. Its last calls were a background `make` it polled with
+  `read_shell_operation` and a `sleep 90`. No shell call hit the broker's
+  120 s or 315 s timeout in any run: the one long build ran in the
+  background.
+- **tenchi cannot finish an inference.** vLLM streams Qwen's thinking as
+  `delta.reasoning`; the kernel's OpenAI delta reads only
+  `reasoning_content` (`crates/kaijutsu-kernel/src/llm/openai/types.rs`,
+  `Delta`), so the thinking phase is invisible and the stream counts as idle.
+  A prefill of the 46K-token coder seat takes about 25 s on tenchi, so the
+  prompt is not the delay. `kaijutsu-solo-acp` also has no flag for the
+  backend's idle timeout. Both need a kernel change.
+- **A deleted working directory wedges the shell.** openssl-selfsigned-cert
+  ran `cd /tmp/neg/ssl`, later `rm -rf /tmp/neg`, and every following
+  `shell` and `shell_write` call failed with `context cwd '/tmp/neg/ssl' is
+  unavailable; set a valid cwd before executing`, including `cd /app; pwd`
+  (`runtime/context_shell.rs`, the initial-cwd check). The model got out by
+  writing a file into the missing directory with the `write` tool.
+- **The kaish parser refuses ordinary bash.** The shell-escape guard denied,
+  as "no execution plan", `git diff master^ master`, `grep "<<<<<<<\|>>>>>>>"`,
+  a `( make … )` subshell, `find … \( -name … \)`, and a brace group used
+  as a report block. 6 of the 29 failed tool calls across the four Qwen runs were
+  parse refusals.
+- **Builtins differ from the programs a model expects.** `git` is kaish-git:
+  `git status` refuses a repository holding a 17 MB blob (8 MiB
+  `max_blob_bytes`), and `git diff` takes `--from/--to` instead of two
+  revisions. `ls -d`, `stat -f` and `diff --help` fail on the builtins.
+  Builtin `ln` could not write `/usr/local/bin` (read-only outside the
+  mounted workspace) though `apt-get install` wrote `/usr/bin` a call
+  earlier.
+- **The read-only `shell` and `shell_write` split costs calls.** Models ran
+  write commands in `shell` and read the refusal ("external commands are
+  disabled on this shell"), and fix-git called a tool that does not exist,
+  `shell_read_note`.
+- **The ACP bridge labels `shell_write` an edit.** `acp_tool_kind` splits the
+  name on `_` and matches `write` (`crates/kaijutsu-acp/src/update.rs`), so
+  Harbor's trajectory records every `shell_write` as kind `edit`.
+  `classify_run.py` now reads the title as well, and counts a completed
+  `shell_write` as both an edit and a command; before that every run in the
+  2026-09-26 arms and all three solved Qwen runs read `ended_unverified`.
+
 Left unmeasured: the Rust polyglot slice (`contrib/bench/analysis/polyglot-rust.md`)
 has not been run with a model; the turn-loop fix has not had a full 20-task
 run; Anthropic models are untested end to end.
@@ -439,8 +578,8 @@ run; Anthropic models are untested end to end.
 ## Known limits
 
 `docs/issues.md`, "What running under a benchmark showed (2026-09-18)" holds
-what these runs exposed and what is still open, most costly first. The two that
-shape every result above: an approved command's output never reaches the model,
-and a turn can end before its ask is offered. The sandbox gate tier avoids both
-by allowing everything, which is why every recorded run has an ask count of
-zero.
+what these runs exposed and what is still open, most costly first. A model's
+turn now holds on its own ask and reads the approved command's output as its
+tool result (`docs/gate-resume.md`, "The turn holds"), but no benchmark has run
+the ask path since: the sandbox gate tier allows everything, which is why every
+recorded run has an ask count of zero.

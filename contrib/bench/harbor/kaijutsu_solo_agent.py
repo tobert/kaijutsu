@@ -45,6 +45,8 @@ BACKEND_ENV = "KAIJUTSU_ACP_BACKEND"
 RUST_LOG_ENV = "KAIJUTSU_ACP_RUST_LOG"
 MAX_TOKENS_ENV = "KAIJUTSU_ACP_MAX_TOKENS"
 RC_OVERLAY_ENV = "KAIJUTSU_ACP_RC_OVERLAY"
+BASE_URL_ENV = "KAIJUTSU_ACP_BASE_URL"
+KEY_ENV_ENV = "KAIJUTSU_ACP_KEY_ENV"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -214,6 +216,23 @@ class KaijutsuSoloOptions(AcpOptions):
             "factory ceiling)."
         ),
     )
+    base_url: str | None = Field(
+        default=None,
+        description=(
+            "OpenAI-compatible endpoint passed to --base-url, e.g. Alibaba's "
+            "compatible-mode URL or a local vLLM server. Default: "
+            f"${BASE_URL_ENV}, else left off, which keeps the provider's own "
+            "endpoint."
+        ),
+    )
+    api_key_env: str | None = Field(
+        default=None,
+        description=(
+            "Name of the variable holding the provider key, passed to "
+            f"--api-key-env. Default: ${KEY_ENV_ENV} (run-harbor.sh exports "
+            "it), else left off, which keeps the provider's own variable."
+        ),
+    )
     rc_overlay: str | None = Field(
         default=None,
         description=(
@@ -249,6 +268,8 @@ class KaijutsuSoloAcp(AcpAgent):
         rust_log: str | None = None,
         max_tokens: int | str | None = None,
         rc_overlay: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
         **kwargs: Any,
     ):
         self._local_binary = self._require_file(
@@ -314,6 +335,8 @@ class KaijutsuSoloAcp(AcpAgent):
         )
         self._rust_log = rust_log or os.environ.get(RUST_LOG_ENV) or DEFAULT_RUST_LOG
         self._solo_args = _split_args(solo_args)
+        self._base_url = base_url or os.environ.get(BASE_URL_ENV) or None
+        self._api_key_env = api_key_env or os.environ.get(KEY_ENV_ENV) or None
 
         # Left off the command line when unset, which is what keeps the
         # binary's own default (the factory token ceiling) in effect -- this
@@ -371,6 +394,8 @@ class KaijutsuSoloAcp(AcpAgent):
             rust_log=self._rust_log,
             max_tokens=self._max_tokens,
             rc_overlay=str(self._rc_overlay) if self._rc_overlay is not None else None,
+            base_url=self._base_url,
+            api_key_env=self._api_key_env,
             **kwargs,
         )
 
@@ -437,6 +462,10 @@ class KaijutsuSoloAcp(AcpAgent):
             "--state-dir",
             self._remote_state.as_posix(),
         ]
+        if self._base_url is not None:
+            args += ["--base-url", self._base_url]
+        if self._api_key_env is not None:
+            args += ["--api-key-env", self._api_key_env]
         if self._local_gate is not None:
             args += ["--gate-config", self.REMOTE_GATE.as_posix()]
         if self._max_tokens is not None:
@@ -553,6 +582,8 @@ class KaijutsuSoloAcp(AcpAgent):
                 "rust_log": self._rust_log,
                 "extra_args": self._solo_args,
                 "max_tokens": self._max_tokens,
+                "base_url": self._base_url,
+                "api_key_env": self._api_key_env,
             },
             "environment": {
                 "machine": machine,

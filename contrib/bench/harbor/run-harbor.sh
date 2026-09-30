@@ -47,7 +47,8 @@ usage: run-harbor.sh --job-name NAME (--task-path DIR | --dataset REF)
 Environment (all have defaults):
   KAIJUTSU_ACP_BINARY KAIJUTSU_ACP_GATE KAIJUTSU_ACP_RUST_LOG
   KAIJUTSU_ACP_MODEL KAIJUTSU_ACP_BACKEND (unset: kaijutsu_solo_agent.py decides)
-  KAIJUTSU_ACP_KEY_FILE KAIJUTSU_ACP_KEY_ENV
+  KAIJUTSU_ACP_BASE_URL (unset: the provider's own endpoint)
+  KAIJUTSU_ACP_KEY_FILE KAIJUTSU_ACP_KEY_ENV (the variable the binary reads)
   HARBOR_ENV_SH HARBOR_JOBS_DIR HARBOR_AGENT_TIMEOUT_MULTIPLIER
 USAGE
 }
@@ -138,7 +139,11 @@ export "${KAIJUTSU_ACP_KEY_ENV?}"
 [[ -n "${!KAIJUTSU_ACP_KEY_ENV}" ]] || { echo "key file is empty: $KAIJUTSU_ACP_KEY_FILE" >&2; exit 1; }
 ( umask 077; printf '%s\n' "${!KAIJUTSU_ACP_KEY_ENV}" > "$pattern_file" )
 
-export KAIJUTSU_ACP_BINARY KAIJUTSU_ACP_GATE KAIJUTSU_ACP_RUST_LOG
+# KAIJUTSU_ACP_KEY_ENV also reaches the adapter, which passes it to the binary
+# as --api-key-env: the variable Harbor puts in the container is the one the
+# kernel reads, whatever the provider calls its own.
+export KAIJUTSU_ACP_BINARY KAIJUTSU_ACP_GATE KAIJUTSU_ACP_RUST_LOG KAIJUTSU_ACP_KEY_ENV
+[[ -n "${KAIJUTSU_ACP_BASE_URL:-}" ]] && export KAIJUTSU_ACP_BASE_URL
 [[ -n "${KAIJUTSU_ACP_MODEL:-}" ]] && export KAIJUTSU_ACP_MODEL
 [[ -n "${KAIJUTSU_ACP_BACKEND:-}" ]] && export KAIJUTSU_ACP_BACKEND
 export PYTHONPATH="${here}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -181,7 +186,12 @@ fi
 
 # Job-level provenance the agent cannot see: what was asked for, and by what.
 harbor_version="$(harbor --version 2>/dev/null | tr -d '\n' || true)"
-tasks_json="$(printf '%s\n' "${task_names[@]}" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd, -)"
+# Joined in bash, not with `paste`: a PATH that shadows `paste` (a clipboard
+# helper, say) hangs here after Harbor has finished and before the key scan.
+tasks_json=""
+for name in "${task_names[@]}"; do
+  [[ -n "$name" ]] && tasks_json+="${tasks_json:+,}\"${name}\""
+done
 cat > "${job_dir}/kaijutsu-job-provenance.json" <<JSON
 {
   "written_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -194,6 +204,9 @@ cat > "${job_dir}/kaijutsu-job-provenance.json" <<JSON
   "binary": "${KAIJUTSU_ACP_BINARY}",
   "gate": "${KAIJUTSU_ACP_GATE}",
   "key_env": "${KAIJUTSU_ACP_KEY_ENV}",
+  "backend": "${KAIJUTSU_ACP_BACKEND:-}",
+  "model": "${KAIJUTSU_ACP_MODEL:-}",
+  "base_url": "${KAIJUTSU_ACP_BASE_URL:-}",
   "harbor_exit": ${status}
 }
 JSON

@@ -652,6 +652,57 @@ class TestVerdictInAnalyzeRun(unittest.TestCase):
         self.assertIsNone(report["verdict_reason"])
 
 
+class TestShellWriteCountsAsExecution(unittest.TestCase):
+    """The ACP bridge labels `shell_write` kind "edit" (its name splits to
+    `write`), but it runs a command. A completed `shell_write` after a file
+    edit is the verification `completed_verified` asks for."""
+
+    def test_shell_write_after_a_file_edit_is_verified(self):
+        events = [
+            tool_call("w1", kind="edit", title="write"),
+            tool_call_update("w1", status="completed", text="wrote fizz.py"),
+            tool_call("s1", kind="edit", title="shell_write"),
+            tool_call_update("s1", status="completed", text="Ran 4 tests, OK"),
+            message_chunk("Fixed and tested."),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["turn_end_class"], "completed_verified")
+
+    def test_a_failed_shell_write_after_the_edit_is_not_verification(self):
+        events = [
+            tool_call("w1", kind="edit", title="write"),
+            tool_call_update("w1", status="completed", text="wrote fizz.py"),
+            tool_call("s1", kind="edit", title="shell_write"),
+            tool_call_update("s1", status="failed", text="exit 1"),
+            message_chunk("Done."),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["turn_end_class"], "ended_unverified")
+
+    def test_a_completed_shell_write_checks_itself(self):
+        # Events cannot tell a test run from a `sed -i`; a completed
+        # shell_write ends the turn verified either way.
+        events = [
+            tool_call("s1", kind="edit", title="shell_write"),
+            tool_call_update("s1", status="completed", text="ok"),
+            message_chunk("Done."),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["turn_end_class"], "completed_verified")
+        self.assertEqual(report["turn_end_evidence"]["last_edit_tool_call_id"], "s1")
+
+    def test_a_file_edit_after_the_last_command_is_unverified(self):
+        events = [
+            tool_call("s1", kind="edit", title="shell_write"),
+            tool_call_update("s1", status="completed", text="ok"),
+            tool_call("w1", kind="edit", title="write"),
+            tool_call_update("w1", status="completed", text="wrote fizz.py"),
+            message_chunk("Done."),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["turn_end_class"], "ended_unverified")
+
+
 class TestShellCommandStats(unittest.TestCase):
     def test_counts_shell_and_shell_write_only(self):
         events = [

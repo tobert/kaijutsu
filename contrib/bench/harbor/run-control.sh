@@ -240,7 +240,12 @@ fi
 # read back from result.json, not assumed from HARBOR_CONTROL_AGENT, so a
 # Harbor-side agent-resolution surprise is visible here rather than hidden).
 harbor_version="$(harbor --version 2>/dev/null | tr -d '\n' || true)"
-tasks_json="$(printf '%s\n' "${task_names[@]}" | sed '/^$/d' | sed 's/.*/"&"/' | paste -sd, -)"
+# Joined in bash, not with `paste`: a PATH that shadows `paste` (a clipboard
+# helper, say) hangs here after Harbor has finished and before the key scan.
+tasks_json=""
+for name in "${task_names[@]}"; do
+  [[ -n "$name" ]] && tasks_json+="${tasks_json:+,}\"${name}\""
+done
 observed_agent_info="$(python3 - "$job_dir" <<'PY'
 import glob
 import json

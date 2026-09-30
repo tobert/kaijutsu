@@ -8,6 +8,8 @@
 #
 # Usage: contrib/bench/build-static.sh
 # Reads the worktree from WORKTREE (default: this script's repo root).
+# CARGO_BUILD_JOBS caps cargo's parallelism inside the container (default 4;
+# an uncapped build swamps a workstation).
 # PODMAN_RUN_ARGS adds flags to the build container, e.g. resource caps:
 #   PODMAN_RUN_ARGS="--memory=16g --memory-swap=16g --cpus=8"
 # A rootless container runs outside the caller's cgroup, so a systemd-run
@@ -18,6 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${WORKTREE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORK_ROOT="${WORK_ROOT:-/home/atobey/src/bench-work/dist}"
 read -r -a EXTRA_RUN_ARGS <<< "${PODMAN_RUN_ARGS:-}"
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 CARGO_HOME_DIR="${WORK_ROOT}/cargo-home"
 TARGET_DIR="${WORK_ROOT}/target"
@@ -46,6 +49,7 @@ echo "==> [2/5] cargo build --release inside the container"
 echo "    worktree (ro):   ${WORKTREE}"
 echo "    CARGO_HOME:      ${CARGO_HOME_DIR}"
 echo "    CARGO_TARGET_DIR:${TARGET_DIR}"
+echo "    jobs:            ${CARGO_BUILD_JOBS}"
 # --target is passed explicitly (even though host == x86_64-unknown-linux-musl
 # on this image) so cargo classifies build scripts and proc-macro crates as
 # HOST artifacts, separate from the TARGET artifacts. The static-link flags
@@ -67,6 +71,7 @@ time podman run --rm "${EXTRA_RUN_ARGS[@]}" \
     -w /src \
     -e "CARGO_HOME=/cargo-home" \
     -e "CARGO_TARGET_DIR=/target" \
+    -e "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}" \
     -e "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=${STATIC_RUSTFLAGS}" \
     "${IMAGE}" \
     cargo build --release --locked \

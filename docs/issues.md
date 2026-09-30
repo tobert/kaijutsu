@@ -652,6 +652,33 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   arms carry a consent mode at all. Decide per-context resolution or retire
   the field; see "Consent setting ownership" above for the constraints.
 
+From the Qwen runs on current main (2026-09-30, `docs/benchmarks.md`, "Qwen
+on current main"):
+
+- **vLLM's `delta.reasoning` is dropped, so a thinking model looks idle.**
+  The OpenAI `Delta` reads only `reasoning_content`
+  (`crates/kaijutsu-kernel/src/llm/openai/types.rs`), and tenchi's vLLM streams
+  Qwen's thinking as `reasoning`. The first inference of a tenchi run failed
+  with `LLM stream idle for 120s` though prefill took about 25 s. Accept the
+  `reasoning` field, and let `kaijutsu-solo-acp` set the backend's idle
+  timeout (it writes `idle_timeout_secs: None`, `crates/kaijutsu-solo-acp/src/state.rs`).
+  `--backend-kind openai` also refuses to start with no key, so a keyless
+  local server needs a throwaway token.
+- **A deleted working directory wedges every shell call.** After `rm -rf` of
+  the context's cwd, `shell` and `shell_write` fail with "context cwd … is
+  unavailable" before running anything, `cd /app` included
+  (`runtime/context_shell.rs`, the initial-cwd check). Fall back to the
+  workspace or home with a notice, or apply the command's leading `cd`.
+- **The ACP bridge reports `shell_write` as kind `edit`.** `acp_tool_kind`
+  splits the name on `_` and matches `write`
+  (`crates/kaijutsu-acp/src/update.rs`), so Harbor's trajectory and every
+  client icon call a command an edit. `classify_run.py` works around it by
+  title.
+- **The kaish parser refuses common bash**, and the shell-escape guard turns
+  the refusal into a denial: `master^`, `"<<<<<<<\|>>>>>>>"`, `( … )`
+  subshells, `\(` in `find`, brace groups. 6 of 29 failed tool calls in four
+  runs.
+
 ## Leftovers from the solo-acp state work (2026-09-18)
 
 Smaller, from the same work:
