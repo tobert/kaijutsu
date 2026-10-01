@@ -589,6 +589,13 @@ more readily than other agents". Open, most costly first:
   signing off…"), against one weaker persistence sentence in
   `lib/create/S00-base.md`. A fresh coder seat is about 46,000 input tokens
   before any work.
+- **Cut shell output accumulates in CAS.** Every model-facing result past
+  8 KiB stores its whole stream (up to 4 MiB) in CAS, and CAS has no
+  retention or reference counting (`kj cas rm` is unconditional). Measure
+  growth over a benchmark run before choosing a policy.
+- **kaish `grep` has no `-x`** (`grep -x 4999 file` is refused as an
+  unexpected argument). Another builtin that differs from the program a
+  model expects; offer a tobert/kaish issue.
 - **A turn can still spend several output ceilings.** A ceiling stop now
   continues the turn with a notice instead of ending it, bounded by
   `MAX_OUTPUT_CEILING_CONTINUATIONS` (`runtime/llm_stream.rs`); see
