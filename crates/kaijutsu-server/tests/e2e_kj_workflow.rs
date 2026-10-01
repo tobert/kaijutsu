@@ -898,14 +898,14 @@ fn test_coder_stance_focused_for_a_frontier_model() {
             blocks
         );
 
-        // "Use test-driven development." is the focused tier's own line;
+        // "Follow existing conventions and change only what the task needs." is the focused tier's own line;
         // the guided tier spells the same rule out as numbered steps — the
         // register split is the whole point of the tiering, so pin the
         // register, not the length.
         let has_focused_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("Use test-driven development.")
+                && b.content.contains("Follow existing conventions and change only what the task needs.")
         });
         assert!(
             has_focused_stance,
