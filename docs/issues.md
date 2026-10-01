@@ -433,8 +433,8 @@ servers"). Open, most likely to bite first:
   runs. Unverified.
 - **No capability gates `declareContextMcpServers`.** Any connection can
   spawn a host command for any context and add one explicit grant to its
-  loadout. Inside the one trust boundary this follows Amy's approval for
-  ACP; whether a context should hold `exec` first is open.
+  loadout. Amy, 2026-10-01: "no exec gate for now ... acp would have to
+  auth over ssh in the first place". Revisit with exec on declaration.
 - **The fleet has no `mcpServers` key.** The end-to-end tests live in
   `crates/kaijutsu-solo-acp/tests/acp_mcp_servers.rs`, so the Harbor-shape
   invariants are not checked against an MCP tool call yet.

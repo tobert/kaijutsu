@@ -222,8 +222,10 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
     std::fs::write(scripts.join("mock-model.json"), serde_json::json!([
         [{"ToolUse": {"id": "offline-1", "name": "shell_write", "input": {"command": "echo offline-ran | tee marker"}}},
          {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}],
+        // A coder ends its task with `done`.
         ["TextStart", {"TextDelta": "understood"}, "TextEnd",
-         {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}]
+         {"ToolUse": {"id": "offline-done", "name": "done", "input": {"status": "blocked", "summary": "the call needs an approval"}}},
+         {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}]
     ]).to_string()).unwrap();
 
     assert!(home.run(&["kj", "--", "character", "create", "bob"]).status.success());
