@@ -803,6 +803,17 @@ fn retry_disposition(error: &LlmError) -> RetryDisposition {
 /// iteration cap still bounds the turn.
 const MAX_OUTPUT_CEILING_CONTINUATIONS: u32 = 3;
 
+/// The tool a context calls to end its task: `builtin.turn`'s `done`.
+/// Offering it changes how a turn ends: text with no tool call no longer
+/// ends the turn, and a successful `done` ends it after its batch.
+pub(crate) const DONE_TOOL: &str = "done";
+
+/// How many times one turn answers a text-only reply with a notice asking for
+/// a tool call or `done`, when the context was offered `done`. The next
+/// text-only reply ends the turn, so a model that never calls `done` cannot
+/// spin.
+const MAX_DONE_NUDGES: u32 = 2;
+
 /// What the turn knows at an output-ceiling stop, for [`CeilingStop::continues`].
 #[derive(Clone, Copy, Debug)]
 struct CeilingStop {
@@ -2361,6 +2372,8 @@ async fn run_llm_stream(
     // Output-ceiling continuations spent by this turn, against
     // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
     let mut ceiling_continuations: u32 = 0;
+    let offers_done = tools.iter().any(|tool| tool.name == DONE_TOOL);
+    let mut done_nudges: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
 
@@ -3147,6 +3160,30 @@ async fn run_llm_stream(
             {
                 continue 'agentic;
             }
+            // A context offered `done` ends its task by calling it. Text alone
+            // is narration, not an ending: ask for a tool call or `done`, up to
+            // `MAX_DONE_NUDGES` times. The guards are the ceiling's: no notice
+            // for an inference that will not run.
+            if offers_done && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
+                && !stop.timed_delivery && !stop.cancelled && !stop.stopping_after_turn
+            {
+                done_nudges += 1;
+                let notice = "You replied without a tool call, so the task is still open. If it is \
+                    finished, blocked, or you are giving up, call `done` with a summary. Otherwise \
+                    continue with a tool call.";
+                tracing::info!(%context_id, nudge = done_nudges, limit = MAX_DONE_NUDGES,
+                    "Text-only reply in a context offered `done`; continuing the turn with a notice");
+                // The same durable carrier as the ceiling notice: the model
+                // reads it as a user message, live and on hydration.
+                last_block_id = documents.insert_block_as(context_id, None, Some(&last_block_id),
+                    Role::System, BlockKind::Notification, notice, Status::Done, ContentType::Plain,
+                    Some(PrincipalId::system()))?;
+                messages.push(LlmMessage::user(notice.to_string()));
+                continue 'agentic;
+            }
+            if offers_done {
+                tracing::warn!(%context_id, nudges = done_nudges, "The turn ended without `done`");
+            }
             tracing::debug!("Agentic loop complete - no tool calls this iteration");
             break;
         }
@@ -3174,6 +3211,12 @@ async fn run_llm_stream(
             after = place_running_result(&documents, context_id, pending.call, after, &pending.id, turn_lease)?;
             placed.push(after);
         }
+
+        // `done` calls in this batch; one that succeeds ends the turn below.
+        let done_calls: Vec<String> = tool_calls.iter()
+            .filter(|pending| offers_done && pending.name == DONE_TOOL && pending.unparsed.is_none())
+            .map(|pending| pending.id.clone())
+            .collect();
 
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
@@ -3225,8 +3268,18 @@ async fn run_llm_stream(
             assistant_tool_uses,
         ));
 
+        let done = tool_results.iter().any(|result| matches!(result,
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if done_calls.contains(tool_use_id)));
+
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
+        // The model called `done` and it succeeded: the task is over, so the
+        // turn ends after this batch. Input that arrived meanwhile stays
+        // pending for the turn's end, like input after a final inference.
+        if done {
+            tracing::info!(%context_id, "The model called `done`; the turn ends");
+            break;
+        }
         // Input that arrived during this round joins here, after its
         // results: the next request already extends the cached prefix here.
         if takes_live_input(&interrupt, turn_lease) {
@@ -3326,11 +3379,38 @@ mod publish_tests {
         arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
         rejected_write: usize,
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
+        drive_turn_offering(origin, kernel, provider, arm_interrupt, rejected_write, vec![]).await
+    }
+
+    /// The `done` tool as a roster offers it.
+    fn done_tool() -> ToolDefinition {
+        ToolDefinition { name: "done".into(), description: "end the task".into(), input_schema: serde_json::json!({"type": "object"}) }
+    }
+
+    async fn drive_turn_offering(
+        origin: TurnOrigin,
+        kernel: Arc<Kernel>,
+        provider: Provider,
+        arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
+        rejected_write: usize,
+        tools: Vec<ToolDefinition>,
+    ) -> (SharedBlockStore, ContextId, PrincipalId) {
         let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
         documents
             .create_document(ctx, DocumentKind::Conversation, None)
             .unwrap();
+        if tools.iter().any(|tool| tool.name == DONE_TOOL) {
+            // Registered as server boot registers it, and granted as a
+            // coder's rc grants it: `*` does not cover `builtin.turn`.
+            kernel.broker().register(Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
+                crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
+            kernel.broker().set_binding(ctx, crate::mcp::ContextToolBinding::with_instances(
+                vec![crate::mcp::InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE)])).await.unwrap();
+            // The turn's roster resolves visible names, as a real turn's does.
+            let visible = kernel.broker().list_visible_tools(ctx, &crate::mcp::CallContext::test()).await.unwrap();
+            assert_eq!(visible.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), [DONE_TOOL]);
+        }
 
         let player = PrincipalId::new();
         // The user/seed block the turn anchors after.
@@ -3371,7 +3451,7 @@ mod publish_tests {
             "mock-model".to_string(),
             kernel.clone(),
             kernel_db,
-            vec![],
+            tools,
             after,
             "system".to_string(),
             1024,
@@ -3924,6 +4004,102 @@ mod publish_tests {
                 );
             })
             .await;
+    }
+
+    fn text_reply(text: &str) -> Vec<crate::llm::StreamEvent> {
+        vec![
+            crate::llm::StreamEvent::TextStart,
+            crate::llm::StreamEvent::TextDelta(text.into()),
+            crate::llm::StreamEvent::TextEnd,
+            crate::llm::StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: Some(10), output_tokens: Some(5), extra: None },
+        ]
+    }
+
+    fn done_call(id: &str) -> Vec<crate::llm::StreamEvent> {
+        vec![
+            crate::llm::StreamEvent::ToolUse { id: id.into(), name: "done".into(),
+                input: serde_json::json!({"status": "done", "summary": "fixed the build"}) },
+            crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(10), output_tokens: Some(5), extra: None },
+        ]
+    }
+
+    async fn turn_offering_done(name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
+        -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
+    {
+        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+        let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Interactive, kernel.clone(),
+            Provider::Mock(MockClient::new("unused").with_scripted_stream(script)), |_| {}, 0, vec![done_tool()]).await;
+        let reason = match completed.try_recv().expect("the turn completes once").payload {
+            TurnFlow::Completed { reason, .. } => reason,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        (reason, documents.block_snapshots(ctx).unwrap())
+    }
+
+    fn nudges(blocks: &[kaijutsu_types::BlockSnapshot]) -> usize {
+        blocks.iter().filter(|b| b.kind == BlockKind::Notification && b.content.contains("call `done`")).count()
+    }
+
+    /// A context offered `done` ends its turn by calling it: the call's batch
+    /// settles and no further inference runs.
+    #[tokio::test]
+    async fn done_ends_the_turn_after_its_batch() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (reason, blocks) = turn_offering_done("done-ends",
+                vec![done_call("call_done"), text_reply("SHOULD NOT RUN")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            let result = blocks.iter().find(|b| b.kind == BlockKind::ToolResult).expect("done has a result");
+            assert!(!result.is_error, "done succeeded: {}", result.content);
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")), "no inference after done");
+            assert_eq!(nudges(&blocks), 0);
+        }).await;
+    }
+
+    /// Text with no tool call does not end a turn that was offered `done`. The
+    /// kernel asks for a tool call or `done`, and a model that then calls it
+    /// ends there.
+    #[tokio::test]
+    async fn text_without_done_is_nudged_and_done_then_ends_the_turn() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (reason, blocks) = turn_offering_done("done-nudge",
+                vec![text_reply("Next I'll run the tests."), done_call("call_done"), text_reply("SHOULD NOT RUN")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert_eq!(nudges(&blocks), 1, "one text-only reply, one nudge");
+            let nudge = blocks.iter().find(|b| b.kind == BlockKind::Notification).unwrap();
+            assert_eq!(nudge.role, Role::System, "a kernel fact, not model text");
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")));
+        }).await;
+    }
+
+    /// The nudge is bounded: after `MAX_DONE_NUDGES` the next text-only reply
+    /// ends the turn, so a model that never calls `done` cannot spin.
+    #[tokio::test]
+    async fn done_nudges_are_bounded() {
+        tokio::task::LocalSet::new().run_until(async {
+            let script = (0..=MAX_DONE_NUDGES + 1).map(|n| text_reply(&format!("reply {n}"))).collect();
+            let (reason, blocks) = turn_offering_done("done-bounded", script).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert_eq!(nudges(&blocks), MAX_DONE_NUDGES as usize);
+            assert!(blocks.iter().any(|b| b.content.contains(&format!("reply {MAX_DONE_NUDGES}"))), "the final reply ran");
+            assert!(!blocks.iter().any(|b| b.content.contains(&format!("reply {}", MAX_DONE_NUDGES + 1))),
+                "the turn ended at the reply after the last nudge");
+        }).await;
+    }
+
+    /// A context not offered `done` keeps the ordinary ending: its first
+    /// text-only reply ends the turn with no nudge.
+    #[tokio::test]
+    async fn a_context_without_done_ends_on_text() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("no-done").await);
+            let (documents, ctx, _) = drive_turn_with(TurnOrigin::Interactive, kernel,
+                Provider::Mock(MockClient::new("unused").with_scripted_stream(vec![text_reply("all set"), text_reply("SHOULD NOT RUN")])),
+                |_| {}).await;
+            let blocks = documents.block_snapshots(ctx).unwrap();
+            assert_eq!(nudges(&blocks), 0);
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")));
+        }).await;
     }
 
     /// One truncated inference in the middle of a turn, exactly as the

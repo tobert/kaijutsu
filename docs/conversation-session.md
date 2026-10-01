@@ -110,6 +110,34 @@ parser's position. The loop continues on that result; the turn does not fail,
 and the ceiling notice is not added on top of it — one message about one
 truncation.
 
+## Ending a task with done
+
+A context offered `done` ends its task by calling it. `done` is the one tool
+on `builtin.turn`; `*` does not cover that instance
+(`mcp/binding.rs`, `OPT_IN_INSTANCES`), so a context type opts in by name.
+The shipped coder does, in `rc/coder/create/S11-done.kai`. Other types keep
+the ordinary ending: text with no tool call ends the turn.
+
+`done` takes a status (`done`, `blocked`, `gave_up`) and a summary, and its
+result reads `status: summary`. When a call in a batch succeeds, the turn
+ends after that batch settles; no further inference runs. Input that arrived
+meanwhile stays pending for the turn's end. A refused call (an empty
+summary) does not end the turn.
+
+In a context offered `done`, a reply with no tool call does not end the turn.
+The loop writes a `(System, Notification)` asking for a tool call or `done`,
+sends it as the next user message, and takes another inference, at most
+`MAX_DONE_NUDGES` (2) times per turn (`runtime/llm_stream.rs`). The next
+text-only reply ends the turn, logged as "The turn ended without `done`". The
+guards are the ceiling continuation's: no nudge after an output-ceiling stop,
+while a beat waits on the turn, or with an interrupt pending.
+
+A driver reads the verdict from the context: `kj wait` prints
+`done: STATUS — SUMMARY` and carries it as `done` in its data, and an ACP
+client sees the `done` call and its result. `contrib/bench/analysis/
+classify_run.py` reports it as the run's verdict (`verdict_source:
+done_tool`).
+
 ## Tool results replay as sent
 
 A model's tool result keeps three things. `content` is what people read: a

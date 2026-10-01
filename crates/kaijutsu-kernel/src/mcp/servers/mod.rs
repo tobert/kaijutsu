@@ -25,6 +25,7 @@ pub mod resources_builtin;
 pub mod shell;
 pub mod tasks;
 pub mod tool_search;
+pub mod turn;
 
 pub use shell_operations::ShellOperationsServer;
 pub use bindings_builtin::BuiltinBindingsServer;
@@ -38,3 +39,4 @@ pub use resources_builtin::BuiltinResourcesServer;
 pub use shell::ShellServer;
 pub use tasks::BuiltinTasksServer;
 pub use tool_search::BuiltinToolSearchServer;
+pub use turn::BuiltinTurnServer;

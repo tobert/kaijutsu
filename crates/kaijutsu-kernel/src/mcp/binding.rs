@@ -119,6 +119,16 @@ pub fn is_context_scoped(instance: &InstanceId) -> bool {
     instance.as_str().starts_with(CONTEXT_SCOPED_PREFIX)
 }
 
+/// Builtin instances `*` never covers: offering one changes how the
+/// context's turns behave, so a context type grants it by name.
+/// `builtin.turn` offers `done`, which changes how a turn ends.
+pub const OPT_IN_INSTANCES: &[&str] = &["builtin.turn"];
+
+/// True if `*` covers `instance`.
+fn star_covers(instance: &InstanceId) -> bool {
+    !is_context_scoped(instance) && !OPT_IN_INSTANCES.contains(&instance.as_str())
+}
+
 /// A single capability grant or query. The allow-set is the positive surface a
 /// context may use. `Instance`/`Tool`/`Facade` are the granular grants;
 /// `AllInstances`/`AllFacades`/`Admin` are the explicit broad grants that set
@@ -136,7 +146,8 @@ pub enum Capability {
     /// A facade tool not routed through the broker.
     Facade(String),
     /// Every broker instance ("*") except context-scoped ones
-    /// ([`CONTEXT_SCOPED_PREFIX`]). Does **not** imply `Admin`.
+    /// ([`CONTEXT_SCOPED_PREFIX`]) and [`OPT_IN_INSTANCES`]. Does **not**
+    /// imply `Admin`.
     AllInstances,
     /// Every facade surface ("facade:*").
     AllFacades,
@@ -326,7 +337,7 @@ impl ContextToolBinding {
     /// True if `*` grants `instance`. It never grants a context-scoped
     /// instance (see [`is_context_scoped`]); only an explicit grant does.
     fn all_instances_cover(&self, instance: &InstanceId) -> bool {
-        self.all_instances && !is_context_scoped(instance)
+        self.all_instances && star_covers(instance)
     }
 
     /// This binding without any grant or sticky name for a context-scoped
@@ -890,6 +901,21 @@ mod tests {
 
         b.grant(Capability::Instance(scoped.clone()));
         assert!(b.allows_tool(&scoped, "fixture_echo"), "an explicit grant covers it");
+    }
+
+    /// `*` does not offer `done`: a broad loadout that picked it up by
+    /// accident would change how every turn in the context ends.
+    #[test]
+    fn all_instances_does_not_cover_builtin_turn() {
+        let turn = inst("builtin.turn");
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        assert!(!b.allows_tool(&turn, "done"));
+        assert!(!b.revoke_is_inert(&Capability::Instance(turn.clone())));
+        assert!(b.allows_tool(&inst("builtin.file"), "read"), "control: * still covers the rest");
+
+        b.grant(Capability::Instance(turn.clone()));
+        assert!(b.allows_tool(&turn, "done"), "a context type grants it by name");
     }
 
     #[test]

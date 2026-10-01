@@ -888,7 +888,7 @@ impl Kernel {
     ) -> crate::mcp::McpResult<()> {
         use crate::mcp::servers::{
             BlockToolsServer, BuiltinBindingsServer, BuiltinHooksServer, BuiltinResourcesServer,
-            BuiltinTasksServer, FileToolsServer, KernelInfoServer,
+            BuiltinTasksServer, BuiltinTurnServer, FileToolsServer, KernelInfoServer,
         };
         use crate::mcp::servers::bindings_builtin::KERNEL_TOOLS_URI;
         use crate::mcp::{InstancePolicy, KernelNotification};
@@ -939,6 +939,12 @@ impl Kernel {
                 Arc::new(KernelInfoServer::new(self.drift.clone(), kernel_db.clone())),
                 InstancePolicy::for_kernel(self),
             )
+            .await?;
+
+        // builtin.turn — `done`, which ends a task. Opt-in: `*` does not
+        // cover it (`binding::OPT_IN_INSTANCES`).
+        self.broker
+            .register_silently(Arc::new(BuiltinTurnServer::new()), InstancePolicy::for_kernel(self))
             .await?;
 
         // Phase 3 (D-41): builtin.resources admin server. Weak<Broker> avoids

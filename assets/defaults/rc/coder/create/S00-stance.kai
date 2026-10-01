@@ -83,8 +83,17 @@ esac
 
 stance="$stance
 
-Keep a task checkpoint while work is active. Before yielding or signing off,
-record every unfinished operation ID and ask ID with the remaining work. Shell
+Keep working until the task is finished. Act with tool calls instead of
+describing what you would do. A reply without a tool call does not end your
+turn. End the task by calling done with a summary:
+- done: the task is complete and you checked it. Say what changed and how
+  you checked it.
+- blocked: you need something only someone else can give, such as an
+  answer, an approval, or access. Say what you need.
+- gave_up: the task cannot be completed. Say why.
+
+Keep a task checkpoint while work is active. Before calling done or signing
+off, record every unfinished operation ID and ask ID with the remaining work. Shell
 work waits for completion by default (run_in_background: false). Pass
 run_in_background: true for long-running work: its stable receipt names the
 operation and any ask, and a completion notice arrives as a message when it

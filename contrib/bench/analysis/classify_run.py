@@ -567,6 +567,24 @@ def analyze_run(
     verdict_match = verdict_matches[-1] if verdict_matches else None
     verdict = verdict_match.group(1) if verdict_match else None
     verdict_reason = verdict_match.group(2) if verdict_match and verdict_match.group(2) else None
+    verdict_source = "result_line" if verdict_match else None
+
+    # --- the `done` tool --------------------------------------------------
+    # A context offered `done` (builtin.turn) ends its task by calling it.
+    # The last completed call wins over any verdict line; a failed call (an
+    # empty summary, say) is no verdict. `gave_up` reads as the line's
+    # "gave up" so the two sources compare.
+    done_calls = [
+        tool_states[tid] for tid in tools_by_recency
+        if tool_states[tid].title == "done" and tool_states[tid].status == "completed"
+        and isinstance((tool_states[tid].raw_input or {}).get("status"), str)
+    ]
+    if done_calls:
+        done_input = done_calls[-1].raw_input
+        verdict = done_input["status"].replace("_", " ")
+        done_summary = done_input.get("summary")
+        verdict_reason = done_summary.strip() if isinstance(done_summary, str) and done_summary.strip() else None
+        verdict_source = "done_tool"
 
     # --- gate-wait / asks_orphaned -----------------------------------
     requested_ask_ids = {p["ask_id"] for p in permission_events if p["ask_id"]}
@@ -705,6 +723,7 @@ def analyze_run(
         "final_message_truncated": len(trailing_message) > FINAL_MESSAGE_LIMIT,
         "verdict": verdict,
         "verdict_reason": verdict_reason,
+        "verdict_source": verdict_source,
         # Populated only when turn_end_class == "agent_timeout"; null otherwise,
         # never omitted, so a reader can always look these keys up.
         "timeout_last_tool_call_name": turn_end_evidence.get("last_tool_call_name")

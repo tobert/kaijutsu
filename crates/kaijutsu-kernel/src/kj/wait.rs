@@ -185,6 +185,24 @@ fn tail_entry(b: &BlockSnapshot, max_bytes: usize) -> serde_json::Value {
 ///
 /// Returns the entries and how many admitted blocks were dropped off the front
 /// to honor the cap, so a caller can tell a short turn from a trimmed one.
+/// The verdict of the last successful `done` call after `since`: its status
+/// and summary, as the tool's result states them (`status: summary`).
+fn done_verdict(blocks: &[BlockSnapshot], since: Option<usize>) -> Option<(String, String)> {
+    let start = since.map_or(0, |i| i + 1);
+    let after = blocks.get(start..).unwrap_or_default();
+    after.iter().rev().find_map(|result| {
+        if result.kind != BlockKind::ToolResult || result.is_error {
+            return None;
+        }
+        let call = after.iter().find(|b| Some(b.id) == result.tool_call_id)?;
+        if call.tool_name.as_deref() != Some(crate::runtime::llm_stream::DONE_TOOL) {
+            return None;
+        }
+        let (status, summary) = result.content.split_once(": ")?;
+        Some((status.to_string(), summary.to_string()))
+    })
+}
+
 fn build_tail(
     blocks: &[BlockSnapshot],
     since: Option<usize>,
@@ -465,6 +483,7 @@ impl KjDispatcher {
         let cursor = blocks.last().map(|b| b.id.to_key());
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
+        let verdict = done_verdict(blocks, since_idx);
         let mut lines = vec![match &detail {
             Some(d) => format!(
                 "context {} — {status} ({d}) in {:.1}s",
@@ -477,6 +496,9 @@ impl KjDispatcher {
                 elapsed_ms as f64 / 1000.0
             ),
         }];
+        if let Some((status, summary)) = &verdict {
+            lines.push(format!("done: {status} — {summary}"));
+        }
         for entry in &tail {
             let kind = entry["kind"].as_str().unwrap_or("?");
             let text = entry["content"].as_str().unwrap_or("");
@@ -501,6 +523,7 @@ impl KjDispatcher {
                 "detail": detail,
                 "output_block_id": output_block_id,
                 "resolved_by": resolved_by,
+                "done": verdict.map(|(status, summary)| serde_json::json!({"status": status, "summary": summary})),
                 "cursor": cursor,
                 "blocks": tail,
                 "omitted": omitted,
@@ -588,6 +611,30 @@ mod tests {
     }
     fn model(content: &str) -> BlockSnapshot {
         snap(Role::Model, BlockKind::Text, Status::Done, content)
+    }
+
+    fn done_pair(n: u64, content: &str, is_error: bool) -> [BlockSnapshot; 2] {
+        let ctx = ContextId::new();
+        let mut call = snap(Role::Model, BlockKind::ToolCall, Status::Done, "{}");
+        call.id = BlockId::new(ctx, PrincipalId::new(), n);
+        call.tool_name = Some("done".into());
+        let mut result = snap(Role::Tool, BlockKind::ToolResult, Status::Done, content);
+        result.tool_call_id = Some(call.id);
+        result.is_error = is_error;
+        [call, result]
+    }
+
+    /// A driver reads how the task ended from the last successful `done`
+    /// after its seed, not from an earlier task or a refused call.
+    #[test]
+    fn the_verdict_is_the_last_successful_done_after_the_seed() {
+        let [old_call, old_result] = done_pair(1, "gave_up: earlier task", false);
+        let [bad_call, bad_result] = done_pair(2, "done: the summary is empty", true);
+        let [call, result] = done_pair(3, "blocked: needs the deploy key", false);
+        let blocks = vec![old_call, old_result, user("next task"), bad_call, bad_result, call, result, model("waiting")];
+        assert_eq!(done_verdict(&blocks, Some(2)), Some(("blocked".into(), "needs the deploy key".into())));
+        assert_eq!(done_verdict(&blocks[..5], Some(2)), None, "a refused done is no verdict");
+        assert_eq!(done_verdict(&blocks[..2], None), Some(("gave_up".into(), "earlier task".into())));
     }
 
     /// The anchor must skip the model AND tool blocks a turn produces — a tool

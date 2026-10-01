@@ -629,6 +629,29 @@ class TestVerdictInAnalyzeRun(unittest.TestCase):
         self.assertIsNone(report["verdict"])
         self.assertIsNone(report["verdict_reason"])
 
+    def test_done_tool_is_the_verdict(self):
+        events = [
+            tool_call("t1", kind="execute", title="shell"),
+            tool_call_update("t1", status="completed", text="ok"),
+            message_chunk("RESULT: done"),
+            tool_call("t2", kind="other", title="done",
+                      raw_input={"status": "gave_up", "summary": "no network"}),
+            tool_call_update("t2", status="completed", text="gave_up: no network"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "gave up")
+        self.assertEqual(report["verdict_reason"], "no network")
+        self.assertEqual(report["verdict_source"], "done_tool")
+
+    def test_a_failed_done_call_is_no_verdict(self):
+        events = [
+            tool_call("t1", kind="other", title="done", raw_input={"status": "done", "summary": " "}),
+            tool_call_update("t1", status="failed", text="done: the summary is empty"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertIsNone(report["verdict"])
+        self.assertIsNone(report["verdict_source"])
+
     def test_verdict_searched_in_untruncated_text(self):
         # The real verdict line sits well before the final FINAL_MESSAGE_LIMIT
         # characters of the trailing message, so final_message (truncated)

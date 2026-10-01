@@ -1,0 +1,6 @@
+# Offer `done` (builtin.turn). A coder ends its task by calling it, and a
+# reply with no tool call does not end its turn: the kernel answers it with a
+# notice, at most twice. `*` does not cover builtin.turn, so this grant is the
+# opt-in. See docs/conversation-session.md, "Ending a task with done".
+set -e
+kj binding allow "builtin.turn"
