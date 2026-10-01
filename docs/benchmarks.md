@@ -439,6 +439,7 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-30 | `kj-qwen-fixgit-1`, `kj-qwen-pair-1`, `kj-qwen-sqlite-1` | `4bd76664…` → `12ed6d76` | qwen3.8-flash (Alibaba) | shipped coder, yolo sandbox gate, factory 16K ceiling, effort dropped, multiplier 1, moltar | 4 (fix-git, openssl-selfsigned-cert, fix-code-vulnerability, sqlite-with-gcov) | 4 | 0.96M | 0 | 0 | 0 | no verdict line |
 | 2026-09-30 | `kj-tenchi-openssl-1` | `4bd76664…` → `12ed6d76` | qwen3.8-27b (tenchi vLLM) | same, multiplier 2 | 1 (openssl-selfsigned-cert) | 0 | n/a | 0 | 0 | 1 | first inference failed: `LLM stream idle for 120s` |
 | 2026-10-01 | `kj-tenchi-tb2-20-2` | `8635a93b…` → `4071fc68` | qwen3.8-27b (tenchi vLLM) | shipped coder, yolo sandbox gate, factory 16K ceiling, no key, idle 600 s, request 1800 s, multiplier 4, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 7 | 0.52M | 0 | 0 | 11 | no verdict line |
+| 2026-10-01 | `kj-ds4-tb2-20-1` | `1997713d…` → `6c8252c4` | deepseek-v4-flash | shipped coder with `done`, yolo sandbox gate, 32768 ceiling, multiplier 1, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 18 (0.90) | 3.57M | 0 | 0 | 2 | `done` on 15/15 turns that ended on their own; 15 done and solved |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -622,6 +623,60 @@ failed, nothing asked (yolo gate), nothing stalled.
   `--no-key` and the two backend timeouts, batch results placed after their
   calls, a removed cwd that refuses once and moves, `shell_write` as kind
   `execute` (`ce55dca4` through `4071fc68`).
+
+### deepseek-v4-flash with `done` (2026-10-01)
+
+18 of 20, against 17 for the frozen plain-rendering arm and 18 for the
+bash-only control on the same model. One sample per task, so read it as
+"the harness no longer costs pass rate here", not as a gain. Binary
+6c8252c4: `done` and its nudge, cut shell output kept in CAS, `timeout_ms`,
+the removed-cwd fix, batch results after their calls. It predates the
+same-file edit ordering (ecc17787), the coder's own binding and one shell
+(a22c2912/7a6a7b2f), and the orientation preload (c2133264).
+
+| Task | Result | Ended | Tokens in / out | Inferences | Trial time |
+|---|---|---|---|---|---|
+| chess-best-move | pass | `done` | 2.17M / 58K | 44 | 379 s |
+| cobol-modernization | pass | `done` | 10.5M / 140K | 94 | 805 s |
+| configure-git-webserver | pass | `done` | 2.45M / 52K | 48 | 376 s |
+| constraints-scheduling | pass | `done` | 607K / 20K | 21 | 145 s |
+| db-wal-recovery | pass | `done` | 1.08M / 55K | 24 | 305 s |
+| dna-assembly | pass | `done` | 13.8M / 186K | 101 | 1187 s |
+| extract-elf | fail | agent process exited 1 | 345K / 9K | 14 | 108 s |
+| fix-code-vulnerability | pass | `done` | 842K / 18K | 26 | 140 s |
+| fix-git | pass | `done` | 709K / 22K | 23 | 157 s |
+| headless-terminal | fail | agent process exited 1 | 335K / 22K | 15 | 176 s |
+| largest-eigenval | pass | agent timeout | 6.79M / 153K | 62 | 938 s |
+| model-extraction-relu-logits | pass | agent timeout | 2.41M / 168K | 30 | 971 s |
+| modernize-scientific-stack | pass | `done` | 1.09M / 33K | 29 | 247 s |
+| openssl-selfsigned-cert | pass | `done` | 509K / 23K | 18 | 342 s |
+| overfull-hbox | pass | `done` | 1.80M / 47K | 34 | 306 s |
+| query-optimize | pass | `done` | 2.61M / 65K | 49 | 1565 s |
+| raman-fitting | pass | agent timeout | 11.2M / 177K | 81 | 937 s |
+| regex-log | pass | `done` | 1.67M / 85K | 22 | 424 s |
+| sparql-university | pass | `done` | 1.71M / 40K | 41 | 286 s |
+| sqlite-with-gcov | pass | `done` | 904K / 18K | 33 | 272 s |
+
+- **`done` held.** Every turn that ended on its own ended with `done`, and no
+  nudge fired: the model never ended on text alone. All 15 verdicts were
+  `done` on a solved task.
+- **Both losses were the agent process dying on `grep -r PATTERN /`.**
+  extract-elf and headless-terminal each ran a recursive builtin `grep` over
+  the whole filesystem as its last command, and `kaijutsu-solo-acp` exited 1
+  with no error logged. kaish builtins run in the kernel's process, so a walk
+  that reads something unbounded can take the agent down with it
+  (`docs/issues.md`).
+- **Three solves ran past the agent timeout.** largest-eigenval reached a
+  passing eval 37 s before its 900 s limit; the deliverable was in place when
+  Harbor stopped it. raman-fitting and model-extraction-relu-logits also
+  passed after timing out.
+- **Same-file edits raced 9 times** ("edit applied, but ... another writer
+  changed it"), the bug ecc17787 fixed after this binary was built.
+- **13 results were cut and stored in CAS; the model read a `/v/cas` path
+  once.** The 6 KiB head and tail were usually enough.
+- **Input cost is reasoning replay.** The first inference is about 14.3K
+  tokens; cobol-modernization and dna-assembly spent 10-14M input tokens over
+  94-101 inferences.
 
 ## Known limits
 

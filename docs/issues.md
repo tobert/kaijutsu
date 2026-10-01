@@ -717,6 +717,22 @@ on current main"):
   subshells, `\(` in `find`, brace groups. 6 of 29 failed tool calls in four
   runs.
 
+## A builtin `grep -r PATTERN /` killed the agent process (2026-10-01)
+
+In `kj-ds4-tb2-20-1`, extract-elf and headless-terminal each ran
+`grep -r PATTERN / ... | grep -v '^/proc' ...` through `shell_write`, and
+`kaijutsu-solo-acp` exited 1 mid-command with nothing logged: both losses of
+the run. kaish's `grep` is a builtin, so the walk runs in the kernel's own
+process; the exclusions come after it in the pipeline, so the walk reaches
+`/proc`, `/sys`, `/dev`, and the `/v` mounts. Not reproduced yet (do it in a
+container, not on a live kernel). Contributing factors to check: reading an
+endless file (`/dev/zero`, `/proc/kmsg`), memory growth with no bound,
+walking `/v/cas` or `/v/docs`, an OOM kill of the container's process. A
+builtin's failure must not take the kernel down: bound recursive builtins
+(skip special files and virtual filesystems by default, as GNU grep's
+`-D skip` does for devices), and report a loud error instead. Filed for kaish
+in `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
+
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 
 Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
