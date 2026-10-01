@@ -3301,13 +3301,16 @@ async fn run_llm_stream(
             assistant_tool_uses,
         ));
 
+        // `done` ends the turn only from a batch where nothing failed: the
+        // model reads a sibling's failure before it can finish.
         let done = tool_results.iter().any(|result| matches!(result,
-            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if done_calls.contains(tool_use_id)));
+            ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if done_calls.contains(tool_use_id)))
+            && !tool_results.iter().any(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
 
         // Add user message with tool results
         messages.push(LlmMessage::tool_results(tool_results));
-        // The model called `done` and it succeeded: the task is over, so the
-        // turn ends after this batch. Input that arrived meanwhile stays
+        // The model called `done`, it succeeded, and nothing beside it failed:
+        // the task is over, so the turn ends after this batch. Input that arrived meanwhile stays
         // pending for the turn's end, like input after a final inference.
         if done {
             tracing::info!(%context_id, "The model called `done`; the turn ends");
@@ -4107,6 +4110,26 @@ mod publish_tests {
             let nudge = blocks.iter().find(|b| b.kind == BlockKind::Notification).unwrap();
             assert_eq!(nudge.role, Role::System, "a kernel fact, not model text");
             assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")));
+        }).await;
+    }
+
+    /// A `done` in a batch where another call failed does not end the turn:
+    /// the model reads the failure before it can finish.
+    #[tokio::test]
+    async fn done_beside_a_failed_call_does_not_end_the_turn() {
+        tokio::task::LocalSet::new().run_until(async {
+            let batch = vec![
+                crate::llm::StreamEvent::ToolUse { id: "c1".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
+                crate::llm::StreamEvent::ToolUse { id: "c2".into(), name: "done".into(),
+                    input: serde_json::json!({"status": "done", "summary": "all good"}) },
+                crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
+            ];
+            let (reason, blocks) = turn_offering_done("done-beside-failure",
+                vec![batch, text_reply("the other call failed; looking"), done_call("c3")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert!(blocks.iter().any(|b| b.content.contains("the other call failed; looking")),
+                "the turn continued past the batch with a failed call");
+            assert_eq!(nudges(&blocks), 1, "the text-only reply after it was nudged, then done ended the turn");
         }).await;
     }
 
