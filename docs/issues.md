@@ -638,9 +638,15 @@ more readily than other agents". Open, most costly first:
   8 KiB stores its whole stream (up to 4 MiB) in CAS, and CAS has no
   retention or reference counting (`kj cas rm` is unconditional). Measure
   growth over a benchmark run before choosing a policy.
-- **kaish `grep` has no `-x`** (`grep -x 4999 file` is refused as an
-  unexpected argument). Another builtin that differs from the program a
-  model expects; offer a tobert/kaish issue.
+- **kaish builtins differ from the programs a model expects.** `timeout`
+  takes the wrapped command's flags as its own (`timeout 10 python3 -c` is
+  refused, the same bug as tobert/kaish#484 for `env`); `grep -x`, `find -o`,
+  `ls -S`, `cat -A`, and read-only kaish-git's `--oneline`/`--all`/`-a` are
+  refused. Evidence and counts: `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`
+  (Amy is taking these to kaish).
+- **A parse refusal reads as a policy denial.** The shell-escape guard turns
+  kaish's parse failure into "no execution plan". Say that kaish cannot parse
+  the command and that `bash -c '...'` runs it.
 - **A turn can still spend several output ceilings.** A ceiling stop now
   continues the turn with a notice instead of ending it, bounded by
   `MAX_OUTPUT_CEILING_CONTINUATIONS` (`runtime/llm_stream.rs`); see
