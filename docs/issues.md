@@ -621,6 +621,16 @@ more readily than other agents". Open, most costly first:
 - **`done` reaches a driver only when it reads.** `kj wait` and an ACP
   client see the verdict; nothing pushes it (a drift to the parent) to a
   driver that does not wait. Build the push when a driver needs it.
+- **Over ACP, a kernel notice reads as the model's own words.** The bridge
+  sends a `(System, Notification)` block (the `done` nudge, the ceiling
+  notice) as `agent_message_chunk` text with no separator, so a client shows
+  "Next I'll run the tests.You replied without a tool call…" and Harbor's
+  trajectory records the notice as model output. A thought chunk or a
+  separated, labeled message would read honestly
+  (`fleet/done-nudge.toml` pins today's shape).
+- **A background completion after `done` starts a turn that calls `done`
+  again.** `kj wait` and `classify_run.py` read the last verdict, so they
+  report the follow-up turn's, not the task's. Harbor reads the first.
 - **The `coder-driven` bench overlay still asks for a `RESULT:` line**, now
   beside `done`. Retire the line or the overlay at the next bench arm.
 - **A fresh coder seat is about 46,000 input tokens** before any work.
