@@ -816,15 +816,36 @@ const MAX_DONE_NUDGES: u32 = 2;
 /// The file a call writes, when it is a file tool that names one: `edit` or
 /// `write` with a `path`, made absolute against the call's cwd. Calls in one
 /// batch that write the same file run in call order.
+///
+/// `tool` is the call's real tool name, not the visible one a qualified
+/// binding gives it: the caller resolves `instance__tool` back to `tool`
+/// before calling this. `.` path segments are dropped, so `./x.c` and `x.c`
+/// key as the one file the model means.
 fn written_file(tool: &str, input: &serde_json::Value, cwd: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     if !matches!(tool, "edit" | "write") {
         return None;
     }
     let path = std::path::Path::new(input.get("path")?.as_str()?);
-    Some(match cwd {
+    let joined = match cwd {
         Some(cwd) if path.is_relative() => cwd.join(path),
         _ => path.to_path_buf(),
-    })
+    };
+    Some(normalize_dot_segments(&joined))
+}
+
+/// Drop `.` segments so `./a` and `a` name one path, leaving the rest as the
+/// model wrote it. A `..` is kept: without resolving it against the real tree
+/// we cannot tell `a/../b` from `b`, and two names that differ only in a
+/// `..` are rare enough that serializing the wrong pair is cheaper than
+/// missing the common `./` one.
+fn normalize_dot_segments(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        if !matches!(part, std::path::Component::CurDir) {
+            out.push(part.as_os_str());
+        }
+    }
+    out
 }
 
 /// What the turn knows at an output-ceiling stop, for [`CeilingStop::continues`].
@@ -3234,12 +3255,27 @@ async fn run_llm_stream(
         // Calls that write the same file run in call order: each waits for the
         // one before it on that file. Run together, a second edit reads a file
         // the first is still changing. Everything else runs concurrently.
-        let mut file_turns: std::collections::HashMap<std::path::PathBuf, tokio::sync::oneshot::Receiver<()>> =
+        //
+        // The key is the instance the call resolves to plus the file's path:
+        // two different file backends writing the same path name two different
+        // files, so they run side by side. The model names a tool by its
+        // visible name, which a collision qualifies as `instance__tool`; the
+        // binding resolves it back to the real tool, so an `edit` still keys
+        // as one even when two instances expose it.
+        let binding = kernel.broker().binding(&context_id).await;
+        let resolve_tool = |visible: &str| -> (String, Option<crate::mcp::InstanceId>) {
+            match binding.as_ref().and_then(|b| b.resolve(visible)) {
+                Some((instance, tool)) => (tool.clone(), Some(instance.clone())),
+                None => (visible.to_owned(), None),
+            }
+        };
+        let mut file_turns: std::collections::HashMap<(Option<crate::mcp::InstanceId>, std::path::PathBuf), tokio::sync::oneshot::Receiver<()>> =
             std::collections::HashMap::new();
         let file_order: Vec<_> = tool_calls.iter().map(|pending| {
-            let path = pending.unparsed.is_none().then(|| written_file(&pending.name, &pending.input, tool_ctx.cwd.as_deref())).flatten()?;
+            let (tool, instance) = resolve_tool(&pending.name);
+            let path = pending.unparsed.is_none().then(|| written_file(&tool, &pending.input, tool_ctx.cwd.as_deref())).flatten()?;
             let (finished, next) = tokio::sync::oneshot::channel();
-            Some((file_turns.insert(path, next), finished))
+            Some((file_turns.insert((instance, path), next), finished))
         }).collect();
 
         // Signal cancellation on the first persistence fault, but join every
@@ -4160,6 +4196,18 @@ mod publish_tests {
         assert_eq!(written_file("edit", &serde_json::json!({}), Some(cwd)), None);
     }
 
+    /// `./x.c` and `x.c` name the same file, so a `.` segment must not make
+    /// two writes to one path run side by side.
+    #[test]
+    fn written_file_keys_a_dot_segment_with_its_plain_spelling() {
+        let cwd = std::path::Path::new("/app");
+        let plain = serde_json::json!({"path": "sub/x.c"});
+        let dotted = serde_json::json!({"path": "./sub/x.c"});
+        let abs_dotted = serde_json::json!({"path": "/app/./sub/x.c"});
+        assert_eq!(written_file("edit", &dotted, Some(cwd)), written_file("edit", &plain, Some(cwd)));
+        assert_eq!(written_file("edit", &abs_dotted, Some(cwd)), written_file("edit", &plain, Some(cwd)));
+    }
+
     /// An `edit` tool that records when each call starts and ends.
     struct RecordingFileServer {
         id: crate::mcp::InstanceId,
@@ -4213,6 +4261,41 @@ mod publish_tests {
             let at = |event: &str| log.iter().position(|e| e == event).unwrap_or_else(|| panic!("{event} missing: {log:?}"));
             assert!(at("end x1") < at("start x2"), "the second edit on x.c waits for the first: {log:?}");
             assert!(at("start y1") < at("end x1"), "an edit on another file runs alongside: {log:?}");
+        }).await;
+    }
+
+    /// A second file backend also exposing `edit` qualifies the visible name
+    /// to `instance__edit`. The same-file ordering still applies: the binding
+    /// resolves the qualified name back to the real `edit` tool, so two writes
+    /// to one file on one backend serialize even though the model called them
+    /// by their qualified names.
+    #[tokio::test]
+    async fn same_file_edits_run_in_call_order_under_a_qualified_name() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("qualified-edits").await);
+            let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let mk = |name: &str| {
+                let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+                let id = crate::mcp::InstanceId::new(name);
+                let server = Arc::new(RecordingFileServer { id: id.clone(), log: log.clone(), notif_tx });
+                (id, server)
+            };
+            let (id_a, a) = mk("rec.a");
+            let (id_b, b) = mk("rec.b");
+            kernel.broker().register(a, crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
+            kernel.broker().register(b, crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
+            // Both expose `edit`, so the roster qualifies each by instance.
+            let edit = |call: &str, backend: &str, path: &str, tag: &str| crate::llm::StreamEvent::ToolUse {
+                id: call.into(), name: format!("{backend}__edit"), input: serde_json::json!({"path": path, "tag": tag}) };
+            let batch = vec![
+                edit("c1", "rec_a", "/app/x.c", "x1"), edit("c2", "rec_a", "/app/x.c", "x2"),
+                crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
+            ];
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(MockClient::new("unused")
+                .with_scripted_stream(vec![batch, text_reply("edited both")])), |_| {}, 0, vec![], vec![id_a.clone(), id_b.clone()]).await;
+            let log = log.lock().clone();
+            let at = |event: &str| log.iter().position(|e| e == event).unwrap_or_else(|| panic!("{event} missing: {log:?}"));
+            assert!(at("end x1") < at("start x2"), "the qualified second edit on x.c waits for the first: {log:?}");
         }).await;
     }
 

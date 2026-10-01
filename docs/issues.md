@@ -744,10 +744,6 @@ Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
   writes and mutating `kj` verbs through it; the ask tier still applies.
   Predates `check_shell_facade`. Choosing `ReadOnly` when only `facade:shell`
   is held changes the person's box in toolie seats: Amy's call.
-- **Same-file ordering keys on the visible tool name** (`written_file` in
-  `runtime/llm_stream.rs`). When two visible instances expose `edit`, the
-  name becomes `builtin_file__edit` and the ordering stops applying. Key on
-  the resolved `(instance, tool)`. `./a` and `a` are also different keys.
 - **The register path still announces tools before a context's first model
   block** (`emit_for_bindings`), unlike the binding-diff path.
 - **The shell descriptions name four of the facts a turn reads**; `[waiting
