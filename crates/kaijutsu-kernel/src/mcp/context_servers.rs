@@ -29,6 +29,7 @@ use kaijutsu_types::{ContextId, SessionId};
 
 use super::binding::{CONTEXT_SCOPED_PREFIX, Capability};
 use super::policy::InstancePolicy;
+use super::server_like::McpServerLike;
 use super::servers::external::{ExternalMcpServer, McpServerConfig, McpTransport};
 use super::types::InstanceId;
 use crate::Kernel;
@@ -76,12 +77,37 @@ struct Entry {
     owners: HashSet<SessionId>,
 }
 
+#[derive(Default)]
+struct State {
+    entries: HashMap<(ContextId, String), Entry>,
+    /// Owners whose connection closed. A declaration still in flight when
+    /// its connection closed must not record a server for a gone owner.
+    closed: HashSet<SessionId>,
+}
+
+/// The runtime every context MCP server runs on. A server's transport tasks
+/// live on the runtime that connected it, and a kaijutsu-server connection
+/// runs on its own runtime that is dropped when the connection closes, so
+/// declarations run here instead.
+struct ServerRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for ServerRuntime {
+    fn drop(&mut self) {
+        // A kernel may be dropped inside async code, where a blocking
+        // runtime shutdown panics.
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// The live client-declared servers, keyed by context and server name.
 #[derive(Default)]
 pub struct ContextMcpServers {
-    // Held across connect and broker calls so declarations for any context
-    // apply one at a time; a declaration is a request-boundary event.
-    entries: tokio::sync::Mutex<HashMap<(ContextId, String), Entry>>,
+    // Held across connect and broker calls so declarations apply one at a
+    // time; a declaration is a request-boundary event.
+    state: tokio::sync::Mutex<State>,
+    runtime: std::sync::OnceLock<ServerRuntime>,
 }
 
 impl ContextMcpServers {
@@ -89,11 +115,26 @@ impl ContextMcpServers {
         Self::default()
     }
 
+    fn handle(&self) -> tokio::runtime::Handle {
+        let rt = self.runtime.get_or_init(|| {
+            ServerRuntime(Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("kj-context-mcp")
+                    .enable_all()
+                    .build()
+                    .expect("build the context MCP server runtime"),
+            ))
+        });
+        rt.0.as_ref().expect("the runtime lives until the kernel drops").handle().clone()
+    }
+
     /// The running servers for `context`, as `(name, instance id)`, sorted
     /// by name.
     pub async fn list(&self, context: ContextId) -> Vec<(String, InstanceId)> {
-        let entries = self.entries.lock().await;
-        let mut out: Vec<(String, InstanceId)> = entries
+        let state = self.state.lock().await;
+        let mut out: Vec<(String, InstanceId)> = state
+            .entries
             .keys()
             .filter(|(ctx, _)| *ctx == context)
             .map(|(ctx, name)| (name.clone(), context_instance_id(*ctx, name)))
@@ -102,13 +143,44 @@ impl ContextMcpServers {
         out
     }
 
+    /// Every running server, as `(context, name, instance id)`, sorted.
+    pub async fn list_all(&self) -> Vec<(ContextId, String, InstanceId)> {
+        let state = self.state.lock().await;
+        let mut out: Vec<(ContextId, String, InstanceId)> = state
+            .entries
+            .keys()
+            .map(|(ctx, name)| (*ctx, name.clone(), context_instance_id(*ctx, name)))
+            .collect();
+        out.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        out
+    }
+
     /// Replace `owner`'s declared servers for `context` with `specs`, and
     /// return the instance ids of `specs` in order.
     ///
-    /// Every new or changed server is started before anything else changes.
-    /// If one fails, the ones started for this call are stopped and the
-    /// previous state stands.
+    /// Runs on the context MCP runtime and completes even if the caller
+    /// stops waiting. Every new or changed server starts before anything
+    /// else changes; if one fails to start, the ones started for this call
+    /// stop and the previous state stands. A later broker failure leaves
+    /// each started server recorded under `owner`, so releasing the owner
+    /// stops it.
     pub async fn declare(
+        &self,
+        kernel: &Arc<Kernel>,
+        context: ContextId,
+        owner: SessionId,
+        specs: Vec<ContextMcpServerSpec>,
+    ) -> Result<Vec<InstanceId>, ContextMcpError> {
+        let kernel = kernel.clone();
+        self.handle()
+            .spawn(async move { kernel.context_mcp().declare_here(&kernel, context, owner, specs).await })
+            .await
+            .unwrap_or_else(|e| {
+                Err(ContextMcpError::Broker { name: String::new(), reason: format!("declaration task failed: {e}") })
+            })
+    }
+
+    async fn declare_here(
         &self,
         kernel: &Arc<Kernel>,
         context: ContextId,
@@ -117,7 +189,13 @@ impl ContextMcpServers {
     ) -> Result<Vec<InstanceId>, ContextMcpError> {
         validate(kernel, &specs).await?;
         let broker = kernel.broker();
-        let mut entries = self.entries.lock().await;
+        let mut state = self.state.lock().await;
+        if state.closed.contains(&owner) {
+            return Err(ContextMcpError::Invalid(
+                "the connection declaring these MCP servers has closed".to_string(),
+            ));
+        }
+        let entries = &mut state.entries;
 
         // Start what is new or changed, before touching any state.
         let mut started: Vec<(ContextMcpServerSpec, ExternalMcpServer)> = Vec::new();
@@ -132,7 +210,6 @@ impl ContextMcpServers {
                 Ok(server) => started.push((spec.clone(), server)),
                 Err(reason) => {
                     for (_, server) in started {
-                        use super::server_like::McpServerLike;
                         let _ = server.shutdown().await;
                     }
                     return Err(ContextMcpError::StartFailed { name: spec.name.clone(), reason });
@@ -150,29 +227,42 @@ impl ContextMcpServers {
             .map(|((_, name), _)| name.clone())
             .collect();
         for name in dropped {
-            release(&mut entries, kernel, context, &name, owner).await;
+            release(entries, kernel, context, &name, owner).await;
         }
 
-        // Register what started, replacing a changed server in place.
+        // Record each started server under its owner before registering it,
+        // so a failure from here on leaves nothing the owner cannot release.
+        // A changed server is replaced in place; `register` tells the
+        // context its tools are back.
         for (spec, server) in started {
             let instance = context_instance_id(context, &spec.name);
             let key = (context, spec.name.clone());
-            if entries.contains_key(&key) {
-                if let Err(e) = broker.unregister(&instance).await {
-                    tracing::error!(%instance, error = %e, "replacing a context MCP server: unregister failed");
+            let mut owners = match entries.remove(&key) {
+                Some(old) => {
+                    if let Err(e) = broker.unregister(&instance).await {
+                        tracing::error!(%instance, error = %e, "replacing a context MCP server: unregister failed");
+                    }
+                    old.owners
                 }
-            }
-            broker
-                .register_silently(Arc::new(server), InstancePolicy::for_kernel(kernel))
-                .await
-                .map_err(|e| ContextMcpError::Broker { name: spec.name.clone(), reason: e.to_string() })?;
-            tracing::info!(context = %context.short(), %instance, command = %spec.command, "context MCP server started");
-            let owners = entries.remove(&key).map(|e| e.owners).unwrap_or_default();
+                None => HashSet::new(),
+            };
+            owners.insert(owner);
+            let name = spec.name.clone();
+            let command = spec.command.clone();
             entries.insert(key, Entry { spec, owners });
+            broker
+                .register(Arc::new(server), InstancePolicy::for_kernel(kernel))
+                .await
+                .map_err(|e| ContextMcpError::Broker { name: name.clone(), reason: e.to_string() })?;
+            tracing::info!(context = %context.short(), %instance, %command, "context MCP server started");
         }
 
-        // Restore a grant a loadout rewrite removed while the server ran.
-        let binding = broker.binding(&context).await.unwrap_or_default();
+        // Grant each server, restoring a grant a loadout rewrite removed
+        // while it ran.
+        let binding = broker
+            .binding_checked(&context)
+            .await
+            .map_err(|e| ContextMcpError::Broker { name: String::new(), reason: e.to_string() })?;
         let mut instances = Vec::with_capacity(specs.len());
         for spec in &specs {
             let entry = entries
@@ -200,34 +290,42 @@ impl ContextMcpServers {
             args: Vec::new(),
             env: Vec::new(),
         };
-        self.entries
+        self.state
             .lock()
             .await
+            .entries
             .insert((context, name.to_string()), Entry { spec, owners: HashSet::from([owner]) });
     }
 
-    /// Every running server, as `(context, name, instance id)`, sorted.
-    pub async fn list_all(&self) -> Vec<(ContextId, String, InstanceId)> {
-        let entries = self.entries.lock().await;
-        let mut out: Vec<(ContextId, String, InstanceId)> = entries
-            .keys()
-            .map(|(ctx, name)| (*ctx, name.clone(), context_instance_id(*ctx, name)))
-            .collect();
-        out.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        out
+    /// Withdraw `owner` from every server it declared, on every context, and
+    /// refuse any later declaration from it. For a connection that closed.
+    pub async fn release_owner(&self, kernel: &Arc<Kernel>, owner: SessionId) {
+        let kernel = kernel.clone();
+        let task = self
+            .handle()
+            .spawn(async move { kernel.context_mcp().release_owner_here(&kernel, owner).await });
+        if let Err(e) = task.await {
+            tracing::error!(owner = %owner.short(), error = %e, "releasing context MCP servers failed");
+        }
     }
 
-    /// Withdraw `owner` from every server it declared, on every context.
-    /// Called when the owner's connection closes.
-    pub async fn release_owner(&self, kernel: &Arc<Kernel>, owner: SessionId) {
-        let mut entries = self.entries.lock().await;
-        let held: Vec<(ContextId, String)> = entries
+    /// [`Self::release_owner`] without waiting, for a synchronous `Drop`.
+    pub fn release_owner_detached(kernel: Arc<Kernel>, owner: SessionId) {
+        let handle = kernel.context_mcp().handle();
+        handle.spawn(async move { kernel.context_mcp().release_owner_here(&kernel, owner).await });
+    }
+
+    async fn release_owner_here(&self, kernel: &Arc<Kernel>, owner: SessionId) {
+        let mut state = self.state.lock().await;
+        state.closed.insert(owner);
+        let held: Vec<(ContextId, String)> = state
+            .entries
             .iter()
             .filter(|(_, e)| e.owners.contains(&owner))
             .map(|(key, _)| key.clone())
             .collect();
         for (context, name) in held {
-            release(&mut entries, kernel, context, &name, owner).await;
+            release(&mut state.entries, kernel, context, &name, owner).await;
         }
     }
 }

@@ -1121,10 +1121,9 @@ impl Broker {
     /// Add an instance to a context's binding (idempotent). Triggers the
     /// same diff + persistence + notification pipeline as `set_binding`.
     pub async fn bind(self: &Arc<Self>, context_id: ContextId, instance: InstanceId) -> McpResult<()> {
-        let mut binding = self
-            .binding(&context_id)
-            .await
-            .unwrap_or_default();
+        // A read failure must not stand in for an empty binding: the write
+        // below replaces the whole persisted loadout.
+        let mut binding = self.binding_checked(&context_id).await?;
         binding.allow(instance);
         self.set_binding(context_id, binding).await
     }
@@ -1133,10 +1132,9 @@ impl Broker {
     /// Also evicts `name_map` entries pointing at the dropped instance so
     /// follow-up calls surface the removed-tool error cleanly.
     pub async fn unbind(self: &Arc<Self>, context_id: ContextId, instance: &InstanceId) -> McpResult<()> {
-        let mut binding = self
-            .binding(&context_id)
-            .await
-            .unwrap_or_default();
+        // A read failure must not stand in for an empty binding: the write
+        // below replaces the whole persisted loadout.
+        let mut binding = self.binding_checked(&context_id).await?;
         binding.revoke(instance);
         self.set_binding(context_id, binding).await
     }

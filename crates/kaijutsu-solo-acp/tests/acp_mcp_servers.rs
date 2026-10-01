@@ -251,15 +251,24 @@ fn another_session_does_not_see_the_server() {
         text("tried"),
     ]));
 
-    new_session(&mut agent, &cwd, json!([fixture_server("fixture", &pidfile)]))
+    let declaring = new_session(&mut agent, &cwd, json!([fixture_server("fixture", &pidfile)]))
         .unwrap_or_else(|e| panic!("{e:#}"));
-    wait_for_pid(&pidfile);
-    let other = new_session(&mut agent, &cwd, json!([])).unwrap_or_else(|e| panic!("{e:#}"));
+    let pid = wait_for_pid(&pidfile);
+    // Another cwd gives another session label, so another context.
+    let other_cwd = scratch_dir("mcp-scope-other");
+    let other = new_session(&mut agent, &other_cwd, json!([])).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_ne!(declaring, other, "the second session must be a different context");
 
     prompt(&mut agent, &other, "call the fixture from a session that did not declare it");
     let calls = client::tool_calls(agent.updates());
+    let call = calls
+        .iter()
+        .find(|c| c.title.contains("fixture_echo"))
+        .unwrap_or_else(|| panic!("the mock's fixture_echo call was not announced: {calls:?}"));
+    assert_eq!(call.status.as_deref(), Some("failed"), "{call:?}");
     assert!(
-        calls.iter().all(|c| !c.output.contains("fixture echo: elsewhere")),
-        "a session that did not declare the server reached it: {calls:?}"
+        !call.output.contains("fixture echo: elsewhere"),
+        "a session that did not declare the server reached it: {call:?}"
     );
+    assert!(process_alive(pid), "the declaring session's server must keep running");
 }

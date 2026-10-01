@@ -810,22 +810,11 @@ impl Drop for ConnectionState {
             }
         }
         // Withdraw this connection's context MCP servers. Stopping one
-        // awaits its process, so the release runs as a task; a server
-        // another connection still declares keeps running.
+        // awaits its process, so the release runs on the kernel's context
+        // MCP runtime, not this connection's, which is about to drop. A
+        // server another connection still declares keeps running.
         if let Some(kernel) = self.context_mcp.take() {
-            let owner = self.session_id;
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(async move {
-                        kernel.context_mcp().release_owner(&kernel, owner).await;
-                    });
-                }
-                Err(e) => log::error!(
-                    "context MCP: connection {} closed with no runtime to stop its servers ({e}); \
-                     they stop with the kernel process",
-                    owner.short()
-                ),
-            }
+            kaijutsu_kernel::mcp::ContextMcpServers::release_owner_detached(kernel, self.session_id);
         }
         // Clean up per-session context tracking. Mirrors the explicit
         // remove that used to live at the tail of `run_rpc`; the Drop

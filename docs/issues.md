@@ -421,6 +421,20 @@ servers"). Open, most likely to bite first:
   is a persisted binding entry; after a crash nothing revokes it. It grants
   nothing (no instance has that id until the session redeclares) but shows
   in `kj binding show`. A boot sweep of `context.*` grants would remove it.
+- **Two `session/new` calls in one cwd within one second share a
+  context.** The label is `acp-<cwd leaf>-<unix seconds>`, and
+  `open_or_create` attaches to a live context holding the label, so the
+  second "new" session is the first one, MCP servers included.
+- **Does `kj mcp reload` start servers on a connection's runtime?** A
+  server's rmcp tasks live on the runtime that connected it; context
+  servers got their own runtime after a test showed them dying with the
+  declaring connection. `reconcile_external_mcp_servers` from `kj mcp
+  reload` or `restart` may have the same exposure, depending on where `kj`
+  runs. Unverified.
+- **No capability gates `declareContextMcpServers`.** Any connection can
+  spawn a host command for any context and add one explicit grant to its
+  loadout. Inside the one trust boundary this follows Amy's approval for
+  ACP; whether a context should hold `exec` first is open.
 - **The fleet has no `mcpServers` key.** The end-to-end tests live in
   `crates/kaijutsu-solo-acp/tests/acp_mcp_servers.rs`, so the Harbor-shape
   invariants are not checked against an MCP tool call yet.

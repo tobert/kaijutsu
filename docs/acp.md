@@ -229,8 +229,9 @@ The bridge hands the list to the kernel (`declareContextMcpServers`). The
 kernel starts each server on the kernel host, registers it on the broker as
 `context.<context id hex>.<name>`, and grants that instance to the session's
 context with an explicit binding entry. `*` never covers a context-scoped
-instance, so another context — even a `coder` holding `*` — does not see
-its tools, and a fork does not inherit the grant. The model sees the tools
+instance, so another context — even a `coder` holding `*` — cannot call its
+tools and never gets them in its tool list, and a fork does not inherit the
+grant. Discovery surfaces such as `kj://kernel/tools` still list them. The model sees the tools
 under their own names, qualified only on a collision, like any broker tool.
 `kj mcp list` shows these servers under "declared by a connected client".
 
@@ -244,7 +245,8 @@ under their own names, qualified only on a collision, like any broker tool.
   servers. Each `session/prompt` redeclares the session's servers, which
   restarts them after a reconnect and changes nothing otherwise; a turn
   already running when the connection dropped loses them until the next
-  prompt.
+  prompt. If that restart fails, the prompt fails naming the server;
+  `session/load` or `session/resume` with a corrected list recovers.
 - **Errors.** Nothing starts and the request fails, naming the server, when
   two servers share a name, a name is empty, a name is already an `mcp.toml`
   server (`invalid_params`), a transport is `http` or `sse`

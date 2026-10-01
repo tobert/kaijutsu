@@ -125,3 +125,70 @@ async fn context_declared_server_lives_as_long_as_an_owner() {
     assert!(!kernel.broker().binding(&declaring).await.unwrap().allows(&grant));
     assert!(servers.list_all().await.is_empty());
 }
+
+fn stub_pid(pidfile: &std::path::Path) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(pidfile)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "the stub never wrote its pidfile");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// True while `pid` has not exited; a zombie has.
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        let state = stat.rsplit(')').next().and_then(|rest| rest.split_whitespace().next());
+        state != Some("Z") && state != Some("X")
+    })
+}
+
+/// A declared server must outlive the runtime of the connection that
+/// declared it — each kaijutsu-server connection runs on its own runtime,
+/// dropped when the connection closes — and must stop when the closing
+/// connection's synchronous `Drop` hands its owner to
+/// `release_owner_detached`, while the kernel keeps running.
+#[test]
+fn a_declared_server_outlives_the_declaring_runtime_until_released() {
+    use kaijutsu_kernel::mcp::{ContextMcpServerSpec, ContextMcpServers};
+    use kaijutsu_types::{ContextId, SessionId};
+
+    let main = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let kernel = main.block_on(async { Arc::new(Kernel::new_ephemeral("test").await) });
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("stub.pid");
+    let spec = ContextMcpServerSpec {
+        name: "stub".to_string(),
+        command: stub_server_path(),
+        args: Vec::new(),
+        env: vec![("MCP_STUB_PIDFILE".to_string(), pidfile.display().to_string())],
+    };
+    let context = ContextId::new();
+    let owner = SessionId::new();
+
+    // Declare from a short-lived current-thread runtime, as a connection does.
+    let connection_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let declaring = kernel.clone();
+    connection_rt
+        .block_on(async move { declaring.context_mcp().declare(&declaring, context, owner, vec![spec]).await })
+        .unwrap();
+    drop(connection_rt);
+
+    let pid = stub_pid(&pidfile);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(alive(pid), "the server died with the runtime that declared it");
+
+    ContextMcpServers::release_owner_detached(kernel.clone(), owner);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(std::time::Instant::now() < deadline, "the released server is still running");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    main.block_on(async {
+        assert!(kernel.context_mcp().list_all().await.is_empty());
+    });
+}

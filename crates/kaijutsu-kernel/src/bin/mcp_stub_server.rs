@@ -25,6 +25,11 @@ impl ServerHandler for StubServer {}
 
 #[tokio::main]
 async fn main() {
+    // With `MCP_STUB_PIDFILE` set, record this process's pid there so a test
+    // can tell whether the server is still running.
+    if let Some(path) = std::env::var_os("MCP_STUB_PIDFILE") {
+        std::fs::write(&path, std::process::id().to_string()).expect("write the stub pidfile");
+    }
     let service = StubServer
         .serve(stdio())
         .await
