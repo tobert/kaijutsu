@@ -749,9 +749,6 @@ Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
 - **The shell descriptions name four of the facts a turn reads**; `[waiting
   for approval…]`, `[timed out waiting…]`, `[data]`, and `[latch]` are not
   described, and the ceiling-case truncation note has a different shape.
-- **`S16-handoff.kai`'s comment says a trailing `|| true` never fires after
-  `$(...)`**; the reviewer's kaish fires it. Confirm on the pinned kaish and
-  correct `S16`/`S17`.
 - **`toolie/create/S45-shell-guard.kai` exists** although the script's header
   says it goes only to seats holding `exec`; two comments cite
   `docs/gate-and-shell-split.md`, which does not exist.

@@ -38,8 +38,9 @@ kind="$(echo "$info" | jq -r '.kind')"
 
 # `block inspect --json` carries content_length, not content — read the
 # first line separately. `|| true` guards the substitution under `set -e`
-# (a trailing `||` on the assignment itself never fires); an unreadable edge
-# block still lets the notification land, with an empty excerpt.
+# from inside it, where it reacts at the failing command itself — a trailing
+# `||` on the assignment reads only its last substitution's status. An
+# unreadable edge block still lets the notification land, empty excerpt.
 line="$(kj block read --no-line-numbers --range 0:1 "$KJ_EDGE_BLOCK" || true)"
 excerpt="$(echo "$line" | cut -c1-80)"
 if test "${#line}" -gt 80; then

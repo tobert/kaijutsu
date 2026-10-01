@@ -939,10 +939,14 @@ Each slice is independently shippable and leaves the tree green.
    is set by `register_session` with `kj context create --as`, except for a
    root character, which cannot be cast. The window
    is 50, set on the first note (a marker needs a block to anchor on).
-   `S16-handoff.kai` guards `kj handoff tail` inside the substitution: a
-   trailing `||` never fires in kaish, and under `set -e` a failing
+   `S16-handoff.kai` guards `kj handoff tail` inside the substitution, where
+   the guard reacts at the failing command itself: under `set -e` a failing
    substitution aborts the script, so a principal with no character got an
-   Error block on every create until the guard moved.
+   Error block on every create until the guard moved. When that guard moved,
+   kaish also ignored a trailing `||` on the assignment; the linked kaish
+   (0.17.2, ad293823) fires it, verified live 2026-10-01. The inner placement
+   stays — it is the narrower guard — pinned by the kernel test
+   `set_e_substitution_guards_behave_as_rc_scripts_place_them`.
 5. **rc union.** Two directories, one sorted list, collision is an error,
    `KJ_CONTEXT_TYPE` and `KJ_CHARACTER` seeded; `characters.rc_dir` arrives.
    Reseed leaves character dirs alone (they are not shipped defaults).

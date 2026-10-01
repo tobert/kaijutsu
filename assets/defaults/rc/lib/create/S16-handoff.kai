@@ -19,7 +19,9 @@
 #    principal is not an error condition — so its exit is guarded INSIDE
 #    the substitution (`|| true`), and `exit 0` is the literal last line.
 #    Under `set -e` a failing `$(...)` assignment aborts the whole script,
-#    and no later line runs. Verified live.
+#    and no later line runs. Re-verified live 2026-10-01 on the pinned kaish
+#    0.17.2 (ad293823); pinned by the kernel test
+#    `set_e_substitution_guards_behave_as_rc_scripts_place_them`.
 #  - NOTIFICATION, never (Role::System, BlockKind::Text). This content
 #    differs on every create, and the System+Text slot folds into the
 #    CACHED system prompt (llm/system_prompt.rs), so writing there would
@@ -32,9 +34,12 @@
 #    --window keeps it that way.
 #  - kj-and-VFS only. No network, no external process.
 #
-# `$(...)` assignment cannot be guarded with a trailing `||` — kaish never
-# fires it. The `|| true` therefore sits inside the substitution, where it
-# does fire, and the fallback text is a separate `test -z` statement.
+# The `|| true` sits INSIDE the substitution: it reacts at the failing
+# command itself. A trailing `||` on the assignment also fires on the pinned
+# kaish (it was fixed in the linked build; the kernel test above now pins
+# both halves), but it reads only the assignment's status, and a line with
+# two substitutions takes the LAST one's — an earlier failure hides behind a
+# later success. The fallback text is a separate `test -z` statement.
 set -e
 
 window=12

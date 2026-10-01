@@ -1212,6 +1212,83 @@ mod tests {
         );
     }
 
+    /// Pin the substitution-guard semantics on which the create/submit rc
+    /// scripts place their `|| true` guards — and which S16's comment got
+    /// wrong for a while ("a trailing `||` … kaish never fires it"). That
+    /// was true of the older linked kaish and was fixed in the build pinned
+    /// now (0.17.2, ad293823); kaibo's DeepSeek review flagged the stale
+    /// comment on 2026-10-01, and this test is what keeps the corrected
+    /// text honest through the next dependency bump.
+    ///
+    /// All four rows were verified live in a kernel shell before being
+    /// written here. **If an assertion flips, kaish changed `set -e` or
+    /// substitution-status semantics** — re-verify the rc guard placements
+    /// (`lib/create/S16-handoff.kai`, `S17-predecessor.kai`,
+    /// `lib/submit/S10-edge.kai`) against the new behavior instead of
+    /// relaxing the test.
+    #[tokio::test]
+    async fn set_e_substitution_guards_behave_as_rc_scripts_place_them() {
+        let blocks = shared_block_store(kaijutsu_types::PrincipalId::system());
+        let kernel = test_kernel("test-sete-guards").await;
+        let kaish = EmbeddedKaish::new("test-sete-guards", blocks, kernel, None).unwrap();
+        let run = |cmd: &str| {
+            let k = &kaish;
+            let cmd = cmd.to_string();
+            async move {
+                let r = k
+                    .execute_with_options(&cmd, ExecuteOptions::default())
+                    .await
+                    .unwrap_or_else(|e| panic!("`{cmd}` errored: {e}"));
+                (r.code, r.text_out().to_string())
+            }
+        };
+
+        // 1. A BARE failing substitution under `set -e` aborts the script —
+        //    the hazard that forces a guard to exist at all. Unreached echo,
+        //    nonzero exit.
+        let (code, out) = run(r#"set -e; x="$(false)"; echo NOT-ABORTED"#).await;
+        assert_ne!(code, 0, "an unguarded failing substitution must abort under set -e");
+        assert!(
+            !out.contains("NOT-ABORTED"),
+            "the script must stop at the failing substitution, got: {out}"
+        );
+
+        // 2. A TRAILING `|| true` on the assignment fires on the pinned
+        //    kaish — this is the half S16's comment said "never" happens.
+        //    (Mutation-checked 2026-10-01: asserting the pre-fix behavior
+        //    fails with code 0, so this row really pins the fix.)
+        let (code, out) = run(r#"set -e; x="$(false)" || true; echo REACHED"#).await;
+        assert_eq!(code, 0, "a trailing `|| true` must carry the assignment, got code {code}: {out}");
+        assert!(out.contains("REACHED"), "the script must continue past the guarded assignment, got: {out}");
+
+        // 3. The guard INSIDE the substitution — the placement every rc
+        //    script actually uses — works as before.
+        let (code, out) = run(r#"set -e; y="$(false || true)"; echo REACHED"#).await;
+        assert_eq!(code, 0, "the inner guard must carry the substitution, got code {code}: {out}");
+        assert!(out.contains("REACHED"), "the script must continue with the inner guard, got: {out}");
+
+        // 4. Why inner beats trailing: an assignment's status is the LAST
+        //    substitution's (POSIX last-wins), so with two substitutions a
+        //    trailing guard misses an earlier failure, while the inner guard
+        //    reacts at the failing command itself.
+        let (code, out) =
+            run(r#"set -e; z="$(false)$(echo tail)" || z="TRAILING-CAUGHT"; echo "[$z]""#).await;
+        assert_eq!(code, 0, "the last substitution's success decides: {out}");
+        assert!(
+            out.contains("[tail]"),
+            "`||` must NOT fire when only an earlier substitution failed \
+             (last-wins; mutation-checked 2026-10-01 — asserting \
+             `[TRAILING-CAUGHT]` here fails); got {out}"
+        );
+        let (code, out) =
+            run(r#"set -e; w="$(false || echo GUARDED)$(echo tail)"; echo "[$w]""#).await;
+        assert_eq!(code, 0, "an inner guard keeps the script running: {out}");
+        assert!(
+            out.contains("[GUARDEDtail]"),
+            "the inner guard reacts at the failure point; got {out}"
+        );
+    }
+
     /// The external-exec policy end to end: `Allow` + a Local-mounted cwd runs
     /// a real host binary through kaish's subprocess path; `Deny` fails fast
     /// with `command not found` (127) — no PATH, no absolute-path escape.

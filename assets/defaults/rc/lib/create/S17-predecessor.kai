@@ -10,7 +10,7 @@
 # blocks, each cut at 400 bytes, so the capture stays under the 8192-byte
 # builtin stdout cap (runtime/embedded_kaish.rs). A stale or archived
 # predecessor degrades to a fallback line; this script NEVER exits nonzero
-# (see S16-handoff.kai for the contract and the `|| true` placement).
+# (see S16-handoff.kai for the contract and why the guard sits inside).
 #
 # NOTIFICATION, never (Role::System, BlockKind::Text): the content differs
 # per create and must not fold into the cached system prompt.
