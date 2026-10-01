@@ -36,6 +36,16 @@ The kernel adds runtime facts, including the performing character and its
 assigned reviewer (stable IDs and names); rc supplies the chosen instruction
 sections. Provider/model selection remains a separate fact.
 
+The coder has its own binding (`coder/create/S10-binding.kai`): one shell
+(`shell_write`, with the shell-operation tools it projects), the file tools,
+tasks, and `done`, plus the person's input facades. Every tool schema rides on
+every request, so the roster is the seat's largest cost. The shell tools'
+descriptions carry the one statement of what kaish is and what a call returns;
+no rc seeds a separate kaish primer, and `help syntax` holds the language
+reference. The coder stance chooses a tier from the resolved model (a `case`
+on `.resolved_model`); its shared tail says when the task is finished and how
+to use the tools, adapting DeepSeek Harness's tool rules (MIT).
+
 The executable filename controls order: `S00-base.kai` precedes `S00-stance.kai`.
 The shared file ends with `頑張（がんば）って！`. Default handles general work;
 assistant remains fleet coordination. Coder retains focused and guided branches
@@ -120,6 +130,61 @@ conversation without joining the cached system instruction sections. Handoff
 reads the last twelve notes. A missing handoff log or predecessor is reported
 as fallback text; these optional scripts do not abort creation. This differs
 from the required instruction-file reads described below.
+
+## Coder working-directory orientation
+
+```text
+Orientation of the working directory, read at context create (2026-10-01 10:31 -0400). It does not update as you work.
+cwd: /app
+git: branch main at 01234567
+recent HEAD moves (reflog, newest first):
+  01234567 commit: parser handles nested brackets
+  11111111 commit (initial): start the parser
+
+top level (gitignore applied; a directory shows its entries or their counts):
+  data/ (120 files)
+  src/: main.rs  parse/
+  .gitignore  Cargo.toml  Makefile  README.md
+
+build files: Cargo.toml Makefile
+  Makefile targets: all build test
+
+README.md (first lines):
+  # Widget
+  Widget parses bracket trees.
+```
+
+`coder/create/S35-orient.kai` emits this `(System, Notification)` block when
+a coder context is created with a cwd. It saves the first few discovery calls
+of a task. Like handoff and recall, it is a changing observation: a git HEAD
+and a file list go stale as the model works, so the block is a dated
+notification, never a cached system instruction.
+
+It reads only the cwd's files, with kaish builtins and `kj`; it runs no host
+program, so it works under any loadout. Sections:
+
+- `git:` the branch and HEAD read from `.git/HEAD`, loose refs, and
+  `packed-refs`, found at or above the cwd, including a linked worktree. The
+  last five reflog entries (`.git/logs/HEAD`) stand in for recent commits.
+  There is no dirty-tree summary: that needs a git index reader, and rc
+  shells have none.
+- `top level:` each directory with up to eight entries listed inline, or its
+  immediate file and directory counts, at most 30 directories; then up to 24
+  file names. Counts are immediate children, never a recursive walk, so a
+  large tree costs one listing per directory.
+- `build files:` which of a fixed list of manifests exist, Makefile targets,
+  `package.json` scripts, and whether `Cargo.toml` is a workspace.
+- The README's first twelve non-blank lines, without badges, HTML, or rules,
+  each cut at 160 characters.
+
+An empty section is omitted. A context with no cwd gets no block, because its
+shell starts in the kernel's own directory. The whole block is cut at 6000
+characters and says so. Measured on this repository it is about 2000
+characters; a two-file directory is about 350.
+
+Every client that knows its working directory must create the context with
+`kj context create --cwd`, so the create lifecycle runs there. ACP
+`session/new` does; a later `kj context set --cwd` does not rerun create.
 
 ## Rotating a context
 

@@ -166,7 +166,7 @@ impl KernelBridge {
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         let id = self
             .actor
-            .create_context_under(parent.context_id, target, &self.context_type, None)
+            .create_context_under(parent.context_id, target, &self.context_type, None, None)
             .await
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
         self.actor.join_context(id).await?;

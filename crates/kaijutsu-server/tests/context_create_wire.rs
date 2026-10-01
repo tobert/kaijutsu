@@ -23,7 +23,7 @@ fn a_context_created_through_kj_is_parented_by_the_context_it_runs_from() {
 
         let parent_blocks = kernel.documents.block_snapshots(parent.context_id).unwrap().len();
         let result = kj
-            .execute_kj_quiet(parent.context_id, &context_create_argv("lane", "coder", None))
+            .execute_kj_quiet(parent.context_id, &context_create_argv("lane", "coder", None, None))
             .await
             .unwrap();
         let lane = context_id_from_create_result(&result).expect("kj context create succeeds");
@@ -51,9 +51,9 @@ fn a_duplicate_label_is_refused_with_a_label_conflict() {
         let (kj, _) = client.bind_kernel().await.unwrap();
         let parent = choose_parent(None, &kj.list_contexts().await.unwrap()).unwrap();
 
-        let first = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", None)).await.unwrap();
+        let first = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", None, None)).await.unwrap();
         context_id_from_create_result(&first).expect("first create succeeds");
-        let second = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", None)).await.unwrap();
+        let second = kj.execute_kj_quiet(parent.context_id, &context_create_argv("dup", "coder", None, None)).await.unwrap();
         let error = context_id_from_create_result(&second).expect_err("a live label cannot be reused");
         assert!(error.contains("label conflict"), "clients retry on this text: {error}");
     });

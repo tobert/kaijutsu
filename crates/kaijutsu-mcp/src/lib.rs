@@ -1987,7 +1987,7 @@ impl KaijutsuMcp {
         for attempt in 1..=MAX_RETRIES {
             let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
             match actor
-                .create_context_under(create.parent.context_id, &candidate, context_type, create.performer.as_deref())
+                .create_context_under(create.parent.context_id, &candidate, context_type, create.performer.as_deref(), None)
                 .await
             {
                 Ok(id) => return Ok((id, candidate)),
@@ -2266,6 +2266,7 @@ impl KaijutsuMcp {
                         &requested_label,
                         &context_type,
                         create.performer.as_deref(),
+                        None,
                     )
                     .await
                 {

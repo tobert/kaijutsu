@@ -439,6 +439,22 @@ servers"). Open, most likely to bite first:
   `crates/kaijutsu-solo-acp/tests/acp_mcp_servers.rs`, so the Harbor-shape
   invariants are not checked against an MCP tool call yet.
 
+## From the coder orientation preload (2026-10-01)
+
+- `kj context create --cwd` stores the path without checking that it names a
+  directory. A missing directory makes the first create script refuse and
+  moves the context to the nearest existing ancestor; later scripts run there.
+  ACP `session/new` still calls `setContextCwd` after creating, which does
+  check, and archives the fresh context on failure. Checking at create would
+  let that second call go for fresh contexts.
+- rc shells have no read-only kaish-git (`runtime/git_tool.rs` registers it
+  only in `ShellPolicy::ReadOnly`), so `coder/create/S35-orient.kai` reads
+  `.git` files directly and has no dirty-tree summary or commit log; the
+  reflog stands in. Registering kaish-git under rc would shadow host `git`
+  for rc scripts; decide before doing it.
+- The TUI and kaijutsu-mcp create contexts without `--cwd`; their create
+  lifecycle therefore gets no orientation.
+
 ## kaijutsu-mcp session identity (2026-09-25)
 
 From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
@@ -633,7 +649,10 @@ more readily than other agents". Open, most costly first:
   report the follow-up turn's, not the task's. Harbor reads the first.
 - **The `coder-driven` bench overlay still asks for a `RESULT:` line**, now
   beside `done`. Retire the line or the overlay at the next bench arm.
-- **A fresh coder seat is about 46,000 input tokens** before any work.
+- **Measure the narrowed coder seat.** It was about 14,400 input tokens on
+  2026-10-01, 80% of it tool schemas, before the coder got its own binding
+  and one shell. Most input tokens are reasoning replay, not the seat: one
+  13K-token reasoning step doubled the next request.
 - **Cut shell output accumulates in CAS.** Every model-facing result past
   8 KiB stores its whole stream (up to 4 MiB) in CAS, and CAS has no
   retention or reference counting (`kj cas rm` is unconditional). Measure

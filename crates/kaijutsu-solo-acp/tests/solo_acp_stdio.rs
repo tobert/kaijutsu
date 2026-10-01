@@ -532,6 +532,51 @@ fn an_rc_overlay_marker_reaches_the_contexts_system_instructions() {
     );
 }
 
+/// `session/new` creates the coder context in the session cwd, so its create
+/// lifecycle already sees that cwd: the shipped orientation script describes
+/// the session directory, not the kernel's own.
+#[test]
+fn the_create_lifecycle_runs_in_the_session_cwd() {
+    let state = scratch_dir("orient-state").join("state");
+    let mut agent = spawn_mock_with("chat", &["--state-dir", state.to_str().expect("utf-8 state path")]);
+    agent.initialize().expect("initialize");
+    let cwd = scratch_dir("orient-cwd");
+    std::fs::write(cwd.join("orient-marker-file.txt"), "x\n").expect("write the marker file");
+    let session = agent.new_session(&cwd).expect("session/new");
+
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
+
+    let context_id = kaijutsu_types::ContextId::parse(&session)
+        .unwrap_or_else(|e| panic!("session id {session:?} is not a context id: {e}"));
+    let db = Arc::new(parking_lot::Mutex::new(
+        kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+            .expect("reopen the kernel db the binary just closed"),
+    ));
+    let blocks = kaijutsu_kernel::block_store::shared_block_store_with_db(
+        db,
+        kaijutsu_types::WorkspaceId::new(),
+        kaijutsu_types::PrincipalId::system(),
+    );
+    blocks.load_from_db().expect("load documents from the reopened db");
+    let snapshots = blocks
+        .block_snapshots(context_id)
+        .unwrap_or_else(|e| panic!("read blocks for context {context_id}: {e}"));
+    let orientation = snapshots
+        .iter()
+        .find(|b| b.content.starts_with("Orientation of the working directory"))
+        .unwrap_or_else(|| {
+            let bodies: Vec<&str> = snapshots.iter().map(|b| b.content.as_str()).collect();
+            panic!("no orientation block; saw {bodies:#?}")
+        });
+    assert!(
+        orientation.content.contains(&format!("cwd: {}", cwd.display()))
+            && orientation.content.contains("orient-marker-file.txt"),
+        "orientation must describe the session cwd:\n{}",
+        orientation.content
+    );
+}
+
 #[test]
 fn an_unusable_rc_overlay_refuses_the_boot() {
     let missing = scratch_dir("rc-overlay-refusals").join("missing");

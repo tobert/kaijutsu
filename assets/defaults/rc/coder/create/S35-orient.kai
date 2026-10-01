@@ -1,0 +1,231 @@
+# Orient a new coder in its working directory: the cwd, git branch and
+# recent HEAD moves, the top level of the tree, build files, and the head of
+# the README. It saves the first few discovery calls of a task.
+#
+# Rules this script follows (docs/prompts.md, "Coder working-directory
+# orientation"):
+#
+#  - NOTIFICATION, never (System, Text). The text is an observation that
+#    changes with the checkout; a Text instruction folds into the cached
+#    system prompt.
+#  - Builtins and kj only. No host programs, so it works under any loadout.
+#    git state is read from the plain files under .git (HEAD, refs,
+#    packed-refs, logs/HEAD); a dirty-tree summary needs a git index reader,
+#    which rc shells do not have.
+#  - Bounded. Every list has a count limit and every line a width limit; the
+#    whole block is cut at 6000 characters. Directory sizes are immediate
+#    child counts, never a recursive walk, so a huge tree costs one listing.
+#  - Silent where there is nothing. An absent section is omitted, never
+#    reported as unavailable. A context without a cwd gets no block: the
+#    shell would start in the kernel's own directory.
+#  - Never exit nonzero on a missing file; only a failed block write fails
+#    the script.
+
+cap=6000
+
+cwd="$(kj context info --json | jq -r '.cwd // empty')"
+if test -z "$cwd"; then
+  echo "orient: context has no cwd; skipped"
+  exit 0
+fi
+if test ! -d "$cwd"; then
+  echo "orient: cwd $cwd is not a directory; skipped"
+  exit 0
+fi
+cd "$cwd"
+
+stamp="$(date '+%Y-%m-%d %H:%M %z')"
+out="Orientation of the working directory, read at context create ($stamp). It does not update as you work.
+cwd: $cwd"
+
+# --- git: find .git at or above cwd ---
+top=""
+gitdir=""
+dir="$cwd"
+while true; do
+  if test -d "$dir/.git"; then
+    top="$dir"
+    gitdir="$dir/.git"
+    break
+  fi
+  if test -f "$dir/.git"; then
+    # A linked worktree: ".git" names its gitdir.
+    top="$dir"
+    gitdir="$(cat "$dir/.git" | grep '^gitdir: ' | head -n 1 | cut -c "9-")"
+    case "$gitdir" in
+      /*) ;;
+      ?*) gitdir="$dir/$gitdir" ;;
+    esac
+    break
+  fi
+  if test "$dir" = "/"; then
+    break
+  fi
+  dir="$(dirname "$dir")"
+done
+
+if test -n "$gitdir" && test -f "$gitdir/HEAD"; then
+  common="$gitdir"
+  if test -f "$gitdir/commondir"; then
+    rel="$(cat "$gitdir/commondir" | head -n 1)"
+    case "$rel" in
+      /*) common="$rel" ;;
+      *) common="$gitdir/$rel" ;;
+    esac
+  fi
+  head_raw="$(cat "$gitdir/HEAD" | head -n 1)"
+  where=""
+  case "$head_raw" in
+    "ref: "*)
+      ref="$(echo "$head_raw" | cut -c "6-")"
+      sha=""
+      if test -f "$gitdir/$ref"; then
+        sha="$(cat "$gitdir/$ref" | head -n 1)"
+      elif test -f "$common/$ref"; then
+        sha="$(cat "$common/$ref" | head -n 1)"
+      elif test -f "$common/packed-refs"; then
+        packed="$(cat "$common/packed-refs")"
+        sha="$(jq -n -r --arg p "$packed" --arg r "$ref" '$p | split("\n") | map(select(endswith(" " + $r))) | .[0] // "" | split(" ")[0]')"
+      fi
+      branch="$(echo "$ref" | sed 's|^refs/heads/||')"
+      where="branch $branch"
+      if test -n "$sha"; then
+        short="$(echo "$sha" | cut -c "1-8")"
+        where="$where at $short"
+      fi
+      ;;
+    *)
+      short="$(echo "$head_raw" | cut -c "1-8")"
+      where="detached HEAD at $short"
+      ;;
+  esac
+  line="git: $where"
+  if test "$top" != "$cwd"; then
+    line="$line (repository root $top)"
+  fi
+  out="$out
+$line"
+  if test -f "$gitdir/logs/HEAD"; then
+    moves="$(tail -n 5 "$gitdir/logs/HEAD")"
+    moves="$(jq -n -r --arg m "$moves" '$m | split("\n") | map(select(contains("\t"))) | reverse | map(split("\t") as $f | "  " + ($f[0] | split(" ")[1] | .[0:8]) + " " + ($f[1] | .[0:120])) | join("\n")')"
+    if test -n "$moves"; then
+      out="$out
+recent HEAD moves (reflog, newest first):
+$moves"
+    fi
+  fi
+fi
+
+# --- the top level, gitignore applied ---
+# glob prints a JSON error object when nothing matches; each list below
+# treats a non-array as [].
+dirs="$(glob -a -t d --json '*' 2>/dev/null || true)"
+dirs="$(jq -n -c --argjson v "$dirs" 'if ($v | type) == "array" then $v else [] end')"
+files="$(glob -a -t f --json '*' 2>/dev/null || true)"
+files="$(jq -n -c --argjson v "$files" 'if ($v | type) == "array" then $v else [] end')"
+
+dir_lines=""
+ndirs="$(jq -n -r --argjson v "$dirs" '$v | length')"
+for d in $(jq -n -r --argjson v "$dirs" '$v[:30][]'); do
+  all="$(glob -a -t a --json "$d/*" 2>/dev/null || true)"
+  sub="$(glob -a -t d --json "$d/*" 2>/dev/null || true)"
+  entry="$(jq -n -r --arg d "$d" --argjson a "$all" --argjson s "$sub" '
+    ($a | if type == "array" then . else [] end) as $a |
+    ($s | if type == "array" then . else [] end) as $s |
+    ($a - $s) as $f |
+    ([$f[] | ltrimstr($d + "/")] + [$s[] | ltrimstr($d + "/") + "/"]) as $names |
+    if ($names | length) == 0 then "  " + $d + "/ (empty)"
+    elif ($names | length) <= 8 and (($names | join("  ")) | length) <= 140
+      then "  " + $d + "/: " + ($names | join("  "))
+    else "  " + $d + "/ (" + ([
+        (if ($f | length) == 1 then "1 file" elif ($f | length) > 1 then ($f | length | tostring) + " files" else empty end),
+        (if ($s | length) == 1 then "1 dir" elif ($s | length) > 1 then ($s | length | tostring) + " dirs" else empty end)
+      ] | join(", ")) + ")"
+    end')"
+  dir_lines="$dir_lines
+$entry"
+done
+if test "$ndirs" -gt 30; then
+  dir_lines="$dir_lines
+  ... and $(jq -n -r --argjson n "$ndirs" '$n - 30') more directories"
+fi
+
+file_lines="$(jq -n -r --argjson v "$files" '
+  ($v | length) as $n |
+  ($v[:24] | reduce .[] as $w ([""];
+      if (.[-1] | length) > 0 and ((.[-1] | length) + ($w | length)) > 100
+      then . + [$w]
+      else .[:-1] + [(if .[-1] == "" then $w else .[-1] + "  " + $w end)]
+      end)
+    | map(select(length > 0) | "  " + .)) as $rows |
+  ($rows + (if $n > 24 then ["  ... and \($n - 24) more files"] else [] end)) | join("\n")')"
+
+if test -n "$dir_lines" || test -n "$file_lines"; then
+  out="$out
+
+top level (gitignore applied; a directory shows its entries or their counts):$dir_lines"
+  if test -n "$file_lines"; then
+    out="$out
+$file_lines"
+  fi
+else
+  out="$out
+
+The directory is empty."
+fi
+
+# --- build files ---
+found=""
+for m in Cargo.toml package.json pyproject.toml setup.py setup.cfg requirements.txt go.mod Makefile GNUmakefile CMakeLists.txt meson.build configure.ac build.gradle build.gradle.kts pom.xml Gemfile composer.json mix.exs deno.json build.zig Package.swift stack.yaml dune-project Dockerfile Containerfile docker-compose.yml compose.yaml justfile Justfile flake.nix tox.ini; do
+  if test -f "$m"; then
+    found="$found $m"
+  fi
+done
+if test -n "$found"; then
+  out="$out
+
+build files:$found"
+  if test -f Cargo.toml; then
+    if grep -q '^\[workspace\]' Cargo.toml; then
+      out="$out
+  Cargo.toml is a workspace"
+    fi
+  fi
+  for mk in Makefile GNUmakefile; do
+    if test -f "$mk"; then
+      targets="$(grep -E '^[A-Za-z0-9_-][A-Za-z0-9_.-]*:' "$mk" | grep -v -E '^[^:]*:=' | cut -d: -f1 | head -n 15)"
+      targets="$(jq -n -r --arg t "$targets" '$t | split("\n") | map(select(length > 0)) | join(" ")')"
+      if test -n "$targets"; then
+        out="$out
+  $mk targets: $targets"
+      fi
+    fi
+  done
+  if test -f package.json; then
+    scripts="$(jq -r '(.scripts // {}) | keys | .[:15] | join(" ")' package.json 2>/dev/null || true)"
+    if test -n "$scripts"; then
+      out="$out
+  package.json scripts: $scripts"
+    fi
+  fi
+fi
+
+# --- README head ---
+for r in README.md README README.rst README.txt README.markdown readme.md Readme.md; do
+  if test -f "$r"; then
+    head_lines="$(head -n 60 "$r" | grep -v -E '^[[:space:]]*$|^[[:space:]]*(\[!\[|<)|^[[:space:]]*[-=*_]{3,}[[:space:]]*$' | head -n 12 | cut -c "1-160" | sed "s/^/  /")"
+    if test -n "$head_lines"; then
+      out="$out
+
+$r (first lines):
+$head_lines"
+    fi
+    break
+  fi
+done
+
+out="$(jq -n -r --arg s "$out" --argjson cap "$cap" 'if ($s | length) > $cap then $s[:$cap] + "\n[orientation cut at \($cap) characters]" else $s end')"
+
+kj block create --role system --kind notification --content "$out"
+echo "orient: $(jq -n -r --arg s "$out" '$s | length') characters for $cwd"
+exit 0

@@ -492,7 +492,7 @@ pub async fn create_context_typed(
 ) -> Result<kaijutsu_types::ContextId, String> {
     let contexts = kernel.list_contexts().await.map_err(|e| e.to_string())?;
     let parent = kaijutsu_client::choose_parent(None, &contexts)?;
-    let argv = kaijutsu_client::context_create_argv(label, context_type, None);
+    let argv = kaijutsu_client::context_create_argv(label, context_type, None, None);
     let result = kernel.execute_kj_quiet(parent.context_id, &argv).await.map_err(|e| e.to_string())?;
     kaijutsu_client::context_id_from_create_result(&result)
 }

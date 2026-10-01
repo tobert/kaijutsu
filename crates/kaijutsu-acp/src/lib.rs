@@ -315,10 +315,12 @@ async fn handle_new_session(
     }
     bridge.note_client_cwd(&req.cwd);
     let label = new_session_label(&req.cwd);
-    let opened = match bridge.kernel.open_or_create(&label).await {
+    let opened = match bridge.kernel.open_or_create(&label, &req.cwd).await {
         Ok(o) => o,
         Err(e) => return responder.respond_with_error(internal(e)),
     };
+    // A fresh context was created in this cwd; setting it again checks that
+    // it names a directory on the kernel host. A resumed one moves here.
     if let Err(e) = bridge.kernel.set_context_cwd(opened.context_id, &req.cwd).await {
         if !opened.resumed
             && let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await

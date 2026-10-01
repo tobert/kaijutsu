@@ -174,7 +174,7 @@ fn rename_context_rpc_renames_and_refuses_taken_labels() {
         let parent = kaijutsu_client::choose_parent(None, &contexts).expect("the root context");
         let other = remote
             .actor
-            .create_context_under(parent.context_id, "rename-e2e-other", "default", None)
+            .create_context_under(parent.context_id, "rename-e2e-other", "default", None, None)
             .await
             .expect("create second context");
         let err = remote

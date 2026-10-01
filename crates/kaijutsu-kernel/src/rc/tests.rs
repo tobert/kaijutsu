@@ -2962,3 +2962,218 @@ esac
         assert!(RC_VERBS.contains(&VERB_SUBMIT));
         assert!(verb_is_wired("submit"));
     }
+
+    // ── Working-directory orientation (coder/create/S35-orient.kai) ───────
+
+    /// First words of the orientation notification.
+    const ORIENT_MARKER: &str = "Orientation of the working directory";
+    /// The script's hard cap on its block, in characters.
+    const ORIENT_CAP_CHARS: usize = 6000;
+
+    /// Create a coder context whose cwd is `cwd` (or none) over the real seed
+    /// tree with the host filesystem mounted read-only, and return its
+    /// orientation notifications, the script's own rc blocks, and the cached
+    /// system prompt sections.
+    async fn coder_orientation(cwd: Option<&std::path::Path>) -> (Vec<kaijutsu_types::BlockSnapshot>, Vec<String>, Vec<String>) {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel()
+            .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
+            .await;
+        let caller = console_caller(&d);
+        let mut args = vec!["context".to_string(), "create".into(), "orient".into(), "--type".into(), "coder".into()];
+        if let Some(cwd) = cwd {
+            args.push("--cwd".into());
+            args.push(cwd.display().to_string());
+        }
+        let r = d.dispatch(&args, &caller).await;
+        assert!(r.is_ok(), "create failed: {}", r.message());
+        let ctx = lookup_context_id(&d, "orient");
+        let blocks = d.block_store().block_snapshots(ctx).unwrap();
+        let notes: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Notification && b.content.starts_with(ORIENT_MARKER))
+            .cloned()
+            .collect();
+        let sections = crate::extract_system_prompt_sections(&blocks);
+        // Diagnostics: only this script's own trace or failure block.
+        let own = blocks.into_iter().map(|b| b.content).filter(|c| c.contains("S35-orient")).collect();
+        (notes, own, sections)
+    }
+
+    fn write_file(root: &std::path::Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A small git checkout written by hand (no host `git`): HEAD on a
+    /// branch, a loose ref, a reflog, a Cargo manifest, a Makefile, a README,
+    /// and an ignored build directory.
+    fn orientation_repo_fixture(root: &std::path::Path) {
+        write_file(root, ".git/HEAD", "ref: refs/heads/main\n");
+        write_file(root, ".git/refs/heads/main", "0123456789abcdef0123456789abcdef01234567\n");
+        let zero = "0000000000000000000000000000000000000000";
+        write_file(
+            root,
+            ".git/logs/HEAD",
+            &format!(
+                "{zero} 1111111111111111111111111111111111111111 A <a@b> 1700000000 +0000\tcommit (initial): start the parser\n\
+                 1111111111111111111111111111111111111111 0123456789abcdef0123456789abcdef01234567 A <a@b> 1700000100 +0000\tcommit: parser handles nested brackets\n"
+            ),
+        );
+        write_file(root, ".gitignore", "/target/\n");
+        write_file(root, "target/debug/should-not-appear", "x");
+        write_file(root, "Cargo.toml", "[package]\nname = \"widget\"\nversion = \"0.1.0\"\n");
+        write_file(root, "Makefile", ".PHONY: test\nCC := cc\nall: build\nbuild:\n\tcargo build\ntest:\n\tcargo test\n");
+        write_file(root, "src/main.rs", "fn main() {}\n");
+        write_file(root, "src/parse/mod.rs", "\n");
+        let mut readme = String::from("# Widget\n\n[![ci](https://example.invalid/badge.svg)](x)\n  <img src=\"logo.png\">\n---\n\nWidget parses bracket trees.\n");
+        for i in 0..400 {
+            readme.push_str(&format!("README line {i} {}\n", "z".repeat(300)));
+        }
+        write_file(root, "README.md", &readme);
+        for i in 0..120 {
+            write_file(root, &format!("data/case-{i:03}.txt"), "x");
+        }
+        for i in 0..90 {
+            write_file(root, &format!("top-level-file-with-a-long-name-{i:03}.txt"), "x");
+        }
+    }
+
+    #[test]
+    fn coder_create_orients_a_git_checkout() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(coder_create_orients_a_git_checkout_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn coder_create_orients_a_git_checkout_body() {
+        let dir = tempfile::tempdir().unwrap();
+        orientation_repo_fixture(dir.path());
+        let (notes, all, sections) = coder_orientation(Some(dir.path())).await;
+        assert_eq!(notes.len(), 1, "expected one orientation notification, got: {all:#?}");
+        let text = &notes[0].content;
+        eprintln!("{text}");
+        assert_eq!(notes[0].role, Role::System);
+        let cwd = dir.path().display().to_string();
+        for needle in [
+            cwd.as_str(),
+            "branch main",
+            "01234567",
+            "parser handles nested brackets",
+            "src/",
+            "Cargo.toml",
+            "Makefile",
+            "all build test",
+            "Widget parses bracket trees.",
+            "README line 0",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        // Newest reflog entry first.
+        let newest = text.find("parser handles nested brackets").unwrap();
+        let oldest = text.find("start the parser").unwrap();
+        assert!(newest < oldest, "reflog must read newest first:\n{text}");
+        for absent in ["should-not-appear", "target/", ".git/", "[![ci]", "<img", "\n  ---", "README line 399", "unavailable"] {
+            assert!(!text.contains(absent), "unexpected {absent:?} in:\n{text}");
+        }
+        assert!(
+            text.chars().count() <= ORIENT_CAP_CHARS + 80,
+            "orientation is {} characters, over the cap:\n{text}",
+            text.chars().count()
+        );
+        assert!(
+            sections.iter().all(|s| !s.contains(ORIENT_MARKER)),
+            "orientation leaked into the cached system prompt"
+        );
+    }
+
+    #[test]
+    fn coder_create_orients_a_bare_directory_silently() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(coder_create_orients_a_bare_directory_silently_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    async fn coder_create_orients_a_bare_directory_silently_body() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "solve.py", "print(1)\n");
+        write_file(dir.path(), "data/input.csv", "a,b\n");
+        let (notes, all, _) = coder_orientation(Some(dir.path())).await;
+        assert_eq!(notes.len(), 1, "expected one orientation notification, got: {all:#?}");
+        let text = &notes[0].content;
+        eprintln!("{text}");
+        for needle in [dir.path().display().to_string().as_str(), "solve.py", "data/: input.csv"] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        for absent in ["Git", "git:", "README", "Build files", "unavailable", "none"] {
+            assert!(!text.contains(absent), "empty section {absent:?} must be omitted:\n{text}");
+        }
+        assert!(text.chars().count() < 600, "a two-file directory needs a short block:\n{text}");
+    }
+
+    /// Without a context cwd the shell starts in the kernel's own default
+    /// directory, which says nothing about the work: no orientation.
+    #[test]
+    fn coder_create_without_cwd_skips_orientation() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(async {
+                    let (notes, _, _) = coder_orientation(None).await;
+                    assert!(notes.is_empty(), "no cwd, no orientation: {notes:#?}");
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    /// Every section at its own limit adds up to more than the cap; the
+    /// block is cut at the cap and says so. The branch resolves through
+    /// packed-refs.
+    #[test]
+    fn coder_create_orientation_is_cut_at_its_cap() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(async {
+                    let dir = tempfile::tempdir().unwrap();
+                    orientation_repo_fixture(dir.path());
+                    // The branch ref lives only in packed-refs here.
+                    std::fs::remove_file(dir.path().join(".git/refs/heads/main")).unwrap();
+                    write_file(
+                        dir.path(),
+                        ".git/packed-refs",
+                        "# pack-refs with: peeled fully-peeled sorted\n\
+                         89abcdef89abcdef89abcdef89abcdef89abcdef refs/heads/main-old\n\
+                         0123456789abcdef0123456789abcdef01234567 refs/heads/main\n",
+                    );
+                    for d in 0..40 {
+                        for f in 0..8 {
+                            write_file(dir.path(), &format!("dir-{d:02}/child-{f}-ab.txt"), "x");
+                        }
+                    }
+                    let (notes, own, _) = coder_orientation(Some(dir.path())).await;
+                    assert_eq!(notes.len(), 1, "expected one orientation notification, got: {own:#?}");
+                    let text = &notes[0].content;
+                    assert!(text.contains("git: branch main at 01234567\n"), "packed ref unresolved:\n{text}");
+                    assert!(text.contains("[orientation cut at 6000 characters]"), "uncut:\n{text}");
+                    assert!(
+                        text.chars().count() <= ORIENT_CAP_CHARS + 80,
+                        "orientation is {} characters, over the cap",
+                        text.chars().count()
+                    );
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }

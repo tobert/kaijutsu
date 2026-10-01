@@ -359,7 +359,9 @@ impl KernelBridge {
     /// the label is *attached* (an ACP client reconnecting should land back in
     /// its conversation), a concluded or archived one is never resurrected —
     /// we take a fresh suffixed label instead — and an unknown label creates.
-    pub async fn open_or_create(&self, label: &str) -> Result<OpenedContext> {
+    /// A created context starts in `cwd`, so its create lifecycle runs
+    /// there; an attached one keeps its own cwd until the caller sets it.
+    pub async fn open_or_create(&self, label: &str, cwd: &std::path::Path) -> Result<OpenedContext> {
         match self.actor.resolve_context_label(label).await? {
             Some(existing) if existing.concluded_at.is_none() && !existing.archived => {
                 // Loud on purpose: a reused label attaching to a prior
@@ -384,7 +386,7 @@ impl KernelBridge {
                     label = %fresh,
                     "prior context is concluded/archived; taking a fresh label"
                 );
-                let id = self.create_context(&fresh).await?;
+                let id = self.create_context(&fresh, cwd).await?;
                 self.actor.join_context(id).await?;
                 Ok(OpenedContext {
                     context_id: id,
@@ -394,7 +396,7 @@ impl KernelBridge {
                 })
             }
             None => {
-                let id = self.create_context(label).await?;
+                let id = self.create_context(label, cwd).await?;
                 self.actor.join_context(id).await?;
                 Ok(OpenedContext {
                     context_id: id,
@@ -408,9 +410,13 @@ impl KernelBridge {
 
     /// Create a performer-assigned context through `kj` so the kernel validates
     /// the character before inserting it and runs the selected context type's
-    /// rc create lifecycle with the correct identity already on the row.
-    async fn create_context(&self, label: &str) -> Result<ContextId> {
+    /// rc create lifecycle with the correct identity and cwd already on the
+    /// row.
+    async fn create_context(&self, label: &str, cwd: &std::path::Path) -> Result<ContextId> {
         let character = self.character.as_ref().expect("new-session path validates --character first");
+        let cwd = cwd
+            .to_str()
+            .with_context(|| format!("ACP cwd is not valid UTF-8: {}", cwd.display()))?;
         let contexts = self.list_contexts().await?;
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &contexts)
             .map_err(|e| anyhow::anyhow!("ACP session/new: {e}"))?;
@@ -418,7 +424,7 @@ impl KernelBridge {
             tracing::warn!(parent = %parent.label, "no --parent given; creating under the kernel's only root context");
         }
         self.actor
-            .create_context_under(parent.context_id, label, &self.context_type, Some(character))
+            .create_context_under(parent.context_id, label, &self.context_type, Some(character), Some(cwd))
             .await
             .map_err(|e| anyhow::anyhow!("ACP could not create a context for character '{character}': {e}"))
     }
