@@ -25,6 +25,7 @@
 //! off. See docs/acp.md.
 
 pub mod bridge;
+pub mod mcp;
 pub mod permission;
 pub mod rank;
 pub mod session;
@@ -35,18 +36,23 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    CloseSessionRequest, CloseSessionResponse,
     DeleteSessionRequest, DeleteSessionResponse, Error, Implementation,
     InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionId,
-    SessionDeleteCapabilities, SessionListCapabilities, SessionNotification,
+    SessionCloseCapabilities, SessionDeleteCapabilities, SessionListCapabilities,
+    SessionNotification,
     SessionResumeCapabilities, SessionUpdate, UnstructuredCommandInput,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::ContentBlock;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use kaijutsu_client::ContextMcpServerDecl;
+use kaijutsu_types::ContextId;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 use bridge::{KernelBridge, new_session_label};
 use session::{Session, SessionRegistry, TurnOutcome, run_pump, run_turn, settle_command_delivery};
@@ -67,6 +73,11 @@ pub struct AcpBridge {
     /// (ACP's own field for this) and falls back to this only when the
     /// client left that unset.
     last_client_cwd: Mutex<Option<PathBuf>>,
+    /// The MCP servers each live session declared, by context. A prompt
+    /// redeclares them, which is a no-op while they run and restarts them
+    /// after a reconnect: the kernel stops a connection's servers when that
+    /// connection closes.
+    mcp_declared: Mutex<HashMap<ContextId, Vec<ContextMcpServerDecl>>>,
 }
 
 impl AcpBridge {
@@ -76,6 +87,7 @@ impl AcpBridge {
             sessions: SessionRegistry::default(),
             client_info: Mutex::new(None),
             last_client_cwd: Mutex::new(None),
+            mcp_declared: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,7 +117,9 @@ impl AcpBridge {
 /// something kaijutsu genuinely has (a durable context, and the time well's
 /// rank). Prompt capabilities are all `false`: this bridge forwards text and
 /// nothing else today — an image in a prompt would be silently dropped, and
-/// advertising a capability we drop is worse than declining it.
+/// advertising a capability we drop is worse than declining it. MCP
+/// capabilities stay at their default: stdio, which every agent supports,
+/// and neither `http` nor `sse`.
 fn agent_capabilities() -> AgentCapabilities {
     AgentCapabilities::new()
         .load_session(true)
@@ -119,7 +133,8 @@ fn agent_capabilities() -> AgentCapabilities {
             SessionCapabilities::new()
                 .list(SessionListCapabilities::new())
                 .delete(SessionDeleteCapabilities::new())
-                .resume(SessionResumeCapabilities::new()),
+                .resume(SessionResumeCapabilities::new())
+                .close(SessionCloseCapabilities::new()),
         )
 }
 
@@ -160,6 +175,7 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
     let resume = Arc::clone(&bridge);
     let list = Arc::clone(&bridge);
     let delete = Arc::clone(&bridge);
+    let close = Arc::clone(&bridge);
     let prompt = Arc::clone(&bridge);
     let cancel = Arc::clone(&bridge);
     let permission = Arc::clone(&bridge);
@@ -204,6 +220,12 @@ pub async fn serve_stdio(bridge: Arc<AcpBridge>) -> Result<(), Error> {
         .on_receive_request(
             async move |req: DeleteSessionRequest, responder, _cx| {
                 handle_delete_session(Arc::clone(&delete), req, responder).await
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: CloseSessionRequest, responder, _cx| {
+                handle_close_session(Arc::clone(&close), req, responder).await
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -279,7 +301,10 @@ async fn handle_new_session(
     responder: Responder<NewSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
-    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/new");
+    let mcp_servers = match mcp::declarations(&req.mcp_servers) {
+        Ok(d) => d,
+        Err(reason) => return responder.respond_with_error(invalid_mcp(reason)),
+    };
     if let Err(e) = validate_acp_cwd(&req.cwd) {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
@@ -308,6 +333,18 @@ async fn handle_new_session(
     }
     if !opened.resumed {
         apply_client_cast_preset(&bridge, opened.context_id).await;
+    }
+    if let Err(e) = declare_mcp_servers(&bridge, opened.context_id, mcp_servers).await {
+        if !opened.resumed
+            && let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await
+        {
+            tracing::warn!(
+                context = %opened.context_id.short(),
+                error = %cleanup,
+                "failed to archive fresh context after its MCP servers were refused"
+            );
+        }
+        return responder.respond_with_error(e);
     }
     let session_id = rank::session_id_of(opened.context_id);
     match start_session(&bridge, &session_id, opened.context_id, opened.label, &cx, false).await {
@@ -391,7 +428,10 @@ async fn handle_load_session(
     responder: Responder<LoadSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
-    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/load");
+    let mcp_servers = match mcp::declarations(&req.mcp_servers) {
+        Ok(d) => d,
+        Err(reason) => return responder.respond_with_error(invalid_mcp(reason)),
+    };
     let Some(context_id) = rank::context_id_of(&req.session_id) else {
         return responder.respond_with_error(
             Error::invalid_params().data(serde_json::json!({
@@ -411,6 +451,9 @@ async fn handle_load_session(
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
     bridge.note_client_cwd(&req.cwd);
+    if let Err(e) = declare_mcp_servers(&bridge, context_id, mcp_servers).await {
+        return responder.respond_with_error(e);
+    }
     // Replay the transcript: `session/load` exists so a client can render the
     // conversation it is rejoining.
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, true).await {
@@ -425,7 +468,10 @@ async fn handle_resume_session(
     responder: Responder<ResumeSessionResponse>,
     cx: ConnectionTo<Client>,
 ) -> Result<(), Error> {
-    warn_ignored_mcp_servers(req.mcp_servers.len(), "session/resume");
+    let mcp_servers = match mcp::declarations(&req.mcp_servers) {
+        Ok(d) => d,
+        Err(reason) => return responder.respond_with_error(invalid_mcp(reason)),
+    };
     let Some(context_id) = rank::context_id_of(&req.session_id) else {
         return responder.respond_with_error(
             Error::invalid_params().data(serde_json::json!({
@@ -445,20 +491,55 @@ async fn handle_resume_session(
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
     bridge.note_client_cwd(&req.cwd);
+    if let Err(e) = declare_mcp_servers(&bridge, context_id, mcp_servers).await {
+        return responder.respond_with_error(e);
+    }
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, false).await {
         Ok(()) => responder.respond(ResumeSessionResponse::new()),
         Err(e) => responder.respond_with_error(e),
     }
 }
 
-fn warn_ignored_mcp_servers(count: usize, method: &'static str) {
-    if count != 0 {
-        tracing::warn!(
-            count,
-            method,
-            "ignoring client-declared mcpServers — external MCP wiring is unplumbed (docs/acp.md gap #5)"
-        );
+/// Hand a session's MCP servers to the kernel and remember them for
+/// [`redeclare_mcp_servers`]. An empty list withdraws them. A refusal names
+/// the server: `invalid_params` when the declaration must change,
+/// `internal_error` when a server failed to start.
+async fn declare_mcp_servers(
+    bridge: &AcpBridge,
+    context_id: ContextId,
+    servers: Vec<ContextMcpServerDecl>,
+) -> Result<(), Error> {
+    let known = bridge.mcp_declared.lock().contains_key(&context_id);
+    if servers.is_empty() && !known {
+        return Ok(());
     }
+    match bridge.kernel.declare_mcp_servers(context_id, servers.clone()).await {
+        Ok(Ok(instances)) => {
+            if servers.is_empty() {
+                bridge.mcp_declared.lock().remove(&context_id);
+            } else {
+                tracing::info!(context = %context_id.short(), ?instances, "session MCP servers running");
+                bridge.mcp_declared.lock().insert(context_id, servers);
+            }
+            Ok(())
+        }
+        Ok(Err(refusal)) if refusal.invalid => Err(invalid_mcp(refusal.message)),
+        Ok(Err(refusal)) => Err(Error::internal_error().data(serde_json::json!({ "reason": refusal.message }))),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// Declare a session's MCP servers again before a prompt. While they run
+/// this changes nothing; after a reconnect it restarts them.
+async fn redeclare_mcp_servers(bridge: &AcpBridge, context_id: ContextId) -> Result<(), Error> {
+    let Some(servers) = bridge.mcp_declared.lock().get(&context_id).cloned() else {
+        return Ok(());
+    };
+    declare_mcp_servers(bridge, context_id, servers).await
+}
+
+fn invalid_mcp(reason: String) -> Error {
+    Error::invalid_params().data(serde_json::json!({ "reason": reason }))
 }
 
 fn invalid_cwd(cwd: &std::path::Path, error: anyhow::Error) -> Error {
@@ -624,6 +705,9 @@ async fn handle_delete_session(
             })),
         );
     };
+    if let Err(e) = declare_mcp_servers(&bridge, context_id, Vec::new()).await {
+        return responder.respond_with_error(e);
+    }
     match bridge.kernel.archive_context(context_id).await {
         Ok(()) => {
             bridge.sessions.unbind(&req.session_id);
@@ -631,6 +715,30 @@ async fn handle_delete_session(
         }
         Err(e) => responder.respond_with_error(Error::resource_not_found(Some(e.to_string()))),
     }
+}
+
+/// `session/close` — stop the session's turn, withdraw its MCP servers, and
+/// stop its event pump. The context stays live in the kernel; a later
+/// `session/load` or `session/resume` attaches it again.
+async fn handle_close_session(
+    bridge: Arc<AcpBridge>,
+    req: CloseSessionRequest,
+    responder: Responder<CloseSessionResponse>,
+) -> Result<(), Error> {
+    let Some(session) = bridge.sessions.get(&req.session_id) else {
+        return responder.respond_with_error(Error::resource_not_found(Some(format!(
+            "no such session: {} — it is not open on this connection",
+            req.session_id
+        ))));
+    };
+    if let Err(e) = bridge.kernel.interrupt(session.context_id, false).await {
+        return responder.respond_with_error(internal(e));
+    }
+    if let Err(e) = declare_mcp_servers(&bridge, session.context_id, Vec::new()).await {
+        return responder.respond_with_error(e);
+    }
+    bridge.sessions.unbind(&req.session_id);
+    responder.respond(CloseSessionResponse::new())
 }
 
 /// `session/prompt` — spawned, never run in the dispatch loop.
@@ -663,6 +771,9 @@ fn handle_prompt(
         )
         .await
         {
+            return responder.respond_with_error(e);
+        }
+        if let Err(e) = redeclare_mcp_servers(&bridge, session.context_id).await {
             return responder.respond_with_error(e);
         }
 

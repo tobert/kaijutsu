@@ -12,6 +12,13 @@ instance-id namespace so a context binding can grant/deny the two
 independently. `[servers.kaibo]` and `[servers.bevy_brp]` in
 `assets/defaults/mcp.toml` are the shipping examples.
 
+A connected client can also declare stdio servers for one context
+(`declareContextMcpServers`; ACP `mcpServers`). Those register as
+`context.<context id hex>.<name>`, are granted to that context alone (`*`
+does not cover them), and stop with the last connection that declared them
+(`mcp/context_servers.rs`; docs/acp.md, "Client-declared MCP servers"). A
+declared name that an `external.*` server already holds is refused.
+
 ## Component 1 — the loader (`mcp/toml.rs`)
 
 `load_mcp_config_toml` parses the TOML into `Vec<McpServerConfig>` +

@@ -108,6 +108,17 @@ pub const FACADE_PROJECTED_INSTANCES: &[(&str, &str)] = &[
     ("builtin.shell_operations", "shell_write"),
 ];
 
+/// Instance-id prefix for MCP servers a connected client declared for one
+/// context: `context.<context id hex>.<server name>`. `*` never covers these
+/// instances; the declaring context holds an explicit instance grant while
+/// the server runs. See `docs/acp.md`, "Client-declared MCP servers".
+pub const CONTEXT_SCOPED_PREFIX: &str = "context.";
+
+/// True if `instance` is a context-scoped MCP server instance.
+pub fn is_context_scoped(instance: &InstanceId) -> bool {
+    instance.as_str().starts_with(CONTEXT_SCOPED_PREFIX)
+}
+
 /// A single capability grant or query. The allow-set is the positive surface a
 /// context may use. `Instance`/`Tool`/`Facade` are the granular grants;
 /// `AllInstances`/`AllFacades`/`Admin` are the explicit broad grants that set
@@ -124,7 +135,8 @@ pub enum Capability {
     Tool { instance: InstanceId, tool: String },
     /// A facade tool not routed through the broker.
     Facade(String),
-    /// Every broker instance ("*"). Does **not** imply `Admin`.
+    /// Every broker instance ("*") except context-scoped ones
+    /// ([`CONTEXT_SCOPED_PREFIX`]). Does **not** imply `Admin`.
     AllInstances,
     /// Every facade surface ("facade:*").
     AllFacades,
@@ -311,6 +323,22 @@ impl ContextToolBinding {
         self.binding_admin
     }
 
+    /// True if `*` grants `instance`. It never grants a context-scoped
+    /// instance (see [`is_context_scoped`]); only an explicit grant does.
+    fn all_instances_cover(&self, instance: &InstanceId) -> bool {
+        self.all_instances && !is_context_scoped(instance)
+    }
+
+    /// This binding without any grant or sticky name for a context-scoped
+    /// instance. A fork copies its parent's binding through this, so the
+    /// child does not inherit servers declared for the parent alone.
+    pub fn without_context_scoped(mut self) -> Self {
+        self.allowed_instances.retain(|i| !is_context_scoped(i));
+        self.allowed_tools.retain(|(i, _)| !is_context_scoped(i));
+        self.name_map.retain(|_, (i, _)| !is_context_scoped(i));
+        self
+    }
+
     /// True if this binding grants `facade` — directly or via `facade:*`.
     fn facade_granted(&self, facade: &str) -> bool {
         self.all_facades || self.allowed_facades.iter().any(|f| f == facade)
@@ -333,10 +361,10 @@ impl ContextToolBinding {
     pub fn allows(&self, cap: &Capability) -> bool {
         match cap {
             Capability::Instance(instance) => {
-                self.all_instances || self.allowed_instances.contains(instance)
+                self.all_instances_cover(instance) || self.allowed_instances.contains(instance)
             }
             Capability::Tool { instance, tool } => {
-                self.all_instances
+                self.all_instances_cover(instance)
                     || self.allowed_instances.contains(instance)
                     || self.facade_projection_allows(instance)
                     || self
@@ -424,7 +452,9 @@ impl ContextToolBinding {
     /// `AllInstances` itself is never inert — revoking `*` does narrow.
     pub fn revoke_is_inert(&self, cap: &Capability) -> bool {
         match cap {
-            Capability::Instance(_) | Capability::Tool { .. } => self.all_instances,
+            Capability::Instance(instance) | Capability::Tool { instance, .. } => {
+                self.all_instances_cover(instance)
+            }
             Capability::Facade(_) => self.all_facades,
             _ => false,
         }
@@ -848,5 +878,34 @@ mod tests {
         assert!(!b.is_allowed(&a));
         assert!(b.name_map.values().all(|(inst, _)| inst != &a));
         assert_eq!(b.resolve("b.write"), Some(&(c, "write".into())));
+    }
+    #[test]
+    fn all_instances_does_not_cover_a_context_scoped_instance() {
+        let scoped = inst("context.0123456789abcdef0123456789abcdef.fixture");
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        assert!(!b.allows(&Capability::Instance(scoped.clone())));
+        assert!(!b.allows_tool(&scoped, "fixture_echo"));
+        assert!(!b.revoke_is_inert(&Capability::Instance(scoped.clone())));
+
+        b.grant(Capability::Instance(scoped.clone()));
+        assert!(b.allows_tool(&scoped, "fixture_echo"), "an explicit grant covers it");
+    }
+
+    #[test]
+    fn a_fork_copy_drops_context_scoped_grants() {
+        let scoped = inst("context.0123456789abcdef0123456789abcdef.fixture");
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::AllInstances);
+        b.grant(Capability::Instance(scoped.clone()));
+        b.grant(Capability::Tool { instance: scoped.clone(), tool: "fixture_echo".into() });
+        b.grant(Capability::Instance(inst("builtin.file")));
+        b.apply_resolutions(vec![((scoped.clone(), "fixture_echo".into()), "fixture_echo".into())]);
+
+        let child = b.without_context_scoped();
+        assert!(!child.allows_tool(&scoped, "fixture_echo"));
+        assert!(child.resolve("fixture_echo").is_none());
+        assert!(child.all_instances);
+        assert!(child.allows(&Capability::Instance(inst("builtin.file"))));
     }
 }

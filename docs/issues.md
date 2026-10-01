@@ -399,6 +399,32 @@ this left open:
   description needs correcting, or the archived case needs the same
   registry-fallback treatment the already-joined fast path now gets.
 
+## Client-declared MCP servers: what stays open (2026-10-01)
+
+ACP `mcpServers` now start on the kernel host and reach only the session's
+context (`mcp::context_servers`, docs/acp.md, "Client-declared MCP
+servers"). Open, most likely to bite first:
+
+- **10 s is short for an `npx` server.** A declared server must finish spawn,
+  handshake, and `tools/list` within the kernel's `mcp_connect_timeout`
+  (10 s). `npx -y <package>` on a cold cache downloads first, so an MCPMark
+  task can fail `session/new` for want of time. ACP carries no timeout; the
+  choices are a longer kernel default for declared servers or a `_meta` key.
+- **`http` is unproven from ACP.** The broker speaks streamable HTTP for
+  `mcp.toml`, and Harbor sends `streamable-http` servers as ACP `http`, but
+  no test drives it, so `mcpCapabilities.http` stays false and such a
+  session fails. `sse` has no broker transport at all.
+- **A reconnect mid-turn loses the tools until the next prompt.** The kernel
+  stops a connection's servers when it closes; the bridge redeclares only
+  at `session/prompt`.
+- **A kernel crash leaves stale grants.** The `context.<hex>.<name>` grant
+  is a persisted binding entry; after a crash nothing revokes it. It grants
+  nothing (no instance has that id until the session redeclares) but shows
+  in `kj binding show`. A boot sweep of `context.*` grants would remove it.
+- **The fleet has no `mcpServers` key.** The end-to-end tests live in
+  `crates/kaijutsu-solo-acp/tests/acp_mcp_servers.rs`, so the Harbor-shape
+  invariants are not checked against an MCP tool call yet.
+
 ## kaijutsu-mcp session identity (2026-09-25)
 
 From the kaibo review of 2d274c2e (routing by host pid, host-supplied ids):
@@ -612,9 +638,8 @@ more readily than other agents". Open, most costly first:
 - **ACP has no model selection.** Harbor's runner raises when `--model` is
   passed and the agent advertises none; the model is chosen through the
   agent's own flags meanwhile.
-- **ACP `mcpServers` are ignored** with a warning
-  (`crates/kaijutsu-acp/src/lib.rs`, `warn_ignored_mcp_servers`), which blocks
-  MCPMark and any task that ships MCP servers.
+- **ACP `mcpServers` run, stdio only.** See "Client-declared MCP servers:
+  what stays open" for what an MCPMark run may still hit.
 - **File tools:** `read` truncates a line at 2000 characters with no way to
   page within it; `grep` stops at 200 matches without saying how many remain
   (`mcp/servers/file.rs`).

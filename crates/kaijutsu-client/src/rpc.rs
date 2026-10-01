@@ -518,6 +518,28 @@ pub struct KjCommandInfo {
     pub argv_prefix: Vec<String>,
 }
 
+/// One stdio MCP server a client declares for a context
+/// (`declareContextMcpServers`). It runs on the kernel host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextMcpServerDecl {
+    pub name: String,
+    /// Executable path, or a bare name found on the kernel's `PATH`.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// The kernel refused a context MCP declaration; nothing changed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ContextMcpRefusal {
+    /// Names the server and the reason.
+    pub message: String,
+    /// True when the declaration must change (duplicate, empty, or reserved
+    /// name); false when a server failed to start.
+    pub invalid: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KjExecutionResult {
     pub exit_code: i32,
@@ -2331,6 +2353,53 @@ impl KernelHandle {
             return Err(RpcError::ServerError(result.get_error()?.to_string()?));
         }
         Ok(())
+    }
+
+    /// Replace this connection's MCP servers for `context_id` with
+    /// `servers`; an empty list withdraws them. Returns each server's broker
+    /// instance id, or the kernel's refusal.
+    pub async fn declare_context_mcp_servers(
+        &self,
+        context_id: ContextId,
+        servers: &[ContextMcpServerDecl],
+    ) -> Result<Result<Vec<String>, ContextMcpRefusal>, RpcError> {
+        let mut request = self.kernel.declare_context_mcp_servers_request();
+        request.get().set_context_id(context_id.as_bytes());
+        {
+            let mut list = request.get().init_servers(servers.len() as u32);
+            for (i, server) in servers.iter().enumerate() {
+                let mut entry = list.reborrow().get(i as u32);
+                entry.set_name(&server.name);
+                entry.set_command(&server.command);
+                let mut args = entry.reborrow().init_args(server.args.len() as u32);
+                for (j, arg) in server.args.iter().enumerate() {
+                    args.set(j as u32, arg);
+                }
+                let mut env = entry.init_env(server.env.len() as u32);
+                for (j, (name, value)) in server.env.iter().enumerate() {
+                    let mut var = env.reborrow().get(j as u32);
+                    var.set_name(name);
+                    var.set_value(value);
+                }
+            }
+        }
+        {
+            let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+            let mut trace = request.get().init_trace();
+            trace.set_traceparent(&traceparent);
+            trace.set_tracestate(&tracestate);
+        }
+        let response = request.send().promise.await?;
+        let result = response.get()?;
+        let error = result.get_error()?.to_string()?;
+        if !error.is_empty() {
+            return Ok(Err(ContextMcpRefusal { message: error, invalid: result.get_invalid() }));
+        }
+        let mut instances = Vec::new();
+        for instance in result.get_instances()?.iter() {
+            instances.push(instance?.to_string()?);
+        }
+        Ok(Ok(instances))
     }
 
     /// Run `argv`, authoring a tool-call/tool-result block pair — the

@@ -73,3 +73,55 @@ command = "{stub}"
         "a clean pass must clear any previous failure list"
     );
 }
+
+/// A context-scoped declaration (`mcp::context_servers`) against a real
+/// stdio process: it is granted to the declaring context alone, an unchanged
+/// redeclaration keeps the running instance, and the server stops only when
+/// its last owner lets go.
+#[tokio::test]
+async fn context_declared_server_lives_as_long_as_an_owner() {
+    use kaijutsu_kernel::mcp::{
+        Capability, ContextMcpServerSpec, ContextToolBinding, context_instance_id,
+    };
+    use kaijutsu_types::{ContextId, SessionId};
+
+    let kernel = Arc::new(Kernel::new_ephemeral("test").await);
+    let declaring = ContextId::new();
+    let bystander = ContextId::new();
+    let mut star = ContextToolBinding::new();
+    star.grant(Capability::AllInstances);
+    kernel.broker().set_binding(bystander, star).await.unwrap();
+
+    let spec = ContextMcpServerSpec {
+        name: "stub".to_string(),
+        command: stub_server_path(),
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let first = SessionId::new();
+    let second = SessionId::new();
+    let servers = kernel.context_mcp();
+    let instance = context_instance_id(declaring, "stub");
+
+    let ids = servers.declare(&kernel, declaring, first, vec![spec.clone()]).await.unwrap();
+    assert_eq!(ids, vec![instance.clone()]);
+    let running = kernel.broker().instances_snapshot().await[&instance].clone();
+    let grant = Capability::Instance(instance.clone());
+    assert!(kernel.broker().binding(&declaring).await.unwrap().allows(&grant));
+    assert!(
+        !kernel.broker().binding(&bystander).await.unwrap().allows(&grant),
+        "`*` on another context must not reach a context-scoped server"
+    );
+
+    servers.declare(&kernel, declaring, second, vec![spec.clone()]).await.unwrap();
+    let still = kernel.broker().instances_snapshot().await[&instance].clone();
+    assert!(Arc::ptr_eq(&running, &still), "an unchanged declaration must not restart the server");
+
+    servers.declare(&kernel, declaring, first, Vec::new()).await.unwrap();
+    assert!(kernel.broker().list_instances().await.contains(&instance), "the second owner still holds it");
+
+    servers.release_owner(&kernel, second).await;
+    assert!(!kernel.broker().list_instances().await.contains(&instance));
+    assert!(!kernel.broker().binding(&declaring).await.unwrap().allows(&grant));
+    assert!(servers.list_all().await.is_empty());
+}

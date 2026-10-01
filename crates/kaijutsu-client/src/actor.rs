@@ -525,6 +525,13 @@ enum RpcCommand {
         path: String,
         reply: oneshot::Sender<Result<(), CallError>>,
     },
+    DeclareContextMcpServers {
+        context_id: ContextId,
+        servers: Vec<crate::rpc::ContextMcpServerDecl>,
+        reply: oneshot::Sender<
+            Result<Result<Vec<String>, crate::rpc::ContextMcpRefusal>, CallError>,
+        >,
+    },
     ExecuteKj {
         context_id: ContextId,
         argv: Vec<String>,
@@ -821,6 +828,7 @@ impl RpcCommand {
             Self::GetCommandHistory { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetContextCwd { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DeclareContextMcpServers { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKjQuiet { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1524,6 +1532,18 @@ impl ActorHandle {
             path: path.into(),
             reply,
         }).await
+    }
+
+    /// Replace this connection's MCP servers for `context_id`; an empty
+    /// list withdraws them. The kernel stops them when this connection
+    /// closes, so a caller redeclares after a reconnect.
+    #[tracing::instrument(skip(self, servers))]
+    pub async fn declare_context_mcp_servers(
+        &self,
+        context_id: ContextId,
+        servers: Vec<crate::rpc::ContextMcpServerDecl>,
+    ) -> Result<Result<Vec<String>, crate::rpc::ContextMcpRefusal>, CallError> {
+        self.send(|reply| RpcCommand::DeclareContextMcpServers { context_id, servers, reply }).await
     }
 
     #[tracing::instrument(skip(self, argv))]
@@ -3788,6 +3808,15 @@ async fn dispatch_kernel_command(
         }
         // Structured commands use the gate-aware deadline. The server owns
         // accepted execution; a client timeout only stops this wait.
+        // Starting servers spawns processes and waits on each handshake,
+        // which can outlast the request tier.
+        RpcCommand::DeclareContextMcpServers { context_id, servers, reply } => {
+            dispatch_deadline!(
+                kernel, reply, close_tx, k,
+                kaijutsu_types::timeout::tiers::WORK,
+                k.declare_context_mcp_servers(context_id, &servers)
+            );
+        }
         RpcCommand::ExecuteKj { context_id, argv, reply } => {
             dispatch_deadline!(
                 kernel, reply, close_tx, k,

@@ -276,6 +276,20 @@ impl KernelBridge {
             .context("archive context")
     }
 
+    /// Replace this connection's MCP servers for one context; an empty list
+    /// withdraws them. The outer error is the RPC; the inner one is the
+    /// kernel's refusal, which names the server.
+    pub async fn declare_mcp_servers(
+        &self,
+        context_id: ContextId,
+        servers: Vec<kaijutsu_client::ContextMcpServerDecl>,
+    ) -> Result<Result<Vec<String>, kaijutsu_client::ContextMcpRefusal>> {
+        self.actor
+            .declare_context_mcp_servers(context_id, servers)
+            .await
+            .context("declare context MCP servers")
+    }
+
     /// Read the context's authoritative, loadout-filtered `kj` command surface.
     pub async fn kj_command_catalog(&self, context_id: ContextId) -> Result<Vec<KjCommandInfo>> {
         self.actor

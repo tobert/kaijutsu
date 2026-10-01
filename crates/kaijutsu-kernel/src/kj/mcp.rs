@@ -1,5 +1,6 @@
 //! `kj mcp` — visibility and reconciliation for external MCP servers
-//! (mcp.toml: kaibo, bevy_brp, …).
+//! (mcp.toml: kaibo, bevy_brp, …). `list` also shows the servers connected
+//! clients declared for one context each (`mcp::context_servers`).
 //!
 //! Before this verb existed, `kj config set mcp.toml` was a silent no-op at
 //! runtime — nothing ever read the file back. `list` (alias `status`) makes
@@ -39,7 +40,8 @@ pub(crate) struct McpArgs {
 #[derive(Subcommand, Debug)]
 enum McpCommand {
     /// Show every configured server (mcp.toml) alongside what's actually
-    /// registered on the broker, with health.
+    /// registered on the broker, with health, then the servers connected
+    /// clients declared for one context each.
     #[command(alias = "status")]
     List {},
     /// Re-read mcp.toml and reconcile: add newly-configured servers, remove
@@ -200,7 +202,8 @@ impl KjDispatcher {
             ));
         }
 
-        if rows.is_empty() {
+        let declared = self.kernel().context_mcp().list_all().await;
+        if rows.is_empty() && declared.is_empty() {
             return KjResult::ok_with_data(
                 "(no external MCP servers configured)".to_string(),
                 serde_json::Value::Array(Vec::new()),
@@ -209,13 +212,13 @@ impl KjDispatcher {
 
         let data = serde_json::Value::Array(
             rows.iter()
-                .map(|(name, _, _, _, _)| {
-                    serde_json::Value::String(external_instance_id(name).as_str().to_string())
-                })
+                .map(|(name, _, _, _, _)| external_instance_id(name).as_str().to_string())
+                .chain(declared.iter().map(|(_, _, instance)| instance.as_str().to_string()))
+                .map(serde_json::Value::String)
                 .collect(),
         );
 
-        let mut lines = Vec::with_capacity(rows.len());
+        let mut lines = Vec::with_capacity(rows.len() + declared.len() + 1);
         for (name, status, transport, health, last_failure) in &rows {
             let health_str = match health {
                 Some(Health::Ready) => " ready".to_string(),
@@ -229,6 +232,21 @@ impl KjDispatcher {
                 line.push_str(&format!("\n    last failure: {reason}"));
             }
             lines.push(line);
+        }
+        if !declared.is_empty() {
+            lines.push("declared by a connected client, one context each:".to_string());
+            let snapshot = broker.instances_snapshot().await;
+            for (context, name, instance) in &declared {
+                let health = match snapshot.get(instance) {
+                    Some(server) => match server.health().await {
+                        Health::Ready => "ready".to_string(),
+                        Health::Degraded { reason } => format!("degraded ({reason})"),
+                        Health::Down { reason } => format!("down ({reason})"),
+                    },
+                    None => "not registered".to_string(),
+                };
+                lines.push(format!("  {name} — context {} {health}", context.short()));
+            }
         }
         KjResult::ok_with_data(lines.join("\n"), data)
     }
@@ -346,6 +364,26 @@ mod tests {
             .await
             .unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn list_shows_servers_a_client_declared_for_a_context() {
+        let d = test_dispatcher("").await;
+        let ctx = kaijutsu_types::ContextId::new();
+        d.kernel()
+            .context_mcp()
+            .insert_for_test(ctx, "fixture", kaijutsu_types::SessionId::new())
+            .await;
+        let caller = test_helpers::test_caller();
+
+        let result = d.dispatch_mcp(&[s("list")], &caller).await;
+        let KjResult::Ok { message, .. } = result else {
+            panic!("expected Ok, got {result:?}");
+        };
+        assert!(
+            message.contains(&format!("fixture — context {}", ctx.short())),
+            "got: {message}"
+        );
     }
 
     #[tokio::test]

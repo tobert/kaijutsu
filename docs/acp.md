@@ -37,7 +37,8 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`):
 | `session/load` | attach → reassert requested cwd → replay transcript as updates | built |
 | `session/resume` | attach → reassert requested cwd → live pump without transcript replay | built; advertised as stable ACP v1 |
 | `session/list` | **the rank** — `list_contexts` → `assign_ring_seats`, ring 0 then ring 1; cwd read per context | built |
-| `session/delete` | archive the kj context → unbind/stop the live pump | built; advertised as stable ACP v1 |
+| `session/delete` | withdraw its MCP servers → archive the kj context → unbind/stop the live pump | built; advertised as stable ACP v1 |
+| `session/close` | soft interrupt → withdraw its MCP servers → unbind/stop the live pump; the context stays live | built; advertised as stable ACP v1 |
 | `session/prompt` | `get_input_state` → `edit_input(0, text, len)` → `submit_input(ctx, false)` | built; text-only |
 | turn end → `stopReason` | `ServerEvent::TurnCompleted{stop_reason}` (1:1 by construction) | built |
 | turn broke | `ServerEvent::TurnFailed` → JSON-RPC error, **not** a stop reason | built |
@@ -45,7 +46,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`):
 | `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
 | `session/request_permission` | approval-ledger ask → `subscribeLedgerEvents` generation bump → `kj ledger list`/`show` poll → ACP session (`rank::session_id_of`) → real round trip → `kj ledger allow`/`deny` | built |
-| `mcpServers` declared into session | external MCP wiring (`external.rs`, no caller) | ignored + warned |
+| `mcpServers` declared into session | `declareContextMcpServers` → stdio server on the kernel host, granted to the session's context alone | built, stdio only; `http`/`sse` refused by name — see "Client-declared MCP servers" |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the context mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
 | `session/update` `UsageUpdate` | context-window occupancy (`used`/`size`) at each turn boundary | built — see "Context window usage" below |
@@ -216,6 +217,47 @@ Two prototype compromises remain behind the otherwise working turn loop:
 Both want addressed identity on the originating write/turn, not another
 timing heuristic.
 
+### Client-declared MCP servers
+
+```json
+{"method": "session/new", "params": {"cwd": "/app", "mcpServers": [
+  {"name": "fixture", "command": "/usr/local/bin/mcp-fixture", "args": [], "env": []}
+]}}
+```
+
+The bridge hands the list to the kernel (`declareContextMcpServers`). The
+kernel starts each server on the kernel host, registers it on the broker as
+`context.<context id hex>.<name>`, and grants that instance to the session's
+context with an explicit binding entry. `*` never covers a context-scoped
+instance, so another context — even a `coder` holding `*` — does not see
+its tools, and a fork does not inherit the grant. The model sees the tools
+under their own names, qualified only on a collision, like any broker tool.
+`kj mcp list` shows these servers under "declared by a connected client".
+
+- **Lifecycle.** A declaration replaces the connection's set for that
+  context. `session/new`, `session/load`, and `session/resume` each declare;
+  a redeclared, unchanged server keeps its process, a changed one restarts,
+  and one left out stops. `session/close` and `session/delete` withdraw the
+  set. The kernel also withdraws it when the declaring connection closes,
+  and kills a server whose kernel exits (`PR_SET_PDEATHSIG`).
+- **Reconnect.** A dropped kernel connection stops that connection's
+  servers. Each `session/prompt` redeclares the session's servers, which
+  restarts them after a reconnect and changes nothing otherwise; a turn
+  already running when the connection dropped loses them until the next
+  prompt.
+- **Errors.** Nothing starts and the request fails, naming the server, when
+  two servers share a name, a name is empty, a name is already an `mcp.toml`
+  server (`invalid_params`), a transport is `http` or `sse`
+  (`invalid_params`), or a server fails to start or finish the MCP
+  handshake within the kernel's `mcp_connect_timeout`, 10 s by default
+  (`internal_error`). A fresh context from a failed `session/new` is
+  archived.
+- **Command.** `command` runs on the kernel host, which is the same machine
+  as the client for `kaijutsu-solo-acp`. A bare name is found on the
+  kernel's `PATH`; ACP asks for an absolute path, and Harbor sends both. The
+  server inherits the kernel's environment plus the declared `env`, and the
+  kernel process's working directory, not the session cwd.
+
 ## Remaining work, in shippable hunks
 
 The order is deliberate but not a monolithic project plan. Each hunk should
@@ -249,9 +291,11 @@ a Toad flight before the next one needs to start.
    it with even if it were on — `ContextUsageRow` is a last-completed-call
    snapshot, not a cumulative total. See "Context window usage" below for
    the full writeup.
-5. **Client-declared MCP servers.** Call the already-built external MCP
-   substrate for `mcpServers` on new/load/resume; define lifecycle, reconnect,
-   duplicate-name, and teardown semantics before advertising transports.
+5. **Client-declared MCP servers — shipped, stdio.** `mcpServers` on
+   new/load/resume start on the kernel host and reach only the session's
+   context; see "Client-declared MCP servers" below. `http` stays
+   unadvertised until a test drives the broker's streamable-HTTP transport
+   from ACP; `sse` has no broker transport.
 6. **Modes and config options.** Project casts/presets/context type and useful
    settings; implement both client-set methods and asynchronous updates.
 7. **Rich prompt content.** Carry resources and media end to end, then turn on
@@ -296,11 +340,9 @@ memory lives.
 
 ## Open gaps below the adapter
 
-- **ACP's client-declared `mcpServers` is ignored + warned, not wired**
-  (matches the concept-mapping table above) — kaijutsu's own external-MCP
-  reconciler only reads `/config/kernel/mcp.toml`, never a per-session,
-  client-supplied server list. Also v2-proofing: v2 drops `fs/*`/`terminal/*`
-  for client-provided MCP.
+- **Client-declared MCP servers are stdio only.** v2 drops
+  `fs/*`/`terminal/*` for client-provided MCP, so `http` (and whatever v2
+  names its in-band transport) is the next transport to prove.
 - **`kj wait` is built** (fork/drive/wait composes: fork snapshots, drive execs
   the child, wait joins it) — a subscription taken before the first state read
   closes the turn-ended-before-the-waiter-subscribed race against the
@@ -318,6 +360,7 @@ src/bridge.rs      kernel side: connect, resolve/create/join, prompt, interrupt
 src/session.rs     SessionRegistry + the per-session event pump + the turn wait
 src/update.rs      PURE: BlockSnapshot → SessionUpdate (the mapping layer)
 src/rank.rs        PURE: ContextInfo[] → the rank → SessionInfo[]
+src/mcp.rs         PURE: ACP mcpServers → the kernel's context MCP declaration
 src/permission.rs  the live Ask pathway: pump, option shaping, answer mapping
 src/lib.rs         the six ACP handlers + version negotiation
 src/main.rs        clap, stderr tracing, LocalSet, --connect

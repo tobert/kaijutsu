@@ -9,6 +9,7 @@ pub mod binding;
 pub mod broker;
 pub mod coalescer;
 pub mod context;
+pub mod context_servers;
 pub mod error;
 pub mod external_registry;
 pub mod hook_persist;
@@ -29,6 +30,9 @@ pub use external_registry::{
 };
 pub use toml::{McpConfigLoad, load_mcp_config_toml};
 pub use context::{CallContext, TraceContext};
+pub use context_servers::{
+    ContextMcpError, ContextMcpServerSpec, ContextMcpServers, context_instance_id,
+};
 pub use error::{CoalescerError, HookId, McpError, McpResult, PolicyError};
 pub use hook_table::{
     AskSpec, GlobPattern, Hook, HookAction, HookBody, HookEntry, McpHookPhase, HookTable,

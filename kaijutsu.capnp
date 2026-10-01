@@ -524,6 +524,21 @@ struct CommitCaptureOutcome {
   }
 }
 
+# One stdio MCP server a client declares for a context
+# (`declareContextMcpServers`). `command` is an executable path, or a bare
+# name the kernel finds on its own PATH; it runs on the kernel host.
+struct ContextMcpServer {
+  name @0 :Text;
+  command @1 :Text;
+  args @2 :List(Text);
+  env @3 :List(EnvVar);
+
+  struct EnvVar {
+    name @0 :Text;
+    value @1 :Text;
+  }
+}
+
 struct ExecuteKjOutcome {
   union {
     ok :group {
@@ -2560,4 +2575,20 @@ interface Kernel {
   # connection-bound rule. `observedEpochNs` is the daemon's own wallclock
   # at observation, in the kernel's clock domain.
   reportAudioInventory @104 (node :Text, revision :UInt64, observedEpochNs :UInt64, report :Data) -> ();
+
+  # ── Client-declared MCP servers (docs/acp.md, "Client-declared MCP servers") ──
+
+  # Replace this connection's MCP servers for one context with `servers`;
+  # an empty list withdraws them. The kernel starts each new or changed
+  # server, grants it to that context alone (`*` never covers it), and
+  # stops it when no connection declares it any more — including when the
+  # declaring connection closes. Redeclaring an unchanged server keeps its
+  # running process. Returns each server's broker instance id, in order.
+  #
+  # On failure nothing changes and `error` names the server. `invalid` is
+  # true when the declaration itself must change (a duplicate name, an
+  # empty name or command, a name an mcp.toml server already holds) and
+  # false when a server failed to start.
+  declareContextMcpServers @106 (contextId :Data, servers :List(ContextMcpServer), trace :TraceContext)
+      -> (instances :List(Text), error :Text, invalid :Bool);
 }

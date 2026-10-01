@@ -569,6 +569,10 @@ pub struct ConnectionState {
     /// the connection's `LocalSet`, which is dropped the moment the RPC
     /// session returns, so nothing written after its loop ever runs.
     peer_attachments: Option<(Arc<Kernel>, Vec<(String, u64)>)>,
+    /// The kernel this connection declared context MCP servers on, if it
+    /// declared any. `Drop` withdraws them so a server never outlives every
+    /// connection that declared it.
+    context_mcp: Option<Arc<Kernel>>,
 }
 
 impl ConnectionState {
@@ -591,6 +595,7 @@ impl ConnectionState {
             audio_inventory: None,
             midi_exchange: None,
             peer_attachments: None,
+            context_mcp: None,
         }
     }
 
@@ -802,6 +807,24 @@ impl Drop for ConnectionState {
                     self.session_id.short(),
                     detached.join(", ")
                 );
+            }
+        }
+        // Withdraw this connection's context MCP servers. Stopping one
+        // awaits its process, so the release runs as a task; a server
+        // another connection still declares keeps running.
+        if let Some(kernel) = self.context_mcp.take() {
+            let owner = self.session_id;
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        kernel.context_mcp().release_owner(&kernel, owner).await;
+                    });
+                }
+                Err(e) => log::error!(
+                    "context MCP: connection {} closed with no runtime to stop its servers ({e}); \
+                     they stop with the kernel process",
+                    owner.short()
+                ),
             }
         }
         // Clean up per-session context tracking. Mirrors the explicit
@@ -4013,6 +4036,68 @@ impl kernel::Server for KernelImpl {
             results.get().set_error(outcome.err().unwrap_or_default());
             Ok(())
         }.instrument(trace_span))
+    }
+
+    fn declare_context_mcp_servers(
+        self: Rc<Self>,
+        params: kernel::DeclareContextMcpServersParams,
+        mut results: kernel::DeclareContextMcpServersResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let trace_span = extract_rpc_trace(p.get_trace(), "declare_context_mcp_servers");
+        let context_id = pry!(
+            ContextId::try_from_slice(pry!(p.get_context_id()))
+                .ok_or_else(|| capnp::Error::failed("invalid context ID".into()))
+        );
+        pry!(require_context_exists(&self.kernel, context_id));
+        let mut specs = Vec::new();
+        for server in pry!(p.get_servers()).iter() {
+            let text = |t: capnp::Result<capnp::text::Reader<'_>>| -> capnp::Result<String> {
+                Ok(t?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_owned())
+            };
+            let mut args = Vec::new();
+            for arg in pry!(server.get_args()).iter() {
+                args.push(pry!(text(arg)));
+            }
+            let mut env = Vec::new();
+            for var in pry!(server.get_env()).iter() {
+                env.push((pry!(text(var.get_name())), pry!(text(var.get_value()))));
+            }
+            specs.push(kaijutsu_kernel::mcp::ContextMcpServerSpec {
+                name: pry!(text(server.get_name())),
+                command: pry!(text(server.get_command())),
+                args,
+                env,
+            });
+        }
+        let kernel = self.kernel.kernel.clone();
+        let connection = self.connection.clone();
+        Promise::from_future(
+            async move {
+                let owner = {
+                    let mut conn = connection.borrow_mut();
+                    if conn.context_mcp.is_none() {
+                        conn.context_mcp = Some(kernel.clone());
+                    }
+                    conn.session_id
+                };
+                match kernel.context_mcp().declare(&kernel, context_id, owner, specs).await {
+                    Ok(instances) => {
+                        let mut list = results.get().init_instances(instances.len() as u32);
+                        for (i, instance) in instances.iter().enumerate() {
+                            list.set(i as u32, instance.as_str());
+                        }
+                        results.get().set_error("");
+                    }
+                    Err(e) => {
+                        results.get().set_error(e.to_string());
+                        results.get().set_invalid(e.is_invalid());
+                    }
+                }
+                Ok(())
+            }
+            .instrument(trace_span),
+        )
     }
 
     fn execute_kj(

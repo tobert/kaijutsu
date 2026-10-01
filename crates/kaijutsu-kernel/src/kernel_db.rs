@@ -4042,7 +4042,11 @@ impl KernelDb {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
         let egress = self.list_context_egress(source)?;
-        let binding = self.get_context_binding(source)?;
+        // A parent's context-scoped MCP grants name servers declared for the
+        // parent alone; the child keeps the rest of the loadout.
+        let binding = self
+            .get_context_binding(source)?
+            .map(crate::mcp::ContextToolBinding::without_context_scoped);
 
         let ws_id = row.workspace_id.unwrap_or(default_workspace_id);
         let doc = DocumentRow {
@@ -6864,7 +6868,8 @@ impl KernelDb {
     /// Copy shell config + env vars + egress hosts + capability binding from
     /// source context to target. Called during all fork operations. The
     /// binding copy makes permissions follow the fork — under deny-by-default
-    /// a fork would otherwise start with no loadout and be locked out.
+    /// a fork would otherwise start with no loadout and be locked out. Grants
+    /// for MCP servers declared for the source alone are not copied.
     ///
     /// Atomic: the four copies land in ONE transaction. A fork that fails
     /// partway must leave NO partial config behind — a half-copied loadout
@@ -6876,7 +6881,9 @@ impl KernelDb {
         let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
         let egress = self.list_context_egress(source)?;
-        let binding = self.get_context_binding(source)?;
+        let binding = self
+            .get_context_binding(source)?
+            .map(crate::mcp::ContextToolBinding::without_context_scoped);
 
         let tx = self.conn.transaction()?;
         if let Some(src) = shell {
@@ -6905,7 +6912,8 @@ impl KernelDb {
     /// Copy the capability binding (flags + instances + tools + facades +
     /// sticky names) from `source` to `target`. No-op if the source has no
     /// binding. The child can later attenuate (self-narrow) but inherits the
-    /// parent's loadout as its starting point.
+    /// parent's loadout as its starting point, without the parent's
+    /// context-scoped MCP server grants.
     pub fn copy_context_binding(
         &mut self,
         source: ContextId,
@@ -6913,7 +6921,7 @@ impl KernelDb {
     ) -> KernelDbResult<bool> {
         match self.get_context_binding(source)? {
             Some(binding) => {
-                self.upsert_context_binding(target, &binding)?;
+                self.upsert_context_binding(target, &binding.without_context_scoped())?;
                 Ok(true)
             }
             None => Ok(false),
@@ -14042,6 +14050,32 @@ mod tests {
         assert!(
             db.get_document(tgt.context_id).unwrap().is_none(),
             "document row must roll back when the config copy fails",
+        );
+    }
+
+    /// A fork keeps its parent's loadout but not the grants for MCP servers
+    /// a client declared for the parent alone.
+    #[test]
+    fn insert_forked_context_drops_context_scoped_mcp_grants() {
+        use crate::mcp::{Capability, ContextToolBinding, InstanceId};
+        let mut db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let src = make_context_row(Some("ifc-scoped-src"));
+        insert_context_with_doc(&db, &src, ws_id);
+        let scoped = InstanceId::new(format!("context.{}.fixture", src.context_id.to_hex()));
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::AllInstances);
+        binding.grant(Capability::Instance(scoped.clone()));
+        db.upsert_context_binding(src.context_id, &binding).unwrap();
+
+        let tgt = make_context_row(Some("ifc-scoped-tgt"));
+        db.insert_forked_context(&tgt, ws_id, src.context_id).unwrap();
+
+        let child = db.get_context_binding(tgt.context_id).unwrap().unwrap();
+        assert!(child.all_instances, "the loadout follows the fork");
+        assert!(
+            !child.allows(&Capability::Instance(scoped)),
+            "a parent's context-scoped MCP grant must not follow the fork"
         );
     }
 

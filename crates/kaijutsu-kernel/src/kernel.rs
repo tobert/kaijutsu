@@ -98,6 +98,10 @@ pub struct Kernel {
     /// MCP-centric tool broker (Phase 1; sits alongside the old `tools`
     /// registry until M4 swaps call sites).
     broker: Arc<Broker>,
+    /// MCP servers connected clients declared for one context each
+    /// (`docs/acp.md`, "Client-declared MCP servers"). Ephemeral: they live
+    /// only as long as a declaring connection.
+    context_mcp: crate::mcp::ContextMcpServers,
     /// Kernel-wide timeout policy: kaish-script bounds, LLM streaming,
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
@@ -421,6 +425,7 @@ impl Kernel {
                 b.engage_unbound_deny();
                 b
             }),
+            context_mcp: crate::mcp::ContextMcpServers::new(),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
             blocks,
             file_cache,
@@ -578,6 +583,11 @@ impl Kernel {
     /// Get the MCP tool broker (Phase 1).
     pub fn broker(&self) -> &Arc<Broker> {
         &self.broker
+    }
+
+    /// MCP servers connected clients declared for one context each.
+    pub fn context_mcp(&self) -> &crate::mcp::ContextMcpServers {
+        &self.context_mcp
     }
 
     /// The host `PATH` this kernel process started with — the `$PATH` seed for
