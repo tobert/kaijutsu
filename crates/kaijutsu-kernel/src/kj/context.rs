@@ -1253,19 +1253,6 @@ impl KjDispatcher {
             )),
         };
 
-        // tool_names: the current tool inventory via the same broker call
-        // the turn path uses, gated on the CALLING principal's own
-        // visibility — a preview should show what this caller's own turn
-        // would actually see, not an omniscient view.
-        let tool_names: Vec<String> = match self
-            .kernel()
-            .list_tool_defs_via_broker(target_id, caller.principal_id)
-            .await
-        {
-            Ok(defs) => defs.into_iter().map(|(name, _, _)| name).collect(),
-            Err(e) => return KjResult::Err(format!("kj context prompt: tool broker: {e}")),
-        };
-
         let situational = crate::llm::SituationalContext {
             context_id: Some(target_id),
             context_label: ctx_label.clone(),
@@ -1274,7 +1261,6 @@ impl KjDispatcher {
             model: resolved_model.clone(),
             performer,
             reviewer,
-            tool_names,
         };
         let prompt = crate::llm::build_system_prompt(&situational, &rc_sections);
 

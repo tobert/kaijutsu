@@ -57,9 +57,14 @@ case "$who" in
     ;;
 esac
 
-if test -z "$notes"; then
-  notes="(no handoff log reachable — this seat's character may have no sheet yet; 'kj character create <name>' mints one)"
-fi
+# Nothing to hand over is nothing to say: no block, so the seat does not carry
+# an empty section on every request. The phrase is `kj handoff tail`'s own.
+case "$notes" in
+  ""|*"has no handoff notes yet"*)
+    echo "handoff: none for $who"
+    exit 0
+    ;;
+esac
 
 stamp="$(date -u --iso-8601=seconds)"
 

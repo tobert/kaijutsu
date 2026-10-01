@@ -126,8 +126,8 @@ interrupt       <target> [--immediate] — stop an accepted turn and close its
                 restarting the chain; only an explicit `kj drive` reopens
                 it. No default target, so a bare `kj interrupt` cannot stop
                 your own turn
-kaish           primer — composed kaish agent-onboarding guidance (kaish-help);
-                what S05-kaish.kai turns into a per-context system block
+kaish           primer — composed kaish agent-onboarding guidance (kaish-help),
+                printed on request; no rc seeds it
 ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 approval-ledger asks left by gated verbs (e.g. `kj cc send`);
                 allow/deny take `--remember <session|always>` to generalize

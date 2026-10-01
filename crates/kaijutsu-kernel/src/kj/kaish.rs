@@ -4,11 +4,9 @@
 //! `kaish-help` exists so a kaish release updates every embedder's
 //! agent-facing prose at once instead of each frontend (kaijutsu, kaibo)
 //! drifting its own copy (`docs/composable-help.md` step 4, kaish-help's own
-//! crate docs). `kj kaish primer` is the per-context onboarding surface: the
-//! `lib/create/S05-kaish.kai` rc script pipes its output into a system block
-//! at every context creation, so the primer is recomposed — and so re-synced
-//! to whatever kaish version is linked — on every `create`, never stored
-//! durably as a copy that can go stale.
+//! crate docs). `kj kaish primer` prints the composed onboarding text on
+//! request. No rc seeds it: the shell tools' descriptions carry the one
+//! statement of kaish a model reads (`mcp/servers/shell.rs`).
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::ContentType;
@@ -31,7 +29,7 @@ pub(crate) struct KaishArgs {
 #[derive(Subcommand, Debug)]
 enum KaishCommand {
     /// Print the composed agent-onboarding primer (model + operating
-    /// contract + builtins) — what `S05-kaish.kai` turns into a system block.
+    /// contract + builtins).
     Primer,
 }
 
@@ -176,7 +174,7 @@ mod tests {
         assert!(result.is_ok(), "kaish primer failed: {}", result.message());
         let primer = result.message();
 
-        let tool_desc = crate::mcp::servers::shell::composed_tool_description();
+        let tool_desc = crate::mcp::servers::shell::tool_description();
         let repeated: Vec<&str> = tool_desc
             .lines()
             .filter(|l| l.trim().len() > 40 && primer.contains(l.trim()))

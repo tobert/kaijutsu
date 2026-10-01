@@ -472,9 +472,11 @@ What is supported:
 
 - **The harness costs pass rate, tokens and time against a bash-only control
   on the same model:** 14 and 15 of 20 against 18, about twice the tokens per
-  solved task, and a slower median solve. A fresh coder seat carries about
-  46,000 input tokens of instructions on every inference; hello-world cost
-  42,497 input tokens against the control's 3,670.
+  solved task, and a slower median solve. A fresh coder seat measured
+  about 14,400 input tokens on 2026-10-01 (the first inference's input
+  count), 80% of it tool schemas; the 46,000 first recorded here was a
+  trial's total. hello-world's whole trial cost 42,497 input tokens against
+  the control's 3,670.
 - **Every ceiling stop in arm A was fatal** (three of three), and the one
   ceiling stop in arm C was survived. That is the turn-loop change
   (`413b9ce0`): a turn now continues past the output ceiling, at most three
@@ -540,7 +542,7 @@ What the runs showed, beyond the pass rate:
   `delta.reasoning`; the kernel's OpenAI delta reads only
   `reasoning_content` (`crates/kaijutsu-kernel/src/llm/openai/types.rs`,
   `Delta`), so the thinking phase is invisible and the stream counts as idle.
-  A prefill of the 46K-token coder seat takes about 25 s on tenchi, so the
+  A prefill of the 14K-token coder seat takes about 25 s on tenchi, so the
   prompt is not the delay. `kaijutsu-solo-acp` also has no flag for the
   backend's idle timeout. Both need a kernel change.
 - **A deleted working directory wedges the shell.** openssl-selfsigned-cert

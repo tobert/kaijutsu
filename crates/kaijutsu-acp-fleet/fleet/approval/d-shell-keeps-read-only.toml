@@ -1,6 +1,11 @@
 description = "Property (d), path B: an approved hook ask on the read-only shell runs with the read-only policy it was asked under, so a write stays refused."
 
 [rc]
+"coder/create/S11-read-only-shell.kai" = """
+# The shipped coder holds one shell, the writable one. This scenario tests the
+# read-only shell other seats hold, so it grants it here.
+kj binding allow "facade:shell"
+"""
 "coder/create/S60-fleet-hook.kai" = """
 kj hook add pre_call '{"match_tool":"shell","hook_id":"fleet-shell-ask"}' '{"type":"kaish_path","path":"/config/rc/lib/hooks/fleet.kai"}'
 """

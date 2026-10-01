@@ -104,6 +104,12 @@ contexts do not read history. Put what they need in the brief you give them."
     ;;
 esac
 
+stance="$stance
+
+Before you stop, leave a handoff note: what you did, what is unfinished, and
+what is next. A later seat starts from that note and cannot ask you. Durable
+decisions belong in the project notes as well."
+
 echo "stance: $tier tier (resolved_model=$model, character=$who)"
 
 kj block create --role system --kind text --content "$stance"

@@ -1,1 +1,24 @@
-/config/rc/lib/create/S10-binding.kai
+# coder: what a coding seat uses, and nothing else. Every tool schema rides
+# on every request, so the roster is the seat's largest cost.
+set -e
+# One shell: the writable one. Its facade also projects the shell-operation
+# tools and opens the person's shell box (`Broker::check_shell_facade`).
+kj binding allow "facade:shell_write"
+kj binding allow "builtin.file"
+kj binding allow "builtin.tasks"
+# `done` ends the task, and a reply with no tool call does not end the turn.
+# `*` does not cover builtin.turn; this grant is the opt-in. See
+# docs/conversation-session.md, "Ending a task with done".
+kj binding allow "builtin.turn"
+# The person's input surfaces in this context: compose edits, submit, capture.
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"
+# kj verb authorities, as the shared broad loadout grants them.
+kj binding allow "drive"
+kj binding allow "fork"
+kj binding allow "drift"
+kj binding allow "transport"
+kj binding allow "operator"
+kj binding allow "exec"
+kj binding allow "editor"

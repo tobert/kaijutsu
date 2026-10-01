@@ -1178,6 +1178,13 @@ impl Broker {
         old_pairs: &HashSet<(InstanceId, String)>,
         new_pairs: &HashSet<(InstanceId, String)>,
     ) {
+        // A context whose model has not run has no roster to change: its first
+        // request carries the whole tool list. An rc create script grants
+        // several instances, and announcing each would hand the model a stack
+        // of notices about tools it already has.
+        if !self.model_has_run(context_id).await {
+            return;
+        }
         let added = group_pairs_by_instance(new_pairs.difference(old_pairs));
         let removed = group_pairs_by_instance(old_pairs.difference(new_pairs));
         for (instance, tools) in added {
@@ -1501,6 +1508,21 @@ impl Broker {
             });
         }
         Ok(())
+    }
+
+    /// The RPC shell's gate: either shell facade opens it. `shell_write` is
+    /// the writable superset of `shell`, so a context granted only the
+    /// writable shell (a coder, whose model sees one shell tool) keeps the
+    /// person's shell box. A refusal names `shell`.
+    pub async fn check_shell_facade(&self, context_id: &ContextId) -> McpResult<()> {
+        match self.check_facade(context_id, "shell").await {
+            Err(McpError::FacadeDenied { .. }) => self.check_facade(context_id, "shell_write").await
+                .map_err(|error| match error {
+                    McpError::FacadeDenied { .. } => McpError::FacadeDenied { facade: "shell".to_string() },
+                    other => other,
+                }),
+            other => other,
+        }
     }
 
     /// Compute the visible tool list for `context_id` by walking the
@@ -3624,6 +3646,15 @@ impl Broker {
     /// Used for binding-mutation diff emissions where the mutation
     /// itself is the trigger, not ongoing binding membership. Still runs
     /// `OnNotification` hooks for consistency with `emit_for_bindings`.
+    /// True once the context holds a model block. Without a block store
+    /// (bare broker tests) every context counts as having run.
+    async fn model_has_run(&self, context_id: ContextId) -> bool {
+        let Some(docs) = self.documents.read().await.clone() else { return true };
+        docs.block_snapshots(context_id)
+            .map(|blocks| blocks.iter().any(|b| b.role == kaijutsu_types::Role::Model))
+            .unwrap_or(true)
+    }
+
     async fn emit_for_context(
         self: &Arc<Self>,
         context_id: ContextId,
@@ -5094,6 +5125,26 @@ mod tests {
             s.unsubscribe("file:///x", &ctx).await,
             Err(McpError::Unsupported)
         ));
+    }
+
+    /// The RPC shell (the human shell box, `kaijutsu-mcp`'s `shell`) runs for
+    /// a context holding either shell facade, while the model's roster still
+    /// follows each facade alone: a coder with only `shell_write` keeps its
+    /// person's shell box and gets one shell tool.
+    #[tokio::test]
+    async fn the_rpc_shell_accepts_either_shell_facade() {
+        let broker = Arc::new(Broker::new());
+        let ctx = ContextId::new();
+        let mut write_only = ContextToolBinding::new();
+        write_only.grant(super::super::binding::Capability::Facade("shell_write".into()));
+        broker.set_binding(ctx, write_only.clone()).await.unwrap();
+        broker.check_shell_facade(&ctx).await.expect("shell_write opens the RPC shell");
+        assert!(!write_only.allows(&super::super::binding::Capability::Instance(InstanceId::new("builtin.shell"))),
+            "the model does not get the read-only shell tool");
+
+        let none = ContextId::new();
+        broker.set_binding(none, ContextToolBinding::new()).await.unwrap();
+        assert!(matches!(broker.check_shell_facade(&none).await, Err(McpError::FacadeDenied { ref facade }) if facade == "shell"));
     }
 
     #[tokio::test]
@@ -9785,6 +9836,27 @@ mod tests {
 
     // ── Binding mutation and ListTools filtering ───────────────
 
+    /// A model block in `ctx`: its model has seen a roster, so roster changes
+    /// are news.
+    fn model_has_run_in(store: &SharedBlockStore, ctx: ContextId) {
+        store.insert_block_as(ctx, None, None, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text,
+            "earlier reply", kaijutsu_types::Status::Done, kaijutsu_types::ContentType::Plain, None).unwrap();
+    }
+
+    /// Before the context's model has run, a binding change announces
+    /// nothing: the first request carries the whole roster.
+    #[tokio::test]
+    async fn bind_before_the_model_has_run_emits_nothing() {
+        let (broker, store, ctx) = wired_broker().await;
+        let server = Arc::new(MockServer::new("svc").with_tool("ping"));
+        broker.register_silently(server, InstancePolicy::default()).await.unwrap();
+        broker.bind(ctx, InstanceId::new("svc")).await.unwrap();
+        assert!(notifications_in(&store, ctx).is_empty(), "no roster to change yet");
+        model_has_run_in(&store, ctx);
+        broker.unbind(ctx, &InstanceId::new("svc")).await.unwrap();
+        assert_eq!(notifications_in(&store, ctx).len(), 1, "after a model turn, the change is news");
+    }
+
     /// `bind` with a previously-registered instance emits a single
     /// `ToolAdded` block into the calling context listing every tool that
     /// instance advertises. D-35 coalesced: one block per (instance, batch),
@@ -9792,6 +9864,7 @@ mod tests {
     #[tokio::test]
     async fn bind_emits_coalesced_tool_added_for_newly_visible_tools() {
         let (broker, store, ctx) = wired_broker().await;
+        model_has_run_in(&store, ctx);
         // Register first (so tool_snapshots has the instance's tools) with
         // no binding for this context yet — suppress the synthetic
         // ToolAdded from register so we only measure the bind's emission.
@@ -9827,6 +9900,7 @@ mod tests {
     #[tokio::test]
     async fn unbind_emits_tool_removed() {
         let (broker, store, ctx) = wired_broker().await;
+        model_has_run_in(&store, ctx);
         let server = Arc::new(MockServer::new("svc").with_tool("ping"));
         broker
             .register_silently(server, InstancePolicy::default())
@@ -9858,6 +9932,7 @@ mod tests {
     #[tokio::test]
     async fn set_binding_diff_fires_per_added_and_removed_instance() {
         let (broker, store, ctx) = wired_broker().await;
+        model_has_run_in(&store, ctx);
         let a = Arc::new(MockServer::new("a").with_tool("alpha"));
         let b = Arc::new(MockServer::new("b").with_tool("beta").with_tool("gamma"));
         broker
@@ -9921,6 +9996,7 @@ mod tests {
     #[tokio::test]
     async fn set_binding_diff_covers_a_star_binding() {
         let (broker, store, ctx) = wired_broker().await;
+        model_has_run_in(&store, ctx);
         let a = Arc::new(MockServer::new("a").with_tool("alpha"));
         broker
             .register_silently(a, InstancePolicy::default())
@@ -9983,6 +10059,7 @@ mod tests {
     #[tokio::test]
     async fn set_binding_no_emission_when_pairs_unchanged() {
         let (broker, store, ctx) = wired_broker().await;
+        model_has_run_in(&store, ctx);
         let server = Arc::new(MockServer::new("svc").with_tool("ping"));
         broker
             .register_silently(server, InstancePolicy::default())

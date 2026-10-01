@@ -21,8 +21,4 @@ explanations. Never invent a result or report an unperformed check as passed.
 
 Report the outcome, evidence, and remaining uncertainty concisely.
 
-Before you stop, leave a handoff note: what you did, what is unfinished, and
-what is next. A later seat starts from that note and cannot ask you. Durable
-decisions belong in the project notes as well.
-
 頑張（がんば）って！

@@ -163,9 +163,18 @@ pub struct RcSeedReport {
 /// Paths, relative to the rc root, that earlier seeds installed and the
 /// embedded set no longer carries. Install-if-absent cannot see them, so
 /// [`reseed_rc_files`] names each one still present and removes it under
-/// `force`. These installed the retired risk-classifier pre_call hook
-/// (`docs/gate-policy-tuning.md`).
+/// `force`. The lfm2d entries installed the retired risk-classifier pre_call
+/// hook (`docs/gate-policy-tuning.md`). The kaish primer moved into the shell
+/// tools' descriptions, one statement for every seat; the coder's `done` grant
+/// moved into its own binding.
 pub const RETIRED_RC_SEEDS: &[&str] = &[
+    "coder/create/S05-kaish.kai",
+    "coder/create/S11-done.kai",
+    "default/create/S05-kaish.kai",
+    "director/create/S05-kaish.kai",
+    "lib/create/S05-kaish.kai",
+    "mcp/create/S05-kaish.kai",
+    "toolie/create/S05-kaish.kai",
     "coder/create/S50-lfm2d.kai",
     "default/create/S50-lfm2d.kai",
     "director/create/S50-lfm2d.kai",
@@ -770,50 +779,18 @@ mod tests {
         assert_eq!(parts.verb, "tick");
     }
 
-    /// `kj kaish primer` (composed kaish-help guidance) is wired into every
-    /// context_type whose `S10-binding.kai` actually grants a shell facade
-    /// (`facade:shell` or `facade:shell_write`; there is no
-    /// `shell_readonly` facade) — coder/default/mcp via the shared `lib/create/S10-binding.kai`
-    /// (`facade:*`), director explicitly (`facade:shell` +
-    /// `facade:shell_write`), and toolie via `facade:shell`. `musician` is
-    /// deliberately excluded: its binding grants no shell facade at all
-    /// (Chameleon's tool-free player —
-    /// see `docs/chameleon.md`), so seeding it a primer for a tool it can
-    /// never call would be dead weight.
+    /// The shell tools' descriptions carry the one statement of kaish, so no
+    /// seat seeds a second one, and reseed removes the copies earlier seeds
+    /// installed.
     #[test]
-    fn kaish_primer_seeded_for_every_shell_seat_not_musician() {
-        for with_shell in ["coder", "default", "mcp", "director", "toolie"] {
-            let path = format!("/config/rc/{with_shell}/create/S05-kaish.kai");
-            assert_eq!(
-                seed_body(&path).map(str::trim),
-                Some("/config/rc/lib/create/S05-kaish.kai"),
-                "{with_shell} must symlink the shared kaish primer script"
-            );
+    fn no_seat_seeds_a_kaish_primer() {
+        for ty in ["coder", "default", "mcp", "director", "toolie", "musician", "lib"] {
+            let rel = format!("{ty}/create/S05-kaish.kai");
+            assert!(seed_body(&format!("/config/rc/{rel}")).is_none(), "{rel} is still seeded");
+            if ty != "musician" {
+                assert!(RETIRED_RC_SEEDS.contains(&rel.as_str()), "{rel} is not retired");
+            }
         }
-        assert!(
-            seed_body("/config/rc/musician/create/S05-kaish.kai").is_none(),
-            "musician grants no shell facade — it must not seed a kaish primer"
-        );
-        // The canonical body itself: composes `kj kaish primer` into a
-        // Role::System/BlockKind::Text block, mirroring S00-stance.kai's
-        // `kj block create --role system --kind text` shape.
-        let canonical = seed_body("/config/rc/lib/create/S05-kaish.kai")
-            .expect("lib kaish primer seed must exist");
-        assert!(canonical.contains("kj kaish primer"));
-        assert!(canonical.contains("kj block create --role system --kind text"));
-    }
-
-    /// The musician seeds the hydration-window guard at create — `kj context
-    /// hydrate` pins the prefix + sets the sliding tail so a self-driving
-    /// musician doesn't re-hydrate its whole history every turn (the cost guard).
-    #[test]
-    fn musician_seeds_include_hydration_window() {
-        let body = seed_body("/config/rc/musician/create/S30-hydrate.kai")
-            .expect("musician must seed the hydration-window script");
-        assert!(
-            body.contains("kj context hydrate"),
-            "the hydrate seed must set a window via `kj context hydrate`"
-        );
     }
 
     /// The musician ALSO seeds a fork-side hydration script — the create script

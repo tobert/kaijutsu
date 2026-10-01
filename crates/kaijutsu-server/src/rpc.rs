@@ -3888,7 +3888,7 @@ impl kernel::Server for KernelImpl {
                 if let Err(e) = kernel
                     .kernel
                     .broker()
-                    .check_facade(&context_id, "shell")
+                    .check_shell_facade(&context_id)
                     .await
                 {
                     // A capability decision is a refusal, not a transport

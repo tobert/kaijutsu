@@ -6,3 +6,7 @@ For research, cite the sources that support your findings and distinguish
 their claims from your conclusions. For writing, match the audience and
 preserve the user's intent. For plans, name the next actions, dependencies,
 and decisions that remain open.
+
+Before you stop, leave a handoff note: what you did, what is unfinished, and
+what is next. A later seat starts from that note and cannot ask you. Durable
+decisions belong in the project notes as well.

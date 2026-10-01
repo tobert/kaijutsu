@@ -84,80 +84,52 @@ pub(crate) fn resolve_command_timeout(
     }
 }
 
-// The kaish-language guidance (word-splitting, globs, `case`/`esac`,
-// pre-validation, …) is composed from `kaish-help` at process start instead of
-// hand-maintained here — that crate exists so a kaish release updates this
-// text everywhere (kaijutsu, kaibo) instead of every embedder re-drifting its
-// own prose (kaish's `docs/composable-help.md` step 4). `without_overlay()`
-// drops the copy-on-write-overlay paragraph: kaijutsu materializes a fresh
-// context kaish per call and never turns overlay on, so that guidance would
-// be an active mixed signal ("run `kaish-vfs commit`" for a mode that isn't
-// enabled). `LazyLock`, not `const`, because composition is a runtime call
-// (`compose()`), not a `&'static str` kaish-help can hand us at compile time.
-static COMPOSED_TOOL_DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
-    kaish_help::compose(
-        &kaish_help::Recipe::tool_description().without_overlay(),
-        &kaish_help::SchemaContent::new(&[]),
-    )
-});
+// One short statement of what the shell is and what a call returns. The
+// language reference stays in kaish (`help syntax`); a model that needs a rule
+// asks for it, and the description every request carries stays small.
+const ABOUT_KAISH: &str = "kaish (会sh) is a Bourne-like shell with a JSON data \
+     model: values keep their types (strings, numbers, booleans, lists \
+     `[a b c]`, records `{k: v}`) through variables and pipes, and builtins \
+     return structured data. It checks a whole command before running it, so a \
+     command never half-runs. Builtins run in-process; other programs run from \
+     PATH. `help syntax` lists where kaish differs from bash.";
 
-/// The composed (kaish-sourced) half of the shell tool description, for the
-/// cross-slot duplication guard in `kj::kaish` — the primer must not repeat
-/// what already rides here. Exposed rather than duplicated so the guard reads
-/// the real bytes, not a second composition that could drift from this one.
-///
-/// `cfg(test)` rather than `allow(dead_code)`: it exists for the guard, and a
-/// production build has no caller.
-#[cfg(test)]
-pub(crate) fn composed_tool_description() -> &'static str {
-    &COMPOSED_TOOL_DESCRIPTION
-}
-
-// The kaijutsu-specific half kaish-help can't know: what this tool IS here
-// (runs in the caller's current kernel context), that `kj` is in scope for
-// context/drift/fork management, and the return contract (one JSON envelope,
-// every key always present). Kept as an intro paragraph, separated from the
-// composed kaish-language rules by a blank line, so the two sources stay
-// visibly distinct rather than blurring into one hand-tuned paragraph the way
-// the old static file did.
-//
-// RETURN_CONTRACT is the one statement of the envelope, shared by both
-// flavours — two copies of a shape description drift, and this one is read by
-// every model that calls the tool.
-const RETURN_CONTRACT: &str = "Returns one JSON object, always the same \
-     keys: {stdout, stderr, exit_code, status, did_spill, data, latch, \
-     block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error}. \
-     `stdout` and `stderr` are separate and are empty strings when the \
-     command wrote none. Read `status` to distinguish completion, failure, \
-     and pending work. `status` is done, error, rejected, running, waiting, timeout or \
-     stream_closed — `rejected` means kaish refused the program and nothing \
-     ran, so fix the command text and retry. `exit_code` is null exactly \
-     when there is no code to report; null is never evidence of success. \
-     `did_spill` true means the output was cut to a head and tail; its last \
-     line names the `/v/cas` path holding the rest. `data` \
-     is the kj structured payload when present.";
+// What a call returns, as a model turn reads it (`ShellEnvelope::model_text`)
+// and as an MCP caller receives it (the envelope). Both flavours share it.
+const RESULT_CONTRACT: &str = "The result is the command's output, then one \
+     bracketed line for each fact that changes your next step: `[exit N]`; \
+     `[rejected: the program did not run]` (kaish refused the text: fix it and \
+     retry); `[running in the background: operation ID]`; `[output truncated: \
+     N bytes; the full output is at /v/cas/…]` (read that path with `grep`, \
+     `sed -n`, or `read`). A clean success is its output alone. An MCP caller \
+     receives one JSON object with the keys {stdout, stderr, exit_code, status, \
+     did_spill, data, latch, block_id, operation_id, ask_id, content_type, \
+     ephemeral, elapsed_ms, error}; `exit_code` null is never evidence of success.";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Run a command in your current kernel context using kaish (会sh). \
-         `kj` is in scope for context/drift/fork management. {}\n\n{}",
-        RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
+        "Run a command in your current kernel context. {ABOUT_KAISH} `kj` manages \
+         contexts, drift, and forks. {RESULT_CONTRACT}"
     )
 });
 
 // The model sees the policy and the writable alternative alongside kaish syntax.
 static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "Run a READ-ONLY command in your current kernel context using kaish \
-         (会sh). Submitted commands cannot mutate shared state. File writes, \
-         external commands, mutating `kj` verbs, editor input, `curl`, and MCP \
-         calls are refused. Use `shell_write` for those operations. Host tools \
-         may still be installed and on PATH. Inspect with filesystem builtins \
-         (`cat`, `grep`, `find`), `/v/docs`, and read-only `kj` commands. \
-         Help and local shell variables remain available. {}\n\n{}",
-        RETURN_CONTRACT, &*COMPOSED_TOOL_DESCRIPTION
+        "Run a READ-ONLY command in your current kernel context. Submitted \
+         commands cannot mutate shared state. File writes, external commands, \
+         mutating `kj` verbs, editor input, `curl`, and MCP calls are refused. Use \
+         `shell_write` for those operations. Host tools may still be installed and \
+         on PATH. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
+         `/v/docs`, and read-only `kj` commands. {ABOUT_KAISH} {RESULT_CONTRACT}"
     )
 });
+
+/// The writable shell's description, for the primer duplication guard.
+#[cfg(test)]
+pub(crate) fn tool_description() -> &'static str {
+    &DESCRIPTION
+}
 
 /// Broker server for `shell` or `shell_write`, selected at construction.
 /// A weak broker reference avoids a cycle; each call constructs its own shell.
@@ -438,70 +410,40 @@ mod tests {
         }
     }
 
-    /// The composed half must carry real kaish-help content (a known rule)
-    /// and must NOT carry the overlay paragraph — the assertion that would
-    /// have caught shipping published kaish-help 0.13 (which forces overlay
-    /// guidance into every recipe) instead of the opt-in-overlay rev this
-    /// dependency is pinned to.
+    /// The description names every fact line a model turn reads after a
+    /// command's output (`ShellEnvelope::model_text`), so the two cannot drift.
     #[test]
-    fn composed_tool_description_has_a_known_rule_and_excludes_overlay() {
-        let text = DESCRIPTION.as_str();
-        assert!(
-            text.to_lowercase().contains("word splitting"),
-            "composed description should carry the no-word-splitting rule: {text}"
-        );
-        assert!(
-            !text.contains("Overlay mode") && !text.contains("kaish-vfs commit"),
-            "kaijutsu never enables overlay mode; the description must not tell \
-             the model to run `kaish-vfs commit`: {text}"
-        );
-
-        let ro_text = DESCRIPTION_READ_ONLY.as_str();
-        assert!(
-            ro_text.to_lowercase().contains("word splitting"),
-            "read-only description should carry the same composed rules: {ro_text}"
-        );
-        assert!(
-            !ro_text.contains("Overlay mode") && !ro_text.contains("kaish-vfs commit"),
-            "read-only description must not carry overlay guidance either: {ro_text}"
-        );
+    fn the_description_names_the_facts_a_turn_reads() {
+        use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+        let mut error = ShellEnvelope::new(ShellStatus::Error);
+        error.exit_code = Some(2);
+        let mut running = ShellEnvelope::new(ShellStatus::Running);
+        running.operation_id = Some("ID".into());
+        for (env, fact) in [(error, "[exit 2]"), (ShellEnvelope::new(ShellStatus::Rejected), "[rejected: the program did not run]"),
+            (running, "[running in the background: operation ID]")]
+        {
+            assert!(env.model_text("").contains(fact), "model_text no longer writes {fact}");
+        }
+        for text in [DESCRIPTION.as_str(), DESCRIPTION_READ_ONLY.as_str()] {
+            for fact in ["`[exit N]`", "`[rejected: the program did not run]`", "`[running in the background: operation ID]`",
+                "[output truncated: N bytes; the full output is at /v/cas/"]
+            {
+                assert!(text.contains(fact), "missing {fact}: {text}");
+            }
+        }
     }
 
-    /// The kaijutsu-specific wrapper — what kaish-help can't know — must
-    /// survive composition: what the tool IS here (current kernel context),
-    /// `kj` in scope, and the return contract. The read-only variant also
-    /// names its mutation refusal and the document views it can still read.
+    /// One short statement per flavour: every request carries it.
     #[test]
-    fn kaijutsu_wrapper_survives_composition() {
+    fn descriptions_stay_short_and_carry_the_kaijutsu_facts() {
         let text = DESCRIPTION.as_str();
-        assert!(text.contains("current kernel context"), "{text}");
-        assert!(text.contains("`kj` is in scope"), "{text}");
-        assert!(
-            text.contains("one JSON object, always the same keys")
-                && text.contains("Read `status`"),
-            "return contract must survive: {text}"
-        );
-
+        assert!(text.len() < 2000, "{} chars: {text}", text.len());
+        assert!(text.contains("current kernel context") && text.contains("`kj` manages"), "{text}");
+        assert!(text.contains("JSON data") && text.contains("help syntax"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
-        assert!(
-            ro_text.contains("cannot mutate shared state"),
-            "read-only contract must survive: {ro_text}"
-        );
-        assert!(
-            ro_text.contains("/v/docs"),
-            "read-only document views must survive: {ro_text}"
-        );
-        assert!(
-            ro_text.contains("one JSON object, always the same keys")
-                && ro_text.contains("Read `status`"),
-            "return contract must survive on the read-only variant too: {ro_text}"
-        );
-        // Execution refusal does not imply a host binary is absent.
-        assert!(
-            ro_text.contains("`shell_write`") && ro_text.contains("on PATH"),
-            "the read-only description must name `shell_write` as where \
-             external commands run, and say the binary is still installed: {ro_text}"
-        );
+        assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
+        assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");
+        assert!(ro_text.contains("`shell_write`") && ro_text.contains("on PATH"), "{ro_text}");
     }
 
     /// Prints the read-only tool description as the model receives it —

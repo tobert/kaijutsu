@@ -648,7 +648,6 @@ pub(super) async fn spawn_admitted_turn(
         model: Some(model_name.clone()),
         performer: Some(performer.clone()),
         reviewer: Some(reviewer.clone()),
-        tool_names: tools.iter().map(|t| t.name.clone()).collect(),
     };
     let rc_sections = match crate::read_system_prompt_sections(&documents, context_id) {
         Ok(sections) => sections,

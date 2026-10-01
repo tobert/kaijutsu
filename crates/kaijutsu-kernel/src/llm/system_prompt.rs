@@ -39,8 +39,6 @@ pub struct SituationalContext {
     pub performer: Option<CharacterIdentity>,
     /// The character assigned to review this performer's asks.
     pub reviewer: Option<CharacterIdentity>,
-    /// Names of tools currently visible in this context.
-    pub tool_names: Vec<String>,
 }
 
 impl SituationalContext {
@@ -53,7 +51,6 @@ impl SituationalContext {
             && self.model.is_none()
             && self.performer.is_none()
             && self.reviewer.is_none()
-            && self.tool_names.is_empty()
     }
 }
 
@@ -70,9 +67,11 @@ impl SituationalContext {
 ///   <model provider="anthropic" name="claude-haiku-4-5"/>
 ///   <performer id="…" name="coder"/>
 ///   <reviewer id="…" name="lead"/>
-///   <tools count="N">name1, name2, ...</tools>
 /// </situation>
 /// ```
+///
+/// Tool names are not listed: the request's tools array already carries
+/// every tool, with its description.
 ///
 /// `rc_sections` carries the content of `(Role::System, BlockKind::Text)`
 /// blocks the rc create/fork lifecycle has dropped into the conversation
@@ -149,14 +148,6 @@ pub fn build_system_prompt(situational: &SituationalContext, rc_sections: &[Stri
             "  <reviewer id=\"{}\" name=\"{}\"/>\n",
             reviewer.principal_id,
             xml_escape(&reviewer.name)
-        ));
-    }
-
-    if !situational.tool_names.is_empty() {
-        out.push_str(&format!(
-            "  <tools count=\"{}\">{}</tools>\n",
-            situational.tool_names.len(),
-            xml_escape(&situational.tool_names.join(", "))
         ));
     }
 
@@ -252,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn label_state_provider_and_tools_appear_in_addendum() {
+    fn label_state_and_provider_appear_in_addendum_and_tools_do_not() {
         let situational = SituationalContext {
             context_id: Some(ContextId::new()),
             context_label: Some("planning".to_string()),
@@ -261,7 +252,6 @@ mod tests {
             model: Some("claude-haiku-4-5".to_string()),
             performer: None,
             reviewer: None,
-            tool_names: vec!["block_create".to_string(), "shell".to_string()],
         };
         let out = build_system_prompt(&situational, &[]);
         assert!(out.contains("<situation>"));
@@ -269,9 +259,7 @@ mod tests {
         assert!(out.contains("state=\"live\""));
         assert!(out.contains("provider=\"anthropic\""));
         assert!(out.contains("name=\"claude-haiku-4-5\""));
-        assert!(out.contains("count=\"2\""));
-        assert!(out.contains("block_create"));
-        assert!(out.contains("shell"));
+        assert!(!out.contains("<tools"), "the tools array carries the roster; the situation does not repeat it");
     }
 
     #[test]
@@ -315,7 +303,6 @@ mod tests {
         let out = build_system_prompt(&situational, &[]);
         assert!(out.contains("<model"));
         assert!(!out.contains("<context"), "no context fields → no <context> section");
-        assert!(!out.contains("<tools"), "no tool names → no <tools> section");
     }
 
     #[test]

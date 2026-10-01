@@ -129,17 +129,31 @@ if test -f $mem_file; then
   fi
 fi
 
+# A source this host cannot read is left out, and with neither readable (a
+# task container, another user's machine) the script adds nothing.
+sections=""
+if test -f $fleet_file; then
+  sections="$sections
+
+-- fleet.md standing constraints (first 20 of $fleet_total, index-line grade; full file: $fleet_file) --
+$fleet_digest"
+fi
+if test -f $mem_file; then
+  sections="$sections
+
+-- MEMORY.md topic index (first 20 of $mem_total, index-line grade; full file: $mem_file) --
+$mem_digest"
+fi
+if test -z "$sections"; then
+  echo "recall: nothing readable on this host"
+  exit 0
+fi
+
 content="=== Fleet + memory recall (auto-injected at context create; read-only, direct-from-disk) ===
 Read $stamp. exomemory HEAD: $head_hash.
 Staleness is VISIBLE, not absent: this date+HEAD is a freshness bound on the digest below, not a
 claim that nothing changed since. Treat anything after this stamp as unseen, not absent, and
-re-read the source files directly for anything time-sensitive.
-
--- fleet.md standing constraints (first 20 of $fleet_total, index-line grade; full file: $fleet_file) --
-$fleet_digest
-
--- MEMORY.md topic index (first 20 of $mem_total, index-line grade; full file: $mem_file) --
-$mem_digest"
+re-read the source files directly for anything time-sensitive.$sections"
 
 kj block create --role system --kind notification --content "$content" || true
 

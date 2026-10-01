@@ -1,5 +1,12 @@
 description = "The read-only shell refuses a host program, and its result names shell_write as the write path."
 
+[rc]
+"coder/create/S11-read-only-shell.kai" = """
+# The shipped coder holds one shell, the writable one. This scenario tests the
+# read-only shell other seats hold, so it grants it here.
+kj binding allow "facade:shell"
+"""
+
 [[model]]
 tool_calls = [{ name = "shell", input = { command = "id" } }]
 [[model]]

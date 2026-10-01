@@ -115,7 +115,7 @@ truncation.
 A context offered `done` ends its task by calling it. `done` is the one tool
 on `builtin.turn`; `*` does not cover that instance
 (`mcp/binding.rs`, `OPT_IN_INSTANCES`), so a context type opts in by name.
-The shipped coder does, in `rc/coder/create/S11-done.kai`. Other types keep
+The shipped coder does, in its own `rc/coder/create/S10-binding.kai`. Other types keep
 the ordinary ending: text with no tool call ends the turn.
 
 `done` takes a status (`done`, `blocked`, `gave_up`) and a summary, and its
