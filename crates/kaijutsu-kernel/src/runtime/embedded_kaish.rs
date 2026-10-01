@@ -71,6 +71,9 @@ pub struct EmbeddedKaish {
     /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` at construction.
     /// Callers use `timeouts()` when supplying per-invocation `ExecuteOptions`.
     timeouts: kaijutsu_types::TimeoutPolicy,
+    /// The store a model-facing (Agent profile) shell keeps cut output in;
+    /// `None` for an Internal shell, whose results are never cut.
+    preview_store: Option<Arc<kaijutsu_cas::FileStore>>,
 }
 
 /// Refuse tools whose effects cannot be limited to observation. Register these
@@ -141,34 +144,129 @@ pub enum ExternalExec {
 
 /// Output limits selected by the consumer.
 ///
-/// Kaish replaces oversized output with a preview and sets exit code 3, retaining
-/// the command's code in `original_code`. That remap also reaches script `$?`.
-/// Internal consumers need complete text and a larger cap; callers must reject
+/// Both profiles run kaish under a 4 MiB memory ceiling. Past it, kaish keeps
+/// a head and tail, sets exit code 3, and retains the command's code in
+/// `original_code`; that remap also reaches script `$?`. Callers must reject
 /// spilled output when a preview would corrupt the result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputProfile {
-    /// Model-facing output: kaish's 8 KB agent limit and head/tail preview.
+    /// Model-facing output: the kernel cuts a final result past
+    /// `PREVIEW_LIMIT_BYTES` to a head and tail and stores the whole of it in
+    /// CAS, named by its `/v/cas` path (`preview_for_model`).
     #[default]
     Agent,
-    /// Rc, hook, and editor output: a 4 MiB memory ceiling.
+    /// Rc, hook, and editor output: the full text, up to the ceiling.
     Internal,
 }
 
-/// Memory ceiling for internal consumers; spill still requires caller handling.
-const INTERNAL_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Memory ceiling for every embedded shell's captured output.
+const OUTPUT_CEILING_BYTES: usize = 4 * 1024 * 1024;
+
+/// A model-facing result past this many bytes, stdout or stderr, is cut to a
+/// preview.
+const PREVIEW_LIMIT_BYTES: usize = 8 * 1024;
+/// The preview keeps this much of the start.
+const PREVIEW_HEAD_BYTES: usize = 2 * 1024;
+/// And this much of the end, where test summaries and errors land.
+const PREVIEW_TAIL_BYTES: usize = 4 * 1024;
 
 impl OutputProfile {
     /// Build the kaish config for this profile.
     fn to_config(self) -> OutputLimitConfig {
-        match self {
-            Self::Agent => OutputLimitConfig::agent(),
-            Self::Internal => {
-                let mut cfg = OutputLimitConfig::agent();
-                cfg.set_limit(Some(INTERNAL_OUTPUT_LIMIT_BYTES));
-                cfg
+        let mut cfg = OutputLimitConfig::agent();
+        cfg.set_limit(Some(OUTPUT_CEILING_BYTES));
+        if self == Self::Agent {
+            // Past the ceiling, CAS keeps what kaish kept.
+            cfg.set_head_bytes(OUTPUT_CEILING_BYTES / 4 * 3);
+            cfg.set_tail_bytes(OUTPUT_CEILING_BYTES / 4);
+        }
+        cfg
+    }
+}
+
+/// Cut a model-facing result to a preview, storing each oversized stream in
+/// CAS and naming its `/v/cas` path on the preview's last line.
+///
+/// The exit code stays the command's own. `did_spill` reports the cut.
+async fn preview_for_model(result: &mut ExecResult, cas: &Arc<kaijutsu_cas::FileStore>) {
+    let kept_by_kaish = result.did_spill;
+    let stdout = match result.out_bytes() {
+        Some(bytes) if std::str::from_utf8(bytes).is_err() => {
+            (bytes.len() > PREVIEW_LIMIT_BYTES).then(|| (bytes.to_vec(), "application/octet-stream"))
+        }
+        _ => {
+            let text = result.text_out();
+            (text.len() > PREVIEW_LIMIT_BYTES).then(|| (text.into_owned().into_bytes(), "text/plain"))
+        }
+    };
+    if let Some((bytes, mime)) = stdout {
+        let note = stored_note(cas, &bytes, mime, "output", kept_by_kaish).await;
+        let preview = if mime == "text/plain" {
+            let text = String::from_utf8(bytes).expect("checked as UTF-8 above");
+            format!("{}\n...\n{}\n{note}", preview_head(&text), preview_tail(&text))
+        } else {
+            note
+        };
+        result.set_out(preview);
+        if let Some(code) = result.original_code.take() {
+            result.code = code;
+        }
+        result.did_spill = true;
+    }
+    if result.err.len() > PREVIEW_LIMIT_BYTES {
+        let err = std::mem::take(&mut result.err);
+        let note = stored_note(cas, err.as_bytes(), "text/plain", "stderr", false).await;
+        result.err = format!("{}\n...\n{}\n{note}", preview_head(&err), preview_tail(&err));
+        result.did_spill = true;
+    }
+}
+
+/// Store `bytes` and say where they are, or say that storing failed.
+async fn stored_note(
+    cas: &Arc<kaijutsu_cas::FileStore>,
+    bytes: &[u8],
+    mime: &'static str,
+    stream: &str,
+    kept_by_kaish: bool,
+) -> String {
+    use kaijutsu_cas::ContentStore;
+    let len = bytes.len();
+    let store = cas.clone();
+    let owned = bytes.to_vec();
+    let stored = tokio::task::spawn_blocking(move || store.store(&owned, mime))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+    match stored {
+        Ok(hash) => {
+            let path = format!("{}/{}/{hash}", kaijutsu_types::paths::CAS_ROOT, hash.prefix());
+            if kept_by_kaish {
+                format!("[{stream} truncated: past the {OUTPUT_CEILING_BYTES}-byte ceiling; the {len} bytes kept are at {path}]")
+            } else {
+                format!("[{stream} truncated: {len} bytes; the full {stream} is at {path}]")
             }
         }
+        Err(e) => {
+            tracing::error!(error = %e, len, "storing a model-facing {stream} in CAS failed");
+            format!("[{stream} truncated: {len} bytes; storing the full {stream} failed: {e}]")
+        }
     }
+}
+
+fn preview_head(s: &str) -> &str {
+    let mut end = PREVIEW_HEAD_BYTES.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn preview_tail(s: &str) -> &str {
+    let mut start = s.len().saturating_sub(PREVIEW_TAIL_BYTES);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
 }
 
 impl EmbeddedKaish {
@@ -346,8 +444,6 @@ impl EmbeddedKaish {
             // thread so abrupt server death does not leave them running.
             .with_kill_children_on_parent_death(true)
             // Output cap by consumer, not by trust — see `OutputProfile`.
-            // Model-facing shells keep kaish's 8 KB agent preset; rc/hook/
-            // editor shells use the larger internal ceiling. Both can spill.
             .with_output_limit(output.to_config());
         if let Some(root) = project_root {
             config = config.with_cwd(root);
@@ -375,6 +471,7 @@ impl EmbeddedKaish {
             docs_fs
         };
 
+        let preview_store = (output == OutputProfile::Agent).then(|| kernel.cas().clone());
         let ctx_for_tools = session_contexts.clone();
         let sid_for_tools = session_id;
         let timeouts = kernel.timeouts().clone();
@@ -417,6 +514,7 @@ impl EmbeddedKaish {
             session_contexts,
             session_id,
             timeouts,
+            preview_store,
         })
     }
 
@@ -449,7 +547,11 @@ impl EmbeddedKaish {
         let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
-        self.kernel.execute_with_options(code, opts).await
+        let mut result = self.kernel.execute_with_options(code, opts).await?;
+        if let Some(cas) = &self.preview_store {
+            preview_for_model(&mut result, cas).await;
+        }
+        Ok(result)
     }
 
     /// Capture the final result and report each completed statement to the
@@ -461,7 +563,11 @@ impl EmbeddedKaish {
         let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
         let context_id = self.context_id().map(|cid| cid.to_string());
         let opts = merge_trace_context(opts, traceparent, tracestate, context_id);
-        self.kernel.execute_with_options_streaming(code, opts, on_output).await
+        let mut result = self.kernel.execute_with_options_streaming(code, opts, on_output).await?;
+        if let Some(cas) = &self.preview_store {
+            preview_for_model(&mut result, cas).await;
+        }
+        Ok(result)
     }
 
     /// Get a variable value.
@@ -1166,23 +1272,20 @@ mod tests {
         assert_eq!(r.code, 127, "fail-fast command-not-found: {}", r.err);
     }
 
-    /// Output capping must not forge a failure inside the script.
+    /// A model shell that prints a lot keeps the real `$?`, reads a head and
+    /// tail preview, and can recover every byte from `/v/cas`.
     ///
-    /// kaish remaps a capped command's exit code to 3 so the *embedder* can
-    /// tell (`output_limit` module doc). That signal reaches the running
-    /// program's `$?` as well, so on the Agent profile a successful command
-    /// that merely printed a lot reads as failed — which is why rc scripts,
-    /// hook bodies, and editor splices run Internal instead.
-    ///
-    /// Both halves are asserted deliberately. The Agent half pins kaish's
-    /// current behaviour: if a future bump stops forging the code, this test
-    /// fails and tells us the local workaround can go away, rather than the
-    /// workaround quietly outliving its reason.
+    /// The Agent profile caps only what the model reads: kaish runs under the
+    /// internal ceiling, so `$?` inside the script is the command's own exit,
+    /// and the kernel stores the full output in CAS and names its path in the
+    /// preview. The Internal half is the control: rc, hook, and editor shells
+    /// read the output verbatim.
     #[tokio::test]
-    async fn internal_profile_does_not_forge_a_failure_on_large_output() {
+    async fn agent_profile_previews_large_output_and_keeps_all_of_it_in_cas() {
         let principal = kaijutsu_types::PrincipalId::system();
         let blocks = shared_block_store(principal);
         let kernel = test_kernel("test-outlimit").await;
+        kernel.mount(CAS_ROOT, crate::vfs::CasFs::new(kernel.cas().clone())).await;
 
         let mk = |name: &str, profile: OutputProfile| {
             EmbeddedKaish::with_identity(
@@ -1202,53 +1305,36 @@ mod tests {
         // ~23 KB from a kaish builtin — no host exec, so this is the shell's
         // own captured-output path and nothing else.
         const BIG: &str = "seq 1 5000; echo \"status=$?\"";
-        // Same command shape, small enough never to trip the cap: the control
-        // that proves the profile is what differs and not the command.
         const SMALL: &str = "seq 1 100; echo \"status=$?\"";
 
         let agent = mk("test-outlimit-agent", OutputProfile::Agent);
-        let r = agent
-            .execute_with_options(SMALL, ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert!(
-            r.text_out().contains("status=0"),
-            "control: under the cap, $? must be the real exit — got: {}",
-            r.text_out().lines().last().unwrap_or("")
-        );
+        let r = agent.execute_with_options(SMALL, ExecuteOptions::default()).await.unwrap();
+        assert!(!r.did_spill, "control: under the preview limit nothing is cut");
+        assert!(r.text_out().ends_with("status=0\n"), "control got: {}", r.text_out());
 
-        let r = agent
-            .execute_with_options(BIG, ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert!(
-            r.text_out().contains("status=3"),
-            "Agent profile is expected to forge $?=3 on a capped command \
-             (kaish's did_spill remap). If this now reports status=0, kaish \
-             changed and OutputProfile::Internal may no longer be needed — \
-             check before deleting it. Got: {}",
-            r.text_out().lines().last().unwrap_or("")
-        );
+        let r = agent.execute_with_options(BIG, ExecuteOptions::default()).await.unwrap();
+        let text = r.text_out().into_owned();
+        assert!(r.did_spill, "a previewed result reports the cut");
+        assert_eq!((r.code, r.original_code), (0, None), "the real exit, not kaish's spill remap");
+        assert!(text.len() < PREVIEW_LIMIT_BYTES, "the model reads a preview, not {} bytes", text.len());
+        assert!(text.starts_with("1\n2\n3\n"), "the preview keeps the head: {text}");
+        assert!(text.contains("status=0"), "the script's own $? is real, and the tail keeps it: {text}");
+        let full = format!("{}status=0\n", (1..=5000).map(|n| format!("{n}\n")).collect::<String>());
+        let fact = format!("[output truncated: {} bytes; the full output is at {CAS_ROOT}/", full.len());
+        let at = text.find(&fact).unwrap_or_else(|| panic!("the preview names its CAS path: {text}"));
+        let path = text[at + fact.len() - CAS_ROOT.len() - 1..].trim_end().trim_end_matches(']').to_string();
+
+        let back = agent.execute_with_options(&format!("grep '^4999$' {path}"), ExecuteOptions::default()).await.unwrap();
+        assert_eq!(back.text_out(), "4999\n", "the model can search the stored output at {path}: {}", back.err);
+        let hash = path.rsplit('/').next().unwrap();
+        use kaijutsu_cas::ContentStore;
+        let stored = kernel.cas().retrieve(&hash.parse().unwrap()).unwrap().expect("stored in CAS");
+        assert_eq!(stored, full.as_bytes(), "CAS holds every byte the command printed");
 
         let internal = mk("test-outlimit-internal", OutputProfile::Internal);
-        let r = internal
-            .execute_with_options(BIG, ExecuteOptions::default())
-            .await
-            .unwrap();
-        assert!(
-            r.text_out().contains("status=0"),
-            "Internal profile must report the command's REAL exit — an rc \
-             script doing `cmd || escalate` must not escalate on a command \
-             that worked and merely printed a lot. Got: {}",
-            r.text_out().lines().last().unwrap_or("")
-        );
-        // And the output itself must be verbatim, not a head+tail splice —
-        // the editor's `:r !cmd` splices this text into a document.
-        assert!(
-            r.text_out().contains("\n5000\n"),
-            "Internal profile must not truncate: the last line of a 5000-line \
-             run is missing, so the capture was spliced"
-        );
+        let r = internal.execute_with_options(BIG, ExecuteOptions::default()).await.unwrap();
+        assert!(!r.did_spill);
+        assert_eq!(r.text_out(), full, "Internal output is verbatim: the editor splices it into a document");
     }
 
     /// `$HOME` and `~` must give the SAME answer, and it must be non-empty.

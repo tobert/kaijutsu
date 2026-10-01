@@ -133,7 +133,8 @@ const RETURN_CONTRACT: &str = "Returns one JSON object, always the same \
      stream_closed — `rejected` means kaish refused the program and nothing \
      ran, so fix the command text and retry. `exit_code` is null exactly \
      when there is no code to report; null is never evidence of success. \
-     `did_spill` true means output was capped and the tail dropped. `data` \
+     `did_spill` true means the output was cut to a head and tail; its last \
+     line names the `/v/cas` path holding the rest. `data` \
      is the kj structured payload when present.";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {

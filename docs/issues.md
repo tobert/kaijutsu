@@ -589,10 +589,6 @@ more readily than other agents". Open, most costly first:
   signing off…"), against one weaker persistence sentence in
   `lib/create/S00-base.md`. A fresh coder seat is about 46,000 input tokens
   before any work.
-- **Shell output is capped at 8 KiB**, keeping 1024 B of head and 512 B of
-  tail, with the exit code remapped to 3 on spill
-  (`runtime/embedded_kaish.rs`, `runtime/command_result.rs`). A failing test
-  suite is mostly unreadable to the model.
 - **A turn can still spend several output ceilings.** A ceiling stop now
   continues the turn with a notice instead of ending it, bounded by
   `MAX_OUTPUT_CEILING_CONTINUATIONS` (`runtime/llm_stream.rs`); see

@@ -343,15 +343,10 @@ identically in a narrow loadout. Read git HEAD by reading `.git/HEAD` and
 `.git/refs/heads/<branch>` as plain files rather than shelling out to `git`,
 which *is* external and exec-gated.
 
-**A kaish builtin's captured stdout is capped at 8192 bytes**
-(`OutputLimitConfig::agent()`, wired at
-`kernel/src/runtime/embedded_kaish.rs:264`). Crossing it does **not** error —
-the capture silently collapses to a ~1.6 KB head+tail splice with
-`[output truncated]` in the middle. This already produced a wrong answer
-during slice-1 work: an unbounded `grep … | grep -c .` over a ~18 KB capture
-reported 12 where the truth was 105. **Bound every read before it lands in a
-variable.** This is a silent fallback and should probably be made loud; see
-`issues.md`.
+**A captured value is capped at 4 MiB** (`OutputProfile`,
+`kernel/src/runtime/embedded_kaish.rs`). Past it kaish keeps a head and tail
+and sets the exit to 3. Only the final result a model reads is cut to an
+8 KiB preview, and that preview names the `/v/cas` path holding the rest.
 
 **Addressing doctrine.** Host-truth trees are addressed at their **real
 paths** (like `~/src`). `/etc/memory` would be actively wrong — `/etc/*`

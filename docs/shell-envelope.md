@@ -54,10 +54,16 @@ in the runtime execution record.
 | `timeout` | gave up waiting for the outcome |
 | `stream_closed` | the event stream closed before the outcome arrived |
 
-**Truncation is not failure.** A capped result (kaish `did_spill`: exit
-remapped to 3, real exit in `original_code`) is judged by the command's real
-exit. Flagging it an error tempts a model into re-running a command that
-already succeeded. The capping stays visible as `did_spill: true`.
+**Truncation is not failure, and nothing is lost.** A model-facing shell
+cuts a stdout or stderr past 8 KiB to a 2 KiB head and a 4 KiB tail, and
+stores the whole stream in CAS. The preview's last line names its
+`/v/cas` path, where `grep`, `sed -n`, and `read` reach it. The exit code
+stays the command's own, and kaish runs under a 4 MiB ceiling, so `$?`
+inside a script is real too. Past that ceiling kaish keeps a head and tail
+itself and remaps the exit to 3 (real exit in `original_code`); the result
+is still judged by the real exit. The cut stays visible as
+`did_spill: true`. `preview_for_model` in
+`kernel/src/runtime/embedded_kaish.rs` owns this.
 
 ## Runtime outcomes
 
@@ -140,7 +146,7 @@ the model does next:
 | background call | `[running in the background: operation ID]` |
 | waiting for approval | `[waiting for approval; not run yet: operation ID, ask ID]` |
 | gave up waiting, stream closed | `[timed out waiting; ...]`, `[the outcome never arrived ...]` |
-| capped output | `[output truncated]` |
+| output past 8 KiB | the preview's own last line, `[output truncated: N bytes; the full output is at /v/cas/PREFIX/HASH]` (`stderr` likewise) |
 | a `kj` payload or latch | `[data] JSON`, `[latch] JSON` |
 
 `block_id`, `content_type`, `ephemeral`, and `elapsed_ms` are never sent. The

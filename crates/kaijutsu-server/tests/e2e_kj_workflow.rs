@@ -480,23 +480,11 @@ fn test_shell_propagates_exit_code() {
     });
 }
 
-/// Regression pin for the truncation exit-code bug: `shell_execute` runs its
-/// shell at `OutputProfile::Agent` (an 8 KB captured-output cap). When a
-/// command's output crosses that cap, kaish-kernel truncates it AND remaps
-/// the exit code to 3 (`did_spill`), stashing the command's real code in
-/// `original_code` — a deliberate, loud signal aimed at a script's own `$?`.
-/// `execute_shell_command` was persisting the remapped `3` onto the durable
-/// ToolResult block regardless of what the command actually did, so a command
-/// that ran to completion and exited 0 — merely printing more than 8 KB —
-/// recorded `exit_code = 3` forever. `seq 1 5000` is a kaish builtin (no host
-/// exec needed) that prints ~19 KB and always exits 0, so it deterministically
-/// crosses the cap on every host, unlike the earlier `mount`-based flake this
-/// bug hid behind (see `kj::context_shell::tests::
-/// unknown_command_fails_fast_exec_granted_shell`, whose host-dependent
-/// `mount` output was this same remap wearing a different command).
-///
-/// This test failed before the `original_code` resolution landed in
-/// `execute_shell_command` (recorded `exit_code = Some(3)`) and passes after.
+/// A model-facing shell's output past the preview limit keeps the command's
+/// exit. `seq 1 5000` is a kaish builtin (no host exec) that prints ~19 KB
+/// and always exits 0, so it crosses the limit on every host. The durable
+/// ToolResult must record exit 0 and carry the preview's
+/// `[output truncated: ...]` line, which names the `/v/cas` path of the rest.
 #[test]
 fn test_shell_truncation_does_not_corrupt_exit_code() {
     run_local(async {

@@ -222,9 +222,6 @@ impl ShellEnvelope {
             ShellStatus::Timeout => facts.push(operation("timed out waiting; the command may still be running")),
             ShellStatus::StreamClosed => facts.push(operation("the outcome never arrived")),
         }
-        if self.did_spill == Some(true) {
-            facts.push("[output truncated]".to_string());
-        }
         if let Some(data) = &self.data {
             facts.push(format!("[data] {data}"));
         }
@@ -283,7 +280,7 @@ impl ShellEnvelope {
                 },
                 "did_spill": {
                     "type": ["boolean", "null"],
-                    "description": "output was capped and the tail dropped; null when this path cannot tell"
+                    "description": "output was cut to a head and tail whose last line says where the rest is; null when this path cannot tell"
                 },
                 "data": { "description": "kj structured payload when present, else null" },
                 "latch": { "description": "kj confirmation-gate re-run hint when present, else null" },
@@ -353,7 +350,7 @@ mod tests {
         env.data = Some(serde_json::json!(["a", "b"]));
         env.latch = Some(serde_json::json!({"command": "kj context archive x --confirm"}));
         assert_eq!(env.model_text("listed\n"),
-            "listed\n[output truncated]\n[data] [\"a\",\"b\"]\n[latch] {\"command\":\"kj context archive x --confirm\"}");
+            "listed\n[data] [\"a\",\"b\"]\n[latch] {\"command\":\"kj context archive x --confirm\"}");
         assert_eq!(ShellEnvelope::new(ShellStatus::Rejected).model_text("parse error at 1:4"),
             "parse error at 1:4\n[rejected: the program did not run]");
     }
