@@ -28,15 +28,12 @@
 #    genuinely external commands. This script shells out to nothing, so it
 #    behaves identically in a narrow loadout and a wide one.
 #  - Bounded reads. Every extraction is grep/sed-filtered THEN
-#    `head -n 20`-capped before it ever lands in a variable. This also
-#    dodges a live-verified kaish landmine: a single builtin's own stdout
-#    is capped at 8192 bytes (OutputLimitConfig::agent(), wired in
-#    kaijutsu-kernel/src/runtime/embedded_kaish.rs) — cross it and the
-#    captured output silently collapses to a ~1.6KB head+tail+"[output
-#    truncated]" splice instead of erroring. An early, unbounded
-#    `grep '^- \[' MEMORY.md` (105 lines, ~18KB) hit exactly this and
-#    silently mis-reported its own count as 12 instead of 105 when routed
-#    through a second capture. Every capture here is pre-trimmed to a few
+#    `head -n 20`-capped before it ever lands in a variable. A captured
+#    value is capped (4 MiB now, 8 KiB when this was written; OutputProfile
+#    in kaijutsu-kernel/src/runtime/embedded_kaish.rs), and crossing it
+#    keeps only a head and tail. An early, unbounded
+#    `grep '^- \[' MEMORY.md` hit the old cap and mis-reported its own
+#    count. Every capture here is pre-trimmed to a few
 #    KB, comfortably under the cap, and totals are counted via a dedicated
 #    `grep -c` call on the filtered-but-unbounded pipeline (its output is
 #    just a number, so it can't hit the byte cap) rather than derived from

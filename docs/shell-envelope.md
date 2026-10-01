@@ -54,7 +54,7 @@ in the runtime execution record.
 | `timeout` | gave up waiting for the outcome |
 | `stream_closed` | the event stream closed before the outcome arrived |
 
-**Truncation is not failure, and nothing is lost.** A model-facing shell
+**Truncation is not failure.** A model-facing shell
 cuts a stdout or stderr past 8 KiB to a 2 KiB head and a 4 KiB tail, and
 stores the whole stream in CAS. The preview's last line names its
 `/v/cas` path, where `grep`, `sed -n`, and `read` reach it. The exit code

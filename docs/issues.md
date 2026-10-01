@@ -717,6 +717,35 @@ on current main"):
   subshells, `\(` in `find`, brace groups. 6 of 29 failed tool calls in four
   runs.
 
+## From the kaibo DeepSeek review of 2026-10-01's changes
+
+Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
+
+- **A context holding only `facade:shell` gets a writable RPC shell.** The
+  shell RPC (`rpc.rs`, the person's shell box and kaijutsu-mcp's `shell`)
+  always materializes `ShellPolicy::Agent` (`interactive.rs`), so a toolie
+  seat, granted the safe facade because it "cannot hurt anything", reaches
+  writes and mutating `kj` verbs through it; the ask tier still applies.
+  Predates `check_shell_facade`. Choosing `ReadOnly` when only `facade:shell`
+  is held changes the person's box in toolie seats: Amy's call.
+- **Same-file ordering keys on the visible tool name** (`written_file` in
+  `runtime/llm_stream.rs`). When two visible instances expose `edit`, the
+  name becomes `builtin_file__edit` and the ordering stops applying. Key on
+  the resolved `(instance, tool)`. `./a` and `a` are also different keys.
+- **The register path still announces tools before a context's first model
+  block** (`emit_for_bindings`), unlike the binding-diff path.
+- **The shell descriptions name four of the facts a turn reads**; `[waiting
+  for approval…]`, `[timed out waiting…]`, `[data]`, and `[latch]` are not
+  described, and the ceiling-case truncation note has a different shape.
+- **`S16-handoff.kai`'s comment says a trailing `|| true` never fires after
+  `$(...)`**; the reviewer's kaish fires it. Confirm on the pinned kaish and
+  correct `S16`/`S17`.
+- **`toolie/create/S45-shell-guard.kai` exists** although the script's header
+  says it goes only to seats holding `exec`; two comments cite
+  `docs/gate-and-shell-split.md`, which does not exist.
+- **A background job's live stream is uncut and unbounded on the kernel
+  side** (`command.rs`, an unbounded channel of cloned results).
+
 ## Leftovers from the solo-acp state work (2026-09-18)
 
 Smaller, from the same work:

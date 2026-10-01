@@ -26,10 +26,10 @@
 #    invalidate the --target=system cache breakpoint on every context
 #    creation. Notification hydrates as an ordinary appended turn
 #    (llm/hydrate.rs) and is never swept into the system prompt.
-#  - Bounded. A single builtin's stdout is capped at 8192 bytes
-#    (OutputLimitConfig::agent(), runtime/embedded_kaish.rs); crossing it
-#    silently splices head+tail rather than erroring. Twelve notes sit far
-#    under that, and --window keeps it that way.
+#  - Bounded. An rc shell's captured stdout is capped at 4 MiB
+#    (OutputProfile, runtime/embedded_kaish.rs); crossing it keeps a head
+#    and tail and sets the exit to 3. Twelve notes sit far under that, and
+#    --window keeps it that way.
 #  - kj-and-VFS only. No network, no external process.
 #
 # `$(...)` assignment cannot be guarded with a trailing `||` — kaish never
