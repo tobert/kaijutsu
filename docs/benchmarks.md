@@ -438,6 +438,7 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-26 | `kj-tb2-render-plain` | `01f5b424…` → `0e88658c` | deepseek-v4-flash | same, shell results as plain text (`model_text`) | 20 (tb2-subset) | 17 (0.85) | 3.40M | 0 | 0 | 4 | no verdict line in this arm |
 | 2026-09-30 | `kj-qwen-fixgit-1`, `kj-qwen-pair-1`, `kj-qwen-sqlite-1` | `4bd76664…` → `12ed6d76` | qwen3.8-flash (Alibaba) | shipped coder, yolo sandbox gate, factory 16K ceiling, effort dropped, multiplier 1, moltar | 4 (fix-git, openssl-selfsigned-cert, fix-code-vulnerability, sqlite-with-gcov) | 4 | 0.96M | 0 | 0 | 0 | no verdict line |
 | 2026-09-30 | `kj-tenchi-openssl-1` | `4bd76664…` → `12ed6d76` | qwen3.8-27b (tenchi vLLM) | same, multiplier 2 | 1 (openssl-selfsigned-cert) | 0 | n/a | 0 | 0 | 1 | first inference failed: `LLM stream idle for 120s` |
+| 2026-10-01 | `kj-tenchi-tb2-20-2` | `8635a93b…` → `4071fc68` | qwen3.8-27b (tenchi vLLM) | shipped coder, yolo sandbox gate, factory 16K ceiling, no key, idle 600 s, request 1800 s, multiplier 4, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 7 | 0.52M | 0 | 0 | 11 | no verdict line |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -572,8 +573,53 @@ What the runs showed, beyond the pass rate:
   2026-09-26 arms and all three solved Qwen runs read `ended_unverified`.
 
 Left unmeasured: the Rust polyglot slice (`contrib/bench/analysis/polyglot-rust.md`)
-has not been run with a model; the turn-loop fix has not had a full 20-task
-run; Anthropic models are untested end to end.
+has not been run with a model; Anthropic models are untested end to end.
+
+### tenchi on the 20-task subset (2026-10-01)
+
+The first full subset run on a local model: qwen3.8-27b on tenchi's vLLM,
+about 17 output tokens a second. 7 of 20 solved. The run took 7.5 hours
+with two trials at once. tenchi costs nothing but time, so there is no
+dollar column; vLLM reports no cost.
+
+| Task | Result | Ended | Tokens in / out | Inferences | Trial time |
+|---|---|---|---|---|---|
+| constraints-scheduling | pass | `completed_verified` | 169K / 13K | 8 | 836 s |
+| db-wal-recovery | pass | `completed_verified` | 311K / 10K | 14 | 654 s |
+| extract-elf | pass | `completed_verified` | 587K / 29K | 29 | 1982 s |
+| fix-code-vulnerability | pass | `completed_verified` | 874K / 16K | 30 | 1109 s |
+| fix-git | pass | `completed_verified` | 863K / 15K | 32 | 1037 s |
+| modernize-scientific-stack | pass | `completed_verified` | 336K / 15K | 16 | 984 s |
+| openssl-selfsigned-cert | pass | `completed_verified` | 377K / 10K | 20 | 683 s |
+| configure-git-webserver | fail | `completed_verified` | 1.03M / 40K | 41 | 2732 s |
+| query-optimize | fail | `completed_verified` | 397K / 29K | 22 | 3612 s |
+| dna-assembly | fail | `token_ceiling` | 128K / 66K | 7 | 3982 s |
+| chess-best-move | fail | agent timeout | 1.08M / 46K | 34 | 3637 s |
+| cobol-modernization | fail | agent timeout | 383K / 54K | 17 | 3635 s |
+| headless-terminal | fail | agent timeout | 503K / 54K | 23 | 3635 s |
+| largest-eigenval | fail | agent timeout | 132K / 49K | 8 | 3637 s |
+| model-extraction-relu-logits | fail | agent timeout | 50K / 48K | 3 | 3634 s |
+| overfull-hbox | fail | agent timeout | 250K / 47K | 13 | 3055 s |
+| raman-fitting | fail | agent timeout | 533K / 57K | 17 | 3632 s |
+| regex-log | fail | agent timeout | 113K / 51K | 7 | 3638 s |
+| sparql-university | fail | agent timeout | 286K / 44K | 13 | 3637 s |
+| sqlite-with-gcov | fail | agent timeout | 531K / 46K | 27 | 3635 s |
+
+Totals: 8.93M tokens in, 0.74M out; 0.52M in per solved task. No turn
+failed, nothing asked (yolo gate), nothing stalled.
+
+- **Time is the limit, not the turn loop.** 10 of the 13 failures are
+  Harbor's agent timeout at four times each task's own limit. Several made
+  only 3 to 8 inferences in an hour (model-extraction-relu-logits 3,
+  regex-log 7, largest-eigenval 8): each inference spent minutes thinking
+  near the 16K output ceiling. Output tokens per inference, not tool calls,
+  set the pace.
+- Every solved task ended `completed_verified` in under 35 minutes; a
+  long run did not turn into a solve.
+- The changes this run needed: vLLM's `delta.reasoning`, solo-acp
+  `--no-key` and the two backend timeouts, batch results placed after their
+  calls, a removed cwd that refuses once and moves, `shell_write` as kind
+  `execute` (`ce55dca4` through `4071fc68`).
 
 ## Known limits
 
