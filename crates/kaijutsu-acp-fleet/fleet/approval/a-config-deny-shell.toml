@@ -14,18 +14,20 @@ deny = ["cat"]
 tool_calls = [{ name = "shell", input = { command = "cat seed.txt" } }]
 [[model]]
 text = "refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "cat is denied" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger list --history --status denied" } }]
 [[model]]
 text = "listed"
+tool_calls = [{ name = "done", input = { status = "done", summary = "listed the denied asks" } }]
 
 [[prompt]]
 text = "read the seed"
 text_contains = ["refused"]
-tool_calls = [{ title = "shell", status = "failed", output_contains = "global config denies cat" }]
+tool_calls = [{ title = "shell", status = "failed", output_contains = "global config denies cat" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "show the denied asks"
 text_contains = ["listed"]
-tool_calls = [{ title = "shell_write", status = "completed", output_contains = "cat seed.txt" }]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "cat seed.txt" }, { title = "done", status = "completed" }]

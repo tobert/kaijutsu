@@ -9,10 +9,12 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
 text = "noted"
+tool_calls = [{ name = "done", input = { status = "done", summary = "recorded a run" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
 text = "ran it"
+tool_calls = [{ name = "done", input = { status = "done", summary = "recorded another run" } }]
 
 # The client answers "always allow", which remembers an exact-text rule, and
 # the held turn runs the command.
@@ -21,7 +23,7 @@ text = "record a run"
 permissions = ["allow_always"]
 permission_titles = ["echo ran >> runs.txt"]
 text_contains = ["noted"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }, { title = "done", status = "completed" }]
 
 # An operator then denies echo in gate.toml. The learned allow still wins,
 # with no ask.
@@ -32,7 +34,7 @@ gate = """
 deny = ["echo"]
 """
 text_contains = ["ran it"]
-tool_calls = [{ title = "shell_write", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "runs.txt"

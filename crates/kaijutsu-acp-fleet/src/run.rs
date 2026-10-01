@@ -564,6 +564,11 @@ pub struct Seen<'a> {
     pub permissions: &'a [PermissionRecord],
 }
 
+/// A call's ACP kind. ACP v1 reads an omitted `kind` as `other`.
+fn acp_kind(call: &client::ToolCallSeen) -> &str {
+    call.kind.as_deref().unwrap_or("other")
+}
+
 /// Every way `seen` misses `prompt`'s expectations.
 pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String> {
     let mut failures = Vec::new();
@@ -584,12 +589,18 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
 
     if let Some(expected) = &prompt.tool_calls {
         let calls = client::tool_calls(seen.updates);
-        let got: Vec<String> =
-            calls.iter().map(|c| format!("{} ({})", c.title, c.status.as_deref().unwrap_or("no status"))).collect();
+        let got: Vec<String> = calls
+            .iter()
+            .map(|c| {
+                let kind = acp_kind(c);
+                format!("{} ({}, kind {kind})", c.title, c.status.as_deref().unwrap_or("no status"))
+            })
+            .collect();
         let matches = calls.len() == expected.len()
             && calls.iter().zip(expected).all(|(call, want)| {
                 call.title == want.title
                     && want.status.as_ref().is_none_or(|s| call.status.as_ref() == Some(s))
+                    && want.kind.as_ref().is_none_or(|k| acp_kind(call) == k)
                     && want.output_contains.as_ref().is_none_or(|o| o.all().iter().all(|n| call.output.contains(n.as_str())))
             });
         if !matches {
@@ -597,7 +608,8 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
                 .iter()
                 .map(|w| {
                     let output = w.output_contains.as_ref().map_or(String::new(), |o| format!(", output contains {:?}", o.all()));
-                    format!("{} ({}{output})", w.title, w.status.as_deref().unwrap_or("any status"))
+                    let kind = w.kind.as_ref().map_or(String::new(), |k| format!(", kind {k}"));
+                    format!("{} ({}{kind}{output})", w.title, w.status.as_deref().unwrap_or("any status"))
                 })
                 .collect();
             let outputs: Vec<&str> = calls.iter().map(|c| c.output.as_str()).collect();
@@ -904,6 +916,26 @@ mod tests {
         let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "write", "status": "failed"}})];
         let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
         assert_eq!(check_prompt("p", &p, &seen).len(), 1);
+    }
+
+    #[test]
+    fn a_tool_call_kind_mismatch_fails() {
+        let p = prompt("tool_calls = [{ title = \"done\", kind = \"other\" }]");
+        let response = json!({"stopReason": "end_turn"});
+        let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "done", "kind": "execute"}})];
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
+        let failures = check_prompt("p", &p, &seen);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("kind other") && failures[0].contains("kind execute"), "{failures:#?}");
+    }
+
+    #[test]
+    fn an_omitted_tool_call_kind_is_other() {
+        let p = prompt("tool_calls = [{ title = \"done\", kind = \"other\" }]");
+        let response = json!({"stopReason": "end_turn"});
+        let updates = [json!({"update": {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "done"}})];
+        let seen = Seen { response: &response, updates: &updates, answered: updates.len(), permissions: &[] };
+        assert_eq!(check_prompt("p", &p, &seen), Vec::<String>::new());
     }
 
     #[test]

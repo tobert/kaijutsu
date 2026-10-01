@@ -30,6 +30,7 @@ tool_calls = [
 tool_calls = [{ name = "shell_write", input = { command = "mkdir \"after-$SHOWN\"" } }]
 [[model]]
 text = "wrote it where it was shown"
+tool_calls = [{ name = "done", input = { status = "done", summary = "wrote out.txt in sub" } }]
 
 [[prompt]]
 text = "write the variable into sub"

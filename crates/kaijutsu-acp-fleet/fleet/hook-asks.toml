@@ -16,13 +16,14 @@ exit 3
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
 [[model]]
 text = "left it alone"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir doomed was denied" } }]
 
 [[prompt]]
 text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "doomed"

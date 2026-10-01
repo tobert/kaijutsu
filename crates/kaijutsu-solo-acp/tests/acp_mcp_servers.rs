@@ -59,12 +59,15 @@ fn tool_use(id: &str, name: &str, input: Value) -> Value {
     ])
 }
 
-fn text(reply: &str) -> Value {
+/// A reply that says `reply` and ends the task with `done`, as a coder's
+/// last reply must (`docs/conversation-session.md`, "Ending a task with done").
+fn done(id: &str, reply: &str) -> Value {
     json!([
         "TextStart",
         {"TextDelta": reply},
         "TextEnd",
-        {"Done": {"stop_reason": "end_turn", "input_tokens": 1, "output_tokens": 1, "extra": null}}
+        {"ToolUse": {"id": id, "name": "done", "input": {"status": "done", "summary": reply}}},
+        {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
     ])
 }
 
@@ -136,7 +139,7 @@ fn a_declared_server_is_callable_and_stops_when_the_session_closes() {
     let pidfile = cwd.join("fixture.pid");
     let mut agent = spawn_with_replies(json!([
         tool_use("mcp-call-1", "fixture_echo", json!({"text": "hi"})),
-        text("echoed"),
+        done("mcp-call-done", "echoed"),
     ]));
 
     let session = new_session(&mut agent, &cwd, json!([fixture_server("fixture", &pidfile)]))
@@ -248,7 +251,7 @@ fn another_session_does_not_see_the_server() {
     let pidfile = cwd.join("fixture.pid");
     let mut agent = spawn_with_replies(json!([
         tool_use("mcp-scope-1", "fixture_echo", json!({"text": "elsewhere"})),
-        text("tried"),
+        done("mcp-scope-done", "tried"),
     ]));
 
     let declaring = new_session(&mut agent, &cwd, json!([fixture_server("fixture", &pidfile)]))

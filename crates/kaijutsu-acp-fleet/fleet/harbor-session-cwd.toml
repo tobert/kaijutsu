@@ -16,11 +16,12 @@ uncovered = "allow"
 tool_calls = [{ name = "shell_write", input = { command = "cat marker.txt; echo made > made.txt" } }]
 [[model]]
 text = "read the marker"
+tool_calls = [{ name = "done", input = { status = "done", summary = "read marker.txt and made made.txt" } }]
 
 [[prompt]]
 text = "read marker.txt and make made.txt"
 text_contains = ["read the marker"]
-tool_calls = [{ title = "shell_write", status = "completed", output_contains = "the task directory" }]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "the task directory" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "task/made.txt"

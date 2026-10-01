@@ -1,0 +1,17 @@
+description = "A coder's text-only reply does not end its turn: the kernel's notice reaches the client as agent text, the model calls done, and the prompt ends end_turn."
+
+# The first reply is narration with no tool call. The kernel answers it with
+# a (System, Notification), which the bridge sends as an agent message, and
+# runs another inference in the same turn.
+[[model]]
+text = "Next I'll run the tests."
+[[model]]
+text = "The tests pass."
+tool_calls = [{ name = "done", input = { status = "done", summary = "the tests pass" } }]
+
+# Harbor names a call of kind `other` by its title, so `done` reaches its
+# trajectory as `done` with the verdict as output.
+[[prompt]]
+text = "run the tests"
+text_contains = ["Next I'll run the tests.", "You replied without a tool call, so the task is still open.", "The tests pass."]
+tool_calls = [{ title = "done", kind = "other", status = "completed", output_contains = "done: the tests pass" }]

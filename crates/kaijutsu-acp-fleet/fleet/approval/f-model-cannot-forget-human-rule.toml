@@ -10,14 +10,17 @@ allow = ["jq"]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
 text = "noted"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir forbidden was denied" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger forget \"$(kj ledger rules | jq -r '.[0]')\"" } }]
 [[model]]
 text = "tried to forget it"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "only the reviewer who made the rule can forget it" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
 text = "still refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "a rule denies mkdir forbidden" } }]
 
 # The client answers "always deny", which remembers the rule.
 [[prompt]]
@@ -25,18 +28,18 @@ text = "make the forbidden directory"
 permissions = ["deny_always"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir forbidden"]
 text_contains = ["noted"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "forget the rule"
 text_contains = ["tried to forget it"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "ask the reviewer who made it" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "ask the reviewer who made it" }, { title = "done", status = "completed" }]
 
 # The rule answers with no ask.
 [[prompt]]
 text = "make the forbidden directory again"
 text_contains = ["still refused"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "forbidden"

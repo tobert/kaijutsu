@@ -21,11 +21,12 @@ exit 1
 tool_calls = [{ name = "shell_write", input = { command = "mkdir stopped" } }]
 [[model]]
 text = "refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir stopped was denied" } }]
 
 [[prompt]]
 text = "make the stopped directory"
 text_contains = ["refused"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by hook fleet-deny" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by hook fleet-deny" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "stopped"

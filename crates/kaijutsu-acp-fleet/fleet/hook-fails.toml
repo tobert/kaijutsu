@@ -14,11 +14,12 @@ no-such-command-in-the-fleet
 tool_calls = [{ name = "shell_write", input = { command = "mkdir crashed" } }]
 [[model]]
 text = "refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir crashed was denied" } }]
 
 [[prompt]]
 text = "make the crashed directory"
 text_contains = ["refused"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "fleet-hook" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "fleet-hook" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "crashed"

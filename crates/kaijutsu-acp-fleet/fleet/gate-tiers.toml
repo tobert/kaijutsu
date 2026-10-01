@@ -25,33 +25,36 @@ exit 0
 tool_calls = [{ name = "shell_write", input = { command = "mkdir tier-allowed" } }]
 [[model]]
 text = "made it"
+tool_calls = [{ name = "done", input = { status = "done", summary = "made the directory" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "dd if=seed.txt of=copy.txt" } }]
 [[model]]
 text = "refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "dd is denied" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mv seed.txt moved.txt" } }]
 [[model]]
 text = "left it alone"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "the move was denied" } }]
 
 [[prompt]]
 text = "make the directory"
 text_contains = ["made it"]
-tool_calls = [{ title = "shell_write", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "copy with dd"
 text_contains = ["refused"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "move the seed"
 permissions = ["deny"]
 permission_titles = ["shell_write: 1 statement(s) — mv seed.txt moved.txt"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "tier-allowed"

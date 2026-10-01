@@ -4,8 +4,9 @@ description = "The read-only shell refuses a host program, and its result names 
 tool_calls = [{ name = "shell", input = { command = "id" } }]
 [[model]]
 text = "use shell_write then"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "the read-only shell refuses id" } }]
 
 [[prompt]]
 text = "who am I"
 text_contains = ["use shell_write then"]
-tool_calls = [{ title = "shell", status = "failed", output_contains = "Run host programs and git writes (commit, add, push) with `shell_write`" }]
+tool_calls = [{ title = "shell", status = "failed", output_contains = "Run host programs and git writes (commit, add, push) with `shell_write`" }, { title = "done", status = "completed" }]

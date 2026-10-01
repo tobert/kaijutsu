@@ -13,10 +13,12 @@ tool_calls = [
 ]
 [[model]]
 text = "one refused, one ran"
+tool_calls = [{ name = "done", input = { status = "done", summary = "made the late directory once" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
 [[model]]
 text = "the rule refused it"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "a rule denies mkdir late" } }]
 
 # Both requests are held until both have arrived. The first is answered
 # "always deny", which remembers a deny rule; only once the bridge has
@@ -36,13 +38,14 @@ tool_calls = [
   { title = "shell_write" },
   { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" },
   { title = "kj", status = "completed", output_contains = "allowed ask" },
+  { title = "done", status = "completed" },
 ]
 
 # The rule is in force: the same command is refused with no ask.
 [[prompt]]
 text = "make it again"
 text_contains = ["the rule refused it"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "user rule denies the exact statement" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "late"

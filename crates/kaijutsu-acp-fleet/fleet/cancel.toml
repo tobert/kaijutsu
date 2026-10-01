@@ -15,6 +15,7 @@ tool_calls = [{ name = "shell_write", input = { command = "while ! [[ -f release
 # prompt 2. A turn that kept going after the cancel would take it here.
 [[model]]
 text = "a fresh turn after the cancel"
+tool_calls = [{ name = "done", input = { status = "done", summary = "still here" } }]
 
 [[prompt]]
 text = "wait for the release file"
@@ -25,7 +26,7 @@ tool_calls = [{ title = "shell_write", status = "completed" }]
 [[prompt]]
 text = "are you still there"
 text_contains = ["a fresh turn after the cancel"]
-tool_calls = []
+tool_calls = [{ title = "done", status = "completed" }]
 
 [[verify]]
 path = "finished.txt"

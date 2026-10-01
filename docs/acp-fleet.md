@@ -56,13 +56,14 @@ exit 3
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
 [[model]]
 text = "left it alone"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir doomed was denied" } }]
 
 [[prompt]]
 text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "doomed"
@@ -81,6 +82,7 @@ tool_calls = [{ name = "shell_write", input = { command = "git init -q" } }]
 # ... write, git add, git commit ...
 [[model]]
 text = "committed"
+tool_calls = [{ name = "done", input = { status = "done", summary = "committed hello.txt" } }]
 
 [[prompt]]
 text = "put hello.txt under git and commit it"
@@ -102,7 +104,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `rc` | A table of rc-tree-relative path to contents, installed with `--rc-overlay`. Each file's directory must already exist in the seeded tree. See "Hook scenarios". |
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `session_cwd` | A workspace-relative directory `session/new` names as the session cwd. The agent still launches in the workspace root. Default: the workspace root. |
-| `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events; `events` gives the mock backend's raw events instead. |
+| `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events, text first; `events` gives the mock backend's raw events instead. See "Ending a task". |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
 | `prompt.release` | Answers for the requests this prompt holds, oldest first, sent while the prompt is open: once every held request has arrived, and after `on_hold`. Each answer after the first waits until the bridge has recorded the one before it. Any answer but `hold`. See "Held requests". |
@@ -112,7 +114,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.permission_tool_calls` | One title per request, in order: the request's `toolCall.toolCallId` must name a `tool_call` this prompt announced with exactly that title. |
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including any that arrive during the quiet wait. |
-| `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status` and `output_contains` (one substring, or a list that must all appear). |
+| `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status`, ACP `kind` (an omitted kind reads as `other`), and `output_contains` (one substring, or a list that must all appear). |
 | `prompt.reports_cost` | `true`: the last `usage_update` before the response must carry `cost` in USD. See "Harbor shape". |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
@@ -126,6 +128,37 @@ Every scenario is also checked for the Harbor shape; see "Harbor shape".
 A prompt also fails when its agent text contains `stream error:`, which is
 what the ACP bridge sends when a model turn fails outside a prompt. An
 exhausted mock script shows up this way.
+
+## Ending a task
+
+```toml
+[[model]]
+text = "made it"
+tool_calls = [{ name = "done", input = { status = "done", summary = "made the directory" } }]
+
+[[prompt]]
+text = "make the directory"
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
+```
+
+An ACP session runs a coder context, which is offered `done`, so a scripted
+model ends each task the way a coder must: its last reply calls `done`, and
+that prompt's `tool_calls` lists it. A reply with no tool call does not end
+the turn. The kernel answers it with a notice and takes another reply, at
+most twice (`docs/conversation-session.md`, "Ending a task with done"); a
+script with no reply left then fails the prompt, and the agent's stderr
+says the mock script was exhausted. The runner adds no `done` of its own.
+
+The notice is a `(System, Notification)` block, which the bridge sends as
+`agent_message_chunk` text. `fleet/done-nudge.toml` shows the whole shape: a
+text-only reply, the notice, then a reply that calls `done`, and
+`stopReason: end_turn`. The `done` call arrives with no `kind`, which ACP
+reads as `other`, so Harbor names the step by its title, `done`.
+
+A turn that ends another way needs no `done`. A cancelled turn ends at the
+cancel (`fleet/cancel.toml`). A background completion starts a turn of its
+own after the response, which calls `done` again
+(`fleet/harbor-background-after-response.toml`).
 
 ## Harbor shape
 
@@ -261,6 +294,7 @@ kaijutsu-mcp (path D) have no ACP entry.
 tool_calls = [{ name = "shell_write", input = { command = "while ! [[ -f release ]]; do sleep 0.05; done; echo finished > finished.txt" } }]
 [[model]]
 text = "a fresh turn after the cancel"
+tool_calls = [{ name = "done", input = { status = "done", summary = "still here" } }]
 
 [[prompt]]
 text = "wait for the release file"
@@ -271,6 +305,7 @@ tool_calls = [{ title = "shell_write", status = "completed" }]
 [[prompt]]
 text = "are you still there"
 text_contains = ["a fresh turn after the cancel"]
+tool_calls = [{ title = "done", status = "completed" }]
 ```
 
 The runner waits for the named tool call to be reported `in_progress`, sends
@@ -279,7 +314,8 @@ and only then writes `release`. The scripted command waits for that file,
 so the cancel always lands while the call runs, with no timing guess.
 
 `session/cancel` is a soft interrupt: the running tool call finishes, and
-the turn ends before its next model call, with `stopReason: cancelled`. The
+the turn ends before its next model call, with `stopReason: cancelled` and
+no `done`. The
 second prompt gets the reply the cancelled turn did not take, so a turn that
 kept going, or one still holding the context, fails the scenario
 (`fleet/cancel.toml`).
@@ -310,7 +346,8 @@ text, then `pending`; `session/request_permission` arrives while
 tool call, the approved command runs, the call settles `completed` or
 `failed`, and the same turn goes on with the result. A scenario scripts
 one reply after the call and no follow-up turn;
-`fleet/permission-allow-deny.toml` shows the whole shape. Since every
+`fleet/permission-allow-deny.toml` shows the whole shape. That reply calls
+`done`, so the prompt's `tool_calls` ends with it. Since every
 permission request a model's turn raises now arrives before the response,
 the quiet wait could shrink or end at the response for such prompts; it
 stays at 3 seconds until the bridge reports turn state (`docs/issues.md`,

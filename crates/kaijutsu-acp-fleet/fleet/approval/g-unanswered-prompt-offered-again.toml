@@ -8,6 +8,7 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir offered" } }]
 [[model]]
 text = "allowed on the second offer"
+tool_calls = [{ name = "done", input = { status = "done", summary = "made the offered directory" } }]
 
 # The first request is never answered. The bridge gives up on it after 30 s,
 # says so, and offers the same ask again; the second offer is answered allow.
@@ -16,7 +17,7 @@ text = "make the offered directory"
 permissions = ["hold", "allow"]
 permission_titles = ["mkdir offered", "mkdir offered"]
 text_contains = ["timed out waiting for the client; ask remains pending", "allowed on the second offer"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "offered"

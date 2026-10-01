@@ -224,6 +224,9 @@ pub struct ToolCallExpect {
     /// The call's last reported status, such as `completed` or `failed`.
     #[serde(default)]
     pub status: Option<String>,
+    /// The call's ACP `kind`, such as `execute` or `other`.
+    #[serde(default)]
+    pub kind: Option<String>,
     /// A substring of the call's reported output text, or a list of them.
     #[serde(default)]
     pub output_contains: Option<Substrings>,

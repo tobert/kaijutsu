@@ -4,6 +4,7 @@ known_gap = { finding = "H3", fails = ["prompt 1: reports_cost"] }
 
 [[model]]
 text = "fleet mock speaking"
+tool_calls = [{ name = "done", input = { status = "done", summary = "said something" } }]
 
 [[prompt]]
 text = "say something"

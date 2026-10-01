@@ -10,14 +10,16 @@ known_gap = { finding = "H2", fails = ["harbor shape run-ends-at-response", "har
 tool_calls = [{ name = "shell_write", input = { command = "sleep 1; git --version > git-version.txt", run_in_background = true } }]
 [[model]]
 text = "started it"
+tool_calls = [{ name = "done", input = { status = "done", summary = "started recording the git version in the background" } }]
 # Only the completion notice starts this turn.
 [[model]]
 text = "the background job finished"
+tool_calls = [{ name = "done", input = { status = "done", summary = "git-version.txt is written" } }]
 
 [[prompt]]
 text = "record the git version in the background"
 text_contains = ["started it", "the background job finished"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell", status = "completed" }, { title = "done", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 script = """

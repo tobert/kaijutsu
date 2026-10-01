@@ -9,13 +9,14 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir uncovered" } }]
 [[model]]
 text = "left it alone"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir uncovered was denied" } }]
 
 [[prompt]]
 text = "make the uncovered directory"
 permissions = ["deny"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir uncovered"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "uncovered"

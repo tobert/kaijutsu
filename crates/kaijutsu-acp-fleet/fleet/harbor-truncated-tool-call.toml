@@ -6,10 +6,13 @@ events = [
   { ToolUseInvalid = { id = "fleet-cut", name = "shell_write", arguments = "{\"command\": \"echo hel", error = "EOF while parsing a string at line 1 column 21" } },
   { Done = { stop_reason = "max_tokens", input_tokens = 1, output_tokens = 1 } },
 ]
+# The model reads the failed result and stops. Any reply proves the turn
+# went on; this one ends the task, since a coder's turn ends with `done`.
 [[model]]
-text = "I will make the call again in smaller pieces"
+text = "The call was cut off at the output limit."
+tool_calls = [{ name = "done", input = { status = "gave_up", summary = "the file is too large to write in one call" } }]
 
 [[prompt]]
 text = "write a very large file"
-text_contains = ["I will make the call again in smaller pieces"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "its arguments were not valid JSON" }]
+text_contains = ["The call was cut off at the output limit."]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "its arguments were not valid JSON" }, { title = "done", status = "completed", output_contains = "gave_up: the file is too large to write in one call" }]

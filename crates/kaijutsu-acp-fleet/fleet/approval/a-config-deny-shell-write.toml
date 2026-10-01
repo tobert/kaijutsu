@@ -14,6 +14,7 @@ deny = ["dd"]
 tool_calls = [{ name = "shell_write", input = { command = "dd if=seed.txt of=copy.txt" } }]
 [[model]]
 text = "refused"
+tool_calls = [{ name = "done", input = { status = "blocked", summary = "dd is denied" } }]
 
 # The model reads the ledger back. The listing call is itself allowed, so a
 # denied row can only be the refusal's.
@@ -21,16 +22,17 @@ text = "refused"
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger list --history --status denied" } }]
 [[model]]
 text = "listed"
+tool_calls = [{ name = "done", input = { status = "done", summary = "listed the denied asks" } }]
 
 [[prompt]]
 text = "copy with dd"
 text_contains = ["refused"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "global config denies dd" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "show the denied asks"
 text_contains = ["listed"]
-tool_calls = [{ title = "shell_write", status = "completed", output_contains = "dd if=seed.txt of=copy.txt" }]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = "dd if=seed.txt of=copy.txt" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "copy.txt"
