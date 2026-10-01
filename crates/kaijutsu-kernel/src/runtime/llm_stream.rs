@@ -814,6 +814,20 @@ pub(crate) const DONE_TOOL: &str = "done";
 /// spin.
 const MAX_DONE_NUDGES: u32 = 2;
 
+/// The file a call writes, when it is a file tool that names one: `edit` or
+/// `write` with a `path`, made absolute against the call's cwd. Calls in one
+/// batch that write the same file run in call order.
+fn written_file(tool: &str, input: &serde_json::Value, cwd: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if !matches!(tool, "edit" | "write") {
+        return None;
+    }
+    let path = std::path::Path::new(input.get("path")?.as_str()?);
+    Some(match cwd {
+        Some(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    })
+}
+
 /// What the turn knows at an output-ceiling stop, for [`CeilingStop::continues`].
 #[derive(Clone, Copy, Debug)]
 struct CeilingStop {
@@ -3218,20 +3232,40 @@ async fn run_llm_stream(
             .map(|pending| pending.id.clone())
             .collect();
 
+        // Calls that write the same file run in call order: each waits for the
+        // one before it on that file. Run together, a second edit reads a file
+        // the first is still changing. Everything else runs concurrently.
+        let mut file_turns: std::collections::HashMap<std::path::PathBuf, tokio::sync::oneshot::Receiver<()>> =
+            std::collections::HashMap::new();
+        let file_order: Vec<_> = tool_calls.iter().map(|pending| {
+            let path = pending.unparsed.is_none().then(|| written_file(&pending.name, &pending.input, tool_ctx.cwd.as_deref())).flatten()?;
+            let (finished, next) = tokio::sync::oneshot::channel();
+            Some((file_turns.insert(path, next), finished))
+        }).collect();
+
         // Signal cancellation on the first persistence fault, but join every
         // admitted call before terminal cleanup. Dropping siblings here would
         // leave side effects without their final result.
-        let futures = tool_calls.into_iter().zip(placed).map(|(PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }, placed)| {
+        let futures = tool_calls.into_iter().zip(placed).zip(file_order).map(|((PendingCall { id: tool_use_id, name: tool_name, input, call, unparsed }, placed), file_order)| {
             let kernel = kernel.clone();
             let documents = documents.clone();
             let tool_ctx = tool_ctx.clone();
             let interrupt = interrupt.clone();
             async move {
+                let finished = match file_order {
+                    Some((before, finished)) => {
+                        // A dropped sender means the earlier call ended; go on.
+                        if let Some(before) = before { let _ = before.await; }
+                        Some(finished)
+                    }
+                    None => None,
+                };
                 let result = match unparsed {
                     Some(detail) => answer_unparsed_call(&documents, context_id, call, placed, detail),
                     None => dispatch_recorded_tool_result(&documents, context_id, &kernel, &tool_name, &input,
                         &tool_ctx, interrupt.cancel.clone(), &interrupt.stop_waiting, call, placed).await,
                 };
+                if let Some(finished) = finished { let _ = finished.send(()); }
                 match result {
                     Ok((result, anchor)) => Ok((ContentBlock::ToolResult {
                         tool_use_id, content: result.content, is_error: result.is_error,
@@ -3379,7 +3413,7 @@ mod publish_tests {
         arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
         rejected_write: usize,
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
-        drive_turn_offering(origin, kernel, provider, arm_interrupt, rejected_write, vec![]).await
+        drive_turn_offering(origin, kernel, provider, arm_interrupt, rejected_write, vec![], vec![]).await
     }
 
     /// The `done` tool as a roster offers it.
@@ -3394,6 +3428,7 @@ mod publish_tests {
         arm_interrupt: impl FnOnce(&Arc<ContextInterruptState>),
         rejected_write: usize,
         tools: Vec<ToolDefinition>,
+        mut bind: Vec<crate::mcp::InstanceId>,
     ) -> (SharedBlockStore, ContextId, PrincipalId) {
         let documents = kernel.blocks().clone();
         let ctx = ContextId::new();
@@ -3405,11 +3440,15 @@ mod publish_tests {
             // coder's rc grants it: `*` does not cover `builtin.turn`.
             kernel.broker().register(Arc::new(crate::mcp::servers::BuiltinTurnServer::new()),
                 crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
-            kernel.broker().set_binding(ctx, crate::mcp::ContextToolBinding::with_instances(
-                vec![crate::mcp::InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE)])).await.unwrap();
+            bind.push(crate::mcp::InstanceId::new(crate::mcp::servers::BuiltinTurnServer::INSTANCE));
+        }
+        if !bind.is_empty() {
+            kernel.broker().set_binding(ctx, crate::mcp::ContextToolBinding::with_instances(bind)).await.unwrap();
             // The turn's roster resolves visible names, as a real turn's does.
             let visible = kernel.broker().list_visible_tools(ctx, &crate::mcp::CallContext::test()).await.unwrap();
-            assert_eq!(visible.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), [DONE_TOOL]);
+            for tool in &tools {
+                assert!(visible.iter().any(|(name, _)| name == &tool.name), "{} is visible", tool.name);
+            }
         }
 
         let player = PrincipalId::new();
@@ -4029,7 +4068,7 @@ mod publish_tests {
         let kernel = Arc::new(Kernel::new_ephemeral(name).await);
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Interactive, kernel.clone(),
-            Provider::Mock(MockClient::new("unused").with_scripted_stream(script)), |_| {}, 0, vec![done_tool()]).await;
+            Provider::Mock(MockClient::new("unused").with_scripted_stream(script)), |_| {}, 0, vec![done_tool()], vec![]).await;
         let reason = match completed.try_recv().expect("the turn completes once").payload {
             TurnFlow::Completed { reason, .. } => reason,
             other => panic!("expected Completed, got {other:?}"),
@@ -4084,6 +4123,74 @@ mod publish_tests {
             assert!(blocks.iter().any(|b| b.content.contains(&format!("reply {MAX_DONE_NUDGES}"))), "the final reply ran");
             assert!(!blocks.iter().any(|b| b.content.contains(&format!("reply {}", MAX_DONE_NUDGES + 1))),
                 "the turn ended at the reply after the last nudge");
+        }).await;
+    }
+
+    /// A relative path and its absolute spelling name one file; only the file
+    /// tools' writes are keyed.
+    #[test]
+    fn written_file_keys_file_tool_writes_by_absolute_path() {
+        let cwd = std::path::Path::new("/app");
+        let rel = serde_json::json!({"path": "x.c"});
+        let abs = serde_json::json!({"path": "/app/x.c"});
+        assert_eq!(written_file("edit", &rel, Some(cwd)), written_file("write", &abs, Some(cwd)));
+        assert_eq!(written_file("read", &abs, Some(cwd)), None);
+        assert_eq!(written_file("edit", &serde_json::json!({}), Some(cwd)), None);
+    }
+
+    /// An `edit` tool that records when each call starts and ends.
+    struct RecordingFileServer {
+        id: crate::mcp::InstanceId,
+        log: Arc<parking_lot::Mutex<Vec<String>>>,
+        notif_tx: tokio::sync::broadcast::Sender<crate::mcp::server_like::ServerNotification>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mcp::server_like::McpServerLike for RecordingFileServer {
+        fn instance_id(&self) -> &crate::mcp::InstanceId { &self.id }
+        async fn list_tools(&self, _ctx: &crate::mcp::CallContext) -> crate::mcp::McpResult<Vec<crate::mcp::KernelTool>> {
+            Ok(vec![crate::mcp::KernelTool { instance: self.id.clone(), name: "edit".into(), description: None,
+                input_schema: serde_json::json!({"type": "object"}) }])
+        }
+        async fn call_tool(&self, params: crate::mcp::KernelCallParams, _ctx: &crate::mcp::CallContext,
+            _cancel: tokio_util::sync::CancellationToken) -> crate::mcp::McpResult<crate::mcp::KernelToolResult>
+        {
+            let tag = params.arguments["tag"].as_str().unwrap().to_string();
+            self.log.lock().push(format!("start {tag}"));
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.log.lock().push(format!("end {tag}"));
+            Ok(crate::mcp::KernelToolResult::text("edited"))
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<crate::mcp::server_like::ServerNotification> {
+            self.notif_tx.subscribe()
+        }
+    }
+
+    /// Calls in one batch that write the same file run in call order: run
+    /// together, the second edit read a file the first was still changing.
+    /// Calls on other files still run alongside them.
+    #[tokio::test]
+    async fn same_file_edits_in_one_batch_run_in_call_order() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("same-file-edits").await);
+            let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let (notif_tx, _) = tokio::sync::broadcast::channel(1);
+            let id = crate::mcp::InstanceId::new("rec.file");
+            kernel.broker().register(Arc::new(RecordingFileServer { id: id.clone(), log: log.clone(), notif_tx }),
+                crate::mcp::InstancePolicy::for_kernel(&kernel)).await.unwrap();
+            let edit = |call: &str, path: &str, tag: &str| crate::llm::StreamEvent::ToolUse { id: call.into(), name: "edit".into(),
+                input: serde_json::json!({"path": path, "tag": tag}) };
+            let batch = vec![
+                edit("c1", "/app/x.c", "x1"), edit("c2", "/app/x.c", "x2"), edit("c3", "/app/y.c", "y1"),
+                crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
+            ];
+            let tools = vec![ToolDefinition { name: "edit".into(), description: String::new(), input_schema: serde_json::json!({"type": "object"}) }];
+            drive_turn_offering(TurnOrigin::Interactive, kernel, Provider::Mock(MockClient::new("unused")
+                .with_scripted_stream(vec![batch, text_reply("edited both")])), |_| {}, 0, tools, vec![id]).await;
+            let log = log.lock().clone();
+            let at = |event: &str| log.iter().position(|e| e == event).unwrap_or_else(|| panic!("{event} missing: {log:?}"));
+            assert!(at("end x1") < at("start x2"), "the second edit on x.c waits for the first: {log:?}");
+            assert!(at("start y1") < at("end x1"), "an edit on another file runs alongside: {log:?}");
         }).await;
     }
 
