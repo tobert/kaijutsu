@@ -3209,3 +3209,49 @@ carries it with the other gaps a replacement scorer inherits.
 
 Credits: Claude Opus 5.5.
 
+
+## Kaijutsu stops trusting the whole host (October 2)
+
+Both losses in the 10-01 DeepSeek-flash Terminal-Bench run were the agent
+process dying on `grep -r PATTERN /`. Reproduced under a memory cap: kaish's
+builtin `grep` runs in the kernel and reads each file whole, and
+`/proc/<pid>/pagemap` reports size 0 and returns about 256 GiB. The model's
+`grep -v '^/proc'` filter ran after the read. An audit of 40 trials then found
+no model reached `/` by accident; every whole-host walk was deliberate, mostly
+hunting for the grader, and the root listing invited it.
+
+Amy set the direction: kaijutsu becomes less privileged, so that it is freer
+inside its own space. No cap on file reads ("too easy to introduce accidental
+corruption"); a memory limit per kaish execution, raisable by the user, is the
+right bound, still to design. The kernel unlists the host's `/proc` and
+`/sys`, dropping them from walks, FSN, and SFTP while naming them still
+works. kaish walks stay in the mount region they start in unless a mount is
+named or `--cross-mounts` is given, and say once on stderr what they skipped.
+Kaijutsu's rule: host work trees (`/`, `/tmp`, `/app`, `~/src`) are walked
+through; its own spaces (`/config`, `/run`, `/v`, `/r`, `/dev`) stop a walk.
+The file tools follow the same rule. "The inversion" in `docs/mounts.md`
+remains the larger step.
+
+A cwd became deliberate and visible. `kj context create` inherits the caller's
+cwd; one check, the same one `cd` uses, guards `--cwd`, `--pwd`, inherited
+cwds, and `setContextCwd`; a removed cwd never moves a context to `/`; shell
+results name a changed cwd. `/` is allowed by kaish and accepted by kaijutsu,
+but every surface at `/` warns: "it's almost always a mistake." Making `cd`
+follow symlinks exposed `rm -r link` deleting the link target's files on host
+mounts; removal now unlinks.
+
+Toolie became a read-only explorer ported from kaibo's explorer prompts; the
+facade, not the RPC, now chooses the shell, so a seat holding only
+`facade:shell` stays read-only through `shellExecute`, `execute`, drafts, and
+approved asks.
+
+Bash compatibility follows 80/20. Replaying 1169 benchmark commands through
+`kaish --plan` (parse and plan only) measured what still fails; an A/B of the
+shell description on DeepSeek flash showed that calling kaish "a subset" with
+one quoting rule removed the gluing mistakes. kaish fixes inconsistencies
+(`-name=value` as one word like `--name=value`, glued comma and colon lists,
+`+x`, `...`) and keeps refusing bash word gluing by design. Next for #485: a
+per-kernel counter stamps output spans, so merged stdout and stderr can follow
+write order.
+
+Credits: Claude Opus 5.5; DeepSeek flash via kaibo for reviews and studies.
