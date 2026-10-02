@@ -748,66 +748,57 @@ Shipped 2026-10-02: the kernel unlists the host's `/proc` and `/sys`
 (`MountTable::unlist`, `docs/mounts.md`, "Unlisted paths"), so a walk from
 `/` does not enter them and naming them still works. Still open:
 
+Decided 2026-10-02 (Amy). Kaijutsu becomes less privileged, so that it is
+freer inside its own space: "I can connect to the host if I need that." The
+unlist also takes `/proc` and `/sys` out of the FSN view and SFTP listings,
+and that is wanted. Still open:
+
 - **A walk or read that names `/proc` can still kill the kernel**
-  (`grep -r x /proc`, `cat /proc/self/pagemap`). Proposal, kaijutsu side: a
-  ceiling on whole-file reads through `MountBackend::read` (read at most N+1
-  bytes; past N fail with "FILE is larger than N bytes; read a range with
-  `head -c`, `tail -c`, or `sed -n`"). It covers every spelling and every
-  oversized file, and is small. The cost is that a legitimate `cat` of a
-  file over N fails until kaish streams; N is Amy's call (256 MiB would cover
-  every file a model can use whole).
-- **Hiding `/v` (and kaish's `/dev`) from a shell walk needs kaish.** The
-  overlay's listing of `/` adds kaish's mounts and the synthesized `/v` back
-  after kaijutsu's listing. Proposed kaish change: `VfsRouter::unlist(path)`,
-  honored by `VfsRouter::list` and by the shared-ancestor union in
-  `VirtualOverlayBackend::list`; kaijutsu would call it for `/v` in
-  `EmbeddedKaish`'s `configure_vfs`. Whether `ls /` should also stop showing
-  `/v` is Amy's call: the listing is what a walk sees, so the two go together.
-- **Recursive builtins have no bound** (kaish). Proposed: `grep -r` reads
-  through the chunked reader it already uses for one file; walks skip
-  non-regular files, as GNU `grep -D skip` does (kaish's `DirEntryKind` has
-  no device or FIFO kind, so a FIFO in a walked tree blocks `grep`); and an
-  optional walk budget (entries or bytes) that stops with exit 2 and names
-  the budget. Filed in `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
-- **Catching the accident itself.** `grep -r PATTERN /` is almost always a
-  mistake in kaijutsu work, and naming the right tree is the fix. Options:
-  1. A rule in the shell-escape guard (`lib/hooks/shell-guard.kai`, over
-     `KJ_TOOL_PLAN`): a content-reading recursive walk (`grep -r`/`-R`,
-     `rg`) whose path operand folds to `/` is denied with "a recursive grep
-     from / reads the whole host; name the tree you mean (/usr/include,
-     /app), or locate files first with `find / -name NAME`". Cheap, fails in
-     the same call, and matches the file tools' `refuse_filesystem_root_walk`.
-     Lexical only: `cd / && grep -r x .` passes, and the read-only `shell`
-     has no pre_call guard. Leave `find / -name` alone: it is the common,
-     legitimate way a model locates a file, and it reads no contents.
-  2. An ask instead of a denial, so a reviewer (a person or a model seat)
-     decides. Allows the rare legitimate case, but costs a round trip and a
-     reviewer, and in a benchmark run the reviewer is the bridge.
-  3. The kaish walk budget above, which catches every spelling but only
-     after the walk has started.
-  Recommendation: the ceiling and option 1 now, the kaish bounds next.
-  Whether `$HOME` counts as a root for option 1 is open: `~/src` walks are
-  usually deliberate.
+  (`grep -r x /proc`, `cat /proc/self/pagemap`). Do not cap file reads: a
+  limit inside file I/O can easily corrupt data by accident. Bound the blast
+  radius of a kaish execution instead: one memory limit for the whole
+  execution, which the user can raise. Exceeding it stops the interpreter,
+  and the kernel survives. A stopped interpreter is a place to inspect and
+  intervene. Open question: could peeking at an oversized kaish, killing
+  its running commands, and playing the rest out work as an interrupt, more
+  like `kill -9` or power loss than a clean cancel, with partial recovery
+  someday? Needs a design conversation: where the accounting lives (the
+  kernel process, a per-execution allocator, a cgroup) and what the receipt
+  says.
+- **Walks stay on one filesystem by default** (kaish). A recursive walk does
+  not cross into another mount unless that mount is named. To crawl `/v` or
+  `/r`, name it. This is the reverse of GNU's `--one-file-system`/`-xdev`
+  opt-in. It covers `/v`, kaish's `/dev`, and client shares under `/r`,
+  which a walk from `/` would otherwise crawl over the network. Supersedes
+  the `VfsRouter::unlist` proposal for walks. `/proc` and `/sys` stay
+  unlisted in kaijutsu, because the host's `/` is one `LocalBackend` mount.
+- **Recursive builtins have no bound** (kaish). `grep -r` could read through
+  the chunked reader it already uses for one file. Walks could skip
+  non-regular files, as GNU `grep -D skip` does: kaish's `DirEntryKind` has
+  no device or FIFO kind, so a FIFO in a walked tree blocks `grep`. Filed in
+  `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
+- **Find where a model ends up at a bare `/`, and fix the UX/AX there**,
+  rather than a guard rule against `grep -r PATTERN /` (decided against: it
+  is lexical, and it treats the symptom). Candidates: a context with no cwd
+  starts in the kernel's own directory; a removed cwd moves to its nearest
+  ancestor; a home-dir fallback; benchmark tasks where the model does not
+  know its tree (`/app`) and searches the whole host to find it.
 
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 
 Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
 
-- **A context holding only `facade:shell` gets a writable RPC shell.** The
-  shell RPC (`rpc.rs`, the person's shell box and kaijutsu-mcp's `shell`)
-  always materializes `ShellPolicy::Agent` (`interactive.rs`), so a toolie
-  seat, granted the safe facade because it "cannot hurt anything", reaches
-  writes and mutating `kj` verbs through it; the ask tier still applies.
-  Predates `check_shell_facade`. Choosing `ReadOnly` when only `facade:shell`
-  is held changes the person's box in toolie seats: Amy's call.
+- **The `execute` and `executeKj` RPCs ignore the shell facade.** Both run
+  `ShellPolicy::Agent` with no facade check (`rpc.rs`, `streaming::execute`
+  and `structured::execute_kj`), so a toolie seat still reaches writes and
+  mutating `kj` verbs through them; the ask tier still applies. `shellExecute`
+  and shell drafts now follow the facade (`Broker::check_shell_facade`). No
+  shipped client calls `execute`; `executeKj` is the person's `kj` path.
 - **The register path still announces tools before a context's first model
   block** (`emit_for_bindings`), unlike the binding-diff path.
 - **The shell descriptions name four of the facts a turn reads**; `[waiting
   for approval…]`, `[timed out waiting…]`, `[data]`, and `[latch]` are not
   described, and the ceiling-case truncation note has a different shape.
-- **`toolie/create/S45-shell-guard.kai` exists** although the script's header
-  says it goes only to seats holding `exec`; two comments cite
-  `docs/gate-and-shell-split.md`, which does not exist.
 - **A background job's live stream is uncut and unbounded on the kernel
   side** (`command.rs`, an unbounded channel of cloned results).
 
