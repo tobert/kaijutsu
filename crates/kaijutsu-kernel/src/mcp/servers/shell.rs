@@ -102,10 +102,11 @@ const RESULT_CONTRACT: &str = "The result is the command's output, then one \
      retry); `[running in the background: operation ID]`; `[output truncated: \
      N bytes; the full output is at /v/cas/…]` (read that path with `grep`, \
      `sed -n`, or `read`); `[cwd now DIR]` (the call changed your working \
-     directory). A clean success is its output alone. An MCP caller \
+     directory); `[warning: …]` (correct it first; a cwd of `/` draws one on \
+     every call). A clean success is its output alone. An MCP caller \
      receives one JSON object with the keys {stdout, stderr, exit_code, status, \
      did_spill, data, latch, block_id, operation_id, ask_id, content_type, \
-     ephemeral, elapsed_ms, error, cwd}; `exit_code` null is never evidence of success.";
+     ephemeral, elapsed_ms, error, cwd, warning}; `exit_code` null is never evidence of success.";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -1085,6 +1086,47 @@ mod tests {
             let command = params.arguments["command"].clone();
             let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
             assert_eq!(body_of(&result)["cwd"], cwd, "{command}: {}", body_of(&result));
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A shell left at `/` says so on every call, not only the one that went
+    /// there. The read-only shell discards a `cd`, so it warns about the cwd
+    /// it started in, which is where its next call starts too.
+    #[tokio::test]
+    async fn a_shell_at_the_root_warns_on_every_call() {
+        use crate::vfs::VfsOps;
+        let (broker, d) = wired().await;
+        broker.register(Arc::new(ShellServer::new_read_only(Arc::downgrade(&broker))), InstancePolicy::default())
+            .await.unwrap();
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"),
+            b"[global]\nallow = [\"cd\", \"echo\", \"false\"]\n").await.unwrap();
+        d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
+        let principal = PrincipalId::new();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("cwd-root"), principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        d.kernel_db().lock().upsert_context_shell(&ContextShellRow {
+            context_id: context, cwd: Some("/work".into()), updated_at: 0,
+        }).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        let warning = serde_json::json!("cwd is /, which is almost always a mistake; cd to your work tree");
+        for (params, expected) in [
+            (call_write("echo hi"), serde_json::Value::Null),
+            (call_write("cd /"), warning.clone()),
+            (call_write("echo hi"), warning.clone()),
+            (call_write("cd /; false"), warning.clone()),
+            (call("cd /work"), warning.clone()),
+            (call("echo hi"), warning.clone()),
+            (call_write("cd /work"), serde_json::Value::Null),
+            (call("cd /"), serde_json::Value::Null),
+        ] {
+            let command = params.arguments["command"].clone();
+            let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
+            assert_eq!(body_of(&result)["warning"], expected, "{command}: {}", body_of(&result));
         }
         d.kernel().shutdown_runtime_worker().await.unwrap();
     }

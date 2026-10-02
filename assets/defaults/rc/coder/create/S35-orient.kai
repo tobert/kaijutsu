@@ -17,7 +17,9 @@
 #    child counts, never a recursive walk, so a huge tree costs one listing.
 #  - Silent where there is nothing. An absent section is omitted, never
 #    reported as unavailable. A context without a cwd gets a short note
-#    instead: its shell starts in the kernel's own home directory.
+#    instead: its shell starts in the kernel's own home directory. A context
+#    at / gets a short warning instead: / is accepted, but it is almost
+#    always a mistake.
 #  - Never exit nonzero on a missing file; only a failed block write fails
 #    the script.
 
@@ -27,6 +29,11 @@ cwd="$(kj context info --json | jq -r '.cwd // empty')"
 if test -z "$cwd"; then
   kj block create --role system --kind notification --content "This context has no working directory, so the shell starts in the kernel's home directory, which is not your project. Give it one with `cd DIR` in shell_write; the change persists. From outside this context, `kj context set . --cwd DIR` sets it."
   echo "orient: context has no cwd; said so"
+  exit 0
+fi
+if test "$cwd" = "/"; then
+  kj block create --role system --kind notification --content "This context's working directory is /, which is almost always a mistake: relative paths and searches start at the top of the host, not in your project. Move to your project with `cd DIR` in shell_write; the change persists. From outside this context, `kj context set . --cwd DIR` sets it."
+  echo "orient: context cwd is /; said so"
   exit 0
 fi
 if test ! -d "$cwd"; then

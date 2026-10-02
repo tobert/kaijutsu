@@ -840,7 +840,11 @@ impl KjDispatcher {
         self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        let message = format!("forked to '{}' ({})", display, short);
+        let mut message = format!("forked to '{}' ({})", display, short);
+        if let Some(line) = child_cwd.as_deref().and_then(|cwd| crate::runtime::shell_state::root_cwd_line(new_id, cwd)) {
+            message.push('\n');
+            message.push_str(&line);
+        }
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
@@ -1118,7 +1122,11 @@ impl KjDispatcher {
         self.request_child_turn(new_id, prompt.as_deref(), staging, caller);
         let short = new_id.short();
         let display = label.as_deref().unwrap_or(&short);
-        let message = format!("compact-forked to '{}' ({})", display, new_id.short());
+        let mut message = format!("compact-forked to '{}' ({})", display, new_id.short());
+        if let Some(line) = child_cwd.as_deref().and_then(|cwd| crate::runtime::shell_state::root_cwd_line(new_id, cwd)) {
+            message.push('\n');
+            message.push_str(&line);
+        }
         self.fork_outcome(new_id, label.as_deref(), switch, message)
     }
 
@@ -2648,6 +2656,46 @@ mod tests {
             assert!(result.message().contains("--pwd '/no/such/dir' is not a directory"), "msg: {}", result.message());
         }
         assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "nothing is forked");
+    }
+
+    /// A child at `/`, named by `--pwd` or inherited, is forked, and the
+    /// output says so. `--pwd DIR` draws no warning.
+    #[tokio::test]
+    async fn a_root_cwd_forks_with_a_warning() {
+        use crate::vfs::VfsOps;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/scratch/work"), 0o755).await.unwrap();
+        let source = register_context(&d, Some("src"), None, PrincipalId::new());
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let mut source_cwd_is_root = false;
+        for (label, pwd, warned) in [
+            ("named", Some("/"), true),
+            ("worked", Some("/scratch/work"), false),
+            ("inherited", None, true),
+        ] {
+            if pwd.is_none() && !source_cwd_is_root {
+                d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                    context_id: source, cwd: Some("/".into()), updated_at: 0,
+                }).unwrap();
+                source_cwd_is_root = true;
+            }
+            let mut argv = vec![s("fork"), s("--name"), s(label)];
+            if let Some(pwd) = pwd {
+                argv.extend([s("--pwd"), s(pwd)]);
+            }
+            let result = d.dispatch(&argv, &c).await;
+            assert!(result.is_ok(), "{label}: {}", result.message());
+            let child = d.kernel_db().lock().find_context_by_label(label).unwrap().unwrap().context_id;
+            let warning = format!(
+                "\nwarning: context {short} has cwd /, which is almost always a mistake; \
+                 set its work tree with `kj context set {short} --cwd DIR`", short = child.short());
+            assert_eq!(result.message().contains(&warning), warned, "{label}: {}", result.message());
+        }
     }
 
     /// A source cwd that `cd` no longer enters refuses the fork before any

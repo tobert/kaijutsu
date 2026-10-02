@@ -1659,6 +1659,10 @@ impl KjDispatcher {
         if !config_changes.is_empty() {
             msg.push_str(&format!(" [{}]", config_changes.join(", ")));
         }
+        if let Some(line) = cfg.cwd_spec.as_deref().and_then(|cwd| crate::runtime::shell_state::root_cwd_line(new_id, cwd)) {
+            msg.push('\n');
+            msg.push_str(&line);
+        }
         // Report whether the retained context received a usable loadout.
         match self.has_usable_loadout(new_id) {
             Ok(true) => {}
@@ -2080,7 +2084,14 @@ impl KjDispatcher {
             Ok(changes) if changes.is_empty() => {
                 KjResult::ok("no changes specified".to_string())
             }
-            Ok(changes) => KjResult::ok(format!("updated: {}", changes.join(", "))),
+            Ok(changes) => {
+                let mut msg = format!("updated: {}", changes.join(", "));
+                if let Some(line) = cfg.cwd_spec.as_deref().and_then(|cwd| crate::runtime::shell_state::root_cwd_line(target_id, cwd)) {
+                    msg.push('\n');
+                    msg.push_str(&line);
+                }
+                KjResult::ok(msg)
+            }
             Err(e) => KjResult::Err(format!("kj context set: {e}")),
         }
     }
@@ -5280,6 +5291,40 @@ mod tests {
 
         let result = d.dispatch(&[s("context"), s("create"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
         assert!(result.is_ok(), "create --cwd on a directory succeeds: {}", result.message());
+    }
+
+    /// `/` is accepted as a cwd, and every command that leaves a context
+    /// there says so in its output. Another directory draws no warning.
+    #[tokio::test]
+    async fn a_root_cwd_is_accepted_with_a_warning() {
+        let d = wired_dispatcher().await;
+        let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        let c = caller_with_context(parent);
+        let warns = |message: &str, ctx: ContextId| message.contains(&format!(
+            "\nwarning: context {short} has cwd /, which is almost always a mistake; \
+             set its work tree with `kj context set {short} --cwd DIR`", short = ctx.short()));
+
+        let result = d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/")], &c).await;
+        assert!(result.is_ok() && warns(result.message(), parent), "set --cwd /: {}", result.message());
+        let result = d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/scratch/work")], &c).await;
+        assert!(result.is_ok() && !result.message().contains("warning"), "set --cwd DIR: {}", result.message());
+
+        for (label, argv) in [
+            ("explicit", vec![s("context"), s("create"), s("explicit"), s("--cwd"), s("/")]),
+            ("inherited", vec![s("context"), s("create"), s("inherited")]),
+        ] {
+            if label == "inherited" {
+                d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s("/")], &c).await;
+            }
+            let result = d.dispatch(&argv, &c).await;
+            assert!(result.is_ok(), "{label}: {}", result.message());
+            let child = d.kernel_db().lock().find_context_by_label(label).unwrap().unwrap().context_id;
+            assert!(warns(result.message(), child), "{label}: {}", result.message());
+            assert_eq!(d.kernel_db().lock().get_context_shell(child).unwrap().unwrap().cwd.as_deref(), Some("/"));
+        }
+        let result = d.dispatch(&[s("context"), s("create"), s("worked"), s("--cwd"), s("/scratch/work")], &c).await;
+        assert!(result.is_ok() && !result.message().contains("warning"), "create --cwd DIR: {}", result.message());
     }
 
     #[tokio::test]

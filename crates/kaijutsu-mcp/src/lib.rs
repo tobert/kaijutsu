@@ -231,6 +231,7 @@ impl ShellCompletion {
     /// keys whichever path served the call. Fields this path cannot know stay
     /// `null` — `did_spill` and `latch` ride kaish's `ExecResult`, and `cwd`
     /// the kernel's settlement, neither of which reaches a block snapshot.
+    /// `warning` is set after this, from the context's stored cwd.
     ///
     /// `cfg(test)`: production reaches the envelope through `to_tool_result`,
     /// which needs the typed value to decide the error flag. The tests read
@@ -1383,6 +1384,19 @@ impl KaijutsuMcp {
         .await;
         let mut envelope = completion.to_envelope();
         envelope.operation_id = Some(submission.operation_id);
+        // The block snapshot carries no cwd, so read the context's stored cwd
+        // once the command has settled. A failed read leaves `warning` null:
+        // this path cannot tell.
+        if matches!(completion, ShellCompletion::Done { .. }) {
+            match actor.get_context_cwd(ctx_id).await {
+                Ok(cwd) => {
+                    envelope.warning = cwd.as_deref().and_then(|cwd| {
+                        kaijutsu_types::shell_envelope::root_cwd_warning(std::path::Path::new(cwd))
+                    });
+                }
+                Err(e) => tracing::warn!("Shell command: reading the context cwd for the root warning failed: {e}"),
+            }
+        }
         if envelope.is_error() {
             CallToolResult::structured_error(envelope.to_value())
         } else {
@@ -1811,7 +1825,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set run_in_background=true to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. A call that waits for completion preserves durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error, cwd. Unknown values are null. Requires --connect and register_session.",
+        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set run_in_background=true to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. A call that waits for completion preserves durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error, cwd, warning. A warning names a condition to correct first; a context cwd of / draws one on every call. Unknown values are null. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]

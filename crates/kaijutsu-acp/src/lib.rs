@@ -346,7 +346,10 @@ async fn handle_new_session(
     }
     let session_id = rank::session_id_of(opened.context_id);
     match start_session(&bridge, &session_id, opened.context_id, opened.label, &cx, false).await {
-        Ok(()) => responder.respond(NewSessionResponse::new(session_id)),
+        Ok(()) => {
+            warn_root_cwd(&cx, &session_id, &req.cwd);
+            responder.respond(NewSessionResponse::new(session_id))
+        }
         Err(e) => responder.respond_with_error(e),
     }
 }
@@ -455,7 +458,10 @@ async fn handle_load_session(
     // Replay the transcript: `session/load` exists so a client can render the
     // conversation it is rejoining.
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, true).await {
-        Ok(()) => responder.respond(LoadSessionResponse::new()),
+        Ok(()) => {
+            warn_root_cwd(&cx, &req.session_id, &req.cwd);
+            responder.respond(LoadSessionResponse::new())
+        }
         Err(e) => responder.respond_with_error(e),
     }
 }
@@ -493,7 +499,10 @@ async fn handle_resume_session(
         return responder.respond_with_error(e);
     }
     match start_session(&bridge, &req.session_id, context_id, info.label, &cx, false).await {
-        Ok(()) => responder.respond(ResumeSessionResponse::new()),
+        Ok(()) => {
+            warn_root_cwd(&cx, &req.session_id, &req.cwd);
+            responder.respond(ResumeSessionResponse::new())
+        }
         Err(e) => responder.respond_with_error(e),
     }
 }
@@ -552,6 +561,24 @@ fn validate_acp_cwd(cwd: &std::path::Path) -> anyhow::Result<()> {
         anyhow::bail!("ACP cwd must be absolute: {}", cwd.display());
     }
     Ok(())
+}
+
+/// Tell the client when its session's cwd is `/`. The kernel accepts `/`,
+/// so a session is never trapped there, but it is almost always a mistake.
+/// See `docs/shell-envelope.md`, "A cwd of `/`".
+fn warn_root_cwd(cx: &ConnectionTo<Client>, session_id: &SessionId, cwd: &std::path::Path) {
+    if !kaijutsu_types::shell_envelope::is_root_cwd(cwd) {
+        return;
+    }
+    let message = "warning: this session's cwd is /, which is almost always a mistake; \
+                   start the client in your work tree, or `cd DIR` in the shell";
+    tracing::warn!(session = %session_id, "{message}");
+    if let Err(e) = cx.send_notification(SessionNotification::new(
+        session_id.clone(),
+        SessionUpdate::AgentMessageChunk(crate::update::text_chunk(message)),
+    )) {
+        tracing::warn!(session = %session_id, error = %e, "could not send the root cwd warning");
+    }
 }
 
 /// Bind a session and start its pump. Idempotent: loading an already-bound

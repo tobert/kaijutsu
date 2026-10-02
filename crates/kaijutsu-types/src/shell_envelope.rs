@@ -94,6 +94,25 @@ pub struct ShellEnvelope {
     /// The shell's working directory after this call, when the call changed
     /// it. `null` when it did not, or when the serving path cannot tell.
     pub cwd: Option<String>,
+    /// A condition the caller should correct before it goes on, such as a
+    /// shell left at `/`. `null` when there is none, or when the serving
+    /// path cannot tell.
+    pub warning: Option<String>,
+}
+
+/// Whether `cwd` names the filesystem root.
+///
+/// kaish accepts `/` as a working directory. A kaijutsu seat at `/` is almost
+/// always a mistake, so every surface that leaves a shell there says so and
+/// none refuses it. See `docs/shell-envelope.md`, "A cwd of `/`".
+pub fn is_root_cwd(cwd: &std::path::Path) -> bool {
+    cwd.has_root() && cwd.parent().is_none()
+}
+
+/// The shell result's warning for a shell whose cwd is `cwd`: present only
+/// for `/`.
+pub fn root_cwd_warning(cwd: &std::path::Path) -> Option<String> {
+    is_root_cwd(cwd).then(|| "cwd is /, which is almost always a mistake; cd to your work tree".to_string())
 }
 
 impl ShellEnvelope {
@@ -116,6 +135,7 @@ impl ShellEnvelope {
             elapsed_ms: None,
             error: None,
             cwd: None,
+            warning: None,
         }
     }
 
@@ -237,6 +257,9 @@ impl ShellEnvelope {
         if let Some(cwd) = &self.cwd {
             facts.push(format!("[cwd now {cwd}]"));
         }
+        if let Some(warning) = &self.warning {
+            facts.push(format!("[warning: {warning}]"));
+        }
         let mut text = if clean.is_empty() && facts.is_empty() { "(no output)".to_string() } else { clean.to_string() };
         for fact in facts {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -266,6 +289,7 @@ impl ShellEnvelope {
         "elapsed_ms",
         "error",
         "cwd",
+        "warning",
     ];
 
     /// The declared result shape (an MCP `Tool.outputSchema`).
@@ -310,11 +334,15 @@ impl ShellEnvelope {
                 "cwd": {
                     "type": ["string", "null"],
                     "description": "the shell's working directory after this call, when the call changed it; null when it did not, or when this path cannot tell"
+                },
+                "warning": {
+                    "type": ["string", "null"],
+                    "description": "a condition to correct before going on, such as a shell left at /; null when there is none"
                 }
             },
             "required": [
                 "stdout", "stderr", "exit_code", "status", "did_spill", "data", "latch",
-                "block_id", "operation_id", "ask_id", "content_type", "ephemeral", "elapsed_ms", "error", "cwd"
+                "block_id", "operation_id", "ask_id", "content_type", "ephemeral", "elapsed_ms", "error", "cwd", "warning"
             ]
         })
     }
@@ -381,6 +409,32 @@ mod tests {
         env.status = ShellStatus::Error;
         env.exit_code = Some(1);
         assert_eq!(env.model_text("no such file\n"), "no such file\n[exit 1]\n[cwd now /work/sub]");
+    }
+
+    /// A call that leaves the shell at `/` says so on every call, after the
+    /// output and the other facts, whether or not the call changed the cwd.
+    #[test]
+    fn a_warning_reads_as_one_line() {
+        let mut env = ShellEnvelope::new(ShellStatus::Done);
+        env.exit_code = Some(0);
+        env.warning = root_cwd_warning(std::path::Path::new("/"));
+        assert_eq!(env.model_text(""),
+            "[warning: cwd is /, which is almost always a mistake; cd to your work tree]");
+        env.cwd = Some("/".into());
+        assert_eq!(env.model_text("bin\netc\n"),
+            "bin\netc\n[cwd now /]\n[warning: cwd is /, which is almost always a mistake; cd to your work tree]");
+    }
+
+    /// Only the filesystem root draws the warning.
+    #[test]
+    fn only_the_root_is_a_root_cwd() {
+        for root in ["/", "//"] {
+            assert!(is_root_cwd(std::path::Path::new(root)), "{root}");
+        }
+        for not_root in ["/home", "/tmp/", "work", ""] {
+            assert!(!is_root_cwd(std::path::Path::new(not_root)), "{not_root}");
+            assert_eq!(root_cwd_warning(std::path::Path::new(not_root)), None, "{not_root}");
+        }
     }
 
     /// An envelope stored without `cwd` still reads, as unchanged: the

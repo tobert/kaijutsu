@@ -1,13 +1,13 @@
 # The shell envelope
 
-`kj shell 'echo hi'` and an MCP `shell` call return the same fifteen keys.
+`kj shell 'echo hi'` and an MCP `shell` call return the same sixteen keys.
 One tool name, one shape, one error rule.
 
 ```json
 {"stdout":"hi\n","stderr":"","exit_code":0,"status":"done","did_spill":false,
  "data":null,"latch":null,"block_id":null,"operation_id":null,"ask_id":null,
  "content_type":"text/plain","ephemeral":false,"elapsed_ms":3,"error":null,
- "cwd":null}
+ "cwd":null,"warning":null}
 ```
 
 The type is `kaijutsu_types::shell_envelope::ShellEnvelope`. It is the single
@@ -35,7 +35,9 @@ never the same as `0`, `false`, or `""`. `did_spill` and `latch` ride kaish's
 does not carry them. `cwd` names the shell's working directory after a call
 that changed it and persisted the change, and is `null` otherwise. The kernel
 sets it at settlement; the read-only shell, which discards a `cd`, and the MCP
-path leave it `null`.
+path leave it `null`. `warning` names a condition to correct before going on,
+and is `null` when there is none; today the one condition is a cwd of `/`
+(below).
 
 **A nonzero exit is an error.** Both builders set the tool-result error flag
 from `status`, so the flag and the field can never disagree. (Amy, 2026-09-04.)
@@ -155,6 +157,27 @@ the model does next:
 | output past 8 KiB | the preview's own last line, `[output truncated: N bytes; the full output is at /v/cas/PREFIX/HASH]` (`stderr` likewise) |
 | a `kj` payload or latch | `[data] JSON`, `[latch] JSON` |
 | the call changed the shell's cwd | `[cwd now DIR]` |
+| a warning | `[warning: TEXT]`, last |
+
+## A cwd of `/`
+
+`[warning: cwd is /, which is almost always a mistake; cd to your work tree]`
+follows every result whose shell is at `/` after the call, not only the call
+that went there. kaish accepts `/` as a cwd and so does kaijutsu, so a seat is
+never trapped: an ACP client launched at `/`, a context stored at `/`, and a
+person's `cd /` all work. Every surface that leaves a shell at `/` says so
+instead (Amy, 2026-10-02):
+
+| Surface | What it says |
+|---|---|
+| `shell_write`, `kj shell` | `warning` set after settlement, from the cwd the call left |
+| read-only `shell` | `warning` set from the cwd it started in, since its `cd` is discarded |
+| kaijutsu-mcp `shell` | `warning` set from the context's stored cwd, read once the command completed |
+| `kj context create\|set --cwd /`, `kj fork --pwd /`, an inherited `/` | an output line, `` warning: context ID has cwd /, which is almost always a mistake; set its work tree with `kj context set ID --cwd DIR` `` |
+| ACP `session/new`, `session/load`, `session/resume` at `/` | an agent message to the client, and a kernel log line on `setContextCwd` |
+| coder create orientation | a notification in place of the orientation |
+
+`kaijutsu_types::shell_envelope::is_root_cwd` is the one test for `/`.
 
 `block_id`, `content_type`, `ephemeral`, and `elapsed_ms` are never sent. The
 rendering is always text, including for a command that printed nothing: the

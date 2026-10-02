@@ -7872,6 +7872,9 @@ async fn set_context_cwd(
     ).await {
         return Ok(Err(refusal));
     }
+    if let Some(line) = kaijutsu_kernel::runtime::shell_state::root_cwd_line(context_id, path) {
+        log::warn!("setContextCwd: {line}");
+    }
 
     let updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

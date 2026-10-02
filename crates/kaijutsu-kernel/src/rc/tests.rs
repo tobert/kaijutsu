@@ -2969,6 +2969,8 @@ esac
     const ORIENT_MARKER: &str = "Orientation of the working directory";
     /// First words of the notification a coder without a cwd gets instead.
     const NO_CWD_MARKER: &str = "This context has no working directory";
+    /// First words of the notification a coder at `/` gets instead.
+    const ROOT_CWD_MARKER: &str = "This context's working directory is /";
     /// The script's hard cap on its block, in characters.
     const ORIENT_CAP_CHARS: usize = 6000;
 
@@ -2995,7 +2997,7 @@ esac
         let notes: Vec<_> = blocks
             .iter()
             .filter(|b| b.kind == BlockKind::Notification
-                && (b.content.starts_with(ORIENT_MARKER) || b.content.starts_with(NO_CWD_MARKER)))
+                && [ORIENT_MARKER, NO_CWD_MARKER, ROOT_CWD_MARKER].iter().any(|m| b.content.starts_with(m)))
             .cloned()
             .collect();
         let sections = crate::extract_system_prompt_sections(&blocks);
@@ -3137,6 +3139,28 @@ esac
                     let text = &notes[0].content;
                     assert!(text.starts_with(NO_CWD_MARKER), "{text}");
                     assert!(text.contains("`cd DIR`") && text.contains("kj context set . --cwd DIR"), "{text}");
+                    assert_eq!(notes[0].role, kaijutsu_types::Role::System, "{text}");
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    }
+
+    /// A coder created at `/` is accepted, and told that `/` is almost
+    /// always a mistake and how to move, instead of an orientation of the
+    /// filesystem root.
+    #[test]
+    fn coder_create_at_the_root_says_so() {
+        crate::spawn_kaish_thread("rc-test-thread", || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(async {
+                    let (notes, own, _) = coder_orientation(Some(std::path::Path::new("/"))).await;
+                    assert_eq!(notes.len(), 1, "expected one notification, got: {own:#?}");
+                    let text = &notes[0].content;
+                    assert!(text.starts_with(ROOT_CWD_MARKER), "{text}");
+                    assert!(text.contains("almost always a mistake") && text.contains("`cd DIR`")
+                        && text.contains("kj context set . --cwd DIR"), "{text}");
                     assert_eq!(notes[0].role, kaijutsu_types::Role::System, "{text}");
                 });
         })

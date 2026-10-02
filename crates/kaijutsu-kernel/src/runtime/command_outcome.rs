@@ -44,11 +44,14 @@ pub struct CommandOutcome {
     /// the change was persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// A condition the caller should correct, such as a shell left at `/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl CommandOutcome {
     pub fn new(execution: CommandExecution, elapsed_ms: u64) -> Self {
-        Self { execution, hook: None, settlement_error: None, elapsed_ms, cwd: None }
+        Self { execution, hook: None, settlement_error: None, elapsed_ms, cwd: None, warning: None }
     }
 
     pub fn from_execution(result: Result<ExecResult, kaish_kernel::KernelError>, elapsed_ms: u64) -> Self {
@@ -117,6 +120,7 @@ impl CommandOutcome {
         };
         envelope.elapsed_ms = Some(self.elapsed_ms);
         envelope.cwd = self.cwd.clone();
+        envelope.warning = self.warning.clone();
         if let Some(error) = &self.settlement_error {
             envelope.status = ShellStatus::Error;
             envelope.error = Some(match envelope.error {

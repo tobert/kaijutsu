@@ -516,14 +516,19 @@ async fn capture_command(
         None if matches!(state_writeback, ShellStateWriteBack::Persist) => {
             let state_after = snapshot_shell_state(kaish).await;
             match persist_shell_state(kernel.kernel_db(), context_id, &state_before, &state_after) {
-                Ok(()) => outcome.cwd = state_after.changed_cwd(&state_before),
+                Ok(()) => {
+                    outcome.cwd = state_after.changed_cwd(&state_before);
+                    outcome.warning = kaijutsu_types::shell_envelope::root_cwd_warning(state_after.cwd());
+                }
                 Err(error) => {
                     tracing::error!("shell state write failed: {error}");
                     outcome.settlement_error = Some(error);
                 }
             }
         }
-        None => {}
+        // The shell's state is discarded, so its next call starts where this
+        // one did.
+        None => outcome.warning = kaijutsu_types::shell_envelope::root_cwd_warning(state_before.cwd()),
     }
 }
 

@@ -473,3 +473,32 @@ fn published_shell_retains_broker_output() {
         server.await.unwrap();
     });
 }
+
+/// A context whose cwd is `/` gets a warning on every completed call through
+/// this path too, not only the call that went there.
+#[test]
+fn shell_at_the_root_warns_on_every_call() {
+    run_local(async {
+        let addr = start_server().await;
+        let mcp = connect_mcp(addr).await;
+        register_with_retry(&mcp, "root-cwd").await;
+        let run = |command: &str| {
+            let request = ShellRequest { command: command.to_string(), run_in_background: false, timeout_secs: Some(30) };
+            let mcp = &mcp;
+            async move { mcp.shell_impl(request, None).await.structured_content.expect("shell must return structuredContent") }
+        };
+        let start = run("pwd").await;
+        assert_eq!(start["warning"], serde_json::Value::Null, "{start}");
+        let start = start["stdout"].as_str().unwrap().trim().to_string();
+        assert_ne!(start, "/", "the test needs a starting cwd other than /");
+
+        let warning = serde_json::json!("cwd is /, which is almost always a mistake; cd to your work tree");
+        for command in ["cd /", "echo hi"] {
+            let env = run(command).await;
+            assert_eq!(env["status"], "done", "{command}: {env}");
+            assert_eq!(env["warning"], warning, "{command}: {env}");
+        }
+        let env = run(&format!("cd '{start}'")).await;
+        assert_eq!(env["warning"], serde_json::Value::Null, "{env}");
+    });
+}

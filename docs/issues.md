@@ -855,14 +855,13 @@ Still open:
    orientation. Other context types are not told. Paths that still create
    one: a create from a context with no cwd (root consoles have none), and
    a client directory the kernel refused.
-5. **`/` is accepted as a durable cwd.** `shell_state::check_shell_cwd`
-   accepts `/`, and `persist_shell_state` persists `cd /`, while the
-   removed-cwd repair avoids `/`. Proposed: refuse `/` in
-   `check_shell_cwd`, naming a real directory, and skip persisting a `cd /`
-   with a `[cwd not saved: /]` line. Waits for Amy: an ACP client launched
-   at `/` could then open no session (`invalid_cwd`); a context already
-   stored at `/` could not fork or create a child without `--pwd`/`--cwd`;
-   and a person's `cd /` in the tui would not last to the next command.
+5. **`/` policy: decided and shipped.** Amy, 2026-10-02: "/ should be
+   allowed as cwd by kaish, but not by kaijutsu. kaijutsu can make noise
+   any time cwd is /, it's almost always a mistake." `/` stays accepted,
+   so no seat is trapped, and every surface that leaves a shell there says
+   so: a `warning` on every shell result, an output line from `kj context
+   create|set` and `kj fork`, an ACP agent message, and the coder
+   orientation. See `docs/shell-envelope.md`, "A cwd of `/`".
 6. **Two small cwd leftovers.** The ambient `getCwd` RPC answers `/docs`
    for a context with no cwd (`rpc.rs`, `get_cwd`); no client calls
    `getCwd` or `setCwd`, so both can become `retired8`/`retired9` stubs.

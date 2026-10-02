@@ -908,3 +908,25 @@ fn stdin_eof_exits_clean_and_removes_the_temp_state() {
         !state.exists()
     });
 }
+
+/// A session at `/` opens, and the client is told the cwd is almost always
+/// a mistake. A session in a work tree is not.
+#[test]
+fn a_session_at_the_root_opens_with_a_warning() {
+    let cwd = scratch_dir("root-warning-cwd");
+    let mut agent = spawn_mock("chat");
+    agent.initialize().expect("initialize");
+    let warning = "warning: this session's cwd is /, which is almost always a mistake; \
+                   start the client in your work tree, or `cd DIR` in the shell";
+
+    agent.new_session(&cwd).expect("session/new in a work tree");
+    assert!(!agent_text(&agent).contains(warning), "a work tree is not warned about: {:?}", agent_text(&agent));
+
+    agent.new_session(Path::new("/")).expect("session/new at / is accepted");
+    assert!(
+        agent_text(&agent).contains(warning),
+        "the client is told; saw {:?}\n--- stderr ---\n{}",
+        agent_text(&agent),
+        agent.stderr()
+    );
+}

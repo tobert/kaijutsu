@@ -18,6 +18,11 @@ impl ShellStateSnapshot {
     pub fn changed_cwd(&self, before: &ShellStateSnapshot) -> Option<String> {
         (self.cwd != before.cwd).then(|| self.cwd.to_string_lossy().into_owned())
     }
+
+    /// This snapshot's cwd.
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
 }
 
 pub async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
@@ -96,6 +101,20 @@ pub(crate) fn move_missing_cwd(
         updated_at: kaijutsu_types::now_millis() as i64,
     }).map_err(|e| format!("persist context cwd {:?}: {e}", used))?;
     Ok(None)
+}
+
+/// The line a command adds to its output when it leaves `context` at cwd
+/// `/`, or `None` for any other cwd.
+///
+/// `/` is accepted wherever a cwd is set, so a seat is never trapped; it is
+/// almost always a mistake, so the command says so. See
+/// `docs/shell-envelope.md`, "A cwd of `/`".
+pub fn root_cwd_line(context: ContextId, cwd: &str) -> Option<String> {
+    kaijutsu_types::shell_envelope::is_root_cwd(std::path::Path::new(cwd)).then(|| format!(
+        "warning: context {short} has cwd /, which is almost always a mistake; \
+         set its work tree with `kj context set {short} --cwd DIR`",
+        short = context.short(),
+    ))
 }
 
 /// Check that `path` is a directory the context shell's `cd` enters.
