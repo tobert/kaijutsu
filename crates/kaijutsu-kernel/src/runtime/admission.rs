@@ -89,6 +89,7 @@ mod tests {
                 match path {
                     "interactive" => {
                         let (submission, _) = crate::runtime::interactive::submit(kernel, identity,
+                            crate::runtime::context_shell::ShellPolicy::Agent,
                             crate::runtime::interactive::ShellSource::Code("echo admitted-before-archive".into()), true).await.unwrap();
                         tokio::time::timeout(std::time::Duration::from_secs(5), async {
                             loop {

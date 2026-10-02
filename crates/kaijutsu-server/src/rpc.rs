@@ -3893,24 +3893,28 @@ impl kernel::Server for KernelImpl {
                 // Shared facade gate (deny-by-default): humans (app) and agents
                 // (MCP) both reach shell execution through this RPC, so the
                 // allow-set is enforced here for everyone, keyed on the context
-                // binding — not on which client called.
-                if let Err(e) = kernel
+                // binding — not on which client called. The facade also
+                // chooses the shell: `shell` alone is read-only.
+                let policy = match kernel
                     .kernel
                     .broker()
                     .check_shell_facade(&context_id)
                     .await
                 {
-                    // A capability decision is a refusal, not a transport
-                    // failure — it travels the same channel as the gate's.
-                    let refusal = refusal_or_fault(e, "shell")?;
-                    let mut b = results.get().init_outcome().init_refused();
-                    set_refusal(&mut b, &refusal);
-                    return Ok(());
-                }
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        // A capability decision is a refusal, not a transport
+                        // failure — it travels the same channel as the gate's.
+                        let refusal = refusal_or_fault(e, "shell")?;
+                        let mut b = results.get().init_outcome().init_refused();
+                        set_refusal(&mut b, &refusal);
+                        return Ok(());
+                    }
+                };
 
                 let submission = execute_shell_command(
                     kaijutsu_kernel::runtime::interactive::ShellSource::Code(code),
-                    context_id, user_principal_id, user_initiated, &kernel, &connection,
+                    context_id, user_principal_id, policy, user_initiated, &kernel, &connection,
                 ).await?;
                 let mut outcome = results.get().init_outcome();
                 outcome.set_operation_id(&submission.operation_id);
@@ -5727,6 +5731,17 @@ impl kernel::Server for KernelImpl {
                 let documents = kernel.documents.clone();
 
                 if is_shell {
+                    // A shell draft runs the shell its seat's facade chose,
+                    // under the same gate as `shell_execute`.
+                    let policy = match kernel.kernel.broker().check_shell_facade(&context_id).await {
+                        Ok(policy) => policy,
+                        Err(e) => {
+                            let refusal = refusal_or_fault(e, "shell")?;
+                            let mut b = results.get().init_outcome().init_refused();
+                            set_refusal(&mut b, &refusal);
+                            return Ok(());
+                        }
+                    };
                     // Capture the revision without clearing it. Runtime admission
                     // authors the shell pair and consumes only this revision after
                     // PreCall accepts it, even if the submitting RPC disconnects.
@@ -5738,6 +5753,7 @@ impl kernel::Server for KernelImpl {
                         kaijutsu_kernel::runtime::interactive::ShellSource::Draft(draft),
                         context_id,
                         user_principal_id,
+                        policy,
                         true,
                         &kernel,
                         &connection,
@@ -7913,6 +7929,7 @@ async fn execute_shell_command(
     source: kaijutsu_kernel::runtime::interactive::ShellSource,
     context_id: ContextId,
     user_principal_id: PrincipalId,
+    policy: ShellPolicy,
     user_initiated: bool,
     kernel: &SharedKernelState,
     connection: &Rc<RefCell<ConnectionState>>,
@@ -7922,7 +7939,7 @@ async fn execute_shell_command(
     let identity = ShellIdentity { requester: user_principal_id, performer: user_principal_id,
         reviewer, context: context_id, session };
     let (submission, mut switches) = kaijutsu_kernel::runtime::interactive::submit(
-        &kernel.kernel, identity, source, user_initiated,
+        &kernel.kernel, identity, policy, source, user_initiated,
     ).await.map_err(capnp::Error::failed)?;
     let connection = connection.clone();
     tokio::task::spawn_local(async move {

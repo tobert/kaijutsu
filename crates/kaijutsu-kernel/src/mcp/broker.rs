@@ -1510,18 +1510,23 @@ impl Broker {
         Ok(())
     }
 
-    /// The RPC shell's gate: either shell facade opens it. `shell_write` is
-    /// the writable superset of `shell`, so a context granted only the
-    /// writable shell (a coder, whose model sees one shell tool) keeps the
-    /// person's shell box. A refusal names `shell`.
-    pub async fn check_shell_facade(&self, context_id: &ContextId) -> McpResult<()> {
-        match self.check_facade(context_id, "shell").await {
-            Err(McpError::FacadeDenied { .. }) => self.check_facade(context_id, "shell_write").await
-                .map_err(|error| match error {
-                    McpError::FacadeDenied { .. } => McpError::FacadeDenied { facade: "shell".to_string() },
-                    other => other,
-                }),
-            other => other,
+    /// The RPC shell's gate and policy: either shell facade opens it, and the
+    /// facade chooses the shell. `facade:shell_write` gives the writable shell,
+    /// so a context granted only it (a coder, whose model sees one shell tool)
+    /// keeps the person's shell box. `facade:shell` alone gives the read-only
+    /// shell, the same one the model's `shell` tool runs, so a read-only seat
+    /// (a toolie) has no write path through the person's box or
+    /// `kaijutsu-mcp`. A refusal names `shell`.
+    pub async fn check_shell_facade(
+        &self,
+        context_id: &ContextId,
+    ) -> McpResult<crate::runtime::context_shell::ShellPolicy> {
+        use crate::runtime::context_shell::ShellPolicy;
+        match self.check_facade(context_id, "shell_write").await {
+            Ok(()) => Ok(ShellPolicy::Agent),
+            Err(McpError::FacadeDenied { .. }) => self.check_facade(context_id, "shell").await
+                .map(|()| ShellPolicy::ReadOnly),
+            Err(other) => Err(other),
         }
     }
 
@@ -3022,8 +3027,7 @@ impl Broker {
         String::from_utf8(bytes).map_err(|e| e.to_string())
     }
 
-    // ── Direct kaish exec paths take the hook path (docs/gate-and-shell-
-    // split.md, "The three rpc.rs shell paths take the hook path") ──────
+    // ── Direct kaish exec paths take the hook path ──────────────────────
     //
     // Runtime shell owners call these methods around captured kaish execution
     // because that execution does not enter `Broker::call_tool`. They receive
@@ -3053,6 +3057,17 @@ impl Broker {
         }
     }
 
+    /// The identity the read-only `shell` tool's own call presents. A direct
+    /// exec on a read-only shell asks under it, so an approval resumes the
+    /// command read-only.
+    pub(crate) fn read_only_shell_hook_params(command: &str) -> KernelCallParams {
+        KernelCallParams {
+            instance: InstanceId::new(super::servers::ShellServer::INSTANCE),
+            tool: super::servers::ShellServer::TOOL.to_string(),
+            arguments: serde_json::json!({ "command": command }),
+        }
+    }
+
     /// Run `PreCall` against `command` as if it were a `shell_write` tool
     /// call. The caller must honor the verdict before running anything:
     /// `Proceed` runs the command normally, `ShortCircuit` substitutes the
@@ -3065,7 +3080,27 @@ impl Broker {
         ctx: &CallContext,
         cancel: &CancellationToken,
     ) -> ShellHookVerdict {
-        let params = Self::shell_write_hook_params(command);
+        self.shell_pre_call_hooks_as(Self::shell_write_hook_params(command), command, ctx, cancel).await
+    }
+
+    /// [`Self::shell_pre_call_hooks`] for a read-only shell: `PreCall` runs
+    /// as if `command` were a call to the read-only `shell` tool.
+    pub async fn read_only_shell_pre_call_hooks(
+        &self,
+        command: &str,
+        ctx: &CallContext,
+        cancel: &CancellationToken,
+    ) -> ShellHookVerdict {
+        self.shell_pre_call_hooks_as(Self::read_only_shell_hook_params(command), command, ctx, cancel).await
+    }
+
+    async fn shell_pre_call_hooks_as(
+        &self,
+        params: KernelCallParams,
+        command: &str,
+        ctx: &CallContext,
+        cancel: &CancellationToken,
+    ) -> ShellHookVerdict {
         let outcome = match self
             .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None, cancel)
             .await
@@ -5130,17 +5165,32 @@ mod tests {
     /// The RPC shell (the human shell box, `kaijutsu-mcp`'s `shell`) runs for
     /// a context holding either shell facade, while the model's roster still
     /// follows each facade alone: a coder with only `shell_write` keeps its
-    /// person's shell box and gets one shell tool.
+    /// person's shell box and gets one shell tool. The facade chooses the
+    /// shell: `shell` alone is read-only, `shell_write` is writable.
     #[tokio::test]
     async fn the_rpc_shell_accepts_either_shell_facade() {
+        use crate::runtime::context_shell::ShellPolicy;
         let broker = Arc::new(Broker::new());
         let ctx = ContextId::new();
         let mut write_only = ContextToolBinding::new();
         write_only.grant(super::super::binding::Capability::Facade("shell_write".into()));
         broker.set_binding(ctx, write_only.clone()).await.unwrap();
-        broker.check_shell_facade(&ctx).await.expect("shell_write opens the RPC shell");
+        assert!(matches!(broker.check_shell_facade(&ctx).await.expect("shell_write opens the RPC shell"),
+            ShellPolicy::Agent), "shell_write gives the writable shell");
         assert!(!write_only.allows(&super::super::binding::Capability::Instance(InstanceId::new("builtin.shell"))),
             "the model does not get the read-only shell tool");
+
+        for facades in [&["shell"][..], &["shell", "shell_write"][..]] {
+            let ctx = ContextId::new();
+            let mut binding = ContextToolBinding::new();
+            for facade in facades {
+                binding.grant(super::super::binding::Capability::Facade((*facade).into()));
+            }
+            broker.set_binding(ctx, binding).await.unwrap();
+            let policy = broker.check_shell_facade(&ctx).await.expect("a shell facade opens the RPC shell");
+            assert_eq!(matches!(policy, ShellPolicy::ReadOnly), facades == ["shell"],
+                "{facades:?}: only a seat without shell_write gets the read-only shell");
+        }
 
         let none = ContextId::new();
         broker.set_binding(none, ContextToolBinding::new()).await.unwrap();

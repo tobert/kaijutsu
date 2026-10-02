@@ -9,7 +9,7 @@ use kaijutsu_types::{BlockId, Refusal, Role, ToolKind};
 #[cfg(test)]
 use kaijutsu_types::{PrincipalId, Status};
 use crate::{Kernel, block_store::DraftSubmission};
-use super::command::{self, CommandContextSwitch, CommandRunOptions, ContextSwitch};
+use super::command::{self, CommandContextSwitch, CommandRunOptions, ContextSwitch, ShellStateWriteBack};
 use super::command_outcome::{CommandExecution, CommandHookEffect, CommandOutcome};
 use super::context_shell::{ShellCwd, ShellIdentity, ShellPolicy};
 use super::embedded_kaish::EmbeddedKaish;
@@ -28,8 +28,10 @@ pub struct ShellSubmission {
 
 /// Accepted work survives its caller. The receiver carries connection-local
 /// context switches; dropping it does not cancel execution or durable settlement.
+/// `policy` is the shell the seat's facade chose
+/// ([`crate::mcp::Broker::check_shell_facade`]).
 pub async fn submit(
-    kernel: &Arc<Kernel>, identity: ShellIdentity, source: ShellSource, user_initiated: bool,
+    kernel: &Arc<Kernel>, identity: ShellIdentity, policy: ShellPolicy, source: ShellSource, user_initiated: bool,
 ) -> Result<(ShellSubmission, mpsc::UnboundedReceiver<ContextSwitch>), String> {
     let (switches, receiver) = mpsc::unbounded_channel();
     let (reply, submitted) = oneshot::channel();
@@ -37,8 +39,9 @@ pub async fn submit(
     let trace_id = kernel.drift().read().trace_id_for_context(identity.context).unwrap_or([0u8; 16]);
     let span = kaijutsu_telemetry::context_root_span(&trace_id, "shell_execute");
     let depth = crate::mcp::broker::current_hook_depth();
+    let read_only = matches!(policy, ShellPolicy::ReadOnly);
     kernel.spawn_context_task(identity.context, move |admission, stop| crate::mcp::broker::inherit_hook_depth(depth, async move {
-        match prepare(&owner, admission, identity, source, user_initiated, &stop).await {
+        match prepare(&owner, admission, identity, policy, source, user_initiated, &stop).await {
             Err(error) => {
                 if let Err(Err(error)) = reply.send(Err(error)) {
                     tracing::error!("interactive admission failed after its caller departed: {error}");
@@ -50,8 +53,11 @@ pub async fn submit(
                     let record = |context| -> futures::future::LocalBoxFuture<'_, ()> {
                         Box::pin(command::send_context_switch(context, &switches, &stop))
                     };
+                    // A read-only shell leaves the context's cwd and env as
+                    // they were, as the model's read-only `shell` does.
+                    let state_writeback = if read_only { ShellStateWriteBack::Discard } else { ShellStateWriteBack::Persist };
                     if let Err(error) = command::run_into_blocks(&kaish, &code, &receipt, &owner, &call_ctx,
-                        CommandRunOptions { cancel: Some(stop.clone()),
+                        CommandRunOptions { cancel: Some(stop.clone()), state_writeback,
                             context_switch: CommandContextSwitch::Publish(Some(&record)), ..Default::default() }).await
                     {
                         tracing::error!("interactive command settlement failed: {error}");
@@ -68,11 +74,12 @@ type PreparedExecution = (EmbeddedKaish, crate::mcp::CallContext, crate::shell_o
 
 async fn prepare(
     kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission,
-    identity: ShellIdentity, source: ShellSource, user_initiated: bool,
+    identity: ShellIdentity, policy: ShellPolicy, source: ShellSource, user_initiated: bool,
     stop: &CancellationToken,
 ) -> Result<(ShellSubmission, Option<PreparedExecution>), String> {
     let context = admission.context();
     debug_assert_eq!(context, identity.context);
+    let read_only = matches!(policy, ShellPolicy::ReadOnly);
     let code = match &source {
         ShellSource::Code(code) => code.clone(),
         ShellSource::Draft(draft) => {
@@ -86,7 +93,7 @@ async fn prepare(
         _ = stop.cancelled() => return Err("kernel runtime shut down before interactive execution".into()),
         result = async {
             let dispatcher = kernel.broker().kj_dispatcher().await.ok_or("kj dispatcher is not registered")?;
-            EmbeddedKaish::for_context(&dispatcher, "interactive", identity, ShellPolicy::Agent, ShellCwd::Context,
+            EmbeddedKaish::for_context(&dispatcher, "interactive", identity, policy, ShellCwd::Context,
                 dispatcher.semantic_index(), dispatcher.block_source()).await.map_err(|e| e.to_string())
         } => result?,
     };
@@ -108,7 +115,11 @@ async fn prepare(
     // Capture and result-hook unwinds belong to command::run_into_blocks.
     let mut settlement_started = false;
     let preparation = std::panic::AssertUnwindSafe(async {
-        let verdict = kernel.broker().shell_pre_call_hooks(&code, &call_ctx, stop).await;
+        let verdict = if read_only {
+            kernel.broker().read_only_shell_pre_call_hooks(&code, &call_ctx, stop).await
+        } else {
+            kernel.broker().shell_pre_call_hooks(&code, &call_ctx, stop).await
+        };
         let execute = matches!(verdict, crate::mcp::ShellHookVerdict::Proceed);
         if !execute {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
@@ -236,7 +247,7 @@ mod tests {
                 if action == "execute" { assert_eq!(result.unwrap().unwrap().exit_code, 0); }
                 else { assert!(matches!(result, Err(_) | Ok(Err(_))), "preparation must report its failure"); }
             } else {
-                let submitted = submit(kernel, identity, ShellSource::Code("echo captured".into()), true).await;
+                let submitted = submit(kernel, identity, ShellPolicy::Agent, ShellSource::Code("echo captured".into()), true).await;
                 if action == "execute" {
                     let id = submitted.unwrap().0.operation_id;
                     tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -285,7 +296,7 @@ mod tests {
                     "CREATE TRIGGER reject_session_link BEFORE UPDATE OF command_block_id ON approvals BEGIN SELECT RAISE(FAIL, 'injected session link fault'); END;"
                 ).unwrap();
             }
-            let result = prepare(kernel, kernel.admit_context(identity.context).unwrap(), identity, ShellSource::Code("echo never-run".into()), true, &CancellationToken::new()).await;
+            let result = prepare(kernel, kernel.admit_context(identity.context).unwrap(), identity, ShellPolicy::Agent, ShellSource::Code("echo never-run".into()), true, &CancellationToken::new()).await;
             let db = kernel.kernel_db().clone();
             let workspace = db.lock().get_or_create_default_workspace(PrincipalId::system()).unwrap();
             let restored = crate::block_store::BlockStore::with_db(db, workspace, PrincipalId::system());
@@ -319,12 +330,38 @@ mod tests {
         }
     }
 
+    /// A read-only submission asks as the read-only `shell`, so an approval
+    /// resumes it read-only; a writable one asks as `shell_write`.
+    #[tokio::test]
+    async fn an_ask_names_the_shell_the_policy_chose() {
+        for (policy, instance, tool) in [(ShellPolicy::ReadOnly, "builtin.shell", "shell"),
+            (ShellPolicy::Agent, "builtin.shell_write", "shell_write")] {
+            let (dispatcher, mut identity) = fixture().await;
+            identity.reviewer = Some(crate::kj::test_helpers::test_reviewer_principal());
+            let kernel = dispatcher.kernel();
+            let context = identity.context;
+            kernel.kernel_db().lock().update_character_root(identity.performer, false).unwrap();
+            kernel.kernel_db().lock().update_context_review(context, Some(identity.performer), identity.reviewer).unwrap();
+            kernel.broker().hooks().write().await.pre_call.entries.push(HookEntry {
+                id: HookId("ask-every-shell".into()), match_instance: None, match_tool: None,
+                match_context: Some(context), match_principal: None, priority: 0, kaish_script_id: None,
+                action: HookAction::Ask(crate::mcp::AskSpec { description: Some("ask every shell".into()) }),
+            });
+            let (_, execution) = prepare(kernel, kernel.admit_context(context).unwrap(), identity, policy,
+                ShellSource::Code("echo probe > /probe".into()), true, &CancellationToken::new()).await.unwrap();
+            assert!(execution.is_none(), "{tool}: the ask holds the command");
+            let row = approval_ledger::ask::list_pending(kernel.kernel_db().lock().conn_for_ledger()).unwrap()
+                .into_iter().find(|row| row.context_id == context.as_bytes()).expect("PreCall must leave its ask");
+            assert_eq!((row.instance.as_deref(), row.tool.as_deref()), (Some(instance), Some(tool)));
+        }
+    }
+
     #[tokio::test]
     async fn stopped_runtime_does_not_author_interactive_blocks() {
         let (dispatcher, identity) = fixture().await;
         let kernel = dispatcher.kernel();
         kernel.shutdown_runtime_worker().await.unwrap();
-        let result = submit(kernel, identity, ShellSource::Code("echo never".into()), true).await;
+        let result = submit(kernel, identity, ShellPolicy::Agent, ShellSource::Code("echo never".into()), true).await;
         assert!(matches!(result, Err(ref error) if error.contains("shut down")));
         assert!(kernel.blocks().block_snapshots(identity.context).unwrap().is_empty());
     }
@@ -340,7 +377,7 @@ mod tests {
             }).unwrap();
             let target = crate::kj::test_helpers::register_context(&dispatcher, Some("switch-target"), None, identity.performer);
             kernel.blocks().create_document(target, crate::DocumentKind::Conversation, None).unwrap();
-            let (submission, mut switches) = submit(kernel, identity,
+            let (submission, mut switches) = submit(kernel, identity, ShellPolicy::Agent,
                 ShellSource::Code(format!("kj context switch {target}")), true).await.unwrap();
             let switch = tokio::time::timeout(std::time::Duration::from_secs(3), switches.recv()).await.unwrap().unwrap();
             assert_eq!(switch.context, target);
@@ -397,7 +434,7 @@ mod tests {
             drop(hooks);
             let local = tokio::task::LocalSet::new();
             let owner = kernel.clone();
-            local.spawn_local(async move { submit(&owner, identity, ShellSource::Code("echo captured-sibling".into()), true).await });
+            local.spawn_local(async move { submit(&owner, identity, ShellPolicy::Agent, ShellSource::Code("echo captured-sibling".into()), true).await });
             local.run_until(tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())).await.unwrap();
             drop(local);
             kernel.spawn_runtime_task(|_| -> std::future::Ready<()> { panic!("work factory panic sentinel"); }).unwrap();
@@ -445,7 +482,7 @@ mod tests {
         let draft = kernel.blocks().draft_for_submission(identity.context, identity.performer).unwrap().unwrap();
         let local = tokio::task::LocalSet::new();
         let owner = kernel.clone();
-        local.spawn_local(async move { submit(&owner, identity, ShellSource::Draft(draft), true).await });
+        local.spawn_local(async move { submit(&owner, identity, ShellPolicy::Agent, ShellSource::Draft(draft), true).await });
         local.run_until(tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified()))
             .await.expect("interactive command must reach PreCall");
         drop(local);
