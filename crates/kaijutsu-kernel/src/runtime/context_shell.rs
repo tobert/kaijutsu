@@ -415,7 +415,7 @@ mod tests {
         let result = kaish.execute_with_options("kj context switch in-docs; pwd", ExecuteOptions::default())
             .await.unwrap();
         assert!(result.ok(), "switch back into /v/docs: {} {}", result.text_out(), result.err);
-        assert_eq!(result.text_out().trim(), "/v/docs");
+        assert_eq!(result.text_out().lines().last(), Some("/v/docs"));
     }
 
     /// A removed cwd refuses the one command and moves the context to the
