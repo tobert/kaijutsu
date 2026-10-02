@@ -441,12 +441,6 @@ servers"). Open, most likely to bite first:
 
 ## From the coder orientation preload (2026-10-01)
 
-- ACP `session/new` reports a cwd missing on the kernel host as `internal`
-  for a fresh context, not `invalid_cwd`: `kj context create --cwd` now
-  refuses a path that is not a directory on the kernel mount table, so the
-  failure comes from `open_or_create`. Map that refusal to `invalid_cwd`, and
-  call `setContextCwd` only for a resumed context (`kaijutsu-acp/src/lib.rs`,
-  `new_session`).
 - rc shells have no read-only kaish-git (`runtime/git_tool.rs` registers it
   only in `ShellPolicy::ReadOnly`), so `coder/create/S35-orient.kai` reads
   `.git` files directly and has no dirty-tree summary or commit log; the

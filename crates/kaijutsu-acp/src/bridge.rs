@@ -426,7 +426,13 @@ impl KernelBridge {
         self.actor
             .create_context_under(parent.context_id, label, &self.context_type, Some(character), Some(cwd))
             .await
-            .map_err(|e| anyhow::anyhow!("ACP could not create a context for character '{character}': {e}"))
+            .map_err(|e| {
+                if e.is_cwd_refusal() {
+                    anyhow::Error::new(CwdRefused(e.to_string()))
+                } else {
+                    anyhow::anyhow!("ACP could not create a context for character '{character}': {e}")
+                }
+            })
     }
 
     /// Join a context by id (the `session/load` path).
@@ -552,6 +558,19 @@ fn ensure_context_attachable(info: &ContextInfo) -> Result<()> {
     }
     Ok(())
 }
+
+/// The kernel refused the session cwd for a new context: it is not a
+/// directory the kernel's shell can enter. ACP reports it as `invalid_cwd`.
+#[derive(Debug)]
+pub struct CwdRefused(pub String);
+
+impl std::fmt::Display for CwdRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CwdRefused {}
 
 /// What `open_or_create` did.
 #[derive(Debug, Clone)]

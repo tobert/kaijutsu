@@ -317,20 +317,16 @@ async fn handle_new_session(
     let label = new_session_label(&req.cwd);
     let opened = match bridge.kernel.open_or_create(&label, &req.cwd).await {
         Ok(o) => o,
+        Err(e) if e.downcast_ref::<bridge::CwdRefused>().is_some() => {
+            return responder.respond_with_error(invalid_cwd(&req.cwd, e));
+        }
         Err(e) => return responder.respond_with_error(internal(e)),
     };
-    // A fresh context was created in this cwd; setting it again checks that
-    // it names a directory on the kernel host. A resumed one moves here.
-    if let Err(e) = bridge.kernel.set_context_cwd(opened.context_id, &req.cwd).await {
-        if !opened.resumed
-            && let Err(cleanup) = bridge.kernel.archive_context(opened.context_id).await
-        {
-            tracing::warn!(
-                context = %opened.context_id.short(),
-                error = %cleanup,
-                "failed to archive fresh context after invalid ACP cwd"
-            );
-        }
+    // A fresh context was created in this cwd, which the kernel checked. A
+    // resumed one moves here.
+    if opened.resumed
+        && let Err(e) = bridge.kernel.set_context_cwd(opened.context_id, &req.cwd).await
+    {
         return responder.respond_with_error(invalid_cwd(&req.cwd, e));
     }
     if !opened.resumed {

@@ -577,6 +577,23 @@ fn the_create_lifecycle_runs_in_the_session_cwd() {
     );
 }
 
+/// A session cwd the kernel host does not have is the client's mistake:
+/// `session/new` answers `invalid_params` naming the cwd, not `internal`,
+/// and a later session in a real directory still opens.
+#[test]
+fn a_session_cwd_missing_on_the_kernel_host_is_invalid_params() {
+    let mut agent = spawn_mock("chat");
+    agent.initialize().expect("initialize");
+    let missing = scratch_dir("missing-session-cwd").join("not-here");
+    let error = agent.open_session(&missing).expect_err("a missing cwd must refuse session/new");
+    let message = format!("{error:#}");
+    assert!(message.contains("-32602"), "expected invalid_params, not internal: {message}");
+    assert!(message.contains(missing.to_str().expect("utf-8 path")), "the error names the cwd: {message}");
+
+    let cwd = scratch_dir("present-session-cwd");
+    agent.new_session(&cwd).expect("a real directory opens a session");
+}
+
 #[test]
 fn an_unusable_rc_overlay_refuses_the_boot() {
     let missing = scratch_dir("rc-overlay-refusals").join("missing");
