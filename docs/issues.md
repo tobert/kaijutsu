@@ -875,6 +875,15 @@ one tab-separated `name  type  size` row per file, with every size 0. Several mo
 fell back to `ls --json`. That costs calls and trust, not a walk; it is a
 kaish note.
 
+## `rc_lifecycle_wire` flaked once under load (2026-10-02)
+
+`shutdown_joins_nested_rc_before_settling_the_command` panicked at
+`rc_lifecycle_wire.rs:32` — the `unwrap()` on `list_active_contexts()` in
+`wait_child`, so the database read itself errored (likely busy), not the
+10 s wait. It passed alone and in the next full `kaijutsu-server` run. If it
+recurs, have `wait_child` report the read error and retry it, instead of
+panicking on the first one.
+
 ## From the one-filesystem walks re-pin (2026-10-02)
 
 Found while re-pinning kaish onto `one-filesystem-walks` (kaijutsu branch
