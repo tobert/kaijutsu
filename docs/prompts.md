@@ -46,6 +46,17 @@ reference. The coder stance chooses a tier from the resolved model (a `case`
 on `.resolved_model`); its shared tail says when the task is finished and how
 to use the tools, adapting DeepSeek Harness's tool rules (MIT).
 
+The toolie is a read-only explorer modeled on kaibo's explorer. Its binding
+(`toolie/create/S10-binding.kai`) grants `facade:shell` alone, so its model has
+one tool, the read-only `shell`, and the person's shell box in a toolie seat is
+the same read-only shell. Its stance (`toolie/create/S00-stance.md`) adapts
+kaibo's explorer preamble: read files whole with their line numbers, read in
+spans past the 8 KiB result preview, follow each name to its definition, and
+end on a cited report (SummaryOfFindings, RelevantLocations, ExplorationTrace)
+that the asker reads verbatim in the toolie's context.
+The test `the_toolie_stance_examples_run_in_its_read_only_shell` runs every
+command the stance shows, so a stance example cannot drift from the shell.
+
 The executable filename controls order: `S00-base.kai` precedes `S00-stance.kai`.
 The shared file ends with `頑張（がんば）って！`. Default handles general work;
 assistant remains fleet coordination. Coder retains focused and guided branches

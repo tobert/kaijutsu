@@ -1096,6 +1096,16 @@ working contract and corrects the claim that all block edits wait for hydration.
 The aim is fewer competing explanations, with correctness checked against code;
 source length alone is not evidence of better model behavior.
 
+The toolie later became a copy of kaibo's explorer, because kaibo is used
+daily and its prompts carry that effort. Amy: “toolie can go read only good
+idea, it should basically become just like kaibo's explorer prompts and all.”
+The port kept kaibo's role, reading rules, and report sections, and adapted
+the facts that differ: an 8 KiB result preview instead of about 1,200 lines,
+a basic-regex `grep`, and a report read in the toolie's own context. The old
+stance told the toolie to `kj drift` its findings, which its read-only shell
+refuses. The seat now holds one tool, the read-only `shell`, and the person's
+shell box in a toolie seat follows the same facade, so it is read-only too.
+
 ## The kernel that fsynced every word (September 11)
 
 Banto's seat was rotated onto the character work the morning after it

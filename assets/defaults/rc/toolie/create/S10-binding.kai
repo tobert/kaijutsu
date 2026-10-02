@@ -1,21 +1,8 @@
-# toolie: read-only allow-set (capability narrowing).
-# The safe shell: reads (files + /v document views), grep, find — no writes,
-# no external commands. `facade:shell` projects the `shell` broker tool (the
-# unmarked, safe name as of the 2026-08-17 flag day — docs/gate-and-shell-
-# split.md "Slice 3"; this grant used to read `facade:shell_readonly`,
-# projecting `read_only_shell`, both retired names) into the model's roster.
-# The toolie never grants `facade:shell_write` (the hot, mutating shell), so
-# it gets exactly one shell, the safe one.
+# toolie: a read-only explorer, modeled on kaibo's. One tool, the read-only
+# `shell`: `facade:shell` projects it into the model's roster and gives the
+# person's shell box the same read-only shell. Files, `git`, blocks, and
+# kernel search are all reached through it (`cat`, `grep`, `kj block read`,
+# `kj search`). The toolie never holds `facade:shell_write`, `exec`, or a
+# write tool.
 set -e
 kj binding allow "facade:shell"
-kj binding allow "builtin.file:read"
-kj binding allow "builtin.file:glob"
-kj binding allow "builtin.file:grep"
-kj binding allow "builtin.block:block_read"
-kj binding allow "builtin.block:block_list"
-kj binding allow "builtin.block:block_search"
-kj binding allow "builtin.block:block_status"
-kj binding allow "builtin.block:kernel_search"
-kj binding allow "builtin.resources"
-kj binding allow "builtin.tool_search"
-kj binding allow "builtin.kernel_info"

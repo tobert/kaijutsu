@@ -166,7 +166,8 @@ pub struct RcSeedReport {
 /// `force`. The lfm2d entries installed the retired risk-classifier pre_call
 /// hook (`docs/gate-policy-tuning.md`). The kaish primer moved into the shell
 /// tools' descriptions, one statement for every seat; the coder's `done` grant
-/// moved into its own binding.
+/// moved into its own binding. The toolie holds no exec, so it ships no shell
+/// guard.
 pub const RETIRED_RC_SEEDS: &[&str] = &[
     "coder/create/S05-kaish.kai",
     "coder/create/S11-done.kai",
@@ -185,6 +186,7 @@ pub const RETIRED_RC_SEEDS: &[&str] = &[
     "root/create/S50-lfm2d.kai",
     "root/create/S51-lfm2d-observe.kai",
     "toolie/create/S50-lfm2d.kai",
+    "toolie/create/S45-shell-guard.kai",
 ];
 
 /// Write the embedded seed tree into `root` (the host directory mounted at
@@ -849,13 +851,15 @@ mod tests {
         );
     }
 
-    /// Every seat whose `create/S10-binding.kai` grants exec-capable
-    /// authority — `"*"`, `"exec"`, or `"facade:shell"` — also ships
-    /// `S45-shell-guard.kai`, the pre_call hook that denies a command handing
-    /// text to a second shell. A binding that grants exec but skips it is a
-    /// seat where `sh -c` runs past the gate unseen.
+    /// A seat ships `S45-shell-guard.kai`, the pre_call hook that denies a
+    /// `shell_write` command handing text to a second shell, exactly when its
+    /// `create/S10-binding.kai` grants exec-capable authority: `"*"`,
+    /// `"exec"`, or `"facade:shell_write"`. A binding that grants exec but
+    /// skips it is a seat where `sh -c` runs past the gate unseen; a seat
+    /// holding only the read-only `shell` cannot start a program, so the
+    /// guard has nothing to guard there.
     #[test]
-    fn every_exec_granting_seat_ships_the_shell_guard() {
+    fn exactly_the_exec_granting_seats_ship_the_shell_guard() {
         let seeds = seed_files();
         let by_path: std::collections::HashMap<&str, &str> =
             seeds.iter().map(|(p, b)| (p.as_str(), *b)).collect();
@@ -873,9 +877,10 @@ mod tests {
         types.sort_unstable();
         types.dedup();
 
-        const EXEC_GRANTS: [&str; 3] = ["\"*\"", "\"exec\"", "\"facade:shell\""];
+        const EXEC_GRANTS: [&str; 3] = ["\"*\"", "\"exec\"", "\"facade:shell_write\""];
 
         let mut missing = Vec::new();
+        let mut unneeded = Vec::new();
         for ty in types {
             let binding_path = format!("{RC_VFS_ROOT}/{ty}/create/S10-binding.kai");
             let Some(&body) = by_path.get(binding_path.as_str()) else {
@@ -895,20 +900,21 @@ mod tests {
                 None => body,
             };
             let grants_exec = EXEC_GRANTS.iter().any(|g| resolved.contains(g));
-            if !grants_exec {
-                continue;
-            }
-            for required in ["S45-shell-guard.kai"] {
-                let want = format!("{RC_VFS_ROOT}/{ty}/create/{required}");
-                if !by_path.contains_key(want.as_str()) {
-                    missing.push(want);
-                }
+            let guard = format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai");
+            match (grants_exec, by_path.contains_key(guard.as_str())) {
+                (true, false) => missing.push(guard),
+                (false, true) => unneeded.push(guard),
+                _ => {}
             }
         }
 
         assert!(
             missing.is_empty(),
             "exec-granting seats missing the shell guard: {missing:#?}"
+        );
+        assert!(
+            unneeded.is_empty(),
+            "seats without exec that ship the shell guard: {unneeded:#?}"
         );
     }
 

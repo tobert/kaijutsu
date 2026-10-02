@@ -11958,7 +11958,7 @@ mod tests {
         insert_context_with_doc(&db, &ctx, ws_id);
 
         // A tool-granular role bundle: no instance-wide grants, just specific
-        // tools plus a facade. This is the toolie shape (slice 5).
+        // tools plus a facade.
         let mut original = ContextToolBinding::new();
         original.grant(Capability::Tool {
             instance: InstanceId::new("builtin.file"),

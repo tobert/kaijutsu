@@ -1016,7 +1016,7 @@ and the `redeemed:` field.
   LEDGER                                                    pending 2   answered today 7
   PENDING
   ! 01a04eb6   12s   kaijutsu   coder    shell_write   git worktree remove --force ~/src/wt/kaish-arith
-  ! 01a04ec1    4m   scout      toolie   file:write    ~/exomemory/scout/work-machine-export.md
+  ! 01a04ec1    4m   exo        coder    file:write    ~/exomemory/exo/work-machine-export.md
   ANSWERED
     01a04eaa  13:58   kaijutsu   allow once     amy   redeemed 13:58   git worktree remove …
     01a04e91  11:20   exo        deny           amy   —                cat /config/kernel/backends.toml

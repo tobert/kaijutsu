@@ -166,17 +166,17 @@ async fn fx_broker_check(
 }
 
 #[test]
-fn toolie_role_seeds_readonly_allow_set_and_refuses_writes() {
+fn toolie_role_seeds_one_read_only_shell_and_refuses_writes() {
     run_on_rc_stack(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build current-thread runtime")
-            .block_on(toolie_role_seeds_readonly_allow_set_and_refuses_writes_body());
+            .block_on(toolie_role_seeds_one_read_only_shell_and_refuses_writes_body());
     });
 }
 
-async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes_body() {
+async fn toolie_role_seeds_one_read_only_shell_and_refuses_writes_body() {
     let h = harness().await;
     let ctx = create_typed(&h, "exp", "toolie").await;
 
@@ -189,39 +189,27 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes_body() {
     let file = InstanceId::new("builtin.file");
     let block = InstanceId::new("builtin.block");
 
-    // Read-oriented grants present…
-    assert!(binding.allows_tool(&file, "read"), "toolie should allow file read");
-    assert!(binding.allows_tool(&file, "grep"), "toolie should allow file grep");
-    assert!(binding.allows_tool(&file, "glob"), "toolie should allow file glob");
-    assert!(
-        binding.allows_tool(&block, "block_read"),
-        "toolie should allow block_read"
-    );
-    // …mutating siblings withheld.
-    assert!(
-        !binding.allows_tool(&file, "write"),
-        "toolie must NOT allow file write"
-    );
-    assert!(
-        !binding.allows_tool(&file, "edit"),
-        "toolie must NOT allow file edit"
-    );
-    assert!(
-        !binding.allows_tool(&block, "block_create"),
-        "toolie must NOT allow block_create"
-    );
+    // The toolie is an explorer modeled on kaibo's: one tool, the read-only
+    // `shell`. Files, blocks, and kernel search are all reached through it.
+    let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new());
+    let visible: Vec<String> = h
+        .kernel
+        .broker()
+        .list_visible_tools(ctx, &call_ctx)
+        .await
+        .expect("list the toolie's tools")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(visible, ["shell"], "the toolie's roster is the read-only shell alone");
+    for (instance, tool) in [(&file, "read"), (&file, "write"), (&file, "edit"), (&block, "block_read"),
+        (&block, "block_create")] {
+        assert!(!binding.allows_tool(instance, tool), "toolie must NOT hold {instance}:{tool}");
+    }
 
-    // Facades, as of the 2026-08-17 shell/shell_write flag day: toolie holds
-    // `facade:shell` — which is now the SAFE, `ExternalExec::Deny` tool — and
-    // is refused `facade:shell_write`, the mutating one.
-    //
-    // Both assertions inverted with the rename, and that inversion IS the
-    // slice: toolie previously held `facade:shell_readonly` and was refused
-    // `facade:shell`, because `shell` named the mutating tool. Now the
-    // unmarked name is the harmless one, so the role that should only read
-    // gets it — a model reaching for the shortest name lands somewhere safe
-    // instead of somewhere hot. (The old comment here claimed toolie "holds
-    // none", which was never true; it held the readonly facade.)
+    // Facades: toolie holds `facade:shell`, the read-only shell, and is
+    // refused `facade:shell_write`. The RPC shell (the person's box,
+    // `kaijutsu-mcp`) follows the facade, so it is read-only here too.
     assert!(!binding.is_admin(), "toolie must NOT be a binding admin");
     assert!(
         !binding.allows(&Capability::Editor),
@@ -240,6 +228,13 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes_body() {
     );
     assert!(
         matches!(
+            h.kernel.broker().check_shell_facade(&ctx).await,
+            Ok(kaijutsu_kernel::runtime::context_shell::ShellPolicy::ReadOnly)
+        ),
+        "toolie's RPC shell must be the read-only shell"
+    );
+    assert!(
+        matches!(
             fx_broker_check(&h, &ctx, "submit_input").await,
             Err(McpError::FacadeDenied { .. })
         ),
@@ -247,7 +242,6 @@ async fn toolie_role_seeds_readonly_allow_set_and_refuses_writes_body() {
     );
 
     // Enforced at the call path: a write is refused, not silently dropped.
-    let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new());
     let denied = h
         .kernel
         .broker()
@@ -492,4 +486,80 @@ async fn mcp_role_holds_config_governance_body() {
         binding.allows(&Capability::ConfigWrite),
         "mcp should hold config-write for model-config governance"
     );
+}
+
+/// Every command the toolie stance teaches, except the `git` reads, runs in
+/// the toolie's shell, and each refusal it describes reads as it says. The
+/// stance must carry each example verbatim, so a stance edit that changes an
+/// example changes this test too. The `git` examples need a repository, which
+/// this harness does not mount.
+#[test]
+fn the_toolie_stance_examples_run_in_its_read_only_shell() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(the_toolie_stance_examples_run_in_its_read_only_shell_body());
+    });
+}
+
+async fn the_toolie_stance_examples_run_in_its_read_only_shell_body() {
+    let h = harness().await;
+    h.kernel.broker().set_kj_dispatcher(&h.dispatcher).await;
+    let ctx = create_typed(&h, "explorer", "toolie").await;
+    let stance = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/defaults/rc/toolie/create/S00-stance.md")).expect("read the toolie stance");
+    let call_ctx = CallContext::new(h.creator, ctx, SessionId::new(), KernelId::new());
+    let run = |command: String| {
+        let broker = h.kernel.broker().clone();
+        let call_ctx = call_ctx.clone();
+        async move {
+            let result = broker.call_tool(KernelCallParams {
+                instance: InstanceId::new("builtin.shell"),
+                tool: "shell".into(),
+                arguments: serde_json::json!({"command": command}),
+            }, &call_ctx, CancellationToken::new()).await.expect("the shell call settles");
+            result.structured.expect("the shell returns its envelope")
+        }
+    };
+    // The stance's placeholders, bound to files every toolie seat has.
+    let file = "/config/rc/toolie/create/S00-stance.md";
+    let dir = "/config/rc/toolie";
+    let reads = [
+        ("cat -n FILE", format!("cat -n {file}")),
+        ("wc -l FILE", format!("wc -l {file}")),
+        ("cat -n FILE | sed -n '1,150p'", format!("cat -n {file} | sed -n '1,150p'")),
+        ("grep -rn PATTERN src docs", format!("grep -rn explorer {dir}")),
+        ("grep -rnF 'fn submit(' crates", format!("grep -rnF 'Read files' {dir}")),
+        ("-B4 -A8", format!("grep -rn -B4 -A8 explorer {dir}")),
+        ("file FILE", format!("file {file}")),
+        ("pwd", "pwd".to_string()),
+        ("kj context log", "kj context log".to_string()),
+        ("kj block list", "kj block list".to_string()),
+        ("kj search PATTERN", "kj search explorer".to_string()),
+        ("help syntax", "help syntax".to_string()),
+    ];
+    for (example, command) in reads {
+        assert!(stance.contains(&format!("`{example}`")), "the stance no longer shows `{example}`");
+        let envelope = run(command.clone()).await;
+        assert_eq!(envelope["exit_code"], 0, "{command}: {envelope}");
+    }
+    assert!(stance.contains("`kj block read ID`"), "the stance no longer shows `kj block read ID`");
+    let listed = run("kj block list".to_string()).await;
+    let id = listed["data"][0].as_str().expect("kj block list returns block ids").to_string();
+    let envelope = run(format!("kj block read {id}")).await;
+    assert_eq!(envelope["exit_code"], 0, "kj block read {id}: {envelope}");
+    let refusals = [
+        (format!("echo probe > {dir}/probe"), 1, "permission denied"),
+        ("kj drift push . probe".to_string(), 1, "read-only"),
+        ("curl http://localhost/".to_string(), 1, "read-only"),
+        ("/usr/bin/true".to_string(), 127, "read-only"),
+    ];
+    for (write, code, says) in refusals {
+        let envelope = run(write.clone()).await;
+        assert_eq!(envelope["exit_code"], code, "{write} must be refused: {envelope}");
+        assert!(envelope["stderr"].as_str().unwrap_or_default().contains(says),
+            "{write}: the refusal must say {says:?}: {envelope}");
+    }
 }

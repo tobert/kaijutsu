@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn no_facade_denies_the_builtin_shell_tool() {
-        // toolie: read-only, no facade. The shell tool must stay hidden and
+        // A role without a shell facade: the shell tool must stay hidden and
         // uncallable — the projection is the ONLY path to it for a non-`*` role.
         let mut b = ContextToolBinding::new();
         b.grant(Capability::Tool {

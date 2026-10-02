@@ -886,6 +886,8 @@ Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
   mutating `kj` verbs through them; the ask tier still applies. `shellExecute`
   and shell drafts now follow the facade (`Broker::check_shell_facade`). No
   shipped client calls `execute`; `executeKj` is the person's `kj` path.
+  The read-only RPC shell's result hooks still match as `shell_write`; only
+  its PreCall presents the read-only `shell`.
 - **The register path still announces tools before a context's first model
   block** (`emit_for_bindings`), unlike the binding-diff path.
 - **The shell descriptions name four of the facts a turn reads**; `[waiting
@@ -2699,7 +2701,21 @@ follow-up commit: `edit` over a dirty buffer the disk moved under, and
 - **The read-only hint names `shell_write` to a seat without it.** A
   `toolie` binds only `facade:shell`. The read-only description says the
   same thing unconditionally. Name the write path only when the seat's
-  roster has it.
+  roster has it. The toolie stance tells its model the seat does not hold
+  `shell_write`; the tool description and refusals still name it.
+- **A redirect refused by a read-only shell says only `permission
+  denied`.** `ReadOnlyFs` refuses with "read-only shell (no writes)", but
+  kaish's redirect error keeps only the error kind, so a toolie, or the
+  person's box in a toolie seat, cannot tell the refusal from a host
+  permission. The toolie stance teaches `permission denied`; the
+  `the_toolie_stance_examples_run_in_its_read_only_shell` test pins it.
+  Carry the message through in kaish, or name the read-only shell in
+  `name_the_write_path` (`runtime/tool_command.rs`).
+- **The toolie has no project file map or house rules.** kaibo's explorer
+  receives an orientation map (each file with its size, marking files too
+  large to read whole) and the operator's `[context]` files after its
+  preamble. The toolie gets neither, so it learns sizes with `wc -l` and
+  project conventions only by reading them.
 - **No test covers a failure on one pool thread with work queued on
   another.** The factory-panic drain test is one-thread by design now.
   Block every thread of a three-thread pool, queue the failing factory and a
