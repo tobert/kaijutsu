@@ -721,17 +721,73 @@ on current main"):
 
 In `kj-ds4-tb2-20-1`, extract-elf and headless-terminal each ran
 `grep -r PATTERN / ... | grep -v '^/proc' ...` through `shell_write`, and
-`kaijutsu-solo-acp` exited 1 mid-command with nothing logged: both losses of
-the run. kaish's `grep` is a builtin, so the walk runs in the kernel's own
-process; the exclusions come after it in the pipeline, so the walk reaches
-`/proc`, `/sys`, `/dev`, and the `/v` mounts. Not reproduced yet (do it in a
-container, not on a live kernel). Contributing factors to check: reading an
-endless file (`/dev/zero`, `/proc/kmsg`), memory growth with no bound,
-walking `/v/cas` or `/v/docs`, an OOM kill of the container's process. A
-builtin's failure must not take the kernel down: bound recursive builtins
-(skip special files and virtual filesystems by default, as GNU grep's
-`-D skip` does for devices), and report a loud error instead. Filed for kaish
-in `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
+`kaijutsu-solo-acp` exited mid-command with nothing logged: both losses of
+the run.
+
+Reproduced 2026-10-02 on a kernel test shell under a 1 GiB memory cap:
+`grep -r zzqq /proc/self` was killed for memory (exit 137, no output).
+Contributing factors:
+
+- kaish's `grep` is a builtin, so the walk and the reads run in the kernel's
+  own process. `grep -r` collects every path first, then reads each file
+  whole (`ctx.backend.read(path, None)`).
+- `MountBackend::read` reaches `LocalBackend::read_all`, which is
+  `fs::read` to end of file with no ceiling.
+- `/proc/<pid>/pagemap` reports size 0 and returns 8 bytes for every page of
+  a 47-bit address space, about 256 GiB. A plain Rust `fs::read` of it under a
+  256 MiB cap is killed the same way. As root in a task container, every
+  process's `pagemap` is readable.
+- The `grep -v '^/proc'` exclusions run after the walk.
+
+Not factors: in a kaish shell `/dev` is kaish's own device mount, and a whole
+read of `zero` or `urandom` fails with an error, so `grep` skips it. Walks of
+`/v` finished; they cost time, not memory. That `solo-acp` reported exit 1
+rather than a signal is not explained.
+
+Shipped 2026-10-02: the kernel unlists the host's `/proc` and `/sys`
+(`MountTable::unlist`, `docs/mounts.md`, "Unlisted paths"), so a walk from
+`/` does not enter them and naming them still works. Still open:
+
+- **A walk or read that names `/proc` can still kill the kernel**
+  (`grep -r x /proc`, `cat /proc/self/pagemap`). Proposal, kaijutsu side: a
+  ceiling on whole-file reads through `MountBackend::read` (read at most N+1
+  bytes; past N fail with "FILE is larger than N bytes; read a range with
+  `head -c`, `tail -c`, or `sed -n`"). It covers every spelling and every
+  oversized file, and is small. The cost is that a legitimate `cat` of a
+  file over N fails until kaish streams; N is Amy's call (256 MiB would cover
+  every file a model can use whole).
+- **Hiding `/v` (and kaish's `/dev`) from a shell walk needs kaish.** The
+  overlay's listing of `/` adds kaish's mounts and the synthesized `/v` back
+  after kaijutsu's listing. Proposed kaish change: `VfsRouter::unlist(path)`,
+  honored by `VfsRouter::list` and by the shared-ancestor union in
+  `VirtualOverlayBackend::list`; kaijutsu would call it for `/v` in
+  `EmbeddedKaish`'s `configure_vfs`. Whether `ls /` should also stop showing
+  `/v` is Amy's call: the listing is what a walk sees, so the two go together.
+- **Recursive builtins have no bound** (kaish). Proposed: `grep -r` reads
+  through the chunked reader it already uses for one file; walks skip
+  non-regular files, as GNU `grep -D skip` does (kaish's `DirEntryKind` has
+  no device or FIFO kind, so a FIFO in a walked tree blocks `grep`); and an
+  optional walk budget (entries or bytes) that stops with exit 2 and names
+  the budget. Filed in `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
+- **Catching the accident itself.** `grep -r PATTERN /` is almost always a
+  mistake in kaijutsu work, and naming the right tree is the fix. Options:
+  1. A rule in the shell-escape guard (`lib/hooks/shell-guard.kai`, over
+     `KJ_TOOL_PLAN`): a content-reading recursive walk (`grep -r`/`-R`,
+     `rg`) whose path operand folds to `/` is denied with "a recursive grep
+     from / reads the whole host; name the tree you mean (/usr/include,
+     /app), or locate files first with `find / -name NAME`". Cheap, fails in
+     the same call, and matches the file tools' `refuse_filesystem_root_walk`.
+     Lexical only: `cd / && grep -r x .` passes, and the read-only `shell`
+     has no pre_call guard. Leave `find / -name` alone: it is the common,
+     legitimate way a model locates a file, and it reads no contents.
+  2. An ask instead of a denial, so a reviewer (a person or a model seat)
+     decides. Allows the rare legitimate case, but costs a round trip and a
+     reviewer, and in a benchmark run the reviewer is the bridge.
+  3. The kaish walk budget above, which catches every spelling but only
+     after the walk has started.
+  Recommendation: the ceiling and option 1 now, the kaish bounds next.
+  Whether `$HOME` counts as a root for option 1 is open: `~/src` walks are
+  usually deliberate.
 
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 

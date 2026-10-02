@@ -1659,4 +1659,63 @@ mod tests {
         assert_eq!(actual, expected, "cwd should be project root");
     }
 
+
+    /// A builtin recursive walk that starts above an unlisted path never
+    /// reaches it, and naming the path still does. The live failure was
+    /// `grep -r PATTERN /` reading `/proc/<pid>/pagemap` whole, which grew
+    /// until the kernel was killed for memory (`docs/issues.md`). Falsified by
+    /// dropping the filter in `MountTable::readdir`.
+    #[tokio::test]
+    async fn a_recursive_walk_from_above_skips_an_unlisted_path() {
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = test_kernel("test-unlisted-walk").await;
+        let root = tempfile::TempDir::new().unwrap();
+        for sub in ["proc/self", "usr"] {
+            std::fs::create_dir_all(root.path().join(sub)).unwrap();
+        }
+        std::fs::write(root.path().join("proc/self/status"), "NEEDLE\n").unwrap();
+        std::fs::write(root.path().join("usr/notes"), "NEEDLE\n").unwrap();
+        kernel
+            .mount("/", crate::vfs::backends::LocalBackend::read_only(root.path()))
+            .await;
+        assert!(kernel.vfs().unlist("/proc").await);
+
+        let shell = EmbeddedKaish::with_identity(
+            "test-unlisted-walk",
+            blocks,
+            kernel.clone(),
+            Some(PathBuf::from("/")),
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
+            crate::runtime::context_engine::session_context_map(),
+            ExternalExec::Deny,
+            OutputProfile::Agent,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let run = |cmd: &'static str| {
+            let shell = &shell;
+            async move {
+                let r = shell.execute_with_options(cmd, ExecuteOptions::default()).await.unwrap();
+                (r.code, r.text_out().to_string())
+            }
+        };
+
+        let (code, out) = run("grep -rl NEEDLE /").await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("/usr/notes"), "the walk reaches listed trees: {out}");
+        assert!(!out.contains("proc"), "the walk from / must not enter /proc: {out}");
+
+        let (code, out) = run("ls /").await;
+        assert_eq!(code, 0, "{out}");
+        assert!(!out.lines().any(|l| l.trim() == "proc"), "`ls /` leaves /proc out: {out}");
+
+        let (code, out) = run("grep -rl NEEDLE /proc").await;
+        assert_eq!(code, 0, "naming /proc still walks it: {out}");
+        assert!(out.contains("/proc/self/status"), "{out}");
+
+        let (code, out) = run("ls /proc/self").await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("status"), "{out}");
+    }
 }

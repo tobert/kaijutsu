@@ -1683,6 +1683,15 @@ pub async fn create_shared_kernel(
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;
 
+    // The host's process and device-model trees stay out of the root
+    // listing, so a recursive walk from `/` never enters them; naming them
+    // still reaches them (`docs/mounts.md`, "Unlisted paths"). Several of
+    // their files never end in practice: a whole read of
+    // `/proc/<pid>/pagemap` grows until the kernel is killed for memory.
+    for path in ["/proc", "/sys"] {
+        kernel.vfs().unlist(path).await;
+    }
+
     // /dev is opaque to ambient sweeps (longest-prefix wins over `/`): still
     // directly browsable, but the FSN backdrop/world walk stops at the node
     // rather than descending. `/dev/fd` is a live view of the kernel

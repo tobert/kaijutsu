@@ -18,7 +18,7 @@ is decided at boot, from the server's configuration.
 
 | Path | Backend | Access |
 |---|---|---|
-| `/` | host root | read-only |
+| `/` | host root; `/proc` and `/sys` unlisted ("Unlisted paths" below) | read-only |
 | `/dev` | host `/dev`, opaque to sweeps | read-only |
 | `$HOME/src` | host directory | read-write |
 | `/tmp` | host directory | read-write |
@@ -57,6 +57,31 @@ goes to `/app/sub`.
 A mount is reach, not a sandbox — the same doctrine the rest of this document
 rests on. It decides what a model can see and resolve, not what a spawned
 child process can do.
+
+## Unlisted paths
+
+The host's `/proc` and `/sys` are left out of the root listing
+(`MountTable::unlist`, set at boot before the freeze, like the mounts). A
+recursive walk that starts above an unlisted path never reaches it, because
+walks reach a tree only through listings: `grep -r PATTERN /`, `find /`,
+`ls -R /`, a `/**` glob, and the file tools' walks all skip it. Naming the
+path still works: `ls /proc`, `cat /proc/self/status`, and
+`grep -r PATTERN /proc/self` reach it as before. Unlisting hides; it does not
+deny.
+
+The reason is that several files there never end in practice. A whole read of
+`/proc/<pid>/pagemap` returns 8 bytes for every page of a 47-bit address
+space, about 256 GiB, and kaish's builtins read whole files into the kernel's
+own process: a builtin `grep -r PATTERN /` was killed for memory with nothing
+logged. A walk that names `/proc` can still do that; see `docs/issues.md`,
+"A builtin `grep -r PATTERN /` killed the agent process".
+
+The listing is the mount table's, so the FSN view and SFTP listings of `/`
+leave the same paths out. In a kaish shell, `/dev` is kaish's own device
+mount (`null`, `zero`, `random`, `urandom`; a whole read of an endless device
+fails with an error), and `/v` lists kaish's mounts beside the kernel's:
+unlisting either in kaijutsu does not hide it from a shell walk, because the
+shell's view adds kaish's mounts back.
 
 ## The inversion
 

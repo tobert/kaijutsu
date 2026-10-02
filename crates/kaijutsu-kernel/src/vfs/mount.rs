@@ -84,6 +84,9 @@ pub struct MountTable {
     /// quiet kernel's digest tick is a single relaxed load-and-compare
     /// against the subscriber's cursor, never a full-map walk.
     activity_epoch: AtomicU64,
+    /// Paths left out of their parent's listing (see [`Self::unlist`]),
+    /// keyed by normalized path. Fixed at boot with the mounts.
+    unlisted: std::sync::RwLock<std::collections::BTreeSet<PathBuf>>,
 }
 
 impl std::fmt::Debug for MountTable {
@@ -109,6 +112,7 @@ impl MountTable {
             generations: dashmap::DashMap::new(),
             activity: dashmap::DashMap::new(),
             activity_epoch: AtomicU64::new(0),
+            unlisted: std::sync::RwLock::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -153,6 +157,29 @@ impl MountTable {
         let path = Self::normalize_mount_path(path.into());
         let mut mounts = self.mounts.write().await;
         mounts.insert(path, fs);
+        true
+    }
+
+    /// Leave `path` out of its parent's directory listing.
+    ///
+    /// A recursive walk that starts above an unlisted path never reaches
+    /// it, while naming the path still does: `getattr`, `readdir`, and
+    /// reads of the path and everything under it are unchanged. Walks reach
+    /// a tree only through listings, so this is what keeps an accidental
+    /// `grep -r PATTERN /` out of `/proc` (`docs/mounts.md`, "Unlisted
+    /// paths"). It hides; it does not deny.
+    ///
+    /// Returns `false` if the table is frozen.
+    pub async fn unlist(&self, path: impl AsRef<Path>) -> bool {
+        if self.is_frozen() {
+            tracing::warn!("unlist rejected: mount table is frozen");
+            return false;
+        }
+        let path = Self::normalize_mount_path(path.as_ref().to_path_buf());
+        self.unlisted
+            .write()
+            .expect("unlisted set lock poisoned")
+            .insert(path);
         true
     }
 
@@ -813,6 +840,51 @@ impl MountTable {
         Ok(entries)
     }
 
+    /// Every entry of `path`: the owning backend's listing merged with
+    /// synthetic mount children. [`VfsOps::readdir`] removes unlisted paths
+    /// from this.
+    async fn readdir_all(&self, path: &Path) -> VfsResult<Vec<DirEntry>> {
+        // Special case: listing root might need to show mount points
+        let path_str = path.to_string_lossy();
+        if path_str.is_empty() || path_str == "/" {
+            return self.list_root().await;
+        }
+
+        // Merge the backend's own listing with any synthetic mount children
+        // (see [`Self::mount_children`]) — a directory can be both real on
+        // its backend AND the parent of deeper mounts. Backend misses are
+        // tolerated only when synthetic children exist AND the miss is
+        // NotFound (the intermediate dir has no real backing); any other
+        // backend error still surfaces. Every `VfsOps` backend reports a
+        // missing path as the typed `VfsError::NotFound` (host-backed
+        // `LocalBackend` included — normalized once at the `From<io::Error>`
+        // conversion in `vfs::error`), so one arm covers every backend here.
+        let normalized = Self::normalize_mount_path(path.to_path_buf());
+        let synthetic = self.mount_children(&normalized).await;
+        let backend_entries = match self.find_mount(path).await {
+            Ok((fs, relative)) => match fs.readdir(&relative).await {
+                Ok(entries) => entries,
+                Err(VfsError::NotFound(_)) if !synthetic.is_empty() => Vec::new(),
+                Err(e) => return Err(e),
+            },
+            Err(_) if !synthetic.is_empty() => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        if synthetic.is_empty() {
+            return Ok(backend_entries);
+        }
+        let mut seen: std::collections::HashSet<String> =
+            backend_entries.iter().map(|e| e.name.clone()).collect();
+        let mut entries = backend_entries;
+        for entry in synthetic {
+            if seen.insert(entry.name.clone()) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
     /// The synthetic children an **intermediate mount directory** owes its
     /// existence to: the next path component of every mount point strictly
     /// under `prefix` (mounts `/v/cas` + `/v/docs` give `/v` the children
@@ -885,44 +957,12 @@ impl VfsOps for MountTable {
     }
 
     async fn readdir(&self, path: &Path) -> VfsResult<Vec<DirEntry>> {
-        // Special case: listing root might need to show mount points
-        let path_str = path.to_string_lossy();
-        if path_str.is_empty() || path_str == "/" {
-            return self.list_root().await;
+        let mut entries = self.readdir_all(path).await?;
+        let unlisted = self.unlisted.read().expect("unlisted set lock poisoned");
+        if !unlisted.is_empty() {
+            let parent = Self::normalize_mount_path(path.to_path_buf());
+            entries.retain(|e| !unlisted.contains(&parent.join(&e.name)));
         }
-
-        // Merge the backend's own listing with any synthetic mount children
-        // (see [`Self::mount_children`]) — a directory can be both real on
-        // its backend AND the parent of deeper mounts. Backend misses are
-        // tolerated only when synthetic children exist AND the miss is
-        // NotFound (the intermediate dir has no real backing); any other
-        // backend error still surfaces. Every `VfsOps` backend reports a
-        // missing path as the typed `VfsError::NotFound` (host-backed
-        // `LocalBackend` included — normalized once at the `From<io::Error>`
-        // conversion in `vfs::error`), so one arm covers every backend here.
-        let normalized = Self::normalize_mount_path(path.to_path_buf());
-        let synthetic = self.mount_children(&normalized).await;
-        let backend_entries = match self.find_mount(path).await {
-            Ok((fs, relative)) => match fs.readdir(&relative).await {
-                Ok(entries) => entries,
-                Err(VfsError::NotFound(_)) if !synthetic.is_empty() => Vec::new(),
-                Err(e) => return Err(e),
-            },
-            Err(_) if !synthetic.is_empty() => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        if synthetic.is_empty() {
-            return Ok(backend_entries);
-        }
-        let mut seen: std::collections::HashSet<String> =
-            backend_entries.iter().map(|e| e.name.clone()).collect();
-        let mut entries = backend_entries;
-        for entry in synthetic {
-            if seen.insert(entry.name.clone()) {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 
@@ -2348,5 +2388,53 @@ mod tests {
         // itself — so exercised via the deny backend's own interior.)
         let result = table.snapshot(Path::new("/scratch/locked/secret"), 3, 100).await;
         assert!(result.unwrap_err().is_permission_denied());
+    }
+
+    // ── unlisted paths: a walk from above does not see them ──
+
+    /// An unlisted path is left out of its parent's listing, so a recursive
+    /// walk that starts above it never descends there, while naming it still
+    /// reaches it. Falsified by dropping the filter in `readdir`.
+    #[tokio::test]
+    async fn an_unlisted_path_is_absent_from_its_parent_but_still_reachable() {
+        use crate::vfs::backends::LocalBackend;
+        let dir = tempfile::TempDir::new().unwrap();
+        for sub in ["proc/self", "sys", "usr/share"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        std::fs::write(dir.path().join("proc/self/status"), "Name: x\n").unwrap();
+        let table = MountTable::new();
+        table.mount("/", LocalBackend::read_only(dir.path())).await;
+        table.mount("/v/cas", MemoryBackend::new()).await;
+        assert!(table.unlist("/proc").await);
+        assert!(table.unlist("/v").await);
+        assert!(table.unlist("/usr/share").await);
+
+        let names = |entries: Vec<DirEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.name).collect()
+        };
+        assert_eq!(names(table.readdir(Path::new("/")).await.unwrap()), ["sys", "usr"],
+            "a root-mount child and a synthetic mount parent are both left out");
+        assert!(names(table.readdir(Path::new("/usr")).await.unwrap()).is_empty(),
+            "a deeper unlisted path is left out of its own parent");
+
+        assert!(table.getattr(Path::new("/proc")).await.unwrap().kind.is_dir());
+        assert_eq!(names(table.readdir(Path::new("/proc")).await.unwrap()), ["self"],
+            "a named unlisted path still lists its own children");
+        assert_eq!(table.read_all(Path::new("/proc/self/status")).await.unwrap(), b"Name: x\n");
+        assert_eq!(names(table.readdir(Path::new("/v")).await.unwrap()), ["cas"]);
+    }
+
+    /// The listing is part of the perimeter: it is fixed at boot like the
+    /// mounts are.
+    #[tokio::test]
+    async fn unlist_is_refused_once_the_table_is_frozen() {
+        let table = MountTable::new();
+        table.mount("/", MemoryBackend::new()).await;
+        table.mkdir(Path::new("/proc"), 0o755).await.unwrap();
+        table.freeze();
+        assert!(!table.unlist("/proc").await, "a frozen table refuses a new unlisted path");
+        let entries = table.readdir(Path::new("/")).await.unwrap();
+        assert!(entries.iter().any(|e| e.name == "proc"), "nothing changed: {entries:?}");
     }
 }
