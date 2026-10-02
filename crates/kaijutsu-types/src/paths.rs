@@ -140,6 +140,13 @@ pub const SWAP_ROOT: &str = "/v/swap";
 /// (the mount table freezes after bootstrap).
 pub const R_ROOT: &str = "/r";
 
+/// The trees the kernel serves itself: configuration, runtime state, `/v`,
+/// client shares, and devices. An operator's read-write mount may not land
+/// at or under one, and a recursive walk does not enter one unless the walk
+/// names it (`docs/mounts.md`, "Where a walk stops"). `/v` and `/dev` have
+/// no constant of their own because kaish mounts trees there too.
+pub const KERNEL_ROOTS: [&str; 5] = [CONFIG_NAMESPACE_ROOT, RUN_ROOT, "/v", R_ROOT, "/dev"];
+
 // ---------------------------------------------------------------------
 // Builders — replace scattered `format!` calls at mount/write sites.
 // ---------------------------------------------------------------------
@@ -225,6 +232,11 @@ fn is_or_under(path: &str, root: &str) -> bool {
     path == root || (path.starts_with(root) && path.as_bytes().get(root.len()) == Some(&b'/'))
 }
 
+/// The kernel root (see [`KERNEL_ROOTS`]) that `path` is or is under.
+pub fn kernel_root_of(path: &str) -> Option<&'static str> {
+    KERNEL_ROOTS.into_iter().find(|root| is_or_under(path, root))
+}
+
 /// True if `path` is under the rc tree (`/config/rc` or `/config/rc/...`).
 pub fn is_rc_path(path: &str) -> bool {
     is_or_under(path, RC_ROOT)
@@ -274,6 +286,19 @@ pub fn is_midi_run_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_root_of_names_the_tree_a_path_is_in() {
+        assert_eq!(kernel_root_of("/v/cas/ab/cdef"), Some("/v"));
+        assert_eq!(kernel_root_of("/config"), Some("/config"));
+        assert_eq!(kernel_root_of("/run/midi/x"), Some("/run"));
+        assert_eq!(kernel_root_of("/r/laptop/src"), Some("/r"));
+        assert_eq!(kernel_root_of("/dev/null"), Some("/dev"));
+        assert_eq!(kernel_root_of("/configuration"), None);
+        assert_eq!(kernel_root_of("/app"), None);
+        assert_eq!(kernel_root_of("/tmp"), None);
+        assert_eq!(kernel_root_of("/"), None);
+    }
 
     #[test]
     fn rc_builders_join_components() {

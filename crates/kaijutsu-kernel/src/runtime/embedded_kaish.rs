@@ -1724,4 +1724,73 @@ mod tests {
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("status"), "{out}");
     }
+
+    /// A recursive walk from `/` walks through host workspace mounts and
+    /// stops at the kernel's own trees (`docs/mounts.md`, "Where a walk
+    /// stops"), saying once which mounts it skipped. Naming a kernel tree
+    /// walks it; `--cross-mounts` crosses.
+    #[tokio::test]
+    async fn a_walk_from_root_enters_workspace_mounts_and_stops_at_kernel_trees() {
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = test_kernel("test-walk-boundaries").await;
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("usr")).unwrap();
+        std::fs::write(root.path().join("usr/notes"), "NEEDLE\n").unwrap();
+        let app = tempfile::TempDir::new().unwrap();
+        std::fs::write(app.path().join("main.rs"), "NEEDLE\n").unwrap();
+        let rc = tempfile::TempDir::new().unwrap();
+        std::fs::write(rc.path().join("S00.kai"), "NEEDLE\n").unwrap();
+        kernel
+            .mount("/", crate::vfs::backends::LocalBackend::read_only(root.path()))
+            .await;
+        kernel.mount("/app", crate::vfs::backends::LocalBackend::new(app.path())).await;
+        kernel.mount("/config/rc", crate::vfs::backends::LocalBackend::new(rc.path())).await;
+        kernel.mount("/r", crate::vfs::backends::MemoryBackend::new()).await;
+
+        let shell = EmbeddedKaish::with_identity(
+            "test-walk-boundaries",
+            blocks,
+            kernel.clone(),
+            Some(PathBuf::from("/")),
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
+            crate::runtime::context_engine::session_context_map(),
+            ExternalExec::Deny,
+            OutputProfile::Agent,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let run = |cmd: &'static str| {
+            let shell = &shell;
+            async move {
+                let r = shell.execute_with_options(cmd, ExecuteOptions::default()).await.unwrap();
+                (r.code, r.text_out().to_string(), r.err.clone())
+            }
+        };
+        let (code, _, err) = run("mkdir -p /r/laptop && echo NEEDLE > /r/laptop/share.txt").await;
+        assert_eq!(code, 0, "{err}");
+
+        let (code, out, err) = run("grep -rl NEEDLE /").await;
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains("/app/main.rs"), "the walk enters a workspace mount: {out}");
+        assert!(out.contains("/usr/notes"), "{out}");
+        assert!(!out.contains("/config/"), "the walk from / must not enter /config: {out}");
+        assert!(!out.contains("/r/"), "the walk from / must not enter /r: {out}");
+        assert_eq!(err.lines().count(), 1, "one note per walk: {err}");
+        assert!(err.starts_with("grep: skipped mounts "), "{err}");
+        for skipped in ["/config", "/r", "/v"] {
+            assert!(err.split_whitespace().any(|word| word == skipped), "{skipped} not named: {err}");
+        }
+        assert!(err.contains("--cross-mounts"), "{err}");
+
+        let (code, out, err) = run("grep -rl NEEDLE /r").await;
+        assert_eq!(code, 0, "naming /r walks it: {out} {err}");
+        assert!(out.contains("/r/laptop/share.txt"), "{out}");
+        assert_eq!(err, "", "a named tree skips nothing");
+
+        let (code, out, err) = run("grep -rl --cross-mounts NEEDLE /").await;
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(out.contains("/r/laptop/share.txt"), "{out}");
+        assert!(out.contains("/config/rc/S00.kai"), "{out}");
+    }
 }

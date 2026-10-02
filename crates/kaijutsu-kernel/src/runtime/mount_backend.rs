@@ -695,6 +695,11 @@ impl KernelBackend for MountBackend {
             .collect()
     }
 
+    fn walk_boundaries(&self) -> Vec<PathBuf> {
+        // Workspace mounts walk through; kernel trees stop a walk.
+        self.mount_table.walk_boundaries()
+    }
+
     fn resolve_real_path(&self, path: &Path) -> Option<PathBuf> {
         // The subprocess seam: kaish calls this (sync) to turn the shell's
         // VFS cwd into a real host cwd before spawning an external command —

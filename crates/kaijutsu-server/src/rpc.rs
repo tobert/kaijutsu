@@ -1825,6 +1825,18 @@ pub async fn create_shared_kernel(
         kernel.mount(&dir, LocalBackend::new(&dir)).await;
     }
 
+    // A walk from `/` enters every mount outside the kernel roots, so a
+    // kernel-served tree must live under one (`docs/mounts.md`, "Where a
+    // walk stops").
+    let strays = kernel.vfs().virtual_mounts_outside_kernel_roots().await;
+    if !strays.is_empty() {
+        return Err(capnp::Error::failed(format!(
+            "kernel-served mounts {strays:?} are outside the kernel roots {:?}; a walk from / \
+             would enter them. Mount them under a kernel root.",
+            kaijutsu_types::paths::KERNEL_ROOTS
+        )));
+    }
+
     // Freeze the mount table — security perimeter is now fixed.
     // No more mount/unmount via RPC after this point.
     kernel.freeze_mounts();

@@ -25,6 +25,10 @@ is decided at boot, from the server's configuration.
 | `/config/<tree>` | the declared host directory (`docs/config-namespace.md`) | read-write |
 | `/run/*`, `/v/cas`, `/r` | kernel-owned | as each backend says |
 
+A recursive walk from `/` enters the host root and the read-write
+directories and stops at `/config`, `/run`, `/v`, `/r`, and `/dev`; see
+"Where a walk stops" below.
+
 `--rw-mount <DIR>` adds a host directory to that set, read-write, at the same
 path inside the kernel: host `/app` is kernel `/app`. It is repeatable and
 position-independent, and it is how a model gets write access to a workspace
@@ -88,6 +92,41 @@ mount (`null`, `zero`, `random`, `urandom`; a whole read of an endless device
 fails with an error), and `/v` lists kaish's mounts beside the kernel's:
 unlisting either in kaijutsu does not hide it from a shell walk, because the
 shell's view adds kaish's mounts back.
+
+## Where a walk stops
+
+A recursive walk passes through the host root and the workspace mounts and
+stops at the kernel's own trees. `grep -r PATTERN /` searches `/usr`, `/tmp`,
+`$HOME/src`, and every `--rw-mount` directory such as `/app`. It lists
+`/config`, `/run`, `/v`, `/r`, and `/dev` but does not enter them, and says
+so once on stderr, keeping its exit status:
+
+```
+grep: skipped mounts /config /dev /r /run /v (use --cross-mounts to enter)
+```
+
+Name a kernel tree to walk it: `grep -r PATTERN /v` walks `/v/cas`,
+`/v/docs`, and kaish's `/v/jobs` alike. `--cross-mounts` on `grep`, `find`,
+`ls -R`, `tree`, and `glob` crosses for one command, and `set -o crossmounts`
+for the session. `find -xdev` stays in place even then. The rule is kaish's;
+see kaish `help vfs`, "Walks stay in one mount".
+
+The kernel trees are `KERNEL_ROOTS` (`kaijutsu_types::paths`), the same list
+a `--rw-mount` may not land in. `MountBackend::walk_boundaries` reports them
+to kaish, and the file tools' walks use the same list
+(`MountTable::walk_boundaries`). A host mount is walked through wherever it
+is mounted, so the host root and the workspace read as one tree, `/tmp`
+included: it is the gateway between the host and the kernel. The server
+refuses to boot when a backend with no host directory is mounted outside the
+kernel trees, because a walk from `/` would enter it. A boundary is a rule
+about kernel paths, not host content: the host directory behind
+`/config/rc` stays reachable through the walked `/` wherever it lives on the
+host.
+
+Unlisting and walk boundaries do different jobs. An unlisted path (`/proc`,
+`/sys`) is left out of its parent's listing, so nothing that lists `/` sees
+it. A kernel tree stays listed, `ls /` shows it, and only a walk that did not
+name it stops there.
 
 ## The inversion
 

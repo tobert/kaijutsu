@@ -738,15 +738,21 @@ rather than a signal is not explained.
 
 Shipped 2026-10-02: the kernel unlists the host's `/proc` and `/sys`
 (`MountTable::unlist`, `docs/mounts.md`, "Unlisted paths"), so a walk from
-`/` does not enter them and naming them still works. Still open:
+`/` does not enter them and naming them still works. A walk from `/` passes
+through the host and workspace mounts and stops at `/config`, `/run`, `/v`,
+`/r`, and `/dev`, naming the mounts it skipped once on stderr
+(`docs/mounts.md`, "Where a walk stops"); `--cross-mounts` crosses. kaish's
+recursive `grep` skips devices, FIFOs, sockets, and discovered symlinks, and
+reads in 256 KiB chunks.
 
 Decided 2026-10-02 (Amy). Kaijutsu becomes less privileged, so that it is
 freer inside its own space: "I can connect to the host if I need that." The
 unlist also takes `/proc` and `/sys` out of the FSN view and SFTP listings,
 and that is wanted. Still open:
 
-- **A walk or read that names `/proc` can still kill the kernel**
-  (`grep -r x /proc`, `cat /proc/self/pagemap`). Do not cap file reads: a
+- **A read that names `/proc` can still kill the kernel**
+  (`cat /proc/self/pagemap`; `grep -C 2 x /proc/self/pagemap` still buffers
+  the whole file). Do not cap file reads: a
   limit inside file I/O can easily corrupt data by accident. Bound the blast
   radius of a kaish execution instead: one memory limit for the whole
   execution, which the user can raise. Exceeding it stops the interpreter,
@@ -757,18 +763,6 @@ and that is wanted. Still open:
   someday? Needs a design conversation: where the accounting lives (the
   kernel process, a per-execution allocator, a cgroup) and what the receipt
   says.
-- **Walks stay on one filesystem by default** (kaish). A recursive walk does
-  not cross into another mount unless that mount is named. To crawl `/v` or
-  `/r`, name it. This is the reverse of GNU's `--one-file-system`/`-xdev`
-  opt-in. It covers `/v`, kaish's `/dev`, and client shares under `/r`,
-  which a walk from `/` would otherwise crawl over the network. Supersedes
-  the `VfsRouter::unlist` proposal for walks. `/proc` and `/sys` stay
-  unlisted in kaijutsu, because the host's `/` is one `LocalBackend` mount.
-- **Recursive builtins have no bound** (kaish). `grep -r` could read through
-  the chunked reader it already uses for one file. Walks could skip
-  non-regular files, as GNU `grep -D skip` does: kaish's `DirEntryKind` has
-  no device or FIFO kind, so a FIFO in a walked tree blocks `grep`. Filed in
-  `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`.
 - **Find where a model ends up at a bare `/`, and fix the UX/AX there**,
   rather than a guard rule against `grep -r PATTERN /` (decided against: it
   is lexical, and it treats the symptom). Candidates: a context with no cwd

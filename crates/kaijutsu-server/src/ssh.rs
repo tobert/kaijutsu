@@ -142,25 +142,6 @@ pub struct SshServerConfig {
     root_key: Option<std::sync::Arc<russh::keys::PrivateKey>>,
 }
 
-/// Kernel paths an extra read-write mount may never take over.
-///
-/// `/config`, `/run`, `/r`, and `/dev` come from `kaijutsu_types::paths` and
-/// this file's fixed mounts; `/v` has no single constant because kaish and
-/// kaijutsu share the namespace (`kaijutsu_types::paths`, "Reserved names"),
-/// so the parent is named here and covers every `/v/*` mount beneath it.
-const RESERVED_MOUNT_ROOTS: &[&str] = &[
-    kaijutsu_types::paths::CONFIG_NAMESPACE_ROOT,
-    kaijutsu_types::paths::RUN_ROOT,
-    kaijutsu_types::paths::R_ROOT,
-    "/v",
-    "/dev",
-];
-
-/// Whether `path` is `root` or a path-component child of it. `/configuration`
-/// is not under `/config`.
-fn is_or_under(path: &str, root: &str) -> bool {
-    path == root || path.starts_with(&format!("{root}/"))
-}
 
 /// Check the paths to unlist and return them with trailing slashes
 /// trimmed. Each must be absolute and may not be `/`; a refusal names the
@@ -207,10 +188,9 @@ pub fn validate_rw_mounts(dirs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
                     .to_string(),
             );
         }
-        if let Some(reserved) = RESERVED_MOUNT_ROOTS
-            .iter()
-            .find(|root| is_or_under(trimmed, root))
-        {
+        // An extra read-write mount may never take over a tree the kernel
+        // serves itself.
+        if let Some(reserved) = kaijutsu_types::paths::kernel_root_of(trimmed) {
             return Err(format!(
                 "read-write mount '{trimmed}' is at or under '{reserved}', a reserved kernel \
                  root; mount a directory of your own instead"

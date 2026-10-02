@@ -161,6 +161,11 @@ These are source observations, not promises that all paths behave alike.
   Repository discovery stops at the containing mount's real root, so
   `MountBackend::mounts()` reports the real `MountTable`. A linked worktree
   needs its main repository's `.git` inside a mount.
+- `MountBackend::walk_boundaries` reports the kernel roots
+  (`KERNEL_ROOTS`), not every mount, so kaish's recursive walks pass through
+  the host and workspace mounts and stop at `/config`, `/run`, `/v`, `/r`,
+  and `/dev`. kaish adds its own `/v/*` and `/dev` mounts to that list. See
+  `docs/mounts.md`, "Where a walk stops".
 - A `ShellPolicy::ReadOnly` shell gets the writable shell's `PATH` through
   `ExternalExec::LookupOnly`, so `which` reports what the host has. Running
   a host program there is refused, and the refusal names `shell_write`. A

@@ -250,6 +250,31 @@ impl MountTable {
             .collect()
     }
 
+    /// The mount points a recursive walk stays between: the kernel roots
+    /// (`kaijutsu_types::paths::KERNEL_ROOTS`). A walk from `/` passes
+    /// through the host root and the workspace mounts (`/tmp`, `$HOME/src`,
+    /// `--rw-mount` directories) and does not enter `/v`, `/r`, `/config`,
+    /// `/run`, or `/dev` unless it names one (`docs/mounts.md`, "Where a
+    /// walk stops").
+    pub fn walk_boundaries(&self) -> Vec<PathBuf> {
+        kaijutsu_types::paths::KERNEL_ROOTS.into_iter().map(PathBuf::from).collect()
+    }
+
+    /// Mount points of backends with no host directory behind them that lie
+    /// outside every kernel root. A walk from `/` would enter such a mount,
+    /// so the server refuses to boot with one.
+    pub async fn virtual_mounts_outside_kernel_roots(&self) -> Vec<PathBuf> {
+        let mounts = self.mounts.read().await;
+        mounts
+            .iter()
+            .filter(|(path, fs)| {
+                fs.real_root().is_none()
+                    && kaijutsu_types::paths::kernel_root_of(&path.to_string_lossy()).is_none()
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
     /// Normalize a mount path: ensure it starts with `/` and has no trailing slash.
     fn normalize_mount_path(path: PathBuf) -> PathBuf {
         let s = path.to_string_lossy();
@@ -1242,6 +1267,28 @@ impl VfsOps for OpaqueBackend {
 mod tests {
     use super::*;
     use crate::vfs::backends::MemoryBackend;
+
+    #[test]
+    fn walks_stop_at_the_kernel_roots_and_nowhere_else() {
+        let points = MountTable::new().walk_boundaries();
+        let mut names: Vec<String> = points.iter().map(|p| p.display().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["/config", "/dev", "/r", "/run", "/v"]);
+    }
+
+    #[tokio::test]
+    async fn a_virtual_mount_outside_the_kernel_roots_is_reported() {
+        let host = tempfile::TempDir::new().unwrap();
+        let table = MountTable::new();
+        table.mount("/", crate::vfs::backends::LocalBackend::read_only(host.path())).await;
+        table.mount("/app", crate::vfs::backends::LocalBackend::new(host.path())).await;
+        table.mount("/v/cas", MemoryBackend::new()).await;
+        table.mount("/run/midi", MemoryBackend::new()).await;
+        assert!(table.virtual_mounts_outside_kernel_roots().await.is_empty());
+
+        table.mount("/scratch", MemoryBackend::new()).await;
+        assert_eq!(table.virtual_mounts_outside_kernel_roots().await, [PathBuf::from("/scratch")]);
+    }
 
     #[tokio::test]
     async fn snapshot_does_not_descend_into_an_opaque_mount() {
