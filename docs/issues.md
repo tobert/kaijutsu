@@ -776,19 +776,6 @@ and that is wanted. Still open:
   ancestor; a home-dir fallback; benchmark tasks where the model does not
   know its tree (`/app`) and searches the whole host to find it.
 
-## `cd` refuses a symlink to a directory (2026-10-02)
-
-`cd link`, where `link` is a symlink to a directory on a host mount, fails
-with "not a directory". kaish's `cd` checks `backend.stat`, and
-`MountBackend::stat` calls `MountTable::getattr`, which `LocalBackend`
-answers with `symlink_metadata` (lstat) so that removal treats a link as a
-link. `MountBackend::lstat` then just calls `stat`. The cwd check behind
-`kj context create|set --cwd`, `kj fork --pwd`, and `setContextCwd`
-(`shell_state::check_shell_cwd`) runs through the same `cd` path, so it
-refuses the same links. Proposed fix: `MountBackend::stat` follows the
-final symlink, as `stat(2)` does, and `lstat` keeps the link; check what
-else reads `stat` expecting lstat before changing it.
-
 ## Where a model ends up at a bare `/` (2026-10-02)
 
 In the Terminal-Bench runs, no model reached `/` by accident. Every whole-host

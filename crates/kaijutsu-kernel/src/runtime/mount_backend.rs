@@ -278,6 +278,24 @@ fn kj_dir_entry_to_kaish(entry: &crate::vfs::DirEntry) -> DirEntry {
     }
 }
 
+/// Links `stat` follows before it refuses, matching Linux's `MAXSYMLINKS`.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Join a symlink target onto the link's directory and remove `.` and `..`
+/// without touching the filesystem. An absolute target replaces `base`.
+fn lexical_join(base: &Path, target: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut joined = PathBuf::from("/");
+    for component in base.join(target).components() {
+        match component {
+            Component::ParentDir => { joined.pop(); }
+            Component::Normal(name) => joined.push(name),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    joined
+}
+
 /// Extract the filename from a path, defaulting to the full path string.
 fn path_name(path: &Path) -> String {
     path.file_name()
@@ -503,17 +521,43 @@ impl KernelBackend for MountBackend {
         Ok(entries.iter().map(kj_dir_entry_to_kaish).collect())
     }
 
+    /// Follow a final symlink, as `stat(2)` does. Each target resolves in
+    /// the kernel namespace: an absolute target names a kernel path, and a
+    /// relative one resolves against the link's directory. A dangling link
+    /// is not found; more than `MAX_SYMLINK_HOPS` links refuse.
     async fn stat(&self, path: &Path) -> BackendResult<DirEntry> {
+        let mut current = path.to_path_buf();
+        for _ in 0..=MAX_SYMLINK_HOPS {
+            let attr = self
+                .mount_table
+                .getattr(&current)
+                .await
+                .map_err(vfs_to_backend)?;
+            if attr.kind != FileType::Symlink {
+                return Ok(file_attr_to_dir_entry(&path_name(path), &attr));
+            }
+            let target = self
+                .mount_table
+                .readlink(&current)
+                .await
+                .map_err(vfs_to_backend)?;
+            let base = current.parent().unwrap_or(Path::new("/"));
+            current = lexical_join(base, &target);
+        }
+        Err(BackendError::InvalidOperation(format!(
+            "{}: more than {MAX_SYMLINK_HOPS} levels of symbolic links",
+            path.display()
+        )))
+    }
+
+    /// Report a final symlink as a link, as `lstat(2)` does.
+    async fn lstat(&self, path: &Path) -> BackendResult<DirEntry> {
         let attr = self
             .mount_table
             .getattr(path)
             .await
             .map_err(vfs_to_backend)?;
         Ok(file_attr_to_dir_entry(&path_name(path), &attr))
-    }
-
-    async fn lstat(&self, path: &Path) -> BackendResult<DirEntry> {
-        self.stat(path).await
     }
 
     async fn mkdir(&self, path: &Path) -> BackendResult<()> {
@@ -548,20 +592,19 @@ impl KernelBackend for MountBackend {
 
     async fn remove(&self, path: &Path, recursive: bool) -> BackendResult<()> {
         self.deny_if_read_only("remove", path)?;
-        if recursive {
-            // Walk and remove children first
+        // `getattr` does not follow a final link, so a link to a directory
+        // is unlinked and its target is never walked, even with `recursive`.
+        let attr = self
+            .mount_table
+            .getattr(path)
+            .await
+            .map_err(vfs_to_backend)?;
+        if !attr.is_dir() {
+            self.mount_table.unlink(path).await.map_err(vfs_to_backend)
+        } else if recursive {
             self.remove_recursive(path).await
         } else {
-            let attr = self
-                .mount_table
-                .getattr(path)
-                .await
-                .map_err(vfs_to_backend)?;
-            if attr.is_dir() {
-                self.mount_table.rmdir(path).await.map_err(vfs_to_backend)
-            } else {
-                self.mount_table.unlink(path).await.map_err(vfs_to_backend)
-            }
+            self.mount_table.rmdir(path).await.map_err(vfs_to_backend)
         }
     }
 
@@ -1109,6 +1152,40 @@ mod tests {
         assert!(matches!(result, Err(BackendError::ToolNotFound(_))));
     }
 
+    /// `stat` follows a final symlink, as `stat(2)` does, so `cd link` enters
+    /// a linked directory. `lstat` reports the link itself, which removal
+    /// relies on to remove the link and spare its target.
+    #[tokio::test]
+    async fn stat_follows_a_symlink_and_lstat_keeps_it() {
+        let backend = test_mount_backend().await;
+        backend.mkdir(Path::new("/tmp/real")).await.unwrap();
+        backend.write(Path::new("/tmp/real/kept.txt"), b"kept", WriteMode::Overwrite).await.unwrap();
+        backend.symlink(Path::new("/tmp/real"), Path::new("/tmp/absolute")).await.unwrap();
+        backend.symlink(Path::new("real"), Path::new("/tmp/relative")).await.unwrap();
+        backend.mkdir(Path::new("/tmp/sub")).await.unwrap();
+        backend.symlink(Path::new("../relative"), Path::new("/tmp/sub/chain")).await.unwrap();
+
+        for link in ["/tmp/absolute", "/tmp/relative", "/tmp/sub/chain"] {
+            let followed = backend.stat(Path::new(link)).await.unwrap();
+            assert!(followed.is_dir(), "{link}: stat follows to the directory");
+            assert_eq!(followed.name, path_name(Path::new(link)), "{link}: the entry keeps the name asked for");
+            assert!(backend.lstat(Path::new(link)).await.unwrap().is_symlink(), "{link}: lstat keeps the link");
+        }
+
+        backend.symlink(Path::new("/tmp/nowhere"), Path::new("/tmp/dangling")).await.unwrap();
+        assert!(backend.stat(Path::new("/tmp/dangling")).await.is_err(), "a dangling link has no target to stat");
+        assert!(backend.lstat(Path::new("/tmp/dangling")).await.unwrap().is_symlink());
+
+        backend.symlink(Path::new("/tmp/loop-b"), Path::new("/tmp/loop-a")).await.unwrap();
+        backend.symlink(Path::new("/tmp/loop-a"), Path::new("/tmp/loop-b")).await.unwrap();
+        assert!(backend.stat(Path::new("/tmp/loop-a")).await.is_err(), "a link cycle refuses rather than spinning");
+
+        backend.remove(Path::new("/tmp/absolute"), false).await.unwrap();
+        backend.remove(Path::new("/tmp/relative"), true).await.unwrap();
+        assert!(backend.lstat(Path::new("/tmp/absolute")).await.is_err(), "the link is gone");
+        assert!(backend.stat(Path::new("/tmp/real/kept.txt")).await.unwrap().is_file(), "the target is spared");
+    }
+
     #[tokio::test]
     async fn test_backend_type() {
         let backend = test_mount_backend().await;
@@ -1174,6 +1251,42 @@ mod tests {
     /// Read-only / OS mounts pass through the VFS and never touch the document
     /// cache: reads work, writes are rejected cleanly, and a rejected write
     /// must NOT leave a phantom edit that a later read would serve.
+    /// On a host mount, `stat` follows a link to a directory and a recursive
+    /// remove of the link removes the link alone: the target's files stay.
+    #[tokio::test]
+    async fn host_symlink_to_a_directory_stats_as_one_and_removes_as_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/kept.txt"), b"kept").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("relative")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("absolute")).unwrap();
+
+        let blocks = shared_block_store(PrincipalId::system());
+        let kernel = Arc::new(KaijutsuKernel::new_ephemeral("test-host-link").await);
+        let sid = kaijutsu_types::SessionId::new();
+        let session_contexts = crate::runtime::context_engine::session_context_map();
+        session_contexts.insert(sid, kaijutsu_types::ContextId::new());
+        let mount_table = Arc::new(MountTable::new());
+        mount_table.mount(dir.to_str().unwrap(), LocalBackend::new(dir)).await;
+        let file_cache = Arc::new(FileDocumentCache::new(blocks.clone(), mount_table.clone(), test_kernel_db()));
+        let docs = Arc::new(KaijutsuBackend::new(
+            blocks,
+            kernel,
+            crate::runtime::context_shell::ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(), reviewer: None, context: crate::runtime::context_engine::SessionContextExt::current(&session_contexts, &sid).expect("fixture context"), session: sid }, session_contexts,
+        ));
+        let backend = MountBackend::new(mount_table, docs, file_cache, PrincipalId::system());
+
+        for link in ["relative", "absolute"] {
+            let link = dir.join(link);
+            assert!(backend.stat(&link).await.unwrap().is_dir(), "{}: stat follows", link.display());
+            assert!(backend.lstat(&link).await.unwrap().is_symlink(), "{}: lstat keeps the link", link.display());
+            backend.remove(&link, true).await.unwrap();
+            assert!(std::fs::symlink_metadata(&link).is_err(), "{}: the link is removed", link.display());
+            assert_eq!(std::fs::read(dir.join("real/kept.txt")).unwrap(), b"kept", "{}: the target's file stays", link.display());
+        }
+    }
+
     #[tokio::test]
     async fn readonly_mount_passes_through_and_does_not_poison() {
         // tempfile: unique + RAII-cleaned (no leaked `/tmp` dir across runs, and

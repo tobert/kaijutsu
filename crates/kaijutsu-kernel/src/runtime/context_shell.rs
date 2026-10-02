@@ -418,6 +418,24 @@ mod tests {
         assert_eq!(result.text_out().lines().last(), Some("/v/docs"));
     }
 
+    /// `cd` enters a symlink to a directory and keeps the link's path, as a
+    /// shell's logical `cd` does.
+    #[tokio::test]
+    async fn cd_enters_a_symlink_to_a_directory() {
+        use crate::vfs::VfsOps;
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("linked"), None, principal);
+        d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/work/real"), 0o755).await.unwrap();
+        d.kernel().vfs().symlink(std::path::Path::new("/work/link"), std::path::Path::new("real")).await.unwrap();
+        let kaish = context_shell(&d, ctx, principal).await.unwrap();
+        let result = kaish.execute_with_options("cd /work/link; pwd", ExecuteOptions::default()).await.unwrap();
+        assert!(result.ok(), "cd into a link: {}", result.err);
+        assert_eq!(result.text_out().trim(), "/work/link");
+    }
+
     /// A removed cwd refuses the one command and moves the context to the
     /// nearest directory above it on the same mount, at most the mount root.
     #[tokio::test]
