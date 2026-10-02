@@ -203,7 +203,11 @@ kernel may run on another host, so a refused directory creates the context
 without it and the client shows the refusal. A later `kj context set --cwd`
 does not rerun create.
 A create without `--cwd` takes the current context's cwd, so a context
-created from a model's shell starts where that model works.
+created from a model's shell starts where that model works. `kj fork` gives
+the child the source's cwd, or `--pwd DIR`. Create and fork check an
+inherited cwd the way `cd` enters it: one that is gone refuses and names
+`--cwd DIR` or `--pwd DIR`, so the child's lifecycle never runs in a missing
+directory.
 
 ## Rotating a context
 

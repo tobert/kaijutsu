@@ -18,7 +18,7 @@ use kaijutsu_types::{
     ContentType, ContextId, ContextState, EdgeKind, ForkKind, PrincipalId,
 };
 
-use crate::kernel_db::{ContextEdgeRow, ContextRow, ContextShellRow};
+use crate::kernel_db::{ContextEdgeRow, ContextRow};
 use crate::llm::splice::{SpliceItem, plan_splice};
 
 use super::effect::{Classify, Effect};
@@ -38,7 +38,8 @@ pub(crate) struct ForkArgs {
     #[arg(long)]
     preset: Option<String>,
     /// Working directory for the forked context's shell: an existing
-    /// absolute directory. Defaults to the source context's cwd
+    /// absolute directory. Defaults to the source context's cwd, which must
+    /// still exist
     #[arg(long)]
     pwd: Option<String>,
     /// Model spec provider/model (or bare model)
@@ -435,16 +436,27 @@ impl KjDispatcher {
         // ExternalMcpServer health/policy.
     }
 
-    /// Check a `--pwd` override the way `cd` would, before any mutation.
-    async fn check_pwd(&self, caller: &KjCaller, source: ContextId, pwd: Option<&str>) -> Result<(), String> {
-        let Some(pwd) = pwd else { return Ok(()) };
+    /// Choose the child's cwd before any mutation: `--pwd`, or else the
+    /// source's stored cwd. Either is checked the way `cd` would enter it, so
+    /// a child never starts in a missing directory, where its fork rc would
+    /// not run.
+    async fn fork_cwd(&self, caller: &KjCaller, source: ContextId, pwd: Option<&str>) -> Result<Option<String>, String> {
         let identity = crate::runtime::context_shell::ShellIdentity {
             requester: caller.principal_id, performer: caller.actor_id, reviewer: caller.reviewer_id,
             context: source, session: caller.session_id,
         };
-        crate::runtime::shell_state::check_shell_cwd(self, identity, std::path::Path::new(pwd))
+        if let Some(pwd) = pwd {
+            crate::runtime::shell_state::check_shell_cwd(self, identity, std::path::Path::new(pwd))
+                .await
+                .map_err(|e| format!("--pwd {e}"))?;
+            return Ok(Some(pwd.to_string()));
+        }
+        let inherited = crate::runtime::shell_state::read_context_cwd(&self.kernel_db().lock(), source)?;
+        let Some(cwd) = inherited else { return Ok(None) };
+        crate::runtime::shell_state::check_shell_cwd(self, identity, &cwd)
             .await
-            .map_err(|e| format!("--pwd {e}"))
+            .map_err(|e| format!("the current context's cwd {e}; name the child's directory with --pwd DIR"))?;
+        Ok(Some(cwd.to_string_lossy().into_owned()))
     }
 
     async fn fork_full(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
@@ -458,9 +470,10 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
-        if let Err(e) = self.check_pwd(caller, source_id, pwd_override.as_deref()).await {
-            return KjResult::Err(format!("kj fork: {e}"));
-        }
+        let child_cwd = match self.fork_cwd(caller, source_id, pwd_override.as_deref()).await {
+            Ok(cwd) => cwd,
+            Err(e) => return KjResult::Err(format!("kj fork: {e}")),
+        };
 
         // Reject a taken label up front — before copying the document — so a
         // conflict can't strand an orphan copy and the caller gets an
@@ -624,22 +637,10 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork: {e}")),
                 };
-            // Context row + shell/env/binding copy land in one transaction, so
+            // Context row, cwd, and env/binding copy land in one transaction, so
             // a failure can't strand a committed-but-misconfigured context.
-            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
+            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id, child_cwd.as_deref()) {
                 return KjResult::Err(format!("kj fork: {e}"));
-            }
-
-            // Apply --pwd override
-            if let Some(ref pwd) = pwd_override {
-                let shell = ContextShellRow {
-                    context_id: new_id,
-                    cwd: Some(pwd.clone()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.upsert_context_shell(&shell) {
-                    return KjResult::Err(format!("kj fork: failed to set --pwd: {e}"));
-                }
             }
 
             // Structural edge: source → new
@@ -858,9 +859,10 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
-        if let Err(e) = self.check_pwd(caller, source_id, pwd_override.as_deref()).await {
-            return KjResult::Err(format!("kj fork --compact: {e}"));
-        }
+        let child_cwd = match self.fork_cwd(caller, source_id, pwd_override.as_deref()).await {
+            Ok(cwd) => cwd,
+            Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
+        };
 
         // Reject a taken label up front — BEFORE the (slow, billed) distill and
         // before any document is created — so a conflict can't strand an orphan
@@ -1002,21 +1004,10 @@ impl KjDispatcher {
                     Ok(id) => id,
                     Err(e) => return KjResult::Err(format!("kj fork --compact: {e}")),
                 };
-            // Context row + shell/env/binding copy land in one transaction, so
+            // Context row, cwd, and env/binding copy land in one transaction, so
             // a failure can't strand a committed-but-misconfigured context.
-            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id) {
+            if let Err(e) = db.insert_forked_context(&row, default_ws, source_id, child_cwd.as_deref()) {
                 return KjResult::Err(format!("kj fork --compact: {e}"));
-            }
-
-            if let Some(ref pwd) = pwd_override {
-                let shell = ContextShellRow {
-                    context_id: new_id,
-                    cwd: Some(pwd.clone()),
-                    updated_at: kaijutsu_types::now_millis() as i64,
-                };
-                if let Err(e) = db.upsert_context_shell(&shell) {
-                    return KjResult::Err(format!("kj fork --compact: failed to set --pwd: {e}"));
-                }
             }
 
             let edge = ContextEdgeRow {
@@ -2541,7 +2532,9 @@ mod tests {
 
     #[tokio::test]
     async fn fork_inherits_config() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/home/user/project", crate::vfs::MemoryBackend::new()).await;
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
@@ -2655,6 +2648,67 @@ mod tests {
             assert!(result.message().contains("--pwd '/no/such/dir' is not a directory"), "msg: {}", result.message());
         }
         assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "nothing is forked");
+    }
+
+    /// A source cwd that `cd` no longer enters refuses the fork before any
+    /// write and names `--pwd DIR`, in both variants; `--pwd` repairs it.
+    /// Otherwise the child would start in a missing directory and its fork
+    /// rc would not run.
+    #[tokio::test]
+    async fn fork_refuses_an_inherited_cwd_that_is_gone() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        {
+            use crate::vfs::VfsOps;
+            d.kernel().vfs().mkdir(std::path::Path::new("/scratch/work"), 0o755).await.unwrap();
+        }
+        let source = register_context(&d, Some("src"), None, PrincipalId::new());
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: source, cwd: Some("/scratch/gone".into()), updated_at: 0,
+        }).unwrap();
+        let c = caller_with_context(source);
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        for argv in [
+            vec![s("fork"), s("--name"), s("lost")],
+            vec![s("fork"), s("--compact"), s("--name"), s("lost")],
+        ] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?} must refuse: {}", result.message());
+            assert!(result.message().contains("'/scratch/gone' is not a directory")
+                && result.message().contains("--pwd DIR"), "msg: {}", result.message());
+        }
+        assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "nothing is forked");
+
+        let result = d.dispatch(&[s("fork"), s("--name"), s("found"), s("--pwd"), s("/scratch/work")], &c).await;
+        assert!(result.is_ok(), "--pwd names a directory that exists: {}", result.message());
+        let db = d.kernel_db().lock();
+        let child = db.find_context_by_label("found").unwrap().unwrap();
+        assert_eq!(db.get_context_shell(child.context_id).unwrap().unwrap().cwd.as_deref(), Some("/scratch/work"));
+    }
+
+    /// `--pwd` lands in the same transaction as the child's row: a failed
+    /// cwd write leaves no child behind.
+    #[tokio::test]
+    async fn fork_pwd_write_failure_leaves_no_child() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        let source = register_context(&d, Some("src"), None, PrincipalId::new());
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        d.kernel_db().lock().conn_for_ledger().execute_batch(
+            "CREATE TRIGGER fail_child_cwd BEFORE INSERT ON context_shell
+             BEGIN SELECT RAISE(ABORT, 'cwd write failed'); END;"
+        ).unwrap();
+        let c = caller_with_context(source);
+        let result = d.dispatch(&[s("fork"), s("--name"), s("orphan"), s("--pwd"), s("/scratch")], &c).await;
+        assert!(!result.is_ok(), "the failed cwd write must fail the fork: {}", result.message());
+        assert!(d.kernel_db().lock().find_context_by_label("orphan").unwrap().is_none(), "no child is left behind");
     }
 
     /// Register a mock LLM provider on the kernel so --model validation passes.

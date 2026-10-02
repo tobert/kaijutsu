@@ -4021,8 +4021,12 @@ impl KernelDb {
     }
 
     /// Atomically create a forked context: the document row, the context row,
-    /// and the shell + env + egress + capability-binding config copied from
-    /// `source`, all in ONE transaction.
+    /// the child's `cwd`, and the env + egress + capability-binding config
+    /// copied from `source`, all in ONE transaction.
+    ///
+    /// `cwd` is the caller's: `kj fork` passes the source's cwd or `--pwd`
+    /// after checking that `cd` enters it. `None` leaves the child without
+    /// a cwd.
     ///
     /// This folds `insert_context_with_document` + `fork_context_config` into a
     /// single all-or-nothing write. Calling them separately left a gap: the
@@ -4038,8 +4042,8 @@ impl KernelDb {
         row: &ContextRow,
         default_workspace_id: WorkspaceId,
         source: ContextId,
+        cwd: Option<&str>,
     ) -> KernelDbResult<()> {
-        let shell = self.get_context_shell(source)?;
         let env = self.get_context_env(source)?;
         let egress = self.list_context_egress(source)?;
         // A parent's context-scoped MCP grants name servers declared for the
@@ -4062,12 +4066,12 @@ impl KernelDb {
         let tx = self.conn.transaction()?;
         Self::write_document_or_ignore(&tx, &doc)?;
         Self::write_context(&tx, row)?;
-        if let Some(src) = shell {
+        if let Some(cwd) = cwd {
             Self::write_context_shell(
                 &tx,
                 &ContextShellRow {
                     context_id: row.context_id,
-                    cwd: src.cwd,
+                    cwd: Some(cwd.to_string()),
                     updated_at: now_millis(),
                 },
             )?;
@@ -13531,7 +13535,7 @@ mod tests {
         // Fork: labelless thin child (spawn shape).
         let mut child = make_context_row(None);
         child.forked_from = Some(parent.context_id);
-        db.insert_forked_context(&child, ws_id, parent.context_id).unwrap();
+        db.insert_forked_context(&child, ws_id, parent.context_id, None).unwrap();
 
         // Child inherits both attachments with unchanged track_ids.
         let bass_att = db.get_attachment("bass", child.context_id).unwrap().unwrap();
@@ -13556,7 +13560,7 @@ mod tests {
 
         let mut child = make_context_row(Some("coder-child"));
         child.forked_from = Some(parent.context_id);
-        db.insert_forked_context(&child, ws_id, parent.context_id).unwrap();
+        db.insert_forked_context(&child, ws_id, parent.context_id, None).unwrap();
 
         assert!(
             db.list_attachments_for_context(child.context_id).unwrap().is_empty(),
@@ -13986,13 +13990,13 @@ mod tests {
 
         // The target is a fresh context that does not yet exist in any table.
         let tgt = make_context_row(Some("ifc-tgt"));
-        db.insert_forked_context(&tgt, ws_id, src.context_id).unwrap();
+        db.insert_forked_context(&tgt, ws_id, src.context_id, Some("/work/kaijutsu")).unwrap();
 
         // Both the document row and the context row were created.
         assert!(db.get_document(tgt.context_id).unwrap().is_some());
         assert!(db.get_context(tgt.context_id).unwrap().is_some());
 
-        // Shell + env + binding all followed the fork.
+        // The given cwd landed; env + binding followed the fork.
         assert_eq!(
             db.get_context_shell(tgt.context_id).unwrap().unwrap().cwd,
             Some("/work/kaijutsu".into()),
@@ -14036,7 +14040,7 @@ mod tests {
             .unwrap();
 
         let tgt = make_context_row(Some("ifc-atomic-tgt"));
-        let result = db.insert_forked_context(&tgt, ws_id, src.context_id);
+        let result = db.insert_forked_context(&tgt, ws_id, src.context_id, None);
         assert!(result.is_err(), "the aborted env write must surface as an error");
 
         db.conn.execute_batch("DROP TRIGGER boom;").unwrap();
@@ -14069,7 +14073,7 @@ mod tests {
         db.upsert_context_binding(src.context_id, &binding).unwrap();
 
         let tgt = make_context_row(Some("ifc-scoped-tgt"));
-        db.insert_forked_context(&tgt, ws_id, src.context_id).unwrap();
+        db.insert_forked_context(&tgt, ws_id, src.context_id, None).unwrap();
 
         let child = db.get_context_binding(tgt.context_id).unwrap().unwrap();
         assert!(child.all_instances, "the loadout follows the fork");
