@@ -394,6 +394,23 @@ impl JoinedContext {
 struct SessionCreate {
     parent: kaijutsu_client::ParentChoice,
     performer: Option<String>,
+    /// This process's working directory, the host agent's project. The
+    /// kernel may run on another host and refuse it.
+    cwd: Option<String>,
+}
+
+/// This process's working directory as a `--cwd` value. `None` when it is
+/// unreadable or not UTF-8.
+fn client_cwd() -> Option<String> {
+    match std::env::current_dir() {
+        Ok(dir) => dir.into_os_string().into_string().map_err(|dir| {
+            tracing::warn!(?dir, "register_session: the working directory is not UTF-8; creating without --cwd");
+        }).ok(),
+        Err(error) => {
+            tracing::warn!(%error, "register_session: the working directory is unreadable; creating without --cwd");
+            None
+        }
+    }
 }
 
 pub(crate) struct JoinOutcome {
@@ -1819,7 +1836,7 @@ impl KaijutsuMcp {
     // ========================================================================
 
     #[tool(
-        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). Returns the context ID and session info.",
+        description = "Register this agent session and join a context. Must be called before using context-dependent tools (shell). Upserts on the label (defaults to this agent session's id): if the label already names a live context, attaches to it instead of creating a new one (reply carries \"resumed\": true). If the label names a concluded or archived context, creates a fresh context under a deterministic suffixed label instead of resurrecting it (reply carries \"previous_context\"). A created context starts in this agent's working directory; when the kernel cannot see that directory, the context is created without it and the reply's \"cwd_refused\" says why. Returns the context ID and session info.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
@@ -1981,16 +1998,18 @@ impl KaijutsuMcp {
         base_label: &str,
         context_type: &str,
         create: &SessionCreate,
-    ) -> Result<(ContextId, String), RegisterFailure> {
+    ) -> Result<(kaijutsu_client::CreatedContext, String), RegisterFailure> {
         const MAX_RETRIES: u32 = 5;
         let mut last_conflict: Option<String> = None;
         for attempt in 1..=MAX_RETRIES {
             let candidate = Self::find_available_suffixed_label(actor, base_label).await?;
             match actor
-                .create_context_under(create.parent.context_id, &candidate, context_type, create.performer.as_deref(), None)
+                .create_context_in_client_cwd(
+                    create.parent.context_id, &candidate, context_type, create.performer.as_deref(), create.cwd.as_deref(),
+                )
                 .await
             {
-                Ok(id) => return Ok((id, candidate)),
+                Ok(created) => return Ok((created, candidate)),
                 Err(e) if Self::is_retryable_label_conflict(&e) => {
                     tracing::warn!(
                         base_label = %base_label,
@@ -2048,7 +2067,7 @@ impl KaijutsuMcp {
             .ok_or_else(|| {
                 RegisterFailure::Fault(format!("character '{}' has no sheet: {}", me.username, sheet.stderr.trim()))
             })?;
-        Ok(SessionCreate { parent, performer: (!root).then_some(me.username) })
+        Ok(SessionCreate { parent, performer: (!root).then_some(me.username), cwd: client_cwd() })
     }
 
     async fn register_session_impl(&self, req: RegisterSessionRequest) -> String {
@@ -2180,6 +2199,9 @@ impl KaijutsuMcp {
         let mut resumed = false;
         let mut previous_context: Option<serde_json::Value> = None;
         let mut parent: Option<kaijutsu_client::ParentChoice> = None;
+        // The kernel's refusal of this process's directory as the new
+        // context's cwd; the context was created without it.
+        let mut cwd_refused: Option<String> = None;
         let (context_id, label) = match existing {
             Some(ctx) if ctx.concluded_at.is_none() && !ctx.archived => {
                 // Attach: the label already names a live context, as it does
@@ -2217,7 +2239,7 @@ impl KaijutsuMcp {
                 // the caller what happened to the old one. Retries internally
                 // on the resolve→create TOCTOU race — see
                 // `create_context_with_fresh_label`'s doc.
-                let (new_id, fresh_label) = match Self::create_context_with_fresh_label(
+                let (created, fresh_label) = match Self::create_context_with_fresh_label(
                     &remote.actor,
                     &requested_label,
                     &context_type,
@@ -2241,6 +2263,8 @@ impl KaijutsuMcp {
                     "register_session: label names a concluded/archived context — \
                      creating a fresh context under a suffixed label",
                 );
+                let new_id = created.id;
+                cwd_refused = created.cwd_refused;
                 if let Err(e) = remote.actor.join_context(new_id).await {
                     return Err(RegisterFailure::call(format!("Error joining context: {e}"), &e));
                 }
@@ -2261,16 +2285,19 @@ impl KaijutsuMcp {
                 };
                 let new_id = match remote
                     .actor
-                    .create_context_under(
+                    .create_context_in_client_cwd(
                         create.parent.context_id,
                         &requested_label,
                         &context_type,
                         create.performer.as_deref(),
-                        None,
+                        create.cwd.as_deref(),
                     )
                     .await
                 {
-                    Ok(id) => id,
+                    Ok(created) => {
+                        cwd_refused = created.cwd_refused;
+                        created.id
+                    }
                     Err(e) => return Err(RegisterFailure::create(format!("Error creating context: {e}"), &e)),
                 };
                 if let Err(e) = remote.actor.join_context(new_id).await {
@@ -2392,8 +2419,22 @@ impl KaijutsuMcp {
             }
         }
 
+        if let Some(refused) = &cwd_refused {
+            tracing::warn!(
+                context_id = %outcome.context_id,
+                refused = %refused,
+                "register_session: the kernel refused this directory as the context's cwd; \
+                 created without it",
+            );
+        }
+        let cwd_note = cwd_refused.map(|refused| format!(
+            "The kernel refused this agent's directory as the context's cwd: {refused}. \
+             The kernel may run on another host. Set one with `kj context set . --cwd DIR`."
+        ));
+
         Ok(Registered::Joined(serde_json::json!({
             "success": true,
+            "cwd_refused": cwd_note,
             "context_id": outcome.context_id.to_hex(),
             "context_short": outcome.context_id.short(),
             "label": outcome.label,

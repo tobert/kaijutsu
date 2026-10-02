@@ -125,6 +125,22 @@ impl CreateContextError {
     pub fn is_label_conflict(&self) -> bool {
         matches!(self, Self::Refused(message) if message.contains("label conflict"))
     }
+
+    /// The kernel refused the `--cwd` directory: it is not an absolute
+    /// directory on the kernel's mount table.
+    pub fn is_cwd_refusal(&self) -> bool {
+        matches!(self, Self::Refused(message) if message.contains("kj context create: --cwd '"))
+    }
+}
+
+/// A context created by [`ActorHandle::create_context_in_client_cwd`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedContext {
+    pub id: ContextId,
+    /// The kernel's refusal of the client's directory, when it refused it.
+    /// The context was then created without `--cwd` and took the parent's
+    /// cwd, if any. A client shows this to its user.
+    pub cwd_refused: Option<String>,
 }
 
 impl std::fmt::Display for CreateContextError {
@@ -155,6 +171,32 @@ impl ActorHandle {
             .await
             .map_err(CreateContextError::Call)?;
         context_id_from_create_result(&result).map_err(CreateContextError::Refused)
+    }
+
+    /// Create from `parent` in `cwd`, the client's own working directory.
+    ///
+    /// The kernel may run on another host, where that directory does not
+    /// exist. When the kernel refuses the directory, create without `--cwd`
+    /// instead and return the refusal in [`CreatedContext::cwd_refused`]; the
+    /// new context then takes `parent`'s cwd. Every other refusal is an
+    /// error. A client that must run in `cwd`, such as an ACP agent, calls
+    /// [`Self::create_context_under`] instead.
+    pub async fn create_context_in_client_cwd(
+        &self,
+        parent: ContextId,
+        label: &str,
+        context_type: &str,
+        performer: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<CreatedContext, CreateContextError> {
+        match self.create_context_under(parent, label, context_type, performer, cwd).await {
+            Ok(id) => Ok(CreatedContext { id, cwd_refused: None }),
+            Err(error) if cwd.is_some() && error.is_cwd_refusal() => {
+                let id = self.create_context_under(parent, label, context_type, performer, None).await?;
+                Ok(CreatedContext { id, cwd_refused: Some(error.to_string()) })
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -277,6 +319,19 @@ mod tests {
         assert!(!CreateContextError::Refused("kj context create: unknown context type".into()).is_label_conflict());
         assert!(!CreateContextError::Call(CallError::PermanentlyFailed("label conflict".into())).is_label_conflict());
         assert!(!CreateContextError::Call(CallError::Shutdown).is_label_conflict());
+    }
+
+    #[test]
+    fn only_a_kernel_refusal_of_the_directory_is_a_cwd_refusal() {
+        for refusal in [
+            "kj context create: --cwd '/gone' is unavailable: not found",
+            "kj context create: --cwd '/etc/hosts' is not a directory",
+            "kj context create: --cwd 'rel' is not an absolute path",
+        ] {
+            assert!(CreateContextError::Refused(refusal.into()).is_cwd_refusal(), "{refusal}");
+        }
+        assert!(!CreateContextError::Refused("kj context create: label conflict: lane".into()).is_cwd_refusal());
+        assert!(!CreateContextError::Call(CallError::PermanentlyFailed("--cwd '/x'".into())).is_cwd_refusal());
     }
 
     #[test]

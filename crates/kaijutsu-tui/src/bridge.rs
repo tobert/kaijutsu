@@ -25,6 +25,21 @@ fn tui_peer_instance() -> &'static str {
     INSTANCE.get_or_init(|| format!("kaijutsu-tui-{}", uuid::Uuid::new_v4()))
 }
 
+/// This process's working directory, which a context `open` creates
+/// starts in when the kernel can see it. `None` when it is unreadable or
+/// not UTF-8, which the kernel's `--cwd` cannot carry.
+fn client_cwd() -> Option<String> {
+    match std::env::current_dir() {
+        Ok(dir) => dir.into_os_string().into_string().map_err(|dir| {
+            tracing::warn!(?dir, "the working directory is not UTF-8; creating without --cwd");
+        }).ok(),
+        Err(error) => {
+            tracing::warn!(%error, "the working directory is unreadable; creating without --cwd");
+            None
+        }
+    }
+}
+
 /// A live connection to a kaijutsu kernel.
 #[derive(Clone)]
 pub struct KernelBridge {
@@ -145,7 +160,7 @@ impl KernelBridge {
 
     /// Resolve a `--context` argument: a context id, then a label, then
     /// create under that label, as a child of `--parent` or of the kernel's
-    /// only live root context.
+    /// only live root context, in this process's working directory.
     pub async fn open(&self, target: &str) -> Result<ContextInfo> {
         if let Ok(id) = ContextId::parse(target) {
             let contexts = self.list_contexts().await?;
@@ -164,11 +179,20 @@ impl KernelBridge {
         }
         let parent = kaijutsu_client::choose_parent(self.parent.as_deref(), &self.list_contexts().await?)
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
-        let id = self
+        let cwd = client_cwd();
+        let created = self
             .actor
-            .create_context_under(parent.context_id, target, &self.context_type, None, None)
+            .create_context_in_client_cwd(parent.context_id, target, &self.context_type, None, cwd.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("create context {target}: {e}"))?;
+        if let Some(refused) = &created.cwd_refused {
+            // Printed before the screen is taken, so it stays in scrollback.
+            eprintln!(
+                "kaijutsu-tui: created {target} without this directory as its cwd, because the \
+                 kernel refused it: {refused}. Set one with `kj context set . --cwd DIR`."
+            );
+        }
+        let id = created.id;
         self.actor.join_context(id).await?;
         let contexts = self.list_contexts().await?;
         contexts

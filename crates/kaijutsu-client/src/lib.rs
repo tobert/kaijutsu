@@ -42,7 +42,7 @@ pub use context_feed::{
     ContextChange, ContextDelivery, ContextMirror, FeedEvent, MirrorError, VersionedChange,
     context_feed_channel,
 };
-pub use context_create::{CreateContextError, ParentChoice, ParentSource, choose_parent, context_create_argv, context_id_from_create_result};
+pub use context_create::{CreateContextError, CreatedContext, ParentChoice, ParentSource, choose_parent, context_create_argv, context_id_from_create_result};
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
 pub use ledger::{
     AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, PendingAskPoll, RememberScope, decide_ask,

@@ -1,4 +1,5 @@
-//! End-to-end tests for `register_session`'s `origin_host` stamping —
+//! End-to-end tests for `register_session`'s origin facts: its cwd, and its
+//! `origin_host` stamping —
 //! recording which host registered a context so a fleet of hosts sharing
 //! one kernel stays distinguishable.
 //!
@@ -214,5 +215,27 @@ fn register_session_does_not_restamp_origin_host_on_resume() {
              origin_host — it is an origin fact set once at creation, never a \
              'last seen from' one"
         );
+    });
+}
+
+/// A fresh `register_session` starts the context in this process's working
+/// directory, the host agent's project, when the kernel can see it, so the
+/// create lifecycle runs there.
+#[test]
+fn register_session_starts_a_fresh_context_in_the_agents_directory() {
+    run_local(async {
+        let addr = start_server().await;
+        let label = "register-cwd-fresh-test";
+        let mcp = connect_mcp(addr).await;
+        let reg = register_with_retry(&mcp, label).await;
+        assert!(reg.get("success").and_then(|v| v.as_bool()).unwrap_or(false), "{reg}");
+        assert_eq!(reg.get("cwd_refused"), Some(&serde_json::Value::Null), "{reg}");
+
+        let Backend::Remote(remote) = mcp.backend() else {
+            panic!("expected Remote backend");
+        };
+        let ctx_id = remote.joined.read().await.as_ref().expect("must be joined").context_id;
+        let here = std::env::current_dir().unwrap().into_os_string().into_string().unwrap();
+        assert_eq!(remote.actor.get_context_cwd(ctx_id).await.unwrap(), Some(here));
     });
 }

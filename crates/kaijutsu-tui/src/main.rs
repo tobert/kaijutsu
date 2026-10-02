@@ -48,7 +48,8 @@ struct Cli {
     key: KeyArgs,
 
     /// Context to attach to, by id or label. Creates it when the label names
-    /// nothing live. Without this, the highest-ranked live context is used.
+    /// nothing live, with this directory as its cwd when the kernel can see
+    /// it. Without this, the highest-ranked live context is used.
     #[arg(long)]
     context: Option<String>,
 

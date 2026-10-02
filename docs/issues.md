@@ -452,8 +452,6 @@ servers"). Open, most likely to bite first:
   `.git` files directly and has no dirty-tree summary or commit log; the
   reflog stands in. Registering kaish-git under rc would shadow host `git`
   for rc scripts; decide before doing it.
-- The TUI and kaijutsu-mcp create contexts without `--cwd`; their create
-  lifecycle therefore gets no orientation.
 
 ## kaijutsu-mcp session identity (2026-09-25)
 
