@@ -196,6 +196,8 @@ characters; a two-file directory is about 350.
 Every client that knows its working directory must create the context with
 `kj context create --cwd`, so the create lifecycle runs there. ACP
 `session/new` does; a later `kj context set --cwd` does not rerun create.
+A create without `--cwd` takes the current context's cwd, so a context
+created from a model's shell starts where that model works.
 
 ## Rotating a context
 

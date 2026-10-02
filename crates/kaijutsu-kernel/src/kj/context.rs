@@ -35,7 +35,8 @@ pub(crate) struct ContextConfigArgs {
     /// Stored legacy prompt value; not included in model instructions. Use rc instruction blocks
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
-    /// Working directory for the context's shell: an existing absolute directory
+    /// Working directory for the context's shell: an existing absolute
+    /// directory. `create` defaults to the current context's cwd
     #[arg(long)]
     cwd: Option<String>,
     /// Set an env var as KEY=VALUE. Repeat the flag for more than one
@@ -424,14 +425,7 @@ impl KjDispatcher {
         }
 
         if let Some(cwd) = &cfg.cwd_spec {
-            use crate::vfs::VfsOps;
-            let path = std::path::Path::new(cwd);
-            crate::runtime::shell_state::validate_cwd(Some(path))?;
-            match self.kernel().vfs().getattr(path).await {
-                Ok(attr) if attr.kind.is_dir() => {}
-                Ok(_) => return Err(format!("--cwd '{cwd}' is not a directory")),
-                Err(error) => return Err(format!("--cwd '{cwd}' is unavailable: {error}")),
-            }
+            self.check_cwd_is_a_directory(cwd).await.map_err(|e| format!("--cwd {e}"))?;
         }
 
         let resolved_cast = match cfg.cast_spec {
@@ -459,6 +453,19 @@ impl KjDispatcher {
         };
 
         Ok((resolved_model, resolved_cast))
+    }
+
+    /// Check that `cwd` is an absolute directory on the kernel mount table,
+    /// the one the shell's `cd` resolves through. The error names the path.
+    async fn check_cwd_is_a_directory(&self, cwd: &str) -> Result<(), String> {
+        use crate::vfs::VfsOps;
+        let path = std::path::Path::new(cwd);
+        crate::runtime::shell_state::validate_cwd(Some(path))?;
+        match self.kernel().vfs().getattr(path).await {
+            Ok(attr) if attr.kind.is_dir() => Ok(()),
+            Ok(_) => Err(format!("'{cwd}' is not a directory")),
+            Err(error) => Err(format!("'{cwd}' is unavailable: {error}")),
+        }
     }
 
     /// Apply already-validated config to an existing context row and return
@@ -1483,6 +1490,27 @@ impl KjDispatcher {
         // — no `context_type == "musician"` branch, and new beat-bearing roles
         // (funkMusician, …) need no kernel edit. `docs/chameleon.md`,
         // "context_type is an rc bundle of features".
+
+        // Without `--cwd`, the new context starts in the caller's cwd, as
+        // `kj fork` does. A cwd that no longer resolves refuses the create.
+        if cfg.cwd_spec.is_none()
+            && let Some(current) = caller.context_id
+        {
+            let inherited = match crate::runtime::shell_state::read_context_cwd(&self.kernel_db().lock(), current) {
+                Ok(cwd) => cwd,
+                Err(e) => return KjResult::Err(format!("kj context create: {e}")),
+            };
+            if let Some(cwd) = inherited {
+                let cwd = cwd.to_string_lossy().into_owned();
+                if let Err(e) = self.check_cwd_is_a_directory(&cwd).await {
+                    return KjResult::Err(format!(
+                        "kj context create: the current context's cwd {e}; name the new \
+                         context's directory with --cwd DIR"
+                    ));
+                }
+                cfg.cwd_spec = Some(cwd);
+            }
+        }
 
         // Validate + resolve the rest before any mutation so a typo'd
         // --model/--cast/--env can't leave an orphan context behind.
@@ -6238,6 +6266,70 @@ mod tests {
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
         assert_eq!(env[0].value, "debug");
+    }
+
+    fn set_cwd(d: &crate::kj::KjDispatcher, context: ContextId, cwd: &str) {
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: context, cwd: Some(cwd.into()), updated_at: 0,
+        }).unwrap();
+    }
+
+    fn cwd_of(d: &crate::kj::KjDispatcher, label: &str) -> Option<String> {
+        let db = d.kernel_db().lock();
+        let id = db.resolve_context(label).unwrap_or_else(|e| panic!("{label} should exist: {e}"));
+        db.get_context_shell(id).unwrap().and_then(|shell| shell.cwd)
+    }
+
+    /// A create without `--cwd` starts where the caller stands, as `kj fork`
+    /// does; `--cwd` names another directory. The caller's context is the
+    /// source even when `--parent` places the new context elsewhere.
+    #[tokio::test]
+    async fn context_create_inherits_the_callers_cwd() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let caller = register_context(&d, Some("caller"), None, principal);
+        let elsewhere = register_context(&d, Some("elsewhere"), None, principal);
+        mount_scratch_work(&d).await;
+        set_cwd(&d, caller, "/scratch/work");
+        set_cwd(&d, elsewhere, "/scratch");
+        let c = caller_with_context(caller);
+
+        let result = d.dispatch(&[s("context"), s("create"), s("kid")], &c).await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        assert_eq!(cwd_of(&d, "kid").as_deref(), Some("/scratch/work"));
+        assert!(result.message().contains("cwd=/scratch/work"), "the result names the cwd: {}", result.message());
+
+        let result = d.dispatch(&[s("context"), s("create"), s("placed"), s("--parent"), s("elsewhere")], &c).await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        assert_eq!(cwd_of(&d, "placed").as_deref(), Some("/scratch/work"), "the caller's cwd, not the parent's");
+
+        let result = d.dispatch(&[s("context"), s("create"), s("named"), s("--cwd"), s("/scratch")], &c).await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        assert_eq!(cwd_of(&d, "named").as_deref(), Some("/scratch"));
+    }
+
+    #[tokio::test]
+    async fn context_create_from_a_context_without_a_cwd_sets_none() {
+        let d = test_dispatcher().await;
+        let caller = register_context(&d, Some("caller"), None, PrincipalId::new());
+        let result = d.dispatch(&[s("context"), s("create"), s("kid")], &caller_with_context(caller)).await;
+        assert!(result.is_ok(), "create failed: {}", result.message());
+        assert_eq!(cwd_of(&d, "kid"), None);
+    }
+
+    /// An inherited cwd that no longer resolves refuses the create and
+    /// names `--cwd`, rather than creating a context in a missing directory.
+    #[tokio::test]
+    async fn context_create_refuses_an_inherited_cwd_that_is_gone() {
+        let d = test_dispatcher().await;
+        let caller = register_context(&d, Some("caller"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        set_cwd(&d, caller, "/scratch/gone");
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        let result = d.dispatch(&[s("context"), s("create"), s("kid")], &caller_with_context(caller)).await;
+        assert!(!result.is_ok(), "an unavailable inherited cwd must refuse: {}", result.message());
+        assert!(result.message().contains("current context's cwd '/scratch/gone'") && result.message().contains("--cwd DIR"), "msg: {}", result.message());
+        assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no context is created");
     }
 
     /// `kj context create` has no `--egress-allow`/`--egress-deny` of its
