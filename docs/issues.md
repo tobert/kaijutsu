@@ -843,7 +843,9 @@ current context's cwd; the tui and kaijutsu-mcp pass their own directory
 (created without it, and saying so, when the kernel refuses it); ACP maps the
 refusal to `invalid_cwd`; a removed cwd never moves to `/` (it stops at its
 mount root, or is cleared); one check that matches `cd` backs every way to
-set a cwd. Still open:
+set a cwd; `kj fork` checks an inherited cwd; `cd` follows a symlink to a
+directory; a shell result says `[cwd now DIR]` when the call changed it.
+Still open:
 
 4. **A context with no cwd runs its shell in the kernel's `$HOME`**, or in
    `/tmp` when `HOME` is unset (`runtime/context_shell.rs`). The file tools
@@ -854,13 +856,21 @@ set a cwd. Still open:
    orientation. Other context types are not told. Paths that still create
    one: a create from a context with no cwd (root consoles have none), and
    a client directory the kernel refused.
-6. **The shell's result does not say where it ran.** A `cd` persists
-   across calls, and the cwd shows only when the model asks with `pwd`.
-   Proposed fix: a `cwd` field on `ShellEnvelope`, set only when the call
-   changed the durable cwd (`persist_shell_state` already compares the
-   before and after snapshots), `null` otherwise. It touches the shared
-   envelope type, both shell tool descriptions, and the kaijutsu-mcp
-   `shell` description, so it waits for a decision.
+5. **`/` is accepted as a durable cwd.** `shell_state::check_shell_cwd`
+   accepts `/`, and `persist_shell_state` persists `cd /`, while the
+   removed-cwd repair avoids `/`. Proposed: refuse `/` in
+   `check_shell_cwd`, naming a real directory, and skip persisting a `cd /`
+   with a `[cwd not saved: /]` line. Waits for Amy: an ACP client launched
+   at `/` could then open no session (`invalid_cwd`); a context already
+   stored at `/` could not fork or create a child without `--pwd`/`--cwd`;
+   and a person's `cd /` in the tui would not last to the next command.
+6. **Two small cwd leftovers.** The ambient `getCwd` RPC answers `/docs`
+   for a context with no cwd (`rpc.rs`, `get_cwd`); no client calls
+   `getCwd` or `setCwd`, so both can become `retired8`/`retired9` stubs.
+   A durable `PWD` export overrides the real cwd at construction
+   (`ContextShellInputs::environment`, pinned by a test); reserve `PWD` in
+   env writes, or set it after exports. The kaijutsu-mcp `shell` envelope
+   leaves `cwd` `null`, since its block snapshot carries none.
 
 Seen in the same trajectories, outside this entry: kaish `ls -la` printed
 one tab-separated `name  type  size` row per file, with every size 0. Several models called it "garbled" and
