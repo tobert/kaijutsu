@@ -37,7 +37,8 @@ pub(crate) struct ForkArgs {
     /// Preset to apply to the child
     #[arg(long)]
     preset: Option<String>,
-    /// Override cwd on the forked context
+    /// Working directory for the forked context's shell: an existing
+    /// absolute directory. Defaults to the source context's cwd
     #[arg(long)]
     pwd: Option<String>,
     /// Model spec provider/model (or bare model)
@@ -434,6 +435,18 @@ impl KjDispatcher {
         // ExternalMcpServer health/policy.
     }
 
+    /// Check a `--pwd` override the way `cd` would, before any mutation.
+    async fn check_pwd(&self, caller: &KjCaller, source: ContextId, pwd: Option<&str>) -> Result<(), String> {
+        let Some(pwd) = pwd else { return Ok(()) };
+        let identity = crate::runtime::context_shell::ShellIdentity {
+            requester: caller.principal_id, performer: caller.actor_id, reviewer: caller.reviewer_id,
+            context: source, session: caller.session_id,
+        };
+        crate::runtime::shell_state::check_shell_cwd(self, identity, std::path::Path::new(pwd))
+            .await
+            .map_err(|e| format!("--pwd {e}"))
+    }
+
     async fn fork_full(&self, args: &ForkArgs, caller: &KjCaller) -> KjResult {
         let label = args.name.clone();
         let prompt = args.prompt.clone();
@@ -445,6 +458,9 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
+        if let Err(e) = self.check_pwd(caller, source_id, pwd_override.as_deref()).await {
+            return KjResult::Err(format!("kj fork: {e}"));
+        }
 
         // Reject a taken label up front — before copying the document — so a
         // conflict can't strand an orphan copy and the caller gets an
@@ -842,6 +858,9 @@ impl KjDispatcher {
             Ok(id) => id,
             Err(e) => return e,
         };
+        if let Err(e) = self.check_pwd(caller, source_id, pwd_override.as_deref()).await {
+            return KjResult::Err(format!("kj fork --compact: {e}"));
+        }
 
         // Reject a taken label up front — BEFORE the (slow, billed) distill and
         // before any document is created — so a conflict can't strand an orphan
@@ -2567,7 +2586,13 @@ mod tests {
 
     #[tokio::test]
     async fn fork_pwd_override() {
-        let d = test_dispatcher().await;
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        {
+            use crate::vfs::VfsOps;
+            d.kernel().vfs().mkdir(std::path::Path::new("/scratch/myproject"), 0o755).await.unwrap();
+        }
         let principal = PrincipalId::new();
         let source = register_context(&d, Some("src"), None, principal);
         d.block_store()
@@ -2593,7 +2618,7 @@ mod tests {
                     s("--name"),
                     s("research"),
                     s("--pwd"),
-                    s("/home/user/src/myproject"),
+                    s("/scratch/myproject"),
                 ],
                 &c,
             )
@@ -2606,7 +2631,30 @@ mod tests {
             .unwrap()
             .unwrap();
         let shell = db.get_context_shell(child.context_id).unwrap().unwrap();
-        assert_eq!(shell.cwd, Some("/home/user/src/myproject".into()));
+        assert_eq!(shell.cwd, Some("/scratch/myproject".into()));
+    }
+
+    /// `--pwd` must name a directory `cd` enters; a refused one forks
+    /// nothing, in both the full and the compact variant.
+    #[tokio::test]
+    async fn fork_pwd_refuses_a_missing_directory_before_forking() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let source = register_context(&d, Some("src"), None, PrincipalId::new());
+        d.block_store()
+            .create_document(source, crate::DocumentKind::Conversation, None)
+            .unwrap();
+        let c = caller_with_context(source);
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        for argv in [
+            vec![s("fork"), s("--name"), s("lost"), s("--pwd"), s("/no/such/dir")],
+            vec![s("fork"), s("--compact"), s("--name"), s("lost"), s("--pwd"), s("/no/such/dir")],
+        ] {
+            let result = d.dispatch(&argv, &c).await;
+            assert!(!result.is_ok(), "{argv:?} must refuse: {}", result.message());
+            assert!(result.message().contains("--pwd '/no/such/dir' is not a directory"), "msg: {}", result.message());
+        }
+        assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "nothing is forked");
     }
 
     /// Register a mock LLM provider on the kernel so --model validation passes.

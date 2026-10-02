@@ -73,7 +73,6 @@ use tokio_util::sync::CancellationToken;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 
-use kaijutsu_kernel::runtime::embedded_kaish::EmbeddedKaish;
 use crate::kaijutsu_capnp::*;
 use kaijutsu_kernel::runtime::shell_state::context_cwd;
 
@@ -7808,51 +7807,6 @@ fn value_to_env_string(value: &kaish_kernel::ast::Value) -> String {
         Value::Bytes(_) => kaish_kernel::interpreter::value_to_json(value).to_string(),
     }
 }
-
-/// Validate a new directory independently of the old cwd so a removed
-/// directory can be repaired. This shell never executes submitted source.
-async fn shell_for_cwd_validation(
-    kernel: &SharedKernelState,
-    connection: &Rc<RefCell<ConnectionState>>,
-    context_id: ContextId,
-) -> Result<EmbeddedKaish, capnp::Error> {
-    let (name, principal, session_id) = {
-        let conn = connection.borrow();
-        (
-            // Naming a shell, not a person: the id's short form, not a
-            // resolved character name that could go stale or require a
-            // lookup just to label a kaish instance.
-            format!(
-                "{}-{}-{}",
-                kernel.name,
-                conn.principal.short(),
-                conn.session_id.short()
-            ),
-            conn.principal,
-            conn.session_id,
-        )
-    };
-    let reviewer = context_reviewer(kernel, context_id).await;
-    // One materialization path for both shells: read the index + block source
-    // off the dispatcher (the server installs the index there at bootstrap via
-    // `set_semantic_index`), the same accessors the in-kernel model shell uses.
-    // `dispatcher.semantic_index()` mirrors `kernel.semantic_index` — installed
-    // from the same Arc — so human and model shells use the same source.
-    EmbeddedKaish::for_context(
-        &kernel.kj_dispatcher,
-        &name,
-        ShellIdentity {
-            requester: principal, performer: principal, reviewer: reviewer,
-            context: context_id, session: session_id,
-        },
-        ShellPolicy::Agent, kaijutsu_kernel::runtime::context_shell::ShellCwd::Captured(None),
-        kernel.kj_dispatcher.semantic_index(),
-        kernel.kj_dispatcher.block_source(),
-    )
-        .await
-        .map_err(|e| capnp::Error::failed(format!("kaish materialization failed: {}", e)))
-}
-
 async fn context_reviewer(
     kernel: &SharedKernelState,
     context_id: ContextId,
@@ -7887,7 +7841,8 @@ async fn context_reviewer_for(
     }
 }
 
-/// Validate and persist a durable cwd through the same backend used by `cd`.
+/// Validate and persist a durable cwd through the same check `cd` passes,
+/// independently of the old cwd so a removed directory can be repaired.
 /// `Ok(Err(message))` is a normal validation refusal for the wire result;
 /// outer errors mean the operation itself could not be performed.
 async fn set_context_cwd(
@@ -7900,9 +7855,16 @@ async fn set_context_cwd(
     if !std::path::Path::new(path).is_absolute() {
         return Ok(Err(format!("cwd must be absolute: {}", path)));
     }
-    let kaish = shell_for_cwd_validation(kernel, connection, context_id).await?;
-    if !kaish.try_set_cwd(std::path::PathBuf::from(path)).await {
-        return Ok(Err(format!("not a directory: {}", path)));
+    let (principal, session) = {
+        let conn = connection.borrow();
+        (conn.principal, conn.session_id)
+    };
+    let reviewer = context_reviewer(kernel, context_id).await;
+    let identity = ShellIdentity { requester: principal, performer: principal, reviewer, context: context_id, session };
+    if let Err(refusal) = kaijutsu_kernel::runtime::shell_state::check_shell_cwd(
+        &kernel.kj_dispatcher, identity, std::path::Path::new(path),
+    ).await {
+        return Ok(Err(refusal));
     }
 
     let updated_at = std::time::SystemTime::now()

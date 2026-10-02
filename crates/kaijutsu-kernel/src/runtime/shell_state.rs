@@ -90,6 +90,34 @@ pub(crate) fn move_missing_cwd(
     Ok(None)
 }
 
+/// Check that `path` is a directory the context shell's `cd` enters.
+///
+/// The check runs through a shell built for `identity`, so it sees what
+/// `cd` sees: the kernel mount table and the shell's own `/v/docs` and
+/// `/v/swap`. `kj context create|set --cwd`, `kj fork --pwd`, and the
+/// `setContextCwd` RPC all use it. The error names the path.
+pub async fn check_shell_cwd(
+    dispatcher: &crate::kj::KjDispatcher,
+    identity: super::context_shell::ShellIdentity,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("'{}' is not an absolute path", path.display()));
+    }
+    // Boxed: callers are themselves large `kj` futures.
+    let kaish = Box::pin(EmbeddedKaish::for_context(
+        dispatcher, "cwd-check", identity,
+        super::context_shell::ShellPolicy::Internal,
+        super::context_shell::ShellCwd::Captured(None),
+        dispatcher.semantic_index(), dispatcher.block_source(),
+    )).await.map_err(|error| format!("could not check '{}': {error:#}", path.display()))?;
+    if kaish.try_set_cwd(path.to_path_buf()).await {
+        Ok(())
+    } else {
+        Err(format!("'{}' is not a directory", path.display()))
+    }
+}
+
 pub(crate) fn validate_cwd(cwd: Option<&std::path::Path>) -> Result<(), String> {
     if let Some(path) = cwd {
         if !path.is_absolute() {
