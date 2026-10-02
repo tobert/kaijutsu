@@ -224,27 +224,38 @@ impl EmbeddedKaish {
                 // before this one. Nothing runs in a directory the caller did
                 // not expect: move the context to the nearest ancestor that
                 // exists and refuse this command, so the next one runs there
-                // knowingly instead of every later command refusing.
+                // knowingly instead of every later command refusing. A mount
+                // point always resolves, so the walk stops at the old cwd's
+                // mount root at the latest. It never lands on `/`, where a
+                // walk reaches the whole host: with only `/` left, the cwd is
+                // cleared and the next command runs where a context without
+                // a cwd runs.
                 let mut used = None;
-                for ancestor in path.ancestors().skip(1) {
+                for ancestor in path.ancestors().skip(1).filter(|ancestor| ancestor.parent().is_some()) {
                     if kaish.try_set_cwd(ancestor.to_path_buf()).await {
                         used = Some(ancestor.to_path_buf());
                         break;
                     }
                 }
-                let Some(used) = used else {
-                    anyhow::bail!("context cwd '{}' is unavailable and no ancestor resolves; set a valid cwd before executing", path.display());
-                };
-                let newer = super::shell_state::move_missing_cwd(&dispatcher.kernel_db().lock(), context_id, path, &used)
+                let newer = super::shell_state::move_missing_cwd(&dispatcher.kernel_db().lock(), context_id, path, used.as_deref())
                     .map_err(anyhow::Error::msg)?;
-                if let Some(newer) = newer {
-                    anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
-                        path.display(), newer.display());
-                }
-                tracing::warn!(%context_id, missing = %path.display(), used = %used.display(),
-                    "context cwd no longer exists; moved to its nearest ancestor");
+                let now = match newer {
+                    Some(newer) => newer,
+                    None => {
+                        tracing::warn!(%context_id, missing = %path.display(), used = ?used,
+                            "context cwd no longer exists; moved to its nearest ancestor below /, or cleared");
+                        match used {
+                            Some(used) => used,
+                            None => anyhow::bail!(
+                                "context cwd '{}' no longer exists, and no directory above it except `/` does; \
+                                 nothing was run. The context now has no working directory, so the next command \
+                                 runs in '{}'. `cd DIR` sets a new one.",
+                                path.display(), kaish_kernel::home_dir().display()),
+                        }
+                    }
+                };
                 anyhow::bail!("context cwd '{}' no longer exists; nothing was run. The working directory is now '{}'; run the command again",
-                    path.display(), used.display());
+                    path.display(), now.display());
             }
         }
 
@@ -368,34 +379,73 @@ mod tests {
         assert!(error.contains("no longer resolves") && error.contains("nothing was run"), "{error}");
     }
 
+    /// Build a context shell for `ctx` from its stored cwd.
+    async fn context_shell(d: &Arc<KjDispatcher>, ctx: ContextId, principal: PrincipalId) -> Result<EmbeddedKaish> {
+        EmbeddedKaish::for_context(d, "missing-cwd", ShellIdentity {
+            requester: principal, performer: principal, reviewer: None,
+            context: ctx, session: SessionId::new(),
+        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await
+    }
+
+    fn stored_cwd(d: &KjDispatcher, ctx: ContextId) -> Option<String> {
+        d.kernel_db().lock().get_context_shell(ctx).unwrap().and_then(|row| row.cwd)
+    }
+
+    fn set_stored_cwd(d: &KjDispatcher, ctx: ContextId, cwd: &str) {
+        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: ctx, cwd: Some(cwd.into()), updated_at: 0,
+        }).unwrap();
+    }
+
+    /// A removed cwd refuses the one command and moves the context to the
+    /// nearest directory above it on the same mount, at most the mount root.
     #[tokio::test]
-    async fn contextual_shell_reports_unavailable_cwd() {
+    async fn a_removed_cwd_moves_up_within_its_mount() {
+        use crate::vfs::VfsOps;
         let d = Arc::new(test_dispatcher().await);
         d.set_self_arc();
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("missing-cwd"), None, principal);
-        let missing = "/unmounted/context-shell-missing-cwd";
-        d.kernel_db().lock().upsert_context_shell(&crate::kernel_db::ContextShellRow {
-            context_id: ctx, cwd: Some(missing.into()), updated_at: 0,
-        }).unwrap();
-        let result = EmbeddedKaish::for_context(&d, "missing-cwd", ShellIdentity {
-            requester: principal, performer: principal, reviewer: None,
-            context: ctx, session: SessionId::new(),
-        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await;
-        let error = match result {
-            Ok(_) => panic!("an unavailable persisted cwd must not run in a different directory"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains(missing) && error.contains("nothing was run"), "{error}");
-        // The refusal moved the context, so the next command is not refused.
-        let moved = d.kernel_db().lock().get_context_shell(ctx).unwrap().and_then(|row| row.cwd);
-        assert_eq!(moved.as_deref(), Some("/"), "the nearest ancestor that exists");
-        assert!(error.contains("now '/'"), "{error}");
-        EmbeddedKaish::for_context(&d, "missing-cwd", ShellIdentity {
-            requester: principal, performer: principal, reviewer: None,
-            context: ctx, session: SessionId::new(),
-        }, ShellPolicy::Internal, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await
-            .expect("the moved cwd resolves");
+        d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/work/a"), 0o755).await.unwrap();
+
+        for (missing, moved) in [("/work/a/b/c", "/work/a"), ("/work/gone/deep", "/work")] {
+            set_stored_cwd(&d, ctx, missing);
+            let error = match context_shell(&d, ctx, principal).await {
+                Ok(_) => panic!("an unavailable persisted cwd must not run in a different directory"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(missing) && error.contains("nothing was run"), "{error}");
+            assert!(error.contains(&format!("now '{moved}'")), "{error}");
+            assert_eq!(stored_cwd(&d, ctx).as_deref(), Some(moved));
+            context_shell(&d, ctx, principal).await.expect("the moved cwd resolves");
+        }
+    }
+
+    /// A mount point always resolves, so the walk ends at the old cwd's
+    /// mount root at the latest. When only `/` is left, the context is left
+    /// with no cwd rather than moved to `/`; the refusal says where the next
+    /// command runs.
+    #[tokio::test]
+    async fn a_removed_cwd_with_only_the_root_above_clears_the_cwd() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("missing-cwd"), None, principal);
+
+        for missing in ["/unmounted/context-shell-missing-cwd"] {
+            set_stored_cwd(&d, ctx, missing);
+            let error = match context_shell(&d, ctx, principal).await {
+                Ok(_) => panic!("an unavailable persisted cwd must not run in a different directory"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(missing) && error.contains("nothing was run"), "{error}");
+            assert!(error.contains("no working directory") && error.contains("`cd DIR`"), "{error}");
+            assert!(!error.contains("now '/'"), "{error}");
+            assert_eq!(stored_cwd(&d, ctx), None, "{missing}: the cwd is cleared, not moved to /");
+            let kaish = context_shell(&d, ctx, principal).await.expect("a context without a cwd runs");
+            assert_eq!(kaish.cwd().await, kaish_kernel::home_dir());
+        }
     }
 
     #[tokio::test]

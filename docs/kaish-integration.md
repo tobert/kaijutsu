@@ -100,8 +100,11 @@ These are source observations, not promises that all paths behave alike.
 - Context construction refuses a failed loadout/cwd read or an unavailable
   persisted cwd. Nothing runs in a directory the caller did not expect. A
   context cwd that no longer exists moves to its nearest existing ancestor
-  as the command is refused, and the refusal names it, so the next command
-  runs there instead of every later one refusing. `ShellCwd` selects current context state or captured approval
+  below `/` as the command is refused, and the refusal names it, so the next
+  command runs there instead of every later one refusing. A mount point
+  always resolves, so the move stops at the old cwd's mount root at the
+  latest. When only `/` is left, the cwd is cleared instead and the refusal
+  names the home directory the next command runs in. `ShellCwd` selects current context state or captured approval
   state; a captured unset cwd stays unset. Approval paths no longer restore a
   newer context cwd before applying their pin. Gate outcomes preserve no pin
   versus captured-unset state; rule decisions use current context state. RPC

@@ -72,11 +72,12 @@ pub(crate) fn read_context_cwd(db: &KernelDb, context_id: ContextId) -> Result<O
     Ok(cwd)
 }
 
-/// Move a context whose cwd `missing` no longer exists to `used`, only while
-/// the stored cwd is still `missing`. Returns the stored cwd when another
-/// writer changed it first; that cwd stands and nothing is written.
+/// Move a context whose cwd `missing` no longer exists to `used`, or clear
+/// its cwd when `used` is `None`, only while the stored cwd is still
+/// `missing`. Returns the stored cwd when another writer changed it first;
+/// that cwd stands and nothing is written.
 pub(crate) fn move_missing_cwd(
-    db: &KernelDb, context_id: ContextId, missing: &std::path::Path, used: &std::path::Path,
+    db: &KernelDb, context_id: ContextId, missing: &std::path::Path, used: Option<&std::path::Path>,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let stored = read_context_cwd(db, context_id)?;
     if stored.as_deref() != Some(missing) {
@@ -84,9 +85,9 @@ pub(crate) fn move_missing_cwd(
     }
     db.upsert_context_shell(&ContextShellRow {
         context_id,
-        cwd: Some(used.to_string_lossy().into_owned()),
+        cwd: used.map(|used| used.to_string_lossy().into_owned()),
         updated_at: kaijutsu_types::now_millis() as i64,
-    }).map_err(|e| format!("persist context cwd {}: {e}", used.display()))?;
+    }).map_err(|e| format!("persist context cwd {:?}: {e}", used))?;
     Ok(None)
 }
 
@@ -144,12 +145,12 @@ mod tests {
         let (missing, used) = (std::path::Path::new("/gone/deep"), std::path::Path::new("/gone"));
 
         set("/gone/deep");
-        assert_eq!(move_missing_cwd(&db, context, missing, used).unwrap(), None);
+        assert_eq!(move_missing_cwd(&db, context, missing, Some(used)).unwrap(), None);
         assert_eq!(read_context_cwd(&db, context).unwrap().as_deref(), Some(used));
 
         // Another writer moved the context after the probe read it.
         set("/newer");
-        assert_eq!(move_missing_cwd(&db, context, missing, used).unwrap().as_deref(),
+        assert_eq!(move_missing_cwd(&db, context, missing, Some(used)).unwrap().as_deref(),
             Some(std::path::Path::new("/newer")));
         assert_eq!(read_context_cwd(&db, context).unwrap().as_deref(), Some(std::path::Path::new("/newer")));
     }
