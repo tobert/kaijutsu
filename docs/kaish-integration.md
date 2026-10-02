@@ -157,6 +157,12 @@ These are source observations, not promises that all paths behave alike.
   Repository discovery stops at the containing mount's real root, so
   `MountBackend::mounts()` reports the real `MountTable`. A linked worktree
   needs its main repository's `.git` inside a mount.
+- A `ShellPolicy::ReadOnly` shell gets the writable shell's `PATH` through
+  `ExternalExec::LookupOnly`, so `which` reports what the host has. Running
+  a host program there is refused, and the refusal names `shell_write`. A
+  lookup must not report an installed program as missing: models that saw
+  an empty `PATH` searched `/` for it. Kaish has no `command -v` or `type`
+  builtin yet; `command -v` and `type` reach for a host program instead.
 - `runtime/synthesis.rs` owns the block-source adapters used by contextual
   shells; hooks no longer depend on rc for synthesis wiring.
   Hydration errors stop synthesis before embedding work. Image imports read

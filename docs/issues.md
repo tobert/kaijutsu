@@ -818,19 +818,21 @@ one purpose:
    list the writable mounts and say that the rest of `/` is the host,
    read-only.
 2. **Looking for a program that the read-only `shell` said was missing**
-   (3 trials). On `shell`, external commands are denied and `PATH` is
-   unset (`initial_environment` in `runtime/context_shell.rs` sets `PATH`
-   only under `ExternalExec::Allow`). So `which python3` prints `which: no
-   python3 in ()` while `/usr/bin/python3` exists. In dna-assembly, `find /
-   -maxdepth 3 …` came next. sqlite-with-gcov (tenchi) got `MISSING` from
-   `command -v` for `gcc`, `tar`, and `gzip`, then ran `find / -maxdepth 4
-   -name 'gcc*'`. extract-elf (tenchi) got "node not found", then ran `find
-   / -maxdepth 5 -name 'node'`. The remedy that `name_the_write_path`
-   (`runtime/tool_command.rs`) appends fires only on "external commands are
-   disabled", not on a lookup miss. Proposed fix: `which` and `command -v`
-   on a read-only shell report the host path and say to run the program
-   with `shell_write`, or the remedy also fires on an empty-`PATH` miss.
-   The answer must not be "not installed" when the program exists.
+   (3 trials). The `shell` had no `PATH`, so `which python3` printed
+   `which: no python3 in ()` while `/usr/bin/python3` existed. In
+   dna-assembly, `find / -maxdepth 3 …` came next. sqlite-with-gcov (tenchi)
+   got `MISSING` from `command -v` for `gcc`, `tar`, and `gzip`, then ran
+   `find / -maxdepth 4 -name 'gcc*'`. extract-elf (tenchi) got "node not
+   found", then ran `find / -maxdepth 5 -name 'node'`. `which` is fixed:
+   the read-only `shell` now gets the writable shell's `PATH`
+   (`ExternalExec::LookupOnly`), and running the program it finds is
+   refused with the hint that names `shell_write`. Still open: kaish has
+   no `command` or `type` builtin, so `command -v gcc` is refused on
+   `shell`, and on `shell_write` it needs a host `command` program, which
+   most Linux hosts lack. A script that hides stderr, as
+   `command -v gcc >/dev/null 2>&1 || echo MISSING` does, still reports
+   the program missing. The fix belongs in kaish: `command -v` and `type`
+   builtins that resolve the way `which` does.
 3. **Looking for an input file the task had already placed in the cwd** (3
    trials). chess-best-move ran `find / -name "chess_board.png"`,
    headless-terminal ran `find / -name "*terminal*"`, and dna-assembly ran

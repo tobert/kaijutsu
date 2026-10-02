@@ -140,6 +140,10 @@ pub enum ExternalExec {
     /// Host subprocess exec enabled. `path` seeds `$PATH` in the shell's scope
     /// (kaish never reads OS env); absolute paths work regardless of `path`.
     Allow { path: Option<String> },
+    /// No host subprocesses, but `path` seeds `$PATH` so `which` reports the
+    /// programs the host has. The read-only `shell` uses this with the
+    /// writable shell's `path`; running a program there is refused.
+    LookupOnly { path: Option<String> },
 }
 
 /// Output limits selected by the consumer.
@@ -338,6 +342,7 @@ impl EmbeddedKaish {
         session_contexts: SessionContextMap,
         configure_tools: impl FnOnce(SessionContextMap, SessionId, &mut kaish_kernel::ToolRegistry),
     ) -> Result<Self> {
+        let path = kernel.host_path().map(str::to_string);
         Self::with_identity_mode(
             name,
             blocks,
@@ -347,8 +352,9 @@ impl EmbeddedKaish {
             session_contexts,
             true,
             // Read-only never spawns: external exec is the sandbox's fourth
-            // lever, held Deny by construction (no caller choice to get wrong).
-            ExternalExec::Deny,
+            // lever, held off by construction (no caller choice to get wrong).
+            // Lookups still see the writable shell's PATH.
+            ExternalExec::LookupOnly { path },
             // The read-only model shell uses the agent output limit.
             OutputProfile::Agent,
             configure_tools,

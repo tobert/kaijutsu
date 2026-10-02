@@ -63,6 +63,8 @@ impl ContextShellInputs {
         let external_exec = if !read_only && kernel.broker().binding_checked(&context).await?
             .allows(&crate::mcp::Capability::Exec) {
             super::embedded_kaish::ExternalExec::Allow { path: kernel.host_path().map(str::to_string) }
+        } else if read_only {
+            super::embedded_kaish::ExternalExec::LookupOnly { path: kernel.host_path().map(str::to_string) }
         } else {
             super::embedded_kaish::ExternalExec::Deny
         };
@@ -102,7 +104,8 @@ pub(crate) fn initial_environment(external_exec: &super::embedded_kaish::Externa
     let mut env = std::collections::HashMap::from([
         ("HOME".into(), Value::String(kaish_kernel::home_dir().to_string_lossy().into_owned())),
     ]);
-    if let super::embedded_kaish::ExternalExec::Allow { path: Some(path) } = external_exec {
+    use super::embedded_kaish::ExternalExec;
+    if let ExternalExec::Allow { path: Some(path) } | ExternalExec::LookupOnly { path: Some(path) } = external_exec {
         env.insert("PATH".into(), Value::String(path.clone()));
     }
     env
@@ -879,7 +882,7 @@ mod tests {
                 requester: principal, performer: principal, reviewer: None, context, session: SessionId::new(),
             }, if read_only { ShellPolicy::ReadOnly } else { ShellPolicy::Agent },
                 ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
-            assert_eq!(captured.get("PATH").map(String::as_str), if overridden { Some("/configured-bin") } else if read_only { None } else { d.kernel().host_path() });
+            assert_eq!(captured.get("PATH").map(String::as_str), if overridden { Some("/configured-bin") } else { d.kernel().host_path() });
             for name in ["HOME", "PWD", "PATH", "UNSET"] {
                 let value = shell.get_var(name).await.map(|value| kaish_kernel::interpreter::value_to_string(&value));
                 assert_eq!(value.as_ref(), captured.get(name), "{name}, read_only={read_only}");

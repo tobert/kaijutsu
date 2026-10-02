@@ -119,8 +119,8 @@ static DESCRIPTION_READ_ONLY: LazyLock<String> = LazyLock::new(|| {
         "Run a READ-ONLY command in your current kernel context. Submitted \
          commands cannot mutate shared state. File writes, external commands, \
          mutating `kj` verbs, editor input, `curl`, and MCP calls are refused. Use \
-         `shell_write` for those operations. Host tools may still be installed and \
-         on PATH. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
+         `shell_write` for those operations. `which` finds host programs on PATH; \
+         run them with `shell_write`. Inspect with filesystem builtins (`cat`, `grep`, `find`), \
          `/v/docs`, and read-only `kj` commands. {ABOUT_KAISH} {RESULT_CONTRACT}"
     )
 });
@@ -443,7 +443,7 @@ mod tests {
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");
-        assert!(ro_text.contains("`shell_write`") && ro_text.contains("on PATH"), "{ro_text}");
+        assert!(ro_text.contains("`shell_write`") && ro_text.contains("`which` finds host programs on PATH"), "{ro_text}");
     }
 
     /// Prints the read-only tool description as the model receives it —
@@ -1463,6 +1463,34 @@ mod tests {
 
         let result = broker.call_tool(call("cat /nonexistent-rohint"), &cc, CancellationToken::new()).await.unwrap();
         assert!(!streams_of(&result).contains("shell_write"), "an ordinary failure gets no write-path hint");
+    }
+
+    /// `which` on the read-only shell finds a program the host has, from the
+    /// host `PATH` the writable shell uses, and running that program is still
+    /// refused with the write-path hint. A lookup that misses an installed
+    /// program sends a model on a `find /` hunt.
+    #[tokio::test]
+    async fn read_only_which_finds_host_programs_it_cannot_run() {
+        let (broker, d) = wired().await;
+        // A real cwd, as in production: a refusal must come from the
+        // read-only policy, not from a virtual cwd with nowhere to spawn.
+        d.kernel().mount("/", crate::vfs::backends::LocalBackend::read_only("/")).await;
+        let principal = PrincipalId::new();
+        let ctx_id = register_context(&d, Some("rowhich"), None, principal);
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(ctx_id, binding).await.unwrap();
+        let cc = CallContext::new(principal, ctx_id, SessionId::new(), d.kernel_id());
+
+        let result = broker.call_tool(call("which id"), &cc, CancellationToken::new()).await.unwrap();
+        let found = body_of(&result)["stdout"].as_str().unwrap_or_default().trim().to_string();
+        assert!(!result.is_error && found.ends_with("/id") && std::path::Path::new(&found).is_file(),
+            "which must report the host's id: {}", streams_of(&result));
+
+        let result = broker.call_tool(call(&found), &cc, CancellationToken::new()).await.unwrap();
+        let streams = streams_of(&result);
+        assert!(result.is_error && !streams.contains("uid="), "the read-only shell must not run {found}: {streams}");
+        assert!(streams.contains("shell_write"), "the refusal must name shell_write: {streams}");
     }
 
     /// A context
