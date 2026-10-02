@@ -882,14 +882,18 @@ kaish note.
 
 Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
 
-- **The `execute` and `executeKj` RPCs ignore the shell facade.** Both run
-  `ShellPolicy::Agent` with no facade check (`rpc.rs`, `streaming::execute`
-  and `structured::execute_kj`), so a toolie seat still reaches writes and
-  mutating `kj` verbs through them; the ask tier still applies. `shellExecute`
-  and shell drafts now follow the facade (`Broker::check_shell_facade`). No
-  shipped client calls `execute`; `executeKj` is the person's `kj` path.
-  The read-only RPC shell's result hooks still match as `shell_write`; only
-  its PreCall presents the read-only `shell`.
+- **The `executeKj` RPC ignores the shell facade.** It runs
+  `ShellPolicy::Agent` with no facade check (`structured::execute_kj`), so a
+  toolie seat still reaches mutating `kj` verbs through it, subject to each
+  verb's own capability gate and the ask tier. `executeKj` is the person's
+  `kj` path. `shellExecute`, shell drafts, and the streaming `execute` follow
+  the facade (`Broker::check_shell_facade`). The read-only RPC shell's result
+  hooks still match as `shell_write`; only its PreCall presents the read-only
+  `shell`.
+- **`setContextCwd` writes a context's cwd with no facade check**
+  (`rpc.rs`, `set_context_cwd`), so it moves a toolie seat's cwd although its
+  shells leave cwd unchanged. Changing the cwd is not a file write, but it is
+  the one remaining RPC writer of shell state in a read-only seat.
 - **The register path still announces tools before a context's first model
   block** (`emit_for_bindings`), unlike the binding-diff path.
 - **The shell descriptions name four of the facts a turn reads**; `[waiting

@@ -139,13 +139,14 @@ These are source observations, not promises that all paths behave alike.
   the aggregate read-only flag on kaish's temporary filesystem overlays.
   `kj synth` now shares its argument declaration, effect classification, and
   help rendering with the rest of `kj`; the runtime still owns its index/source.
-- The RPC shell (the person's shell box, `kaijutsu-mcp`'s `shell`, and a
-  shell draft submitted from compose) takes its policy from the context's
+- The RPC shell (the person's shell box, `kaijutsu-mcp`'s `shell`, a shell
+  draft submitted from compose, and the streaming `execute`) takes its policy from the context's
   shell facade: `facade:shell_write` gives `ShellPolicy::Agent`, and
   `facade:shell` alone gives `ShellPolicy::ReadOnly`
   (`Broker::check_shell_facade`). A read-only submission runs PreCall as
-  the read-only `shell` tool, so an approved ask resumes read-only, and it
-  leaves the context's cwd and env unchanged. A seat whose model holds only
+  the read-only `shell` tool, so an approved ask resumes read-only, and
+  both the submission and an approved ask leave the context's cwd and env
+  unchanged. A seat whose model holds only
   the read-only `shell`, such as a toolie, has no write path through the
   person's box either.
 - A `ShellPolicy::ReadOnly` shell registers a builtin read-only `git`

@@ -101,7 +101,7 @@ mod tests {
                     }
                     "structured" | "quiet" => crate::runtime::structured::execute_kj(kernel, identity,
                         &["context".into(), "current".into()], path == "quiet").await.unwrap().unwrap().stdout,
-                    "streaming" => crate::runtime::streaming::execute(kernel, identity,
+                    "streaming" => crate::runtime::streaming::execute(kernel, identity, crate::runtime::context_shell::ShellPolicy::Agent,
                         "echo admitted-before-archive".into(), tokio_util::sync::CancellationToken::new())
                         .await.unwrap().unwrap().completed.await.unwrap().unwrap().envelope().stdout,
                     "editor" => crate::runtime::editor_read::read_shell(dispatcher.clone(), identity,

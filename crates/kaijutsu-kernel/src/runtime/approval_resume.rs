@@ -769,7 +769,12 @@ async fn act_on_executable_answer(
         kernel,
         &crate::mcp::CallContext::new(principal_id, context_id, session_id, kernel.id())
             .with_actor(ask.actor, Some(ask.reviewer)),
-        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(run_cancel.clone()), job_ready, ..Default::default() },
+        // A read-only ask leaves the context's cwd and env unchanged, as the
+        // read-only shell it was raised on does.
+        CommandRunOptions { stdin: ask.stdin.clone(), cancel: Some(run_cancel.clone()), job_ready,
+            state_writeback: if ask.read_only { crate::runtime::command::ShellStateWriteBack::Discard }
+                else { crate::runtime::command::ShellStateWriteBack::Persist },
+            ..Default::default() },
     )
     .await;
     run_cancel.cancel();
@@ -1259,7 +1264,7 @@ mod lifetime_tests {
         kernel.broker().set_kj_dispatcher(&dispatcher).await;
         let dir = tempfile::tempdir().unwrap();
         kernel.mount("/policy-probe", crate::vfs::LocalBackend::new(dir.path())).await;
-        let source = "echo written > /policy-probe/file";
+        let source = "cd /policy-probe; export READ_ONLY_PROBE=kept; echo written > /policy-probe/file";
         let actor = PrincipalId::new();
         let reviewer = PrincipalId::new();
         let context = register_context(&dispatcher, Some("read-only-ask"), None, actor);
@@ -1284,6 +1289,10 @@ mod lifetime_tests {
         let stop = tokio_util::sync::CancellationToken::new();
         act_on_executable_answer(kernel, context, actor, &answer, &ask, "reviewer", &stop).await;
         assert!(!dir.path().join("file").exists(), "an approved read-only ask must not write");
+        let cwd = kernel.kernel_db().lock().get_context_shell(context).unwrap().and_then(|row| row.cwd);
+        assert_eq!(cwd, None, "an approved read-only ask must not move the context's cwd");
+        assert!(!kernel.kernel_db().lock().get_context_env(context).unwrap().iter().any(|row| row.key == "READ_ONLY_PROBE"),
+            "an approved read-only ask must not change the context's env");
         assert_eq!(runs_read_only(Origin::Hook, Some("shell_write")), Ok(false));
         assert_eq!(runs_read_only(Origin::ShellGate, None), Ok(false));
         assert!(runs_read_only(Origin::Hook, Some("write")).is_err(), "an unknown tool with a source is refused");

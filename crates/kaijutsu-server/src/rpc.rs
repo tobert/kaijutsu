@@ -2494,12 +2494,22 @@ impl kernel::Server for KernelImpl {
                     let conn = connection.borrow();
                     (conn.require_context()?, conn.principal, conn.session_id)
                 };
+                // The same facade gate and shell choice as `shell_execute`:
+                // `shell` alone gives the read-only shell.
+                let policy = match kernel.kernel.broker().check_shell_facade(&started_ctx).await {
+                    Ok(policy) => policy,
+                    Err(e) => {
+                        let refusal = refusal_or_fault(e, "shell")?;
+                        set_refusal(&mut results.get().init_outcome().init_refused(), &refusal);
+                        return Ok(());
+                    }
+                };
                 let registration = StreamingRegistration::new(connection.clone())?;
                 let reviewer = context_reviewer_for(&kernel, started_ctx, principal).await;
                 let identity = ShellIdentity { requester: principal, performer: principal,
                     reviewer, context: started_ctx, session };
                 let mut execution = match kaijutsu_kernel::runtime::streaming::execute(
-                    &kernel.kernel, identity, code.clone(), registration.cancel.clone(),
+                    &kernel.kernel, identity, policy, code.clone(), registration.cancel.clone(),
                 ).await.map_err(capnp::Error::failed)? {
                     Ok(execution) => execution,
                     Err(refusal) => {

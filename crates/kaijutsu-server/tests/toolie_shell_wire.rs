@@ -54,3 +54,51 @@ fn a_toolie_seat_rpc_shell_refuses_writes_while_a_writable_seat_writes() {
         assert!(output.contains("still-reads"), "{output}");
     });
 }
+
+/// Run `code` through the streaming `execute` RPC in the connection's current
+/// context and return its exit code with its stdout and stderr.
+async fn stream(kernel: &KernelHandle, code: &str) -> (i32, String) {
+    let mut output = kernel.subscribe_output().await.unwrap();
+    let id = kernel.execute(code).await.unwrap_or_else(|e| panic!("execute({code:?}) failed: {e}"));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut text = String::new();
+        while let Some(event) = output.recv().await {
+            match event {
+                kaijutsu_client::OutputEvent::Stdout { exec_id, text: t }
+                | kaijutsu_client::OutputEvent::Stderr { exec_id, text: t } if exec_id == id => text.push_str(&t),
+                kaijutsu_client::OutputEvent::ExitCode { exec_id, code } if exec_id == id => return (code, text),
+                _ => {}
+            }
+        }
+        panic!("streaming output closed without an exit for {code:?}");
+    }).await.expect("streaming execution settles")
+}
+
+#[test]
+fn the_streaming_execute_rpc_follows_the_shell_facade() {
+    run_local(async {
+        let addr = start_server().await;
+        let scratch = tempfile::tempdir().unwrap();
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let toolie = create_context_typed(&kernel, "toolie-stream", "toolie").await.unwrap();
+        let writer = create_context(&kernel, "writer-stream").await.unwrap();
+        let write = format!("echo stream-probe > {}/probe", scratch.path().display());
+
+        for (context, writable) in [(writer, true), (toolie, false)] {
+            kernel.join_context(context, "stream-probe").await.unwrap();
+            let (code, output) = stream(&kernel, &write).await;
+            assert_eq!(code == 0, writable, "writable={writable}: {output}");
+            assert_eq!(scratch.path().join("probe").exists(), writable, "writable={writable}: {output}");
+            if writable {
+                std::fs::remove_file(scratch.path().join("probe")).unwrap();
+            } else {
+                assert!(output.contains("permission denied"), "{output}");
+            }
+            let (code, output) = stream(&kernel, "export STREAM_PROBE=kept").await;
+            assert_eq!(code, 0, "{output}");
+            let (_, output) = stream(&kernel, "echo \"probe=${STREAM_PROBE:-unset}\"").await;
+            assert_eq!(output.contains("probe=kept"), writable, "writable={writable}: {output}");
+        }
+    });
+}
