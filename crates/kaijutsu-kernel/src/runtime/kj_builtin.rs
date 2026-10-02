@@ -73,6 +73,8 @@ impl KjBuiltin {
         }).map_err(|error| format!("persist context cwd for {context_id}: {error}"))
     }
 
+    /// Check `path` through the running shell's backend, the one `cd`
+    /// resolves through: it includes the shell's own `/v/docs` and `/v/swap`.
     async fn validate_directory(ctx: &ExecContext, path: &std::path::Path) -> Result<(), String> {
         super::shell_state::validate_cwd(Some(path))?;
         match ctx.backend.stat(path).await {

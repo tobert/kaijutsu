@@ -397,6 +397,27 @@ mod tests {
         }).unwrap();
     }
 
+    /// `kj context switch` checks the outgoing cwd with the same resolver as
+    /// `cd`, so a context standing in the shell's own `/v/docs` can leave.
+    #[tokio::test]
+    async fn context_switch_leaves_a_cwd_only_the_shell_mounts() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("in-docs"), None, principal);
+        register_context(&d, Some("elsewhere"), None, principal);
+        set_stored_cwd(&d, ctx, "/v/docs");
+        let kaish = context_shell(&d, ctx, principal).await.expect("/v/docs is a cwd `cd` enters");
+        let result = kaish.execute_with_options("kj context switch elsewhere", ExecuteOptions::default())
+            .await.unwrap();
+        assert!(result.ok(), "switch away from /v/docs: {} {}", result.text_out(), result.err);
+        assert_eq!(stored_cwd(&d, ctx).as_deref(), Some("/v/docs"), "the outgoing cwd is saved");
+        let result = kaish.execute_with_options("kj context switch in-docs; pwd", ExecuteOptions::default())
+            .await.unwrap();
+        assert!(result.ok(), "switch back into /v/docs: {} {}", result.text_out(), result.err);
+        assert_eq!(result.text_out().trim(), "/v/docs");
+    }
+
     /// A removed cwd refuses the one command and moves the context to the
     /// nearest directory above it on the same mount, at most the mount root.
     #[tokio::test]
