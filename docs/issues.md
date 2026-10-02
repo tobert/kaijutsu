@@ -784,6 +784,98 @@ and that is wanted. Still open:
   ancestor; a home-dir fallback; benchmark tasks where the model does not
   know its tree (`/app`) and searches the whole host to find it.
 
+## Where a model ends up at a bare `/` (2026-10-02)
+
+In the Terminal-Bench runs, no model reached `/` by accident. Every whole-host
+walk was deliberate, from a shell whose cwd was `/app`. Fix what sent the
+model there, not the walk. Read from `kj-ds4-tb2-20-1` and
+`kj-tenchi-tb2-20-2` (40 trials), plus `kj-qwen-sqlite-1`. Both
+binaries predate c2133264, so no run had the coder orientation block, and
+each ACP context was created first and given its cwd afterward.
+
+What the model knew: `pwd` printed `/app` in every trial that asked, the
+task text names `/app` in most tasks, and `solo-acp` mounted `/app`
+read-write. A `find /` or `grep -r … /` ran in 10 of 40 trials, plus the
+qwen run. By purpose, most frequent first; one trial can have more than
+one purpose:
+
+1. **Looking for the grader, the tests, or a reference solution** (7
+   trials; both crashes). extract-elf (both runs), headless-terminal,
+   constraints-scheduling, configure-git-webserver, fix-code-vulnerability,
+   raman-fitting. extract-elf step 15: `grep -rl "extract.js" / … | grep -v
+   '^/proc'`, after "Let me search the filesystem for the task/reference".
+   headless-terminal step 17: `grep -r "base_terminal\|BaseTerminal" /`.
+   The root listing invites the hunt: it shows kaijutsu's own `/config`,
+   `/r`, and `/v` beside the harness's `/installed-agent` and `/logs`. Models
+   read `/logs/agent/acp.txt`, which is this kernel's own stderr with the
+   model's own thinking in it. In fix-code-vulnerability, `grep -rl
+   report.jsonl /` found only that log. Proposed fix: the inversion in
+   `docs/mounts.md`, "The inversion". `/` holds the workspace, `/tmp`, the
+   kernel's own trees, and the mounted toolchain, not the host. A walk
+   from `/` is then short and finds only the model's space, and it cannot
+   reach `/proc`. The host stays reachable by naming it, as Amy put it: "I
+   can connect to the host if I need that." Until then, the orientation can
+   list the writable mounts and say that the rest of `/` is the host,
+   read-only.
+2. **Looking for a program that the read-only `shell` said was missing**
+   (3 trials). On `shell`, external commands are denied and `PATH` is
+   unset (`initial_environment` in `runtime/context_shell.rs` sets `PATH`
+   only under `ExternalExec::Allow`). So `which python3` prints `which: no
+   python3 in ()` while `/usr/bin/python3` exists. In dna-assembly, `find /
+   -maxdepth 3 …` came next. sqlite-with-gcov (tenchi) got `MISSING` from
+   `command -v` for `gcc`, `tar`, and `gzip`, then ran `find / -maxdepth 4
+   -name 'gcc*'`. extract-elf (tenchi) got "node not found", then ran `find
+   / -maxdepth 5 -name 'node'`. The remedy that `name_the_write_path`
+   (`runtime/tool_command.rs`) appends fires only on "external commands are
+   disabled", not on a lookup miss. Proposed fix: `which` and `command -v`
+   on a read-only shell report the host path and say to run the program
+   with `shell_write`, or the remedy also fires on an empty-`PATH` miss.
+   The answer must not be "not installed" when the program exists.
+3. **Looking for an input file the task had already placed in the cwd** (3
+   trials). chess-best-move ran `find / -name "chess_board.png"`,
+   headless-terminal ran `find / -name "*terminal*"`, and dna-assembly ran
+   `find / -maxdepth 3 -name 'sequences.fasta'`. Each also ran `ls /app` in
+   the same call, so the model was not lost; it wanted confirmation. The
+   coder orientation (`coder/create/S35-orient.kai`) now lists the top
+   level of the cwd and should answer this. Rerun the subset to measure it.
+   Most trials also opened with `ls /`, which costs one call and is
+   harmless.
+
+Paths in kaijutsu that lead toward `/` or away from the work tree. None
+appeared in these runs:
+
+4. **A context created without a cwd runs its shell in the kernel's
+   `$HOME`**, or in `/tmp` when `HOME` is unset (`kaish_kernel::home_dir`,
+   used at `runtime/context_shell.rs:90`). The file tools refuse a missing
+   cwd ("this context has no working directory set",
+   `mcp/servers/file.rs`, `refuse_missing_cwd`); the shell does not. These
+   paths create a context without a cwd: `kj context create` without
+   `--cwd` (it does not inherit the caller's cwd, though `kj fork` does),
+   the tui (`kaijutsu-tui/src/bridge.rs:169`), and kaijutsu-mcp
+   (`kaijutsu-mcp/src/lib.rs:1990`), which names the context after its
+   cwd but does not set it. The orientation then skips with "orient:
+   context has no cwd; skipped", which reaches the rc log, not the model.
+   Proposed fix: `kj context create` run from a context takes that
+   context's cwd unless `--cwd` names another. The shell refuses a missing
+   cwd as the file tools do, naming `kj context set . --cwd DIR`. Clients
+   that know a directory pass it.
+5. **A removed cwd moves to its nearest existing ancestor, which can be
+   `/`** (`runtime/context_shell.rs`, the ancestor loop before
+   `move_missing_cwd`). The test `contextual_shell_reports_unavailable_cwd`
+   asserts `/` for `/unmounted/…`. The move is durable, and only the one
+   refused command says so. Proposed fix: stop at the root of the mount
+   that held the old cwd. If that root is gone too, refuse and name `kj
+   context set . --cwd DIR`, rather than land at `/`.
+6. **The shell's result does not say where it ran.** A `cd` persists
+   across calls, and the cwd shows only when the model asks with `pwd`.
+   Proposed fix: when a call changes the cwd, the result names the new one
+   in a single line.
+
+Seen in the same trajectories, outside this entry: kaish `ls -la` printed
+one tab-separated `name  type  size` row per file, with every size 0. Several models called it "garbled" and
+fell back to `ls --json`. That costs calls and trust, not a walk; it is a
+kaish note.
+
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 
 Findings the review raised that are not fixed yet (kaibo `job-2`, deepseek):
