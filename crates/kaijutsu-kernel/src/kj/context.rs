@@ -35,7 +35,7 @@ pub(crate) struct ContextConfigArgs {
     /// Stored legacy prompt value; not included in model instructions. Use rc instruction blocks
     #[arg(long = "system-prompt")]
     system_prompt: Option<String>,
-    /// Working directory for the context's shell
+    /// Working directory for the context's shell: an existing absolute directory
     #[arg(long)]
     cwd: Option<String>,
     /// Set an env var as KEY=VALUE. Repeat the flag for more than one
@@ -421,6 +421,17 @@ impl KjDispatcher {
 
         if let Some(env) = cfg.env_spec.iter().find(|e| !e.contains('=')) {
             return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
+        }
+
+        if let Some(cwd) = &cfg.cwd_spec {
+            use crate::vfs::VfsOps;
+            let path = std::path::Path::new(cwd);
+            crate::runtime::shell_state::validate_cwd(Some(path))?;
+            match self.kernel().vfs().getattr(path).await {
+                Ok(attr) if attr.kind.is_dir() => {}
+                Ok(_) => return Err(format!("--cwd '{cwd}' is not a directory")),
+                Err(error) => return Err(format!("--cwd '{cwd}' is unavailable: {error}")),
+            }
         }
 
         let resolved_cast = match cfg.cast_spec {
@@ -5173,11 +5184,12 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let ctx = register_context(&d, Some("target"), None, principal);
+        mount_scratch_work(&d).await;
 
         let c = caller_with_context(ctx);
         let result = d
             .dispatch(
-                &[s("context"), s("set"), s("."), s("--cwd"), s("/tmp/work")],
+                &[s("context"), s("set"), s("."), s("--cwd"), s("/scratch/work")],
                 &c,
             )
             .await;
@@ -5190,7 +5202,46 @@ mod tests {
 
         let db = d.kernel_db().lock();
         let shell = db.get_context_shell(ctx).unwrap().unwrap();
-        assert_eq!(shell.cwd, Some("/tmp/work".into()));
+        assert_eq!(shell.cwd, Some("/scratch/work".into()));
+    }
+
+    /// `/scratch/work` is a directory and `/scratch/file` is a file, on the
+    /// kernel mount table the shell's `cd` resolves through.
+    async fn mount_scratch_work(d: &crate::kj::KjDispatcher) {
+        use crate::vfs::VfsOps;
+        d.kernel().mount("/scratch", crate::vfs::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/scratch/work"), 0o755).await.unwrap();
+        d.kernel().vfs().write_all(std::path::Path::new("/scratch/file"), b"x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_set_cwd_refuses_a_path_that_is_not_a_directory() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("target"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        let c = caller_with_context(ctx);
+        for path in ["/scratch/missing", "/scratch/file", "scratch/work"] {
+            let result = d.dispatch(&[s("context"), s("set"), s("."), s("--cwd"), s(path)], &c).await;
+            assert!(!result.is_ok(), "set --cwd {path} must refuse: {}", result.message());
+            assert!(result.message().contains(path), "the refusal names {path}: {}", result.message());
+        }
+        assert!(d.kernel_db().lock().get_context_shell(ctx).unwrap().is_none(), "a refused cwd writes nothing");
+    }
+
+    #[tokio::test]
+    async fn context_create_cwd_refuses_a_missing_directory_before_creating() {
+        let d = test_dispatcher().await;
+        let parent = register_context(&d, Some("parent"), None, PrincipalId::new());
+        mount_scratch_work(&d).await;
+        let c = caller_with_context(parent);
+        let before = d.kernel_db().lock().list_active_contexts().unwrap().len();
+        let result = d.dispatch(&[s("context"), s("create"), s("lost"), s("--cwd"), s("/scratch/missing")], &c).await;
+        assert!(!result.is_ok(), "create --cwd on a missing directory must refuse: {}", result.message());
+        assert!(result.message().contains("/scratch/missing"), "msg: {}", result.message());
+        assert_eq!(d.kernel_db().lock().list_active_contexts().unwrap().len(), before, "no context is created");
+
+        let result = d.dispatch(&[s("context"), s("create"), s("found"), s("--cwd"), s("/scratch/work")], &c).await;
+        assert!(result.is_ok(), "create --cwd on a directory succeeds: {}", result.message());
     }
 
     #[tokio::test]
@@ -6157,6 +6208,7 @@ mod tests {
         let d = test_dispatcher().await;
         let principal = PrincipalId::new();
         let parent = register_context(&d, Some("parent"), None, principal);
+        mount_scratch_work(&d).await;
 
         let c = caller_with_context(parent);
         let result = d
@@ -6166,7 +6218,7 @@ mod tests {
                     s("create"),
                     s("kid"),
                     s("--cwd"),
-                    s("/tmp/work"),
+                    s("/scratch/work"),
                     s("--env"),
                     s("RUST_LOG=debug"),
                 ],
@@ -6181,7 +6233,7 @@ mod tests {
         };
         let db = d.kernel_db().lock();
         let shell = db.get_context_shell(id).unwrap().unwrap();
-        assert_eq!(shell.cwd, Some("/tmp/work".into()));
+        assert_eq!(shell.cwd, Some("/scratch/work".into()));
         let env = db.get_context_env(id).unwrap();
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].key, "RUST_LOG");
