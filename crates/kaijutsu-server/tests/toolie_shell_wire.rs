@@ -37,7 +37,7 @@ fn a_toolie_seat_rpc_shell_refuses_writes_while_a_writable_seat_writes() {
 
         let (status, output) = run(&kernel, &write, toolie).await;
         assert_eq!(status, Status::Error, "a toolie seat's RPC shell wrote: {output}");
-        assert!(output.contains("permission denied"), "the write must be refused, not fail elsewhere: {output}");
+        assert!(output.contains("read-only filesystem"), "the write must be refused, not fail elsewhere: {output}");
         assert!(!scratch.path().join("probe").exists(), "a toolie seat's RPC shell wrote the probe");
 
         // The writable seat keeps its exports; the read-only one leaves the
@@ -93,7 +93,7 @@ fn the_streaming_execute_rpc_follows_the_shell_facade() {
             if writable {
                 std::fs::remove_file(scratch.path().join("probe")).unwrap();
             } else {
-                assert!(output.contains("permission denied"), "{output}");
+                assert!(output.contains("read-only filesystem"), "{output}");
             }
             let (code, output) = stream(&kernel, "export STREAM_PROBE=kept").await;
             assert_eq!(code, 0, "{output}");

@@ -551,7 +551,7 @@ async fn the_toolie_stance_examples_run_in_its_read_only_shell_body() {
     let envelope = run(format!("kj block read {id}")).await;
     assert_eq!(envelope["exit_code"], 0, "kj block read {id}: {envelope}");
     let refusals = [
-        (format!("echo probe > {dir}/probe"), 1, "permission denied"),
+        (format!("echo probe > {dir}/probe"), 1, "read-only filesystem"),
         ("kj drift push . probe".to_string(), 1, "read-only"),
         ("curl http://localhost/".to_string(), 1, "read-only"),
         ("/usr/bin/true".to_string(), 127, "read-only"),

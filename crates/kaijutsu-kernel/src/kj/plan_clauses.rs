@@ -15,12 +15,12 @@
 //! `"kj fork"`; `echo "${HOME}"` → one clause, the statement's rendered text.
 //!
 //! A statement is cut per command only when it has commands **and** every
-//! argument of every command is [`PlannedValue::Plain`]. A non-plain
-//! argument means the reassembled argv would not be the text that was asked
+//! argument of every command is [`PlannedValue::Literal`] or
+//! [`PlannedValue::Plain`]. Any other argument means the reassembled argv would not be the text that was asked
 //! for, so the whole statement falls back to
 //! [`Plan::rendered`](kaish_types::plan::Plan::rendered) as one clause —
 //! kaish's own unexpanded rendering, which is what a classifier should judge.
-//! The linked kaish produces only `Plain`, so today a bare assignment (a
+//! The linked kaish produces only those two, so today a bare assignment (a
 //! statement with no commands) is the only text that reaches the fallback;
 //! the guard is there because [`PlannedValue`] is `#[non_exhaustive]` and a
 //! redaction pass is exactly what its seam is for.
@@ -93,11 +93,13 @@ pub fn command_clause_texts(stmt: &PlannedStatement) -> Vec<String> {
 /// the whole statement. The single place the cut is decided.
 fn render_statement(stmt: &PlannedStatement) -> Vec<PlanClause> {
     let commands = &stmt.plan.commands;
-    let every_arg_plain = commands
-        .iter()
-        .all(|cmd| cmd.args.iter().all(|a| matches!(a, PlannedValue::Plain(_))));
+    let every_arg_known = commands.iter().all(|cmd| {
+        cmd.args
+            .iter()
+            .all(|a| matches!(a, PlannedValue::Plain(_) | PlannedValue::Literal { .. }))
+    });
 
-    if commands.is_empty() || !every_arg_plain {
+    if commands.is_empty() || !every_arg_known {
         return vec![PlanClause {
             stmt_seq: stmt.index,
             cmd_seq: None,
@@ -114,10 +116,8 @@ fn render_statement(stmt: &PlannedStatement) -> Vec<PlanClause> {
         .map(|(i, cmd)| {
             let mut clause = String::from(cmd.name.as_str());
             for arg in &cmd.args {
-                if let PlannedValue::Plain(s) = arg {
-                    clause.push(' ');
-                    clause.push_str(s);
-                }
+                clause.push(' ');
+                clause.push_str(&arg.display());
             }
             PlanClause {
                 stmt_seq: stmt.index,
@@ -173,24 +173,32 @@ mod tests {
         assert_eq!(seats, vec![(0, Some(0)), (1, Some(0)), (1, Some(1))]);
     }
 
-    /// The non-plain guard has no source text that reaches it with the
-    /// linked kaish: [`PlannedValue`] carries exactly one variant, `Plain`.
-    /// This test pins that fact, so the day kaish (or an embedder-side
-    /// redaction pass) adds a variant, this goes red and the fallback
-    /// branch above needs a real test rather than staying quietly dead.
+    /// The guard for an unknown value has no source text that reaches it
+    /// with the linked kaish: [`PlannedValue`] carries `Plain` and
+    /// `Literal`. This test pins that fact, so the day kaish (or an
+    /// embedder-side redaction pass) adds a variant, this goes red and the
+    /// fallback branch above needs a real test rather than staying quietly
+    /// dead.
     #[test]
-    fn every_planned_value_the_linked_kaish_produces_is_plain() {
-        for stmt in planned("rm --confirm=abc123 x | wc -l") {
+    fn every_planned_value_the_linked_kaish_produces_is_plain_or_literal() {
+        for stmt in planned("rm --confirm=abc123 $x | wc -l") {
             for cmd in &stmt.plan.commands {
                 for arg in &cmd.args {
                     assert!(
-                        matches!(arg, PlannedValue::Plain(_)),
-                        "a non-plain value is now reachable from source text — \
+                        matches!(arg, PlannedValue::Plain(_) | PlannedValue::Literal { .. }),
+                        "an unknown value is now reachable from source text — \
                          give the fallback branch a real test"
                     );
                 }
             }
         }
+    }
+
+    /// A literal word renders as its display text; an expanding one in
+    /// kaish's unexpanded rendering.
+    #[test]
+    fn literal_and_expanding_words_render_unexpanded() {
+        assert_eq!(texts("rm 'a b' $x"), vec!["rm 'a b' ${x}".to_string()]);
     }
 
     /// A statement with no commands at all — a bare assignment — is one

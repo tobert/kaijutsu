@@ -9652,6 +9652,9 @@ mod tests {
             "true && bash -c 'echo hi'",
             "echo one | zsh -c 'echo two'",
             "(dash -c 'echo hi')",
+            "python3 -c 'print(1)'",
+            "python3 '-c' 'print(1)'",
+            "env perl -ne 'print'",
         ];
         for cmd in denied {
             let mut call = params("svc", "shell_write");
@@ -9672,6 +9675,7 @@ mod tests {
             "grep 'sh -c' file",
             "echo \"bash -c\"",
             "git commit -m \"note: sh -c is banned here\"",
+            "python3 script.py",
         ];
         for cmd in benign {
             let mut call = params("svc", "shell_write");

@@ -165,8 +165,9 @@ These are source observations, not promises that all paths behave alike.
   `ExternalExec::LookupOnly`, so `which` reports what the host has. Running
   a host program there is refused, and the refusal names `shell_write`. A
   lookup must not report an installed program as missing: models that saw
-  an empty `PATH` searched `/` for it. Kaish has no `command -v` or `type`
-  builtin yet; `command -v` and `type` reach for a host program instead.
+  an empty `PATH` searched `/` for it. kaish's `command -v` and `type`
+  builtins resolve the same way, so `command -v gcc >/dev/null || echo
+  MISSING` answers on the read-only shell too.
 - `runtime/synthesis.rs` owns the block-source adapters used by contextual
   shells; hooks no longer depend on rc for synthesis wiring.
   Hydration errors stop synthesis before embedding work. Image imports read

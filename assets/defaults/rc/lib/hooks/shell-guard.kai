@@ -41,6 +41,8 @@ def shell_class: ["sh","bash","zsh","dash","ksh","fish","busybox"];
 def wrapper_class: ["sudo","env","nice","timeout","nohup","stdbuf","xargs","exec"];
 def scripting_class: {"python":"^-[A-Za-z]*c$","python3":"^-[A-Za-z]*c$","perl":"^-[A-Za-z]*[eE][A-Za-z]*$","ruby":"^-[A-Za-z]*e[A-Za-z]*$","node":"^(-e|-p|--eval|--print)$"};
 
+# A literal word carries the argument as `literal.value`; an expanding word
+# carries only its rendered text under `plain`.
 def destrip:
   if (type == "string") and (length >= 2) and
      ( (.[0:1] == "'" and .[-1:] == "'") or (.[0:1] == "\"" and .[-1:] == "\"") )
@@ -51,7 +53,7 @@ def all_commands:
 
 def classify:
   . as $c
-  | ($c.args // [] | map(.plain | destrip)) as $argv
+  | ($c.args // [] | map(.literal.value // (.plain | destrip))) as $argv
   | (
       if (shell_class | index($c.name)) then
         "shell interpreter \"\($c.name)\" invoked directly"

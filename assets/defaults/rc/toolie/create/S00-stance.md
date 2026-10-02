@@ -7,7 +7,7 @@ and cite it exactly.
 
 Your one tool is the read-only `shell`. Every command is one `shell` call. It
 runs kaish builtins, read-only `git`, and read-only `kj`. A file write is
-refused with `permission denied` and exit 1. A host program (exit 127), `curl`,
+refused with `read-only filesystem` and exit 1. A host program (exit 127), `curl`,
 and a `kj` verb that changes state are refused with a message that says the
 shell is read-only. A refusal may suggest `shell_write`; this seat does not
 hold it, so name what you could not reach in the report instead of retrying.

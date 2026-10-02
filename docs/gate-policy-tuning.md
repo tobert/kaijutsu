@@ -123,7 +123,7 @@ positional token)**.
 - `kj` keys resolve through the same six structural conditions
   `is_read_only_kj` enforces today (`kj/readonly.rs`, `is_read_only_kj`): name exactly
   `kj`, no redirect, no background, no heredoc, every argument
-  `PlannedValue::Plain`, and the argv classifies (`kj::classify`, which
+  `PlannedValue::Literal` or `Plain`, and the argv classifies (`kj::classify`, which
   parses the whole argv through the verb enums). A kj key that names no
   live leaf fails a test, not silently.
 - Non-kj keys are free-form command names (`rg`) or name-plus-first-token

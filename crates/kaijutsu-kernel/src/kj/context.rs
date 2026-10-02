@@ -6594,8 +6594,13 @@ mod tests {
     /// Context types choose their prompt sections through rc. The opted-in
     /// coder gets the shared base before its role section; musician, which has
     /// no link, gets none. A legacy kernel config file must affect neither.
-    #[tokio::test]
-    async fn context_prompt_uses_rc_owned_sections() {
+    // Creating a coder runs its create rc; use the production rc stack.
+    #[test]
+    fn context_prompt_uses_rc_owned_sections() {
+        on_rc_thread(context_prompt_uses_rc_owned_sections_body);
+    }
+
+    async fn context_prompt_uses_rc_owned_sections_body() {
         use crate::vfs::VfsOps;
 
         let d = std::sync::Arc::new(test_dispatcher_rc().await);

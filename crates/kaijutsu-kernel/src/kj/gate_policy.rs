@@ -812,7 +812,7 @@ impl std::fmt::Display for FamilyRefusal {
 /// The family keys a planned program teaches — one per command, most
 /// specific form — or the refusal: a family allow covers a key and never
 /// arguments, so a command with a redirect, a background flag, a heredoc
-/// or a non-plain argument, or a `kj` argv that does not classify, would
+/// or an argument that is neither literal nor plain, or a `kj` argv that does not classify, would
 /// authorize text the human never saw.
 pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result<Vec<String>, FamilyRefusal> {
     let mut keys: Vec<String> = Vec::new();
@@ -1007,6 +1007,7 @@ fn command_keys(cmd: &PlannedCommand) -> Option<CommandKeys> {
     let mut args = Vec::with_capacity(cmd.args.len());
     for arg in &cmd.args {
         match arg {
+            PlannedValue::Literal { value, .. } => args.push(value.clone()),
             PlannedValue::Plain(s) => args.push(s.clone()),
             _ => return None,
         }
@@ -1079,7 +1080,7 @@ fn command_clause(cmd: &PlannedCommand) -> String {
     let mut words = vec![cmd.name.clone()];
     for arg in &cmd.args {
         match arg {
-            PlannedValue::Plain(s) => words.push(s.clone()),
+            PlannedValue::Plain(s) | PlannedValue::Literal { text: s, .. } => words.push(s.clone()),
             _ => words.push("<redacted>".to_string()),
         }
     }

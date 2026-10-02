@@ -224,14 +224,14 @@ tracing-opentelemetry = "0.32"
 tempfile = "3"
 
 
-# Pre-release kaish stack: the #445 whole-program async API plus tobert/kaish#487-
-# #490 (stdin scoping, command-substitution function scope, scatter stderr, and
-# redirect merge order), merged onto `integration/kaijutsu-preview` as 83c6cc8c.
-# Retire this patch when the next kaish release lands.
+# Pre-release kaish stack: kaish main at e69f21fd plus the
+# `one-filesystem-walks` branch (walks stay in their mount region, a note
+# names the mounts a walk skipped, `find -xdev`, and `command -v`/`type`),
+# head c7cdc8ee. Retire this patch when the next kaish release lands.
 [patch.crates-io]
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
-kaish-types = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
-kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
-kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
-kaish-glob = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "83c6cc8c0e379e4f482f1d08d6658954023005db" }
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }

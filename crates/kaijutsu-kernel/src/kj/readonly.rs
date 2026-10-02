@@ -81,13 +81,13 @@ use super::effect::{classify, Effect};
 ///    gate's control by the time anyone could act on its answer.
 /// 4. `cmd.heredocs` is empty. A heredoc body is data the command consumes,
 ///    outside the argv this function inspects at all.
-/// 5. Every argument is [`PlannedValue::Plain`]. kaish carries no redaction
-///    of its own, so today this holds for everything it plans — the check
-///    is a fail-closed guard on `PlannedValue`'s `#[non_exhaustive]` seam,
-///    which kaish names as where an embedder-side redaction pass would add
-///    its variant. A value this module cannot read as plain text is never
-///    something to wave through unscored.
-/// 6. The plain arguments, as an argv with the leading `kj` dropped, parse
+/// 5. Every argument is [`PlannedValue::Literal`] (read as its `value`) or
+///    [`PlannedValue::Plain`] (an expanding word, read as its rendered
+///    text). Any other variant refuses: `PlannedValue` is
+///    `#[non_exhaustive]`, and kaish names that seam as where an
+///    embedder-side redaction pass would add its variant. A value this
+///    module cannot read is never something to wave through unscored.
+/// 6. The arguments, as an argv with the leading `kj` dropped, parse
 ///    through [`classify`] to [`Effect::Read`]. A parse failure — an
 ///    unknown verb, an unresolvable subcommand, a flag sitting where the
 ///    subcommand belongs, a `${VAR}` in a typed slot — refuses closed: this
@@ -150,6 +150,10 @@ pub(crate) fn resolved_kj_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
     let mut args = Vec::with_capacity(cmd.args.len());
     for arg in &cmd.args {
         match arg {
+            // The word kj receives.
+            PlannedValue::Literal { value, .. } => args.push(value.clone()),
+            // An expanding word, as rendered (`${VERB}`): it names no verb
+            // or flag, so a structural slot fails closed.
             PlannedValue::Plain(s) => args.push(s.clone()),
             // Any variant kaish adds to its redaction seam: never exempt.
             _ => return None,
@@ -295,10 +299,10 @@ mod tests {
     #[test]
     fn an_equals_flag_value_is_an_ordinary_argument_and_does_not_refuse_a_read() {
         let cmd = plan_one("kj block list --kind=text");
-        assert!(
-            cmd.args.iter().all(|a| matches!(a, PlannedValue::Plain(_))),
-            "kaish plans every value as Plain; a new variant means condition 5 \
-             has real work to do again and this test should be revisited"
+        assert_eq!(
+            cmd.args.last().and_then(PlannedValue::literal_value),
+            Some("--kind=text"),
+            "test setup: a literal flag value arrives as one joined word"
         );
         assert!(is_read_only_kj(&cmd));
     }

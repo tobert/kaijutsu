@@ -435,7 +435,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -676,13 +676,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -1810,7 +1810,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2951,7 +2951,7 @@ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -2962,7 +2962,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -3721,7 +3721,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4081,7 +4081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6954,7 +6954,7 @@ dependencies = [
 [[package]]
 name = "kaish-glob"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "async-trait",
  "ignore",
@@ -6965,7 +6965,7 @@ dependencies = [
 [[package]]
 name = "kaish-help"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "kaish-types",
 ]
@@ -6973,7 +6973,7 @@ dependencies = [
 [[package]]
 name = "kaish-kernel"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -7024,7 +7024,7 @@ dependencies = [
 [[package]]
 name = "kaish-tool-api"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "async-trait",
  "clap",
@@ -7089,7 +7089,7 @@ dependencies = [
 [[package]]
 name = "kaish-types"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -7102,7 +7102,7 @@ dependencies = [
 [[package]]
 name = "kaish-vfs"
 version = "0.17.2"
-source = "git+https://github.com/tobert/kaish?rev=83c6cc8c0e379e4f482f1d08d6658954023005db#83c6cc8c0e379e4f482f1d08d6658954023005db"
+source = "git+https://github.com/tobert/kaish?rev=c7cdc8ee9464eb61559f92009f404e2bf4fec6ce#c7cdc8ee9464eb61559f92009f404e2bf4fec6ce"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -7895,7 +7895,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9428,7 +9428,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10443,7 +10443,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10456,7 +10456,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10515,7 +10515,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11321,6 +11321,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
+ "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -11890,7 +11891,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13650,7 +13651,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
