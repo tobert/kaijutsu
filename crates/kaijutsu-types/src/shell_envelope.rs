@@ -91,6 +91,9 @@ pub struct ShellEnvelope {
     /// Why the command's outcome never arrived, or why it was refused.
     /// `null` when the command produced a real outcome.
     pub error: Option<String>,
+    /// The shell's working directory after this call, when the call changed
+    /// it. `null` when it did not, or when the serving path cannot tell.
+    pub cwd: Option<String>,
 }
 
 impl ShellEnvelope {
@@ -112,6 +115,7 @@ impl ShellEnvelope {
             ephemeral: None,
             elapsed_ms: None,
             error: None,
+            cwd: None,
         }
     }
 
@@ -138,9 +142,11 @@ impl ShellEnvelope {
     /// Recover an envelope from a tool result's text body, or `None` when the
     /// body is not one.
     ///
-    /// Deserialization is the test, not a guess about the tool's name: every
-    /// field is required (no `serde(default)` anywhere in this struct), so a
-    /// body that is not a shell envelope cannot be mistaken for one. This is
+    /// Deserialization is the test, not a guess about the tool's name:
+    /// `stdout`, `stderr`, and `status` are required, so a body that is not a
+    /// shell envelope cannot be mistaken for one. An absent optional key
+    /// reads as `null`, so an envelope stored before a key existed still
+    /// reads. This is
     /// what lets a consumer holding only the flattened text — the agentic
     /// loop's tool dispatch — tell an envelope from ordinary tool output.
     pub fn from_tool_result(body: &str) -> Option<Self> {
@@ -228,6 +234,9 @@ impl ShellEnvelope {
         if let Some(latch) = &self.latch {
             facts.push(format!("[latch] {latch}"));
         }
+        if let Some(cwd) = &self.cwd {
+            facts.push(format!("[cwd now {cwd}]"));
+        }
         let mut text = if clean.is_empty() && facts.is_empty() { "(no output)".to_string() } else { clean.to_string() };
         for fact in facts {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -256,6 +265,7 @@ impl ShellEnvelope {
         "ephemeral",
         "elapsed_ms",
         "error",
+        "cwd",
     ];
 
     /// The declared result shape (an MCP `Tool.outputSchema`).
@@ -296,11 +306,15 @@ impl ShellEnvelope {
                 "error": {
                     "type": ["string", "null"],
                     "description": "why the outcome never arrived, or why the program was refused"
+                },
+                "cwd": {
+                    "type": ["string", "null"],
+                    "description": "the shell's working directory after this call, when the call changed it; null when it did not, or when this path cannot tell"
                 }
             },
             "required": [
                 "stdout", "stderr", "exit_code", "status", "did_spill", "data", "latch",
-                "block_id", "operation_id", "ask_id", "content_type", "ephemeral", "elapsed_ms", "error"
+                "block_id", "operation_id", "ask_id", "content_type", "ephemeral", "elapsed_ms", "error", "cwd"
             ]
         })
     }
@@ -353,6 +367,30 @@ mod tests {
             "listed\n[data] [\"a\",\"b\"]\n[latch] {\"command\":\"kj context archive x --confirm\"}");
         assert_eq!(ShellEnvelope::new(ShellStatus::Rejected).model_text("parse error at 1:4"),
             "parse error at 1:4\n[rejected: the program did not run]");
+    }
+
+    /// A call that changed the shell's directory says where it now is, on
+    /// its own line after the output; a call that did not says nothing.
+    #[test]
+    fn a_changed_cwd_reads_as_one_line() {
+        let mut env = ShellEnvelope::new(ShellStatus::Done);
+        env.exit_code = Some(0);
+        env.cwd = Some("/work/sub".into());
+        assert_eq!(env.model_text(""), "[cwd now /work/sub]", "a silent `cd` still says where it went");
+        assert_eq!(env.model_text("built\n"), "built\n[cwd now /work/sub]");
+        env.status = ShellStatus::Error;
+        env.exit_code = Some(1);
+        assert_eq!(env.model_text("no such file\n"), "no such file\n[exit 1]\n[cwd now /work/sub]");
+    }
+
+    /// An envelope stored without `cwd` still reads, as unchanged: the
+    /// shell operation table keeps completed envelopes.
+    #[test]
+    fn a_stored_envelope_without_cwd_reads_as_unchanged() {
+        let mut stored = ShellEnvelope::new(ShellStatus::Done).to_value();
+        stored.as_object_mut().unwrap().remove("cwd");
+        let read: ShellEnvelope = serde_json::from_value(stored).expect("a stored envelope without cwd");
+        assert_eq!(read.cwd, None);
     }
 
     #[test]

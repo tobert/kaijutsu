@@ -1,12 +1,13 @@
 # The shell envelope
 
-`kj shell 'echo hi'` and an MCP `shell` call return the same fourteen keys.
+`kj shell 'echo hi'` and an MCP `shell` call return the same fifteen keys.
 One tool name, one shape, one error rule.
 
 ```json
 {"stdout":"hi\n","stderr":"","exit_code":0,"status":"done","did_spill":false,
  "data":null,"latch":null,"block_id":null,"operation_id":null,"ask_id":null,
- "content_type":"text/plain","ephemeral":false,"elapsed_ms":3,"error":null}
+ "content_type":"text/plain","ephemeral":false,"elapsed_ms":3,"error":null,
+ "cwd":null}
 ```
 
 The type is `kaijutsu_types::shell_envelope::ShellEnvelope`. It is the single
@@ -31,7 +32,10 @@ shape without first knowing which path served it.
 `null`; it never omits the key. `null` means "this path cannot know", which is
 never the same as `0`, `false`, or `""`. `did_spill` and `latch` ride kaish's
 `ExecResult`, so the MCP path leaves them `null` — the block snapshot it polls
-does not carry them.
+does not carry them. `cwd` names the shell's working directory after a call
+that changed it and persisted the change, and is `null` otherwise. The kernel
+sets it at settlement; the read-only shell, which discards a `cd`, and the MCP
+path leave it `null`.
 
 **A nonzero exit is an error.** Both builders set the tool-result error flag
 from `status`, so the flag and the field can never disagree. (Amy, 2026-09-04.)
@@ -124,8 +128,10 @@ byte offsets, which is what every edit and exclusion range depends on. The
 block keeps the envelope with its output blank as `shell_envelope`, the
 record behind what the model read.
 
-Recognition is by deserialization, not by tool name: every field is required,
-so a body that is not an envelope cannot be mistaken for one.
+Recognition is by deserialization, not by tool name: `stdout`, `stderr`, and
+`status` are required, so a body that is not an envelope cannot be mistaken
+for one. An absent nullable key reads as `null`, so an envelope stored before
+the key existed still reads.
 
 The ANSI order matters and is easy to get backwards. An envelope's JSON spells
 an escape as the six characters `\u001b`, not a raw `0x1b`, so projecting the
@@ -148,6 +154,7 @@ the model does next:
 | gave up waiting, stream closed | `[timed out waiting; ...]`, `[the outcome never arrived ...]` |
 | output past 8 KiB | the preview's own last line, `[output truncated: N bytes; the full output is at /v/cas/PREFIX/HASH]` (`stderr` likewise) |
 | a `kj` payload or latch | `[data] JSON`, `[latch] JSON` |
+| the call changed the shell's cwd | `[cwd now DIR]` |
 
 `block_id`, `content_type`, `ephemeral`, and `elapsed_ms` are never sent. The
 rendering is always text, including for a command that printed nothing: the

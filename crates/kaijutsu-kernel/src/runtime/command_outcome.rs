@@ -40,11 +40,15 @@ pub struct CommandOutcome {
     pub hook: Option<CommandHookEffect>,
     pub settlement_error: Option<String>,
     pub elapsed_ms: u64,
+    /// The context's cwd after the command, when the command changed it and
+    /// the change was persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl CommandOutcome {
     pub fn new(execution: CommandExecution, elapsed_ms: u64) -> Self {
-        Self { execution, hook: None, settlement_error: None, elapsed_ms }
+        Self { execution, hook: None, settlement_error: None, elapsed_ms, cwd: None }
     }
 
     pub fn from_execution(result: Result<ExecResult, kaish_kernel::KernelError>, elapsed_ms: u64) -> Self {
@@ -112,6 +116,7 @@ impl CommandOutcome {
             },
         };
         envelope.elapsed_ms = Some(self.elapsed_ms);
+        envelope.cwd = self.cwd.clone();
         if let Some(error) = &self.settlement_error {
             envelope.status = ShellStatus::Error;
             envelope.error = Some(match envelope.error {

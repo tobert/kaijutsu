@@ -13,6 +13,13 @@ pub struct ShellStateSnapshot {
     env: std::collections::BTreeMap<String, String>,
 }
 
+impl ShellStateSnapshot {
+    /// This snapshot's cwd, when it differs from `before`'s.
+    pub fn changed_cwd(&self, before: &ShellStateSnapshot) -> Option<String> {
+        (self.cwd != before.cwd).then(|| self.cwd.to_string_lossy().into_owned())
+    }
+}
+
 pub async fn snapshot_shell_state(kaish: &EmbeddedKaish) -> ShellStateSnapshot {
     ShellStateSnapshot {
         cwd: kaish.cwd().await,

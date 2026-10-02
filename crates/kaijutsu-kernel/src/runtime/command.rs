@@ -515,9 +515,12 @@ async fn capture_command(
         }
         None if matches!(state_writeback, ShellStateWriteBack::Persist) => {
             let state_after = snapshot_shell_state(kaish).await;
-            if let Err(error) = persist_shell_state(kernel.kernel_db(), context_id, &state_before, &state_after) {
-                tracing::error!("shell state write failed: {error}");
-                outcome.settlement_error = Some(error);
+            match persist_shell_state(kernel.kernel_db(), context_id, &state_before, &state_after) {
+                Ok(()) => outcome.cwd = state_after.changed_cwd(&state_before),
+                Err(error) => {
+                    tracing::error!("shell state write failed: {error}");
+                    outcome.settlement_error = Some(error);
+                }
             }
         }
         None => {}

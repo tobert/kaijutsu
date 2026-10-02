@@ -229,8 +229,8 @@ impl ShellCompletion {
     /// The shape is `kaijutsu_types::shell_envelope::ShellEnvelope`, shared
     /// with the in-kernel `shell` tool so the same tool name returns the same
     /// keys whichever path served the call. Fields this path cannot know stay
-    /// `null` — `did_spill` and `latch` ride kaish's `ExecResult`, which does
-    /// not survive the trip out to a block snapshot.
+    /// `null` — `did_spill` and `latch` ride kaish's `ExecResult`, and `cwd`
+    /// the kernel's settlement, neither of which reaches a block snapshot.
     ///
     /// `cfg(test)`: production reaches the envelope through `to_tool_result`,
     /// which needs the typed value to decide the error flag. The tests read
@@ -1811,7 +1811,7 @@ impl KaijutsuMcp {
     }
 
     #[tool(
-        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set run_in_background=true to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. A call that waits for completion preserves durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error. Unknown values are null. Requires --connect and register_session.",
+        description = "Submit a kaish command in your current kernel context. Waits for completion by default; set run_in_background=true to get an operation receipt for long-running work. Use 'kj wait --operation <operation_id>' to wait later, or 'kj wait --ask <ask_id>' for an approval decision. A waiting receipt is accepted work awaiting review. Wait timeouts do not cancel work. All execution uses kaish, including pipes, variables, scripting, and kj commands. A call that waits for completion preserves durable cwd/env. Results use the same JSON envelope as the kernel shell: stdout, stderr, exit_code, status, did_spill, data, latch, block_id, operation_id, ask_id, content_type, ephemeral, elapsed_ms, error, cwd. Unknown values are null. Requires --connect and register_session.",
         annotations(open_world_hint = true),
         output_schema = shell_output_schema()
     )]
@@ -3553,9 +3553,10 @@ mod tests {
         }
     }
 
-    /// This path polls a block snapshot, which does not carry kaish's
-    /// `ExecResult`. Those two fields must read `null` — "this path cannot
-    /// know" — never a fabricated `false`/empty that would read as fact.
+    /// This path polls a block snapshot, which carries neither kaish's
+    /// `ExecResult` nor the shell's cwd. Those fields must read `null` — "this
+    /// path cannot know" — never a fabricated `false`/empty that would read
+    /// as fact.
     #[test]
     fn fields_this_path_cannot_know_are_null_not_invented() {
         let value = ShellCompletion::Done {
@@ -3566,6 +3567,7 @@ mod tests {
         assert_eq!(value["did_spill"], serde_json::Value::Null);
         assert_eq!(value["latch"], serde_json::Value::Null);
         assert_eq!(value["operation_id"], serde_json::Value::Null);
+        assert_eq!(value["cwd"], serde_json::Value::Null);
     }
 
     /// The declared schema and the envelope must not drift. Every `required`

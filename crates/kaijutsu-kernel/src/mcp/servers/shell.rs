@@ -101,10 +101,11 @@ const RESULT_CONTRACT: &str = "The result is the command's output, then one \
      `[rejected: the program did not run]` (kaish refused the text: fix it and \
      retry); `[running in the background: operation ID]`; `[output truncated: \
      N bytes; the full output is at /v/cas/…]` (read that path with `grep`, \
-     `sed -n`, or `read`). A clean success is its output alone. An MCP caller \
+     `sed -n`, or `read`); `[cwd now DIR]` (the call changed your working \
+     directory). A clean success is its output alone. An MCP caller \
      receives one JSON object with the keys {stdout, stderr, exit_code, status, \
      did_spill, data, latch, block_id, operation_id, ask_id, content_type, \
-     ephemeral, elapsed_ms, error}; `exit_code` null is never evidence of success.";
+     ephemeral, elapsed_ms, error, cwd}; `exit_code` null is never evidence of success.";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -1051,6 +1052,41 @@ mod tests {
             labels.contains(&"alpha") && labels.contains(&"beta"),
             "structured data must carry context handles: {labels:?}"
         );
+    }
+
+    /// `cwd` names the shell's directory after a `shell_write` call that
+    /// changed it, and is null after one that did not. The read-only shell
+    /// discards a `cd`, so it never reports one.
+    #[tokio::test]
+    async fn a_call_that_changes_the_cwd_names_it() {
+        use crate::vfs::VfsOps;
+        let (broker, d) = wired().await;
+        broker.register(Arc::new(ShellServer::new_read_only(Arc::downgrade(&broker))), InstancePolicy::default())
+            .await.unwrap();
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"),
+            b"[global]\nallow = [\"cd\", \"echo\", \"false\"]\n").await.unwrap();
+        d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
+        d.kernel().vfs().mkdir(std::path::Path::new("/work/sub"), 0o755).await.unwrap();
+        let principal = PrincipalId::new();
+        let context = crate::kj::test_helpers::register_rooted_context(&d, Some("cwd-change"), principal);
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        binding.grant(Capability::Facade("shell".into()));
+        broker.set_binding(context, binding).await.unwrap();
+        let cc = CallContext::new(principal, context, SessionId::new(), d.kernel_id());
+        for (params, cwd) in [
+            (call_write("cd /work/sub"), serde_json::json!("/work/sub")),
+            (call_write("echo hi"), serde_json::Value::Null),
+            (call_write("cd /work/sub"), serde_json::Value::Null),
+            (call_write("cd /work; false"), serde_json::json!("/work")),
+            (call("cd /work/sub"), serde_json::Value::Null),
+        ] {
+            let command = params.arguments["command"].clone();
+            let result = broker.call_tool(params, &cc, CancellationToken::new()).await.unwrap();
+            assert_eq!(body_of(&result)["cwd"], cwd, "{command}: {}", body_of(&result));
+        }
+        d.kernel().shutdown_runtime_worker().await.unwrap();
     }
 
     /// An `echo` (no structured data) leaves `data` null — the field is present
