@@ -117,6 +117,14 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     mount: Vec<PathBuf>,
 
+    /// Path to leave out of its parent's directory listing, so a walk from
+    /// above (`find /`, `grep -r PATTERN /`, `ls /`) never reaches it, while
+    /// naming it still does. Repeatable. A harness passes its own log
+    /// directory here. The start is refused unless the path is absolute and
+    /// not `/`; it need not exist.
+    #[arg(long, value_name = "PATH")]
+    unlist: Vec<PathBuf>,
+
     /// Do not mount the directory this agent was launched in. Without this,
     /// that directory is mounted read-write: it is the workspace a client
     /// that launched us there is asking about.
@@ -291,6 +299,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut config = kernel::solo_server_config(&solo);
     config.rw_mounts = cli.mount.clone();
+    config.unlisted = cli.unlist.clone();
     if !cli.no_cwd_mount {
         match std::env::current_dir() {
             Ok(cwd) => match skip_cwd_reason(&cwd) {

@@ -13,6 +13,7 @@ async fn start(dir: &std::path::Path) -> Result<kaijutsu_server::SharedKernel, c
         &kaijutsu_server::config_mounts::ConfigMounts::new(dir.join("config")),
         Some(dir),
         &[],
+        &[],
     )
     .await
 }

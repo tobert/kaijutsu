@@ -245,6 +245,15 @@ per-inference token counts and `classify_run.py --kernel-log` scopes them to
 this run's session. Set `rust_log` below `info` and a run keeps no token record
 at all.
 
+The model's walks do not reach `acp.txt`: the adapter passes `--unlist
+/logs` and `--unlist /installed-agent`, so neither appears in its parent's
+listing and `find /`, `grep -r PATTERN /`, and `ls /` skip them. The log
+holds the model's own thinking, and the install directory holds the kernel's
+database. Unlisting hides; it does not deny. A model that names
+`/logs/agent/acp.txt` still reads it, and a host program run from
+`shell_write` (`/usr/bin/find /`) lists the host directly
+(`docs/mounts.md`, "Unlisted paths").
+
 Harbor's own token and cost columns stay empty: kaijutsu sends no
 `PromptResponse.usage`, so `agent_result.n_input_tokens` and `cost_usd` are
 `null`. The kernel log is the only token source today.

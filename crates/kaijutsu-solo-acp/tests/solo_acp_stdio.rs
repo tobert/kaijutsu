@@ -363,6 +363,21 @@ fn an_unusable_mount_refuses_the_boot() {
     }
 }
 
+/// `--unlist` reaches the kernel's boot check: a relative path refuses the
+/// start and is named.
+#[test]
+fn an_unusable_unlist_refuses_the_boot() {
+    let output = Command::new(BIN)
+        .args(["--backend-kind", "mock", "--model", "solo-mock", "--unlist", "logs"])
+        .env("TMPDIR", scratch_dir("tmp"))
+        .output()
+        .unwrap_or_else(|e| panic!("run --unlist logs: {e}"));
+    assert!(!output.status.success(), "a relative --unlist must refuse the boot");
+    assert!(output.stdout.is_empty(), "stdout stays empty on a refusal");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unlisted path 'logs' is not absolute"), "{stderr}");
+}
+
 #[test]
 fn no_provider_key_refuses_before_anything_starts() {
     let mut command = Command::new(BIN);

@@ -76,6 +76,12 @@ own process: a builtin `grep -r PATTERN /` was killed for memory with nothing
 logged. A walk that names `/proc` can still do that; see `docs/issues.md`,
 "A builtin `grep -r PATTERN /` killed the agent process".
 
+An operator can unlist more paths at boot: `SshServerConfig::unlisted`,
+which `kaijutsu-solo-acp --unlist <path>` fills. The Harbor adapter uses it
+to keep its own log directory out of the model's walks
+(`contrib/bench/harbor/README.md`, "Reading a run"). Each must be absolute
+and not `/`, or the boot is refused.
+
 The listing is the mount table's, so the FSN view and SFTP listings of `/`
 leave the same paths out. In a kaish shell, `/dev` is kaish's own device
 mount (`null`, `zero`, `random`, `urandom`; a whole read of an endless device

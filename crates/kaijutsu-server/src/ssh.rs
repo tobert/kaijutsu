@@ -124,6 +124,11 @@ pub struct SshServerConfig {
     /// [`validate_rw_mounts`] at boot. Empty by default — a kernel decides
     /// its own perimeter, and widening it is something an operator asks for.
     pub rw_mounts: Vec<PathBuf>,
+    /// Paths left out of their parents' listings, beside the host's `/proc`
+    /// and `/sys`, so a walk from above never reaches them; naming one still
+    /// does (`docs/mounts.md`, "Unlisted paths"). Checked by
+    /// [`validate_unlisted`] at boot. Empty by default.
+    pub unlisted: Vec<PathBuf>,
     /// Maximum number of concurrent SSH connections. Default: 100.
     pub max_connections: usize,
     /// RAII guard for an `ephemeral()` test dir: removes the dir when the config
@@ -155,6 +160,24 @@ const RESERVED_MOUNT_ROOTS: &[&str] = &[
 /// is not under `/config`.
 fn is_or_under(path: &str, root: &str) -> bool {
     path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// Check the paths to unlist and return them with trailing slashes
+/// trimmed. Each must be absolute and may not be `/`; a refusal names the
+/// path and fails the boot. The path need not exist: unlisting hides a name
+/// from its parent's listing whenever it appears.
+pub fn validate_unlisted(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    paths.iter().map(|path| {
+        let given = path.to_string_lossy();
+        if !given.starts_with('/') {
+            return Err(format!("unlisted path '{given}' is not absolute"));
+        }
+        let trimmed = given.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(format!("unlisted path '{given}' would hide the whole namespace"));
+        }
+        Ok(PathBuf::from(trimmed))
+    }).collect()
 }
 
 /// Check the extra read-write host directories and return them ready to
@@ -350,6 +373,7 @@ impl SshServerConfig {
             config_mounts,
             data_dir: Some(path.clone()),
             rw_mounts: Vec::new(),
+            unlisted: Vec::new(),
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
             root_key: Some(std::sync::Arc::new(root_key)),
@@ -389,6 +413,7 @@ impl SshServerConfig {
             ),
             data_dir: None,   // Use XDG default
             rw_mounts: Vec::new(),
+            unlisted: Vec::new(),
             max_connections: 100,
             _cleanup: None,
             root_key: None,
@@ -573,6 +598,7 @@ impl SshServer {
             &self.config.config_mounts,
             self.config.data_dir.as_deref(),
             &self.config.rw_mounts,
+            &self.config.unlisted,
         )
         .await
         .map_err(|e| std::io::Error::other(format!("Failed to create shared kernel: {}", e)))?;
@@ -1320,7 +1346,7 @@ mod tests {
                 }).unwrap();
                 drop(db);
                 let shared = crate::rpc::create_shared_kernel(None,
-                    &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir), &[]).await.unwrap();
+                    &crate::config_mounts::ConfigMounts::new(dir.join("config")), Some(&dir), &[], &[]).await.unwrap();
                 let context = shared.kernel_db.lock().get_character(principal).unwrap().unwrap().root_ctx.unwrap();
                 let mut binding = ContextToolBinding::new();
                 binding.grant(Capability::Facade("shell".into()));

@@ -36,6 +36,7 @@ impl FileKernel {
             &config.config_mounts,
             config.data_dir.as_deref(),
             &[],
+            &[],
         ).await.expect("build production kernel for filesystem isotest");
         let root = shared.kernel_db.lock().get_character_by_name("tester")
             .expect("read root character").expect("root character");

@@ -145,6 +145,7 @@ pub async fn run_kj(args: KjRunArgs) -> ExitCode {
         &args.config_mounts,
         args.data_dir.as_deref(),
         &args.rw_mounts,
+        &[],
     )
     .await
     {

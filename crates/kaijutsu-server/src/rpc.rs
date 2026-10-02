@@ -1572,6 +1572,9 @@ pub async fn create_shared_kernel(
     // the kernel namespace (`docs/mounts.md`). Empty for a kernel that keeps
     // the fixed perimeter below.
     rw_mounts: &[std::path::PathBuf],
+    // Extra paths to leave out of their parents' listings, beside `/proc`
+    // and `/sys` (`docs/mounts.md`, "Unlisted paths").
+    unlisted: &[std::path::PathBuf],
 ) -> Result<SharedKernel, capnp::Error> {
     // Create shared FlowBus instances - shared between Kernel and BlockStore
     // Per-subscription lossless queue depth (KAIJUTSU_FLOW_QUEUE_DEPTH). The
@@ -1688,6 +1691,9 @@ pub async fn create_shared_kernel(
     // their files never end in practice: a whole read of
     // `/proc/<pid>/pagemap` grows until the kernel is killed for memory.
     for path in ["/proc", "/sys"] {
+        kernel.vfs().unlist(path).await;
+    }
+    for path in crate::ssh::validate_unlisted(unlisted).map_err(capnp::Error::failed)? {
         kernel.vfs().unlist(path).await;
     }
 
@@ -11039,6 +11045,7 @@ mod semantic_search_tests {
             let shared = create_shared_kernel(None,
                 &crate::config_mounts::ConfigMounts::new(dir.path().join("config")),
                 Some(dir.path()),
+                &[],
                 &[],
             ).await.unwrap();
             let connection = Rc::new(RefCell::new(ConnectionState::new(

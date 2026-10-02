@@ -36,6 +36,7 @@ from pydantic import Field
 
 from harbor.agents.installed.acp import AcpAgent, AcpOptions
 from harbor.environments.base import BaseEnvironment
+from harbor.models.trial.paths import EnvironmentPaths
 
 #: Environment variables read when the matching option is not given.
 BINARY_ENV = "KAIJUTSU_ACP_BINARY"
@@ -513,6 +514,14 @@ class KaijutsuSoloAcp(AcpAgent):
             self._solo_model,
             "--state-dir",
             self._remote_state.as_posix(),
+            # Out of the model's walks: Harbor's log directory, whose acp.txt
+            # is this process's own stderr with the model's thinking in it,
+            # and the install directory, which holds the kernel's database.
+            # Naming either still reaches it.
+            "--unlist",
+            EnvironmentPaths.logs_dir.as_posix(),
+            "--unlist",
+            self.REMOTE_DIR.parent.as_posix(),
         ]
         if self._base_url is not None:
             args += ["--base-url", self._base_url]

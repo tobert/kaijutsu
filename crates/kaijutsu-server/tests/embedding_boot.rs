@@ -23,7 +23,7 @@ async fn boot_uses_discovered_dimensions_and_no_builtin_model_files() {
         timeout_ms: 2000, max_in_flight: 2, max_context_bytes: 2048 }).unwrap();
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
     let index = wait_for_index(&shared).await.expect("service discovery must initialize the index");
     assert_eq!(index.embedder().model_name(), "boot-test");
     assert_eq!(index.embedder().dimensions(), 1024);
@@ -41,7 +41,7 @@ async fn unavailable_service_leaves_index_unavailable() {
         timeout_ms: 100, max_in_flight: 1, max_context_bytes: 2048 }).unwrap();
     insert_root_character(&db);
     drop(db);
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
     assert!(wait_for_index(&shared).await.is_none(), "must not substitute another embedding model");
 }
 
@@ -63,7 +63,7 @@ async fn a_silent_service_does_not_hold_boot() {
     insert_root_character(&db);
     drop(db);
     let started = std::time::Instant::now();
-    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[]).await.unwrap();
+    let shared = create_shared_kernel(None, &ConfigMounts::new(dir.path().join("config")), Some(dir.path()), &[], &[]).await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(10),
         "boot waited {:?} on a silent embedding service", started.elapsed());
     assert!(shared.kj_dispatcher.semantic_index().is_none(), "no index before the service answers");
