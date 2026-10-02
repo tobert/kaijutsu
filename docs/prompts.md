@@ -188,8 +188,9 @@ program, so it works under any loadout. Sections:
 - The README's first twelve non-blank lines, without badges, HTML, or rules,
   each cut at 160 characters.
 
-An empty section is omitted. A context with no cwd gets no block, because its
-shell starts in the kernel's own directory. The whole block is cut at 6000
+An empty section is omitted. A context with no cwd gets a one-line
+notification instead: its shell starts in the kernel's home directory, and
+`cd DIR` in `shell_write` gives it one. The whole block is cut at 6000
 characters and says so. Measured on this repository it is about 2000
 characters; a two-file directory is about 350.
 

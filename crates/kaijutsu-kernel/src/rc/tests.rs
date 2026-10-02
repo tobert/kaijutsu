@@ -2967,12 +2967,14 @@ esac
 
     /// First words of the orientation notification.
     const ORIENT_MARKER: &str = "Orientation of the working directory";
+    /// First words of the notification a coder without a cwd gets instead.
+    const NO_CWD_MARKER: &str = "This context has no working directory";
     /// The script's hard cap on its block, in characters.
     const ORIENT_CAP_CHARS: usize = 6000;
 
     /// Create a coder context whose cwd is `cwd` (or none) over the real seed
     /// tree with the host filesystem mounted read-only, and return its
-    /// orientation notifications, the script's own rc blocks, and the cached
+    /// orientation or no-cwd notifications, the script's own rc blocks, and the cached
     /// system prompt sections.
     async fn coder_orientation(cwd: Option<&std::path::Path>) -> (Vec<kaijutsu_types::BlockSnapshot>, Vec<String>, Vec<String>) {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
@@ -2992,7 +2994,8 @@ esac
         let blocks = d.block_store().block_snapshots(ctx).unwrap();
         let notes: Vec<_> = blocks
             .iter()
-            .filter(|b| b.kind == BlockKind::Notification && b.content.starts_with(ORIENT_MARKER))
+            .filter(|b| b.kind == BlockKind::Notification
+                && (b.content.starts_with(ORIENT_MARKER) || b.content.starts_with(NO_CWD_MARKER)))
             .cloned()
             .collect();
         let sections = crate::extract_system_prompt_sections(&blocks);
@@ -3121,15 +3124,20 @@ esac
         assert!(text.chars().count() < 600, "a two-file directory needs a short block:\n{text}");
     }
 
-    /// Without a context cwd the shell starts in the kernel's own default
-    /// directory, which says nothing about the work: no orientation.
+    /// Without a context cwd the shell starts in the kernel's own home
+    /// directory, which says nothing about the work. The model is told so,
+    /// with the way to set one, instead of an orientation.
     #[test]
-    fn coder_create_without_cwd_skips_orientation() {
+    fn coder_create_without_cwd_says_so() {
         crate::spawn_kaish_thread("rc-test-thread", || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
                 .block_on(async {
-                    let (notes, _, _) = coder_orientation(None).await;
-                    assert!(notes.is_empty(), "no cwd, no orientation: {notes:#?}");
+                    let (notes, own, _) = coder_orientation(None).await;
+                    assert_eq!(notes.len(), 1, "expected one notification, got: {own:#?}");
+                    let text = &notes[0].content;
+                    assert!(text.starts_with(NO_CWD_MARKER), "{text}");
+                    assert!(text.contains("`cd DIR`") && text.contains("kj context set . --cwd DIR"), "{text}");
+                    assert_eq!(notes[0].role, kaijutsu_types::Role::System, "{text}");
                 });
         })
         .unwrap()
