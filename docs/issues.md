@@ -820,13 +820,12 @@ one purpose:
    found", then ran `find / -maxdepth 5 -name 'node'`. `which` is fixed:
    the read-only `shell` now gets the writable shell's `PATH`
    (`ExternalExec::LookupOnly`), and running the program it finds is
-   refused with the hint that names `shell_write`. Still open: kaish has
-   no `command` or `type` builtin, so `command -v gcc` is refused on
-   `shell`, and on `shell_write` it needs a host `command` program, which
-   most Linux hosts lack. A script that hides stderr, as
-   `command -v gcc >/dev/null 2>&1 || echo MISSING` does, still reports
-   the program missing. The fix belongs in kaish: `command -v` and `type`
-   builtins that resolve the way `which` does.
+   refused with the hint that names `shell_write`. `command -v`,
+   `command -V`, and `type [-t]` are built in kaish on branch
+   `one-filesystem-walks` (c7cdc8ee) and reach kaijutsu with that re-pin
+   (kaijutsu branch `one-filesystem-walks`). Until then `command -v gcc` is
+   refused on `shell`, and `command -v gcc >/dev/null 2>&1 || echo
+   MISSING` reports a present program missing.
 3. **Looking for an input file the task had already placed in the cwd** (3
    trials). chess-best-move ran `find / -name "chess_board.png"`,
    headless-terminal ran `find / -name "*terminal*"`, and dna-assembly ran
@@ -876,6 +875,30 @@ Seen in the same trajectories, outside this entry: kaish `ls -la` printed
 one tab-separated `name  type  size` row per file, with every size 0. Several models called it "garbled" and
 fell back to `ls --json`. That costs calls and trust, not a walk; it is a
 kaish note.
+
+## From the one-filesystem walks re-pin (2026-10-02)
+
+Found while re-pinning kaish onto `one-filesystem-walks` (kaijutsu branch
+of the same name; kaibo DeepSeek review). Not fixed:
+
+- **The shell-escape guard misses three shapes**: a path-qualified
+  interpreter (`/bin/sh -c '…'`), a variable in the command word
+  (`${SH} -c '…'`), and code attached to the flag (`perl -e'…'`). On a
+  normal kernel these reach a person's ask rather than an allow. The re-pin
+  already moves the guard from `.plain` to `literal.value`; without that,
+  `exec sh -c '…'` passed the guard under the new kaish.
+- **The read-only `kj` exemption treats `${VAR}` in a value slot as
+  harmless.** A token such as `--out=…` breaks that. It is latent today:
+  every verb with that flag needs a positional the token would displace.
+- **Mount paths are matched without normalizing.** `--unlist //logs` and
+  `--unlist /a/../b` are accepted and hide nothing. `--rw-mount
+  /tmp/../config/rc` passes the kernel-root check. Normalize (or refuse a
+  path that is not already normal) at parse time.
+- **Stale comment**: the approval ledger's `ValueKind` says it mirrors
+  kaish's `PlannedValue`; it no longer does.
+- **Stack**: `context_prompt_uses_rc_owned_sections` overflowed a 2 MiB test
+  thread under the new kaish and now runs on the rc stack. Production
+  threads have 16 MiB; the new kaish uses more stack on this path.
 
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 
