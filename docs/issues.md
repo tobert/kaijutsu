@@ -814,7 +814,9 @@ one purpose:
    `/r`, and `/v` beside the harness's `/installed-agent` and `/logs`. Models
    read `/logs/agent/acp.txt`, which is this kernel's own stderr with the
    model's own thinking in it. In fix-code-vulnerability, `grep -rl
-   report.jsonl /` found only that log. Proposed fix: the inversion in
+   report.jsonl /` found only that log. The Harbor adapter now unlists
+   `/logs` and `/installed-agent` (`kaijutsu-solo-acp --unlist`), so walks
+   and `ls /` skip them; naming them still works. Proposed fix: the inversion in
    `docs/mounts.md`, "The inversion". `/` holds the workspace, `/tmp`, the
    kernel's own trees, and the mounted toolchain, not the host. A walk
    from `/` is then short and finds only the model's space, and it cannot
@@ -849,34 +851,29 @@ one purpose:
    harmless.
 
 Paths in kaijutsu that lead toward `/` or away from the work tree. None
-appeared in these runs:
+appeared in these runs. Fixed on 2026-10-02: `kj context create` takes the
+current context's cwd; the tui and kaijutsu-mcp pass their own directory
+(created without it, and saying so, when the kernel refuses it); ACP maps the
+refusal to `invalid_cwd`; a removed cwd never moves to `/` (it stops at its
+mount root, or is cleared); one check that matches `cd` backs every way to
+set a cwd. Still open:
 
-4. **A context created without a cwd runs its shell in the kernel's
-   `$HOME`**, or in `/tmp` when `HOME` is unset (`kaish_kernel::home_dir`,
-   used at `runtime/context_shell.rs:90`). The file tools refuse a missing
-   cwd ("this context has no working directory set",
-   `mcp/servers/file.rs`, `refuse_missing_cwd`); the shell does not. These
-   paths create a context without a cwd: `kj context create` without
-   `--cwd` (it does not inherit the caller's cwd, though `kj fork` does),
-   the tui (`kaijutsu-tui/src/bridge.rs:169`), and kaijutsu-mcp
-   (`kaijutsu-mcp/src/lib.rs:1990`), which names the context after its
-   cwd but does not set it. The orientation then skips with "orient:
-   context has no cwd; skipped", which reaches the rc log, not the model.
-   Proposed fix: `kj context create` run from a context takes that
-   context's cwd unless `--cwd` names another. The shell refuses a missing
-   cwd as the file tools do, naming `kj context set . --cwd DIR`. Clients
-   that know a directory pass it.
-5. **A removed cwd moves to its nearest existing ancestor, which can be
-   `/`** (`runtime/context_shell.rs`, the ancestor loop before
-   `move_missing_cwd`). The test `contextual_shell_reports_unavailable_cwd`
-   asserts `/` for `/unmounted/…`. The move is durable, and only the one
-   refused command says so. Proposed fix: stop at the root of the mount
-   that held the old cwd. If that root is gone too, refuse and name `kj
-   context set . --cwd DIR`, rather than land at `/`.
+4. **A context with no cwd runs its shell in the kernel's `$HOME`**, or in
+   `/tmp` when `HOME` is unset (`runtime/context_shell.rs`). The file tools
+   refuse a missing cwd; the shell does not, and should not: `cd` and `kj
+   context set` run inside the shell being refused, a read-only seat
+   discards `cd`, and kaijutsu-mcp against a remote kernel would lose its
+   shell. A coder created without a cwd is told so by its create
+   orientation. Other context types are not told. Paths that still create
+   one: a create from a context with no cwd (root consoles have none), and
+   a client directory the kernel refused.
 6. **The shell's result does not say where it ran.** A `cd` persists
    across calls, and the cwd shows only when the model asks with `pwd`.
-   Proposed fix: when a call changes the cwd, the result names the new one
-   in a single line.
+   Proposed fix: a `cwd` field on `ShellEnvelope`, set only when the call
+   changed the durable cwd (`persist_shell_state` already compares the
+   before and after snapshots), `null` otherwise. It touches the shared
+   envelope type, both shell tool descriptions, and the kaijutsu-mcp
+   `shell` description, so it waits for a decision.
 
 Seen in the same trajectories, outside this entry: kaish `ls -la` printed
 one tab-separated `name  type  size` row per file, with every size 0. Several models called it "garbled" and
