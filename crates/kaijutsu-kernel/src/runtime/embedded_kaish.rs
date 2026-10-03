@@ -467,6 +467,13 @@ impl EmbeddedKaish {
         config = config.with_job_manager(context_jobs.clone());
 
         config.initial_vars = super::context_shell::initial_environment(&external_exec);
+        // Python is a wrapped command wherever host exec is allowed, so a
+        // plan can name the program it runs (`runtime::python_tool`). Other
+        // shells refuse it as they refuse any host program.
+        let python_tools = match &external_exec {
+            ExternalExec::Allow { path } => super::python_tool::python_tools(path.as_deref())?,
+            ExternalExec::Deny | ExternalExec::LookupOnly { .. } => Vec::new(),
+        };
         config = config.with_allow_unwrapped_commands(matches!(external_exec, ExternalExec::Allow { .. }));
 
         // The kernel document view (`/v/docs`) mounts directly on the kaish VFS,
@@ -494,6 +501,9 @@ impl EmbeddedKaish {
                 }
             },
             |tools| {
+                for python in python_tools {
+                    tools.register(python);
+                }
                 configure_tools(ctx_for_tools, sid_for_tools, tools);
                 if read_only {
                     for name in ["kill", "bg", "fg"] {

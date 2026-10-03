@@ -2849,6 +2849,10 @@ impl Broker {
         // whole statement's rendering, because that is the string the
         // classifier will see for it. Additive.
         //
+        // `interpreter` (docs/kaish-integration.md, "Wrapped python"): on a command
+        // that names a python interpreter; says where its program comes
+        // from (`runtime::python_tool::interpreter_source`). Additive.
+        //
         // `env` captures the effective initial variables through the same
         // ContextShellInputs as shell construction and approval creation.
         // Phases snapshot independently; a later ask can observe changed state.
@@ -2926,6 +2930,9 @@ impl Broker {
                                             "clause".to_string(),
                                             serde_json::Value::String(clause),
                                         );
+                                        if let Some(source) = crate::runtime::python_tool::interpreter_source(cmd) {
+                                            obj.insert("interpreter".to_string(), source);
+                                        }
                                         obj.insert(
                                             "tier".to_string(),
                                             serde_json::Value::String(
@@ -9139,6 +9146,67 @@ mod tests {
             .await
             .expect("KJ_TOOL_PLAN must carry three statements with `delete` inside the loop");
         assert!(!result.is_error);
+    }
+
+    /// `interpreter` on a python command object names where its program is:
+    /// inline after `-c`, a heredoc on stdin, or a script path. The raw
+    /// plan facts it is read from are pinned beside it, so a judge can rely
+    /// on either. Each expectation is compared inside the hook body.
+    #[tokio::test]
+    async fn kj_tool_plan_names_a_python_program() {
+        let cases = [
+            (
+                "python3 -c 'print(1)'",
+                serde_json::json!({"language": "python", "source": "inline", "exact": true,
+                    "code": {"literal": {"text": "'print(1)'", "value": "print(1)"}}, "args": []}),
+                serde_json::json!({"literal": {"text": "'print(1)'", "value": "print(1)"}}),
+                ".args[1]",
+            ),
+            (
+                "python3 - <<'EOF'\nprint(1)\nEOF",
+                serde_json::json!({"language": "python", "source": "stdin", "exact": true, "heredoc": 0,
+                    "code": {"plain": "print(1)\n"}, "args": []}),
+                serde_json::json!({"index": 0, "delimiter": "EOF", "literal": true, "strip_tabs": false,
+                    "body": {"plain": "print(1)\n"}, "body_offset": 18}),
+                ".heredocs[0]",
+            ),
+            (
+                "python3 x.py",
+                serde_json::json!({"language": "python", "source": "script",
+                    "script": {"literal": {"text": "x.py", "value": "x.py"}}, "args": []}),
+                serde_json::json!({"literal": {"text": "x.py", "value": "x.py"}}),
+                ".args[0]",
+            ),
+        ];
+        for (index, (command, interpreter, raw, raw_path)) in cases.into_iter().enumerate() {
+            let (broker, _kernel, _kj) = wired_kaish_broker(&format!("kaish-hook-python-{index}")).await;
+            let svc = Arc::new(MockServer::new("svc").with_tool("shell_write"));
+            broker.register_silently(svc, InstancePolicy::default()).await.unwrap();
+            broker.hooks().write().await.pre_call.entries.push(HookEntry {
+                id: hook_id("python-plan"),
+                match_instance: None,
+                match_tool: Some(GlobPattern("shell_write".into())),
+                match_context: None,
+                match_principal: None,
+                action: HookAction::Invoke(HookBody::Kaish(format!(
+                    "want=$(cat <<'WANT'\n{interpreter}\nWANT\n)\n\
+                     raw=$(cat <<'WANT'\n{raw}\nWANT\n)\n\
+                     got=$(echo $KJ_TOOL_PLAN | jq -r --argjson want \"$want\" --argjson raw \"$raw\" \
+                       '.statements[0].plan.commands[0] | (.interpreter == $want) and ({raw_path} == $raw)')\n\
+                     test \"$got\" = true || exit 1\n\
+                     exit 0"
+                ))),
+                priority: 0,
+                kaish_script_id: None,
+            });
+            let mut call = params("svc", "shell_write");
+            call.arguments = serde_json::json!({ "command": command });
+            let result = broker
+                .call_tool(call, &CallContext::test(), CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| panic!("KJ_TOOL_PLAN for `{command}` must carry {interpreter} and {raw}: {error:?}"));
+            assert!(!result.is_error, "{command}");
+        }
     }
 
     /// `clause` on every command object is exactly what

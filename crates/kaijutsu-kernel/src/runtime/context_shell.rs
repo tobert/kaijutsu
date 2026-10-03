@@ -1409,6 +1409,27 @@ mod tests {
         );
     }
 
+    /// The read-only shell refuses `python3` as it refuses any host program:
+    /// exit 127 and the same message an unwrapped program gets. The python
+    /// wrapper is registered only where host exec is allowed.
+    #[tokio::test]
+    async fn read_only_shell_refuses_python_like_any_host_program() {
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let dir = tempfile::tempdir().unwrap();
+        let kaish = read_only_shell_rooted_at(&d, "python-read-only", dir.path()).await;
+        let refuse = |name: &str| format!("{name} -c 'print(1)'");
+
+        let python = kaish.execute_with_options(&refuse("python3"), ExecuteOptions::default()).await.unwrap();
+        let other = kaish.execute_with_options(&refuse("perl"), ExecuteOptions::default()).await.unwrap();
+        assert_eq!(python.code, 127, "{python:?}");
+        assert!(python.err.contains("external commands are disabled on this shell"), "{python:?}");
+        assert_eq!(python.err.replace("python3", "NAME"), other.err.replace("perl", "NAME"),
+            "python3 and an unwrapped program must get the same refusal");
+        let typed = kaish.execute_with_options("type -t python3", ExecuteOptions::default()).await.unwrap();
+        assert_ne!(typed.text_out().trim(), "builtin", "no python wrapper on a read-only shell: {typed:?}");
+    }
+
     /// The writable shell does not carry the read-only `git` builtin: `git
     /// info` there is not this crate's tool, so it never produces the
     /// builtin's `gix_pins` marker (unique to `kaish-tools-git`'s JSON

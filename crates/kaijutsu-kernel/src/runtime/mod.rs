@@ -51,6 +51,7 @@ pub mod git_tool;
 pub mod kaish_backend;
 pub mod kj_builtin;
 pub mod ps_builtin;
+pub(crate) mod python_tool;
 pub mod mount_backend;
 pub mod read_only_fs;
 pub mod swap_filesystem;

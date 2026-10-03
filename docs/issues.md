@@ -875,6 +875,37 @@ kaish note.
 recurs, have `wait_child` report the read error and retry it, instead of
 panicking on the first one.
 
+## Wrapped python: what stays open (2026-10-03)
+
+`python3` and `python` are wrapped commands and `KJ_TOOL_PLAN` names their
+program (`docs/kaish-integration.md`, "Wrapped python"). Open:
+
+- **The judge.** Nothing reads `interpreter.code` yet. The shell-escape
+  guard still parses python's argv in jq; it can read `interpreter.source`
+  instead, which also covers `.venv/bin/python` and `python3.14`.
+- **Wrappers hide the interpreter.** `timeout 60 python3 -c …`,
+  `env python3 …`, and `xargs python3` plan with the wrapper as the command,
+  so they carry no `interpreter`.
+- **kaish's parser binds options anywhere.** CPython stops at the first
+  operand; kaish's wrapped parser does not, so a trailing value option in a
+  program's own arguments (`python3 tool.py -m`) is refused with exit 2. A
+  `Tail` mode that ends option parsing at the first operand would fix it in
+  kaish and would let kaish's plan carry the wrapper's own reading.
+- **kaish lifts `--json` from a wrapped command's raw argv.** The python
+  tool clears the output format; kaish's `WrappedTool` should never lift it
+  under `Tail::Forward`.
+- **`type python3` says "shell builtin".** kaish has no resolution kind for
+  a wrapped external.
+- **kaish pins a wrapper's executable.** The python tool re-resolves the
+  name on each call so `PATH` order still picks a virtual environment. A
+  kaish option to resolve at call time would remove that adapter.
+- **The plan reads unknown options as harmless.** `python3 -Z x.py` plans
+  a script, where CPython exits 2. A relative `PATH` entry resolves against
+  the kernel process cwd in both the wrapper and kaish's external path, not
+  the shell's cwd.
+- **`pip`, `uv`, `pytest`, and other interpreters** (`node`, `perl`, `ruby`)
+  are not wrapped.
+
 ## From the one-filesystem walks re-pin (2026-10-02)
 
 Found while re-pinning kaish onto `one-filesystem-walks` (kaijutsu branch

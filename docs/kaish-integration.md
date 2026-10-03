@@ -84,7 +84,8 @@ These are source observations, not promises that all paths behave alike.
   its Tokio runtime. Stack tests currently live in server `rpc.rs`.
 - `runtime/embedded_kaish.rs::EmbeddedKaish` wraps the kaish kernel. Its common
   constructor wires mounts, the kernel's file cache, per-context JobManager,
-  output limits, host execution policy, HOME/PATH, and trace propagation.
+  output limits, host execution policy, wrapped python (see "Wrapped
+  python" below), HOME/PATH, and trace propagation.
 - Embedded shells enable kaish's Linux parent-death signal for external
   children. Accepted commands execute on the kernel worker and survive a client
   disconnect; direct external children are killed if the server dies abruptly.
@@ -502,6 +503,72 @@ rollback. The opener remains the owner of `:r !` execution; the read result's
 insertion belongs to whoever submitted the keys. RPC input uses the connection
 principal and `kj editor` uses its invoking performer. Original block IDs and
 authors remain unchanged. Durable per-edit provenance remains separate work.
+
+## Wrapped python
+
+`python3 -c 'print(1)'` on a shell that allows host exec runs a kaish
+wrapped command, not a `PATH` lookup. `runtime/python_tool.rs` registers
+`python3` and `python` in `EmbeddedKaish`'s common constructor when the
+shell's policy is `ExternalExec::Allow`. The contract is kaish's
+`docs/wrapped_command.md`.
+
+- Each name registers only when it resolves on the shell's `PATH` at
+  construction. A name that does not resolve fails as a missing program
+  does: exit 127, `command not found: python`. `python` is never pointed at
+  `python3`.
+- The declaration lists the options `python3 -h` documents, except `-R` and
+  `--check-hash-based-pycs`, which pass through undeclared. Each spelling is
+  its own repeatable flag, with a `script` positional, `args`, `Stdin::Pipe`,
+  and `Tail::Forward`. `Forward` renders every word in the order written and
+  passes undeclared flags through, so arguments after `-c CODE`, `-m MOD`,
+  or the script reach the program unchanged. `AfterDashDash` and `Deny`
+  would refuse `python3 script.py --verbose`. A declared value option at the
+  very end of a program's arguments (`python3 tool.py -c`) is refused with
+  exit 2 before anything runs, because kaish's parser binds options
+  anywhere, not only before the first operand.
+- The declaration pins no environment and no lead argv. The child gets what
+  an unwrapped external gets: kaish's exported variables only (both paths
+  call kaish's `hermetic_env`), and the shell's real cwd. `PATH`,
+  `VIRTUAL_ENV`, and `PYTHONPATH` pass through when exported.
+- Each call resolves the name again on the call's `PATH`, as an unwrapped
+  external does. `export PATH="$VIRTUAL_ENV/bin:$PATH"; python3 x.py` and
+  `PATH=.venv/bin python x.py` run the virtual environment's interpreter.
+  kaish's own wrapper pins its executable at registration; the
+  re-resolution is the kaijutsu tool around it.
+- A path such as `.venv/bin/python` or `/usr/bin/python3` is a different
+  command word. It stays an unwrapped external and runs as before.
+- `--json` belongs to the program. kaish reads a literal `--json` in a raw
+  argv as its output-format flag; the tool clears that format, so the
+  interpreter's output is never reformatted. `python3 --help` prints
+  CPython's usage, because the declaration claims `--help`.
+- `type python3` reports a shell builtin and `command -v python3` prints
+  `python3`; `which python3` still prints the file on `PATH`.
+- A read-only or exec-denied shell registers no wrapper. `python3` there is
+  refused exactly as any host program is: exit 127, `external commands are
+  disabled on this shell`.
+
+`KJ_TOOL_PLAN` gives each command that names a python interpreter an
+`interpreter` object. The command is named by its last path component, so
+`.venv/bin/python` and `python3.14` count. Options are read as CPython reads
+them: clusters (`-uc`), glued values (`-cprint(1)`), and option parsing ends
+at `-c`, `-m`, `-`, `--`, or the first operand.
+
+| Command | `interpreter` |
+|---|---|
+| `python3 -c 'print(1)'` | `{"language":"python","source":"inline","exact":true,"code":{"literal":{"text":"'print(1)'","value":"print(1)"}},"args":[]}` |
+| `python3 - <<'EOF'` … `EOF` | `{"language":"python","source":"stdin","exact":true,"heredoc":0,"code":{"plain":"print(1)\n"},"args":[]}` |
+| `python3 x.py` | `{"language":"python","source":"script","script":{"literal":{"text":"x.py","value":"x.py"}},"args":[]}` |
+
+`source` is `inline`, `module`, `script`, `stdin`, `none` (`-V`, `--help`),
+or `unknown` (a word in option position that kaish expands at run time).
+`code`, `module`, and `script` are kaish `PlannedValue`s; `exact` is true
+when the code is known before the statement runs — a literal `-c` word or a
+quoted heredoc delimiter. A heredoc body is published as `plain` even when
+its delimiter is quoted, so read `exact`, not the variant. `args` holds the
+program's own arguments, or every argument for `none` and `unknown`. The
+plain plan carries the same facts: the `-c` word is `args[1].literal.value`
+and the heredoc is `heredocs[0]`. `mcp::broker`'s
+`kj_tool_plan_names_a_python_program` pins both.
 
 ## Caller migration inventory
 
