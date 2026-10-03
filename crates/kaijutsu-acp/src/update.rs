@@ -515,13 +515,7 @@ impl UpdateMapper {
         // tool_call_update replaces the array wholesale. Streaming shell output
         // therefore re-sends the accumulated text on each op — chatty, but
         // correct, and it is what the ACP shape actually offers.
-        let mut body = block.content.clone();
-        if let Some(err) = block.stderr.as_deref().filter(|s| !s.is_empty()) {
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            body.push_str(err);
-        }
+        let body = kaijutsu_types::shell_envelope::join_streams(&block.content, block.stderr.as_deref().unwrap_or(""));
 
         let changed_status = self.tool_status.get(&target) != Some(&status);
         let changed_body = self.emitted.get(&block.id).map(|m| m.len).unwrap_or(0)
@@ -1517,7 +1511,7 @@ mod tests {
         let ContentBlock::Text(t) = &c.content else {
             panic!("expected text");
         };
-        assert_eq!(t.text, "out\nwarn");
+        assert_eq!(t.text, "out\n[stderr]\nwarn", "stderr is marked as the model reads it");
     }
 
     #[test]

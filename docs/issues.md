@@ -706,6 +706,12 @@ on current main"):
   subshells, `\(` in `find`, brace groups. 6 of 29 failed tool calls in four
   runs.
 
+- **The tui shows stderr unmarked.** `present.rs` appends a tool result's
+  stderr after its body in the block's own tone, while a model and ACP
+  clients read a `[stderr]` line (`shell_envelope::join_streams`). A person
+  cannot tell the streams apart. Color, not the text marker, may suit the
+  tui better; decide against `docs/tui.md`.
+
 ## A builtin `grep -r PATTERN /` killed the agent process (2026-10-01)
 
 In `kj-ds4-tb2-20-1`, extract-elf and headless-terminal each ran
