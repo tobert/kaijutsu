@@ -655,9 +655,6 @@ more readily than other agents". Open, most costly first:
   `ls -S`, `cat -A`, and read-only kaish-git's `--oneline`/`--all`/`-a` are
   refused. Evidence and counts: `~/exomemory/kaijutsu/kaish-fixes-2026-10-01.md`
   (Amy is taking these to kaish).
-- **A parse refusal reads as a policy denial.** The shell-escape guard turns
-  kaish's parse failure into "no execution plan". Say that kaish cannot parse
-  the command and that `bash -c '...'` runs it.
 - **A turn can still spend several output ceilings.** A ceiling stop now
   continues the turn with a notice instead of ending it, bounded by
   `MAX_OUTPUT_CEILING_CONTINUATIONS` (`runtime/llm_stream.rs`); see

@@ -6647,6 +6647,10 @@ mod tests {
             msg.contains("You are coding here"),
             "rc-produced coder stance missing from prompt: {msg}"
         );
+        // Both tiers carry the building rules and the script rule.
+        for rule in ["least privilege", "one small program you own", "reads top-down"] {
+            assert!(msg.contains(rule), "coder stance is missing {rule:?}: {msg}");
+        }
 
         // Order is the rc sort order: shared S00-base → coder S00-stance → situation.
         let base_pos = msg.find(shared).expect("shared section present");

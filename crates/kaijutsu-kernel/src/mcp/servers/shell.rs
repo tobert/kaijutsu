@@ -88,7 +88,8 @@ pub(crate) fn resolve_command_timeout(
 // language reference stays in kaish (`help syntax`), so the description every
 // request carries stays small. It names only the bash habits models still
 // bring after kaish accepts what it can: unquoted mixed words, `( … )`
-// subshells, and `[ … ]` tests.
+// subshells, `[ … ]` tests, and text handed to a second shell, which the
+// shell-escape guard denies.
 const ABOUT_KAISH: &str = "kaish (会sh) is a small shell, not bash: a subset \
      with a JSON data model. Values keep their types (strings, numbers, \
      booleans, lists `[a b c]`, records `{k: v}`) through variables and pipes, \
@@ -97,7 +98,8 @@ const ABOUT_KAISH: &str = "kaish (会sh) is a small shell, not bash: a subset \
      half-runs. Quote a word that mixes text with `$var` or `$(…)`: write \
      \"/tmp/$f.csv\", not /tmp/$f.csv. Group commands with `{ …; }`; there are \
      no `( … )` subshells. Test with `[[ … ]]` or `test`; `[` starts a list. \
-     Builtins run in-process; other programs run from PATH. `help syntax` lists \
+     Do not pass text to `sh -c` or `bash -c`: write a short script file that \
+     reads top-down, then run the file. Builtins run in-process; other programs run from PATH. `help syntax` lists \
      the language.";
 
 // What a call returns, as a model turn reads it (`ShellEnvelope::model_text`)
@@ -458,6 +460,8 @@ mod tests {
         // The habits a DeepSeek A/B still showed after the lexer fixes: name
         // the language as a subset, and the bash forms it refuses.
         assert!(text.contains("not bash") && text.contains("`[[ … ]]`") && text.contains("`{ …; }`"), "{text}");
+        // The shell-escape guard's rule, stated before a call meets it.
+        assert!(text.contains("`sh -c`") && text.contains("write a short script file"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");

@@ -13,8 +13,18 @@
 # an explicit exit 0 or exit 1, so nothing falls through to an implicit
 # allow.
 
+# No plan means kaish refused the text. A parse error is the common case:
+# name it as syntax, with kaish's own message, so a model fixes the syntax or
+# moves the commands into a script file instead of reading it as policy.
 if test -z "${KJ_TOOL_PLAN:-}"; then
-  echo "blocked: no execution plan for this shell_write call (KJ_TOOL_PLAN_ERROR: ${KJ_TOOL_PLAN_ERROR:-none}) -- the shell-escape guard denies what it cannot see; run this as a plain kaish command instead" >&2
+  case "${KJ_TOOL_PLAN_ERROR:-}" in
+    *parse*)
+      echo "blocked: kaish cannot parse this command: ${KJ_TOOL_PLAN_ERROR}. Fix the syntax (help syntax lists the language), or write a short script file that reads top-down and run the file with bash FILE." >&2
+      ;;
+    *)
+      echo "blocked: kaish could not check this command (${KJ_TOOL_PLAN_ERROR:-no reason given}), and the shell-escape guard denies what it cannot check. Fix the command, or write a short script file that reads top-down and run the file with bash FILE." >&2
+      ;;
+  esac
   exit 1
 fi
 
@@ -23,14 +33,20 @@ fi
 # deny reason, or "" when nothing matched. A command is named by the last
 # path component of its word, so `/bin/sh` and `./sh` count as sh.
 #
-# Shell interpreters (sh/bash/zsh/dash/ksh/fish/busybox) deny by name: a
-# shell_write call has no reason to hand text to a second shell instead of
-# running it as kaish, and busybox names its applet in its args.
+# Shell interpreters (sh/bash/zsh/dash/ksh/fish) deny when they run text
+# instead of a script file: a `-c` flag, alone or bundled (`-lc`, `-ec`),
+# `-s`, or no script argument at all, which reads commands from stdin. Only
+# the arguments before the script are flags; `bash run.sh -c x` passes `-c`
+# to the script. `-o NAME`, `+o NAME`, `--rcfile FILE` and `--init-file
+# FILE` take the next argument. A script file is ordinary work: it is there
+# to read. busybox denies by name, since it names its applet in its args.
 #
-# Scripting interpreters (python/python3/perl/ruby/node) deny only with an
-# inline-code flag. Running a script file through them is ordinary, auditable
-# work; a snippet on the command line is as opaque as `sh -c`. Each
-# interpreter has its own pattern, anchored at the start of the word:
+# Scripting interpreters (perl/ruby/node) deny only with an inline-code flag.
+# Running a script file through them is ordinary work; a snippet on the
+# command line is as opaque as `sh -c`. python and python3 are wrapped
+# commands, so the plan identifies their code, and the guard leaves them to
+# the wrapper. Each interpreter has its own pattern, anchored at the start of
+# the word:
 #
 # - perl and ruby bundle short flags, so `perl -ne` and `perl -lane` are
 #   inline code. Code may also follow the flag in the same word (`perl -e1`,
@@ -39,17 +55,44 @@ fi
 #   flag such as python's `-m` or perl's `-M` takes the rest of the word as
 #   its argument, so `python3 -mcProfile` and `perl -Mfeature` are not code.
 # - Perl's eval letters are `e` and `E`; ruby's is `e` (ruby's `-E` sets an
-#   encoding); python's is `c`; node takes `-e`, `-p`, `--eval`, `--print`,
-#   with or without `=`.
+#   encoding); node takes `-e`, `-p`, `--eval`, `--print`, with or without
+#   `=`.
 #
 # Wrapper commands (sudo/env/nice/timeout/nohup/stdbuf/xargs/exec) run a
-# command named in their own args, so their args get the same two checks.
+# command named in their own args, so the args after the wrapped command get
+# the same two checks.
 # A wrapper arg that kaish expands at run time (`exec ${SH} -c x`) is not
 # checked: the guard sees only the unexpanded text.
 filter=$(cat <<'GUARD_FILTER_EOF'
 def shell_class: ["sh","bash","zsh","dash","ksh","fish","busybox"];
 def wrapper_class: ["sudo","env","nice","timeout","nohup","stdbuf","xargs","exec"];
-def scripting_class: {"python":"^-[bBdEhiIOPqRsSuvVx]*c","python3":"^-[bBdEhiIOPqRsSuvVx]*c","perl":"^-[acnpstTuUwWl0-9]*[eE]","ruby":"^-[acdlnpsSvwWy0-9]*e","node":"^(-[ep]|--eval($|=)|--print($|=))"};
+def scripting_class: {"perl":"^-[acnpstTuUwWl0-9]*[eE]","ruby":"^-[acdlnpsSvwWy0-9]*e","node":"^(-[ep]|--eval($|=)|--print($|=))"};
+
+# How a shell given these args gets its commands: "inline" (`-c`), "stdin"
+# (`-s`, `-`, or no script), or null when it runs a script file.
+def shell_source:
+  def go:
+    if length == 0 then "stdin"
+    else .[0] as $a
+      | if $a == "--" then (if (.[1:] | length) == 0 then "stdin" else null end)
+        elif $a == "-" then "stdin"
+        elif ($a == "-o" or $a == "+o" or $a == "--rcfile" or $a == "--init-file") then (.[2:] | go)
+        elif ($a | test("^-[A-Za-z]*c")) then "inline"
+        elif ($a | test("^-[A-Za-z]*s")) then "stdin"
+        elif ($a | test("^[-+]")) then (.[1:] | go)
+        else null
+        end
+    end;
+  go;
+
+def shell_reason($sh; $args; $via):
+  if $sh == "busybox" then "\"busybox\"\($via) can run any applet, which the shell gate cannot check"
+  else ($args | shell_source) as $src
+  | if $src == "inline" then "\"\($sh) -c\"\($via) runs text that the shell gate cannot check"
+    elif $src == "stdin" then "\"\($sh)\"\($via) without a script file reads commands from stdin, which the shell gate cannot check"
+    else null
+    end
+  end;
 
 # The command a word names: `/bin/sh` and `./sh` run sh.
 def base: split("/") | last;
@@ -70,15 +113,15 @@ def classify:
   | ($c.args // [] | map(.literal.value // (.plain | destrip))) as $argv
   | (
       if (shell_class | index($name)) then
-        "shell interpreter \"\($name)\" invoked directly"
+        shell_reason($name; $argv; "")
       elif (scripting_class | has($name))
            and ($argv | any(test(scripting_class[$name]))) then
         "\"\($name)\" invoked with an inline-code flag"
       elif (wrapper_class | index($name)) then
-        ( $argv | map(base | select(. as $a | shell_class | index($a))) | first ) as $wrapped_sh
+        ( [ $argv | to_entries[] | select(.value | base | . as $a | shell_class | index($a)) ] | first ) as $sh_at
         | ( $argv | map(base | select(. as $a | scripting_class | has($a))) | first ) as $wrapped_name
-        | if $wrapped_sh then
-            "shell interpreter \"\($wrapped_sh)\" invoked via wrapper \"\($name)\""
+        | if $sh_at then
+            shell_reason($sh_at.value | base; $argv[($sh_at.key + 1):]; " via \"\($name)\"")
           elif ($wrapped_name != null)
                and ($argv | any(test(scripting_class[$wrapped_name]))) then
             "\"\($wrapped_name)\" invoked with an inline-code flag via wrapper \"\($name)\""
@@ -108,7 +151,7 @@ case "$reason" in
     exit 0
     ;;
   *)
-    echo "blocked: $reason -- opaque to the shell gate; run it as kaish directly, not through a shell interpreter or an inline-eval flag" >&2
+    echo "blocked: $reason. Most commands run directly in kaish. For anything else, write a short script file that reads top-down, then run the file: `bash FILE` or `./FILE`." >&2
     exit 1
     ;;
 esac

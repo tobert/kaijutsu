@@ -9652,23 +9652,29 @@ mod tests {
             "true && bash -c 'echo hi'",
             "echo one | zsh -c 'echo two'",
             "(dash -c 'echo hi')",
-            "python3 -c 'print(1)'",
-            "python3 '-c' 'print(1)'",
+            // Bundled short flags still carry `-c`; `-s` and no script at
+            // all read commands from stdin.
+            "bash -lc 'echo hi'",
+            "bash -ec 'echo hi'",
+            "bash -o pipefail -c 'echo hi'",
+            "bash -s",
+            "bash",
+            "bash -",
+            "echo 'echo hi' | sh",
+            "sh <<'EOF'\necho hi\nEOF",
+            "timeout 60 sh -c 'make'",
             "env perl -ne 'print'",
             // A path-qualified interpreter is the same interpreter.
             "/bin/sh -c 'echo hi'",
             "./bash -c 'echo hi'",
             "exec /bin/sh -c 'echo hi'",
             "sudo -u root /usr/bin/bash -c 'echo hi'",
-            "/usr/bin/python3 -c 'print(1)'",
             // A variable in the command word does not parse in kaish, so
             // there is no plan and the guard refuses.
             "${SH} -c 'echo hi'",
             // Code glued to its flag is one word.
             "perl -e1",
             "perl -lne1",
-            "python3 -cprint",
-            "python3 -Ic'print(1)'",
             "ruby -e1",
             "node -e1",
             "node --eval=1",
@@ -9690,6 +9696,25 @@ mod tests {
         }
         assert!(escaped.is_empty(), "the guard did not deny:\n{}", escaped.join("\n"));
 
+        // A denial names its fix: write a script file and run the file.
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": "bash -c 'echo hi'" });
+        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+            .expect_err("bash -c is denied");
+        let text = format!("{err}");
+        assert!(text.contains("script file") && text.contains("`./FILE`"), "the denial names the fix: {text}");
+
+        // A command kaish cannot parse is a syntax error, not a policy
+        // denial: say so, carry kaish's message, and name both fixes.
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": "for x in a b; do echo $x; done | (cat)" });
+        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+            .expect_err("an unparseable command is denied");
+        let text = format!("{err}");
+        assert!(text.contains("kaish cannot parse this command") && text.contains("help syntax")
+            && text.contains("script file"), "the parse denial names its cause and fixes: {text}");
+        assert!(!text.contains("no execution plan"), "{text}");
+
         // Data-position occurrences of `sh -c` must not be blocked (a regex
         // hook matching the substring anywhere would):
         let benign = [
@@ -9697,6 +9722,23 @@ mod tests {
             "echo \"bash -c\"",
             "git commit -m \"note: sh -c is banned here\"",
             "python3 script.py",
+            // A shell that runs a script file is ordinary work: the file is
+            // there to read. Flags after the script belong to the script.
+            "bash run.sh",
+            "sh ./build.sh --clean",
+            "bash -e -x run.sh",
+            "bash -o pipefail run.sh",
+            "bash run.sh -c foo",
+            "/bin/sh /app/check.sh",
+            "sudo -u user /app/deploy.sh",
+            "sudo -u user bash /app/deploy.sh",
+            "timeout 60 bash run.sh",
+            // Python is identified by its wrapped command, so its inline
+            // code is a value a judge can read.
+            "python3 -c 'print(1)'",
+            "python -c 'print(1)'",
+            "python3 -cprint",
+            "/usr/bin/python3 -c 'print(1)'",
             // A flag whose argument is glued on is not an inline-code flag.
             "python3 -mjson.tool data.json",
             "python3 -mcProfile script.py",
