@@ -6648,7 +6648,9 @@ mod tests {
             "rc-produced coder stance missing from prompt: {msg}"
         );
         // Both tiers carry the building rules and the script rule.
-        for rule in ["least privilege", "one small program you own", "reads top-down"] {
+        for rule in ["least privilege", "one small program you own", "reads top-down",
+            "Make backups of important files", "Verify your work before you say you are done",
+            "Write a large file in parts", "watch it fail"] {
             assert!(msg.contains(rule), "coder stance is missing {rule:?}: {msg}");
         }
 

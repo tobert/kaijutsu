@@ -213,7 +213,7 @@ Settings ride environment variables, each of which has a matching
 
 | Variable | Kwarg | What it sets |
 |---|---|---|
-| `KAIJUTSU_ACP_MAX_TOKENS` | `max_tokens` | `--max-tokens N`. Unset: the factory ceiling, 16384. |
+| `KAIJUTSU_ACP_MAX_TOKENS` | `max_tokens` | `--max-tokens N`. Unset: 65536 on DeepSeek (V4's advertised output limit), else the factory ceiling, 16384. |
 | `KAIJUTSU_ACP_WORKSPACE_MOUNTS` | `workspace_mounts` | Comma-separated directories mounted read-write and made if missing, written to the state directory's `config/mounts.toml`. Unset: `/app,/git,/srv`. Empty: none. |
 | `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
 | `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |

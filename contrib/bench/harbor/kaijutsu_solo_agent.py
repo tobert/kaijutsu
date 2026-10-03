@@ -57,6 +57,10 @@ WORKSPACE_MOUNTS_ENV = "KAIJUTSU_ACP_WORKSPACE_MOUNTS"
 DEFAULT_BACKEND_KIND = "deepseek"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_RUST_LOG = "info"
+#: DeepSeek V4's advertised output limit (64K, reasoning included;
+#: `seed_backends.rs`). The kernel's factory ceiling of 16384 holds for every
+#: backend, and at effort "max" reasoning spends most of it (Amy, 2026-10-03).
+DEEPSEEK_MAX_OUTPUT_TOKENS = 65536
 #: Directories a task commonly works in, mounted read-write and made if
 #: missing: the task's own workspace, a git server's repositories, and a
 #: service's files (Amy, 2026-10-03).
@@ -406,9 +410,6 @@ class KaijutsuSoloAcp(AcpAgent):
             "request_timeout", request_timeout, os.environ.get(REQUEST_TIMEOUT_ENV)
         )
 
-        # Left off the command line when unset, which is what keeps the
-        # binary's own default (the factory token ceiling) in effect -- this
-        # module changes no default of its own, only what it passes through.
         mounts_raw = workspace_mounts if workspace_mounts is not None else os.environ.get(WORKSPACE_MOUNTS_ENV)
         if mounts_raw is None:
             self._workspace_mounts: list[str] = list(DEFAULT_WORKSPACE_MOUNTS)
@@ -420,7 +421,12 @@ class KaijutsuSoloAcp(AcpAgent):
                     f"workspace mount {mount!r} must be an absolute directory other "
                     f"than / (--ak workspace_mounts=... or ${WORKSPACE_MOUNTS_ENV})"
                 )
+        # Unset, DeepSeek gets its models' advertised output limit; any other
+        # backend is left off the command line, which keeps the binary's own
+        # default (the factory token ceiling) in effect.
         max_tokens_raw = max_tokens if max_tokens is not None else os.environ.get(MAX_TOKENS_ENV)
+        if max_tokens_raw is None and self._backend_kind == "deepseek":
+            max_tokens_raw = DEEPSEEK_MAX_OUTPUT_TOKENS
         if max_tokens_raw is None:
             self._max_tokens: int | None = None
         else:
