@@ -166,8 +166,12 @@ impl EmbeddedKaish {
                     d.clone(),
                     Some(principal),
                 ));
-                // Replace the host process listing with Kaijutsu jobs.
-                tools.register(crate::runtime::ps_builtin::PsBuiltin::new(true));
+                // Replace the host process listing with this context's own
+                // shell operations.
+                tools.register(crate::runtime::ps_builtin::PsBuiltin::new(
+                    d.kernel().shell_operations().clone(),
+                    context_id,
+                ));
                 tools.register(crate::runtime::kj_builtin::KjBuiltin::new(
                     d,
                     scm,
@@ -416,6 +420,49 @@ mod tests {
             .await.unwrap();
         assert!(result.ok(), "switch back into /v/docs: {} {}", result.text_out(), result.err);
         assert_eq!(result.text_out().lines().last(), Some("/v/docs"));
+    }
+
+    /// `ps` lists this context's own shell operations, with no `system`
+    /// authority: unfinished ones by default, finished ones with `-a`.
+    /// Another context's work never shows.
+    #[tokio::test]
+    async fn ps_lists_this_contexts_own_operations() {
+        use kaijutsu_types::shell_envelope::{ShellEnvelope, ShellStatus};
+        let d = Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("ps-mine"), None, principal);
+        let other = register_context(&d, Some("ps-other"), None, principal);
+        let registry = d.kernel().shell_operations();
+        let block = |c, n| kaijutsu_types::BlockId::new(c, principal, n);
+        let kaish = context_shell(&d, ctx, principal).await.unwrap();
+
+        let empty = kaish.execute_with_options("ps", ExecuteOptions::default()).await.unwrap();
+        assert!(empty.ok(), "{}", empty.err);
+        assert!(empty.text_out().contains("no shell operations in this context"), "{}", empty.text_out());
+
+        let running = registry.register(ctx, principal, principal, block(ctx, 1), block(ctx, 2), "sleep 600", None).unwrap();
+        let finished = registry.register(ctx, principal, principal, block(ctx, 3), block(ctx, 4), "echo finished", None).unwrap();
+        let mut envelope = ShellEnvelope::new(ShellStatus::Done);
+        envelope.exit_code = Some(0);
+        registry.complete(&finished.operation_id, envelope).unwrap();
+        registry.register(other, principal, principal, block(other, 1), block(other, 2), "echo not mine", None).unwrap();
+
+        let result = kaish.execute_with_options("ps", ExecuteOptions::default()).await.unwrap();
+        assert!(result.ok(), "{}", result.err);
+        let out = result.text_out();
+        assert!(out.contains(&running.operation_id) && out.contains("sleep 600") && out.contains("running"), "{out}");
+        assert!(!out.contains("echo finished") && !out.contains("not mine"), "{out}");
+        assert!(out.contains("1 finished"), "the default view says what it left out: {out}");
+
+        let result = kaish.execute_with_options("ps -a", ExecuteOptions::default()).await.unwrap();
+        let out = result.text_out();
+        assert!(out.contains("echo finished") && out.contains("done") && out.contains("sleep 600"), "{out}");
+        assert!(!out.contains("not mine"), "{out}");
+
+        let bad = kaish.execute_with_options("ps -ef", ExecuteOptions::default()).await.unwrap();
+        assert_eq!(bad.code, 2, "an unknown flag is a usage error: {}", bad.err);
+        assert!(bad.err.contains("-a"), "the error names the flag ps takes: {}", bad.err);
     }
 
     /// `cd` enters a symlink to a directory and keeps the link's path, as a

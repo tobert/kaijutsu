@@ -742,6 +742,19 @@ on current main"):
   sourceforge.net while host `pip` and `apt-get` reached the network in the
   same container. Open: open it for benchmarks, or keep it and say in the
   refusal that the allowlist is kaijutsu's.
+- **Three losses were reasoning past a 16K ceiling** (dna-assembly,
+  headless-terminal, model-extraction-relu-logits): 4 `length` stops each,
+  166-186K characters of reasoning, no tool call. The baseline ran with
+  `max_tokens` 32768; this run left it unset (factory 16384) at effort
+  `max`. The adapter now passes 65536 on DeepSeek. Comparisons must match
+  the ceiling in provenance.
+- **Nothing tracks the OS processes a context starts** (design, Amy: "a
+  cgroup later would be rad"). Daemons a model launches from a script
+  (configure-git-webserver's sshd and web server) leave no record: no way
+  to list what a context left running or stop it on archive. Candidates: a
+  cgroup v2 per context, or the kernel as a child subreaper
+  (`PR_SET_CHILD_SUBREAPER`) attributing orphans by session or process
+  group. Touches kaish's spawn path.
 - **Do not build during a timing-sensitive run.** query-optimize failed its
   timing check (1.21 s against 1.08 s) while niced test builds ran on the
   host; the sample is confounded.

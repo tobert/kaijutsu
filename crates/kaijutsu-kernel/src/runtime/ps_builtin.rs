@@ -1,52 +1,46 @@
-//! `ps` — a sign pointing at `kj system ps`, never the roster itself.
+//! `ps` — this context's own shell operations, never the host's processes.
 //!
 //! kaish ships a `ps` that enumerates host processes. Inside a kaijutsu
 //! shell that is the wrong answer to the right question: a seat asking
-//! "what is running?" means the kernel's own landscape, not every process
-//! on the machine, which kaijutsu agents generally do not need and should not
-//! see.
+//! "what is running?" means its own work, not every process on the machine,
+//! which kaijutsu agents generally do not need and should not see.
 //!
-//! **This tool never renders the table.** `kj system ps` is the one door,
-//! because it is the one that carries the capability check. If `ps` also
-//! rendered the roster it would be a way around that check, which is
-//! exactly the shape of mistake the gate exists to prevent. So `ps` always
-//! fails, and its only job is to say what to do instead.
+//! So `ps` lists the shell operations this context started — background
+//! calls, calls waiting for approval, and with `-a` the finished ones — from
+//! the same registry `list_shell_operations` and `kj wait --operation` read.
+//! It needs no `system` authority because it never leaves the context. The
+//! kernel-wide roster stays `kj system ps`, which carries that check.
 //!
-//! Two messages, because the honest next step differs:
-//!
-//! - A shell that can reach `kj` is told the full path.
-//! - A restricted shell — no host exec, no `kj system` — is told plainly
-//!   that it cannot, with no alternative to chase.
+//! It does not list host processes a context's commands started. Nothing
+//! tracks those yet (`docs/issues.md`, "Nothing tracks the OS processes a
+//! context starts").
 //!
 //! **Why a shadow rather than removal.** `ToolRegistry::register` is a
 //! `HashMap::insert` keyed by `tool.name()`, and the registry has no
-//! `remove`. A kaijutsu shell therefore cannot simply *lack* `ps`; leaving
-//! it unregistered means falling through to kaish's host listing, which is
-//! strictly worse than a refusal. `fg` in `vi_builtin.rs` is the same move
-//! and the precedent for it. kaish's own `ps` is untouched for every other
-//! embedder, which matters because that surface is a promise to them
-//! (CLAUDE.md, "kaish and kaibo are not this").
-//!
-//! This is an ergonomic nudge, not a security control: every player is
-//! still inside one trust boundary (`docs/instrument-design.md`, "Many
-//! hands, one trust boundary"). The point is that a seat will not reason
-//! about host processes by accident, not that it is being defended against.
+//! `remove`. Leaving `ps` unregistered would fall through to kaish's host
+//! listing. kaish's own `ps` is untouched for every other embedder.
 
+use std::sync::Arc;
+
+use kaijutsu_types::ContextId;
 use kaish_kernel::interpreter::ExecResult;
 use kaish_kernel::tools::{ToolArgs, ToolCtx, ToolSchema};
 use kaish_kernel::Tool;
 
+use crate::shell_operations::{ShellOperationRegistry, ShellOperationState};
+
 pub struct PsBuiltin {
-    /// Whether this shell can reach `kj` at all. A restricted shell gets the
-    /// flat refusal; everything else gets pointed at `kj system ps`.
-    has_kj: bool,
+    operations: Arc<ShellOperationRegistry>,
+    context: ContextId,
 }
 
 impl PsBuiltin {
-    pub fn new(has_kj: bool) -> Self {
-        Self { has_kj }
+    pub fn new(operations: Arc<ShellOperationRegistry>, context: ContextId) -> Self {
+        Self { operations, context }
     }
 }
+
+const USAGE: &str = "usage: ps [-a]. ps lists this context's unfinished shell operations; -a adds finished ones.";
 
 #[async_trait::async_trait]
 impl Tool for PsBuiltin {
@@ -57,28 +51,77 @@ impl Tool for PsBuiltin {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "ps",
-            "Not available here. This kernel's process table is `kj system ps`, \
-             which needs the `system` authority.",
+            "List this context's shell operations: background calls and calls waiting \
+             for approval. -a also lists finished ones. Host processes are not listed.",
         )
     }
 
-    async fn execute(&self, _args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
-        // Exit 1, never 0 with text: a caller that checks the status must
-        // see this fail rather than read an empty roster as "nothing running".
-        if self.has_kj {
-            ExecResult::failure(
-                1,
-                "ps is not available in a kaijutsu shell — it would list the host's \
-                 processes, not this kernel's. For the kernel's own turns and jobs, \
-                 run `kj system ps` (needs the `system` authority; drift the question \
-                 to a seat that holds it if yours does not)."
-                    .to_string(),
-            )
-        } else {
-            ExecResult::failure(
-                1,
-                "ps is not available in this shell.".to_string(),
-            )
+    async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+        let argv = match args.to_argv() {
+            Ok(argv) => argv,
+            Err(e) => return ExecResult::failure(2, format!("ps: {e}. {USAGE}")),
+        };
+        let mut all = false;
+        for arg in &argv {
+            match arg.as_str() {
+                "-a" | "--all" => all = true,
+                other => return ExecResult::failure(2, format!("ps: unknown argument '{other}'. {USAGE}")),
+            }
+        }
+        match self.operations.list_for_context(self.context) {
+            Ok(entries) => ExecResult::success(render(&entries, all, now_ms())),
+            Err(e) => ExecResult::failure(1, format!("ps: could not read this context's shell operations: {e}")),
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The status `list_shell_operations` reports for an operation.
+fn status(entry: &ShellOperationState) -> &'static str {
+    match &entry.envelope {
+        Some(envelope) => envelope.status.as_str(),
+        None if entry.receipt.ask_id.is_some() && entry.receipt.job_id.is_none() => "waiting",
+        None => "running",
+    }
+}
+
+fn elapsed(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+fn render(entries: &[ShellOperationState], all: bool, now: i64) -> String {
+    if entries.is_empty() {
+        return "no shell operations in this context\n".to_string();
+    }
+    let finished = entries.iter().filter(|e| e.completed_at.is_some()).count();
+    let shown: Vec<&ShellOperationState> = entries.iter().filter(|e| all || e.completed_at.is_none()).collect();
+    let mut out = String::new();
+    if !shown.is_empty() {
+        out.push_str(&format!("{:<36}  {:<8}  {:>7}  {:>4}  COMMAND\n", "OPERATION", "STATUS", "ELAPSED", "EXIT"));
+        for entry in shown {
+            let end = entry.completed_at.unwrap_or(now);
+            let exit = entry.envelope.as_ref().and_then(|e| e.exit_code).map_or("-".to_string(), |c| c.to_string());
+            let command = entry.source.lines().next().unwrap_or("");
+            out.push_str(&format!(
+                "{:<36}  {:<8}  {:>7}  {:>4}  {}\n",
+                entry.receipt.operation_id, status(entry), elapsed(end - entry.created_at), exit, command
+            ));
+        }
+    } else {
+        out.push_str("no unfinished shell operations in this context\n");
+    }
+    if !all && finished > 0 {
+        out.push_str(&format!("{finished} finished operation(s) not shown; ps -a lists them\n"));
+    }
+    out
 }

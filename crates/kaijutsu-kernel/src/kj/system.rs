@@ -244,12 +244,6 @@ impl KjDispatcher {
         )
     }
 
-    /// The same roster `kj system ps` renders, for the `ps` shell builtin
-    /// (`runtime/ps_builtin.rs`). One implementation, two front doors.
-    pub fn system_ps_public(&self) -> KjResult {
-        self.system_ps_inner()
-    }
-
     fn system_ps(&self, _caller: &KjCaller) -> KjResult {
         self.system_ps_inner()
     }

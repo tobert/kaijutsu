@@ -217,10 +217,14 @@ rule: kaijutsu's own agents may never call it, whatever else they hold.
 **This does not make the `ps` shadow pointless — it is what makes it
 safe.** `ToolRegistry` has no `remove`, so a kaijutsu shell cannot simply
 lack `ps`; without the shadow a coder would get kaish's **host** process
-table, which is strictly worse than getting ours. For a narrow seat the
-shadow should render a refusal that names the alternative (drift a
-question) rather than the roster. The `privileged` flag already threaded
-through `runtime/context_shell.rs` is the switch.
+table, which is strictly worse than getting ours. The shadow lists the
+context's **own** shell operations (`runtime/ps_builtin.rs`): unfinished ones
+by default, finished ones with `-a`, read from the registry
+`list_shell_operations` already exposes to every seat. It never leaves the
+context, so it needs no `system` authority and shows no other seat's work.
+Before 2026-10-03 it refused and named `kj system ps`, a door a coder cannot
+open; a benchmark run hit that dead end. Host processes a context's commands
+start are not listed, because nothing tracks them yet (`docs/issues.md`).
 
 ## Settled while building
 
