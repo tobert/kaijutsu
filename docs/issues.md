@@ -728,6 +728,13 @@ on current main"):
   calls). A read-only error now lists the mounts (in progress, branch
   `ro-mount-errors`). Still open: whether the coder orientation names the
   writable mounts up front.
+- **Writable mounts for benchmark containers: deferred** (Amy: "/git and
+  /srv be writeable and mapped into the workspace, seems the most logical
+  option… I don't want to inject mounts yet"). In the 20-task subset only
+  configure-git-webserver (`/git/server` is required; the webroot is the
+  model's choice) and sqlite-with-gcov (`/usr/local/bin/sqlite3`, or PATH)
+  write outside `/app` and `/tmp`; package installs run in host programs,
+  outside the mount table.
 
 ## A builtin `grep -r PATTERN /` killed the agent process (2026-10-01)
 
