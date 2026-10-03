@@ -3004,6 +3004,7 @@ esac
         d.kernel()
             .mount("/", crate::vfs::backends::LocalBackend::read_only("/"))
             .await;
+        d.kernel().mount("/work", crate::vfs::backends::MemoryBackend::new()).await;
         let caller = console_caller(&d);
         let mut args = vec!["context".to_string(), "create".into(), "orient".into(), "--type".into(), "coder".into()];
         if let Some(cwd) = cwd {
@@ -3097,8 +3098,16 @@ esac
             "all build test",
             "Widget parses bracket trees.",
             "README line 0",
+            "not task data",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        // The writable mounts, from the kernel's own table: a workspace
+        // mount shows, the kernel's own trees do not.
+        let writable = text.lines().find(|l| l.starts_with("writable:")).unwrap_or_else(|| panic!("no writable line in:\n{text}"));
+        assert!(writable.contains("/work"), "{writable}");
+        for kernel_tree in ["/config", "/v", "/dev", "/r ", "/run"] {
+            assert!(!writable.contains(kernel_tree), "{kernel_tree} in {writable}");
         }
         // Newest reflog entry first.
         let newest = text.find("parser handles nested brackets").unwrap();

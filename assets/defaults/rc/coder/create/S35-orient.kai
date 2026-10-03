@@ -46,6 +46,20 @@ stamp="$(date '+%Y-%m-%d %H:%M %z')"
 out="Orientation of the working directory, read at context create ($stamp). It does not update as you work.
 cwd: $cwd"
 
+# --- where kaijutsu's tools write ---
+# Read from the kernel's own mount table, leaving out its own trees. The
+# regex rides in --arg so the jq program needs no double quotes, which kaish
+# cannot parse inside a command substitution.
+kernel_trees='^/(config|run|v|r|dev)(/|$)'
+writable="$(kaish-mounts --json | jq -r --arg k "$kernel_trees" '[.mounts[] | select(.read_only | not) | .path | select(test($k) | not)] | sort | join(" ")' || true)"
+if test -n "$writable"; then
+  out="$out
+writable: $writable
+Kaijutsu's file tools and shell builtins write only under these; the rest of / is read-only to them."
+fi
+out="$out
+/v, /config, /r, and kj hold this session's own tools and history, not task data."
+
 # --- git: find .git at or above cwd ---
 top=""
 gitdir=""

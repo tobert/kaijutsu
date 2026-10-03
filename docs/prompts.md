@@ -147,6 +147,9 @@ from the required instruction-file reads described below.
 ```text
 Orientation of the working directory, read at context create (2026-10-01 10:31 -0400). It does not update as you work.
 cwd: /app
+writable: /app /git /srv /tmp
+Kaijutsu's file tools and shell builtins write only under these; the rest of / is read-only to them.
+/v, /config, /r, and kj hold this session's own tools and history, not task data.
 git: branch main at 01234567
 recent HEAD moves (reflog, newest first):
   01234567 commit: parser handles nested brackets
@@ -174,6 +177,12 @@ notification, never a cached system instruction.
 It reads only the cwd's files, with kaish builtins and `kj`; it runs no host
 program, so it works under any loadout. Sections:
 
+- `writable:` the read-write mounts in the kernel's mount table
+  (`kaish-mounts --json`), leaving out the kernel's own trees (`/config`,
+  `/run`, `/v`, `/r`, `/dev`), then a line saying the kernel's own trees and
+  `kj` hold no task data. A benchmark run spent about 70 calls finding the
+  write boundary, and three runs searched those trees for lost data or a
+  reference answer (`docs/benchmarks.md`, 2026-10-03).
 - `git:` the branch and HEAD read from `.git/HEAD`, loose refs, and
   `packed-refs`, found at or above the cwd, including a linked worktree. The
   last five reflog entries (`.git/logs/HEAD`) stand in for recent commits.
