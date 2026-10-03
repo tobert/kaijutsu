@@ -259,7 +259,7 @@ HARBOR_AGENT_TIMEOUT_MULTIPLIER=5 \
 ```
 
 Rootless task containers on moltar reach both: the tailnet name resolves
-inside the container. The kernel drops the factory `effort = max` on either
+inside the container. The kernel drops the factory `effort = high` on either
 endpoint with a warning (`effort has no sink on a non-hosted, non-DeepSeek
 OpenAI-compatible endpoint`), so these runs use each model's default
 reasoning.

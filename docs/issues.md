@@ -687,11 +687,16 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   policy does not cover; `runtime/llm_stream.rs` deliberately does not retry
   mid-stream to avoid duplicate kernel blocks. Bring partial-block handling to
   the design before changing it.
-- **The factory output ceiling is small for effort max.** `max_tokens` 16384
-  with effort max means reasoning spends the same budget, which is what
-  truncated the `write` call on `regex-log`. `kaijutsu-solo-acp --max-tokens
-  <N>` (2026-09-18, `docs/solo-acp.md`) lets a benchmark operator raise it;
-  every other caller of the factory default is unchanged.
+- **The factory output ceiling is small for DeepSeek's reasoning.**
+  `max_tokens` 16384 counts reasoning too; at effort `max` it truncated a
+  `write` on `regex-log` and, on 2026-10-03, ended three turns that reasoned
+  past it. The factory effort is now `high`, and the benchmark adapter passes
+  65536 on DeepSeek. Every other caller of the factory 16384 is unchanged;
+  a per-model ceiling would remove the single number.
+- **Harbor puts the provider key in process arguments.** `run-harbor.sh`
+  passes `--ae DEEPSEEK_API_KEY=…`, and Harbor's `docker-compose exec -e
+  DEEPSEEK_API_KEY=sk-…` shows the key to anyone running `ps` on the host
+  (seen 2026-10-03). Pass it through the environment or an env file instead.
 - **A process the model spawns can read the kernel's environment through
   `/proc/<pid>/environ`** when it runs as root, which is usual in task
   containers. kaish clears the child environment and `kaijutsu-solo-acp` clears
