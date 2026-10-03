@@ -441,6 +441,7 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-30 | `kj-tenchi-openssl-1` | `4bd76664…` → `12ed6d76` | qwen3.8-27b (tenchi vLLM) | same, multiplier 2 | 1 (openssl-selfsigned-cert) | 0 | n/a | 0 | 0 | 1 | first inference failed: `LLM stream idle for 120s` |
 | 2026-10-01 | `kj-tenchi-tb2-20-2` | `8635a93b…` → `4071fc68` | qwen3.8-27b (tenchi vLLM) | shipped coder, yolo sandbox gate, factory 16K ceiling, no key, idle 600 s, request 1800 s, multiplier 4, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 7 | 0.52M | 0 | 0 | 11 | no verdict line |
 | 2026-10-01 | `kj-ds4-tb2-20-1` | `1997713d…` → `6c8252c4` | deepseek-v4-flash | shipped coder with `done`, yolo sandbox gate, 32768 ceiling, multiplier 1, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 18 (0.90) | 3.57M | 0 | 0 | 2 | `done` on 15/15 turns that ended on their own; 15 done and solved |
+| 2026-10-03 | `kj-ds4-tb2-20-20261003`, `…b` | `0f37d0ee…` → `9283226c` | deepseek-v4-flash | shipped coder, yolo sandbox gate, **16384 ceiling** (unset), multiplier 1, 1 trial at once, moltar; Harbor died at 10 tasks and `…b` ran the other 10 | 20 (`tb2-subset.txt`) | 14 (0.70) | 2.93M | 0 | 0 | 4 | `done` on 17/17 turns that ended on their own; 14 done and solved |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -678,6 +679,47 @@ same-file edit ordering (ecc17787), the coder's own binding and one shell
 - **Input cost is reasoning replay.** The first inference is about 14.3K
   tokens; cobol-modernization and dna-assembly spent 10-14M input tokens over
   94-101 inferences.
+
+### deepseek-v4-flash at a 16K ceiling (2026-10-03)
+
+14 of 20, against 18 for `kj-ds4-tb2-20-1`. **The two runs differ in their
+output ceiling:** that baseline passed `max_tokens` 32768, and this one left it
+unset, so the factory 16384 applied at effort `max`. Binary 9283226c: the
+`[stderr]` marker, the "subset of bash" shell description, a guard that lets a
+shell run a script file, the coder's building rules, and wrapped `python`.
+
+| Task | Result | Ended | Tokens in | Inferences | Trial time |
+|---|---|---|---|---|---|
+| db-wal-recovery | fail | `done` | 14.4M | 114 | 978 s |
+| dna-assembly | fail | `token_ceiling` | 78K | 8 | 362 s |
+| headless-terminal | fail | `token_ceiling` | 40K | 7 | 593 s |
+| model-extraction-relu-logits | fail | `token_ceiling` | 28K | 5 | 362 s |
+| query-optimize | fail | `done` | 449K | 21 | 1390 s |
+| raman-fitting | fail | `done` | 7.13M | 66 | 1085 s |
+| extract-elf | pass | `done` | 13.1M | 133 | 918 s |
+| modernize-scientific-stack | pass | `done` | 104K | 8 | 84 s |
+
+The other 12 passed.
+
+- **Three losses were reasoning past the ceiling.** Each turn stopped on
+  `length` four times with 166-186K characters of reasoning and no tool call,
+  then ended. The adapter now passes 65536 on DeepSeek when `max_tokens` is
+  unset. Compare runs only at the same ceiling, read from provenance.
+- **db-wal-recovery destroyed its input.** The first `sqlite3` open deleted the
+  encrypted WAL it had to recover; the model then reconstructed records by
+  guessing and called `done`, disclosing the guess. The coder stance now says
+  to back up important files first and that a guessed result is not checked.
+- **query-optimize missed a timing check by 17%** while niced test builds ran
+  on the host; treat it as confounded.
+- **raman-fitting** fit the peaks in the wrong units.
+- **extract-elf passed**: the 10-01 loss came from `grep -r /` reading `/proc`,
+  which is now unlisted.
+- **configure-git-webserver** passed after about 70 calls finding that `/git`
+  was read-only to kaijutsu; refusals now list the mounts, and the adapter
+  mounts `/app`, `/git`, and `/srv` read-write.
+- 93 of 1056 tool calls failed. Three were guard parse denials; the rest were
+  ordinary program errors, missing files, read-only writes, and builtin gaps
+  (`docs/issues.md`, "From kj-ds4-tb2-20-20261003").
 
 ## Known limits
 
