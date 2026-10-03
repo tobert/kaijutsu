@@ -216,6 +216,7 @@ Settings ride environment variables, each of which has a matching
 | `KAIJUTSU_ACP_MAX_TOKENS` | `max_tokens` | `--max-tokens N`. Unset: 65536 on DeepSeek (V4's advertised output limit), else the factory ceiling, 16384. |
 | `KAIJUTSU_ACP_WORKSPACE_MOUNTS` | `workspace_mounts` | Comma-separated directories mounted read-write and made if missing, written to the state directory's `config/mounts.toml`. Unset: `/app,/git,/srv`. Empty: none. |
 | `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
+| `KAIJUTSU_ACP_EGRESS_ALLOW` | `egress_allow` | Comma-separated hosts the coder context's `curl` may reach (`docs/egress.md`). Unset: `*`, every host. Empty: none. The adapter adds `coder/create/S50-egress.kai` to the rc overlay; it runs `kj context set . --egress-allow HOST` as the root character `solo`, the context's lineage root. It refuses an overlay that already has that file, and a `--context-type` in `solo_args`. |
 | `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |
 | `KAIJUTSU_ACP_BACKEND` | `backend_kind` | The provider. Unset: `deepseek`. |
 | `KAIJUTSU_ACP_BASE_URL` | `base_url` | `--base-url URL`, an OpenAI-compatible endpoint. Unset: the provider's own. |
@@ -338,7 +339,7 @@ multiplier, binary and gate paths, the key's variable name, Harbor's exit
 status. `<job>/<trial>/agent/kaijutsu-provenance.json` records what ran:
 `binary.sha256` and size, `gate.sha256`, `worktree.head` and whether it was
 dirty, backend and model, `max_tokens`, the rc overlay and its
-hash, the CA bundle, and the state directory.
+hash, the egress hosts and their script, the CA bundle, and the state directory.
 
 To map a binary back to a commit, match `binary.sha256` against
 `BUILD_INFO.json`, which `build-static.sh` writes beside the binaries and into

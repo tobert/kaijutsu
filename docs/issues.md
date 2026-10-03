@@ -740,8 +740,9 @@ on current main"):
   question).
 - **The `curl` builtin's egress allowlist** refused pypi.org and
   sourceforge.net while host `pip` and `apt-get` reached the network in the
-  same container. Open: open it for benchmarks, or keep it and say in the
-  refusal that the allowlist is kaijutsu's.
+  same container. Benchmarks now open it (`egress_allow`, default `*`,
+  `docs/benchmarks.md`). Open: say in the refusal that the allowlist is
+  kaijutsu's.
 - **Three losses were reasoning past a 16K ceiling** (dna-assembly,
   headless-terminal, model-extraction-relu-logits): 4 `length` stops each,
   166-186K characters of reasoning, no tool call. The baseline ran with

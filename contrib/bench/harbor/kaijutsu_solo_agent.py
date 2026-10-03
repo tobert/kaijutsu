@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import uuid
@@ -52,6 +53,7 @@ NO_KEY_ENV = "KAIJUTSU_ACP_NO_KEY"
 IDLE_TIMEOUT_ENV = "KAIJUTSU_ACP_IDLE_TIMEOUT"
 REQUEST_TIMEOUT_ENV = "KAIJUTSU_ACP_REQUEST_TIMEOUT"
 WORKSPACE_MOUNTS_ENV = "KAIJUTSU_ACP_WORKSPACE_MOUNTS"
+EGRESS_ALLOW_ENV = "KAIJUTSU_ACP_EGRESS_ALLOW"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -65,6 +67,20 @@ DEEPSEEK_MAX_OUTPUT_TOKENS = 65536
 #: missing: the task's own workspace, a git server's repositories, and a
 #: service's files (Amy, 2026-10-03).
 DEFAULT_WORKSPACE_MOUNTS = ("/app", "/git", "/srv")
+#: Hosts the coder context's `curl` may reach in a benchmark run: every host
+#: (Amy, 2026-10-03, "open curl"). Kaijutsu's own default stays an empty
+#: list (`docs/egress.md`).
+DEFAULT_EGRESS_ALLOW = ("*",)
+#: Where the egress script lands in the rc overlay. Solo-acp creates a
+#: `coder` context unless `--context-type` says otherwise, and the script
+#: runs in that context's create lifecycle as its creator, the root
+#: character `solo`, which is the context's lineage root and so may change
+#: its egress list (`docs/egress.md`, "Who changes the list").
+EGRESS_SCRIPT = PurePosixPath("coder/create/S50-egress.kai")
+#: A host as `kj context set --egress-allow` takes it: `*`, a DNS name, or a
+#: loopback literal. The kernel validates it fully; this keeps the value safe
+#: to place inside single quotes in the script.
+_EGRESS_HOST = re.compile(r"\*|[A-Za-z0-9.:-]+")
 
 #: Backends `kaijutsu-solo-acp --backend-kind` accepts in a release build.
 SOLO_BACKEND_KINDS = ("anthropic", "deepseek", "openai")
@@ -300,6 +316,15 @@ class KaijutsuSoloOptions(AcpOptions):
             "which keeps the seeded rc tree unchanged."
         ),
     )
+    egress_allow: str | None = Field(
+        default=None,
+        description=(
+            "Comma-separated hosts the coder context's curl may reach, '*' "
+            "for every host. Applied by an rc create script, "
+            f"{EGRESS_SCRIPT}, added to the rc overlay. Empty means none. "
+            f"Default: ${EGRESS_ALLOW_ENV}, else {','.join(DEFAULT_EGRESS_ALLOW)}."
+        ),
+    )
 
 
 class KaijutsuSoloAcp(AcpAgent):
@@ -326,6 +351,7 @@ class KaijutsuSoloAcp(AcpAgent):
         max_tokens: int | str | None = None,
         workspace_mounts: str | None = None,
         rc_overlay: str | None = None,
+        egress_allow: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
         no_key: bool | str | None = None,
@@ -456,6 +482,31 @@ class KaijutsuSoloAcp(AcpAgent):
             )
             self._rc_overlay_hash = _dir_content_hash(self._rc_overlay)
 
+        egress_raw = egress_allow if egress_allow is not None else os.environ.get(EGRESS_ALLOW_ENV)
+        if egress_raw is None:
+            self._egress_allow: list[str] = list(DEFAULT_EGRESS_ALLOW)
+        else:
+            self._egress_allow = [h.strip() for h in egress_raw.split(",") if h.strip()]
+        for host in self._egress_allow:
+            if not _EGRESS_HOST.fullmatch(host):
+                raise ValueError(
+                    f"egress host {host!r} must be '*', a DNS name, or a loopback "
+                    f"literal (--ak egress_allow=... or ${EGRESS_ALLOW_ENV})"
+                )
+        if self._egress_allow:
+            if any(a == "--context-type" or a.startswith("--context-type=") for a in self._solo_args):
+                raise ValueError(
+                    "egress_allow is applied by a coder create script, and "
+                    "solo_args chooses another context type. Set "
+                    "egress_allow= (empty) or drop --context-type."
+                )
+            if self._rc_overlay is not None and (self._rc_overlay / EGRESS_SCRIPT).exists():
+                raise ValueError(
+                    f"rc overlay {self._rc_overlay} already has {EGRESS_SCRIPT}, "
+                    "where egress_allow writes its script. Rename one, or set "
+                    "egress_allow= (empty) and keep the overlay's."
+                )
+
         # A reused container must not silently continue the previous kernel's
         # contexts and transcript, so each constructed agent gets its own state
         # directory. The steps of one multi-step trial share it, which is the
@@ -573,9 +624,14 @@ class KaijutsuSoloAcp(AcpAgent):
             args += ["--gate-config", self.REMOTE_GATE.as_posix()]
         if self._max_tokens is not None:
             args += ["--max-tokens", str(self._max_tokens)]
-        if self._rc_overlay is not None:
+        if self._rc_overlay is not None or self._egress_allow:
             args += ["--rc-overlay", self.REMOTE_RC_OVERLAY.as_posix()]
         return args + self._solo_args
+
+    def _egress_script(self) -> str:
+        """The create script that sets the egress list, one atomic `kj` call."""
+        flags = " ".join(f"--egress-allow '{host}'" for host in self._egress_allow)
+        return f"set -e\nkj context set . {flags}\n"
 
     def _registry_entry_payload(self) -> dict[str, Any]:
         """The ACP registry entry Harbor's launcher is built from."""
@@ -669,6 +725,15 @@ class KaijutsuSoloAcp(AcpAgent):
                 if self._rc_overlay is not None
                 else {"installed": False}
             ),
+            "egress_allow": {
+                "hosts": self._egress_allow,
+                "script": self._egress_script() if self._egress_allow else None,
+                "remote_path": (
+                    (self.REMOTE_RC_OVERLAY / EGRESS_SCRIPT).as_posix()
+                    if self._egress_allow
+                    else None
+                ),
+            },
             "worktree": {
                 "path": str(self._worktree),
                 "head": self._git_head,
@@ -749,6 +814,20 @@ class KaijutsuSoloAcp(AcpAgent):
                 source_dir=self._rc_overlay,
                 target_dir=self.REMOTE_RC_OVERLAY.as_posix(),
             )
+        if self._egress_allow:
+            # Added beside the user's overlay files; __init__ refused a
+            # collision at this path.
+            script = self.logs_dir / "rc-egress.kai"
+            script.write_text(self._egress_script())
+            remote_script = self.REMOTE_RC_OVERLAY / EGRESS_SCRIPT
+            await self.exec_as_root(
+                environment,
+                command=f"mkdir -p {shlex.quote(remote_script.parent.as_posix())}",
+            )
+            await environment.upload_file(
+                source_path=script, target_path=remote_script.as_posix()
+            )
+        if self._rc_overlay is not None or self._egress_allow:
             chmod += f" && chmod -R a+rX {shlex.quote(self.REMOTE_RC_OVERLAY.as_posix())}"
         # The agent user must be able to read and run both, and to write state.
         # Inside a disposable task container that is deliberately permissive.
