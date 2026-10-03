@@ -55,6 +55,11 @@ effective reviewer, or its director (`kj/context.rs`, `context_set` and
 `caller_may_assign_performer`). A model-played context is none of those for
 itself, so it cannot widen its own list. `kj context info` shows the list.
 
+An rc create script's `kj` acts as the context's creator, so a script may
+set the list when the creator holds that authority. The benchmark adapter
+opens egress this way (`docs/benchmarks.md`, `egress_allow`); kaijutsu ships no
+such script.
+
 `kj fork` copies the parent's rows to the child, so a child starts with what
 its parent had and no more. `kj context create` starts with an empty list.
 

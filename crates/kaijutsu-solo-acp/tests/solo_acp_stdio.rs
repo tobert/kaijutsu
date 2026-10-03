@@ -547,6 +547,48 @@ fn an_rc_overlay_marker_reaches_the_contexts_system_instructions() {
     );
 }
 
+/// The benchmark adapter opens egress with an overlay create script that
+/// runs `kj context set . --egress-allow '*'`. On this binary's real path
+/// the rc shell acts as the root character `solo`, which created the
+/// session's coder context and is its lineage root, so the change is
+/// allowed and lands on the context. Observable: reopen `kernel.db` after
+/// exit and read the context's egress rows.
+#[test]
+fn an_rc_overlay_create_script_opens_the_sessions_egress() {
+    let state = scratch_dir("rc-egress-state").join("state");
+    let overlay = scratch_dir("rc-egress-variant");
+    let create = overlay.join("coder").join("create");
+    std::fs::create_dir_all(&create).expect("create the overlay's coder dir");
+    std::fs::write(create.join("S50-egress.kai"), "set -e\nkj context set . --egress-allow '*'\n")
+        .expect("write the overlay egress script");
+
+    let mut agent = spawn_mock_with(
+        "chat",
+        &[
+            "--state-dir",
+            state.to_str().expect("utf-8 state path"),
+            "--rc-overlay",
+            overlay.to_str().expect("utf-8 overlay path"),
+        ],
+    );
+    agent.initialize().expect("initialize");
+    let session = agent.new_session(&scratch_dir("rc-egress-cwd")).expect("session/new");
+
+    let status = close_stdin_and_wait(&mut agent, Duration::from_secs(60));
+    assert_eq!(status.code(), Some(0), "a clean exit checkpoints the db\n--- stderr ---\n{}", agent.stderr());
+
+    let context_id = kaijutsu_types::ContextId::parse(&session)
+        .unwrap_or_else(|e| panic!("session id {session:?} is not a context id: {e}"));
+    let db = kaijutsu_kernel::kernel_db::KernelDb::open(state.join("kernel.db"))
+        .expect("reopen the kernel db the binary just closed");
+    assert_eq!(
+        db.list_context_egress(context_id).expect("read the egress rows"),
+        vec!["*".to_string()],
+        "the overlay's create script must open egress\n--- stderr ---\n{}",
+        agent.stderr()
+    );
+}
+
 /// `session/new` creates the coder context in the session cwd, so its create
 /// lifecycle already sees that cwd: the shipped orientation script describes
 /// the session directory, not the kernel's own.

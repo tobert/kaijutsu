@@ -6417,6 +6417,96 @@ mod tests {
         assert!(d.kernel_db().lock().list_context_egress(id).unwrap().is_empty());
     }
 
+    /// A coder context's rc create lifecycle may widen the egress list of the
+    /// context it is creating, when the creator holds the authority
+    /// `docs/egress.md` names. The setup mirrors kaijutsu-solo-acp: the
+    /// root character `solo` plays the root context and creates a `coder`
+    /// context under it, performed by `coder`. The rc shell's `kj` acts as
+    /// the creator, which is the new context's lineage root. The benchmark
+    /// overlay relies on this; a change to who rc acts as fails here.
+    /// Afterwards the context's own shell builds `curl` with that list, so
+    /// a request to a non-loopback name gets past the egress check and
+    /// fails at name resolution instead (`.invalid` never resolves).
+    #[test]
+    fn a_create_script_may_open_egress_on_the_context_it_creates() {
+        crate::on_rc_thread(a_create_script_may_open_egress_on_the_context_it_creates_body);
+    }
+
+    async fn a_create_script_may_open_egress_on_the_context_it_creates_body() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        let solo = PrincipalId::new();
+        let coder = PrincipalId::new();
+        for (principal_id, name, root) in [(solo, "solo", true), (coder, "coder", false)] {
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id, name: name.into(), created_at: 0, retired_at: None, handoff_ctx: None, root_ctx: None, root,
+            }).unwrap();
+        }
+        let root = register_context(&d, Some("solo"), None, solo);
+        d.kernel_db().lock().update_context_review(root, Some(solo), None).unwrap();
+        install_rc_script_file(
+            &d,
+            "/config/rc/coder/create/S50-egress.kai",
+            "set -e\nkj context set . --egress-allow '*'\n",
+        )
+        .await;
+
+        let solo_call = crate::kj::KjCaller {
+            principal_id: solo, actor_id: solo, reviewer_id: None, context_id: Some(root),
+            session_id: kaijutsu_types::SessionId::new(), confirmed: false, rc_depth: 0, privileged: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
+        let created = d
+            .dispatch(&[s("context"), s("create"), s("bench"), s("--type"), s("coder"), s("--as"), s("coder")], &solo_call)
+            .await;
+        assert!(created.is_ok(), "{}", created.message());
+        let kid = d.kernel_db().lock().resolve_context("bench").expect("the coder context exists");
+        assert_eq!(d.kernel_db().lock().lineage_root(kid).unwrap(), solo, "solo is the new context's lineage root");
+
+        let errors: Vec<String> = d
+            .block_store()
+            .block_snapshots(kid)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.kind == kaijutsu_types::BlockKind::Error)
+            .map(|b| b.content)
+            .collect();
+        assert!(
+            !errors.iter().any(|e| e.contains("S50-egress")),
+            "the egress script must run without an error block: {errors:#?}"
+        );
+        assert_eq!(d.kernel_db().lock().list_context_egress(kid).unwrap(), vec!["*".to_string()]);
+
+        let info = d.dispatch(&[s("context"), s("info"), s("bench")], &solo_call).await;
+        assert!(info.is_ok(), "{}", info.message());
+        assert!(info.message().contains("\nEgress:\n  *"), "kj context info shows the egress list:\n{}", info.message());
+
+        let shell = crate::runtime::embedded_kaish::EmbeddedKaish::for_context(
+            &d,
+            "bench-egress",
+            crate::runtime::context_shell::ShellIdentity {
+                requester: solo, performer: coder, reviewer: Some(solo), context: kid,
+                session: kaijutsu_types::SessionId::new(),
+            },
+            crate::runtime::context_shell::ShellPolicy::Agent,
+            crate::runtime::context_shell::ShellCwd::Context,
+            None,
+            std::sync::Arc::new(crate::runtime::synthesis::NoopBlockSource),
+        )
+        .await
+        .expect("build the coder context's shell");
+        let r = shell
+            .execute_with_options("curl --max-time 5 https://kaijutsu-egress-probe.invalid/", kaish_kernel::ExecuteOptions::default())
+            .await
+            .unwrap();
+        assert!(!r.ok(), "an .invalid name never resolves: {}", r.err);
+        assert!(
+            !r.err.contains("egress allowlist"),
+            "curl must get past the egress check and fail later: {}",
+            r.err
+        );
+    }
+
     #[tokio::test]
     async fn context_create_musician_arms_the_beat() {
         // A musician created via `kj` MUST arm the beat scheduler. The OODA Act
