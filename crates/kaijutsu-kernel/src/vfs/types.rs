@@ -445,3 +445,25 @@ mod tests {
         assert!(create.write);
     }
 }
+
+/// What serves a mount, as a refused write lists it (`docs/mounts.md`,
+/// "When a write is refused").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountKind {
+    /// A host directory.
+    Host,
+    /// A tree the kernel serves itself (`/v/cas`, `/run/*`, `/r`).
+    Kernel,
+    /// Files held in the kernel's memory.
+    Memory,
+}
+
+impl std::fmt::Display for MountKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MountKind::Host => "host",
+            MountKind::Kernel => "kernel",
+            MountKind::Memory => "memory",
+        })
+    }
+}

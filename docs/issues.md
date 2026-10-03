@@ -905,6 +905,28 @@ kaish note.
 recurs, have `wait_child` report the read error and retry it, instead of
 panicking on the first one.
 
+## Read-only refusals that name the mounts: what stays open (2026-10-03)
+
+A refused write now names the mount and lists the writable ones
+(`docs/mounts.md`, "When a write is refused"). Open:
+
+- **kaish prints `invalid operation:` before the text.** kaish's
+  `BackendError::ReadOnly` carries no text, so `MountBackend` hands the
+  refusal over as `InvalidOperation`. A kaish variant that carries text
+  (`ReadOnly` with a reason, or a new one under `#[non_exhaustive]`) would
+  print `touch: /git/x: read-only: kaijutsu mounts / read-only. …`. Needs a
+  kaish release and a rev bump here.
+- **kaish `cp` drops the destination path on a write error.**
+  `cp /app/hook /etc/hook` prints `cp: invalid operation: kaijutsu mounts /
+  read-only. …` with no `/etc/hook`; `name_error` names only source paths.
+  It did the same with the bare `read-only filesystem`. Upstream kaish.
+- **kaish's own mounts refuse with their own text.** In a shell, `/dev`,
+  `/v/docs`, `/v/jobs`, and `/v/bin` are kaish's mounts, not the kernel's,
+  so a write there does not list the kernel's mounts.
+- **Writable `/config/*` trees are listed as rw.** They are writable, so the
+  list names them; whether a refusal should point a model at its own
+  configuration is open.
+
 ## Wrapped python: what stays open (2026-10-03)
 
 `python3` and `python` are wrapped commands and `KJ_TOOL_PLAN` names their

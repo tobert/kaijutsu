@@ -82,10 +82,16 @@ async fn the_hosts_etc_is_refused_by_the_read_only_root_like_any_host_path() {
             .write_all(Path::new(host_path), b"nope")
             .await
             .expect_err("a write under the read-only host root must be refused");
-        assert!(
-            matches!(err, kaijutsu_kernel::vfs::VfsError::ReadOnly),
+        assert_eq!(
+            err.kind(),
+            kaijutsu_types::VfsErrorKind::ReadOnly,
             "{host_path} must be refused as read-only, got {err:?}"
         );
+        assert!(
+            err.to_string().starts_with(&format!("{host_path}: kaijutsu mounts / read-only.")),
+            "the refusal names the read-only root: {err}"
+        );
+        assert!(err.to_string().contains("\n  /tmp "), "the refusal lists writable /tmp: {err}");
         assert!(
             !std::path::Path::new(host_path).exists(),
             "{host_path} must not have been created"
@@ -166,4 +172,34 @@ async fn a_declared_tree_is_mounted_where_it_was_declared() {
         .await
         .expect("declared rc reads");
     assert!(!listed.is_empty(), "the declared rc tree serves its contents");
+}
+
+/// A write into a tree the kernel serves itself names that tree, and a write
+/// to a directory only the mount table knows (`/v`, `/config`) names the root
+/// that owns it, with the writable mounts listed either way.
+#[tokio::test]
+async fn a_refused_write_in_a_kernel_tree_names_that_tree() {
+    let root = tempfile::tempdir().expect("config root");
+    let data = tempfile::tempdir().expect("data dir");
+    let mounts = ConfigMounts::new(root.path());
+
+    support::init_root(data.path(), "tester");
+    let shared = kaijutsu_server::rpc::create_shared_kernel(None, &mounts, Some(data.path()), &[], &[])
+        .await
+        .expect("kernel boots");
+    let vfs = shared.kernel.vfs();
+
+    for (path, mount) in [
+        ("/v/cas/probe", "/v/cas"),
+        ("/dev/kaijutsu-probe", "/dev"),
+        ("/run/roster/probe", "/run/roster"),
+        ("/v/probe", "/"),
+        ("/config/probe", "/"),
+    ] {
+        let err = vfs.write_all(Path::new(path), b"nope").await.expect_err("refused");
+        let text = err.to_string();
+        assert_eq!(err.kind(), kaijutsu_types::VfsErrorKind::ReadOnly, "{path}: {text}");
+        assert!(text.starts_with(&format!("{path}: kaijutsu mounts {mount} read-only.")), "{text}");
+        assert!(text.contains("\n  /tmp ") && text.contains(" rw  host"), "{text}");
+    }
 }

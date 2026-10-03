@@ -211,6 +211,7 @@ fn status_for(err: &VfsError) -> StatusCode {
         VfsError::NotFound(_) | VfsError::NoMountPoint(_) => StatusCode::NoSuchFile,
         VfsError::PermissionDenied(_)
         | VfsError::ReadOnly
+        | VfsError::ReadOnlyMount(_)
         | VfsError::PathEscapesRoot(_) => StatusCode::PermissionDenied,
         _ => StatusCode::Failure,
     }

@@ -18,9 +18,15 @@ pub enum VfsError {
     #[error("permission denied: {0}")]
     PermissionDenied(String),
 
-    /// Filesystem is read-only.
+    /// Filesystem is read-only. A backend's own refusal; `MountTable`
+    /// replaces it with [`VfsError::ReadOnlyMount`].
     #[error("filesystem is read-only")]
     ReadOnly,
+
+    /// A write refused under a read-only mount, naming the mount and listing
+    /// where kaijutsu can write (`docs/mounts.md`, "When a write is refused").
+    #[error("{0}")]
+    ReadOnlyMount(Box<ReadOnlyMount>),
 
     /// Expected a directory.
     #[error("not a directory: {0}")]
@@ -136,7 +142,7 @@ impl VfsError {
             // An escaping path is refused, not missing — saying NotFound
             // would invite the caller to create it.
             VfsError::PermissionDenied(_) | VfsError::PathEscapesRoot(_) => K::PermissionDenied,
-            VfsError::ReadOnly => K::ReadOnly,
+            VfsError::ReadOnly | VfsError::ReadOnlyMount(_) => K::ReadOnly,
             VfsError::NotADirectory(_) => K::NotADirectory,
             VfsError::IsADirectory(_) => K::IsADirectory,
             VfsError::DirectoryNotEmpty(_) => K::NotEmpty,
@@ -260,6 +266,9 @@ impl From<VfsError> for io::Error {
             VfsError::ReadOnly => {
                 io::Error::new(io::ErrorKind::PermissionDenied, "filesystem is read-only")
             }
+            VfsError::ReadOnlyMount(refusal) => {
+                io::Error::new(io::ErrorKind::PermissionDenied, refusal.to_string())
+            }
             VfsError::NotADirectory(msg) => io::Error::new(io::ErrorKind::NotADirectory, msg),
             VfsError::IsADirectory(msg) => io::Error::new(io::ErrorKind::IsADirectory, msg),
             VfsError::DirectoryNotEmpty(msg) => {
@@ -286,6 +295,69 @@ impl From<VfsError> for io::Error {
 
 /// VFS result type.
 pub type VfsResult<T> = Result<T, VfsError>;
+
+/// Rows a refusal lists in full; a longer mount table keeps only the
+/// writable mounts and the refusing one.
+pub const REFUSAL_MOUNT_ROWS: usize = 10;
+
+/// One mount as a refused write lists it, like a line of mtab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountRow {
+    /// The mount point, such as `/app`.
+    pub path: String,
+    /// Whether kaijutsu mounts it read-only.
+    pub read_only: bool,
+    /// What serves it.
+    pub kind: super::types::MountKind,
+}
+
+/// A write refused under a read-only mount, with the mounts it lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyMount {
+    /// The path the write named.
+    pub path: String,
+    /// The mount point that contains `path`.
+    pub mount: String,
+    /// Whether that mount is read-only as a whole. False when a writable
+    /// mount refused this one path.
+    pub mount_read_only: bool,
+    /// The mounts listed, in path order.
+    pub rows: Vec<MountRow>,
+    /// Read-only mounts left out of `rows`.
+    pub omitted: usize,
+}
+
+impl ReadOnlyMount {
+    /// The refusal without the path: the cause and the mount list. kaish
+    /// prints the path itself (`touch: PATH: ...`), so its text starts here.
+    pub fn reason(&self) -> String {
+        let mut out = if self.mount_read_only {
+            format!("kaijutsu mounts {} read-only.", self.mount)
+        } else {
+            format!("the mount {} is read-only at this path.", self.mount)
+        };
+        out.push_str(" Writable mounts are marked rw:");
+        let width = self.rows.iter().map(|row| row.path.len()).max().unwrap_or(0);
+        for row in &self.rows {
+            let access = if row.read_only { "ro" } else { "rw" };
+            out.push_str(&format!("\n  {:width$}  {access}  {}", row.path, row.kind));
+        }
+        if self.omitted > 0 {
+            let mounts = if self.omitted == 1 { "mount" } else { "mounts" };
+            out.push_str(&format!(
+                "\n  {} read-only {mounts} not shown; run kaish-mounts to list every mount",
+                self.omitted
+            ));
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for ReadOnlyMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path, self.reason())
+    }
+}
 
 #[cfg(test)]
 mod tests {

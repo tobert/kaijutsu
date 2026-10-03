@@ -230,6 +230,10 @@ fn vfs_to_backend(err: VfsError) -> BackendError {
         VfsError::AlreadyExists(msg) => BackendError::AlreadyExists(msg),
         VfsError::PermissionDenied(msg) => BackendError::PermissionDenied(msg),
         VfsError::ReadOnly => BackendError::ReadOnly,
+        // kaish's `ReadOnly` carries no text, and kaish prints the path
+        // itself; `InvalidOperation` keeps the mount list intact through
+        // builtins, `cp`, and redirects.
+        VfsError::ReadOnlyMount(refusal) => BackendError::InvalidOperation(refusal.reason()),
         VfsError::NotADirectory(msg) => BackendError::NotDirectory(msg),
         VfsError::IsADirectory(msg) => BackendError::IsDirectory(msg),
         VfsError::DirectoryNotEmpty(msg) => {

@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::ops::VfsOps;
-use crate::vfs::types::{DirEntry, FileAttr, FileType, SetAttr, StatFs};
+use crate::vfs::types::{DirEntry, FileAttr, FileType, MountKind, SetAttr, StatFs};
 
 /// Entry in the memory filesystem.
 #[derive(Debug, Clone)]
@@ -544,6 +544,10 @@ impl VfsOps for MemoryBackend {
 
     fn read_only(&self) -> bool {
         false
+    }
+
+    fn mount_kind(&self) -> MountKind {
+        MountKind::Memory
     }
 
     async fn statfs(&self) -> VfsResult<StatFs> {

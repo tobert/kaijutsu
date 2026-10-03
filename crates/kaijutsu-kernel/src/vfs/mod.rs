@@ -30,12 +30,12 @@ pub use backends::{
     CasFs, LocalBackend, MemoryBackend, RosterFs, SHARE_OP_TIMEOUT, ShareFs, ShareRegisterError,
     ShareRegistry, ShareRow,
 };
-pub use error::{VfsError, VfsResult};
+pub use error::{MountRow, ReadOnlyMount, VfsError, VfsResult};
 pub use mount::{
     MountInfo, MountTable, SNAPSHOT_MAX_DEPTH, SNAPSHOT_MAX_ENTRIES, BASELINE_GENERATION,
 };
 pub use ops::{STREAM_CHUNK_SIZE, VfsOps};
 pub use pump::{CasSink, PumpError, PumpOutcome, PumpSink, SinkError, VfsSink, pump as pump_stream};
 pub use types::{
-    DirEntry, FileAttr, FileType, OpenFlags, SetAttr, SnapshotNode, SnapshotResult, StatFs,
+    DirEntry, FileAttr, FileType, MountKind, OpenFlags, SetAttr, SnapshotNode, SnapshotResult, StatFs,
 };

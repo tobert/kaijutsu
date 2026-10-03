@@ -9,7 +9,7 @@ use futures::stream::BoxStream;
 use std::path::{Path, PathBuf};
 
 use super::VfsResult;
-use super::types::{DirEntry, FileAttr, SetAttr, StatFs};
+use super::types::{DirEntry, FileAttr, MountKind, SetAttr, StatFs};
 
 /// Chunk size for [`VfsOps::open_read_stream`]'s default loop-`read`
 /// implementation. Matches `MAX_READ_LEN` in `crates/kaijutsu-server/src/sftp.rs`
@@ -133,6 +133,12 @@ pub trait VfsOps: Send + Sync {
     /// keep the `None` default.
     fn real_root(&self) -> Option<PathBuf> {
         None
+    }
+
+    /// What serves this mount: a host directory when [`Self::real_root`] names
+    /// one, otherwise a kernel tree. An in-memory backend says so itself.
+    fn mount_kind(&self) -> MountKind {
+        if self.real_root().is_some() { MountKind::Host } else { MountKind::Kernel }
     }
 
     // ========================================================================

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
-use super::error::{VfsError, VfsResult};
+use super::error::{MountRow, REFUSAL_MOUNT_ROWS, ReadOnlyMount, VfsError, VfsResult};
 use super::ops::VfsOps;
 use super::types::{DirEntry, FileAttr, FileType, SetAttr, SnapshotNode, SnapshotResult, StatFs};
 
@@ -205,6 +205,51 @@ impl MountTable {
         match self.find_mount(path).await {
             Ok((fs, _)) => !fs.read_only(),
             Err(_) => false,
+        }
+    }
+
+    /// The refusal for a write to `path` under a read-only mount: the mount
+    /// that contains `path` and where kaijutsu can write. Every mount is
+    /// listed when there are at most [`REFUSAL_MOUNT_ROWS`]; otherwise the
+    /// writable mounts and the containing one, with a count of the rest.
+    /// `docs/mounts.md`, "When a write is refused".
+    pub async fn read_only_refusal(&self, path: &Path) -> VfsError {
+        let path = Self::normalize_mount_path(path.to_path_buf());
+        let (mount, mount_read_only) = match self.owner_of(&path).await {
+            Some((mount, fs)) => (mount, fs.read_only()),
+            None => return VfsError::no_mount_point(path.display().to_string()),
+        };
+        let mounts = self.mounts.read().await;
+        let all: Vec<MountRow> = mounts
+            .iter()
+            .map(|(point, fs)| MountRow {
+                path: point.display().to_string(),
+                read_only: fs.read_only(),
+                kind: fs.mount_kind(),
+            })
+            .collect();
+        let total = all.len();
+        let rows: Vec<MountRow> = if total <= REFUSAL_MOUNT_ROWS {
+            all
+        } else {
+            let mount = mount.display().to_string();
+            all.into_iter().filter(|row| !row.read_only || row.path == mount).collect()
+        };
+        VfsError::ReadOnlyMount(Box::new(ReadOnlyMount {
+            path: path.display().to_string(),
+            mount: mount.display().to_string(),
+            mount_read_only,
+            omitted: total - rows.len(),
+            rows,
+        }))
+    }
+
+    /// Replace a backend's bare [`VfsError::ReadOnly`] for `path` with
+    /// [`Self::read_only_refusal`]; any other result passes through.
+    async fn name_refusal<T>(&self, path: &Path, result: VfsResult<T>) -> VfsResult<T> {
+        match result {
+            Err(VfsError::ReadOnly) => Err(self.read_only_refusal(path).await),
+            other => other,
         }
     }
 
@@ -1055,14 +1100,14 @@ impl VfsOps for MountTable {
     // (`activity.rs`), and this is exactly the heat it reports.
     async fn write(&self, path: &Path, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let (fs, relative) = self.find_mount(path).await?;
-        let n = fs.write(&relative, offset, data).await?;
+        let n = self.name_refusal(path, fs.write(&relative, offset, data).await).await?;
         self.bump_activity(&Self::parent_dir(path));
         Ok(n)
     }
 
     async fn create(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        let attr = fs.create(&relative, mode).await?;
+        let attr = self.name_refusal(path, fs.create(&relative, mode).await).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
@@ -1070,7 +1115,7 @@ impl VfsOps for MountTable {
 
     async fn mkdir(&self, path: &Path, mode: u32) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        let attr = fs.mkdir(&relative, mode).await?;
+        let attr = self.name_refusal(path, fs.mkdir(&relative, mode).await).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
@@ -1078,7 +1123,7 @@ impl VfsOps for MountTable {
 
     async fn unlink(&self, path: &Path) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.unlink(&relative).await?;
+        self.name_refusal(path, fs.unlink(&relative).await).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
         Ok(())
@@ -1086,7 +1131,7 @@ impl VfsOps for MountTable {
 
     async fn rmdir(&self, path: &Path) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.rmdir(&relative).await?;
+        self.name_refusal(path, fs.rmdir(&relative).await).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
         Ok(())
@@ -1102,7 +1147,7 @@ impl VfsOps for MountTable {
             return Err(VfsError::CrossDeviceLink);
         }
 
-        from_fs.rename(&from_relative, &to_relative).await?;
+        self.name_refusal(from, from_fs.rename(&from_relative, &to_relative).await).await?;
         // A rename changes the name-set of BOTH parents (the source loses a
         // name, the destination gains one), even when they're the same
         // directory — bumping twice there is harmlessly redundant, still
@@ -1124,14 +1169,14 @@ impl VfsOps for MountTable {
     // name-set untouched.
     async fn truncate(&self, path: &Path, size: u64) -> VfsResult<()> {
         let (fs, relative) = self.find_mount(path).await?;
-        fs.truncate(&relative, size).await?;
+        self.name_refusal(path, fs.truncate(&relative, size).await).await?;
         self.bump_activity(&Self::parent_dir(path));
         Ok(())
     }
 
     async fn setattr(&self, path: &Path, attr: SetAttr) -> VfsResult<FileAttr> {
         let (fs, relative) = self.find_mount(path).await?;
-        let attr = fs.setattr(&relative, attr).await?;
+        let attr = self.name_refusal(path, fs.setattr(&relative, attr).await).await?;
         self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
     }
@@ -1154,7 +1199,7 @@ impl VfsOps for MountTable {
         } else {
             target
         };
-        let attr = fs.symlink(&relative, target).await?;
+        let attr = self.name_refusal(path, fs.symlink(&relative, target).await).await?;
         self.bump_generation(&Self::parent_dir(path));
         self.bump_activity(&Self::parent_dir(path));
         Ok(attr)
@@ -1169,7 +1214,7 @@ impl VfsOps for MountTable {
             return Err(VfsError::CrossDeviceLink);
         }
 
-        let attr = old_fs.link(&old_relative, &new_relative).await?;
+        let attr = self.name_refusal(newpath, old_fs.link(&old_relative, &new_relative).await).await?;
         // Only newpath's parent gains a name; oldpath's parent's listing is
         // unchanged (a hard link doesn't remove the original name). Same
         // reasoning for activity: the heat lands where the new name appeared.
@@ -2483,5 +2528,192 @@ mod tests {
         assert!(!table.unlist("/proc").await, "a frozen table refuses a new unlisted path");
         let entries = table.readdir(Path::new("/")).await.unwrap();
         assert!(entries.iter().any(|e| e.name == "proc"), "nothing changed: {entries:?}");
+    }
+
+    // ── Read-only refusals name the mounts ─────────────────────────────────
+
+    /// A kernel-owned tree whose backend refuses every mutation with a bare
+    /// `VfsError::ReadOnly`, as the CAS, roster, and presence backends do.
+    /// `claims_read_only: false` is a writable mount whose backend refuses
+    /// one path anyway.
+    struct RefusingBackend {
+        claims_read_only: bool,
+    }
+
+    #[async_trait]
+    impl VfsOps for RefusingBackend {
+        async fn getattr(&self, path: &Path) -> VfsResult<FileAttr> {
+            if path.as_os_str().is_empty() {
+                return Ok(FileAttr::directory(0o755));
+            }
+            Err(VfsError::not_found(path.display().to_string()))
+        }
+        async fn readdir(&self, _path: &Path) -> VfsResult<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+        async fn read(&self, path: &Path, _offset: u64, _size: u32) -> VfsResult<Vec<u8>> {
+            Err(VfsError::not_found(path.display().to_string()))
+        }
+        async fn readlink(&self, path: &Path) -> VfsResult<PathBuf> {
+            Err(VfsError::not_found(path.display().to_string()))
+        }
+        async fn write(&self, _path: &Path, _offset: u64, _data: &[u8]) -> VfsResult<u32> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn create(&self, _path: &Path, _mode: u32) -> VfsResult<FileAttr> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn mkdir(&self, _path: &Path, _mode: u32) -> VfsResult<FileAttr> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn unlink(&self, _path: &Path) -> VfsResult<()> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn rmdir(&self, _path: &Path) -> VfsResult<()> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn rename(&self, _from: &Path, _to: &Path) -> VfsResult<()> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn truncate(&self, _path: &Path, _size: u64) -> VfsResult<()> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn setattr(&self, _path: &Path, _attr: SetAttr) -> VfsResult<FileAttr> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn symlink(&self, _path: &Path, _target: &Path) -> VfsResult<FileAttr> {
+            Err(VfsError::ReadOnly)
+        }
+        async fn link(&self, _oldpath: &Path, _newpath: &Path) -> VfsResult<FileAttr> {
+            Err(VfsError::ReadOnly)
+        }
+        fn read_only(&self) -> bool {
+            self.claims_read_only
+        }
+        async fn statfs(&self) -> VfsResult<StatFs> {
+            Ok(StatFs::default())
+        }
+        async fn real_path(&self, _path: &Path) -> VfsResult<Option<PathBuf>> {
+            Ok(None)
+        }
+    }
+
+    /// The layout of a benchmark container: the host root read-only, the
+    /// workspace and `/tmp` writable.
+    async fn read_only_root_with_workspace() -> (MountTable, tempfile::TempDir, tempfile::TempDir) {
+        use crate::vfs::backends::LocalBackend;
+        let root = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        let table = MountTable::new();
+        table.mount("/", LocalBackend::read_only(root.path())).await;
+        table.mount("/app", LocalBackend::new(app.path())).await;
+        table.mount("/tmp", MemoryBackend::new()).await;
+        (table, root, app)
+    }
+
+    #[tokio::test]
+    async fn a_write_under_the_read_only_root_names_the_mount_and_the_writable_ones() {
+        let (table, root, _app) = read_only_root_with_workspace().await;
+        let path = Path::new("/git/server/hooks/post-receive");
+        let err = table.write_all(path, b"#!/bin/sh\n").await.expect_err("the root is read-only");
+        assert_eq!(err.kind(), kaijutsu_types::VfsErrorKind::ReadOnly, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "/git/server/hooks/post-receive: kaijutsu mounts / read-only. \
+             Writable mounts are marked rw:\n\
+             \x20 /     ro  host\n\
+             \x20 /app  rw  host\n\
+             \x20 /tmp  rw  memory"
+        );
+        assert!(!root.path().join("git").exists(), "nothing was created on the host");
+
+        let err = table.mkdir(Path::new("/srv/www"), 0o755).await.expect_err("the root is read-only");
+        assert!(err.to_string().starts_with("/srv/www: kaijutsu mounts / read-only."), "{err}");
+    }
+
+    #[tokio::test]
+    async fn every_mutation_refused_as_read_only_names_the_mounts() {
+        let (table, root, _app) = read_only_root_with_workspace().await;
+        std::fs::write(root.path().join("etc-file"), b"x").unwrap();
+        let file = Path::new("/etc-file");
+        let other = Path::new("/etc-file2");
+        let errors = [
+            ("write", table.write(file, 0, b"y").await.map(|_| ()).unwrap_err()),
+            ("create", table.create(other, 0o644).await.map(|_| ()).unwrap_err()),
+            ("mkdir", table.mkdir(other, 0o755).await.map(|_| ()).unwrap_err()),
+            ("unlink", table.unlink(file).await.unwrap_err()),
+            ("rename", table.rename(file, other).await.unwrap_err()),
+            ("truncate", table.truncate(file, 0).await.unwrap_err()),
+            ("setattr", table.setattr(file, SetAttr::default()).await.map(|_| ()).unwrap_err()),
+            ("symlink", table.symlink(other, Path::new("etc-file")).await.map(|_| ()).unwrap_err()),
+            ("link", table.link(file, other).await.map(|_| ()).unwrap_err()),
+        ];
+        for (op, err) in errors {
+            assert_eq!(err.kind(), kaijutsu_types::VfsErrorKind::ReadOnly, "{op}: {err}");
+            assert!(err.to_string().contains("kaijutsu mounts / read-only."), "{op}: {err}");
+            assert!(err.to_string().contains("/app  rw  host"), "{op}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_writable_mount_still_succeeds() {
+        let (table, _root, app) = read_only_root_with_workspace().await;
+        table.mkdir(Path::new("/app/hooks"), 0o755).await.unwrap();
+        table.write_all(Path::new("/app/hooks/post-receive"), b"ok").await.unwrap();
+        table.write_all(Path::new("/tmp/x"), b"ok").await.unwrap();
+        assert_eq!(std::fs::read(app.path().join("hooks/post-receive")).unwrap(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn a_kernel_tree_refusal_names_that_tree_not_the_root() {
+        let (table, _root, _app) = read_only_root_with_workspace().await;
+        table.mount("/v/cas", RefusingBackend { claims_read_only: true }).await;
+        let err = table.write_all(Path::new("/v/cas/x"), b"y").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/v/cas/x: kaijutsu mounts /v/cas read-only. Writable mounts are marked rw:\n\
+             \x20 /       ro  host\n\
+             \x20 /app    rw  host\n\
+             \x20 /tmp    rw  memory\n\
+             \x20 /v/cas  ro  kernel"
+        );
+        // `/v` itself is a directory only the mount table knows; a write
+        // there lands on the root mount, and the text says so.
+        let err = table.write_all(Path::new("/v/x"), b"y").await.unwrap_err();
+        assert!(err.to_string().starts_with("/v/x: kaijutsu mounts / read-only."), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_writable_mount_that_refuses_one_path_does_not_claim_the_mount_is_read_only() {
+        let (table, _root, _app) = read_only_root_with_workspace().await;
+        table.mount("/config/rc", RefusingBackend { claims_read_only: false }).await;
+        let err = table.write_all(Path::new("/config/rc/x"), b"y").await.unwrap_err();
+        assert_eq!(err.kind(), kaijutsu_types::VfsErrorKind::ReadOnly);
+        assert_eq!(
+            err.to_string(),
+            "/config/rc/x: the mount /config/rc is read-only at this path. \
+             Writable mounts are marked rw:\n\
+             \x20 /           ro  host\n\
+             \x20 /app        rw  host\n\
+             \x20 /config/rc  rw  kernel\n\
+             \x20 /tmp        rw  memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_mount_table_keeps_the_writable_mounts_and_names_kaish_mounts() {
+        let (table, _root, _app) = read_only_root_with_workspace().await;
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            table.mount(format!("/run/{name}"), RefusingBackend { claims_read_only: true }).await;
+        }
+        let err = table.write_all(Path::new("/run/c/x"), b"y").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/run/c/x: kaijutsu mounts /run/c read-only. Writable mounts are marked rw:\n\
+             \x20 /app    rw  host\n\
+             \x20 /run/c  ro  kernel\n\
+             \x20 /tmp    rw  memory\n\
+             \x20 10 read-only mounts not shown; run kaish-mounts to list every mount"
+        );
     }
 }

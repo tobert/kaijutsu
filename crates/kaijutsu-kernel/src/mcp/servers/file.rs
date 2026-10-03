@@ -520,6 +520,8 @@ impl FileToolsServer {
                     path,
                     content.len(),
                 )),
+                // A refusal names its own path.
+                Err(e @ crate::vfs::VfsError::ReadOnlyMount(_)) => ExecResult::failure(1, e.to_string()),
                 Err(e) => ExecResult::failure(1, format!("{}: {}", path, e)),
             };
         }
@@ -584,10 +586,8 @@ impl FileToolsServer {
         // diff against, and a read-only target can never accept the result
         // anyway) — refuse outright.
         if !self.vfs.is_writable(std::path::Path::new(&path)).await {
-            return ExecResult::failure(
-                1,
-                format!("{}: read-only mount (no writes)", path),
-            );
+            let refusal = self.vfs.read_only_refusal(std::path::Path::new(&path)).await;
+            return ExecResult::failure(1, refusal.to_string());
         }
 
         let (ctx_id, block_id) = match self.cache.try_get_or_load(&path).await {
@@ -2345,5 +2345,62 @@ mod tests {
             "fn main() {}\n",
             "the on-disk file must be byte-identical to before the refused edit"
         );
+    }
+
+    /// `write` and `edit` under the read-only host root name the mount that
+    /// refused and list the writable mounts, the same text kaish's builtins
+    /// carry. `docs/mounts.md`, "When a write is refused".
+    #[tokio::test]
+    async fn write_and_edit_under_the_read_only_root_list_the_writable_mounts() {
+        use crate::vfs::backends::LocalBackend;
+        let root = tempfile::tempdir().unwrap();
+        let app = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        std::fs::write(root.path().join("etc/motd"), "hello\n").unwrap();
+
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/", LocalBackend::read_only(root.path())).await;
+        vfs.mount("/app", LocalBackend::new(app.path())).await;
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+        let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/app"));
+        let table = "kaijutsu mounts / read-only. Writable mounts are marked rw:\n\
+                     \x20 /     ro  host\n\
+                     \x20 /app  rw  host\n\
+                     \x20 /tmp  rw  memory";
+
+        let w = call_with_ctx(
+            &broker,
+            "write",
+            serde_json::json!({ "path": "/git/server/hooks/post-receive", "content": "#!/bin/sh\n" }),
+            &ctx,
+        )
+        .await;
+        assert!(w.is_error);
+        assert_eq!(text_of(&w), format!("/git/server/hooks/post-receive: {table}"));
+
+        let e = call_with_ctx(
+            &broker,
+            "edit",
+            serde_json::json!({ "path": "/etc/motd", "old_string": "hello", "new_string": "bye" }),
+            &ctx,
+        )
+        .await;
+        assert!(e.is_error);
+        assert_eq!(text_of(&e), format!("/etc/motd: {table}"));
+
+        let ok = call_with_ctx(
+            &broker,
+            "write",
+            serde_json::json!({ "path": "/app/hooks.txt", "content": "ok\n" }),
+            &ctx,
+        )
+        .await;
+        assert!(!ok.is_error, "a write to a writable mount still succeeds: {}", text_of(&ok));
+        assert_eq!(std::fs::read_to_string(app.path().join("hooks.txt")).unwrap(), "ok\n");
     }
 }

@@ -1803,4 +1803,67 @@ mod tests {
         assert!(out.contains("/r/laptop/share.txt"), "{out}");
         assert!(out.contains("/config/rc/S00.kai"), "{out}");
     }
+
+    /// A builtin's write under the read-only host root says which mount
+    /// refused it and lists the writable mounts, so one refusal maps the
+    /// boundary. `docs/mounts.md`, "When a write is refused".
+    #[tokio::test]
+    async fn a_builtin_write_under_the_read_only_root_lists_the_writable_mounts() {
+        let principal = kaijutsu_types::PrincipalId::system();
+        let blocks = shared_block_store(principal);
+        let kernel = test_kernel("test-read-only-refusal").await;
+        let root = tempfile::TempDir::new().unwrap();
+        let app = tempfile::TempDir::new().unwrap();
+        std::fs::write(app.path().join("hook"), "#!/bin/sh\n").unwrap();
+        kernel
+            .mount("/", crate::vfs::backends::LocalBackend::read_only(root.path()))
+            .await;
+        kernel.mount("/app", crate::vfs::backends::LocalBackend::new(app.path())).await;
+        kernel.mount("/tmp", crate::vfs::backends::MemoryBackend::new()).await;
+
+        let shell = EmbeddedKaish::with_identity(
+            "test-read-only-refusal",
+            blocks,
+            kernel.clone(),
+            Some(PathBuf::from("/app")),
+            crate::runtime::context_shell::ShellIdentity { requester: principal, performer: principal, reviewer: None, context: ContextId::new(), session: SessionId::new() },
+            crate::runtime::context_engine::session_context_map(),
+            ExternalExec::Deny,
+            OutputProfile::Agent,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let run = |cmd: &'static str| {
+            let shell = &shell;
+            async move {
+                let r = shell.execute_with_options(cmd, ExecuteOptions::default()).await.unwrap();
+                (r.code, r.err.clone())
+            }
+        };
+        let table = "kaijutsu mounts / read-only. Writable mounts are marked rw:\n\
+                     \x20 /     ro  host\n\
+                     \x20 /app  rw  host\n\
+                     \x20 /tmp  rw  memory";
+
+        let (code, err) = run("touch /git/x").await;
+        assert_ne!(code, 0, "{err}");
+        assert_eq!(err.trim_end(), format!("touch: /git/x: invalid operation: {table}"));
+
+        // A redirect into a missing directory is refused by kaish first, with
+        // its own `mkdir -p` advice; one into an existing directory reaches
+        // the mount.
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        for cmd in ["mkdir -p /git/server/hooks", "echo hi > /etc/x", "cp /app/hook /etc/hook"] {
+            let (code, err) = run(cmd).await;
+            assert_ne!(code, 0, "{cmd}: {err}");
+            assert!(err.contains(table), "{cmd}: {err}");
+        }
+        assert!(!root.path().join("git").exists(), "nothing was created on the host");
+        assert!(!root.path().join("etc/x").exists() && !root.path().join("etc/hook").exists());
+
+        let (code, err) = run("touch /app/new && mkdir -p /app/a/b && echo hi > /tmp/x").await;
+        assert_eq!(code, 0, "writes to the writable mounts still succeed: {err}");
+        assert!(app.path().join("new").exists());
+        assert!(app.path().join("a/b").is_dir());
+    }
 }

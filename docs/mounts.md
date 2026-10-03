@@ -62,6 +62,43 @@ A mount is reach, not a sandbox — the same doctrine the rest of this document
 rests on. It decides what a model can see and resolve, not what a spawned
 child process can do.
 
+## When a write is refused
+
+A write under a read-only mount names that mount and lists the mounts,
+marking the writable ones `rw`, so one refusal shows where kaijutsu can
+write. With the host root read-only and `/app` and `/tmp` writable:
+
+```
+touch: /git/x: invalid operation: kaijutsu mounts / read-only. Writable mounts are marked rw:
+  /     ro  host
+  /app  rw  host
+  /tmp  rw  memory
+```
+
+The `write` and `edit` tools give the same text after the path:
+`/git/server/hooks/post-receive: kaijutsu mounts / read-only. …`. The third
+column says what serves the mount: `host` is a host directory, `memory` is
+held in the kernel's memory, and `kernel` is a tree the kernel serves itself
+(`/v/cas`, `/run/*`, `/r`). A directory that only the mount table knows,
+such as `/v` or `/config`, belongs to the mount above it, so a write to
+`/v/x` names `/`.
+
+The list holds every mount when there are at most 10. A longer table keeps
+the writable mounts and the mount that refused, and says how many read-only
+mounts it left out: `12 read-only mounts not shown; run kaish-mounts to list
+every mount`. A mount that is writable but refuses one path says
+`the mount /config/rc is read-only at this path`.
+
+The refusal is `MountTable`'s: a backend refuses with a bare
+`VfsError::ReadOnly`, and the table replaces it with
+`VfsError::ReadOnlyMount`, whose `kind()` is still `ReadOnly`. kaish's
+`BackendError::ReadOnly` carries no text, so `MountBackend` hands the
+refusal to kaish as `BackendError::InvalidOperation`, which is where the
+`invalid operation:` prefix comes from. A redirect prints the text after
+`redirect: PATH:` with no prefix. In a shell, `/dev`, `/v/docs`, `/v/jobs`,
+and `/v/bin` are kaish's own mounts and refuse with kaish's text. Open
+follow-ups: `docs/issues.md`, "Read-only refusals that name the mounts".
+
 ## Unlisted paths
 
 The host's `/proc` and `/sys` are left out of the root listing
