@@ -36,3 +36,35 @@ fn ephemeral_server_allows_host_exec_only_after_opt_in() {
         assert_eq!(output, "allowed");
     });
 }
+
+/// On a context whose create lifecycle installs the shell-escape guard,
+/// `python3 -c` through the person's shell passes the guard and runs as the
+/// wrapped command, while `sh -c` is still denied. Skips when the host has
+/// no `python3`.
+#[test]
+fn python_inline_code_passes_the_guard_and_runs_wrapped() {
+    let has_python = std::env::var("PATH").ok()
+        .and_then(|path| kaish_kernel::tools::wrapped::find_executable("python3", &path)).is_some();
+    if !has_python {
+        eprintln!("SKIP: no python3 on the test process PATH");
+        return;
+    }
+    run_local(async {
+        let addr = start_server_with_host_exec().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kernel, "python-guard").await.unwrap();
+
+        let denied = kernel.shell_execute("sh -c 'echo hi'", context, false).await
+            .expect_err("the guard must be active on this context");
+        assert!(denied.to_string().contains("shell-escape-guard"), "{denied}");
+
+        let (_, output, status) = shell_exec_wait(&kernel, "python3 -c 'print(6*7)'", context).await;
+        assert_eq!(status, Status::Done, "python3 -c must pass the guard: {output}");
+        assert_eq!(output.trim(), "42");
+
+        let (_, output, status) = shell_exec_wait(&kernel, "type -t python3", context).await;
+        assert_eq!(status, Status::Done, "{output}");
+        assert_eq!(output.trim(), "builtin", "python3 must be the wrapped command");
+    });
+}
