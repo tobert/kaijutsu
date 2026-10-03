@@ -883,12 +883,15 @@ panicking on the first one.
 Found while re-pinning kaish onto `one-filesystem-walks` (kaijutsu branch
 of the same name; kaibo DeepSeek review). Not fixed:
 
-- **The shell-escape guard misses three shapes**: a path-qualified
-  interpreter (`/bin/sh -c '…'`), a variable in the command word
-  (`${SH} -c '…'`), and code attached to the flag (`perl -e'…'`). On a
-  normal kernel these reach a person's ask rather than an allow. The re-pin
-  already moves the guard from `.plain` to `literal.value`; without that,
-  `exec sh -c '…'` passed the guard under the new kaish.
+- **The shell-escape guard cannot see a wrapper's expanded argument.**
+  `exec ${SH} -c '…'` and `env $SH -c '…'` plan the interpreter as
+  `{"plain": "${SH}"}`, so the guard passes them. On a normal kernel they
+  reach a person's ask rather than an allow. Closing it is a policy choice:
+  deny any wrapper with an expanding argument (which also catches
+  `timeout $T make`), read the session value at plan time (the plan's
+  `free_variables` note says a `read` in the same statement defeats that),
+  or accept the ask. A variable as the command word itself (`${SH} -c '…'`)
+  does not parse in kaish, so the guard refuses it for lack of a plan.
 - **The read-only `kj` exemption treats `${VAR}` in a value slot as
   harmless.** A token such as `--out=…` breaks that. It is latent today:
   every verb with that flag needs a positional the token would displace.

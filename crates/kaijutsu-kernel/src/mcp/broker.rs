@@ -9655,19 +9655,40 @@ mod tests {
             "python3 -c 'print(1)'",
             "python3 '-c' 'print(1)'",
             "env perl -ne 'print'",
+            // A path-qualified interpreter is the same interpreter.
+            "/bin/sh -c 'echo hi'",
+            "./bash -c 'echo hi'",
+            "exec /bin/sh -c 'echo hi'",
+            "sudo -u root /usr/bin/bash -c 'echo hi'",
+            "/usr/bin/python3 -c 'print(1)'",
+            // A variable in the command word does not parse in kaish, so
+            // there is no plan and the guard refuses.
+            "${SH} -c 'echo hi'",
+            // Code glued to its flag is one word.
+            "perl -e1",
+            "perl -lne1",
+            "python3 -cprint",
+            "python3 -Ic'print(1)'",
+            "ruby -e1",
+            "node -e1",
+            "node --eval=1",
+            "env node --print=1",
         ];
+        // Every shape runs before the assertion, so one failure names every
+        // shape that escaped.
+        let mut escaped = Vec::new();
         for cmd in denied {
             let mut call = params("svc", "shell_write");
             call.arguments = serde_json::json!({ "command": cmd });
-            let err = broker
+            match broker
                 .call_tool(call, &CallContext::test(), CancellationToken::new())
                 .await
-                .unwrap_err();
-            assert!(
-                err.is_refusal(RefusalKind::Denied),
-                "expected the guard to deny {cmd:?}, got {err:?}"
-            );
+            {
+                Err(err) if err.is_refusal(RefusalKind::Denied) => {}
+                other => escaped.push(format!("{cmd:?} -> {other:?}")),
+            }
         }
+        assert!(escaped.is_empty(), "the guard did not deny:\n{}", escaped.join("\n"));
 
         // Data-position occurrences of `sh -c` must not be blocked (a regex
         // hook matching the substring anywhere would):
@@ -9676,18 +9697,25 @@ mod tests {
             "echo \"bash -c\"",
             "git commit -m \"note: sh -c is banned here\"",
             "python3 script.py",
+            // A flag whose argument is glued on is not an inline-code flag.
+            "python3 -mjson.tool data.json",
+            "python3 -mcProfile script.py",
+            "perl -Mstrict script.pl",
+            "ruby -rset script.rb",
+            "node --enable-source-maps app.js",
         ];
+        let mut blocked = Vec::new();
         for cmd in benign {
             let mut call = params("svc", "shell_write");
             call.arguments = serde_json::json!({ "command": cmd });
             let result = broker
                 .call_tool(call, &CallContext::test(), CancellationToken::new())
                 .await;
-            assert!(
-                result.is_ok(),
-                "the guard must NOT deny the benign shape {cmd:?}, got {result:?}"
-            );
+            if result.is_err() {
+                blocked.push(format!("{cmd:?} -> {result:?}"));
+            }
         }
+        assert!(blocked.is_empty(), "the guard denied benign shapes:\n{}", blocked.join("\n"));
     }
 
     /// `kj` is callable from inside a kaish hook body once
