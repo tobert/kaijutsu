@@ -712,6 +712,23 @@ on current main"):
   cannot tell the streams apart. Color, not the text marker, may suit the
   tui better; decide against `docs/tui.md`.
 
+## From kj-ds4-tb2-20-20261003 (deepseek-v4-flash, binary 9283226c)
+
+- **Builtin refusals stop at the builtin.** `curl -w` is refused ("use
+  kaish `--json`"), `tree --version` and `ps` are refused; the model then
+  ran `/usr/bin/tree`. Do not point refusals at host programs: Amy wants
+  fewer host tools exposed over time. Improve the builtins instead, starting
+  with `curl --write-out` in kaish-tools-curl.
+- **Builtin git is read-only and only in the read-only shell.** The
+  writable shell reaches host `git` (absent until apt installed it in the
+  task container). kaish-extras' `commit` and `worktree` axes are designed
+  (`docs/design/architecture.md`, "depends on ledger") and not built. Amy:
+  "We should be providing the builtin git tools too."
+- **The write boundary was invisible** (configure-git-webserver, about 70
+  calls). A read-only error now lists the mounts (in progress, branch
+  `ro-mount-errors`). Still open: whether the coder orientation names the
+  writable mounts up front.
+
 ## A builtin `grep -r PATTERN /` killed the agent process (2026-10-01)
 
 In `kj-ds4-tb2-20-1`, extract-elf and headless-terminal each ran
