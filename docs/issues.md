@@ -728,6 +728,23 @@ on current main"):
   calls). A read-only error now lists the mounts (in progress, branch
   `ro-mount-errors`). Still open: whether the coder orientation names the
   writable mounts up front.
+- **A stuck model inspects kaijutsu itself.** db-wal-recovery (54 calls),
+  configure-git-webserver (24), and extract-elf (25) searched `/v/cas`,
+  `/v/swap`, `kj search`, `kj vfs snapshot`, rc and guard files, and their
+  own `/logs/agent` for lost data, the write boundary, or a reference
+  answer. Candidate orientation line: `/v`, `/config`, `/r`, and `kj` hold
+  this session's own tools and history, not task data.
+- **Builtin gaps that cost calls:** `curl -w` (two tasks), `ls
+  --time-style`, `tree --version`, `ps`. kaish refuses `ps -p 1 -o comm=`
+  as "adjacent words" at parse time; `comm=` is one word in bash (kaish
+  question).
+- **The `curl` builtin's egress allowlist** refused pypi.org and
+  sourceforge.net while host `pip` and `apt-get` reached the network in the
+  same container. Open: open it for benchmarks, or keep it and say in the
+  refusal that the allowlist is kaijutsu's.
+- **Do not build during a timing-sensitive run.** query-optimize failed its
+  timing check (1.21 s against 1.08 s) while niced test builds ran on the
+  host; the sample is confounded.
 - **Writable mounts for benchmark containers: deferred** (Amy: "/git and
   /srv be writeable and mapped into the workspace, seems the most logical
   option… I don't want to inject mounts yet"). In the 20-task subset only
