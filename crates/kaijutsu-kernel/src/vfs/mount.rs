@@ -220,8 +220,14 @@ impl MountTable {
             None => return VfsError::no_mount_point(path.display().to_string()),
         };
         let mounts = self.mounts.read().await;
+        // The `/config` trees are the kernel's own configuration; a model
+        // fixing a task is not pointed at them unless one of them refused.
+        let config = kaijutsu_types::paths::CONFIG_NAMESPACE_ROOT;
         let all: Vec<MountRow> = mounts
             .iter()
+            .filter(|(point, _)| {
+                *point == &mount || !(point.starts_with(config))
+            })
             .map(|(point, fs)| MountRow {
                 path: point.display().to_string(),
                 read_only: fs.read_only(),
@@ -2681,6 +2687,19 @@ mod tests {
         // there lands on the root mount, and the text says so.
         let err = table.write_all(Path::new("/v/x"), b"y").await.unwrap_err();
         assert!(err.to_string().starts_with("/v/x: kaijutsu mounts / read-only."), "{err}");
+    }
+
+    /// A model fixing a task is not pointed at the kernel's own config: the
+    /// `/config` trees are left out of the list unless one of them refused.
+    #[tokio::test]
+    async fn the_config_trees_are_left_out_of_a_refusal() {
+        let (table, _root, _app) = read_only_root_with_workspace().await;
+        table.mount("/config/kernel", crate::vfs::backends::MemoryBackend::new()).await;
+        table.mount("/config/rc", crate::vfs::backends::MemoryBackend::new()).await;
+        let err = table.write_all(Path::new("/git/x"), b"y").await.unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("/config"), "{text}");
+        assert!(text.contains("/app  rw  host"), "{text}");
     }
 
     #[tokio::test]

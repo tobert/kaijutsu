@@ -83,7 +83,9 @@ held in the kernel's memory, and `kernel` is a tree the kernel serves itself
 such as `/v` or `/config`, belongs to the mount above it, so a write to
 `/v/x` names `/`.
 
-The list holds every mount when there are at most 10. A longer table keeps
+The list leaves out the `/config` trees, the kernel's own configuration,
+unless one of them refused (Amy, 2026-10-03). It holds every other mount
+when there are at most 10. A longer table keeps
 the writable mounts and the mount that refused, and says how many read-only
 mounts it left out: `12 read-only mounts not shown; run kaish-mounts to list
 every mount`. A mount that is writable but refuses one path says
