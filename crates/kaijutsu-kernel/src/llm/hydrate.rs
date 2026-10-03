@@ -719,15 +719,13 @@ pub(crate) fn validate_tool_pairing(messages: &[Message]) -> LlmResult<()> {
 /// The `tool_result` text a model reads for a settled result block. A model
 /// turn stored the text it sent; replay it as sent, so a request extends the
 /// one that turn made. Other results: stdout lives in `content` (`stdout`
-/// here, after any diff projection), stderr in its own field, merged back
-/// stdout first. A turn holding on its ask reads its settled result through
+/// here, after any diff projection), stderr in its own field, joined back
+/// under a `[stderr]` line (`shell_envelope::join_streams`). A turn holding on its ask reads its settled result through
 /// this too, so what it sends is what a later hydration replays.
 pub(crate) fn model_tool_result_text(block: &kaijutsu_types::BlockSnapshot, stdout: &str) -> String {
-    match (&block.model_content, block.stderr.as_deref()) {
-        (Some(sent), _) => sent.clone(),
-        (None, Some(err)) if !err.is_empty() && !stdout.is_empty() => format!("{stdout}\n{err}"),
-        (None, Some(err)) if !err.is_empty() => err.to_string(),
-        _ => stdout.to_string(),
+    match &block.model_content {
+        Some(sent) => sent.clone(),
+        None => kaijutsu_types::shell_envelope::join_streams(stdout, block.stderr.as_deref().unwrap_or("")),
     }
 }
 
@@ -1253,5 +1251,35 @@ mod hydration_blindness_tests {
                  messages as the same block without spans"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stderr_marker_tests {
+    use super::*;
+    use kaijutsu_types::{ContextId, PrincipalId, ToolKind};
+
+    fn result(stdout: &str, stderr: Option<&str>) -> kaijutsu_types::BlockSnapshot {
+        let ctx = ContextId::new();
+        let principal = PrincipalId::new();
+        let mut block = kaijutsu_types::BlockSnapshot::tool_result(BlockId::new(ctx, principal, 1),
+            BlockId::new(ctx, principal, 0), ToolKind::Shell, stdout, true, Some(1), Some("t".into()));
+        block.stderr = stderr.map(str::to_owned);
+        block
+    }
+
+    /// A result with no stored model text marks stderr the way a turn does
+    /// (`ShellEnvelope::readable_output`), so the model can tell the streams apart.
+    #[test]
+    fn a_result_without_model_text_marks_its_stderr() {
+        let both = result("hi\n", Some("ls: nope: not found"));
+        assert_eq!(model_tool_result_text(&both, "hi\n"), "hi\n[stderr]\nls: nope: not found");
+        let err_only = result("", Some("boom"));
+        assert_eq!(model_tool_result_text(&err_only, ""), "[stderr]\nboom");
+        let out_only = result("fine\n", None);
+        assert_eq!(model_tool_result_text(&out_only, "fine\n"), "fine\n");
+        let mut sent = result("hi\n", Some("err"));
+        sent.model_content = Some("as sent".into());
+        assert_eq!(model_tool_result_text(&sent, "hi\n"), "as sent", "stored model text replays verbatim");
     }
 }

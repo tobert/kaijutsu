@@ -144,11 +144,26 @@ inside `stdout`. Project the output, then rebuild the envelope.
 
 A kernel model turn sends `ShellEnvelope::model_text`, not the JSON. It is
 the readable output, then one bracketed line for each fact that changes what
-the model does next:
+the model does next.
+
+The readable output is stdout, then a `[stderr]` line and stderr when the
+command wrote any; a refusal's reason reads as stderr. One function joins the
+two streams for every path, `shell_envelope::join_streams`: the live turn, a
+result settled through an approval or in the background, and hydration of a
+result stored without model text. The durable block shows people the same
+text. Both streams stay separate in the envelope; the marker exists only in
+text.
+
+```
+on stdout
+[stderr]
+cat: /missing: not found: /missing
+[exit 1]
+```
 
 | Result | Lines after the output |
 |---|---|
-| exit 0, nothing else | none; an empty result reads `(no output)` |
+| exit 0, nothing else | none; an empty result reads `[no output]` |
 | nonzero exit | `[exit N]` (`[failed; no exit code]` when none exists) |
 | refused before running | `[rejected: the program did not run]` |
 | background call | `[running in the background: operation ID]` |
@@ -178,6 +193,11 @@ instead (Amy, 2026-10-02):
 | coder create orientation | a notification in place of the orientation |
 
 `kaijutsu_types::shell_envelope::is_root_cwd` is the one test for `/`.
+
+A failing shell result carries its facts as these lines and nothing else.
+The turn still records an Error block for people, but its payload, the
+envelope as JSON, is not appended to what the model reads; a tool result that
+is not a shell envelope still carries it.
 
 `block_id`, `content_type`, `ephemeral`, and `elapsed_ms` are never sent. The
 rendering is always text, including for a command that printed nothing: the

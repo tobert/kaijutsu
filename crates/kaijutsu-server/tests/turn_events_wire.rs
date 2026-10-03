@@ -812,3 +812,61 @@ fn context_wait_over_rpc_keeps_waiting_for_overlapping_turns() {
         shared.kernel.shutdown_runtime_worker().await.unwrap();
     });
 }
+
+/// A failing shell call reaches the model as its output with stderr marked,
+/// then `[exit N]`, and nothing else: the facts are already text, so the
+/// envelope's JSON is not appended a second time (`docs/shell-envelope.md`,
+/// "What a model turn reads"). Hydration replays the same text.
+#[test]
+fn a_failing_shell_result_marks_stderr_and_sends_no_json() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MockClient, Provider, stream::StreamEvent};
+        let (addr, server) = start_server_with_mock_llm_kernel_handle().await;
+        let client = connect_client(addr).await;
+        let (kj, _) = client.bind_kernel().await.unwrap();
+        let context = create_context(&kj, "shell-stderr").await.unwrap();
+        assign_turn_identity(&server, context, PrincipalId::new());
+        kj.join_context(context, "shell-stderr").await.unwrap();
+        let done = |stop: &str| StreamEvent::Done { stop_reason: Some(stop.into()), input_tokens: None, output_tokens: None, extra: None };
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            vec![StreamEvent::ToolUse { id: "stderr-shell".into(), name: "shell".into(),
+                input: serde_json::json!({"command": "echo on stdout; cat /no-such-file-zq"}) }, done("tool_use")],
+            vec![StreamEvent::TextStart, StreamEvent::TextDelta("ack".into()), StreamEvent::TextEnd, done("end_turn")],
+        ]).recording_sent_messages();
+        server.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+        let (callback, mut events) = turn_events_channel(32);
+        kj.subscribe_turn_events(callback).await.unwrap();
+        let admitted = kj.execute_kj_quiet(context, &["drive".into(), "--prompt".into(), "run it".into()]).await.unwrap();
+        assert_eq!(admitted.exit_code, 0, "{}", admitted.stderr);
+        assert!(matches!(recv_turn_event(&mut events, context).await, ServerEvent::TurnCompleted { .. }));
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        let (sent_result, is_error) = sent[1].iter().rev().find_map(|m| match &m.content {
+            kaijutsu_kernel::llm::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                kaijutsu_kernel::llm::ContentBlock::ToolResult { content, is_error, .. } => Some((content.clone(), *is_error)),
+                _ => None,
+            }),
+            _ => None,
+        }).expect("the request carries the tool result");
+        assert!(is_error, "a nonzero exit rides the error flag: {sent_result}");
+        assert!(sent_result.starts_with("on stdout\n[stderr]\n"), "stdout first, then the marker: {sent_result:?}");
+        assert!(sent_result.contains("no-such-file-zq"), "stderr follows the marker: {sent_result:?}");
+        let last = sent_result.lines().last().unwrap();
+        assert!(last.starts_with("[exit ") && last.ends_with(']'), "the exit fact ends the result: {sent_result:?}");
+        assert!(!sent_result.contains("<error"), "no error envelope: {sent_result:?}");
+        assert!(!sent_result.contains("\"exit_code\""), "no JSON: {sent_result:?}");
+
+        let mut mailbox = kaijutsu_kernel::ConversationMailbox::new();
+        mailbox.catch_up(&server.kernel.blocks().block_snapshots(context).unwrap());
+        let mut expected = sent[1].clone();
+        expected.push(kaijutsu_kernel::llm::Message::assistant("ack"));
+        let replayed: Vec<serde_json::Value> = mailbox.snapshot().iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        let expected: Vec<serde_json::Value> = expected.iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        if let Some(i) = (0..replayed.len().max(expected.len())).find(|&i| replayed.get(i) != expected.get(i)) {
+            panic!("message {i} differs\nreplayed: {:#}\nsent: {:#}",
+                replayed.get(i).unwrap_or(&serde_json::Value::Null), expected.get(i).unwrap_or(&serde_json::Value::Null));
+        }
+        server.kernel.shutdown_runtime_worker().await.unwrap();
+    });
+}

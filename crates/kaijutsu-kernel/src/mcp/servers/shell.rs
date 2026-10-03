@@ -85,25 +85,33 @@ pub(crate) fn resolve_command_timeout(
 }
 
 // One short statement of what the shell is and what a call returns. The
-// language reference stays in kaish (`help syntax`); a model that needs a rule
-// asks for it, and the description every request carries stays small.
-const ABOUT_KAISH: &str = "kaish (会sh) is a Bourne-like shell with a JSON data \
-     model: values keep their types (strings, numbers, booleans, lists \
-     `[a b c]`, records `{k: v}`) through variables and pipes, and builtins \
-     return structured data. It checks a whole command before running it, so a \
-     command never half-runs. Builtins run in-process; other programs run from \
-     PATH. `help syntax` lists where kaish differs from bash.";
+// language reference stays in kaish (`help syntax`), so the description every
+// request carries stays small. It names only the bash habits models still
+// bring after kaish accepts what it can: unquoted mixed words, `( … )`
+// subshells, and `[ … ]` tests.
+const ABOUT_KAISH: &str = "kaish (会sh) is a small shell, not bash: a subset \
+     with a JSON data model. Values keep their types (strings, numbers, \
+     booleans, lists `[a b c]`, records `{k: v}`) through variables and pipes, \
+     and builtins return structured data. It checks a whole command before \
+     running it and refuses anything outside its language, so a command never \
+     half-runs. Quote a word that mixes text with `$var` or `$(…)`: write \
+     \"/tmp/$f.csv\", not /tmp/$f.csv. Group commands with `{ …; }`; there are \
+     no `( … )` subshells. Test with `[[ … ]]` or `test`; `[` starts a list. \
+     Builtins run in-process; other programs run from PATH. `help syntax` lists \
+     the language.";
 
 // What a call returns, as a model turn reads it (`ShellEnvelope::model_text`)
 // and as an MCP caller receives it (the envelope). Both flavours share it.
-const RESULT_CONTRACT: &str = "The result is the command's output, then one \
-     bracketed line for each fact that changes your next step: `[exit N]`; \
+const RESULT_CONTRACT: &str = "The result is the command's stdout, then a \
+     `[stderr]` line and stderr when the command wrote any. One bracketed line \
+     follows for each fact that changes your next step: `[exit N]`; \
      `[rejected: the program did not run]` (kaish refused the text: fix it and \
      retry); `[running in the background: operation ID]`; `[output truncated: \
      N bytes; the full output is at /v/cas/…]` (read that path with `grep`, \
      `sed -n`, or `read`); `[cwd now DIR]` (the call changed your working \
      directory); `[warning: …]` (correct it first; a cwd of `/` draws one on \
-     every call). A clean success is its output alone. An MCP caller \
+     every call). A clean success is its output alone; a command that printed \
+     nothing reads `[no output]`. An MCP caller \
      receives one JSON object with the keys {stdout, stderr, exit_code, status, \
      did_spill, data, latch, block_id, operation_id, ask_id, content_type, \
      ephemeral, elapsed_ms, error, cwd, warning}; `exit_code` null is never evidence of success.";
@@ -426,9 +434,14 @@ mod tests {
         {
             assert!(env.model_text("").contains(fact), "model_text no longer writes {fact}");
         }
+        assert_eq!(ShellEnvelope::new(ShellStatus::Done).model_text(""), "[no output]");
+        let mut both = ShellEnvelope::new(ShellStatus::Done);
+        both.stdout = "out".into();
+        both.stderr = "err".into();
+        assert_eq!(both.readable_output(), "out\n[stderr]\nerr");
         for text in [DESCRIPTION.as_str(), DESCRIPTION_READ_ONLY.as_str()] {
             for fact in ["`[exit N]`", "`[rejected: the program did not run]`", "`[running in the background: operation ID]`",
-                "[output truncated: N bytes; the full output is at /v/cas/"]
+                "[output truncated: N bytes; the full output is at /v/cas/", "`[stderr]`", "`[no output]`"]
             {
                 assert!(text.contains(fact), "missing {fact}: {text}");
             }
@@ -442,6 +455,9 @@ mod tests {
         assert!(text.len() < 2000, "{} chars: {text}", text.len());
         assert!(text.contains("current kernel context") && text.contains("`kj` manages"), "{text}");
         assert!(text.contains("JSON data") && text.contains("help syntax"), "{text}");
+        // The habits a DeepSeek A/B still showed after the lexer fixes: name
+        // the language as a subset, and the bash forms it refuses.
+        assert!(text.contains("not bash") && text.contains("`[[ … ]]`") && text.contains("`{ …; }`"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");

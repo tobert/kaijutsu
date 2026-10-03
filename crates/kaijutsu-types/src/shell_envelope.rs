@@ -115,6 +115,26 @@ pub fn root_cwd_warning(cwd: &std::path::Path) -> Option<String> {
     is_root_cwd(cwd).then(|| "cwd is /, which is almost always a mistake; cd to your work tree".to_string())
 }
 
+/// The line that marks where stderr starts in a joined result.
+pub const STDERR_MARKER: &str = "[stderr]";
+
+/// stdout, then a `[stderr]` line and stderr when stderr is not empty. Every
+/// path that shows a model or a person both streams as one text joins them
+/// here, so a reader can always tell which lines came from stderr.
+pub fn join_streams(stdout: &str, stderr: &str) -> String {
+    let mut out = String::with_capacity(stdout.len() + stderr.len() + STDERR_MARKER.len() + 2);
+    out.push_str(stdout);
+    if !stderr.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(STDERR_MARKER);
+        out.push('\n');
+        out.push_str(stderr);
+    }
+    out
+}
+
 impl ShellEnvelope {
     /// An envelope with every optional field unset. Fill in what the serving
     /// path actually knows and leave the rest `null`.
@@ -178,35 +198,29 @@ impl ShellEnvelope {
     }
 
     /// What a person reads: the command's output, without the envelope around
-    /// it. `stderr` follows `stdout` on its own line when the command wrote
-    /// both, and a refusal shows the reason it rode in `error`.
+    /// it. stdout comes first; when the command wrote to stderr, a `[stderr]`
+    /// line follows, then stderr. A refusal's reason, which rides in `error`,
+    /// reads as stderr. See `join_streams`.
     ///
     /// This is the durable block's text. The envelope is for the model; a
     /// block is read by people and replayed by hydration, and a JSON object
     /// serves neither.
     pub fn readable_output(&self) -> String {
-        let mut out = String::with_capacity(self.stdout.len() + self.stderr.len());
-        out.push_str(&self.stdout);
-        let push_line = |out: &mut String, s: &str| {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(s);
-        };
-        if !self.stderr.is_empty() {
-            push_line(&mut out, &self.stderr);
-        }
+        let mut stderr = self.stderr.clone();
         if let Some(err) = &self.error {
-            push_line(&mut out, err);
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(err);
         }
-        out
+        join_streams(&self.stdout, &stderr)
     }
 
     /// This envelope carrying `clean` as its output, so the model and the
     /// durable block hold one text with one set of byte offsets.
     ///
     /// `clean` is `readable_output` after ANSI stripping, so it is the
-    /// already-joined pair. It replaces `stdout`; `stderr` and `error` are
+    /// already-joined pair, `[stderr]` marker included. It replaces `stdout`; `stderr` and `error` are
     /// emptied rather than left to repeat text that is now inside `stdout`.
     /// `exit_code`, `status` and every other field are untouched — the
     /// distinction between "wrote to stderr" and "exited nonzero" lives in
@@ -222,7 +236,7 @@ impl ShellEnvelope {
     /// readable output, as the durable block stores it), then one bracketed
     /// line for each fact that changes what the model should do next. A clean
     /// success is its output alone. Always text, never JSON, and never empty:
-    /// a command that printed nothing reads `(no output)`, so every result has
+    /// a command that printed nothing reads `[no output]`, so every result has
     /// one shape. See `docs/shell-envelope.md`, "What a model turn reads".
     pub fn model_text(&self, clean: &str) -> String {
         let operation = |label: &str| match (&self.operation_id, &self.ask_id) {
@@ -260,7 +274,7 @@ impl ShellEnvelope {
         if let Some(warning) = &self.warning {
             facts.push(format!("[warning: {warning}]"));
         }
-        let mut text = if clean.is_empty() && facts.is_empty() { "(no output)".to_string() } else { clean.to_string() };
+        let mut text = if clean.is_empty() && facts.is_empty() { "[no output]".to_string() } else { clean.to_string() };
         for fact in facts {
             if !text.is_empty() && !text.ends_with('\n') {
                 text.push('\n');
@@ -364,7 +378,7 @@ mod tests {
         env.block_id = Some("b".into());
         env.content_type = Some("text/plain".into());
         assert_eq!(env.model_text("hello\n"), "hello\n");
-        assert_eq!(env.model_text(""), "(no output)", "an empty result still has one shape");
+        assert_eq!(env.model_text(""), "[no output]", "an empty result still has one shape");
     }
 
     #[test]
@@ -575,12 +589,27 @@ mod tests {
         env.stderr = "a warning".into();
         env.exit_code = Some(1);
         let text = env.readable_output();
-        assert_eq!(text, "some output\na warning");
+        assert_eq!(text, "some output\n[stderr]\na warning", "a `[stderr]` line marks where stderr starts");
         assert!(!text.contains("exit_code"), "no envelope keys in a block: {text}");
+
+        env.stdout = "ends in a newline\n".into();
+        assert_eq!(env.readable_output(), "ends in a newline\n[stderr]\na warning");
+
+        env.stdout.clear();
+        assert_eq!(env.readable_output(), "[stderr]\na warning", "stderr alone is still marked");
 
         let mut refused = ShellEnvelope::new(ShellStatus::Rejected);
         refused.error = Some("parse error at 1:6".into());
-        assert_eq!(refused.readable_output(), "parse error at 1:6");
+        assert_eq!(refused.readable_output(), "[stderr]\nparse error at 1:6", "a refusal reason reads as stderr");
+
+        let mut both = ShellEnvelope::new(ShellStatus::Rejected);
+        both.stderr = "first".into();
+        both.error = Some("second".into());
+        assert_eq!(both.readable_output(), "[stderr]\nfirst\nsecond", "one marker for stderr and the reason");
+
+        let mut out_only = ShellEnvelope::new(ShellStatus::Done);
+        out_only.stdout = "just stdout\n".into();
+        assert_eq!(out_only.readable_output(), "just stdout\n", "no marker without stderr");
 
         let quiet = ShellEnvelope::new(ShellStatus::Done);
         assert_eq!(quiet.readable_output(), "", "a silent command reads as nothing");

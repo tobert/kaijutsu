@@ -156,12 +156,8 @@ fn settle_known_outcome(
     // holding on its ask reads this block, and hydration replays it.
     let (model_content, record) = if status != Status::Waiting {
         // The readable output a turn builds from an envelope: stdout, then
-        // stderr and the refusal reason on their own line.
-        let mut readable = text.to_owned();
-        if !stderr.is_empty() {
-            if !readable.is_empty() && !readable.ends_with('\n') { readable.push('\n'); }
-            readable.push_str(&stderr);
-        }
+        // stderr and the refusal reason under a `[stderr]` line.
+        let readable = kaijutsu_types::shell_envelope::join_streams(text, &stderr);
         let sent = envelope.model_text(&readable);
         ((sent != text).then_some(sent), Some(envelope.clone().with_clean_output("").to_value().to_string()))
     } else { (None, None) };

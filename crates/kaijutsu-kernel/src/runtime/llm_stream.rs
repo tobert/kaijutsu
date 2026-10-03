@@ -1811,8 +1811,9 @@ async fn dispatch_recorded_tool_result(
         }
 
         // People read the clean output; the model reads it rendered with the facts
-        // that change its next step (`ShellEnvelope::model_text`), plus the Error
-        // child's envelope for an error result. The result stores the rendered
+        // that change its next step (`ShellEnvelope::model_text`). Those facts
+        // already say how a shell call failed, so only a non-shell error result
+        // also carries the Error child's payload. The result stores the rendered
         // text only when it differs from the output, and keeps the shell envelope
         // (output blank) as its record; hydration replays what the model read.
         // Project the actual output once so both readers get clean text.
@@ -1824,7 +1825,7 @@ async fn dispatch_recorded_tool_result(
             Some(env) => env.model_text(block_content),
             None => block_content.to_owned(),
         };
-        if let Some(payload) = &payload {
+        if let (Some(payload), None) = (&payload, &envelope) {
             model_content.push_str("\n\n");
             model_content.push_str(&kaijutsu_types::format_error_payload_for_llm(payload, &payload.summary_line()));
         }
