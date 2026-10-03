@@ -16,13 +16,18 @@
 # No plan means kaish refused the text. A parse error is the common case:
 # name it as syntax, with kaish's own message, so a model fixes the syntax or
 # moves the commands into a script file instead of reading it as policy.
+# Only the first line of kaish's message is kept, cut to 300 characters: the
+# rest quotes the command, and the broker keeps only the last 512 characters
+# of a hook's stderr, so a long command would push the cause off the front.
 if test -z "${KJ_TOOL_PLAN:-}"; then
-  case "${KJ_TOOL_PLAN_ERROR:-}" in
+  plan_error=${KJ_TOOL_PLAN_ERROR:-}
+  first_line=$(echo $plan_error | head -n 1 | cut -c 1-300)
+  case "$plan_error" in
     *parse*)
-      echo "blocked: kaish cannot parse this command: ${KJ_TOOL_PLAN_ERROR}. Fix the syntax (help syntax lists the language), or write a short script file that reads top-down and run the file with bash FILE." >&2
+      echo "blocked: kaish cannot parse this command: ${first_line}. Fix the syntax (help syntax lists the language), or write a short script file that reads top-down and run the file with bash FILE." >&2
       ;;
     *)
-      echo "blocked: kaish could not check this command (${KJ_TOOL_PLAN_ERROR:-no reason given}), and the shell-escape guard denies what it cannot check. Fix the command, or write a short script file that reads top-down and run the file with bash FILE." >&2
+      echo "blocked: kaish could not check this command (${first_line:-no reason given}), and the shell-escape guard denies what it cannot check. Fix the command, or write a short script file that reads top-down and run the file with bash FILE." >&2
       ;;
   esac
   exit 1

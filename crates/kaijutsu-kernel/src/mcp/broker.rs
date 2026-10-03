@@ -9783,6 +9783,18 @@ mod tests {
             && text.contains("script file"), "the parse denial names its cause and fixes: {text}");
         assert!(!text.contains("no execution plan"), "{text}");
 
+        // kaish's error quotes the command, and the broker keeps only the
+        // tail of a hook's stderr. A long command must not push the cause
+        // off the front.
+        let long = format!("for h in {}; do echo $h; done | (cat)", "abc ".repeat(200));
+        let mut call = params("svc", "shell_write");
+        call.arguments = serde_json::json!({ "command": long });
+        let err = broker.call_tool(call, &CallContext::test(), CancellationToken::new()).await
+            .expect_err("an unparseable command is denied");
+        let text = format!("{err}");
+        assert!(text.contains("kaish cannot parse this command") && text.contains("script file"),
+            "a long command keeps the cause and the fix: {text}");
+
         // Data-position occurrences of `sh -c` must not be blocked (a regex
         // hook matching the substring anywhere would):
         let benign = [
