@@ -88,6 +88,22 @@ working directory writable — a project, a task workspace — the flag is
 `--rw-mount <dir>`, which mounts a host directory at its own path outside
 `/config` entirely. See `docs/mounts.md`.
 
+`mounts.toml` declares those directories too, in a `[workspace]` section:
+
+```toml
+[workspace]
+rw = ["/app", "/git", "/srv"]
+create = true
+```
+
+`rw` lists host directories mounted read-write at their own paths; the
+kernel mounts them first, then each `--rw-mount` (solo-acp: `--mount`).
+`create = true` makes a missing directory at start; without it, a missing
+directory refuses the start by name, as a flag's does. An unknown key in
+`[workspace]` refuses the start and names `rw` and `create`.
+`kaijutsu-solo-acp` reads `<state-dir>/config/mounts.toml` the same way; the
+benchmark adapter writes one there (`docs/benchmarks.md`).
+
 **When nothing is declared, nothing looks special.** Every root is a
 subdirectory of one host directory, and the registry is invisible. It earns its
 keep only when a root diverges — which is the point of "don't make rooting on a

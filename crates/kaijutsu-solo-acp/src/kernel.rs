@@ -98,16 +98,23 @@ impl SoloKernel {
 
 /// Build the server configuration for a solo kernel. Every path is named:
 /// nothing here resolves to an XDG default.
-pub fn solo_server_config(state: &SoloState) -> SshServerConfig {
+///
+/// `<state>/config/mounts.toml` is read as a server reads its own
+/// (`docs/config-namespace.md`): its `[workspace]` mounts come first, then
+/// `rw_flags` (`--mount`). A malformed file refuses the start.
+pub fn solo_server_config(state: &SoloState, rw_flags: &[PathBuf]) -> anyhow::Result<SshServerConfig> {
+    let mut mounts = kaijutsu_server::config_mounts::ConfigMounts::new(state.config_root());
+    mounts.load_declarations().map_err(anyhow::Error::msg)?;
+    let rw_mounts = mounts.rw_mounts_with(rw_flags).map_err(anyhow::Error::msg)?;
     let mut config = SshServerConfig::production(0);
     config.bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
     config.key_source = KeySource::Persistent(state.host_key_path());
     config.auth_db_path = Some(state.auth_db_path());
     config.config_dir = Some(state.root().to_path_buf());
-    config.config_mounts =
-        kaijutsu_server::config_mounts::ConfigMounts::new(state.config_root());
+    config.config_mounts = mounts;
+    config.rw_mounts = rw_mounts;
     config.data_dir = Some(state.root().to_path_buf());
-    config
+    Ok(config)
 }
 
 /// Start the kernel and wait until it is serving.
@@ -301,5 +308,35 @@ async fn settle(kernel: &SharedKernel) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "wal_checkpoint failed"),
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// A solo kernel reads `<state>/config/mounts.toml` like a server does:
+    /// its `[workspace]` mounts come first, then `--mount`, and `create`
+    /// makes a missing directory. A benchmark adapter declares `/app`,
+    /// `/git`, and `/srv` this way.
+    #[test]
+    fn the_state_mounts_file_declares_read_write_mounts() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = SoloState::prepare(Some(dir.path().join("state"))).expect("state");
+        let declared = dir.path().join("git");
+        std::fs::create_dir_all(state.config_root()).unwrap();
+        std::fs::write(
+            state.config_root().join("mounts.toml"),
+            format!("[workspace]\nrw = [{:?}]\ncreate = true\n", declared.to_str().unwrap()),
+        )
+        .unwrap();
+        let flag = dir.path().join("flag");
+        let config = solo_server_config(&state, std::slice::from_ref(&flag)).expect("config");
+        assert_eq!(config.rw_mounts, [declared.clone(), flag]);
+        assert!(declared.is_dir(), "create = true made the directory");
+
+        std::fs::write(state.config_root().join("mounts.toml"), "[workspace]\nrws = []\n").unwrap();
+        let Err(err) = solo_server_config(&state, &[]) else { panic!("a typo refuses the start") };
+        assert!(format!("{err:#}").contains("rws"), "{err:#}");
     }
 }

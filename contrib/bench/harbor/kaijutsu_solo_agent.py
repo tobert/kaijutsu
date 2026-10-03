@@ -51,11 +51,16 @@ KEY_ENV_ENV = "KAIJUTSU_ACP_KEY_ENV"
 NO_KEY_ENV = "KAIJUTSU_ACP_NO_KEY"
 IDLE_TIMEOUT_ENV = "KAIJUTSU_ACP_IDLE_TIMEOUT"
 REQUEST_TIMEOUT_ENV = "KAIJUTSU_ACP_REQUEST_TIMEOUT"
+WORKSPACE_MOUNTS_ENV = "KAIJUTSU_ACP_WORKSPACE_MOUNTS"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_RUST_LOG = "info"
+#: Directories a task commonly works in, mounted read-write and made if
+#: missing: the task's own workspace, a git server's repositories, and a
+#: service's files (Amy, 2026-10-03).
+DEFAULT_WORKSPACE_MOUNTS = ("/app", "/git", "/srv")
 
 #: Backends `kaijutsu-solo-acp --backend-kind` accepts in a release build.
 SOLO_BACKEND_KINDS = ("anthropic", "deepseek", "openai")
@@ -225,6 +230,15 @@ class KaijutsuSoloOptions(AcpOptions):
             "lines disappear and a run keeps no token record at all."
         ),
     )
+    workspace_mounts: str | None = Field(
+        default=None,
+        description=(
+            "Comma-separated directories the kernel mounts read-write at their "
+            "own paths, written to the state directory's config/mounts.toml as "
+            "[workspace] rw, with create = true. Empty means none. Default: "
+            f"${WORKSPACE_MOUNTS_ENV}, else {','.join(DEFAULT_WORKSPACE_MOUNTS)}."
+        ),
+    )
     max_tokens: int | None = Field(
         default=None,
         description=(
@@ -306,6 +320,7 @@ class KaijutsuSoloAcp(AcpAgent):
         solo_args: list[str] | str | None = None,
         rust_log: str | None = None,
         max_tokens: int | str | None = None,
+        workspace_mounts: str | None = None,
         rc_overlay: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
@@ -394,6 +409,17 @@ class KaijutsuSoloAcp(AcpAgent):
         # Left off the command line when unset, which is what keeps the
         # binary's own default (the factory token ceiling) in effect -- this
         # module changes no default of its own, only what it passes through.
+        mounts_raw = workspace_mounts if workspace_mounts is not None else os.environ.get(WORKSPACE_MOUNTS_ENV)
+        if mounts_raw is None:
+            self._workspace_mounts: list[str] = list(DEFAULT_WORKSPACE_MOUNTS)
+        else:
+            self._workspace_mounts = [m.strip() for m in mounts_raw.split(",") if m.strip()]
+        for mount in self._workspace_mounts:
+            if not mount.startswith("/") or mount.rstrip("/") == "":
+                raise ValueError(
+                    f"workspace mount {mount!r} must be an absolute directory other "
+                    f"than / (--ak workspace_mounts=... or ${WORKSPACE_MOUNTS_ENV})"
+                )
         max_tokens_raw = max_tokens if max_tokens is not None else os.environ.get(MAX_TOKENS_ENV)
         if max_tokens_raw is None:
             self._max_tokens: int | None = None
@@ -505,6 +531,10 @@ class KaijutsuSoloAcp(AcpAgent):
         if self._git_head:
             return f"git-{self._git_head[:12]}" + ("-dirty" if self._git_dirty else "")
         return f"sha256-{self._binary_sha256[:12]}"
+
+    def _mounts_toml(self) -> str:
+        rw = ", ".join(json.dumps(m) for m in self._workspace_mounts)
+        return f"[workspace]\nrw = [{rw}]\ncreate = true\n"
 
     def _solo_command(self) -> list[str]:
         args = [
@@ -649,6 +679,7 @@ class KaijutsuSoloAcp(AcpAgent):
                 "rust_log": self._rust_log,
                 "extra_args": self._solo_args,
                 "max_tokens": self._max_tokens,
+                "workspace_mounts": self._workspace_mounts,
                 "base_url": self._base_url,
                 "api_key_env": self._api_key_env,
             },
@@ -685,6 +716,17 @@ class KaijutsuSoloAcp(AcpAgent):
         await self.exec_as_root(
             environment, command=f"mkdir -p {remote_dir} {remote_state}"
         )
+        if self._workspace_mounts:
+            # The kernel reads its config root's mounts.toml at start and makes
+            # each missing directory itself (create = true).
+            mounts_toml = self.logs_dir / "mounts.toml"
+            mounts_toml.write_text(self._mounts_toml())
+            remote_config = shlex.quote((self._remote_state / "config").as_posix())
+            await self.exec_as_root(environment, command=f"mkdir -p {remote_config}")
+            await environment.upload_file(
+                source_path=mounts_toml,
+                target_path=(self._remote_state / "config" / "mounts.toml").as_posix(),
+            )
         await environment.upload_file(
             source_path=self._local_binary,
             target_path=self.REMOTE_BINARY.as_posix(),

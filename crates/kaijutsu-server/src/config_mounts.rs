@@ -30,12 +30,20 @@ use kaijutsu_types::paths::{self, CONFIG_TREES};
 pub struct ConfigMounts {
     root: PathBuf,
     overrides: BTreeMap<&'static str, PathBuf>,
+    /// `[workspace].rw`: host directories mounted read-write at their own
+    /// paths, before any `--rw-mount` flag.
+    workspace_rw: Vec<PathBuf>,
+    /// `[workspace].create`: make a missing `rw` directory at boot.
+    workspace_create: bool,
 }
+
+/// The keys `[workspace]` accepts.
+const WORKSPACE_KEYS: [&str; 2] = ["rw", "create"];
 
 impl ConfigMounts {
     /// Every tree defaulting to a subdirectory of `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), overrides: BTreeMap::new() }
+        Self { root: root.into(), overrides: BTreeMap::new(), workspace_rw: Vec::new(), workspace_create: false }
     }
 
     /// `~/.config/kaijutsu/config` — the one place the default config root is
@@ -76,6 +84,8 @@ impl ConfigMounts {
 
     /// Apply `<root>/mounts.toml` if it exists. Returns how many trees it
     /// repointed; `Ok(0)` when the file is absent, which is the normal case.
+    /// Its `[workspace]` section, if any, sets [`Self::workspace_rw`] and
+    /// [`Self::workspace_creates`].
     ///
     /// A malformed file is an error, never a silent skip: it was written on
     /// purpose, and booting with mounts the operator did not ask for is worse
@@ -90,6 +100,9 @@ impl ConfigMounts {
         let parsed: toml::Value = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(workspace) = parsed.get("workspace") {
+            self.load_workspace(workspace).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
         let Some(table) = parsed.get("mounts").and_then(|m| m.as_table()) else {
             return Ok(0);
         };
@@ -103,6 +116,60 @@ impl ConfigMounts {
             n += 1;
         }
         Ok(n)
+    }
+
+    fn load_workspace(&mut self, value: &toml::Value) -> Result<(), String> {
+        let table = value.as_table().ok_or("[workspace] must be a table")?;
+        if let Some(key) = table.keys().find(|k| !WORKSPACE_KEYS.contains(&k.as_str())) {
+            return Err(format!("[workspace] has no key '{key}' — expected one of {}", WORKSPACE_KEYS.join(", ")));
+        }
+        let mut rw = Vec::new();
+        if let Some(list) = table.get("rw") {
+            let list = list.as_array().ok_or("[workspace].rw must be a list of directories")?;
+            for dir in list {
+                let dir = dir.as_str().ok_or("[workspace].rw must be a list of directories")?;
+                rw.push(expand_tilde(PathBuf::from(dir)));
+            }
+        }
+        let create = match table.get("create") {
+            Some(value) => value.as_bool().ok_or("[workspace].create must be true or false")?,
+            None => false,
+        };
+        self.workspace_rw = rw;
+        self.workspace_create = create;
+        Ok(())
+    }
+
+    /// The read-write host directories `[workspace].rw` declares, in order.
+    pub fn workspace_rw(&self) -> &[PathBuf] {
+        &self.workspace_rw
+    }
+
+    /// Whether `[workspace].create` asks for a missing directory to be made.
+    pub fn workspace_creates(&self) -> bool {
+        self.workspace_create
+    }
+
+    /// Make each missing `[workspace].rw` directory when `create = true`.
+    /// Run before the mounts are validated. With `create = false` this does
+    /// nothing, and validation refuses a missing directory by name.
+    pub fn create_workspace(&self) -> Result<(), String> {
+        if !self.workspace_create {
+            return Ok(());
+        }
+        for dir in &self.workspace_rw {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("[workspace] could not create {}: {e}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// The kernel's read-write mounts: `[workspace].rw`, then `flags`
+    /// (`--rw-mount`, or solo-acp's `--mount`). Makes missing declared
+    /// directories first when `create = true`. The caller validates the list.
+    pub fn rw_mounts_with(&self, flags: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+        self.create_workspace()?;
+        Ok(self.workspace_rw.iter().chain(flags).cloned().collect())
     }
 
     /// The host directory backing one tree.
@@ -240,6 +307,88 @@ mod tests {
         )
         .unwrap();
         assert!(m.load_declarations().is_err(), "an unknown tree must fail loud");
+    }
+
+    /// `[workspace]` declares read-write host directories, mounted at their
+    /// own paths, in the same file as the config trees. A file with only a
+    /// workspace section still loads.
+    #[test]
+    fn a_workspace_section_declares_read_write_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ConfigMounts::new(dir.path());
+        assert!(m.workspace_rw().is_empty(), "nothing declared, nothing mounted");
+        std::fs::write(
+            dir.path().join("mounts.toml"),
+            "[workspace]\nrw = [\"/app\", \"/git\", \"/srv\"]\n",
+        )
+        .unwrap();
+        m.load_declarations().unwrap();
+        assert_eq!(m.workspace_rw(), [PathBuf::from("/app"), PathBuf::from("/git"), PathBuf::from("/srv")]);
+        assert!(!m.workspace_creates(), "a missing directory is refused unless asked for");
+        assert_eq!(m.host_dir(RC_ROOT), dir.path().join("rc"), "the trees are untouched");
+    }
+
+    /// A typo in `[workspace]` fails the boot and names the valid keys, the
+    /// same rule as an unknown tree.
+    #[test]
+    fn a_malformed_workspace_section_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = ConfigMounts::new(dir.path());
+        for (text, why) in [
+            ("[workspace]\nrws = [\"/app\"]\n", "an unknown key"),
+            ("[workspace]\nrw = \"/app\"\n", "rw is a list, not a string"),
+            ("[workspace]\nrw = [1]\n", "rw holds strings"),
+            ("[workspace]\ncreate = \"yes\"\n", "create is a boolean"),
+        ] {
+            std::fs::write(dir.path().join("mounts.toml"), text).unwrap();
+            let err = m.load_declarations().expect_err(why);
+            assert!(err.contains("workspace"), "{why}: {err}");
+        }
+        std::fs::write(dir.path().join("mounts.toml"), "[workspace]\nrws = []\n").unwrap();
+        let err = m.load_declarations().unwrap_err();
+        assert!(err.contains("rw") && err.contains("create"), "the error lists the valid keys: {err}");
+    }
+
+    /// `create = true` makes each missing workspace directory before the
+    /// kernel validates its mounts; without it nothing is created.
+    #[test]
+    fn create_makes_missing_workspace_directories_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("git");
+        let toml = |create: bool| format!("[workspace]\nrw = [{:?}]\ncreate = {create}\n", missing.to_str().unwrap());
+
+        let mut m = ConfigMounts::new(dir.path());
+        std::fs::write(dir.path().join("mounts.toml"), toml(false)).unwrap();
+        m.load_declarations().unwrap();
+        m.create_workspace().unwrap();
+        assert!(!missing.exists(), "create = false leaves a missing directory to be refused");
+
+        let mut m = ConfigMounts::new(dir.path());
+        std::fs::write(dir.path().join("mounts.toml"), toml(true)).unwrap();
+        m.load_declarations().unwrap();
+        assert!(m.workspace_creates());
+        m.create_workspace().unwrap();
+        assert!(missing.is_dir(), "create = true makes it");
+        m.create_workspace().unwrap();
+    }
+
+    /// A kernel's read-write mounts are the file's, then the flags'. Both
+    /// boot paths ask for this one list, after any directory was made.
+    #[test]
+    fn read_write_mounts_join_the_file_and_the_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = dir.path().join("srv");
+        std::fs::write(
+            dir.path().join("mounts.toml"),
+            format!("[workspace]\nrw = [{:?}]\ncreate = true\n", declared.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut m = ConfigMounts::new(dir.path());
+        m.load_declarations().unwrap();
+        let flag = PathBuf::from("/from/a/flag");
+        let rw = m.rw_mounts_with(std::slice::from_ref(&flag)).unwrap();
+        assert_eq!(rw, [declared.clone(), flag]);
+        assert!(declared.is_dir(), "the list is ready to validate: declared directories exist");
     }
 
     /// `~` is what a human writes in a config file, so a declaration expands

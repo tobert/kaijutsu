@@ -293,8 +293,14 @@ async fn run_server(
 
     tracing::info!("Starting kaijutsu server on SSH port {}...", port);
     let mut config = SshServerConfig::production(port);
+    config.rw_mounts = match mounts.rw_mounts_with(&rw_mount) {
+        Ok(rw) => rw,
+        Err(e) => {
+            eprintln!("config mounts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     config.config_mounts = mounts;
-    config.rw_mounts = rw_mount;
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {
@@ -726,11 +732,18 @@ async fn cmd_kj(
             return ExitCode::FAILURE;
         }
     };
+    let rw_mounts = match config_mounts.rw_mounts_with(&rw_mount) {
+        Ok(rw) => rw,
+        Err(e) => {
+            eprintln!("config mounts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     run_kj(KjRunArgs {
         config_dir: None,
         config_mounts,
         data_dir: None,
-        rw_mounts: rw_mount,
+        rw_mounts,
         as_character: args.as_character,
         context: args.context,
         json: args.json,

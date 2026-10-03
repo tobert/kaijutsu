@@ -297,8 +297,7 @@ fn run(cli: Cli) -> Result<()> {
     let max_tokens = cli.max_tokens.map(|n| n.get() as i64);
     state::prepare_rows(&solo, ROOT_CHARACTER, &cli.character, &key, &choice, max_tokens)?;
 
-    let mut config = kernel::solo_server_config(&solo);
-    config.rw_mounts = cli.mount.clone();
+    let mut config = kernel::solo_server_config(&solo, &cli.mount)?;
     config.unlisted = cli.unlist.clone();
     if !cli.no_cwd_mount {
         match std::env::current_dir() {
