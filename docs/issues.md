@@ -898,9 +898,13 @@ of the same name; kaibo DeepSeek review). Not fixed:
   path that is not already normal) at parse time.
 - **Stale comment**: the approval ledger's `ValueKind` says it mirrors
   kaish's `PlannedValue`; it no longer does.
-- **Stack**: `context_prompt_uses_rc_owned_sections` overflowed a 2 MiB test
-  thread under the new kaish and now runs on the rc stack. Production
-  threads have 16 MiB; the new kaish uses more stack on this path.
+- **Stack**: kaish uses more stack per rc lifecycle with each recent pin.
+  At kaish c7cdc8ee one test overflowed its 2 MiB test thread; at 118ee69d
+  and ae915794 five more did (`rc_source_edit_applies_only_to_later_lifecycle_runs`
+  needs between 2 and 3 MiB). All six now run through `crate::on_rc_thread`.
+  Production kaish threads have 16 MiB. Nothing measures the margin, so a
+  deeper nest or a further kaish change could reach 16 MiB unseen; a test
+  that runs the deepest shipped rc nest on a smaller stack would show it.
 
 ## From the kaibo DeepSeek review of 2026-10-01's changes
 

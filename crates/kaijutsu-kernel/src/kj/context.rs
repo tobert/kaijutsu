@@ -3897,31 +3897,22 @@ mod tests {
 
     #[test]
     fn rotate_without_a_successor_loadout_leaves_the_predecessor_live() {
-        on_rc_thread(rotate_without_a_successor_loadout_leaves_the_predecessor_live_body);
-    }
-
-    fn on_rc_thread<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
-        crate::spawn_kaish_thread("rc-test-thread", move || {
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+        crate::on_rc_thread(rotate_without_a_successor_loadout_leaves_the_predecessor_live_body);
     }
 
     #[test]
     fn rotate_carries_the_seat_to_its_successor() {
-        on_rc_thread(rotate_carries_the_seat_to_its_successor_body);
+        crate::on_rc_thread(rotate_carries_the_seat_to_its_successor_body);
     }
 
     #[test]
     fn rotate_authority_and_liveness() {
-        on_rc_thread(rotate_authority_and_liveness_body);
+        crate::on_rc_thread(rotate_authority_and_liveness_body);
     }
 
     #[test]
     fn rotate_a_root_context() {
-        on_rc_thread(rotate_a_root_context_body);
+        crate::on_rc_thread(rotate_a_root_context_body);
     }
 
     // Creating through a shell re-enters kaish for rc; use the production rc stack.
@@ -6597,7 +6588,7 @@ mod tests {
     // Creating a coder runs its create rc; use the production rc stack.
     #[test]
     fn context_prompt_uses_rc_owned_sections() {
-        on_rc_thread(context_prompt_uses_rc_owned_sections_body);
+        crate::on_rc_thread(context_prompt_uses_rc_owned_sections_body);
     }
 
     async fn context_prompt_uses_rc_owned_sections_body() {
@@ -6696,8 +6687,13 @@ mod tests {
     /// Rc source files are read when a lifecycle runs. Editing a shared body
     /// changes a later create, never the already-authored instruction blocks
     /// in an existing context.
-    #[tokio::test]
-    async fn rc_source_edit_applies_only_to_later_lifecycle_runs() {
+    // Creating a coder runs its create rc; use the production rc stack.
+    #[test]
+    fn rc_source_edit_applies_only_to_later_lifecycle_runs() {
+        crate::on_rc_thread(rc_source_edit_applies_only_to_later_lifecycle_runs_body);
+    }
+
+    async fn rc_source_edit_applies_only_to_later_lifecycle_runs_body() {
         use crate::vfs::VfsOps;
 
         let d = std::sync::Arc::new(test_dispatcher_rc().await);

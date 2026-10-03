@@ -919,8 +919,13 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    #[tokio::test]
-    async fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer() {
+    // Runs an rc lifecycle; use the production rc stack.
+    #[test]
+    fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer() {
+        crate::on_rc_thread(rc_nested_context_keeps_the_lead_as_director_and_its_reviewer_body);
+    }
+
+    async fn rc_nested_context_keeps_the_lead_as_director_and_its_reviewer_body() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         install_rc_script_file(&d, "/config/rc/test/create/S00-spawn-coder.kai", "kj context create child-work --type child --as coder")
@@ -1261,8 +1266,13 @@ fn console_caller(d: &KjDispatcher) -> KjCaller {
         );
     }
 
-    #[tokio::test]
-    async fn rc_kai_can_call_kj() {
+    // Runs an rc lifecycle; use the production rc stack.
+    #[test]
+    fn rc_kai_can_call_kj() {
+        crate::on_rc_thread(rc_kai_can_call_kj_body);
+    }
+
+    async fn rc_kai_can_call_kj_body() {
         // .kai scripts get `kj` registered when the dispatcher's
         // self-Arc is wired. Without `set_self_arc`, the test
         // dispatcher's scripts still run but can't reach kj.
@@ -2310,8 +2320,13 @@ esac
     /// sections, and it actually hydrates into the conversation the model
     /// sees. This is the full mechanism proof; the sibling tests below only
     /// check the per-type policy matrix (which types get one, which don't).
-    #[tokio::test]
-    async fn coder_create_seeds_model_visible_datetime_notification() {
+    // Runs an rc lifecycle; use the production rc stack.
+    #[test]
+    fn coder_create_seeds_model_visible_datetime_notification() {
+        crate::on_rc_thread(coder_create_seeds_model_visible_datetime_notification_body);
+    }
+
+    async fn coder_create_seeds_model_visible_datetime_notification_body() {
         // `kj` is only registered inside rc `.kai` scripts once the
         // dispatcher's self-Arc is wired (see `rc_kai_can_call_kj` above) —
         // and the coder stance/binding/datetime scripts all call `kj`.
@@ -2454,8 +2469,13 @@ esac
     /// whatever it inherited from the parent (the parent's create-time note
     /// copies over too — fork copies the whole log — so the count grows by
     /// exactly one, not to exactly one).
-    #[tokio::test]
-    async fn coder_fork_reseeds_datetime_notification() {
+    // Runs an rc lifecycle; use the production rc stack.
+    #[test]
+    fn coder_fork_reseeds_datetime_notification() {
+        crate::on_rc_thread(coder_fork_reseeds_datetime_notification_body);
+    }
+
+    async fn coder_fork_reseeds_datetime_notification_body() {
         let d = std::sync::Arc::new(test_dispatcher_rc().await);
         d.set_self_arc();
         let caller = console_caller(&d);

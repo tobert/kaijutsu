@@ -229,9 +229,9 @@ tempfile = "3"
 # names the mounts a walk skipped, `find -xdev`, and `command -v`/`type`),
 # head c7cdc8ee. Retire this patch when the next kaish release lands.
 [patch.crates-io]
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
-kaish-types = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
-kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
-kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
-kaish-glob = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "c7cdc8ee9464eb61559f92009f404e2bf4fec6ce" }
+kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
+kaish-types = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
+kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
+kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
+kaish-glob = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
+kaish-help = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }

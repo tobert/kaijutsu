@@ -78,6 +78,20 @@ pub fn spawn_kaish_thread<T: Send + 'static>(
         .spawn(f)
 }
 
+/// Run a test body on a thread sized like production's kaish threads.
+///
+/// A test that runs an rc lifecycle (creating a coder, a fork, `kj` from a
+/// `.kai` script) needs more than the 2 MiB test-thread stack.
+#[cfg(test)]
+pub(crate) fn on_rc_thread<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+    spawn_kaish_thread("rc-test-thread", move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body());
+    })
+    .unwrap()
+    .join()
+    .unwrap();
+}
+
 pub use peers::{
     InvokeRequest, InvokeResponse, PeerConfig, PeerError, PeerInfo, PeerRegistry,
     SharedPeerRegistry, peer_key, shared_peer_registry,
