@@ -476,8 +476,8 @@ mod tests {
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                stance.contains("Follow their objective and apply their corrections."),
-                "{context_type} carries the collaboration rules in its own stance"
+                stance.contains("accountable"),
+                "{context_type} names who is accountable for the work in its own stance"
             );
         }
     }

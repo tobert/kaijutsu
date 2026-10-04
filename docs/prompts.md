@@ -38,13 +38,12 @@ assigned reviewer (stable IDs and names); rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
 
 Director is the operator's seat. Its `S00-stance.kai` writes one line naming
-the character recorded in `played_by` (below), then reads its companion.
-`S06-kj-help.kai` composes `kj help` plus a selected set of eighteen top-level
-verb help pages into one durable instruction block. Leaf command help remains
-available on demand. This reference was about 28 KB when introduced; that is a
-source size, not a token measurement. The system cache breakpoint permits
-reuse where the provider supports it; the initial request still pays for the
-reference.
+the system and the character recorded in `played_by` (below), then reads its
+companion. `S06-kj-help.kai` reads `S06-kj-help.md`: a short narrative of kj
+(contexts, turns, forks, drift, asks) and the operator's most-used commands,
+each with when to use it. Verb detail stays in `kj <verb> --help`, run on
+demand. The stance and narrative together are about 4.5 KB; they replaced a
+28 KB paste of `kj help` and eighteen verb help pages.
 
 The coder has its own binding (`coder/create/S10-binding.kai`): one shell
 (`shell_write`, with the shell-operation tools it projects), the file tools,

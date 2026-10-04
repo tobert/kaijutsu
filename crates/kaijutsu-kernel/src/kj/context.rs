@@ -3985,7 +3985,7 @@ mod tests {
         assert_eq!(data["played_by_name"], "banto");
         let blocks = d.block_store().block_snapshots(context).unwrap();
         let instructions = crate::llm::extract_system_prompt_sections(&blocks).join("\n");
-        assert!(instructions.contains("You are banto"), "{instructions}");
+        assert!(instructions.contains("we are banto, the operator"), "{instructions}");
         assert!(!instructions.contains("obsolete-name"));
         assert!(!instructions.contains("remember-the-operator-task"));
         assert!(blocks.iter().any(|b| b.kind == kaijutsu_types::BlockKind::Notification
@@ -4043,7 +4043,7 @@ mod tests {
             let id = d.kernel_db().lock().resolve_context(&label).unwrap();
             let blocks = d.block_store().block_snapshots(id).unwrap();
             let instructions = crate::llm::extract_system_prompt_sections(&blocks).join("\n");
-            assert!(instructions.contains(&format!("You are {name},")), "name={name}: {instructions}");
+            assert!(instructions.contains(&format!("we are {name},")), "name={name}: {instructions}");
             let handoff = blocks.iter().find(|b| b.kind == kaijutsu_types::BlockKind::Notification
                 && b.content.contains("name-specific-history")).expect("performer's handoff");
             let advice = handoff.content.lines().find(|line| line.trim_start().starts_with("kj handoff note"))
@@ -6720,7 +6720,7 @@ mod tests {
         assert!(result.is_ok(), "prompt failed: {}", result.message());
         let msg = result.message();
 
-        let opening = "You are a coder.";
+        let opening = "We are a cybernetic system focused on software engineering.";
         assert_eq!(
             msg.match_indices(opening).count(),
             1,
@@ -6730,14 +6730,13 @@ mod tests {
             !msg.contains("LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR"),
             "the old /config/kernel/system.md input must be ignored: {msg}"
         );
-        // The coder stance carries the collaboration rules, the orient and
-        // define-done rhythm, the working rules, and the ending calls.
-        for rule in ["Follow their objective", "ask with blocked",
-            "continue any work that does not depend on the answer",
-            "Start each task by orienting", "record that before you begin",
-            "Search file contents with grep", "Pass a script file, not inline text",
-            "kj wait --operation", "Difficulty and uncertainty are not reasons to stop",
-            "use the done tool to let us know", "頑張って"] {
+        // The coder stance carries accountability, the define-done and
+        // orient rhythm, honest guessing, the working rules, and done.
+        for rule in ["The human in our system is accountable for our work",
+            "how we will know when it is complete", "We begin each task by getting oriented",
+            "The most important thing to do when guessing is say so",
+            "Search file contents with grep", "least privilege",
+            "kj wait --operation", "Use the `done` tool", "頑張って"] {
             // Prose wraps freely; compare with line breaks folded to spaces.
             let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(flat.contains(rule), "coder stance is missing {rule:?}: {msg}");

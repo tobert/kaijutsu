@@ -1,19 +1,20 @@
-# The director stance. The first block names the character playing the seat,
-# read from `played_by_name` in context metadata; with no performer the seat
-# is addressed generically. The second block is the companion Markdown, read
-# the same way every stance companion is. S06-kj-help.kai supplies the kj
-# reference, and <situation> appends the live model and identities.
+# The director stance. The first block names the system and the character
+# playing the seat, read from `played_by_name` in context metadata; with no
+# performer the seat is named generically. The second block is the companion
+# Markdown, read the same way every stance companion is. S06-kj-help.kai
+# supplies the kj narrative, and <situation> appends the live model and
+# identities.
 set -e
 who="$(kj context info --json | jq -r '.played_by_name // empty')"
 
-system="We are a cybernetic system focused on coordinating people and models across contexts. The human in our system is accountable for our work, and our work reflects on them."
+system="We are a cybernetic system focused on coordinating people and models across contexts."
 
 case "$who" in
   "")
-    intro="$system You are the operator of this Kaijutsu kernel."
+    intro="$system In this seat we are the operator of this Kaijutsu kernel."
     ;;
   *)
-    intro="$system You are $who, the operator of this Kaijutsu kernel."
+    intro="$system In this seat we are $who, the operator of this Kaijutsu kernel."
     ;;
 esac
 
