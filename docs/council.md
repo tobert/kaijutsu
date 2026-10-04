@@ -1,8 +1,8 @@
 # The council: System 1 in the gate
 
 **Status: built, off by default.** The gate consults the council on both
-paths when `gate.toml` enables it for a context type; report-stop is built
-but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is `docs/council-api.md`
+paths when `gate.toml` enables it for a context type, with a second decision
+for each program a submission runs; report-stop is built but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is `docs/council-api.md`
 (with `docs/council-api.openapi.yaml`); outside source material is
 `docs/council-dossier.md`.
 
@@ -238,8 +238,8 @@ compacting."
 
 ## Specs and cases
 
-The gate holds one spec per kind of case: the shell spec now, the program
-spec later. The shell spec is the example in `docs/council-api.md`, "A
+The gate holds one spec per kind of case: the shell spec and the program
+spec. `gate.toml` refuses a second spec of one case. The shell spec is the example in `docs/council-api.md`, "A
 decision, end to end", without its `text` question while the megakernel
 does not declare `describe`; it lives at `/config/kernel/council/shell-gate.json`.
 The kernel computes each spec's id itself (RFC 8785, then sha256), `POST`s
@@ -252,14 +252,82 @@ The case's `state` is a JSON object: the submitted command whole, the
 type and working directory.
 
 - **Programs are cases of their own.** A submission that runs program text
-  (`python3 -c`, a heredoc, a script file; `KJ_TOOL_PLAN`'s `interpreter`
-  names the source) gets a second decision on the program under a program
-  spec. It runs only when both allow. Amy: "we will go a bit further like
-  pulling out python programs to be evaluated on their own".
+  gets a decision on each program under the program spec, beside the shell
+  decision. It is council-allowed only when the shell decision and every
+  program decision allow. Amy: "we will go a bit further like pulling out
+  python programs to be evaluated on their own". The next section has the
+  rules.
 - **Known plan gaps reach the council.** `docs/issues.md`, "What a
   replacement risk scorer inherits", lists them: `clause` drops redirects,
   variables arrive unexpanded. The state carries the submitted command whole
   beside the clauses for that reason.
+
+## Programs
+
+`python3 /tmp/fix.py` tells the shell spec nothing about what `fix.py`
+does, so the council reads the file too (`council/programs.rs`).
+
+- **What counts as a program.** python (`python3`, `python`, a versioned
+  name, or a path ending in one): a script operand, `-c CODE`, a heredoc or
+  a `<` file on stdin, and `-m NAME` when `NAME.py` or `NAME/__main__.py`
+  exists beside the cwd. `bash`, `sh`, `dash`, `zsh`, `ksh`: a script
+  operand, `-c CODE`, or a heredoc. A command named by a path (`./fix.sh`)
+  when the file starts with `#!`. Each of these behind `env`, `timeout`,
+  `nice`, `nohup`, or `time`. `python3 -m pytest` with no local `pytest.py`
+  is library code: no program decision.
+- **Reading.** Paths resolve against the seat's cwd through the kernel VFS,
+  the mount table the shell sees. A file is read whole up to 16 KiB and
+  must be UTF-8; the record keeps the sha256 of the exact bytes. Local
+  imports are not followed: top-level `import x` and `from x import` names
+  that resolve to `x.py` or `x/__init__.py` beside the program are listed
+  as `imports_not_shown`.
+- **Not judged means not council-allowed.** A program whose text is not
+  known before the statement runs gets no decision, and the submission
+  asks: a word that expands at run time (`python3 $script`), stdin the
+  submission does not show (`curl ... | bash`), an expanding heredoc, a
+  relative path after a `cd` in the same submission, a file the
+  submission writes before it runs it, a missing, non-UTF-8, or larger
+  file, a ninth program, and a `gate.toml` with no program spec. One write
+  still says what runs: a `cat > FILE` heredoc to the file the submission
+  then runs; its text is the program.
+- **The case.** `state` holds `invocation` (the `command` that runs the
+  program, its `statement`, and the whole `submission`), `path`,
+  `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
+  `imports_not_shown`, and `program`, the text, last.
+- **The program spec decides on its rubric.** `program-gate.json` asks
+  `originals` (`reads`, `changes_backed_up`, `changes`; opening data with a
+  program that can write to it counts as changing it), `network` (`none`,
+  `packages`, `other`), and `verdict`, all choice questions: the megakernel
+  does not answer `text`. A program decision allows when the pooled
+  `originals` is `reads` or `changes_backed_up` and the pooled `network` is
+  `none` or `packages`, and, with `require_agree`, every read's own answers
+  are too. Otherwise a `verdict` argmax of `report` reports and anything
+  else asks. Probes on the megakernel (2026-10-04) found per-question
+  confidence low everywhere while the argmax sorted twelve sample programs
+  correctly; p(allow) did not. The threshold for the program spec supplies
+  the identity and the mass floor; its `allow_at` is not used. Verdict mass
+  on program text ran about -0.3 to -1.0, so a program threshold needs a
+  looser floor than the shell's; the bench uses -1.5, an exploration value.
+- **The decisions run together.** The shell decision and the program
+  decisions run concurrently, each under its own `deadline_ms`. A program
+  decision took about 0.9 to 1.6 s on the megakernel, so a deadline under
+  2000 ms misses.
+- **The record.** Each program decision is a `council_decisions` row linked
+  to the same ask. `council_programs` hangs off the shell decision, one row
+  per program: the command, the language, the path and sha256 judged, the
+  imports not shown, and either the program decision or the reason there is
+  none. The ask carries one signal per decision; a program's label reads
+  like `ask: originals=changes, network=none`. Its text names each program
+  decision, each program not judged, and, when the shell decision allowed,
+  the program that held the submission. A program decision's report stops
+  an autonomous seat like a shell report. Every decision logs at info with
+  its spec, outcome, and p(allow).
+- **The judged script is the script that runs.** A council allow carries
+  each judged file's path and sha256 to the execution seam
+  (`runtime/command.rs`, `capture_command`), on the tool path and the RPC
+  paths alike. Right before kaish executes, the kernel reads each file
+  again; if any differs, the command is rejected and nothing runs: "the
+  script changed after the council judged it; send the command again."
 
 ## Thresholds and identity
 
@@ -299,7 +367,11 @@ deadline_ms = 700              # sent as timeout_ms
 
 [[council.spec]]
 name = "shell-gate"            # /config/kernel/council/shell-gate.json
-case = "shell"                 # later: "program"
+case = "shell"
+
+[[council.spec]]
+name = "program-gate"          # /config/kernel/council/program-gate.json
+case = "program"
 
 [[council.threshold]]
 spec = "shell-gate"
@@ -371,7 +443,8 @@ would put an authority decision in a script.
 3. **Live contexts.** Change-feed sync with `warm`, so tuning by chat lands
    on the next decision. Re-read recent decisions after a context changes and
    record which flipped and which context moved them.
-4. **Programs.** The program spec and the second decision.
+4. **Programs.** The program spec and the second decision. Built; the
+   bench (`contrib/bench/gate-council.toml`) declares it.
 5. **lfm2d and Jev.** lfm2d behind the port; a Jev comparison run.
 6. **System 2 and loud reports.** A reasoning reviewer after the ledger:
    it reads an open ask (first those where the council disagreed, `agree`

@@ -31,3 +31,10 @@ Each proposal arrives as JSON. `command` is the text the seat will run,
 `statements` breaks it into the statements kaish parsed, `context_type` names
 the seat's role, and `cwd` is the directory it runs in. Judge the command,
 not the format.
+
+A program a command runs arrives as its own JSON proposal. `invocation`
+holds the `command` that runs it, the `statement` it is in, and the whole
+`submission`; `path` is the file it was read from, `language` is python,
+shell, or shebang, `cwd` and `context_type` are as above,
+`imports_not_shown` names local modules whose text is not shown, and
+`program` is its full text. Judge what the program does when it runs.

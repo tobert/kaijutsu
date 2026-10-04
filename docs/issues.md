@@ -155,6 +155,33 @@ WAL. Accept `-p`, or have the refusal name the fix.
   span and the event only. Durable would mean an additive column written
   after the ask's transaction commits.
 
+## Council programs: what the program decision left open (2026-10-04)
+
+- **Interpreters and wrappers not read.** `node`, `perl`, `ruby`, `uv run`,
+  `poetry run`, `npx`, `xargs`, `find -exec`, `sudo`, and kaish `source`
+  run program text the council does not see; only the shell decision reads
+  them. Add each the way `council/programs.rs` reads python and the shells.
+- **Writes the plan cannot see.** A file written through a word that
+  expands (`cp x $dst`) or by a program the submission runs earlier is
+  judged by its text at the gate, and the re-hash before execution happens
+  before the submission writes it. A program the submission runs earlier is
+  itself judged, so its writes are in front of the council; an expanding
+  copy is not.
+- **Imports are named, not read or hashed.** A local module listed in
+  `imports_not_shown` can change between the decision and the run without
+  the integrity check noticing.
+- **Program decisions run when the shell decision does not allow.** They
+  run concurrently for the record; skipping them after a shell ask would
+  save server time and lose the data.
+- **`kj ledger show` does not render `council_programs`.** The signals and
+  the ask's text carry the answers; the rows are reachable by SQL only.
+- **A program threshold's `allow_at` is required and unused.** The program
+  case decides on its rubric. Either drop the field for the program case or
+  give it a meaning.
+- **Pre-existing test failure.** `kj::context::tests::rc_source_edit_applies_only_to_later_lifecycle_runs`
+  asserts the seeded coder stance contains "You are a coder."; ec76d3c9
+  removed that sentence. The test needs the stance's current text.
+
 ## `kj context list --tree` draws siblings as children (2026-10-04)
 
 On zorak, `kj context list --tree` drew `tui-ask-stuck`, the banto contexts,

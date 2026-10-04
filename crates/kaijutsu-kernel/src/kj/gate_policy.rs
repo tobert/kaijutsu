@@ -2633,6 +2633,19 @@ enabled = false
         assert_eq!(c.threshold_for("program-gate", &identity("wh1")).unwrap().mass_floor, -1.5);
     }
 
+    /// The benchmark's council gate parses and judges programs under its own
+    /// spec, with a threshold for the same server identity as the shell's.
+    #[test]
+    fn the_bench_council_gate_declares_both_cases() {
+        let cfg = config(include_str!("../../../../contrib/bench/gate-council.toml"));
+        let c = cfg.council().expect("the bench file declares a council");
+        let cases: Vec<CouncilCase> = c.specs.iter().map(|s| s.case).collect();
+        assert_eq!(cases, vec![CouncilCase::Shell, CouncilCase::Program]);
+        let shell = c.thresholds.iter().find(|t| t.spec == "shell-gate").unwrap();
+        assert!(c.threshold_for("program-gate", &shell.identity).is_some());
+        assert!(cfg.council_enabled_for(Some("coder")));
+    }
+
     #[test]
     fn a_threshold_must_name_a_declared_spec() {
         let m = council_err(&council_with("spec = \"shell-gate\"", "spec = \"nope\""));

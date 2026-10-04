@@ -36,5 +36,26 @@ template = "mk-letters-1:47004159d76ccca4"
 allow_at = 0.98
 mass_floor = -0.05
 
+# Each program a submission runs (a python script, `python3 -c`, a heredoc,
+# `bash FILE`, `./script`) gets its own decision under program-gate, which
+# the kernel seeds to /config/kernel/council/program-gate.json. The program
+# decision allows on its rubric (originals and network), not on allow_at;
+# the threshold supplies the identity and the mass floor. Probes on the
+# megakernel put verdict mass on program text at about -0.3 to -1.0, so
+# -0.05 would make every program decision a miss; -1.5 is an exploration
+# value, a miss guard only.
+[[council.spec]]
+name = "program-gate"
+case = "program"
+
+[[council.threshold]]
+spec = "program-gate"
+weight_hash = "0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"
+engine = "044545114a4e0112d9ac2ba1bdb2682f688dfca5:8a85c7dc4023b87b845091fe42d477733f3c2e153e086c73a1112861001ec6a9"
+tokenizer_hash = "518665209619906d18852264fb032d302f6171425e4faa84aec9ac7d4b96cac6"
+template = "mk-letters-1:47004159d76ccca4"
+allow_at = 0.98
+mass_floor = -1.5
+
 [context_type.coder.council]
 enabled = true
