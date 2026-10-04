@@ -1,10 +1,13 @@
 # Create council-system, the house rules the council reads for every gate
-# decision, once per kernel. The text is the companion Markdown.
+# decision, once per kernel. The text is the companion Markdown. The council
+# context type has no seeded rc bucket, and an rc overlay may only replace
+# files in existing types, so the bucket is installed here with `kj rc add`.
 set -e
 if kj context info council-system > /dev/null 2>&1; then
   echo "council-system: present"
   exit 0
 fi
+kj rc add /config/rc/council/create/S00-none.kai --content "true" || true
 kj context create council-system --type council --top
 kj block create -c council-system --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
 echo "council-system: created"
