@@ -171,6 +171,7 @@ pub struct RcSeedReport {
 /// its links are gone; the mcp stance went because an outside agent's own
 /// system prompt is the only one its model reads.
 pub const RETIRED_RC_SEEDS: &[&str] = &[
+    "coder/create/S15-recall.kai",
     "lib/create/S00-base.kai",
     "lib/create/S00-base.md",
     "coder/create/S00-base.kai",

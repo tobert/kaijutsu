@@ -3004,6 +3004,24 @@ esac
         });
     }
 
+    /// A coder starts clean: no fleet or memory recall digest. That script
+    /// read one person's notes from paths fixed in its source and put their
+    /// index into every coder context (Amy, 2026-10-03: "want coder clean").
+    #[test]
+    fn coder_create_runs_no_recall_script() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seed_scripts::ensure_rc_seed_files(dir.path()).unwrap();
+        let create = dir.path().join("coder/create");
+        let scripts: Vec<String> = std::fs::read_dir(&create).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!scripts.iter().any(|name| name.contains("recall")), "{scripts:?}");
+        for name in &scripts {
+            let body = std::fs::read_to_string(create.join(name)).unwrap_or_default();
+            assert!(!body.contains("memory recall"), "{name} still writes a recall block");
+        }
+    }
+
     // ── Working-directory orientation (coder/create/S35-orient.kai) ───────
 
     /// First words of the orientation notification.
