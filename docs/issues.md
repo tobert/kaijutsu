@@ -118,6 +118,18 @@ Measure and design recovery before promising durable admission or delivery.
   Amy: an interrupt abandons the turn's held ask (`runtime/interrupt.rs`), so
   docs/council.md's "until someone answers the ask" is not true today.
 
+## `blocks repair-order` does not converge on one conversation (2026-10-04)
+
+On zorak's deploy, the first `--apply` fixed 1099 conversations' worth of
+pre-855ace8a misordering (248 results, 2965 blocks re-keyed), but
+conversation `01a0d469-3af0-7701-88a9-9f76ea803728` keeps 123 results
+before their calls in one 661-block run. Each `--apply` re-keys the same
+run again and reports the same 123, so the run's ticks themselves put
+results first (tied or wrong ticks), and tick-order re-keying cannot fix
+it. It was applied twice; don't keep applying. Look at that run's ticks
+before deciding: a per-pair repair (move each result after its call), or
+archive the conversation as-is.
+
 ## The coder-stance sentinel tests fail on main (2026-10-04)
 
 2a6a0a5c rewrote `assets/defaults/rc/coder/create/S00-stance.md`, which now
