@@ -342,11 +342,142 @@ impl TierTable {
     }
 }
 
-/// The parsed `gate.toml`: the global tier and one tier per context type.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The parsed `gate.toml`: the global tier, one tier per context type, and
+/// the council's settings when the file declares them.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct GateConfig {
     global: TierTable,
     context_types: BTreeMap<String, TierTable>,
+    council: Option<CouncilConfig>,
+    /// Context types whose `[context_type.<type>.council]` says `enabled = true`.
+    council_enabled: std::collections::BTreeSet<String>,
+}
+
+/// How the kernel pools the council's per-context reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CouncilPoolMethod {
+    Linear,
+    LogLinear,
+}
+
+/// What weights the pool gives each read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CouncilPoolWeights {
+    Uniform,
+    Mass,
+}
+
+/// The kind of case a council spec reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CouncilCase {
+    Shell,
+}
+
+/// A spec the council holds: `name` is the stem of
+/// `/config/kernel/council/<name>.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CouncilSpec {
+    pub(crate) name: String,
+    pub(crate) case: CouncilCase,
+}
+
+/// What produced a number: a threshold fitted under one identity does not
+/// carry to another.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CouncilIdentity {
+    pub(crate) weight_hash: String,
+    pub(crate) engine: String,
+    pub(crate) tokenizer_hash: String,
+    pub(crate) template: String,
+}
+
+/// The cut a spec's pooled answer must clear under one identity.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CouncilThreshold {
+    pub(crate) spec: String,
+    pub(crate) identity: CouncilIdentity,
+    /// Pooled p(allow) at or above which the council may allow.
+    pub(crate) allow_at: f64,
+    /// Each read's verdict mass, a log probability, at or above which the
+    /// read counts.
+    pub(crate) mass_floor: f64,
+}
+
+/// The `[council]` section with its specs and thresholds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CouncilConfig {
+    pub(crate) server: String,
+    pub(crate) contexts: Vec<String>,
+    pub(crate) pool_method: CouncilPoolMethod,
+    pub(crate) pool_weights: CouncilPoolWeights,
+    pub(crate) deadline_ms: u64,
+    pub(crate) require_agree: bool,
+    pub(crate) specs: Vec<CouncilSpec>,
+    pub(crate) thresholds: Vec<CouncilThreshold>,
+}
+
+impl CouncilConfig {
+    /// The threshold for `spec` under `identity`, or `None` when none was
+    /// fitted for that identity.
+    pub(crate) fn threshold_for(
+        &self,
+        spec: &str,
+        identity: &CouncilIdentity,
+    ) -> Option<&CouncilThreshold> {
+        self.thresholds.iter().find(|t| t.spec == spec && t.identity == *identity)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilToml {
+    server: String,
+    contexts: Vec<String>,
+    pool: CouncilPoolToml,
+    deadline_ms: i64,
+    #[serde(default = "default_require_agree")]
+    require_agree: bool,
+    #[serde(default)]
+    spec: Vec<CouncilSpecToml>,
+    #[serde(default)]
+    threshold: Vec<CouncilThresholdToml>,
+}
+
+fn default_require_agree() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilPoolToml {
+    method: String,
+    weights: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilSpecToml {
+    name: String,
+    case: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilThresholdToml {
+    spec: String,
+    weight_hash: String,
+    engine: String,
+    tokenizer_hash: String,
+    template: String,
+    allow_at: f64,
+    mass_floor: f64,
+}
+
+/// `[context_type.<type>.council]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilSwitchToml {
+    enabled: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -356,6 +487,7 @@ struct GateToml {
     global: TierToml,
     #[serde(default)]
     context_type: BTreeMap<String, TierToml>,
+    council: Option<CouncilToml>,
 }
 
 #[derive(Deserialize, Default)]
@@ -369,6 +501,8 @@ struct TierToml {
     deny: Vec<String>,
     /// `ask` (the default) or `allow`.
     uncovered: Option<String>,
+    /// Accepted under `[context_type.<type>]` only; `[global]` is refused.
+    council: Option<CouncilSwitchToml>,
 }
 
 /// Why `gate.toml` could not be used. Every variant refuses the
@@ -418,14 +552,184 @@ impl GateConfig {
         let mut config = GateConfig {
             global: Self::table_from(&raw.global, "[global]")?,
             context_types: BTreeMap::new(),
+            council: None,
+            council_enabled: Default::default(),
         };
+        if raw.global.council.is_some() {
+            return Err(GateConfigError::Parse(
+                "[global.council]: the council has no global switch; enable it per context type \
+                 with [context_type.<type>.council]"
+                    .into(),
+            ));
+        }
         for (context_type, tier) in &raw.context_type {
             let section = format!("[context_type.{context_type}]");
             config
                 .context_types
                 .insert(context_type.clone(), Self::table_from(tier, &section)?);
+            if tier.council.as_ref().is_some_and(|c| c.enabled) {
+                config.council_enabled.insert(context_type.clone());
+            }
+        }
+        if let Some(council) = &raw.council {
+            config.council = Some(Self::council_from(council)?);
+        } else if let Some(name) = config.council_enabled.iter().next() {
+            return Err(GateConfigError::Parse(format!(
+                "[context_type.{name}.council] enabled = true: the file has no [council] section \
+                 to enable"
+            )));
         }
         Ok(config)
+    }
+
+    fn council_from(raw: &CouncilToml) -> Result<CouncilConfig, GateConfigError> {
+        let err = |m: String| GateConfigError::Parse(m);
+        let rest = raw
+            .server
+            .strip_prefix("http://")
+            .or_else(|| raw.server.strip_prefix("https://"));
+        if !rest.is_some_and(|r| !r.is_empty() && !r.contains(char::is_whitespace)) {
+            return Err(err(format!(
+                "[council] server: `{}` must be an http:// or https:// URL with a host",
+                raw.server
+            )));
+        }
+        if raw.contexts.is_empty() {
+            return Err(err("[council] contexts: must list at least one context label".into()));
+        }
+        for (i, label) in raw.contexts.iter().enumerate() {
+            if label.trim().is_empty() {
+                return Err(err("[council] contexts: labels must be non-empty".into()));
+            }
+            if raw.contexts[..i].contains(label) {
+                return Err(err(format!("[council] contexts: `{label}` is listed twice")));
+            }
+        }
+        let pool_method = match raw.pool.method.as_str() {
+            "linear" => CouncilPoolMethod::Linear,
+            "loglinear" => CouncilPoolMethod::LogLinear,
+            other => {
+                return Err(err(format!(
+                    "[council] pool.method: `{other}` is not one of linear, loglinear"
+                )))
+            }
+        };
+        let pool_weights = match raw.pool.weights.as_str() {
+            "uniform" => CouncilPoolWeights::Uniform,
+            "mass" => CouncilPoolWeights::Mass,
+            other => {
+                return Err(err(format!(
+                    "[council] pool.weights: `{other}` is not one of uniform, mass"
+                )))
+            }
+        };
+        if raw.deadline_ms <= 0 {
+            return Err(err(format!(
+                "[council] deadline_ms: {} must be an integer greater than 0",
+                raw.deadline_ms
+            )));
+        }
+        if raw.spec.is_empty() {
+            return Err(err("[council]: declare at least one [[council.spec]]".into()));
+        }
+        let mut specs: Vec<CouncilSpec> = Vec::new();
+        for s in &raw.spec {
+            if s.name.is_empty()
+                || !s.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(err(format!(
+                    "[[council.spec]] name: `{}` must match [A-Za-z0-9_-]+ (a file stem under \
+                     /config/kernel/council/)",
+                    s.name
+                )));
+            }
+            if specs.iter().any(|p| p.name == s.name) {
+                return Err(err(format!("[[council.spec]] name: `{}` is declared twice", s.name)));
+            }
+            let case = match s.case.as_str() {
+                "shell" => CouncilCase::Shell,
+                other => {
+                    return Err(err(format!(
+                        "[[council.spec]] {} case: `{other}` is not one of shell",
+                        s.name
+                    )))
+                }
+            };
+            specs.push(CouncilSpec { name: s.name.clone(), case });
+        }
+        let mut thresholds: Vec<CouncilThreshold> = Vec::new();
+        for t in &raw.threshold {
+            let at = format!("[[council.threshold]] spec {}", t.spec);
+            if !specs.iter().any(|s| s.name == t.spec) {
+                return Err(err(format!(
+                    "[[council.threshold]] spec: `{}` names no [[council.spec]]",
+                    t.spec
+                )));
+            }
+            for (field, value) in [
+                ("weight_hash", &t.weight_hash),
+                ("engine", &t.engine),
+                ("tokenizer_hash", &t.tokenizer_hash),
+                ("template", &t.template),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(err(format!("{at} {field}: must be a non-empty string")));
+                }
+            }
+            if !(t.allow_at.is_finite() && t.allow_at > 0.0 && t.allow_at <= 1.0) {
+                return Err(err(format!(
+                    "{at} allow_at: {} must satisfy 0 < allow_at <= 1",
+                    t.allow_at
+                )));
+            }
+            if !(t.mass_floor.is_finite() && t.mass_floor <= 0.0) {
+                return Err(err(format!(
+                    "{at} mass_floor: {} must be a log probability, at most 0",
+                    t.mass_floor
+                )));
+            }
+            let identity = CouncilIdentity {
+                weight_hash: t.weight_hash.clone(),
+                engine: t.engine.clone(),
+                tokenizer_hash: t.tokenizer_hash.clone(),
+                template: t.template.clone(),
+            };
+            if thresholds.iter().any(|p| p.spec == t.spec && p.identity == identity) {
+                return Err(err(format!(
+                    "{at}: a second threshold repeats the same weight_hash, engine, \
+                     tokenizer_hash and template; one threshold per identity"
+                )));
+            }
+            thresholds.push(CouncilThreshold {
+                spec: t.spec.clone(),
+                identity,
+                allow_at: t.allow_at,
+                mass_floor: t.mass_floor,
+            });
+        }
+        Ok(CouncilConfig {
+            server: raw.server.clone(),
+            contexts: raw.contexts.clone(),
+            pool_method,
+            pool_weights,
+            deadline_ms: raw.deadline_ms as u64,
+            require_agree: raw.require_agree,
+            specs,
+            thresholds,
+        })
+    }
+
+    /// The council's settings, when the file declares `[council]`.
+    pub(crate) fn council(&self) -> Option<&CouncilConfig> {
+        self.council.as_ref()
+    }
+
+    /// Whether the council reads for a caller of `context_type`: the file
+    /// declares `[council]` and the type's own section enables it. Off for
+    /// every other type, and for a caller with no type.
+    pub(crate) fn council_enabled_for(&self, context_type: Option<&str>) -> bool {
+        self.council.is_some()
+            && context_type.is_some_and(|t| self.council_enabled.contains(t))
     }
 
     fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
@@ -2039,5 +2343,260 @@ uncovered = "allow"
         assert!(matches!(load_config(&vfs).await, Err(GateConfigError::Parse(_))));
         std::fs::write(dir.path().join(GATE_CONFIG_FILE), EXAMPLE).unwrap();
         assert_eq!(load_config(&vfs).await, Ok(config(EXAMPLE)));
+    }
+
+    // ---- council configuration ----
+
+    const COUNCIL_FULL: &str = r#"
+[council]
+server = "http://zorak:8090"
+contexts = ["voice", "system-rules"]
+pool = { method = "loglinear", weights = "mass" }
+deadline_ms = 700
+
+[[council.spec]]
+name = "shell-gate"
+case = "shell"
+
+[[council.threshold]]
+spec = "shell-gate"
+weight_hash = "wh1"
+engine = "mk-1"
+tokenizer_hash = "tk1"
+template = "mk-letters-1:abc"
+allow_at = 0.98
+mass_floor = -0.05
+
+[[council.threshold]]
+spec = "shell-gate"
+weight_hash = "wh2"
+engine = "mk-1"
+tokenizer_hash = "tk1"
+template = "mk-letters-1:abc"
+allow_at = 0.9
+mass_floor = -0.1
+
+[context_type.coder.council]
+enabled = true
+
+[context_type.toolie.council]
+enabled = false
+"#;
+
+    fn identity(weight_hash: &str) -> CouncilIdentity {
+        CouncilIdentity {
+            weight_hash: weight_hash.into(),
+            engine: "mk-1".into(),
+            tokenizer_hash: "tk1".into(),
+            template: "mk-letters-1:abc".into(),
+        }
+    }
+
+    fn council_err(text: &str) -> String {
+        let GateConfigError::Parse(m) = GateConfig::parse(text).unwrap_err() else {
+            panic!("expected a parse error")
+        };
+        m
+    }
+
+    /// COUNCIL_FULL with one `from` substring replaced by `to`.
+    fn council_with(from: &str, to: &str) -> String {
+        assert!(COUNCIL_FULL.contains(from), "fixture lacks {from}");
+        COUNCIL_FULL.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn a_full_council_config_round_trips() {
+        let cfg = config(COUNCIL_FULL);
+        let c = cfg.council().expect("council declared");
+        assert_eq!(c.server, "http://zorak:8090");
+        assert_eq!(c.contexts, ["voice", "system-rules"]);
+        assert_eq!(c.pool_method, CouncilPoolMethod::LogLinear);
+        assert_eq!(c.pool_weights, CouncilPoolWeights::Mass);
+        assert_eq!(c.deadline_ms, 700);
+        assert!(c.require_agree, "require_agree defaults to true");
+        assert_eq!(
+            c.specs,
+            [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }]
+        );
+        assert_eq!(c.thresholds.len(), 2);
+        assert_eq!(c.thresholds[0].allow_at, 0.98);
+        assert_eq!(c.thresholds[0].mass_floor, -0.05);
+    }
+
+    #[test]
+    fn require_agree_can_be_turned_off() {
+        let cfg = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nrequire_agree = false"));
+        assert!(!cfg.council().unwrap().require_agree);
+    }
+
+    #[test]
+    fn council_absent_means_off_everywhere() {
+        let cfg = config("[global]\nallow = [\"rg\"]\n");
+        assert!(cfg.council().is_none());
+        assert!(!cfg.council_enabled_for(None));
+        assert!(!cfg.council_enabled_for(Some("coder")));
+        let shipped = config(crate::config_seed::DEFAULT_GATE_CONFIG);
+        assert!(shipped.council().is_none(), "the shipped default is council-off");
+        assert!(!shipped.council_enabled_for(Some("coder")));
+    }
+
+    #[test]
+    fn council_is_enabled_per_context_type() {
+        let cfg = config(COUNCIL_FULL);
+        assert!(cfg.council_enabled_for(Some("coder")));
+        assert!(!cfg.council_enabled_for(Some("toolie")), "enabled = false");
+        assert!(!cfg.council_enabled_for(Some("director")), "unmentioned type");
+        assert!(!cfg.council_enabled_for(None), "no context type");
+    }
+
+    #[test]
+    fn a_type_enabling_a_council_the_file_lacks_fails_the_load() {
+        let m = council_err("[context_type.coder.council]\nenabled = true\n");
+        assert!(m.contains("coder") && m.contains("[council]"), "{m}");
+        config("[context_type.coder.council]\nenabled = false\n");
+    }
+
+    #[test]
+    fn global_gets_no_council_switch() {
+        let m = council_err(&format!("[global.council]\nenabled = true\n{COUNCIL_FULL}"));
+        assert!(m.contains("[global.council]"), "{m}");
+    }
+
+    #[test]
+    fn unknown_council_fields_fail_the_load() {
+        for text in [
+            council_with("deadline_ms = 700", "deadline_ms = 700\nretries = 2"),
+            council_with("case = \"shell\"", "case = \"shell\"\nextra = 1"),
+            council_with("allow_at = 0.98", "allow_at = 0.98\nextra = 1"),
+            council_with("enabled = true", "enabled = true\nextra = 1"),
+            council_with("weights = \"mass\" }", "weights = \"mass\", extra = 1 }"),
+        ] {
+            let m = council_err(&text);
+            assert!(m.contains("extra") || m.contains("retries"), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_bad_council_server_is_rejected_naming_the_field() {
+        for bad in ["zorak:8090", "ftp://zorak", "http://", "http://a b"] {
+            let m = council_err(&council_with("http://zorak:8090", bad));
+            assert!(m.contains("[council] server") && m.contains("http"), "{bad}: {m}");
+        }
+        config(&council_with("http://zorak:8090", "https://zorak.example:8090"));
+    }
+
+    #[test]
+    fn council_contexts_must_be_nonempty_distinct_labels() {
+        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[]"));
+        assert!(m.contains("[council] contexts") && m.contains("at least one"), "{m}");
+        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[\"voice\", \"\"]"));
+        assert!(m.contains("[council] contexts") && m.contains("non-empty"), "{m}");
+        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[\"voice\", \"voice\"]"));
+        assert!(m.contains("[council] contexts") && m.contains("voice") && m.contains("twice"), "{m}");
+    }
+
+    #[test]
+    fn council_pool_words_are_checked() {
+        let m = council_err(&council_with("method = \"loglinear\"", "method = \"geometric\""));
+        assert!(m.contains("pool.method") && m.contains("linear, loglinear"), "{m}");
+        let m = council_err(&council_with("weights = \"mass\"", "weights = \"even\""));
+        assert!(m.contains("pool.weights") && m.contains("uniform, mass"), "{m}");
+        let cfg = config(&council_with("\"loglinear\", weights = \"mass\"", "\"linear\", weights = \"uniform\""));
+        let c = cfg.council().unwrap();
+        assert_eq!((c.pool_method, c.pool_weights), (CouncilPoolMethod::Linear, CouncilPoolWeights::Uniform));
+    }
+
+    #[test]
+    fn council_deadline_must_be_positive() {
+        for bad in ["0", "-5"] {
+            let m = council_err(&council_with("deadline_ms = 700", &format!("deadline_ms = {bad}")));
+            assert!(m.contains("[council] deadline_ms") && m.contains("greater than 0"), "{m}");
+        }
+    }
+
+    #[test]
+    fn council_needs_a_spec_with_a_safe_unique_name_and_a_known_case() {
+        let no_spec = COUNCIL_FULL
+            .replace("[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n", "");
+        let m = council_err(&no_spec.replace("spec = \"shell-gate\"", "spec = \"x\""));
+        assert!(m.contains("at least one [[council.spec]]"), "{m}");
+        for bad in ["a/b", "a.json", "", "a b", ".."] {
+            let m = council_err(&council_with("name = \"shell-gate\"", &format!("name = \"{bad}\"")));
+            assert!(m.contains("[[council.spec]] name") && m.contains("[A-Za-z0-9_-]+"), "{bad}: {m}");
+        }
+        let m = council_err(&council_with("case = \"shell\"", "case = \"program\""));
+        assert!(m.contains("case") && m.contains("program") && m.contains("shell"), "{m}");
+        let dup = COUNCIL_FULL.replacen(
+            "[[council.threshold]]",
+            "[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n[[council.threshold]]",
+            1,
+        );
+        let m = council_err(&dup);
+        assert!(m.contains("shell-gate") && m.contains("twice"), "{m}");
+    }
+
+    #[test]
+    fn a_threshold_must_name_a_declared_spec() {
+        let m = council_err(&council_with("spec = \"shell-gate\"", "spec = \"nope\""));
+        assert!(m.contains("[[council.threshold]] spec") && m.contains("nope"), "{m}");
+    }
+
+    #[test]
+    fn threshold_identity_fields_must_be_nonempty() {
+        for field in ["weight_hash", "engine", "tokenizer_hash", "template"] {
+            let from = format!("{field} = ");
+            let line = COUNCIL_FULL
+                .lines()
+                .find(|l| l.starts_with(&from))
+                .unwrap_or_else(|| panic!("fixture lacks {field}"));
+            let m = council_err(&council_with(line, &format!("{field} = \"\"")));
+            assert!(m.contains(field) && m.contains("non-empty"), "{field}: {m}");
+        }
+    }
+
+    #[test]
+    fn threshold_allow_at_must_be_in_the_unit_interval() {
+        for bad in ["0", "-0.1", "1.01"] {
+            let m = council_err(&council_with("allow_at = 0.98", &format!("allow_at = {bad}")));
+            assert!(m.contains("allow_at") && m.contains("0 < allow_at <= 1"), "{bad}: {m}");
+        }
+        config(&council_with("allow_at = 0.98", "allow_at = 1"));
+    }
+
+    #[test]
+    fn threshold_mass_floor_must_be_a_log_probability() {
+        let m = council_err(&council_with("mass_floor = -0.05", "mass_floor = 0.1"));
+        assert!(m.contains("mass_floor") && m.contains("at most 0"), "{m}");
+        config(&council_with("mass_floor = -0.05", "mass_floor = 0"));
+    }
+
+    #[test]
+    fn two_thresholds_for_one_spec_and_identity_are_an_error() {
+        let m = council_err(&council_with("weight_hash = \"wh2\"", "weight_hash = \"wh1\""));
+        assert!(m.contains("one threshold per identity") && m.contains("shell-gate"), "{m}");
+    }
+
+    #[test]
+    fn thresholds_are_found_by_spec_and_identity() {
+        let cfg = config(COUNCIL_FULL);
+        let c = cfg.council().unwrap();
+        assert_eq!(c.threshold_for("shell-gate", &identity("wh1")).unwrap().allow_at, 0.98);
+        assert_eq!(c.threshold_for("shell-gate", &identity("wh2")).unwrap().allow_at, 0.9);
+        assert!(c.threshold_for("shell-gate", &identity("other")).is_none());
+        assert!(c.threshold_for("other-spec", &identity("wh1")).is_none());
+        let mut shifted = identity("wh1");
+        shifted.template = "mk-letters-2:abc".into();
+        assert!(c.threshold_for("shell-gate", &shifted).is_none(), "every identity field counts");
+    }
+
+    #[test]
+    fn the_shipped_default_has_no_live_council_section_but_documents_one() {
+        let body = crate::config_seed::DEFAULT_GATE_CONFIG;
+        assert!(body.contains("[council]"), "the example is in the file");
+        assert!(
+            body.lines().all(|l| !l.starts_with("[council") && !l.starts_with("[[council")),
+            "every council line in the shipped default is a comment"
+        );
     }
 }

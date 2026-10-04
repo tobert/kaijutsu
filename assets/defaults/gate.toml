@@ -40,6 +40,36 @@
 #   [context_type.coder]
 #   allow = ["shell_write"]
 
+# Council: a System 1 model check that may allow a statement the tiers
+# above leave to the human. It is off. To turn it on, uncomment the
+# sections below, fill every identity field from the council server's
+# answer, and enable it per context type. The file refuses to load on an
+# unknown field, a bad URL, a threshold naming no spec, or two thresholds
+# for one spec and identity. See docs/council.md, "Configuration".
+#
+#   [council]
+#   server = "http://zorak:8090"            # http:// or https:// URL
+#   contexts = ["voice", "system-rules"]    # distinct context labels, at least one
+#   pool = { method = "loglinear", weights = "mass" }   # linear|loglinear, uniform|mass
+#   deadline_ms = 700                       # integer > 0; sent as timeout_ms
+#   require_agree = true                    # default true: every read must agree to allow
+#
+#   [[council.spec]]
+#   name = "shell-gate"                     # /config/kernel/council/shell-gate.json
+#   case = "shell"                          # the only accepted value today
+#
+#   [[council.threshold]]                   # one per (spec, identity)
+#   spec = "shell-gate"                     # must name a [[council.spec]]
+#   weight_hash = "..."
+#   engine = "..."
+#   tokenizer_hash = "..."
+#   template = "..."
+#   allow_at = 0.98                         # pooled p(allow); 0 < x <= 1
+#   mass_floor = -0.05                      # each read's verdict mass; log probability, <= 0
+#
+#   [context_type.coder.council]
+#   enabled = true                          # off for every type that does not say so
+
 [global]
 allow = [
   "kj handoff note",     # recoverable by construction; the friction that started this

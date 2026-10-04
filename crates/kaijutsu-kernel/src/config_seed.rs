@@ -28,6 +28,11 @@ pub const DEFAULT_MCP_CONFIG: &str = include_str!("../../../assets/defaults/mcp.
 /// `kj::gate_policy` reads beneath the ledger's rules.
 pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gate.toml");
 
+/// Embedded council spec for shell statements, seeded to
+/// `/config/kernel/council/shell-gate.json` (`docs/council-api.md`).
+pub const DEFAULT_COUNCIL_SHELL_GATE: &str =
+    include_str!("../../../assets/defaults/council/shell-gate.json");
+
 /// Embedded continuation-window policy for automatic gate-resume turns.
 pub const DEFAULT_CONTINUATION_CONFIG: &str =
     include_str!("../../../assets/defaults/continuation.toml");
@@ -78,6 +83,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("theme.toml"), DEFAULT_THEME),
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
+        (config_path("council/shell-gate.json"), DEFAULT_COUNCIL_SHELL_GATE),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
         (config_path("continuation.md"), DEFAULT_CONTINUATION_PROMPT),
@@ -204,6 +210,7 @@ mod tests {
         assert!(names.contains(&config_path("mcp.toml").as_str()));
         assert!(names.contains(&config_path("gate.toml").as_str()));
         assert!(!names.contains(&config_path("approval.toml").as_str()), "review has no configured default");
+        assert!(names.contains(&config_path("council/shell-gate.json").as_str()));
         assert!(names.contains(&config_path("continuation.toml").as_str()));
         assert!(names.contains(&config_path("distillation.md").as_str()));
         assert!(names.contains(&config_path("continuation.md").as_str()));
@@ -311,6 +318,47 @@ mod tests {
             Some(DEFAULT_SCROLL),
             "resetting a per-client scroll override restores the shared default",
         );
+    }
+
+    #[test]
+    fn council_shell_gate_spec_is_valid_json_with_the_documented_questions() {
+        let v: serde_json::Value =
+            serde_json::from_str(DEFAULT_COUNCIL_SHELL_GATE).expect("spec is JSON");
+        assert_eq!(v["name"], "shell-gate");
+        assert!(v["instructions"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(v["input_label"], "Proposed statement");
+        let qs = v["questions"].as_array().expect("questions array");
+        let order: Vec<(&str, &str)> = qs
+            .iter()
+            .map(|q| (q["id"].as_str().unwrap(), q["type"].as_str().unwrap()))
+            .collect();
+        assert_eq!(order, [("effect", "text"), ("undo", "score"), ("verdict", "choice")]);
+        assert_eq!(qs[0]["max_tokens"], 48);
+        assert_eq!(qs[1]["criteria"], serde_json::json!(["easy", "hard", "impossible"]));
+        let options: Vec<&str> = qs[2]["criteria"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["option"].as_str().unwrap())
+            .collect();
+        assert_eq!(options, ["allow", "ask", "report"]);
+        assert_eq!(
+            config_seed_body(&config_path("council/shell-gate.json")),
+            Some(DEFAULT_COUNCIL_SHELL_GATE)
+        );
+    }
+
+    #[test]
+    fn seeding_creates_the_council_subdirectory_and_keeps_an_edited_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = kaijutsu_types::paths::CONFIG_ROOT;
+        let written = seed_entries_into_dir(tree, config_seed_files(), dir.path()).unwrap();
+        assert_eq!(written, config_seed_files().len());
+        let spec = dir.path().join("council/shell-gate.json");
+        assert_eq!(std::fs::read_to_string(&spec).unwrap(), DEFAULT_COUNCIL_SHELL_GATE);
+        std::fs::write(&spec, "{}").unwrap();
+        assert_eq!(seed_entries_into_dir(tree, config_seed_files(), dir.path()).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&spec).unwrap(), "{}");
     }
 
     #[test]
