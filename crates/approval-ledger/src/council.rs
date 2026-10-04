@@ -165,11 +165,21 @@ fn check_outcome_and_cause(d: &NewCouncilDecision) -> Result<()> {
 /// back. A `request_id` that names no ask is refused, whether or not the
 /// connection enforces foreign keys.
 pub fn insert_council_decision(conn: &Connection, d: &NewCouncilDecision) -> Result<Vec<u8>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let decision_id = insert_council_decision_within(&tx, d)?;
+    tx.commit()?;
+    Ok(decision_id)
+}
+
+/// [`insert_council_decision`] for a caller that already holds a
+/// transaction on `conn`, such as the one that creates the decision's ask.
+/// Nothing commits here: the caller's commit or rollback takes the
+/// decision with it.
+pub fn insert_council_decision_within(conn: &Connection, d: &NewCouncilDecision) -> Result<Vec<u8>> {
     check_outcome_and_cause(d)?;
     let decision_id = uuid::Uuid::now_v7().as_bytes().to_vec();
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     if let Some(request_id) = &d.request_id {
-        let exists: bool = tx.query_row(
+        let exists: bool = conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM approvals WHERE request_id = ?1)",
             [request_id],
             |row| row.get(0),
@@ -178,12 +188,11 @@ pub fn insert_council_decision(conn: &Connection, d: &NewCouncilDecision) -> Res
             return Err(LedgerError::NotFound(request_id.clone()));
         }
     }
-    insert_rows(&tx, &decision_id, d)?;
-    tx.commit()?;
+    insert_rows(conn, &decision_id, d)?;
     Ok(decision_id)
 }
 
-fn insert_rows(tx: &Transaction<'_>, decision_id: &[u8], d: &NewCouncilDecision) -> Result<()> {
+fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> Result<()> {
     tx.execute(
         "INSERT INTO council_decisions (
             decision_id, request_id, context_id, principal_id, submission_digest, spec_id, spec_name,
@@ -607,6 +616,32 @@ mod tests {
         // The connection is usable afterward: nothing is left open.
         input.reads[1].questions[0].options.pop();
         insert_council_decision(&conn, &input).unwrap();
+    }
+
+    /// The gate records a decision in the transaction that creates its ask,
+    /// so the two commit together or not at all.
+    #[test]
+    fn a_decision_inside_the_ask_transaction_commits_and_rolls_back_with_it() {
+        let conn = open_memory();
+        let linked = crate::ask::create_ask_recorded(&conn, &minimal_ask(), |tx, request_id| {
+            let mut input = decision();
+            input.request_id = Some(request_id.to_string());
+            insert_council_decision_within(tx, &input).map(|_| ())
+        })
+        .unwrap();
+        let listed = list_council_decisions_for_request(&conn, &linked, 10).unwrap();
+        assert_eq!(listed.len(), 1, "the decision commits with its ask");
+
+        let asks_before = count(&conn, "approvals");
+        let failed = crate::ask::create_ask_recorded(&conn, &minimal_ask(), |tx, request_id| {
+            let mut input = decision();
+            input.request_id = Some(request_id.to_string());
+            input.reads[1].questions[0].options.push(option("yes", 0.5));
+            insert_council_decision_within(tx, &input).map(|_| ())
+        });
+        assert!(failed.is_err(), "a failing decision fails the ask transaction");
+        assert_eq!(count(&conn, "approvals"), asks_before, "the ask rolls back with its decision");
+        assert_eq!(count(&conn, "council_decisions"), 1);
     }
 
     #[test]

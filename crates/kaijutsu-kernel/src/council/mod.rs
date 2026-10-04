@@ -6,5 +6,10 @@
 //! `gate` makes one decision for a submission and records it.
 
 pub(crate) mod gate;
+#[cfg(test)]
+mod gate_e2e;
+pub(crate) mod observe;
 mod projection;
+pub(crate) mod report_stop;
 pub(crate) mod sync;
+pub(crate) mod voices;

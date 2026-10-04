@@ -359,6 +359,20 @@ pub enum ShellHookVerdict {
     Denied(McpError),
 }
 
+/// The gate-policy ask a shell submission raises on the RPC paths.
+struct AskTier {
+    /// The ask's description: each asking statement's layer and key.
+    description: String,
+    /// The council reads the submission before the ask: `gate.toml`
+    /// enables it for the caller's context type and the actor is not a live
+    /// root character.
+    council: bool,
+}
+
+/// What a dry run adds to an ask the council would have read first.
+const COUNCIL_DRY_RUN_NOTE: &str =
+    "\n\nThe council would read this submission before the ask; a dry run does not consult it.";
+
 impl Broker {
     pub fn new() -> Self {
         let (notif_tx, _) = broadcast::channel(NOTIF_CAPACITY);
@@ -2337,7 +2351,8 @@ impl Broker {
         cancel: &CancellationToken,
     ) -> McpResult<PhaseOutcome> {
         let spec = AskSpec { description: Some(description) };
-        Ok(match self.run_permission_ask(&hook_id, &spec, params, ctx, phase, payload, review, cancel).await? {
+        // A hook's own ask stands: the council never reads it.
+        Ok(match self.run_permission_ask(&hook_id, &spec, params, ctx, phase, payload, review, false, cancel).await? {
             PermissionAskOutcome::Proceed => PhaseOutcome::Continue,
             PermissionAskOutcome::Denied { reason, ask } => PhaseOutcome::Deny { hook_id, reason, ask },
             PermissionAskOutcome::Unavailable { reason, ask } => {
@@ -2483,6 +2498,12 @@ impl Broker {
     /// execute its captured source. A result review is owned by the caller's
     /// retained outcome and resumes this same hook snapshot after its answer.
     /// Callers without a result-review owner fail before opening such an ask.
+    ///
+    /// With `council`, a PreCall ask is read by the council first
+    /// (`crate::council::gate::consult`), and its verdict reaches the gate's
+    /// own evaluation: an allow becomes an auto-decided row, anything else an
+    /// ask carrying the council's signal.
+    #[allow(clippy::too_many_arguments)]
     async fn run_permission_ask(
         &self,
         hook_id: &HookId,
@@ -2492,6 +2513,7 @@ impl Broker {
         phase: McpHookPhase,
         payload: &PhasePayload<'_>,
         review: Option<&dyn ResultReview>,
+        council: bool,
         cancel: &CancellationToken,
     ) -> McpResult<PermissionAskOutcome> {
         if cancel.is_cancelled() {
@@ -2552,12 +2574,21 @@ impl Broker {
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
         }
+        let council = if council && phase == McpHookPhase::PreCall {
+            match crate::council::gate::consult(dispatcher.kernel(), &caller, &gate_spec, &gate_config).await {
+                Ok(council) => council,
+                Err(reason) => return Ok(PermissionAskOutcome::Unavailable { reason, ask: None }),
+            }
+        } else {
+            None
+        };
         let outcome = crate::kj::gate::run_gate_recorded(
             dispatcher.kernel(),
             &caller,
             gate_spec,
             dispatcher.kernel().ledger_flows(),
             &gate_config,
+            council,
             &|conn, request| match review {
                 Some(review) => review.record_ask(conn, request),
                 None => Ok(()),
@@ -3149,7 +3180,7 @@ impl Broker {
     /// executor parses with the same kaish parser, so it runs nothing and
     /// reports the parse error itself. `Err` when the config does not load,
     /// or the actor's sheet does not read, so the call is refused.
-    async fn ask_tier_description(&self, command: &str, ctx: &CallContext) -> Result<Option<String>, String> {
+    async fn ask_tier(&self, command: &str, ctx: &CallContext) -> Result<Option<AskTier>, String> {
         let Ok(statements) = kaish_kernel::ast::plan::plan_program(command) else {
             return Ok(None);
         };
@@ -3161,8 +3192,9 @@ impl Broker {
         if policy.verdict() != approval_ledger::types::AskVerdict::Escalate {
             return Ok(None);
         }
-        let uncovered_asks = !self.actor_is_root(ctx).await?;
-        Ok(policy.describe_asks_planned(&statements, uncovered_asks))
+        let root = self.actor_is_root(ctx).await?;
+        let council = !root && config.council_enabled_for(context_type.as_deref());
+        Ok(policy.describe_asks_planned(&statements, !root).map(|description| AskTier { description, council }))
     }
 
     /// Whether `ctx`'s actor is a live root character: a person's hands, so
@@ -3212,6 +3244,13 @@ impl Broker {
     /// human first. `None` means no ask-tier statement, or a human already
     /// allowed it. A config that stopped loading is gate unavailable. See `docs/gate-policy-tuning.md`,
     /// "Settled while reviewing".
+    ///
+    /// The council reads the ask first when `gate.toml` enables it for the
+    /// caller's context type and the actor is not a live root character,
+    /// whose uncovered statements run without an ask here. Its verdict
+    /// reaches the gate's own evaluation through `run_permission_ask`; a
+    /// council allow leaves an auto-decided row naming the council and the
+    /// call proceeds (`docs/council.md`, "Where it plugs in").
     async fn ask_tier_ask(
         &self,
         command: &str,
@@ -3220,14 +3259,16 @@ impl Broker {
         cancel: &CancellationToken,
     ) -> McpResult<Option<PhaseOutcome>> {
         let hook_id = HookId(GATE_POLICY_SUBJECT.into());
-        let description = match self.ask_tier_description(command, ctx).await {
-            Ok(Some(description)) => description,
+        let tier = match self.ask_tier(command, ctx).await {
+            Ok(Some(tier)) => tier,
             Ok(None) => return Ok(None),
             Err(reason) => return Ok(Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask: None })),
         };
-        let spec = AskSpec { description: Some(description) };
+        let spec = AskSpec { description: Some(tier.description) };
         Ok(match self
-            .run_permission_ask(&hook_id, &spec, params, ctx, McpHookPhase::PreCall, &PhasePayload::None, None, cancel)
+            .run_permission_ask(
+                &hook_id, &spec, params, ctx, McpHookPhase::PreCall, &PhasePayload::None, None, tier.council, cancel,
+            )
             .await?
         {
             PermissionAskOutcome::Proceed => None,
@@ -3274,9 +3315,13 @@ impl Broker {
             else { inherit_hook_depth(0, evaluation).await };
         match result? {
             PhaseEval::DryRun(report) if report.outcome == DryRunOutcome::WouldProceed => {
-                match self.ask_tier_description(command, ctx).await {
-                    Ok(Some(description)) => {
+                match self.ask_tier(command, ctx).await {
+                    Ok(Some(tier)) => {
                         let hook_id = HookId(GATE_POLICY_SUBJECT.into());
+                        let mut description = tier.description;
+                        if tier.council {
+                            description.push_str(COUNCIL_DRY_RUN_NOTE);
+                        }
                         Ok(self.dry_run_ask(&hook_id, description, &params, ctx).await)
                     }
                     Ok(None) => Ok(report),

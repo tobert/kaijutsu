@@ -190,14 +190,20 @@ pub enum LedgerError {
     /// conflating them would leave a caller unable to tell "nobody ever
     /// answered this" from "the answer was already delivered", and the two
     /// call for different responses (keep waiting vs. treat as spent).
+    #[error("approval request {request_id} carries no answer to redeem: status is `{status}`, not `allowed` or `denied`")]
+    NotDecided { request_id: String, status: String },
+
     /// A council decision that breaks a rule the schema also enforces
     /// (a miss without a cause, a cause without a miss, a duplicate key).
     /// Refused before any row is written.
     #[error("invalid council decision: {0}")]
     InvalidCouncilDecision(String),
 
-    #[error("approval request {request_id} carries no answer to redeem: status is `{status}`, not `allowed` or `denied`")]
-    NotDecided { request_id: String, status: String },
+    /// A council observation or voice skip that breaks a rule the schema
+    /// also enforces (a miss without a cause, an answer without a choice),
+    /// or that names no council decision. Refused before any row is written.
+    #[error("invalid council observation: {0}")]
+    InvalidCouncilObservation(String),
 }
 
 pub type Result<T> = std::result::Result<T, LedgerError>;

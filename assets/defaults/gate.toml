@@ -49,10 +49,11 @@
 #
 #   [council]
 #   server = "http://zorak:8090"            # http:// or https:// URL
-#   contexts = ["voice", "system-rules"]    # distinct context labels, at least one
+#   contexts = ["council-system"]           # distinct context labels, at least one
 #   pool = { method = "loglinear", weights = "mass" }   # linear|loglinear, uniform|mass
 #   deadline_ms = 700                       # integer > 0; sent as timeout_ms
 #   require_agree = true                    # default true: every read must agree to allow
+#   voices = false                          # default false; true reads council-<character> along the reviewer chain
 #
 #   [[council.spec]]
 #   name = "shell-gate"                     # /config/kernel/council/shell-gate.json

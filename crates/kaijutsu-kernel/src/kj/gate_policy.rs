@@ -101,6 +101,9 @@ pub(crate) enum Layer {
     /// names the `[context_type.<type>]` section that set it; `None` is
     /// `[global]`.
     UncoveredAllow(Option<String>),
+    /// The council's allow for a statement no other layer covered, naming
+    /// the spec it read the submission under (`docs/council.md`).
+    Council(String),
 }
 
 impl std::fmt::Display for Layer {
@@ -113,6 +116,7 @@ impl std::fmt::Display for Layer {
             Self::Builtin => f.write_str("builtin"),
             Self::UncoveredAllow(None) => f.write_str("global config uncovered tier"),
             Self::UncoveredAllow(Some(t)) => write!(f, "context_type config ({t}) uncovered tier"),
+            Self::Council(spec) => write!(f, "council ({spec})"),
         }
     }
 }
@@ -172,6 +176,17 @@ impl PolicyEvaluation {
             return AskVerdict::Allow;
         }
         AskVerdict::Escalate
+    }
+
+    /// Turn every `Uncovered` statement into the council's allow, keyed by
+    /// `key(index)`. An `Ask` stays firm and a `Deny` stays a deny, so a
+    /// submission holding either is decided as before.
+    pub(crate) fn apply_council_allow(&mut self, spec: &str, key: impl Fn(usize) -> String) {
+        for (i, verdict) in self.per_statement.iter_mut().enumerate() {
+            if matches!(verdict, PolicyVerdict::Uncovered) {
+                *verdict = PolicyVerdict::Allow(vec![Decision { layer: Layer::Council(spec.to_string()), key: key(i) }]);
+            }
+        }
     }
 
     /// The `auto_reason` text for an auto-decision on a gate ask, naming the
@@ -351,6 +366,10 @@ pub(crate) struct GateConfig {
     council: Option<CouncilConfig>,
     /// Context types whose `[context_type.<type>.council]` says `enabled = true`.
     council_enabled: std::collections::BTreeSet<String>,
+    /// `[council] voices`: compose `council-<character>` contexts along the
+    /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
+    /// contexts").
+    council_voices: bool,
 }
 
 /// How the kernel pools the council's per-context reads.
@@ -437,6 +456,8 @@ struct CouncilToml {
     deadline_ms: i64,
     #[serde(default = "default_require_agree")]
     require_agree: bool,
+    #[serde(default)]
+    voices: bool,
     #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
@@ -554,6 +575,7 @@ impl GateConfig {
             context_types: BTreeMap::new(),
             council: None,
             council_enabled: Default::default(),
+            council_voices: false,
         };
         if raw.global.council.is_some() {
             return Err(GateConfigError::Parse(
@@ -573,6 +595,7 @@ impl GateConfig {
         }
         if let Some(council) = &raw.council {
             config.council = Some(Self::council_from(council)?);
+            config.council_voices = council.voices;
         } else if let Some(name) = config.council_enabled.iter().next() {
             return Err(GateConfigError::Parse(format!(
                 "[context_type.{name}.council] enabled = true: the file has no [council] section \
@@ -730,6 +753,13 @@ impl GateConfig {
     pub(crate) fn council_enabled_for(&self, context_type: Option<&str>) -> bool {
         self.council.is_some()
             && context_type.is_some_and(|t| self.council_enabled.contains(t))
+    }
+
+    /// Whether a decision composes `council-<character>` voices along the
+    /// reviewer chain: the file declares `[council]` with `voices = true`.
+    /// Off by default.
+    pub(crate) fn council_voices(&self) -> bool {
+        self.council.is_some() && self.council_voices
     }
 
     fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
@@ -1577,6 +1607,32 @@ mod tests {
         assert_eq!(evaluate_planned(&[], layers).verdict(), AskVerdict::Escalate);
     }
 
+    /// The council's allow covers only what no layer decided: an uncovered
+    /// statement becomes an allow naming the council, an ask stays firm, a
+    /// deny stays a deny, and the description names the council's layer.
+    #[test]
+    fn a_council_allow_converts_only_uncovered_statements() {
+        let cfg = config("[global]\nask = [\"git push\"]\ndeny = [\"dd\"]\n");
+        let layers = Layers { config: &cfg, context_type: None };
+        let mut mixed = evaluate_planned(&plan("kj block list; touch x"), layers);
+        mixed.apply_council_allow("shell-gate", |i| format!("statement #{i} at p=0.991"));
+        assert_eq!(mixed.verdict(), AskVerdict::Allow);
+        assert!(matches!(&mixed.per_statement[0], PolicyVerdict::Allow(d) if d[0].layer == Layer::Builtin));
+        assert_eq!(
+            mixed.describe_planned(&plan("kj block list; touch x"), true),
+            "gate policy: builtin allows kj block list; council (shell-gate) allows statement #1 at p=0.991"
+        );
+
+        let mut asked = evaluate_planned(&plan("touch x; git push origin main"), layers);
+        asked.apply_council_allow("shell-gate", |_| "at p=0.991".into());
+        assert_eq!(asked.verdict(), AskVerdict::Escalate, "a static ask stays firm");
+        assert!(matches!(asked.per_statement[1], PolicyVerdict::Ask(_)));
+
+        let mut denied = evaluate_planned(&plan("touch x; dd if=/dev/zero"), layers);
+        denied.apply_council_allow("shell-gate", |_| "at p=0.991".into());
+        assert_eq!(denied.verdict(), AskVerdict::Deny, "a deny stays a deny");
+    }
+
     /// `verdict()` re-states the ledger's composition rather than
     /// delegating to it (the ledger composes rule rows, this composes
     /// layers). Pinned against `AskCoverage::verdict` over every mix of
@@ -2422,6 +2478,16 @@ enabled = false
         assert_eq!(c.thresholds.len(), 2);
         assert_eq!(c.thresholds[0].allow_at, 0.98);
         assert_eq!(c.thresholds[0].mass_floor, -0.05);
+    }
+
+    #[test]
+    fn voices_are_off_unless_the_council_turns_them_on() {
+        assert!(!config(COUNCIL_FULL).council_voices(), "voices default to false");
+        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = true"));
+        assert!(on.council_voices());
+        assert!(!config("[global]\nallow = [\"rg\"]\n").council_voices(), "no [council], no voices");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = \"yes\""));
+        assert!(m.contains("voices"), "{m}");
     }
 
     #[test]

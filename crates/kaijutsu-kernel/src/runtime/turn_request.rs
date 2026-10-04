@@ -109,6 +109,9 @@ pub(crate) fn queue_startup(
     ready: Option<tokio::sync::oneshot::Receiver<()>>,
     slot: crate::runtime::RuntimeSlot,
 ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
+    // Recorded before the startup task runs, so the turn's origin is known
+    // for as long as it is accepted.
+    accepted.lease.set_origin(accepted.origin);
     let (reply, result) = tokio::sync::oneshot::channel();
     let host = kernel.clone();
     let span = tracing::Span::current();

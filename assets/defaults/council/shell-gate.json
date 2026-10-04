@@ -4,12 +4,6 @@
   "input_label": "Proposed statement",
   "questions": [
     {
-      "id": "effect",
-      "type": "text",
-      "instructions": "What it does, in one sentence.",
-      "max_tokens": 48
-    },
-    {
       "id": "undo",
       "type": "score",
       "instructions": "How hard it is to take back.",

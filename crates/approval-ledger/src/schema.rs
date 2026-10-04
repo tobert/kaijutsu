@@ -927,6 +927,77 @@ CREATE TABLE IF NOT EXISTS council_control_text (
     token       TEXT    NOT NULL,
     PRIMARY KEY (decision_id, seq)
 );
+
+-- ── Council observations ─────────────────────────────────────────────
+-- One row per read of a model character's voice context
+-- (`council-<character>`) under its own spec, made after the gate decided
+-- (`docs/council.md`, "Council contexts are kaijutsu contexts"). It hangs
+-- off the decision it observed and never changes that decision's rows.
+-- `seat_context_id` is NULL when the label resolved to no live context;
+-- `spec_id` and the identity columns are empty strings when the server never
+-- reported them, as in `council_decisions`. `outcome` follows the
+-- growable-value-set rule in `DDL`'s doc comment
+-- (`CouncilObservationOutcome` in `council_observation.rs` owns the set). The
+-- fixed-shape rule stays in SQL: a miss carries its cause and no choice, and
+-- an answer carries its choice and no cause.
+CREATE TABLE IF NOT EXISTS council_observations (
+    observation_id  BLOB    NOT NULL PRIMARY KEY,
+    decision_id     BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    seat_label      TEXT    NOT NULL,
+    seat_context_id BLOB,
+    spec_name       TEXT    NOT NULL,
+    spec_id         TEXT    NOT NULL,
+    server_model    TEXT    NOT NULL,
+    weight_hash     TEXT    NOT NULL,
+    tokenizer_hash  TEXT    NOT NULL,
+    template        TEXT    NOT NULL,
+    engine          TEXT    NOT NULL,
+    outcome         TEXT    NOT NULL,
+    choice          TEXT,
+    miss_cause      TEXT,
+    snapshot        TEXT,
+    expected_head   TEXT,
+    queue_ms        INTEGER NOT NULL,
+    ms              INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    CHECK ((outcome = 'miss') = (miss_cause IS NOT NULL)),
+    CHECK ((outcome = 'miss') = (choice IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_council_observations_decision
+    ON council_observations(decision_id, created_at, observation_id);
+
+-- One row per observation and question. `confidence` is NULL for noul.
+CREATE TABLE IF NOT EXISTS council_observation_questions (
+    observation_id BLOB NOT NULL REFERENCES council_observations(observation_id) ON DELETE CASCADE,
+    question_id    TEXT NOT NULL,
+    mass           REAL NOT NULL,
+    confidence     REAL,
+    PRIMARY KEY (observation_id, question_id)
+);
+
+-- One row per observation, question, and option: the raw log probability
+-- and the probability derived from it.
+CREATE TABLE IF NOT EXISTS council_observation_options (
+    observation_id BLOB NOT NULL,
+    question_id    TEXT NOT NULL,
+    option         TEXT NOT NULL,
+    logprob        REAL NOT NULL,
+    probability    REAL NOT NULL,
+    PRIMARY KEY (observation_id, question_id, option),
+    FOREIGN KEY (observation_id, question_id)
+        REFERENCES council_observation_questions(observation_id, question_id) ON DELETE CASCADE
+);
+
+-- One row per character on a decision's reviewer chain that has no
+-- `council-<character>` context, in chain order. A skip is not a miss.
+CREATE TABLE IF NOT EXISTS council_voice_skips (
+    decision_id    BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    principal_id   BLOB    NOT NULL,
+    character_name TEXT    NOT NULL,
+    PRIMARY KEY (decision_id, seq)
+);
 "#;
 
 /// Create every table/index/trigger this crate owns, idempotently. Safe to

@@ -63,6 +63,7 @@
 pub mod ask;
 pub mod claim;
 pub mod council;
+pub mod council_observation;
 pub mod decide;
 pub mod error;
 mod events;

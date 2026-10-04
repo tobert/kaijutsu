@@ -1,7 +1,8 @@
 //! Keeps the council server holding the council contexts and specs, and
 //! hands the gate what a decision needs.
 //!
-//! [`CouncilSync::prepare`] runs before each decision. It does only the
+//! [`CouncilSync::prepare`] (or [`CouncilSync::prepare_labels`], for a
+//! decision that also reads voices) runs before each decision. It does only the
 //! requests the server is not already believed to have answered: the identity
 //! once per server, a spec once per spec id, and a context only when its
 //! projected body changed. This kernel is the only writer of its council
@@ -12,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use kaijutsu_council::canon;
-use kaijutsu_council::wire::{Capability, ServerIdentity, SnapshotId, Spec, SpecId};
+use kaijutsu_council::wire::{Capability, ServerIdentity, SnapshotId, Spec, SpecId, SpecQuestion};
 use kaijutsu_council::{CouncilClient, CouncilError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
@@ -68,12 +69,32 @@ pub(crate) struct CouncilSync {
 }
 
 impl CouncilSync {
-    /// Brings the server up to date for a decision on `spec`.
+    /// Brings the server up to date for a decision on `spec` over the
+    /// contexts `[council] contexts` lists.
     pub(crate) async fn prepare(
         &self,
         kernel: &crate::Kernel,
         council: &CouncilConfig,
         spec: &CouncilSpec,
+    ) -> Result<Prepared, PrepareMiss> {
+        self.prepare_labels(kernel, council, &spec.name, &council.contexts).await
+    }
+
+    /// Brings the server up to date for a decision on the spec named
+    /// `spec_name` (`/config/kernel/council/<spec_name>.json`) over exactly
+    /// `labels`, in that order. A gate decision passes `[council] contexts`
+    /// followed by its voting voices ([`super::voices::VoiceChain::decision_labels`]);
+    /// an observation passes the one voice it reads.
+    ///
+    /// A miss, before any context is sent: a spec holding a `text` question
+    /// when the server lacks the `describe` capability, a label listed twice,
+    /// and more labels than the server's `contexts_per_decision`.
+    pub(crate) async fn prepare_labels(
+        &self,
+        kernel: &crate::Kernel,
+        council: &CouncilConfig,
+        spec_name: &str,
+        labels: &[String],
     ) -> Result<Prepared, PrepareMiss> {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
@@ -81,18 +102,42 @@ impl CouncilSync {
             .map_err(|e| self.failed(server, "client", e))?;
 
         let identity = self.identity(&client, server).await?;
-        let (spec_body, spec_id) = read_spec(kernel, &spec.name).await?;
+        let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
+        if let Some(text) = spec_body.questions.iter().find(|q| matches!(q, SpecQuestion::Text(_)))
+            && !identity.capabilities.contains(&Capability::Describe)
+        {
+            return Err(PrepareMiss(format!(
+                "spec {spec_name} holds the text question `{}`, and council server {server} lacks the \
+                 `describe` capability that answers one; remove the question from \
+                 /config/kernel/council/{spec_name}.json",
+                text.id()
+            )));
+        }
+        if let Some((i, label)) = labels.iter().enumerate().find(|(i, l)| labels[..*i].contains(l)) {
+            return Err(PrepareMiss(format!(
+                "a decision on spec {spec_name} lists council context \"{label}\" twice (position {})",
+                i + 1
+            )));
+        }
+        if labels.len() as u64 > identity.limits.contexts_per_decision {
+            return Err(PrepareMiss(format!(
+                "a decision on spec {spec_name} reads {} contexts ({}), and council server {server} \
+                 reads at most {} per decision",
+                labels.len(),
+                labels.join(", "),
+                identity.limits.contexts_per_decision
+            )));
+        }
         self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
 
-        let mut contexts = Vec::with_capacity(council.contexts.len());
-        for label in &council.contexts {
+        let mut contexts = Vec::with_capacity(labels.len());
+        for label in labels {
             let context_id = resolve_label(kernel, label)?;
-            let body = project(
-                label,
-                &kernel.blocks().block_snapshots(context_id).map_err(|e| {
-                    PrepareMiss(format!("council context \"{label}\" cannot be read: {e}"))
-                })?,
-            );
+            let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
+                PrepareMiss(format!("council context \"{label}\" cannot be read: {e}"))
+            })?;
+            let body = project(label, &blocks, &*kernel.kernel_db().lock())
+                .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
             let hash = body_hash(&body)?;
             let key = (server.to_string(), context_id);
             let held = self.state.lock().contexts.get(&key).cloned();
@@ -215,60 +260,59 @@ async fn read_spec(kernel: &crate::Kernel, name: &str) -> Result<(Spec, SpecId),
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod mock {
+    //! A mock council server on 127.0.0.1 for the council's kernel tests.
+
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    use kaijutsu_council::canon;
+    use kaijutsu_council::wire::Spec;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::super::projection::fixtures::{append_dialogue, live_context};
-    use super::*;
-    use crate::Kernel;
-    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights};
-    use crate::vfs::LocalBackend;
-
-    const SPEC: &str = include_str!("../../../kaijutsu-council/tests/fixtures/spec.json");
-
     #[derive(Clone, Debug)]
-    struct Reply {
-        status: u16,
-        body: String,
+    pub(crate) struct Reply {
+        pub(crate) status: u16,
+        pub(crate) body: String,
     }
 
-    fn reply(status: u16, body: impl Into<String>) -> Reply {
+    pub(crate) fn reply(status: u16, body: impl Into<String>) -> Reply {
         Reply { status, body: body.into() }
     }
 
     #[derive(Debug)]
-    struct Captured {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-        body: String,
+    pub(crate) struct Captured {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) headers: Vec<(String, String)>,
+        pub(crate) body: String,
     }
 
     impl Captured {
-        fn header(&self, name: &str) -> Option<&str> {
+        pub(crate) fn header(&self, name: &str) -> Option<&str> {
             self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
         }
     }
 
     /// A mock council server on 127.0.0.1 that answers the contract's happy
     /// path unless a test queues a reply for a method.
-    struct Mock {
-        base: String,
+    pub(crate) struct Mock {
+        pub(crate) base: String,
         seen: Arc<Mutex<Vec<Captured>>>,
         forced: Arc<Mutex<VecDeque<(String, Reply)>>>,
+        decide: Decide,
     }
 
+    type Decide = Arc<Mutex<Option<Box<dyn Fn(&str) -> Reply + Send>>>>;
+
     impl Mock {
-        fn force(&self, method: &str, r: Reply) {
+        pub(crate) fn force(&self, method: &str, r: Reply) {
             self.forced.lock().unwrap().push_back((method.to_string(), r));
         }
 
-        fn calls(&self, method: &str) -> Vec<String> {
+        pub(crate) fn calls(&self, method: &str) -> Vec<String> {
             self.seen
                 .lock()
                 .unwrap()
@@ -278,7 +322,7 @@ mod tests {
                 .collect()
         }
 
-        fn puts(&self) -> Vec<(Option<String>, serde_json::Value)> {
+        pub(crate) fn puts(&self) -> Vec<(Option<String>, serde_json::Value)> {
             self.seen
                 .lock()
                 .unwrap()
@@ -288,16 +332,32 @@ mod tests {
                 .collect()
         }
 
-        fn count(&self) -> usize {
+        pub(crate) fn count(&self) -> usize {
             self.seen.lock().unwrap().len()
+        }
+
+        /// Answer each `POST /council/v1/decisions` with `f` of its body.
+        pub(crate) fn on_decide(&self, f: impl Fn(&str) -> Reply + Send + 'static) {
+            *self.decide.lock().unwrap() = Some(Box::new(f));
+        }
+
+        /// The bodies of every request to `path`, in order.
+        pub(crate) fn bodies(&self, path: &str) -> Vec<serde_json::Value> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.path == path)
+                .map(|c| serde_json::from_str(&c.body).unwrap())
+                .collect()
         }
     }
 
-    fn snap(n: u64) -> String {
+    pub(crate) fn snap(n: u64) -> String {
         format!("snap:{n:064x}")
     }
 
-    fn identity_json() -> String {
+    pub(crate) fn identity_json() -> String {
         json!({"model": "m", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
                "engine": "e",
                "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 4,
@@ -327,12 +387,13 @@ mod tests {
         }
     }
 
-    async fn serve() -> Mock {
+    pub(crate) async fn serve() -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let forced: Arc<Mutex<VecDeque<(String, Reply)>>> = Arc::default();
-        let (log, queue) = (seen.clone(), forced.clone());
+        let decide: Decide = Arc::default();
+        let (log, queue, decider) = (seen.clone(), forced.clone(), decide.clone());
         tokio::spawn(async move {
             let mut puts = 0u64;
             loop {
@@ -376,9 +437,13 @@ mod tests {
                     let mut q = queue.lock().unwrap();
                     q.iter().position(|(m, _)| *m == captured.method).and_then(|i| q.remove(i))
                 };
-                let r = match forced_reply {
-                    Some((_, r)) => r,
-                    None => default_reply(&captured, &mut puts),
+                let decided = (captured.path == "/council/v1/decisions")
+                    .then(|| decider.lock().unwrap().as_ref().map(|f| f(&captured.body)))
+                    .flatten();
+                let r = match (forced_reply, decided) {
+                    (Some((_, r)), _) => r,
+                    (None, Some(r)) => r,
+                    (None, None) => default_reply(&captured, &mut puts),
                 };
                 log.lock().unwrap().push(captured);
                 let out = format!(
@@ -391,8 +456,28 @@ mod tests {
                 let _ = sock.shutdown().await;
             }
         });
-        Mock { base, seen, forced }
+        Mock { base, seen, forced, decide }
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::mock::{Mock, identity_json, reply, serve, snap};
+    use super::super::projection::fixtures::{append_dialogue, live_context};
+    use super::*;
+    use crate::Kernel;
+    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights};
+    use crate::vfs::LocalBackend;
+
+    /// The shipped shell spec: no `text` question, so it needs no
+    /// `describe` capability.
+    const SPEC: &str = crate::config_seed::DEFAULT_COUNCIL_SHELL_GATE;
+    /// The contract's example spec, which holds the `text` question `effect`.
+    const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-council/tests/fixtures/spec.json");
 
     struct Rig {
         kernel: Kernel,
@@ -625,5 +710,57 @@ mod tests {
         r.council.server = format!("http://{addr}");
         let miss = r.prepare().await.err().expect("a miss");
         assert!(miss.0.contains(&addr.to_string()), "{}", miss.0);
+    }
+
+    fn identity_with(capabilities: serde_json::Value) -> String {
+        let mut id: serde_json::Value = serde_json::from_str(&identity_json()).unwrap();
+        id["capabilities"] = capabilities;
+        id.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_text_question_without_describe_is_a_miss_naming_both() {
+        let r = rig().await;
+        std::fs::write(r.config.path().join("council/shell-gate.json"), SPEC_WITH_TEXT).unwrap();
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("`effect`") && miss.0.contains("`describe`"), "{}", miss.0);
+        assert!(r.mock.calls("POST").is_empty(), "the spec is not posted");
+        assert!(r.mock.puts().is_empty(), "no context is sent");
+    }
+
+    #[tokio::test]
+    async fn a_text_question_with_describe_prepares() {
+        let r = rig().await;
+        std::fs::write(r.config.path().join("council/shell-gate.json"), SPEC_WITH_TEXT).unwrap();
+        r.mock.force("GET", reply(200, identity_with(json!(["leave_one_out", "describe"]))));
+        r.prepare().await.expect("prepared");
+    }
+
+    #[tokio::test]
+    async fn prepare_labels_reads_exactly_the_labels_given_in_order() {
+        let r = rig().await;
+        let amy = live_context(&r.kernel, "council-amy");
+        append_dialogue(&r.kernel, amy, &["keep main green"]);
+        let labels = vec!["voice".to_string(), "council-amy".to_string()];
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels).await.unwrap();
+        assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["voice", "council-amy"]);
+        assert_eq!(p.contexts[1].context_id, amy);
+
+        let one = vec!["council-amy".to_string()];
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one).await.unwrap();
+        assert_eq!(p.contexts.len(), 1, "a single voice, without [council] contexts");
+        assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
+    }
+
+    #[tokio::test]
+    async fn more_labels_than_the_server_reads_or_a_repeated_label_is_a_miss() {
+        let r = rig().await;
+        let labels: Vec<String> = (0..5).map(|i| format!("ctx-{i}")).collect();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels).await.err().unwrap();
+        assert!(miss.0.contains("at most 4"), "{}", miss.0);
+        let twice = vec!["voice".to_string(), "voice".to_string()];
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice).await.err().unwrap();
+        assert!(miss.0.contains("\"voice\" twice"), "{}", miss.0);
+        assert!(r.mock.puts().is_empty());
     }
 }

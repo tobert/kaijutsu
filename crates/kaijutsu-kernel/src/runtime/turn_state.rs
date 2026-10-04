@@ -10,6 +10,9 @@ use super::interrupt::ContextInterruptState;
 struct ActiveTurn {
     began: std::time::Instant,
     interrupt: Arc<ContextInterruptState>,
+    /// Who asked for the turn; `None` until startup is queued
+    /// (`TurnLease::set_origin`).
+    origin: Option<crate::flows::TurnOrigin>,
 }
 
 type ActiveTurns = HashMap<ContextId, std::collections::BTreeMap<TurnId, ActiveTurn>>;
@@ -98,6 +101,13 @@ impl TurnLease {
     }
     pub(crate) fn interrupt(&self) -> Arc<ContextInterruptState> { self.interrupt.clone() }
     pub(crate) fn context(&self) -> ContextId { self.context }
+    /// Record who asked for this turn, so [`TurnState::any_autonomous`] can
+    /// answer for it while it is accepted.
+    pub(crate) fn set_origin(&self, origin: crate::flows::TurnOrigin) {
+        if let Some(turn) = self.active.lock().get_mut(&self.context).and_then(|turns| turns.get_mut(&self.id)) {
+            turn.origin = Some(origin);
+        }
+    }
 }
 
 impl Drop for TurnLease {
@@ -157,13 +167,22 @@ impl TurnState {
         if idle_only && active.contains_key(&context) { return None; }
         let id = TurnId::new();
         active.entry(context).or_default().insert(id, ActiveTurn {
-            began: std::time::Instant::now(), interrupt: interrupt.clone(),
+            began: std::time::Instant::now(), interrupt: interrupt.clone(), origin: None,
         });
         Some(TurnLease { active: self.active.clone(), context, id, delivery: None, blocks: Default::default(), interrupt })
     }
 
     pub fn active_count(&self, context: ContextId) -> usize {
         self.active.lock().get(&context).map_or(0, |turns| turns.len())
+    }
+
+    /// Whether any accepted turn in `context` was driven by the kernel
+    /// (`TurnOrigin::Autonomous`). A turn whose startup is not queued yet
+    /// has no origin and does not count.
+    pub fn any_autonomous(&self, context: ContextId) -> bool {
+        self.active.lock().get(&context).is_some_and(|turns| {
+            turns.values().any(|turn| turn.origin == Some(crate::flows::TurnOrigin::Autonomous))
+        })
     }
 
     /// Interrupt every accepted turn, including work waiting for the context lock.
@@ -357,6 +376,29 @@ mod turn_lease_tests {
         let next = state.begin_if_idle(context).unwrap();
         assert!(!next.interrupt.cancel.is_cancelled());
         assert!(!next.interrupt.stop_after_turn.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    use crate::flows::TurnOrigin;
+
+    #[test]
+    fn a_context_is_autonomous_while_an_accepted_turn_says_so() {
+        let state = TurnState::default();
+        let context = ContextId::new();
+        let interactive = state.begin(context);
+        assert!(!state.any_autonomous(context), "no origin recorded yet");
+        interactive.set_origin(TurnOrigin::Interactive);
+        assert!(!state.any_autonomous(context));
+        let driven = state.begin(context);
+        driven.set_origin(TurnOrigin::Autonomous);
+        assert!(state.any_autonomous(context));
+        assert!(!state.any_autonomous(ContextId::new()), "another context");
+        drop(driven);
+        assert!(!state.any_autonomous(context), "the autonomous turn ended");
+        drop(interactive);
     }
 }
 

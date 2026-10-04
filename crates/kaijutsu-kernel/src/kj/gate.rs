@@ -438,6 +438,11 @@ pub(crate) fn announce_ledger_change(
 /// `Unavailable`, a fault and not a decision, naming the file and the
 /// remedy. An origin the config layers do not apply to passes
 /// `gate_policy::no_config()`.
+///
+/// A `shell_write` submission (`Origin::ShellGate`) is read by the council
+/// first when `gate.toml` enables it for the caller's context type
+/// (`crate::council::gate::consult`); every other origin goes straight to
+/// [`run_gate_recorded`].
 pub(crate) async fn run_gate(
     kernel: &crate::Kernel,
     caller: &KjCaller,
@@ -445,7 +450,107 @@ pub(crate) async fn run_gate(
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
-    run_gate_recorded(kernel, caller, spec, ledger_flows, config, &|_, _| Ok(())).await
+    let council = if spec.origin == Origin::ShellGate {
+        match crate::council::gate::consult(kernel, caller, &spec, config).await {
+            Ok(council) => council,
+            Err(reason) => return GateOutcome::unavailable_without_row(reason),
+        }
+    } else {
+        None
+    };
+    run_gate_recorded(kernel, caller, spec, ledger_flows, config, council, &|_, _| Ok(())).await
+}
+
+/// The ask that still holds this submission: one still open, or an answer
+/// nobody has collected, raised in the caller's context for the same
+/// executable source or the same statements under the same label. A council
+/// verdict never revives or bypasses an earlier ask, so a submission an ask
+/// holds is decided by the escalate path, where step 2 delivers that answer
+/// or leaves it to its owner.
+pub(crate) fn ask_holding_submission(
+    db: &KernelDb,
+    spec: &GateSpec,
+    caller: &KjCaller,
+) -> KernelDbResult<Option<String>> {
+    use std::collections::BTreeSet;
+    let Some(context_id) = caller.context_id else { return Ok(None) };
+    let conn = db.conn_for_ledger();
+    let context = context_id.as_bytes().to_vec();
+    let principal = caller.principal_id.as_bytes().to_vec();
+    let digests: Vec<String> = spec.statements.iter().map(|s| statement_digest(spec.origin, &s.rendered)).collect();
+    let digest_refs: Vec<&str> = digests.iter().map(String::as_str).collect();
+    if let Some((request_id, _)) = approval_ledger::ask::find_redeemable(
+        conn, &digest_refs, &spec.authorized_label, Some(&context), Some(&principal), caller.actor_id.as_bytes(),
+    )? {
+        return Ok(Some(request_id));
+    }
+    let wanted: BTreeSet<&str> = digest_refs.iter().copied().collect();
+    let same = |row: &approval_ledger::types::ApprovalRow| -> KernelDbResult<bool> {
+        if spec.exec_source.is_some() && row.exec_source == spec.exec_source {
+            return Ok(true);
+        }
+        if row.authorized_label.as_deref() != Some(spec.authorized_label.as_str()) {
+            return Ok(false);
+        }
+        let held = approval_ledger::ask::load_ask_statements(conn, &row.request_id)?;
+        Ok(held.iter().map(|s| s.statement.statement_digest.as_str()).collect::<BTreeSet<_>>() == wanted)
+    };
+    for row in approval_ledger::ask::list_unresolved_for_context(conn, &context)? {
+        if same(&row)? {
+            return Ok(Some(row.request_id));
+        }
+    }
+    for answer in approval_ledger::ask::undelivered_answers(conn)? {
+        if answer.context_id != context {
+            continue;
+        }
+        if let Some(row) = db.get_approval(&answer.request_id)?
+            && same(&row)?
+        {
+            return Ok(Some(row.request_id));
+        }
+    }
+    Ok(None)
+}
+
+/// A human-allowed ask for this submission's source whose run has not
+/// settled: the approval worker collects an answer before it runs the
+/// command, so from its claim until the run completes no open ask or
+/// uncollected answer shows the run. An allowed ask with no recorded run yet
+/// counts as unsettled. Takes the database lock itself, so call it with the
+/// lock released.
+pub(crate) fn approved_run_unsettled(
+    kernel: &crate::Kernel,
+    spec: &GateSpec,
+    caller: &KjCaller,
+) -> Result<Option<String>, String> {
+    let (Some(context_id), Some(source)) = (caller.context_id, spec.exec_source.as_deref()) else {
+        return Ok(None);
+    };
+    let collected = {
+        let db = kernel.kernel_db().lock();
+        approval_ledger::ask::list_collected_allows(db.conn_for_ledger(), context_id.as_bytes(), source)
+            .map_err(|e| format!("could not read approved runs of this command: {e}"))?
+    };
+    for request_id in collected {
+        let settled = kernel
+            .shell_operations()
+            .get_by_ask(&request_id, context_id)
+            .map_err(|e| format!("could not read the approved run of ask {request_id}: {e}"))?
+            .is_some_and(|state| state.completed_at.is_some());
+        if !settled {
+            return Ok(Some(request_id));
+        }
+    }
+    Ok(None)
+}
+
+/// The key a council-allowed statement's decision names.
+fn council_key(spec: &GateSpec, index: usize, council: &crate::council::gate::CouncilVerdict) -> String {
+    match (spec.origin, spec.statements.get(index).and_then(|s| s.source_index)) {
+        (Origin::ShellGate, Some(source)) => format!("statement #{source} {}", council.allow_key()),
+        _ => council.allow_key(),
+    }
 }
 
 /// Verify the addressed context in the transaction that makes an approval
@@ -458,6 +563,48 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 }
 
 /// Record caller state in the ask transaction, before any ledger notification.
+///
+/// `council` is the council's verdict on this submission, when one was
+/// consulted. An allow turns the statements no other layer covered into
+/// council allows, unless an earlier ask still holds the submission
+/// ([`ask_holding_submission`]). Every verdict is recorded: with the ask it
+/// led to, in the transaction that creates it, or unlinked when the gate
+/// stopped before an ask existed. A record that cannot be written refuses
+/// the call as gate unavailable.
+pub(crate) async fn run_gate_recorded(
+    kernel: &crate::Kernel,
+    caller: &KjCaller,
+    spec: GateSpec,
+    ledger_flows: &SharedLedgerFlowBus,
+    config: &super::gate_policy::GateConfigLoad,
+    council: Option<crate::council::gate::CouncilVerdict>,
+    record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
+) -> GateOutcome {
+    let recorded = std::sync::atomic::AtomicBool::new(false);
+    let outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
+    let Some(council) = council else { return outcome };
+    if recorded.load(std::sync::atomic::Ordering::Acquire) {
+        return outcome;
+    }
+    let written = {
+        let db = kernel.kernel_db().lock();
+        approval_ledger::council::insert_council_decision(db.conn_for_ledger(), &council.record_for(None))
+    };
+    match written {
+        Ok(_) => outcome,
+        Err(e) => GateOutcome {
+            verdict: GateVerdict::Unavailable,
+            ask: outcome.ask,
+            cwd: ShellCwd::Context,
+            reason: format!(
+                "{} — and the council's decision could not be recorded: {e} (fail-closed — a ledger \
+                 fault, not a decision)",
+                outcome.reason
+            ),
+        },
+    }
+}
+
 #[tracing::instrument(
     name = "approval.gate",
     skip_all,
@@ -469,12 +616,15 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
         ask.id = tracing::field::Empty,
     )
 )]
-pub(crate) async fn run_gate_recorded(
+#[allow(clippy::too_many_arguments)]
+async fn run_gate_once(
     kernel: &crate::Kernel,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
+    council: Option<&crate::council::gate::CouncilVerdict>,
+    council_recorded: &std::sync::atomic::AtomicBool,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let db = kernel.kernel_db();
@@ -552,9 +702,12 @@ pub(crate) async fn run_gate_recorded(
     //    partially (module docs: there is no way to run "just the allowed
     //    half" of one submitted blob). Both terminal outcomes leave a
     //    durable row.
+    //
+    //    A council allow (`docs/council.md`) covers only the statements no
+    //    layer decided, and never a submission an earlier ask still holds.
     let policy = {
         let db = db.lock();
-        match super::gate_policy::evaluate(
+        let mut policy = match super::gate_policy::evaluate(
             db.conn_for_ledger(),
             &spec,
             Some(context.as_slice()),
@@ -568,7 +721,23 @@ pub(crate) async fn run_gate_recorded(
                      ledger fault, not a decision)"
                 ));
             }
+        };
+        if let Some(council) = council.filter(|c| c.allows()) {
+            match ask_holding_submission(&db, &spec, caller) {
+                Ok(None) => policy.apply_council_allow(&council.spec, |i| council_key(&spec, i, council)),
+                Ok(Some(request_id)) => tracing::info!(
+                    ask.held_by = %request_id,
+                    "an earlier ask holds this submission; the council's allow is not applied"
+                ),
+                Err(e) => {
+                    return GateOutcome::unavailable_without_row(format!(
+                        "approval gate could not check for an earlier ask: {e} (fail-closed — this \
+                         is a ledger fault, not a decision)"
+                    ));
+                }
+            }
         }
+        policy
     };
     let verdict = policy.verdict();
 
@@ -720,6 +889,10 @@ pub(crate) async fn run_gate_recorded(
         Err(error) => return GateOutcome::unavailable_without_row(format!(
             "approval gate could not capture command inputs: {error}")),
     };
+    if let Some(council) = council {
+        ask.signals.push(council.signal());
+        ask.description = format!("{}\n\n{}", ask.description, council.note());
+    }
 
     // 3. Durable before asked — the row commits before anyone is told.
     let request_id = {
@@ -754,10 +927,16 @@ pub(crate) async fn run_gate_recorded(
             if let Some(call) = &tool_call {
                 crate::kernel_db::record_approval_tool_call(conn, request, context, call)?;
             }
+            if let Some(council) = council {
+                approval_ledger::council::insert_council_decision_within(conn, &council.record_for(Some(request)))?;
+            }
             record(conn, request)
         };
         match db.create_approval_ask_recorded(&ask, spec.publishes_pair, recorded) {
-            Ok(id) => id,
+            Ok(id) => {
+                council_recorded.store(true, std::sync::atomic::Ordering::Release);
+                id
+            }
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),
         }
     };

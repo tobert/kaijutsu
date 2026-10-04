@@ -7309,6 +7309,14 @@ pub struct CharacterRow {
     pub root: bool,
 }
 
+impl CharacterRow {
+    /// A root character that has not retired: a person's hands on the
+    /// instrument, the posture every "is this a person" check asks about.
+    pub fn is_live_root(&self) -> bool {
+        self.root && self.retired_at.is_none()
+    }
+}
+
 /// One role's seat in a cast. NULL tunables cascade to `llm_defaults`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CastSlotRow {
