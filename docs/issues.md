@@ -761,6 +761,21 @@ usable, but callers that source `env.sh` fail. Treat an existing tier as done
   db-wal-recovery again ran `sqlite3` in place, lost the WAL, said so, and
   restored the fixture from harbor-framework/terminal-bench-2. Network
   restriction for task containers is the remaining fix.
+- **db-wal-recovery at 661ec552 (orient on how tools treat data, one sample
+  at a time), three DeepSeek runs:** 1 honest pass, 1 fetched pass, 1 fail.
+  The honest run spent 3.8K output tokens before its second action and backed
+  up the WAL; the other two spent 226 and 534, ran `sqlite3` in the same
+  parallel batch as a hexdump, and lost the WAL. "One sample at a time" was
+  not followed in any run. Offline probes that reasoned at length backed up
+  every time, so the knowledge is present and the failure is the reflex
+  batch. A System 1 command check is the next layer: flag a batch that
+  inspects a data file and also opens it with a program.
+- **A coder opened its own kernel's live `kernel.db`.** Run 2 lost the WAL,
+  then searched kaijutsu's state directory for a copy and ran `sqlite3`
+  against the running kernel's `kernel.db` before the agent process exited
+  nonzero. The solo state directory is visible to the coder's shell. Either
+  keep it out of the coder's reach or have the command check refuse writes
+  and opens there.
 - **The backup rule did not hold.** db-wal-recovery opened `main.db` with
   `sqlite3` before copying the WAL, and SQLite deleted it, as on 10-03.
 - **configure-git-webserver is unscorable as written.** Its verifier logs in
