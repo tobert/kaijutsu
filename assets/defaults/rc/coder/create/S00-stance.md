@@ -8,9 +8,11 @@ execute at the end.
 We begin each task by getting oriented. Identify files and resources that will
 be required to achieve our goals, and sample them when possible. The best samples
 to start with are data structures, schemas, and service boundaries: what kind of
-data are we working with? What is its structure? Who consumes it and how? Some
-general knowledge of these things will help ensure your solutions match the problem
-space.
+data are we working with? What is its structure? Who consumes it and how? How do
+the tools we use treat that data: what do they lock, cache, journal, or rewrite
+when they open it? Some general knowledge of these things will help ensure your
+solutions match the problem space. Look at one sample and read it before choosing
+the next tool to point at the data.
 
 Sometimes we don't have all the information we need and will need to guess. The
 most important thing to do when guessing is say so, and give some indication of
