@@ -60,5 +60,7 @@ r=[check("Spec",spec,why="api example spec"),
  check("DecisionRequest",{"state":"x","questions":{"a":{"type":"noul","instructions":"q","temperature":0}}},ok=False,why="inline question extra field"),
  check("ContextPutResult",{"id":U1,"head":SN,"tokens":96,"kept":0,"fed":96,"dry_run":False,"snapshots":[]},why="api PUT reply"),
  check("ContextPutResult",{"id":U1,"head":SN,"tokens":96,"kept":0,"fed":96,"snapshots":[]},ok=False,why="PUT reply without dry_run"),
+ check("Turn",{"role":"assistant","content":"READY","reasoning":"I would ask before any push.","snap":True},why="assistant turn with reasoning"),
+ check("Turn",{"role":"user","content":"x","reasoning":"y"},ok=False,why="reasoning on a user turn"),
 ]
 sys.exit(0 if all(r) else 1)

@@ -162,6 +162,13 @@ Decisions API. The body and answer are the same.
   `snap` flag by `snap` flag, with what it holds, and feeds from the first
   difference. `"snap": true` marks a boundary: a turn the client expects to
   keep while later turns change.
+- **An assistant turn may carry `reasoning`**, the model's own thinking,
+  which the server renders as that turn's thinking region. It is part of the
+  context's content, so snapshot ids, `rendered_sha256`, and `dry_run` all
+  see it; absent renders an empty thinking region. A `reasoning` on any other
+  role is a `400`. A client uses it to keep a warm-up in a context: the model
+  thinks through how it would decide and works an example or two before the
+  spec layer.
 - **`If-Match: <head>`** makes a `PUT` conditional: when the context's head is
   not that snapshot, the answer is a `412` with the current head. Without
   it, the last `PUT` the server accepts wins.
