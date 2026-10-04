@@ -195,7 +195,15 @@ compacting."
   the projection reads drift blocks in voice contexts.
 - **The chain follows the reviewer, for now.** Amy: "reviewer is fine for
   now". Recording which context drives a coder is the alternative if the
-  reviewer and the director come apart.
+  reviewer and the director come apart. Above the first reviewer, the climb
+  walks the submitting context's fork tree the way `kj ledger escalate`
+  does, taking each responsible character it has not seen, until a live
+  root.
+- **`council-system` is reserved.** A character named `system` would collide
+  with it, so the chain walk fails loudly on one.
+- **Voices count against the server's limit.** The system context plus the
+  voting voices must fit `identity.limits.contexts_per_decision` (8 on the
+  megakernel); a longer chain is a miss naming the limit, not a silent cut.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
