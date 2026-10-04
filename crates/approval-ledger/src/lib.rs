@@ -62,6 +62,7 @@
 
 pub mod ask;
 pub mod claim;
+pub mod council;
 pub mod decide;
 pub mod error;
 mod events;

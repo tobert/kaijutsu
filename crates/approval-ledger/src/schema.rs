@@ -802,6 +802,131 @@ CREATE TABLE IF NOT EXISTS script_bodies (
     first_seen_at INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER))
 );
+
+-- ── Council decisions ────────────────────────────────────────────────
+-- One row per System 1 decision on a shell submission, allow or not
+-- (`docs/council.md`, "The record"). `request_id` names the ask the
+-- decision led to and is NULL when none was raised; a decision outlives
+-- its ask, so there is no cascade. `outcome` follows the growable-value-set
+-- rule in `DDL`'s doc comment (`CouncilOutcome` in `council.rs` owns the
+-- set). The fixed-shape rules stay in SQL: a miss carries its cause and
+-- nothing else does, the threshold columns are all set or all NULL, and
+-- `agree` and `spread` are both set or both NULL. `control_text_hits` is
+-- the count of `council_control_text` rows; `insert_council_decision`
+-- writes both from the same list.
+CREATE TABLE IF NOT EXISTS council_decisions (
+    decision_id       BLOB    NOT NULL PRIMARY KEY,
+    request_id        TEXT    REFERENCES approvals(request_id),
+    context_id        BLOB    NOT NULL,
+    principal_id      BLOB    NOT NULL,
+    submission_digest TEXT    NOT NULL,
+    spec_id           TEXT    NOT NULL,
+    spec_name         TEXT    NOT NULL,
+    server_model      TEXT    NOT NULL,
+    weight_hash       TEXT    NOT NULL,
+    tokenizer_hash    TEXT    NOT NULL,
+    template          TEXT    NOT NULL,
+    engine            TEXT    NOT NULL,
+    pool_method       TEXT    NOT NULL,
+    pool_weights      TEXT    NOT NULL,
+    allow_at          REAL,
+    mass_floor        REAL,
+    require_agree     INTEGER,
+    deadline_ms       INTEGER NOT NULL,
+    outcome           TEXT    NOT NULL,
+    miss_cause        TEXT,
+    agree             INTEGER,
+    spread            REAL,
+    control_text_hits INTEGER NOT NULL,
+    queue_ms          INTEGER NOT NULL,
+    ms                INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL
+        DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    CHECK ((outcome = 'miss') = (miss_cause IS NOT NULL)),
+    CHECK (
+        (allow_at IS NULL) = (mass_floor IS NULL)
+        AND (allow_at IS NULL) = (require_agree IS NULL)
+    ),
+    CHECK (require_agree IS NULL OR require_agree IN (0, 1)),
+    CHECK ((agree IS NULL) = (spread IS NULL)),
+    CHECK (agree IS NULL OR agree IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_council_decisions_request
+    ON council_decisions(request_id, created_at DESC, decision_id DESC)
+    WHERE request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_council_decisions_context
+    ON council_decisions(context_id, created_at DESC, decision_id DESC);
+
+-- One row per read of one decision. `context_id` is NULL for a read of the
+-- spec alone. `expected_head` is the head the kernel expected the context
+-- to be at when it asked.
+CREATE TABLE IF NOT EXISTS council_reads (
+    decision_id     BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    read_idx        INTEGER NOT NULL,
+    context_id      BLOB,
+    snapshot        TEXT    NOT NULL,
+    expected_head   TEXT,
+    rendered_sha256 TEXT    NOT NULL,
+    PRIMARY KEY (decision_id, read_idx)
+);
+
+-- One row per read and choice, score, or noul question. `confidence` is
+-- NULL for noul, which has none.
+CREATE TABLE IF NOT EXISTS council_read_questions (
+    decision_id BLOB    NOT NULL,
+    read_idx    INTEGER NOT NULL,
+    question_id TEXT    NOT NULL,
+    mass        REAL    NOT NULL,
+    confidence  REAL,
+    PRIMARY KEY (decision_id, read_idx, question_id),
+    FOREIGN KEY (decision_id, read_idx)
+        REFERENCES council_reads(decision_id, read_idx) ON DELETE CASCADE
+);
+
+-- One row per read, question, and option: the raw log probability and the
+-- probability derived from it.
+CREATE TABLE IF NOT EXISTS council_read_options (
+    decision_id BLOB    NOT NULL,
+    read_idx    INTEGER NOT NULL,
+    question_id TEXT    NOT NULL,
+    option      TEXT    NOT NULL,
+    logprob     REAL    NOT NULL,
+    probability REAL    NOT NULL,
+    PRIMARY KEY (decision_id, read_idx, question_id, option),
+    FOREIGN KEY (decision_id, read_idx, question_id)
+        REFERENCES council_read_questions(decision_id, read_idx, question_id) ON DELETE CASCADE
+);
+
+-- One row per pooled question and option.
+CREATE TABLE IF NOT EXISTS council_pooled (
+    decision_id BLOB NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    option      TEXT NOT NULL,
+    probability REAL NOT NULL,
+    PRIMARY KEY (decision_id, question_id, option)
+);
+
+-- One row per read and text question: what that read's model wrote.
+CREATE TABLE IF NOT EXISTS council_described (
+    decision_id BLOB    NOT NULL,
+    read_idx    INTEGER NOT NULL,
+    question_id TEXT    NOT NULL,
+    body        TEXT    NOT NULL,
+    PRIMARY KEY (decision_id, read_idx, question_id),
+    FOREIGN KEY (decision_id, read_idx)
+        REFERENCES council_reads(decision_id, read_idx) ON DELETE CASCADE
+);
+
+-- Each place the server found control text, in the server's order.
+-- `location` is `state`, `spec`, `context:<id>:system`, or
+-- `context:<id>:turn:<n>`.
+CREATE TABLE IF NOT EXISTS council_control_text (
+    decision_id BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    location    TEXT    NOT NULL,
+    token       TEXT    NOT NULL,
+    PRIMARY KEY (decision_id, seq)
+);
 "#;
 
 /// Create every table/index/trigger this crate owns, idempotently. Safe to
@@ -2407,6 +2532,67 @@ mod tests {
         assert!(
             generation_after > generation_before,
             "ledger_generation_bump_on_signal_insert must survive the rebuild"
+        );
+    }
+
+    /// A database created before `council` was a signal source carries
+    /// `CHECK (source_kind IN ('rule', 'classifier'))`. Its signals survive
+    /// the migration and a council signal inserts afterward.
+    #[test]
+    fn a_pre_council_database_keeps_its_signals_and_accepts_a_council_signal() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO approvals (request_id, context_id, principal_id, origin, description)
+             VALUES ('r1', X'01', X'02', 'shell_gate', 'x')",
+            [],
+        )
+        .unwrap();
+        put_table_back_on_legacy_shape(&conn, "approval_signals");
+        conn.execute(
+            "INSERT INTO approval_signals (request_id, seq, source_kind, source_id, score, verdict)
+             VALUES ('r1', 0, 'rule', 'rule-7', NULL, 'allow'), ('r1', 1, 'classifier', 'risk-v1', 0.25, 'escalate')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO approval_signals (request_id, seq, source_kind, verdict) VALUES ('r1', 2, 'council', 'allow')",
+                [],
+            )
+            .is_err(),
+            "the legacy shape must reject the new kind, or this test proves nothing"
+        );
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        crate::ask::add_signal(
+            &conn,
+            "r1",
+            &crate::types::NewSignal {
+                source_kind: crate::types::SignalSourceKind::Council,
+                source_id: Some("shell-v1".into()),
+                model_id: Some("lfm2d".into()),
+                weight_hash: Some("w1".into()),
+                stmt_seq: None,
+                cmd_seq: None,
+                label: Some("allow".into()),
+                score: Some(0.93),
+                verdict: crate::types::SignalVerdict::Allow,
+            },
+        )
+        .unwrap();
+
+        let signals = crate::ask::list_signals(&conn, "r1").unwrap();
+        let kinds: Vec<_> = signals.iter().map(|s| (s.source_kind.as_str(), s.source_id.clone(), s.score)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("rule", Some("rule-7".to_string()), None),
+                ("classifier", Some("risk-v1".to_string()), Some(0.25)),
+                ("council", Some("shell-v1".to_string()), Some(0.93)),
+            ]
         );
     }
 

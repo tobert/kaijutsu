@@ -203,6 +203,8 @@ impl fmt::Display for VarBinding {
 pub enum SignalSourceKind {
     Rule,
     Classifier,
+    /// The council's pooled verdict on a shell submission.
+    Council,
 }
 
 impl SignalSourceKind {
@@ -210,6 +212,7 @@ impl SignalSourceKind {
         match self {
             Self::Rule => "rule",
             Self::Classifier => "classifier",
+            Self::Council => "council",
         }
     }
 }
