@@ -165,7 +165,8 @@ Decisions API. The body and answer are the same.
 - **An assistant turn may carry `reasoning`**, the model's own thinking,
   which the server renders as that turn's thinking region. It is part of the
   context's content, so snapshot ids, `rendered_sha256`, and `dry_run` all
-  see it; absent renders an empty thinking region. A `reasoning` on any other
+  see it; absent and empty render the same empty thinking region, with the
+  same snapshot ids. A `reasoning` on any other
   role is a `400`. A client uses it to keep a warm-up in a context: the model
   thinks through how it would decide and works an example or two before the
   spec layer.
@@ -318,8 +319,9 @@ map is the Decisions API's answer, pooled over the reads.
    never closes or opens a turn. The case always sits in its own user turn,
    so text that imitates the spec's format stays inside it. The server
    reports each hit in `signals.control_text` as `{where, token}`, where
-   `where` is `state`, `spec`, `context:<id>:system`, or
-   `context:<id>:turn:<n>`, and never refuses the request for it.
+   `where` is `state`, `spec`, `context:<id>:system`,
+   `context:<id>:turn:<n>`, or `context:<id>:turn:<n>:reasoning`, and never
+   refuses the request for it.
 3. **Each context describes for itself.** A `text` answer comes from inside
    each context's own stack. One shared description would erase what separates
    the contexts.

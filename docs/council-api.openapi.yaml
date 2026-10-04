@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Council API
-  version: 0.2.2-draft
+  version: 0.2.3-draft
   summary: Typed decisions read after several held model contexts, a superset of the gateway Decisions API.
   description: |
     Proposed contract for the megakernel and lfm2d decision servers. The prose
@@ -291,7 +291,7 @@ components:
           description: Keep a snapshot boundary at the end of this turn. Part of the context's content.
         reasoning:
           type: string
-          description: The model's own thinking for an assistant turn, rendered as that turn's thinking and part of the context's content. Assistant turns only; absent renders an empty thinking region.
+          description: The model's own thinking for an assistant turn, rendered as that turn's thinking and part of the context's content. Assistant turns only; absent and empty render the same empty thinking region.
       if:
         required: [reasoning]
       then:
@@ -813,7 +813,7 @@ components:
       properties:
         where:
           type: string
-          description: 'state, spec, a context system message as "context:<id>:system", or a context turn as "context:<id>:turn:<n>".'
+          description: 'state, spec, a context system message as "context:<id>:system", a context turn as "context:<id>:turn:<n>", or that turn''s reasoning as "context:<id>:turn:<n>:reasoning".'
         token:
           type: string
           description: The control token the text spells.
