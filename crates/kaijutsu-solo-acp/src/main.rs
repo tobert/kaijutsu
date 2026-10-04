@@ -69,7 +69,7 @@ struct Cli {
     base_url: Option<String>,
 
     /// Model id for every turn. Default: the provider's shipped model —
-    /// `deepseek-v4-flash` or `claude-sonnet-5`. The `openai` provider ships
+    /// `deepseek-v4-flash` or `claude-sonnet-5-5`. The `openai` provider ships
     /// none, so it needs this flag.
     #[arg(long)]
     model: Option<String>,

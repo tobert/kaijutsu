@@ -67,17 +67,21 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
         api_key_file: Some("~/.anthropic-key.txt"),
         key_optional: false,
         models: &[
-            // Haiku 4.5 is still the latest Haiku (there is no Haiku 5) and is
-            // the one model here supporting NO effort levels, while opus-5 /
-            // sonnet-5 / fable-5 support low→max.
+            // Haiku 4.5 is still the latest Haiku (the live models list has no
+            // Haiku 5 or 5.5) and is the one model here supporting NO effort
+            // levels, while the opus 5.x / sonnet 5.x / fable 5.x ids support
+            // low→max.
             ("claude-haiku-4-5", Some(200_000)),
             ("claude-opus-4-5", Some(200_000)),
             ("claude-opus-4-7", Some(1_000_000)),
             ("claude-opus-4-8", Some(1_000_000)),
             ("claude-opus-5", Some(1_000_000)),
+            ("claude-opus-5-5", Some(1_000_000)),
             ("claude-sonnet-4-6", Some(1_000_000)),
             ("claude-sonnet-5", Some(1_000_000)),
+            ("claude-sonnet-5-5", Some(1_000_000)),
             ("claude-fable-5", Some(1_000_000)),
+            ("claude-fable-5-1", Some(1_000_000)),
         ],
     },
     FactoryBackend {
@@ -453,6 +457,22 @@ mod tests {
     fn factory_defaults_name_a_factory_backend() {
         assert!(is_factory_backend_name(FACTORY_DEFAULT_BACKEND));
         assert!(!FACTORY_DEFAULT_MODEL.is_empty());
+    }
+
+    #[test]
+    fn anthropic_floor_lists_the_current_models() {
+        let anthropic = FACTORY_BACKENDS.iter().find(|fb| fb.name == "anthropic").unwrap();
+        for id in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                anthropic.models.iter().any(|(m, _)| *m == id),
+                "{id} missing from the anthropic floor"
+            );
+        }
     }
 
     #[test]

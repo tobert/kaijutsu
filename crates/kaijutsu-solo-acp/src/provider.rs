@@ -46,7 +46,7 @@ impl BackendKind {
                 kind: "anthropic",
                 api_key_env: Some("ANTHROPIC_API_KEY"),
                 api_key_file: Some("~/.anthropic-key.txt"),
-                default_model: Some("claude-sonnet-5"),
+                default_model: Some("claude-sonnet-5-5"),
             },
             Self::Deepseek => Factory {
                 backend: "deepseek",
@@ -263,6 +263,11 @@ fn autodetect(host: &dyn Host) -> Result<BackendKind> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anthropic_defaults_to_the_current_sonnet() {
+        assert_eq!(BackendKind::Anthropic.factory().default_model, Some("claude-sonnet-5-5"));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

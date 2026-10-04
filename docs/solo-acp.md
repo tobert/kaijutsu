@@ -66,7 +66,7 @@ file the backend row names. It never belongs in this file.
 | `--state-dir <dir>` | Where the databases, keys, and `/config` live. Default: a temporary directory, removed however the process exits. A named one is never removed. |
 | `--backend-kind <anthropic\|deepseek\|openai>` | Which provider. Default: the one whose key is in the environment, when exactly one is. |
 | `--base-url <url>` | An OpenAI-compatible endpoint of your own. |
-| `--model <id>` | The model every turn uses. Default: `deepseek-v4-flash` or `claude-sonnet-5`; the `openai` provider ships no model id, so it needs this flag. |
+| `--model <id>` | The model every turn uses. Default: `deepseek-v4-flash` or `claude-sonnet-5-5`; the `openai` provider ships no model id, so it needs this flag. |
 | `--api-key-env <VAR>` | The variable holding the key. The key itself is never a command-line argument. |
 | `--no-key` | Connect with no key, for a local server that takes none. Needs `--base-url`; refused alongside `--api-key-env`. |
 | `--idle-timeout <SECS>` | Seconds the model's stream may stay silent before the turn fails, written onto the backend row. Default: the kernel's, 120. |
