@@ -168,17 +168,26 @@ reason. These let us tune in real time."
 |---|---|---|
 | voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy |
 | system rules | the house rules every seat shares | Amy and banto, by chat |
-| banto | banto's own judgment as the house's head clerk | banto, writing text blocks in it |
+| the reviewer's seat | the judgment of the director that reviews this coder, such as banto | that director, writing text blocks in it |
 | (later) | one more, when evidence asks for it | |
 
 - **One voice context for every seat.** It is one set of snapshots and one
   fit. Amy, 2026-10-04: "one global voice context is fine".
-- **Banto has its own seat.** Its view reaches the council as a context of
-  its own, not as drifts into Amy's voice, so the reads keep Amy's words and
-  banto's apart and `leave_one_out` can say which of them moved a decision.
-  Amy, 2026-10-04: "I think we'd give banto its own seat on the council".
-  Banto writes that context's text blocks itself; the projection reads them
-  like any other.
+- **A director has its own seat, shared by the coders it reviews.** Banto's
+  view reaches the council as a context of its own, not as drifts into Amy's
+  voice, so the reads keep Amy's words and banto's apart and `leave_one_out`
+  can say which of them moved a decision. Amy, 2026-10-04: "I think we'd give
+  banto its own seat on the council" and "if banto has several coders they
+  would share that banto's council seat". The director writes that context's
+  text blocks itself; the projection reads them like any other.
+- **The seat follows the ask's reviewer.** Every ask already resolves a
+  reviewer (`docs/approval-identity.md`, reviewer resolution). When that
+  reviewer is a model character, the decision adds the context labeled
+  `council-<character>`, so every coder banto reviews reads `council-banto`.
+  When the reviewer is a live root character (Amy at her own root), the
+  voice context already speaks for her and no seat is added. A model
+  reviewer with no seat context is recorded on the decision and read
+  without one; it is not a miss.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
@@ -255,7 +264,8 @@ before any host file gains these lines.
 ```toml
 [council]
 server = "http://zorak:8090"
-contexts = ["voice", "system-rules", "banto"]
+contexts = ["voice", "system-rules"]
+reviewer_seat = true           # add council-<reviewer> when the reviewer is a model
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 
