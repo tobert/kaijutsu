@@ -219,7 +219,8 @@ reason. These let us tune in real time."
 
 The gate holds one spec per kind of case: the shell spec now, the program
 spec later. The shell spec is the example in `docs/council-api.md`, "A
-decision, end to end"; it lives at `/config/kernel/council/shell-gate.json`.
+decision, end to end", without its `text` question while the megakernel
+does not declare `describe`; it lives at `/config/kernel/council/shell-gate.json`.
 The kernel computes each spec's id itself (RFC 8785, then sha256), `POST`s
 the spec at boot and whenever the file changes, and treats a server that
 answers with a different id as a fault. A spec change is a new spec id and
