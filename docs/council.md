@@ -191,7 +191,9 @@ reason. These let us tune in real time."
   reviewer (`docs/approval-identity.md`, reviewer resolution). When that
   reviewer is a model character with a `council-<character>` context, the
   decision schedules the seat's read. A root reviewer has no seat; Amy's
-  voice context already speaks for her.
+  voice context already speaks for her. Amy, 2026-10-04: "reviewer is fine
+  for now"; recording which context drives a coder is the alternative if
+  the reviewer and the director come apart.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
