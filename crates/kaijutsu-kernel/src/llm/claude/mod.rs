@@ -693,6 +693,39 @@ data: {\"type\":\"message_stop\"}
         );
     }
 
+    /// Live effort test: a current model accepts the effort token on the
+    /// request's top-level `output_config` beside adaptive thinking.
+    ///
+    /// ```sh
+    /// ANTHROPIC_API_KEY=$(< ~/.anthropic-key.txt) \
+    ///   cargo test -p kaijutsu-kernel --lib claude_live_effort \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires ANTHROPIC_API_KEY; run with `cargo test --ignored claude_live`"]
+    async fn claude_live_effort_is_accepted_beside_adaptive_thinking() {
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => return,
+        };
+        let client = Client::new(api_key);
+        let opts = BuildOpts::new("claude-sonnet-5-5").with_max_tokens(1024).with_effort("low");
+        let mut stream = client
+            .stream(opts, vec![Message::user("Reply with the single word: ready.")])
+            .await
+            .expect("stream open must succeed: effort beside adaptive thinking is valid");
+        let mut text = String::new();
+        while let Some(ev) = stream.next_event().await {
+            match ev {
+                StreamEvent::TextDelta(t) => text.push_str(&t),
+                StreamEvent::Error(e) => panic!("live stream error: {e}"),
+                _ => {}
+            }
+        }
+        println!("\n--- answer ---\n{text}\n");
+        assert!(!text.is_empty(), "must produce answer text");
+    }
+
     /// The UA rides the real wire path: reqwest applies client defaults at
     /// `execute()`, so a built request isn't proof — a captured request is.
     /// A loopback listener reads the raw request head the server receives,

@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use super::types::{
-    CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, RequestContent,
+    CacheControl, ImageSource, MessageContent, MessageRole, MessagesRequest, OutputConfig, RequestContent,
     RequestMessage, RequestTool, SystemBlock, SystemPrompt, Thinking,
 };
 use crate::llm::stream::{BuildOpts, CacheTarget, CacheTtl};
@@ -146,6 +146,7 @@ pub fn build_request(
         top_p: opts.top_p,
         stream: streaming.then_some(true),
         thinking: None, // apply_thinking() fills this in after build_request
+        output_config: None, // and this, when the adaptive tier carries effort
         stop_sequences: vec![],
     }
 }
@@ -175,10 +176,8 @@ pub fn build_request(
 pub fn resolve_thinking(opts: &BuildOpts) -> Result<Option<Thinking>, LlmError> {
     let thinking = match opts.thinking_style.as_deref() {
         None | Some("auto") => Thinking::default_for_model(&opts.model)
-            .map(|_| Thinking::adaptive_summarized_with_effort(opts.effort.as_deref())),
-        Some("adaptive") => Some(Thinking::adaptive_summarized_with_effort(
-            opts.effort.as_deref(),
-        )),
+            .map(|_| Thinking::adaptive_summarized()),
+        Some("adaptive") => Some(Thinking::adaptive_summarized()),
         Some("budget") => {
             let budget = opts.thinking_budget.ok_or_else(|| {
                 LlmError::InvalidRequest(format!(
@@ -215,7 +214,7 @@ pub fn resolve_thinking(opts: &BuildOpts) -> Result<Option<Thinking>, LlmError> 
             knob = "effort",
             value = %effort,
             "effort has no field to land on for this thinking configuration \
-             (only the adaptive tier's output_config.effort accepts it); dropped"
+             (output_config.effort rides only with the adaptive tier); dropped"
         );
     }
     if opts.thinking_budget.is_some() && !matches!(thinking, Some(Thinking::Enabled { .. })) {
@@ -242,6 +241,12 @@ pub fn resolve_thinking(opts: &BuildOpts) -> Result<Option<Thinking>, LlmError> 
 /// [`resolve_thinking`]'s effort/thinking_budget warnings.
 pub fn apply_thinking(body: &mut MessagesRequest, opts: &BuildOpts) -> Result<(), LlmError> {
     body.thinking = resolve_thinking(opts)?;
+    body.output_config = match (&body.thinking, &opts.effort) {
+        (Some(Thinking::Adaptive { .. }), Some(effort)) => Some(OutputConfig {
+            effort: Some(effort.clone()),
+        }),
+        _ => None,
+    };
     if body.thinking.is_some() {
         if body.temperature.take().is_some() {
             tracing::warn!(
@@ -1103,13 +1108,10 @@ mod tests {
         fn auto_style_with_effort_lands_on_output_config_when_adaptive_applies() {
             let mut o = opts("claude-opus-4-8");
             o.effort = Some("high".into());
-            let t = resolve_thinking(&o).unwrap().expect("opus defaults to adaptive");
-            match t {
-                Thinking::Adaptive { output_config, .. } => {
-                    assert_eq!(output_config.unwrap().effort.as_deref(), Some("high"));
-                }
-                other => panic!("expected Adaptive, got {other:?}"),
-            }
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).unwrap();
+            assert!(matches!(req.thinking, Some(Thinking::Adaptive { .. })), "opus defaults to adaptive");
+            assert_eq!(req.output_config.unwrap().effort.as_deref(), Some("high"));
         }
 
         #[test]
@@ -1117,13 +1119,10 @@ mod tests {
             let mut o = opts("claude-opus-4-8");
             o.thinking_style = Some("adaptive".into());
             o.effort = Some("max".into());
-            let t = resolve_thinking(&o).unwrap().expect("adaptive forced on");
-            match t {
-                Thinking::Adaptive { output_config, .. } => {
-                    assert_eq!(output_config.unwrap().effort.as_deref(), Some("max"));
-                }
-                other => panic!("expected Adaptive, got {other:?}"),
-            }
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).unwrap();
+            assert!(matches!(req.thinking, Some(Thinking::Adaptive { .. })), "adaptive forced on");
+            assert_eq!(req.output_config.unwrap().effort.as_deref(), Some("max"));
         }
 
         #[test]
@@ -1189,6 +1188,31 @@ mod tests {
             let err = resolve_thinking(&o).unwrap_err();
             assert!(err.to_string().contains("bogus"), "{err}");
             assert!(err.to_string().contains("auto"), "{err}");
+        }
+
+        /// Effort rides on the request's top-level `output_config`, beside
+        /// `thinking`. Inside `thinking` the Messages API 400s with
+        /// "thinking.adaptive.output_config: Extra inputs are not permitted".
+        #[test]
+        fn effort_serializes_as_top_level_output_config() {
+            let mut o = opts("claude-sonnet-5-5"); // defaults to adaptive
+            o.effort = Some("high".into());
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).expect("adaptive default must not error");
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["thinking"]["type"], "adaptive", "{v}");
+            assert!(v["thinking"].get("output_config").is_none(), "{v}");
+            assert_eq!(v["output_config"]["effort"], "high", "{v}");
+        }
+
+        #[test]
+        fn effort_is_absent_when_thinking_is_off() {
+            let mut o = opts("claude-haiku-4-5"); // no adaptive tier
+            o.effort = Some("high".into());
+            let mut req = build_request(&o, &[Message::user("hi")], true);
+            apply_thinking(&mut req, &o).expect("no thinking must not error");
+            let v = serde_json::to_value(&req).unwrap();
+            assert!(v.get("output_config").is_none(), "haiku 4.5 rejects effort: {v}");
         }
 
         #[test]

@@ -57,6 +57,12 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
 
+    /// Request-level output settings, beside `thinking`: today the effort
+    /// ladder token. [`super::build::apply_thinking`] sets it only when the
+    /// adaptive tier applies; models without that tier reject `effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+
     /// Optional list of stop sequences.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
@@ -215,13 +221,6 @@ pub enum Thinking {
     Adaptive {
         #[serde(skip_serializing_if = "Option::is_none")]
         display: Option<ThinkingDisplay>,
-        /// Effort-ladder knob for the adaptive tier (`output_config.effort`
-        /// on the wire — Anthropic's current Messages API shape). `None`
-        /// omits `output_config` entirely. The `Enabled`/legacy budget tier
-        /// has no equivalent field; an `effort` configured alongside that
-        /// tier is INERT (see `super::build::resolve_thinking`).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_config: Option<OutputConfig>,
     },
     Enabled {
         budget_tokens: u64,
@@ -229,8 +228,8 @@ pub enum Thinking {
     Disabled,
 }
 
-/// `thinking.output_config` — currently just the effort-ladder token.
-/// Anthropic's own wire shape wraps it in this object rather than a flat
+/// The request's top-level `output_config`: currently just the effort-ladder
+/// token. Anthropic's wire shape wraps it in this object rather than a flat
 /// field, so we mirror that instead of flattening it away.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputConfig {
@@ -248,24 +247,10 @@ pub enum ThinkingDisplay {
 }
 
 impl Thinking {
-    /// Adaptive thinking with readable (summarized) thinking text, no
-    /// `output_config`.
+    /// Adaptive thinking with readable (summarized) thinking text.
     pub fn adaptive_summarized() -> Self {
         Self::Adaptive {
             display: Some(ThinkingDisplay::Summarized),
-            output_config: None,
-        }
-    }
-
-    /// Adaptive thinking with readable (summarized) thinking text and an
-    /// effort-ladder token on `output_config.effort`. `None` behaves exactly
-    /// like [`Self::adaptive_summarized`] (omits `output_config`).
-    pub fn adaptive_summarized_with_effort(effort: Option<&str>) -> Self {
-        Self::Adaptive {
-            display: Some(ThinkingDisplay::Summarized),
-            output_config: effort.map(|e| OutputConfig {
-                effort: Some(e.to_string()),
-            }),
         }
     }
 
@@ -418,6 +403,7 @@ mod tests {
             top_p: None,
             stream: None,
             thinking: None,
+            output_config: None,
             stop_sequences: vec![],
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -440,28 +426,9 @@ mod tests {
 
     #[test]
     fn thinking_adaptive_without_display_omits_field() {
-        let v = serde_json::to_value(Thinking::Adaptive {
-            display: None,
-            output_config: None,
-        })
-        .unwrap();
+        let v = serde_json::to_value(Thinking::Adaptive { display: None }).unwrap();
         assert_eq!(v["type"], "adaptive");
         assert!(v.get("display").is_none());
-        assert!(v.get("output_config").is_none());
-    }
-
-    #[test]
-    fn thinking_adaptive_with_effort_serializes_output_config() {
-        let t = Thinking::adaptive_summarized_with_effort(Some("high"));
-        let v = serde_json::to_value(&t).unwrap();
-        assert_eq!(v["type"], "adaptive");
-        assert_eq!(v["output_config"]["effort"], "high");
-    }
-
-    #[test]
-    fn thinking_adaptive_with_no_effort_omits_output_config() {
-        let t = Thinking::adaptive_summarized_with_effort(None);
-        let v = serde_json::to_value(&t).unwrap();
         assert!(v.get("output_config").is_none());
     }
 
