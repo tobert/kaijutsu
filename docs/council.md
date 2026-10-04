@@ -162,38 +162,40 @@ the blocks, and the history. Below, "held context" means the server's copy.
 Amy: "I am thinking 3 context feeds for the adjudicator contexts: a shadow
 context that has my prompts + additional ones I put in or banto drifts in.
 system rules (shared by all contexts), and maybe 1 or 2 more if we find good
-reason. These let us tune in real time."
+reason. These let us tune in real time." Then, 2026-10-04: "each character
+perhaps has a council voice, and we compose them as needed, so when banto
+runs a coder it would compose system, mine, and its own voice. Copying would
+work like context forking; we have tools for filtering and eventually
+compacting."
 
-| Context | Holds | Fed by |
+| Context | Holds | Built by |
 |---|---|---|
-| voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy |
-| system rules | the house rules every seat shares | Amy and banto, by chat |
-| a director's seat (observes) | the directions of the director that reviews this coder, such as banto | that director, by drift |
-| (later) | one more, when evidence asks for it | |
+| system rules (`council-system`) | the house rules every seat shares | Amy and banto, by chat |
+| a character's council voice (`council-<character>`) | that character's guidance: Amy's words in `council-amy`, banto's directions in `council-banto` | forking from that character's working contexts with fork filters, then chat, drift, and exclusions |
 
-- **One voice context for every seat.** It is one set of snapshots and one
-  fit. Amy, 2026-10-04: "one global voice context is fine".
-- **A director's seat observes; it does not vote.** A director such as banto
-  gives directions, so its question is different from the safety verdict:
-  "is this action following my directions?" Amy, 2026-10-04: "It's an
-  experiment; I'm unsure where it'll in authority." So the seat:
-  - is a context of its own, labeled `council-<character>`, shared by every
-    coder that director reviews ("if banto has several coders they would
-    share that banto's council seat");
-  - is fed by drift: the director drifts its directions into it as it goes,
-    or when Amy asks it to, so the projection reads drift blocks in seat
-    contexts;
-  - is read under its own spec (`direction-check`), after the gate has
-    decided, off the hot path, and its answer is recorded with the decision;
-  - never enters the pool and never changes what the gate does. Giving it
-    authority is a later choice, made from the recorded answers.
-- **The seat follows the ask's reviewer.** Every ask already resolves a
-  reviewer (`docs/approval-identity.md`, reviewer resolution). When that
-  reviewer is a model character with a `council-<character>` context, the
-  decision schedules the seat's read. A root reviewer has no seat; Amy's
-  voice context already speaks for her. Amy, 2026-10-04: "reviewer is fine
-  for now"; recording which context drives a coder is the alternative if
-  the reviewer and the director come apart.
+- **A decision composes voices along the reviewer chain.** It starts at the
+  submitting seat's reviewer (`docs/approval-identity.md`, reviewer
+  resolution) and climbs to the first live root character, collecting each
+  character's `council-<character>` context. A coder banto runs for Amy
+  reads `council-system`, `council-amy`, and `council-banto`. Several coders
+  under one banto share `council-banto`. A character with no voice context
+  is skipped and the skip is recorded; it is not a miss.
+- **A root's voice votes; a director's voice observes, for now.** Amy's voice
+  and the system rules are pooled into the verdict. A model director's voice
+  is read under its own `direction-check` spec ("is this action following my
+  directions?"), after the gate has decided, off the hot path, and recorded
+  with the decision. It never enters the pool or changes the outcome. Amy:
+  "It's an experiment; I'm unsure where it'll in authority." Giving it a
+  vote is a later choice, made from the recorded answers.
+- **A voice is built like a fork, not fed.** Nothing copies prompts into a
+  voice automatically. A voice context is made and refreshed the way a fork
+  is: copy from the character's working contexts through fork filters
+  (`docs/fork-filters.md`), shape it with `kj stage exclude`, and later
+  compact it. A director may also drift into its own voice as it goes, so
+  the projection reads drift blocks in voice contexts.
+- **The chain follows the reviewer, for now.** Amy: "reviewer is fine for
+  now". Recording which context drives a coder is the alternative if the
+  reviewer and the director come apart.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
@@ -271,8 +273,8 @@ before any host file gains these lines.
 ```toml
 [council]
 server = "http://zorak:8090"
-contexts = ["voice", "system-rules"]
-director_seats = true          # read council-<reviewer> after deciding, recorded only
+contexts = ["council-system"]  # read for every decision
+voices = true                  # compose council-<character> along the reviewer chain
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 
@@ -340,7 +342,7 @@ would put an authority decision in a script.
 1. **The contract.** These docs, the OpenAPI file, and a conformance suite
    both servers run. The megakernel serves `/council/v1/`.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
-   tables, one spec, the voice and system-rules contexts sent at boot and on
+   tables, one spec, the system-rules context and Amy's voice sent at boot and on
    config change, traces, the report event, and a report interrupting an
    autonomous seat's turn. Deployed on zorak against
    the megakernel, with coder seats moved back to `uncovered = "ask"`.
