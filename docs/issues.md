@@ -717,6 +717,14 @@ on current main"):
   cannot tell the streams apart. Color, not the text marker, may suit the
   tui better; decide against `docs/tui.md`.
 
+## contrib/bench/boot-kernel.sh stops at its gate patch (2026-10-04)
+
+The seeded `gate.toml` already carries a `[context_type.coder]` tier, so the
+patch step reports "a [context_type.coder] tier is already present" and the
+script exits before it writes `env.sh`. The kernel is left running and
+usable, but callers that source `env.sh` fail. Treat an existing tier as done
+(or check that it matches) and continue.
+
 ## From kj-ds4-tb2-20-64d8b208 (deepseek-v4-flash, binary 64d8b208)
 
 - **Models fetch benchmark answers over the task container's network.** Four
@@ -727,6 +735,11 @@ on current main"):
   Amy: deny these hosts at the container network, scan transcripts after each
   job and fail the trial, or both. A stance line alone does not stop a stuck
   model.
+- **Spins at cb74a4f0 (Amy's coder stance), 2026-10-04:** extract-elf passed
+  without fetching and stated its reading with a confidence (~70-75%).
+  db-wal-recovery again ran `sqlite3` in place, lost the WAL, said so, and
+  restored the fixture from harbor-framework/terminal-bench-2. Network
+  restriction for task containers is the remaining fix.
 - **The backup rule did not hold.** db-wal-recovery opened `main.db` with
   `sqlite3` before copying the WAL, and SQLite deleted it, as on 10-03.
 - **configure-git-webserver is unscorable as written.** Its verifier logs in
