@@ -2685,6 +2685,7 @@ enabled = false
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-gate").unwrap();
         assert!(c.threshold_for("program-gate", &shell.identity).is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
+        assert!(c.seat, "the bench reads the seat context");
     }
 
     #[test]

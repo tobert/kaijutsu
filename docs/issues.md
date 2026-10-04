@@ -182,6 +182,43 @@ WAL. Accept `-p`, or have the refusal name the fix.
   asserts the seeded coder stance contains "You are a coder."; ec76d3c9
   removed that sentence. The test needs the stance's current text.
 
+## Council seat context: what is open (2026-10-04)
+
+- **The seat's account can raise pooled p(allow).** The seat context is
+  written by the model under judgment. With `require_agree` it cannot turn
+  another read's ask into an allow, but under loglinear pooling a confident
+  seat read lifts the pool, and with `require_agree = false` it can unlock
+  a submission. A guard: also require the pool without the seat
+  (`leave_one_out`) to clear `allow_at`, which would also cancel the
+  probe's work-on-a-copy improvement. Decide from recorded decisions.
+- **Raw narration, not a summary.** The seat context is the newest model
+  text, which includes plans, guesses, and noise. A summarizer model
+  writing "what the seat has learned" would be shorter and cleaner, at the
+  cost of a model call per update. Measure noise against the probe first.
+- **The budget is bytes.** `seat_tokens` is estimated at four bytes a
+  token; the server's tokenizer may disagree. A narration block larger
+  than the budget keeps only its end.
+- **Seat contexts are never dropped from the server.** Each seat holds a
+  context on the council server and the kernel keeps its body hash in
+  memory. `DELETE` a seat's context when it is archived or concluded.
+- **Observations do not read the seat context.** A director's
+  `direction-check` reads its voice alone.
+- **"Seat" in `council_observations`.** `seat_label` and `seat_context_id`
+  there name the observed voice context, not a seat. Rename them
+  (`voice_label`, `voice_context_id`) before the seat context and the
+  voices are read side by side in SQL.
+- **Elided program text depends on spelling.** The shell case elides a
+  judged program's text only where it appears verbatim; `-c` text with
+  escapes stays, and the shell decision may still ask about it.
+- **The zorak `council-system` lacks the seat sentence.** `contrib/council/seed-voices.kai`
+  gained it, but it runs once; add the block to the live context by chat.
+- **Flaky test.** `council::sync::tests::a_prepare_dropped_during_a_put_sends_the_context_fresh_next_time`
+  failed 2 of 3 runs once, then passed 8 in a row; origin/main passed 4 of
+  4. The panic was the mock's "client closed before sending a request",
+  which kills the mock's accept loop. A likely cause: a prepare dropped at
+  100 ms while still connecting closes a connection empty. Let the mock
+  ignore an empty connection.
+
 ## `kj context list --tree` draws siblings as children (2026-10-04)
 
 On zorak, `kj context list --tree` drew `tui-ask-stuck`, the banto contexts,

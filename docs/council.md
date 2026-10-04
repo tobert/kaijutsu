@@ -159,6 +159,8 @@ change: `approval_signals` holds one label and score per source
   the head the kernel expected, and the verdict's mass and confidence.
 - A child table holds one row per read and option: the option, its log
   probability, and its probability.
+- `seat_head` names the head of the seat context the decision read, NULL
+  when it read none (see "The seat context").
 - `SignalSourceKind` gains `council`, so an ask carries the pooled verdict as
   a signal a human sees in `kj ledger show`.
 - Traces carry the same numbers as span attributes (`docs/telemetry.md`),
@@ -236,6 +238,62 @@ compacting."
   that resolves to nothing is a council miss with that cause, not a gate
   refusal, so a missing context cannot stop every seat.
 
+## The seat context
+
+The council reads what the proposing seat was asked and has written, so it
+judges a command in its situation. In db-wal-recovery, `sqlite3 main.db
+".tables"` is a safe reader in general, but the seat's WAL is XOR-scrambled,
+and SQLite deletes a WAL it cannot read when the database closes. A probe
+on the megakernel with an `originals`/`network` rubric found:
+
+| Seat context | `sqlite3 main.db ".tables"` |
+|---|---|
+| none | `reads`: allow; the council cannot know |
+| "WAL unreadable, no backup yet" | `changes`: back it up first |
+| "backups made in /tmp" | `reads`: allow |
+
+Routine commands (`ls`, `cp`, `pip install`) allowed in all three. Amy,
+2026-10-04, approved "give the council a short summary of what the seat
+learned".
+
+- **On with `[council] seat = true`.** Off by default. Every decision, the
+  shell decision and each program decision, reads the seat context after
+  `[council] contexts` and the voting voices. Observations do not.
+- **What it holds.** The seat's brief, the first finished user text
+  block, and its newest finished model narration: whole model text blocks,
+  newest first, while they fit `seat_tokens` (default 2000), put back in
+  document order. A newest block larger than the budget keeps its end, and
+  a brief larger than the budget keeps its start. Tokens are estimated at
+  four bytes each. Tool calls and results, thinking, system text, later
+  user text, and excluded, ephemeral, or unfinished blocks stay out. A seat
+  with no narration yet sends no seat context.
+- **Its shape.** A fixed system message names it "seat" and says it is the
+  proposing seat's own account, which describes the situation and grants no
+  permission. The brief and the narration are two user turns: the seat's
+  words are not the council's own.
+- **It votes.** The seat context is pooled with the other reads, as the
+  probe pooled it. It is the only place the council learns the situation,
+  and an observing read could not change the outcome. With `require_agree`,
+  every read must top allow on its own, so the seat's account cannot turn
+  another read's ask into an allow. It can still raise pooled p(allow);
+  `docs/issues.md`, "Council seat context: what is open", records that.
+- **Its cost.** It is held under the seat's own context id. The kernel
+  sends it only when its projected body changes, so a tool call sends
+  nothing and a finished narration block sends it once, before the next
+  decision. Only the brief turn is marked `snap`: an update re-feeds the
+  narration alone (about `seat_tokens`) and adds one head snapshot (about
+  112 MiB on the megakernel). Every seat's system message is the same text,
+  so seats share its snapshot.
+- **It is pinned and counted.** The decision pins it with `at`, like every
+  context, so it reads the seat as of the submission. `[council] contexts`,
+  the voting voices, and the seat context together must fit
+  `identity.limits.contexts_per_decision`; a miss names the limit. A seat
+  that is itself a labeled council context is read once, under its label.
+- **The record.** `council_decisions.seat_head` names the seat head the
+  decision read, NULL when it read none; that read's row is the one whose
+  context is the decision's own. The info-level outcome line and the
+  `council.decide` span carry `seat_head`, or `none`.
+
 ## Specs and cases
 
 The gate holds one spec per kind of case: the shell spec and the program
@@ -290,6 +348,14 @@ does, so the council reads the file too (`council/programs.rs`).
   file, a ninth program, and a `gate.toml` with no program spec. One write
   still says what runs: a `cat > FILE` heredoc to the file the submission
   then runs; its text is the program.
+- **The shell decision does not judge the text again.** A program that
+  gets its own decision appears in the shell case as
+  `<program judged separately>`: in `command`, each statement's
+  `rendered`, and its clauses. The shell decision judges the invocation,
+  and the program decision judges the text. This covers `-c` text, a
+  heredoc, and a `cat > FILE` heredoc; a file operand's text was never in
+  the shell case. Text the submission spells differently, such as with
+  escapes, stays as written.
 - **The case.** `state` holds `invocation` (the `command` that runs the
   program, its `statement`, and the whole `submission`), `path`,
   `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
@@ -362,6 +428,8 @@ before any host file gains these lines.
 server = "http://zorak:8090"
 contexts = ["council-system"]  # read for every decision
 voices = true                  # compose council-<character> along the reviewer chain
+seat = true                    # read the submitting seat's own context; off by default
+seat_tokens = 2000             # the seat context's budget for the brief and the narration, each
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 

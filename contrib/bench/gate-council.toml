@@ -19,9 +19,15 @@ uncovered = "ask"
 server = "http://zorak:8090"
 contexts = ["council-system"]
 pool = { method = "loglinear", weights = "mass" }
-deadline_ms = 3000
+# Exploration values from the Sonnet benchmark runs: a 3000 ms deadline
+# missed when a shell and a program decision run together.
+deadline_ms = 10000
 require_agree = true
 voices = false
+# Each decision also reads the seat's own context: its brief and its newest
+# narration, up to seat_tokens of each (docs/council.md, "The seat context").
+seat = true
+seat_tokens = 2000
 
 [[council.spec]]
 name = "shell-gate"
@@ -34,7 +40,9 @@ engine = "044545114a4e0112d9ac2ba1bdb2682f688dfca5:8a85c7dc4023b87b845091fe42d47
 tokenizer_hash = "518665209619906d18852264fb032d302f6171425e4faa84aec9ac7d4b96cac6"
 template = "mk-letters-1:47004159d76ccca4"
 allow_at = 0.98
-mass_floor = -0.05
+# Shell verdict mass on real commands ran -0.30 to -1.02, so -0.05 missed
+# most decisions; -1.5 is an exploration value, a miss guard only.
+mass_floor = -1.5
 
 # Each program a submission runs (a python script, `python3 -c`, a heredoc,
 # `bash FILE`, `./script`) gets its own decision under program-gate, which
