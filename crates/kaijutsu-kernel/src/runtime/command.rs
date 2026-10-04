@@ -73,11 +73,15 @@ pub struct CommandRunOptions<'a> {
     pub job_ready: Option<tokio::sync::oneshot::Sender<()>>,
     pub context_switch: CommandContextSwitch<'a>,
     pub review_notices: Option<tokio::sync::mpsc::UnboundedSender<kaijutsu_types::Refusal>>,
+    /// Program files the council judged. The command runs only while each
+    /// still holds the bytes the council read; otherwise it is rejected
+    /// and nothing runs (`docs/council.md`, "Programs are cases of their own").
+    pub judged: Vec<crate::council::programs::JudgedFile>,
 }
 
 impl Default for CommandRunOptions<'_> {
     fn default() -> Self {
-        Self { stdin: None, hooks: None, state_writeback: ShellStateWriteBack::Persist, job_output: CommandJobOutput::Settled, cancel: None, job_ready: None, context_switch: CommandContextSwitch::Publish(None), review_notices: None }
+        Self { stdin: None, hooks: None, state_writeback: ShellStateWriteBack::Persist, job_output: CommandJobOutput::Settled, cancel: None, job_ready: None, context_switch: CommandContextSwitch::Publish(None), review_notices: None, judged: Vec::new() }
     }
 }
 
@@ -434,7 +438,7 @@ async fn capture_and_review(
     let cancel = options.cancel_token.clone().unwrap_or_default();
     let mut captured_outcome = None;
     let captured = std::panic::AssertUnwindSafe(Box::pin(capture_command(kaish, code, options,
-        kernel, context, run.context_switch, run.state_writeback, streams, &mut captured_outcome))).catch_unwind().await;
+        kernel, context, run.context_switch, run.state_writeback, streams, &run.judged, &mut captured_outcome))).catch_unwind().await;
     let (mut outcome, mut panic) = match captured {
         Ok(()) => (captured_outcome.expect("completed capture supplies its outcome"), None),
         Err(panic) => {
@@ -475,12 +479,17 @@ async fn capture_command(
     context_switch: CommandContextSwitch<'_>,
     state_writeback: ShellStateWriteBack,
     streams: Option<kaish_kernel::scheduler::JobStreams>,
+    judged: &[crate::council::programs::JudgedFile],
     captured: &mut Option<CommandOutcome>,
 ) {
     if options.cancel_token.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
         let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
         outcome.settlement_error = Some("Command was cancelled before execution.".into());
         *captured = Some(outcome);
+        return;
+    }
+    if let Err(changed) = crate::council::programs::verify_judged(kernel.vfs().as_ref(), judged).await {
+        *captured = Some(CommandOutcome::new(CommandExecution::Rejected(changed), 0));
         return;
     }
     // Persist only this invocation's cwd/export changes to the context.

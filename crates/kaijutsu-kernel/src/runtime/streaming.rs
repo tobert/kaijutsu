@@ -38,7 +38,7 @@ pub async fn execute(
     let span = tracing::Span::current();
     kernel.spawn_context_task(identity.context, move |admission, shutdown| crate::mcp::broker::inherit_hook_depth(depth, async move {
         let run = async {
-            let (kaish, call, replacement) = match prepare(&owner, admission, identity, policy, &code, &cancel).await {
+            let (kaish, call, replacement, judged) = match prepare(&owner, admission, identity, policy, &code, &cancel).await {
                 Ok(Ok(prepared)) => prepared,
                 Ok(Err(refusal)) => { let _ = ready.send(Ok(Err(refusal))); return; }
                 Err(error) => { let _ = ready.send(Err(error)); return; }
@@ -53,6 +53,7 @@ pub async fn execute(
                     CommandRunOptions {
                         cancel: Some(cancel.clone()), context_switch: CommandContextSwitch::Publish(Some(&record)),
                         state_writeback: if read_only { ShellStateWriteBack::Discard } else { ShellStateWriteBack::Persist },
+                        judged,
                         ..Default::default()
                     }).await,
             };
@@ -73,7 +74,9 @@ pub async fn execute(
     }
 }
 
-type Prepared = (EmbeddedKaish, crate::mcp::CallContext, Option<CommandOutcome>);
+/// The shell, the call, a hook's replacement outcome when one stands in
+/// for the command, and the program files the council judged.
+type Prepared = (EmbeddedKaish, crate::mcp::CallContext, Option<CommandOutcome>, Vec<crate::council::programs::JudgedFile>);
 
 async fn prepare(
     kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission, identity: ShellIdentity, policy: ShellPolicy,
@@ -97,8 +100,12 @@ async fn prepare(
     } else {
         kernel.broker().shell_pre_call_hooks(code, &call, cancel).await
     };
+    let mut judged = Vec::new();
     let replacement = match verdict {
-        crate::mcp::ShellHookVerdict::Proceed => None,
+        crate::mcp::ShellHookVerdict::Proceed(files) => {
+            judged = files;
+            None
+        }
         crate::mcp::ShellHookVerdict::Denied(error) => return match error.as_refusal() {
             Some(refusal) => Ok(Err(refusal)),
             None => Err(format!("execute: {error}")),
@@ -109,7 +116,7 @@ async fn prepare(
             Some(outcome)
         }
     };
-    Ok(Ok((kaish, call, replacement)))
+    Ok(Ok((kaish, call, replacement, judged)))
 }
 
 #[cfg(test)]
@@ -188,7 +195,7 @@ mod tests {
             });
             let prepared = prepare(kernel, kernel.admit_context(context).unwrap(), identity, policy,
                 "echo probe > /probe", &CancellationToken::new()).await.unwrap();
-            assert!(!matches!(prepared, Ok((_, _, None))), "{tool}: the ask holds the command");
+            assert!(!matches!(prepared, Ok((_, _, None, _))), "{tool}: the ask holds the command");
             let row = approval_ledger::ask::list_pending(kernel.kernel_db().lock().conn_for_ledger()).unwrap()
                 .into_iter().find(|row| row.context_id == context.as_bytes()).expect("PreCall must leave its ask");
             assert_eq!((row.instance.as_deref(), row.tool.as_deref()), (Some(instance), Some(tool)));

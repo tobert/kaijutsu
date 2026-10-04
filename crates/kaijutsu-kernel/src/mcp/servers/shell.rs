@@ -262,6 +262,7 @@ impl McpServerLike for ShellServer {
         // enforce their policy structurally and do not need execution approval.
         // An approved writable submission carries the directory it authorized.
         let mut cwd_source = ShellCwd::Context;
+        let mut judged = Vec::new();
         if !self.read_only {
             // A submission that does not parse is refused here, before the
             // gate — a human is never asked to approve text that cannot be
@@ -344,6 +345,7 @@ impl McpServerLike for ShellServer {
             // Preserve the directory attached to the approval; current context
             // state may have changed while its reviewer was deciding.
             cwd_source = outcome.cwd;
+            judged = outcome.judged;
         }
 
         let semantic_index = dispatcher.semantic_index();
@@ -368,7 +370,7 @@ impl McpServerLike for ShellServer {
             slot, admission,
             kernel: dispatcher.kernel().clone(), broker, kaish, params, call: ctx.clone(),
             code: parsed.command, stdin: parsed.stdin, background: parsed.run_in_background, read_only: self.read_only,
-            timeout,
+            timeout, judged,
         }.execute(cancel).await
     }
 

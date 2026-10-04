@@ -388,7 +388,7 @@ impl Rig {
     async fn submit(&self, command: &str) -> Result<(), McpError> {
         match self.via {
             Via::Rpc => match self.broker.shell_pre_call_hooks(command, &self.ctx, &CancellationToken::new()).await {
-                ShellHookVerdict::Proceed => Ok(()),
+                ShellHookVerdict::Proceed(_) => Ok(()),
                 ShellHookVerdict::Denied(error) => Err(error),
                 other => panic!("unexpected verdict {other:?}"),
             },
@@ -1725,4 +1725,50 @@ async fn without_a_program_spec_a_program_is_not_judged_and_asks() {
         assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: only the shell decision");
         rig.finish().await;
     }
+}
+
+/// The judged script is the script that runs: a script changed while the
+/// council decided is refused at execution and nothing runs. On the tool
+/// path the call reports the refusal; on the RPC path the gate's verdict
+/// carries the judged file and its hash to the execution seam.
+///
+/// Falsified by dropping the re-hash before execution: the tool path runs
+/// the changed script.
+#[tokio::test]
+async fn a_script_changed_after_the_council_judged_it_does_not_run() {
+    let rig = rig(Via::Tool, Setup { programs: true, ..Setup::default() }).await;
+    rig.write("/work/fix.py", "print('judged')\n").await;
+    shell_and_program(&rig.mock, &ALLOW, FIRST, FIRST);
+    let (reached, release) = rig.mock.hold_next_decision();
+    let params = KernelCallParams {
+        instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+        tool: ShellServer::TOOL_WRITE.to_string(),
+        arguments: serde_json::json!({ "command": "python3 /work/fix.py" }),
+    };
+    let call = rig.broker.call_tool(params, &rig.ctx, CancellationToken::new());
+    let change = async {
+        reached.await.unwrap();
+        rig.write("/work/fix.py", "print('swapped')\n").await;
+        release.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(call, change);
+    let result = result.expect("the gate allowed the call");
+    assert!(result.is_error, "{result:?}");
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(text.contains("the script changed after the council judged it; send the command again"), "{text}");
+    assert_eq!(rig.only_ask().status, ApprovalStatus::Allowed, "the council allowed what it read");
+    rig.finish().await;
+
+    let rig = self::rig(Via::Rpc, Setup { programs: true, ..Setup::default() }).await;
+    rig.write("/work/fix.py", "print('judged')\n").await;
+    shell_and_program(&rig.mock, &ALLOW, FIRST, FIRST);
+    match rig.broker.shell_pre_call_hooks("python3 /work/fix.py", &rig.ctx, &CancellationToken::new()).await {
+        ShellHookVerdict::Proceed(judged) => {
+            assert_eq!(judged.len(), 1, "{judged:?}");
+            assert_eq!(judged[0].path, "/work/fix.py");
+            assert_eq!(judged[0].sha256, super::programs::sha256_of(b"print('judged')\n"));
+        }
+        other => panic!("the council allows: {other:?}"),
+    }
+    rig.finish().await;
 }

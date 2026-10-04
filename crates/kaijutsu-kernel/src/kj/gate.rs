@@ -99,6 +99,10 @@ pub(crate) struct GateOutcome {
     /// Rule decisions use current context state; a missing pin is not a captured
     /// unset directory.
     pub cwd: ShellCwd,
+    /// On a council allow: the program files the council judged, by the
+    /// hash of the bytes it read. The command runs only while each still
+    /// holds them.
+    pub judged: Vec<crate::council::programs::JudgedFile>,
 }
 
 /// What a player does about a pending ask whose `exec_source` is `Some` —
@@ -144,7 +148,7 @@ impl GateOutcome {
 
     /// A fault before anything durable existed.
     fn unavailable_without_row(reason: String) -> Self {
-        Self { verdict: GateVerdict::Unavailable, ask: None, reason, cwd: ShellCwd::Context }
+        Self { verdict: GateVerdict::Unavailable, ask: None, reason, cwd: ShellCwd::Context, judged: Vec::new() }
     }
 }
 
@@ -602,8 +606,11 @@ pub(crate) async fn run_gate_recorded(
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let recorded = std::sync::OnceLock::new();
-    let outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
+    let mut outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
     let Some(mut council) = council else { return outcome };
+    if outcome.allowed() && council.allows() {
+        outcome.judged = council.judged();
+    }
     // A report stops an autonomous seat once its ask exists; the decision
     // is recorded with the ask, so a linked record means the ask exists.
     council.report(kernel, caller, recorded.get().is_some());
@@ -629,6 +636,7 @@ pub(crate) async fn run_gate_recorded(
                  fault, not a decision)",
                 outcome.reason
             ),
+            judged: Vec::new(),
         },
     }
 }
@@ -878,6 +886,7 @@ async fn run_gate_once(
                         "this exact request was already denied by its assigned reviewer"
                             .to_string()
                     },
+                    judged: Vec::new(),
                 };
             }
             // No answer waiting is the ordinary path — ask the assigned reviewer.
@@ -1027,6 +1036,7 @@ async fn run_gate_once(
                 ask: Some(ask_ref(request_id, row.status)),
                 cwd: ShellCwd::Context,
                 reason: auto_reason.to_string(),
+                judged: Vec::new(),
             },
             // The ask committed and its decision did not, so the row exists
             // and is still pending — a fault, and one that leaves something
@@ -1039,6 +1049,7 @@ async fn run_gate_once(
                     "approval gate could not record the rule decision: {e} (fail-closed — \
                      this is a ledger fault, not a decision)"
                 ),
+                judged: Vec::new(),
             },
         };
     }
@@ -1058,6 +1069,7 @@ async fn run_gate_once(
         } else {
             PENDING_REASON_RETRY.to_string()
         },
+        judged: Vec::new(),
     }
 }
 

@@ -103,7 +103,7 @@ async fn run_kj(
         }
     };
     let outcome = match verdict {
-        crate::mcp::ShellHookVerdict::Proceed => match &receipt {
+        crate::mcp::ShellHookVerdict::Proceed(_) => match &receipt {
             Some(receipt) => command::run_into_blocks(&kaish, &code, receipt,
                 kernel, &call_ctx, CommandRunOptions { stdin: None,
                     context_switch: CommandContextSwitch::Pinned, review_notices: Some(notices),

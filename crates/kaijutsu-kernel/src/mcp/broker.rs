@@ -234,8 +234,9 @@ enum PermissionAskOutcome {
     /// because the three teach a model three different next moves. `ask`
     /// is the durable row this outcome belongs to.
     Pending { reason: String, ask: Option<AskRef> },
-    /// The gate resolved `Allowed`. The call proceeds.
-    Proceed,
+    /// The gate resolved `Allowed`. The call proceeds; it runs only while
+    /// each program file the council judged still holds the bytes it read.
+    Proceed { judged: Vec<crate::council::programs::JudgedFile> },
     /// The gate resolved `Denied` — a real verdict. `reason` is
     /// tracing/hook-visible prose, not shown to the model directly.
     Denied { reason: String, ask: Option<AskRef> },
@@ -349,8 +350,11 @@ fn no_hook_matched(mode: PhaseMode) -> PhaseEval {
 /// to its captured outcome before publishing any terminal projection.
 #[derive(Debug)]
 pub enum ShellHookVerdict {
-    /// No hook fired, or every matching hook let the call through.
-    Proceed,
+    /// No hook fired, or every matching hook let the call through. The
+    /// list names each program file the council judged, by the hash of the
+    /// bytes it read; the caller runs the command only while each file still
+    /// holds them (`docs/council.md`, "Programs are cases of their own").
+    Proceed(Vec<crate::council::programs::JudgedFile>),
     /// A hook produced a synthetic result in lieu of the real command —
     /// the caller must use this instead of running/having run anything.
     ShortCircuit(KernelToolResult),
@@ -2353,7 +2357,7 @@ impl Broker {
         let spec = AskSpec { description: Some(description) };
         // A hook's own ask stands: the council never reads it.
         Ok(match self.run_permission_ask(&hook_id, &spec, params, ctx, phase, payload, review, false, cancel).await? {
-            PermissionAskOutcome::Proceed => PhaseOutcome::Continue,
+            PermissionAskOutcome::Proceed { .. } => PhaseOutcome::Continue,
             PermissionAskOutcome::Denied { reason, ask } => PhaseOutcome::Deny { hook_id, reason, ask },
             PermissionAskOutcome::Unavailable { reason, ask } => {
                 PhaseOutcome::GateUnavailable { hook_id, reason, ask }
@@ -2607,7 +2611,7 @@ impl Broker {
             };
             return match review.wait_for_review(&ask).await {
                 Ok(()) if cancel.is_cancelled() => Err(McpError::Cancelled),
-                Ok(()) => Ok(PermissionAskOutcome::Proceed),
+                Ok(()) => Ok(PermissionAskOutcome::Proceed { judged: Vec::new() }),
                 Err(error) => match error.as_refusal() {
                     Some(refusal) => Ok(PermissionAskOutcome::Denied { reason: error.to_string(), ask: refusal.ask }),
                     None if matches!(&error, McpError::Cancelled) || cancel.is_cancelled() => Err(McpError::Cancelled),
@@ -2626,7 +2630,7 @@ impl Broker {
                     ask = %outcome.ask_description(),
                     "permission ask allowed",
                 );
-                PermissionAskOutcome::Proceed
+                PermissionAskOutcome::Proceed { judged: outcome.judged.clone() }
             }
             crate::kj::gate::GateVerdict::Denied => {
                 tracing::debug!(
@@ -3139,19 +3143,23 @@ impl Broker {
         ctx: &CallContext,
         cancel: &CancellationToken,
     ) -> ShellHookVerdict {
+        let mut judged = Vec::new();
         let outcome = match self
             .evaluate_phase(McpHookPhase::PreCall, &params, ctx, PhasePayload::None, cancel)
             .await
         {
             Ok(PhaseOutcome::Continue) => match self.ask_tier_ask(command, &params, ctx, cancel).await {
-                Ok(None) => Ok(PhaseOutcome::Continue),
-                Ok(Some(outcome)) => Ok(outcome),
+                Ok(Ok(files)) => {
+                    judged = files;
+                    Ok(PhaseOutcome::Continue)
+                }
+                Ok(Err(outcome)) => Ok(outcome),
                 Err(e) => Err(e),
             },
             other => other,
         };
         match outcome {
-            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed(judged),
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
                 emit_short_circuit_attribution(McpHookPhase::PreCall, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
@@ -3257,12 +3265,12 @@ impl Broker {
         params: &KernelCallParams,
         ctx: &CallContext,
         cancel: &CancellationToken,
-    ) -> McpResult<Option<PhaseOutcome>> {
+    ) -> McpResult<Result<Vec<crate::council::programs::JudgedFile>, PhaseOutcome>> {
         let hook_id = HookId(GATE_POLICY_SUBJECT.into());
         let tier = match self.ask_tier(command, ctx).await {
             Ok(Some(tier)) => tier,
-            Ok(None) => return Ok(None),
-            Err(reason) => return Ok(Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask: None })),
+            Ok(None) => return Ok(Ok(Vec::new())),
+            Err(reason) => return Ok(Err(PhaseOutcome::GateUnavailable { hook_id, reason, ask: None })),
         };
         let spec = AskSpec { description: Some(tier.description) };
         Ok(match self
@@ -3271,13 +3279,13 @@ impl Broker {
             )
             .await?
         {
-            PermissionAskOutcome::Proceed => None,
-            PermissionAskOutcome::Denied { reason, ask } => Some(PhaseOutcome::Deny { hook_id, reason, ask }),
+            PermissionAskOutcome::Proceed { judged } => Ok(judged),
+            PermissionAskOutcome::Denied { reason, ask } => Err(PhaseOutcome::Deny { hook_id, reason, ask }),
             PermissionAskOutcome::Unavailable { reason, ask } => {
-                Some(PhaseOutcome::GateUnavailable { hook_id, reason, ask })
+                Err(PhaseOutcome::GateUnavailable { hook_id, reason, ask })
             }
             PermissionAskOutcome::Pending { reason, ask } => {
-                Some(PhaseOutcome::GatePending { hook_id, reason, ask })
+                Err(PhaseOutcome::GatePending { hook_id, reason, ask })
             }
         })
     }
@@ -3364,7 +3372,7 @@ impl Broker {
             )
             .await
         {
-            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed(Vec::new()),
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
                 emit_short_circuit_attribution(McpHookPhase::PostCall, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
@@ -3401,7 +3409,7 @@ impl Broker {
             )
             .await
         {
-            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed,
+            Ok(PhaseOutcome::Continue) => ShellHookVerdict::Proceed(Vec::new()),
             Ok(PhaseOutcome::ShortCircuit { hook_id, result }) => {
                 emit_short_circuit_attribution(McpHookPhase::OnError, &hook_id);
                 ShellHookVerdict::ShortCircuit(result)
@@ -4934,6 +4942,7 @@ mod tests {
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
             code: "echo never".into(), stdin: None, background: true, read_only: false,
             timeout: kernel.timeouts().shell_command_default,
+            judged: Vec::new(),
         }.execute(CancellationToken::new());
         let mut call = Box::pin(call);
         assert!(futures::poll!(&mut call).is_pending());
@@ -4979,6 +4988,7 @@ mod tests {
             call: CallContext::new(PrincipalId::system(), context, kaijutsu_types::SessionId::new(), kernel.id()),
             code: "echo never".into(), stdin: None, background: true, read_only: false,
             timeout: kernel.timeouts().shell_command_default,
+            judged: Vec::new(),
         }.execute(CancellationToken::new());
         let mut call = Box::pin(call);
         assert!(futures::poll!(&mut call).is_pending());
@@ -9421,11 +9431,11 @@ mod tests {
         let db = kj.kernel_db();
 
         match broker.shell_pre_call_hooks("kj ledger allow 01a0-abc", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
+            ShellHookVerdict::Proceed(_) => {}
             other => panic!("the answer path must proceed without a hook, got {other:?}"),
         }
         match broker.shell_pre_call_hooks("kj block list", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
+            ShellHookVerdict::Proceed(_) => {}
             other => panic!("a read-only kj call must proceed without a hook, got {other:?}"),
         }
         assert!(
@@ -10952,7 +10962,7 @@ mod tests {
         let db = kj.kernel_db();
 
         match broker.shell_pre_call_hooks("echo hi", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
+            ShellHookVerdict::Proceed(_) => {}
             other => panic!("an uncovered statement with no hook must proceed, got {other:?}"),
         }
         assert!(db.lock().list_pending_asks().unwrap().is_empty());
@@ -11022,7 +11032,7 @@ mod tests {
 
         teach_rule(&kj, &ctx, "git push origin main", true, false).await;
         match broker.shell_pre_call_hooks("git push origin main", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
+            ShellHookVerdict::Proceed(_) => {}
             other => panic!("a learned allow outranks a config deny, got {other:?}"),
         }
         match broker.shell_pre_call_hooks("git push origin other", &ctx, &CancellationToken::new()).await {
@@ -11067,7 +11077,7 @@ mod tests {
 
         seat_a_root(&kj, &ctx);
         match broker.shell_pre_call_hooks("touch other.txt", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Proceed => {}
+            ShellHookVerdict::Proceed(_) => {}
             other => panic!("a root character's uncovered statement runs, got {other:?}"),
         }
 
@@ -11358,7 +11368,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(verdict, ShellHookVerdict::Proceed),
+            matches!(verdict, ShellHookVerdict::Proceed(_)),
             "hook saw the real exit code + stdout (KJ_TOOL_RESULT) and exited 0; \
              expected Proceed, got {verdict:?}",
         );
@@ -11392,7 +11402,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(verdict, ShellHookVerdict::Proceed),
+            matches!(verdict, ShellHookVerdict::Proceed(_)),
             "hook saw the real error (KJ_TOOL_ERROR) and exited 0; expected Proceed, got {verdict:?}",
         );
     }

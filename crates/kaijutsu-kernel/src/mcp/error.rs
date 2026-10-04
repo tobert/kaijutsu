@@ -382,6 +382,7 @@ mod tests {
             // None`), not a stand-in — a stand-in makes this test unable to
             // fail when that text regresses.
             reason: PENDING_REASON_RETRY.to_string(),
+            judged: Vec::new(),
         }
     }
 
@@ -478,6 +479,7 @@ mod tests {
             ask: None,
             cwd: crate::runtime::context_shell::ShellCwd::Context,
             reason: "the ledger could not be reached".to_string(),
+            judged: Vec::new(),
         };
         let rendered = McpError::gate_unavailable(
             Some(HookId("risk-advisory".to_string())),

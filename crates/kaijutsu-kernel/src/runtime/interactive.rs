@@ -49,7 +49,7 @@ pub async fn submit(
             }
             Ok((submission, execution)) => {
                 let _ = reply.send(Ok(submission));
-                if let Some((kaish, call_ctx, receipt, code)) = execution {
+                if let Some((kaish, call_ctx, receipt, code, judged)) = execution {
                     let record = |context| -> futures::future::LocalBoxFuture<'_, ()> {
                         Box::pin(command::send_context_switch(context, &switches, &stop))
                     };
@@ -57,7 +57,7 @@ pub async fn submit(
                     // they were, as the model's read-only `shell` does.
                     let state_writeback = if read_only { ShellStateWriteBack::Discard } else { ShellStateWriteBack::Persist };
                     if let Err(error) = command::run_into_blocks(&kaish, &code, &receipt, &owner, &call_ctx,
-                        CommandRunOptions { cancel: Some(stop.clone()), state_writeback,
+                        CommandRunOptions { cancel: Some(stop.clone()), state_writeback, judged,
                             context_switch: CommandContextSwitch::Publish(Some(&record)), ..Default::default() }).await
                     {
                         tracing::error!("interactive command settlement failed: {error}");
@@ -70,7 +70,15 @@ pub async fn submit(
     Ok((submission, receiver))
 }
 
-type PreparedExecution = (EmbeddedKaish, crate::mcp::CallContext, crate::shell_operations::ShellOperationReceipt, String);
+/// The shell, the call, its receipt, the source, and the program files the
+/// council judged.
+type PreparedExecution = (
+    EmbeddedKaish,
+    crate::mcp::CallContext,
+    crate::shell_operations::ShellOperationReceipt,
+    String,
+    Vec<crate::council::programs::JudgedFile>,
+);
 
 async fn prepare(
     kernel: &Arc<Kernel>, admission: super::admission::ContextAdmission,
@@ -120,8 +128,11 @@ async fn prepare(
         } else {
             kernel.broker().shell_pre_call_hooks(&code, &call_ctx, stop).await
         };
-        let execute = matches!(verdict, crate::mcp::ShellHookVerdict::Proceed);
-        if !execute {
+        let execute = match &verdict {
+            crate::mcp::ShellHookVerdict::Proceed(files) => Some(files.clone()),
+            _ => None,
+        };
+        if execute.is_none() {
             let mut outcome = CommandOutcome::new(CommandExecution::NotRun, 0);
             outcome.apply_hook(verdict);
             settlement_started = true;
@@ -163,7 +174,7 @@ async fn prepare(
             }
         }
     };
-    Ok((submission, execute.then_some((kaish, call_ctx, receipt, code))))
+    Ok((submission, execute.map(|judged| (kaish, call_ctx, receipt, code, judged))))
 }
 
 #[cfg(test)]

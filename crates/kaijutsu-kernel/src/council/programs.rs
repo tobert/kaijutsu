@@ -451,10 +451,10 @@ pub(crate) const PROGRAM_CAP: usize = 16 * 1024;
 
 /// A file the council judged, by the hash of the exact bytes it read.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct JudgedFile {
-    pub(crate) path: String,
+pub struct JudgedFile {
+    pub path: String,
     /// `sha256:` and the hex digest of the file's bytes.
-    pub(crate) sha256: String,
+    pub sha256: String,
 }
 
 /// A program with its text, or the reason the text could not be read.

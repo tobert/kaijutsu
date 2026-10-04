@@ -65,7 +65,7 @@ impl CommandOutcome {
 
     pub fn apply_hook(&mut self, verdict: ShellHookVerdict) {
         self.hook = match verdict {
-            ShellHookVerdict::Proceed => None,
+            ShellHookVerdict::Proceed(_) => None,
             ShellHookVerdict::ShortCircuit(result) => Some(CommandHookEffect::Replacement(result)),
             ShellHookVerdict::Denied(error) => Some(CommandHookEffect::Refused {
                 reason: error.to_string(),

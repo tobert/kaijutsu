@@ -45,6 +45,8 @@ pub(crate) struct ToolCommand {
     /// How long a waiting command may run before it is killed. A background
     /// command is not bound by it.
     pub timeout: std::time::Duration,
+    /// Program files the council judged; see `CommandRunOptions::judged`.
+    pub judged: Vec<crate::council::programs::JudgedFile>,
 }
 
 impl ToolCommand {
@@ -88,6 +90,7 @@ impl ToolCommand {
                     state_writeback: if self.read_only { ShellStateWriteBack::Discard } else { ShellStateWriteBack::Persist },
                     job_output: if background { CommandJobOutput::LiveExecution } else { CommandJobOutput::Settled },
                     cancel: Some(task_cancel), job_ready: Some(ready_tx), review_notices: Some(notices),
+                    judged: self.judged,
                 };
                 let execute = async { match &completion_receipt {
                     Some(receipt) => command::run_into_blocks(&self.kaish, &self.code, receipt, &self.kernel, &self.call, run).await,
