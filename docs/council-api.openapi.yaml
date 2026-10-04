@@ -1,0 +1,936 @@
+openapi: 3.1.0
+info:
+  title: Council API
+  version: 0.2.0-draft
+  summary: Typed decisions read after several held model contexts, a superset of the gateway Decisions API.
+  description: |
+    Proposed contract for the megakernel and lfm2d decision servers. The prose
+    contract is docs/council-api.md; its rules (raw numbers replay bit for bit,
+    content is never control, each context describes for itself, no winner is
+    decided, failures are explicit, the rendering is the server's) bind every
+    server.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://localhost:8090
+    description: A council server; each deployment names its own.
+tags:
+  - name: identity
+  - name: contexts
+  - name: specs
+  - name: decisions
+paths:
+  /council/v1/identity:
+    get:
+      tags: [identity]
+      operationId: getIdentity
+      summary: The server's identity, limits, and capabilities.
+      responses:
+        '200':
+          description: The identity.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServerIdentity'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /council/v1/contexts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ContextIdPath'
+    put:
+      tags: [contexts]
+      operationId: putContext
+      summary: Hold or update a context. The body is the whole context.
+      description: |
+        Idempotent. The server compares the body, turn by turn and snap flag by
+        snap flag, with what it holds, and feeds from the first difference.
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: The snapshot id the context's head must be; otherwise 412.
+          schema: {$ref: '#/components/schemas/SnapshotId'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContextPut'}
+      responses:
+        '200':
+          description: The context as held now, or as it would be under dry_run.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContextPutResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '412': {$ref: '#/components/responses/HeadMismatch'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '507': {$ref: '#/components/responses/PinBudget'}
+    get:
+      tags: [contexts]
+      operationId: getContext
+      summary: The context's head and held snapshots.
+      responses:
+        '200':
+          description: The context.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ContextState'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      tags: [contexts]
+      operationId: deleteContext
+      summary: Drop the context's record and its pins. Its snapshots become ordinary eviction candidates.
+      responses:
+        '204': {description: Dropped.}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /council/v1/specs:
+    post:
+      tags: [specs]
+      operationId: postSpec
+      summary: Hold a spec. The same spec gets the same id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Spec'}
+      responses:
+        '200':
+          description: The held spec.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HeldSpec'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    get:
+      tags: [specs]
+      operationId: listSpecs
+      summary: The held specs.
+      responses:
+        '200':
+          description: The held specs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [specs]
+                properties:
+                  specs:
+                    type: array
+                    items: {$ref: '#/components/schemas/HeldSpec'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /council/v1/specs/{spec_id}:
+    parameters:
+      - $ref: '#/components/parameters/SpecIdPath'
+    get:
+      tags: [specs]
+      operationId: getSpec
+      summary: One held spec.
+      responses:
+        '200':
+          description: The spec.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HeldSpec'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    delete:
+      tags: [specs]
+      operationId: deleteSpec
+      summary: Drop a spec.
+      responses:
+        '204': {description: Dropped.}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /council/v1/decisions:
+    post:
+      tags: [decisions]
+      operationId: postDecision
+      summary: Read one case after zero or more held contexts.
+      description: |
+        A plain Decisions API request (model, state, questions) is valid here
+        and gets a Decisions-shaped answer. A server may serve the same
+        operation at its gateway path. The server resolves every context to a
+        snapshot when it accepts the decision.
+      parameters:
+        - name: traceparent
+          in: header
+          required: false
+          description: W3C trace context; the server's spans join this trace.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DecisionRequest'}
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DecisionResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/SnapshotGone'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '429': {$ref: '#/components/responses/Busy'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+components:
+  parameters:
+    ContextIdPath:
+      name: id
+      in: path
+      required: true
+      description: The context's id, a UUID the client chose.
+      schema: {$ref: '#/components/schemas/ContextId'}
+    SpecIdPath:
+      name: spec_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/SpecId'}
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying, when known.
+      schema: {type: integer, minimum: 0}
+  responses:
+    BadRequest:
+      description: The body is outside the schema or breaks a rule in docs/council-api.md, including a missing capability.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: An unknown context or spec id. PUT or POST it again.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    SnapshotGone:
+      description: A context's `at` names a snapshot the server no longer holds; error.head is the current one.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    HeadMismatch:
+      description: The If-Match snapshot is not the context's head; error.head is the current one.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TooLarge:
+      description: Past a limit in identity.limits; error.param names it.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Busy:
+      description: The server is busy.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: The server is stopped or failed.
+      headers:
+        Retry-After: {$ref: '#/components/headers/RetryAfter'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Timeout:
+      description: timeout_ms passed, queue time included. No partial answer is returned.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    PinBudget:
+      description: A pin would pass the server's pin budget.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    ContextId:
+      type: string
+      format: uuid
+      description: Chosen by the client. A server never mints or rewrites one.
+    SnapshotId:
+      type: string
+      pattern: '^snap:[0-9a-f]{64}$'
+      description: Opaque address of one build of a context prefix (tokens, snap boundaries, server identity). A build extends only from a declared boundary. Never shared across servers.
+    SpecId:
+      type: string
+      pattern: '^sha256:[0-9a-f]{64}$'
+      description: sha256 of the spec's canonical JSON (RFC 8785).
+    QuestionId:
+      type: string
+      pattern: '^[A-Za-z_][A-Za-z0-9_]{0,63}$'
+      description: The client's name for a question. Never shown to the model.
+    Instructions:
+      description: What the question asks. A string, or structured guidance as in the Decisions API.
+      oneOf:
+        - type: string
+        - type: object
+        - type: array
+    Turn:
+      type: object
+      required: [role, content]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, tool]
+        content:
+          type: string
+          description: Tokenized with special tokens off; text that spells a control token is text.
+        snap:
+          type: boolean
+          default: false
+          description: Keep a snapshot boundary at the end of this turn. Part of the context's content.
+    ContextPut:
+      type: object
+      required: [system, turns]
+      additionalProperties: false
+      properties:
+        system:
+          type: string
+          description: The context's system message.
+        turns:
+          type: array
+          items: {$ref: '#/components/schemas/Turn'}
+        pin:
+          type: boolean
+          description: true exempts the head and its spec layers from eviction, false releases it, absent leaves it as it was.
+        warm:
+          type: array
+          description: Specs whose spec layer the server rebuilds before answering. Requires the warm capability.
+          items: {$ref: '#/components/schemas/SpecId'}
+          uniqueItems: true
+          maxItems: 16
+        dry_run:
+          type: boolean
+          default: false
+          description: Report head, kept and fed and build nothing. Requires the dry_run capability.
+    SnapshotInfo:
+      type: object
+      required: [id, tokens, layer]
+      properties:
+        id: {$ref: '#/components/schemas/SnapshotId'}
+        tokens:
+          type: integer
+          minimum: 0
+        layer:
+          type: string
+          enum: [system, turn, spec]
+        turn:
+          type: integer
+          minimum: 0
+          description: For a turn snapshot, the index of the turn it ends.
+        spec_id: {$ref: '#/components/schemas/SpecId'}
+        bytes:
+          type: integer
+          minimum: 0
+        parked:
+          type: boolean
+          description: Held on disk.
+        pinned:
+          type: boolean
+    ContextState:
+      type: object
+      required: [id, head, tokens, snapshots]
+      properties:
+        id: {$ref: '#/components/schemas/ContextId'}
+        head: {$ref: '#/components/schemas/SnapshotId'}
+        tokens:
+          type: integer
+          minimum: 0
+        pinned:
+          type: boolean
+        snapshots:
+          type: array
+          items: {$ref: '#/components/schemas/SnapshotInfo'}
+    ContextPutResult:
+      allOf:
+        - $ref: '#/components/schemas/ContextState'
+        - type: object
+          required: [kept, fed, dry_run]
+          properties:
+            kept:
+              type: integer
+              minimum: 0
+              description: Tokens reused from a held build.
+            fed:
+              type: integer
+              minimum: 0
+              description: Tokens this request ran, or would run under dry_run.
+            dry_run:
+              type: boolean
+              description: When true, nothing was built and head is the id the build would have.
+    ChoiceOption:
+      type: object
+      required: [option, means]
+      additionalProperties: false
+      properties:
+        option:
+          type: string
+          minLength: 1
+        means:
+          type: string
+          description: What choosing this option means.
+    SpecChoiceQuestion:
+      type: object
+      required: [id, type, instructions, criteria]
+      additionalProperties: false
+      properties:
+        id: {$ref: '#/components/schemas/QuestionId'}
+        type: {const: choice}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          type: array
+          description: The ordered options; at most identity.limits.choice_options.
+          minItems: 2
+          maxItems: 255
+          items: {$ref: '#/components/schemas/ChoiceOption'}
+    SpecScoreQuestion:
+      type: object
+      required: [id, type, instructions, criteria]
+      additionalProperties: false
+      properties:
+        id: {$ref: '#/components/schemas/QuestionId'}
+        type: {const: score}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          type: array
+          description: Level names, lowest first.
+          minItems: 2
+          maxItems: 10
+          items: {type: string, minLength: 1}
+    SpecNoulQuestion:
+      type: object
+      required: [id, type, instructions]
+      additionalProperties: false
+      properties:
+        id: {$ref: '#/components/schemas/QuestionId'}
+        type: {const: noul}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          description: Optional guidance.
+          oneOf:
+            - type: string
+            - type: object
+            - type: array
+            - type: 'null'
+    SpecTextQuestion:
+      type: object
+      required: [id, type, instructions, max_tokens]
+      additionalProperties: false
+      description: Written greedily before the questions after it, stopping at the end of the field. Requires the describe capability.
+      properties:
+        id: {$ref: '#/components/schemas/QuestionId'}
+        type: {const: text}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: At most identity.limits.text_tokens.
+    SpecQuestion:
+      oneOf:
+        - $ref: '#/components/schemas/SpecChoiceQuestion'
+        - $ref: '#/components/schemas/SpecScoreQuestion'
+        - $ref: '#/components/schemas/SpecNoulQuestion'
+        - $ref: '#/components/schemas/SpecTextQuestion'
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: '#/components/schemas/SpecChoiceQuestion'
+          score: '#/components/schemas/SpecScoreQuestion'
+          noul: '#/components/schemas/SpecNoulQuestion'
+          text: '#/components/schemas/SpecTextQuestion'
+    InlineChoiceQuestion:
+      type: object
+      required: [type, instructions, criteria]
+      additionalProperties: false
+      properties:
+        type: {const: choice}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          type: object
+          description: Option to its meaning, read in the order listed.
+          minProperties: 2
+          maxProperties: 255
+          additionalProperties: {type: string}
+    InlineScoreQuestion:
+      type: object
+      required: [type, instructions, criteria]
+      additionalProperties: false
+      properties:
+        type: {const: score}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          type: array
+          minItems: 2
+          maxItems: 10
+          items: {type: string, minLength: 1}
+    InlineNoulQuestion:
+      type: object
+      required: [type, instructions]
+      additionalProperties: false
+      properties:
+        type: {const: noul}
+        instructions: {$ref: '#/components/schemas/Instructions'}
+        criteria:
+          oneOf:
+            - type: string
+            - type: object
+            - type: array
+            - type: 'null'
+    InlineQuestion:
+      oneOf:
+        - $ref: '#/components/schemas/InlineChoiceQuestion'
+        - $ref: '#/components/schemas/InlineScoreQuestion'
+        - $ref: '#/components/schemas/InlineNoulQuestion'
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: '#/components/schemas/InlineChoiceQuestion'
+          score: '#/components/schemas/InlineScoreQuestion'
+          noul: '#/components/schemas/InlineNoulQuestion'
+    Spec:
+      type: object
+      required: [name, instructions, input_label, questions]
+      additionalProperties: false
+      description: Numbers in a spec are integers below 2^53.
+      properties:
+        name:
+          type: string
+          maxLength: 64
+        instructions:
+          type: string
+          description: Rendered in the spec layer, after the context's turns.
+        input_label:
+          type: string
+          maxLength: 64
+          description: Heads the state in the case's user turn.
+        questions:
+          type: array
+          minItems: 1
+          description: Spec order. A non-text question is read after the text answers before it; non-text answers never condition a later question.
+          items: {$ref: '#/components/schemas/SpecQuestion'}
+    HeldSpec:
+      type: object
+      required: [spec_id, spec, template]
+      properties:
+        spec_id: {$ref: '#/components/schemas/SpecId'}
+        spec: {$ref: '#/components/schemas/Spec'}
+        template:
+          type: string
+          description: How this server compiles and renders the spec; part of identity.
+    ContextRef:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id: {$ref: '#/components/schemas/ContextId'}
+        at:
+          $ref: '#/components/schemas/SnapshotId'
+          description: Read the context as of this snapshot. Absent means its head when the decision is accepted.
+    Pool:
+      type: object
+      additionalProperties: false
+      properties:
+        method:
+          type: string
+          enum: [linear, loglinear]
+          default: linear
+          description: linear is the weighted mean of probabilities; loglinear the normalized weighted product, where any one read can veto an option.
+        weights:
+          type: string
+          enum: [uniform, mass, given]
+          default: uniform
+          description: mass weighs each read by its exp(mass) for that question; given takes values.
+        values:
+          type: array
+          description: With weights given, one finite number per read, at least 0, summing above 0.
+          items: {type: number, minimum: 0}
+    DecisionRequest:
+      type: object
+      required: [state]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          description: Must be identity.model or one of identity.aliases.
+        state:
+          description: The case, in its own user turn after the input label. A string verbatim; an object or array as JSON with members in request order.
+          oneOf:
+            - type: string
+            - type: object
+            - type: array
+        spec_id: {$ref: '#/components/schemas/SpecId'}
+        ask:
+          type: array
+          description: A subset of the spec's non-text questions to read. Default all.
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/QuestionId'}
+        options:
+          type: object
+          description: Narrow a spec choice question to a subset of its options, by question id.
+          propertyNames: {$ref: '#/components/schemas/QuestionId'}
+          additionalProperties:
+            type: array
+            items: {type: string}
+            minItems: 2
+            uniqueItems: true
+        questions:
+          type: object
+          description: Inline Decisions API questions, read independently with no description.
+          propertyNames: {$ref: '#/components/schemas/QuestionId'}
+          additionalProperties: {$ref: '#/components/schemas/InlineQuestion'}
+          minProperties: 1
+        contexts:
+          type: array
+          maxItems: 8
+          description: References to distinct context ids, at most identity.limits.contexts_per_decision.
+          items: {$ref: '#/components/schemas/ContextRef'}
+        pool: {$ref: '#/components/schemas/Pool'}
+        timeout_ms:
+          type: integer
+          minimum: 1
+          description: Default identity.limits.default_timeout_ms.
+        session_id:
+          type: string
+          maxLength: 256
+        user:
+          type: string
+        trace:
+          type: object
+          description: Observability metadata, as in the Decisions API. Logged, never rendered.
+        provider:
+          type: object
+          description: Accepted for Decisions API clients and ignored; session_id, user and trace are logged.
+      oneOf:
+        - required: [spec_id]
+          not: {required: [questions]}
+        - required: [questions]
+          not:
+            anyOf:
+              - required: [spec_id]
+              - required: [ask]
+              - required: [options]
+    Probabilities:
+      type: object
+      description: Option or level to probability, summing to 1.
+      additionalProperties: {type: number, minimum: 0, maximum: 1}
+    LogProbs:
+      type: object
+      description: Option or level to the raw full-vocabulary log probability of its answer tokens as this server renders them.
+      additionalProperties: {type: number, maximum: 0}
+    Mass:
+      type: number
+      maximum: 0
+      description: log of the sum of exp(logprobs). Low mass is no opinion, not a low score.
+    Confidence:
+      type: number
+      minimum: 0
+      maximum: 1
+      description: exp(mass) times the top probability; pooled, the pooled top probability times the weighted mean of exp(mass).
+    ReadChoiceAnswer:
+      type: object
+      required: [type, choice, probabilities, confidence, logprobs, mass]
+      properties:
+        type: {const: choice}
+        choice:
+          type: string
+          description: The option with the highest probability; ties go to the earlier option. Not a decision.
+        probabilities: {$ref: '#/components/schemas/Probabilities'}
+        confidence: {$ref: '#/components/schemas/Confidence'}
+        logprobs: {$ref: '#/components/schemas/LogProbs'}
+        mass: {$ref: '#/components/schemas/Mass'}
+    ReadScoreAnswer:
+      type: object
+      required: [type, score, legend, probabilities, confidence, logprobs, mass]
+      properties:
+        type: {const: score}
+        score:
+          type: number
+          description: The probability-weighted level number.
+        legend:
+          type: object
+          additionalProperties: {type: string}
+        probabilities: {$ref: '#/components/schemas/Probabilities'}
+        confidence: {$ref: '#/components/schemas/Confidence'}
+        logprobs: {$ref: '#/components/schemas/LogProbs'}
+        mass: {$ref: '#/components/schemas/Mass'}
+    ReadNoulAnswer:
+      type: object
+      required: [type, noul, logprobs, mass]
+      properties:
+        type: {const: noul}
+        noul:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: The probability of yes.
+        logprobs:
+          $ref: '#/components/schemas/LogProbs'
+          description: Keyed yes and no.
+        mass: {$ref: '#/components/schemas/Mass'}
+    ReadAnswer:
+      oneOf:
+        - $ref: '#/components/schemas/ReadChoiceAnswer'
+        - $ref: '#/components/schemas/ReadScoreAnswer'
+        - $ref: '#/components/schemas/ReadNoulAnswer'
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: '#/components/schemas/ReadChoiceAnswer'
+          score: '#/components/schemas/ReadScoreAnswer'
+          noul: '#/components/schemas/ReadNoulAnswer'
+    PooledAgreement:
+      type: object
+      required: [agree, spread]
+      properties:
+        agree:
+          type: boolean
+          description: Every read has the same top option. True with one read.
+        spread:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: The largest gap between two reads' probabilities for one option. 0 with one read.
+    PooledChoiceAnswer:
+      allOf:
+        - $ref: '#/components/schemas/PooledAgreement'
+        - type: object
+          required: [type, choice, probabilities, confidence]
+          properties:
+            type: {const: choice}
+            choice:
+              type: string
+              description: The pooled argmax; ties go to the earlier option. Not a decision.
+            probabilities: {$ref: '#/components/schemas/Probabilities'}
+            confidence: {$ref: '#/components/schemas/Confidence'}
+            leave_one_out:
+              type: object
+              description: Pooled probabilities without each read, keyed by context id. Two or more reads and the leave_one_out capability.
+              additionalProperties:
+                oneOf:
+                  - $ref: '#/components/schemas/Probabilities'
+                  - type: 'null'
+    PooledScoreAnswer:
+      allOf:
+        - $ref: '#/components/schemas/PooledAgreement'
+        - type: object
+          required: [type, score, legend, probabilities, confidence]
+          properties:
+            type: {const: score}
+            score: {type: number}
+            legend:
+              type: object
+              additionalProperties: {type: string}
+            probabilities: {$ref: '#/components/schemas/Probabilities'}
+            confidence: {$ref: '#/components/schemas/Confidence'}
+            leave_one_out:
+              type: object
+              additionalProperties:
+                oneOf:
+                  - $ref: '#/components/schemas/Probabilities'
+                  - type: 'null'
+    PooledNoulAnswer:
+      allOf:
+        - $ref: '#/components/schemas/PooledAgreement'
+        - type: object
+          required: [type, noul]
+          properties:
+            type: {const: noul}
+            noul:
+              type: number
+              minimum: 0
+              maximum: 1
+            leave_one_out:
+              type: object
+              description: Pooled probability of yes without each read, keyed by context id. Two or more reads and the leave_one_out capability.
+              additionalProperties:
+                oneOf:
+                  - {type: number, minimum: 0, maximum: 1}
+                  - type: 'null'
+    PooledAnswer:
+      oneOf:
+        - $ref: '#/components/schemas/PooledChoiceAnswer'
+        - $ref: '#/components/schemas/PooledScoreAnswer'
+        - $ref: '#/components/schemas/PooledNoulAnswer'
+      discriminator:
+        propertyName: type
+        mapping:
+          choice: '#/components/schemas/PooledChoiceAnswer'
+          score: '#/components/schemas/PooledScoreAnswer'
+          noul: '#/components/schemas/PooledNoulAnswer'
+    Read:
+      type: object
+      required: [context, snapshot, answers, rendered_sha256]
+      properties:
+        context:
+          description: The context read, or null for the spec alone.
+          oneOf:
+            - $ref: '#/components/schemas/ContextId'
+            - type: 'null'
+        snapshot:
+          description: The snapshot this read started from, the spec layer when there is a spec; null for inline questions with no context.
+          oneOf:
+            - $ref: '#/components/schemas/SnapshotId'
+            - type: 'null'
+        described:
+          type: object
+          description: The text answers this read's model wrote, by question id.
+          additionalProperties: {type: string}
+        answers:
+          type: object
+          additionalProperties: {$ref: '#/components/schemas/ReadAnswer'}
+        rendered_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: sha256 of the rendered text this read was conditioned on, through its own described text.
+        tokens:
+          type: integer
+          minimum: 0
+          description: The context's length in tokens.
+        ms:
+          type: number
+          minimum: 0
+    ControlTextHit:
+      type: object
+      required: [where, token]
+      properties:
+        where:
+          type: string
+          description: 'state, spec, or a context turn as "context:<id>:turn:<n>".'
+        token:
+          type: string
+          description: The control token the text spells.
+    DecisionResponse:
+      type: object
+      required: [model, answers, reads, pool, identity]
+      properties:
+        model:
+          type: string
+        answers:
+          type: object
+          description: By question id, pooled over the reads.
+          additionalProperties: {$ref: '#/components/schemas/PooledAnswer'}
+        reads:
+          type: array
+          description: One per context in request order, or one with context null.
+          minItems: 1
+          items: {$ref: '#/components/schemas/Read'}
+        pool:
+          type: object
+          required: [method, weights, normalized]
+          properties:
+            method:
+              type: string
+              enum: [linear, loglinear]
+            weights:
+              type: string
+              enum: [uniform, mass, given]
+            normalized:
+              type: object
+              description: By question id, the weight each read pooled with, in read order.
+              additionalProperties:
+                type: array
+                items: {type: number, minimum: 0}
+        signals:
+          type: object
+          properties:
+            control_text:
+              type: array
+              items: {$ref: '#/components/schemas/ControlTextHit'}
+        identity: {$ref: '#/components/schemas/DecisionIdentity'}
+        usage:
+          type: object
+          properties:
+            input_tokens:
+              type: integer
+              minimum: 0
+              description: The case as rendered.
+            output_tokens:
+              type: integer
+              minimum: 0
+              description: The text answers written.
+            fed_tokens:
+              type: integer
+              minimum: 0
+              description: Tokens this decision ran past held snapshots, spec-layer rebuilds included.
+        queue_ms:
+          type: number
+          minimum: 0
+        ms:
+          type: number
+          minimum: 0
+    DecisionIdentity:
+      type: object
+      required: [model, weight_hash, tokenizer_hash, template, engine]
+      description: The fields a fitted threshold depends on.
+      properties:
+        model: {type: string}
+        weight_hash: {type: string}
+        tokenizer_hash: {type: string}
+        template: {type: string}
+        engine: {type: string}
+        spec_id: {$ref: '#/components/schemas/SpecId'}
+    ServerIdentity:
+      type: object
+      required: [model, weight_hash, tokenizer_hash, template, engine, limits, capabilities]
+      properties:
+        model: {type: string}
+        aliases:
+          type: array
+          items: {type: string}
+        weight_hash: {type: string}
+        tokenizer_hash: {type: string}
+        template: {type: string}
+        engine:
+          type: string
+          description: Build commit and binary hash.
+        device: {type: string}
+        text_stop:
+          type: string
+          description: With describe, the rule that ends a text answer.
+        limits:
+          type: object
+          required: [context_tokens, state_bytes, contexts_per_decision, choice_options, default_timeout_ms]
+          properties:
+            context_tokens: {type: integer, minimum: 1}
+            state_bytes: {type: integer, minimum: 1}
+            contexts_per_decision: {type: integer, minimum: 1, maximum: 8}
+            questions_per_spec: {type: integer, minimum: 1}
+            choice_options: {type: integer, minimum: 2, maximum: 255}
+            text_tokens: {type: integer, minimum: 1}
+            default_timeout_ms: {type: integer, minimum: 1}
+            pin_bytes: {type: integer, minimum: 0}
+            snapshot_bytes: {type: integer, minimum: 0}
+        capabilities:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [park, warm, dry_run, describe, leave_one_out]
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [invalid_request, not_found, snapshot_gone, head_mismatch, too_large, busy, unavailable, timeout, pin_budget, internal]
+            message: {type: string}
+            param:
+              type: string
+              description: The request field or limit at fault.
+            head:
+              $ref: '#/components/schemas/SnapshotId'
+              description: For snapshot_gone and head_mismatch, the context's current head.

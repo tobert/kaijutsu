@@ -84,6 +84,16 @@ work history remain live state, not restart recovery or durable work provenance.
 A persistent write fault also holds later feedback behind the failed event.
 Measure and design recovery before promising durable admission or delivery.
 
+## "Context" means two things once the council lands (2026-10-04)
+
+`docs/council-api.md` uses context for a held model context, as the
+megakernel and lfm2d do; our Terms table (`docs/writing.md`) uses it for
+kaijutsu's durable block log. Amy: "if a context is a context call it a
+context here. kaijutsu shoulda called it something else in any case." A
+council context is a kaijutsu context held on the server under the same id,
+so the two mostly coincide. Renaming kaijutsu's term is open; until then,
+say "held context" when the server's copy is meant.
+
 ## Architecture cleanup plan
 
 Source review at `f7e46f8e`, September 16:
