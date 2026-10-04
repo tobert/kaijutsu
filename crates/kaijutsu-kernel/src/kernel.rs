@@ -154,6 +154,8 @@ pub struct Kernel {
     /// at a caller-provided `data_dir` (production, embedded). `Arc` keeps the dir
     /// alive until the last clone of this guard drops.
     temp_cleanup: Option<std::sync::Arc<TempDirGuard>>,
+    /// What the council server is believed to hold (`council/sync.rs`).
+    council_sync: crate::council::sync::CouncilSync,
     /// Open in-app editor sessions (`vi`/`kj editor`). The registry is
     /// kernel-owned so any peer can drive it and the app renders it. Behind a
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
@@ -434,6 +436,7 @@ impl Kernel {
             track_timelines: dashmap::DashMap::new(),
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
+            council_sync: crate::council::sync::CouncilSync::default(),
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
@@ -1456,6 +1459,11 @@ impl Kernel {
     /// There is exactly one instance for the kernel's lifetime.
     pub fn file_cache(&self) -> &Arc<crate::file_tools::FileDocumentCache> {
         &self.file_cache
+    }
+
+    /// What the council server is believed to hold for this kernel.
+    pub(crate) fn council_sync(&self) -> &crate::council::sync::CouncilSync {
+        &self.council_sync
     }
 
     /// The kernel's `KernelDb` handle — the same instance `blocks()` and

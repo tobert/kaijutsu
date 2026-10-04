@@ -1,2 +1,629 @@
 //! Keeps the council server holding the council contexts and specs, and
 //! hands the gate what a decision needs.
+//!
+//! [`CouncilSync::prepare`] runs before each decision. It does only the
+//! requests the server is not already believed to have answered: the identity
+//! once per server, a spec once per spec id, and a context only when its
+//! projected body changed. This kernel is the only writer of its council
+//! contexts, so a `PUT` carries the head the server last reported as
+//! `If-Match`; a head that moved anyway is a miss, not a retry.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use kaijutsu_council::canon;
+use kaijutsu_council::wire::{Capability, ServerIdentity, SnapshotId, Spec, SpecId};
+use kaijutsu_council::{CouncilClient, CouncilError};
+use kaijutsu_types::ContextId;
+use sha2::{Digest, Sha256};
+
+use super::projection::project;
+use crate::kj::gate_policy::{CouncilConfig, CouncilSpec};
+
+/// Everything one decision needs from the server's side.
+pub(crate) struct Prepared {
+    /// Addresses `CouncilConfig.server`; its timeout is `deadline_ms`.
+    pub(crate) client: CouncilClient,
+    pub(crate) identity: ServerIdentity,
+    pub(crate) spec: Spec,
+    pub(crate) spec_id: SpecId,
+    /// In `CouncilConfig.contexts` order.
+    pub(crate) contexts: Vec<PreparedContext>,
+}
+
+/// One council context as the server holds it.
+pub(crate) struct PreparedContext {
+    pub(crate) label: String,
+    pub(crate) context_id: ContextId,
+    /// The head the server reported for the body this kernel sent.
+    pub(crate) head: SnapshotId,
+}
+
+/// Why the council cannot be asked right now, in plain words; the gate
+/// records it as a miss cause.
+#[derive(Debug)]
+pub(crate) struct PrepareMiss(pub(crate) String);
+
+#[derive(Clone)]
+struct Held {
+    /// sha256 of the projected body last sent, before any `warm` is added.
+    body: [u8; 32],
+    head: SnapshotId,
+}
+
+#[derive(Default)]
+struct State {
+    identities: HashMap<String, ServerIdentity>,
+    specs: HashSet<(String, SpecId)>,
+    contexts: HashMap<(String, ContextId), Held>,
+}
+
+/// What this kernel believes each council server holds.
+#[derive(Default)]
+pub(crate) struct CouncilSync {
+    /// Serializes `prepare`, so two decisions never `PUT` the same context
+    /// against the same head.
+    serial: tokio::sync::Mutex<()>,
+    state: parking_lot::Mutex<State>,
+}
+
+impl CouncilSync {
+    /// Brings the server up to date for a decision on `spec`.
+    pub(crate) async fn prepare(
+        &self,
+        kernel: &crate::Kernel,
+        council: &CouncilConfig,
+        spec: &CouncilSpec,
+    ) -> Result<Prepared, PrepareMiss> {
+        let _serial = self.serial.lock().await;
+        let server = council.server.as_str();
+        let client = CouncilClient::new(server, Duration::from_millis(council.deadline_ms))
+            .map_err(|e| self.failed(server, "client", e))?;
+
+        let identity = self.identity(&client, server).await?;
+        let (spec_body, spec_id) = read_spec(kernel, &spec.name).await?;
+        self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
+
+        let mut contexts = Vec::with_capacity(council.contexts.len());
+        for label in &council.contexts {
+            let context_id = resolve_label(kernel, label)?;
+            let body = project(
+                label,
+                &kernel.blocks().block_snapshots(context_id).map_err(|e| {
+                    PrepareMiss(format!("council context \"{label}\" cannot be read: {e}"))
+                })?,
+            );
+            let hash = body_hash(&body)?;
+            let key = (server.to_string(), context_id);
+            let held = self.state.lock().contexts.get(&key).cloned();
+            if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
+                contexts.push(PreparedContext { label: label.clone(), context_id, head: h.head.clone() });
+                continue;
+            }
+            let mut body = body;
+            if identity.capabilities.contains(&Capability::Warm) {
+                body.warm = Some(vec![spec_id.clone()]);
+            }
+            let id = context_id.to_string();
+            let mut if_match = held.as_ref().map(|h| h.head.clone());
+            let result = loop {
+                match client.put_context(&id, &body, if_match.as_ref()).await {
+                    Err(e) if e.status() == Some(404) && if_match.is_some() => {
+                        if_match = None;
+                    }
+                    other => break other,
+                }
+            };
+            match result {
+                Ok(put) => {
+                    self.state
+                        .lock()
+                        .contexts
+                        .insert(key, Held { body: hash, head: put.head.clone() });
+                    contexts.push(PreparedContext { label: label.clone(), context_id, head: put.head });
+                }
+                Err(e) if e.status() == Some(412) => {
+                    self.state.lock().contexts.remove(&key);
+                    return Err(PrepareMiss(format!(
+                        "council context \"{label}\" moved on {server} under If-Match \
+                         (server head {}); the next decision sends it fresh",
+                        e.head().map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
+                    )));
+                }
+                Err(e) => return Err(self.failed(server, &format!("PUT of context \"{label}\""), e)),
+            }
+        }
+
+        let spec = spec_body;
+        Ok(Prepared { client, identity, spec, spec_id, contexts })
+    }
+
+    /// Forgets what the server is believed to hold for `context_id`, so the
+    /// next `prepare` sends it again without `If-Match`. Call it after a 404
+    /// or 409 from a decision.
+    pub(crate) fn invalidate(&self, context_id: ContextId) {
+        self.state.lock().contexts.retain(|(_, id), _| *id != context_id);
+    }
+
+    async fn identity(&self, client: &CouncilClient, server: &str) -> Result<ServerIdentity, PrepareMiss> {
+        if let Some(i) = self.state.lock().identities.get(server) {
+            return Ok(i.clone());
+        }
+        let identity = client.identity().await.map_err(|e| self.failed(server, "identity", e))?;
+        self.state.lock().identities.insert(server.to_string(), identity.clone());
+        Ok(identity)
+    }
+
+    async fn ensure_spec(
+        &self,
+        client: &CouncilClient,
+        server: &str,
+        spec: &Spec,
+        spec_id: &SpecId,
+    ) -> Result<(), PrepareMiss> {
+        let key = (server.to_string(), spec_id.clone());
+        if self.state.lock().specs.contains(&key) {
+            return Ok(());
+        }
+        client
+            .post_spec(spec)
+            .await
+            .map_err(|e| self.failed(server, &format!("POST of spec \"{}\"", spec.name), e))?;
+        self.state.lock().specs.insert(key);
+        Ok(())
+    }
+
+    /// A call to `server` failed: forget its identity and posted specs, so
+    /// the next `prepare` asks again, and name the failure.
+    fn failed(&self, server: &str, what: &str, e: CouncilError) -> PrepareMiss {
+        let mut state = self.state.lock();
+        state.identities.remove(server);
+        state.specs.retain(|(s, _)| s != server);
+        PrepareMiss(format!("council server {server}: {what} failed: {e}"))
+    }
+}
+
+fn body_hash(body: &kaijutsu_council::wire::ContextPut) -> Result<[u8; 32], PrepareMiss> {
+    let bytes = serde_json::to_vec(body)
+        .map_err(|e| PrepareMiss(format!("council context body does not serialize: {e}")))?;
+    Ok(Sha256::digest(&bytes).into())
+}
+
+fn resolve_label(kernel: &crate::Kernel, label: &str) -> Result<ContextId, PrepareMiss> {
+    let row = kernel
+        .kernel_db()
+        .lock()
+        .find_context_by_label(label)
+        .map_err(|e| PrepareMiss(format!("council context \"{label}\" lookup failed: {e}")))?;
+    row.map(|r| r.context_id)
+        .ok_or_else(|| PrepareMiss(format!("council context \"{label}\" names no live context")))
+}
+
+async fn read_spec(kernel: &crate::Kernel, name: &str) -> Result<(Spec, SpecId), PrepareMiss> {
+    use crate::vfs::VfsOps;
+    let path = kaijutsu_types::paths::config_path(&format!("council/{name}.json"));
+    let bytes = kernel
+        .vfs()
+        .read_all(std::path::Path::new(&path))
+        .await
+        .map_err(|e| PrepareMiss(format!("council spec file {path} cannot be read: {e}")))?;
+    let spec: Spec = serde_json::from_slice(&bytes)
+        .map_err(|e| PrepareMiss(format!("council spec file {path} is not a spec: {e}")))?;
+    let id = canon::spec_id(&spec)
+        .map_err(|e| PrepareMiss(format!("council spec file {path} has no spec id: {e}")))?;
+    Ok((spec, id))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::super::projection::fixtures::{append_dialogue, live_context};
+    use super::*;
+    use crate::Kernel;
+    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights};
+    use crate::vfs::LocalBackend;
+
+    const SPEC: &str = include_str!("../../../kaijutsu-council/tests/fixtures/spec.json");
+
+    #[derive(Clone, Debug)]
+    struct Reply {
+        status: u16,
+        body: String,
+    }
+
+    fn reply(status: u16, body: impl Into<String>) -> Reply {
+        Reply { status, body: body.into() }
+    }
+
+    #[derive(Debug)]
+    struct Captured {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Captured {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// A mock council server on 127.0.0.1 that answers the contract's happy
+    /// path unless a test queues a reply for a method.
+    struct Mock {
+        base: String,
+        seen: Arc<Mutex<Vec<Captured>>>,
+        forced: Arc<Mutex<VecDeque<(String, Reply)>>>,
+    }
+
+    impl Mock {
+        fn force(&self, method: &str, r: Reply) {
+            self.forced.lock().unwrap().push_back((method.to_string(), r));
+        }
+
+        fn calls(&self, method: &str) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.method == method)
+                .map(|c| c.path.clone())
+                .collect()
+        }
+
+        fn puts(&self) -> Vec<(Option<String>, serde_json::Value)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.method == "PUT")
+                .map(|c| (c.header("if-match").map(String::from), serde_json::from_str(&c.body).unwrap()))
+                .collect()
+        }
+
+        fn count(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    fn snap(n: u64) -> String {
+        format!("snap:{n:064x}")
+    }
+
+    fn identity_json() -> String {
+        json!({"model": "m", "weight_hash": "w", "tokenizer_hash": "t", "template": "tpl",
+               "engine": "e",
+               "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 4,
+                          "choice_options": 8, "default_timeout_ms": 1000},
+               "capabilities": ["leave_one_out"]})
+        .to_string()
+    }
+
+    fn default_reply(c: &Captured, puts: &mut u64) -> Reply {
+        match (c.method.as_str(), c.path.as_str()) {
+            ("GET", "/council/v1/identity") => reply(200, identity_json()),
+            ("POST", "/council/v1/specs") => {
+                let spec: Spec = serde_json::from_str(&c.body).unwrap();
+                let id = canon::spec_id(&spec).unwrap();
+                reply(200, json!({"spec_id": id, "spec": spec, "template": "t"}).to_string())
+            }
+            ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
+                *puts += 1;
+                reply(
+                    200,
+                    json!({"id": p.rsplit('/').next().unwrap(), "head": snap(*puts), "tokens": 1,
+                           "kept": 0, "fed": 1, "dry_run": false, "snapshots": []})
+                    .to_string(),
+                )
+            }
+            _ => reply(500, "unexpected"),
+        }
+    }
+
+    async fn serve() -> Mock {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let forced: Arc<Mutex<VecDeque<(String, Reply)>>> = Arc::default();
+        let (log, queue) = (seen.clone(), forced.clone());
+        tokio::spawn(async move {
+            let mut puts = 0u64;
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let (head_end, len) = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "client closed before sending a request");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        break (i + 4, len);
+                    }
+                };
+                while buf.len() < head_end + len {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                let mut lines = head.lines();
+                let mut first = lines.next().unwrap().split(' ');
+                let method = first.next().unwrap().to_string();
+                let path = first.next().unwrap().to_string();
+                let headers = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(n, v)| (n.trim().to_lowercase(), v.trim().to_string()))
+                    .collect();
+                let captured = Captured {
+                    method,
+                    path,
+                    headers,
+                    body: String::from_utf8_lossy(&buf[head_end..]).to_string(),
+                };
+                let forced_reply = {
+                    let mut q = queue.lock().unwrap();
+                    q.iter().position(|(m, _)| *m == captured.method).and_then(|i| q.remove(i))
+                };
+                let r = match forced_reply {
+                    Some((_, r)) => r,
+                    None => default_reply(&captured, &mut puts),
+                };
+                log.lock().unwrap().push(captured);
+                let out = format!(
+                    "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    r.status,
+                    r.body.len(),
+                    r.body
+                );
+                let _ = sock.write_all(out.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        Mock { base, seen, forced }
+    }
+
+    struct Rig {
+        kernel: Kernel,
+        mock: Mock,
+        council: CouncilConfig,
+        spec: CouncilSpec,
+        voice: ContextId,
+        config: tempfile::TempDir,
+    }
+
+    async fn rig() -> Rig {
+        let kernel = Kernel::new_ephemeral("council-sync").await;
+        let config = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config.path().join("council")).unwrap();
+        std::fs::write(config.path().join("council/shell-gate.json"), SPEC).unwrap();
+        kernel
+            .vfs()
+            .mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path()))
+            .await;
+        let voice = live_context(&kernel, "voice");
+        append_dialogue(&kernel, voice, &["never rm -rf the repo", "understood"]);
+        let mock = serve().await;
+        let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell };
+        let council = CouncilConfig {
+            server: mock.base.clone(),
+            contexts: vec!["voice".into()],
+            pool_method: CouncilPoolMethod::Linear,
+            pool_weights: CouncilPoolWeights::Uniform,
+            deadline_ms: 5000,
+            require_agree: false,
+            specs: vec![spec.clone()],
+            thresholds: vec![],
+        };
+        Rig { kernel, mock, council, spec, voice, config }
+    }
+
+    impl Rig {
+        async fn prepare(&self) -> Result<Prepared, PrepareMiss> {
+            self.kernel.council_sync().prepare(&self.kernel, &self.council, &self.spec).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_prepare_gets_the_identity_posts_the_spec_and_puts_each_context() {
+        let r = rig().await;
+        let p = r.prepare().await.expect("prepared");
+        assert_eq!(r.mock.calls("GET"), ["/council/v1/identity"]);
+        assert_eq!(r.mock.calls("POST"), ["/council/v1/specs"]);
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, None, "the first PUT has no If-Match");
+        assert_eq!(puts[0].1["turns"].as_array().unwrap().len(), 2);
+        assert!(puts[0].1.get("warm").is_none() && puts[0].1.get("dry_run").is_none());
+        assert_eq!(p.contexts.len(), 1);
+        assert_eq!(p.contexts[0].label, "voice");
+        assert_eq!(p.contexts[0].context_id, r.voice);
+        assert_eq!(p.contexts[0].head.as_str(), snap(1));
+        assert_eq!(p.spec_id, canon::spec_id(&p.spec).unwrap());
+        assert_eq!(p.identity.engine, "e");
+    }
+
+    #[tokio::test]
+    async fn a_second_prepare_with_no_change_sends_nothing() {
+        let r = rig().await;
+        let first = r.prepare().await.unwrap();
+        let sent = r.mock.count();
+        let second = r.prepare().await.unwrap();
+        assert_eq!(r.mock.count(), sent, "no request for an unchanged world");
+        assert_eq!(second.contexts[0].head, first.contexts[0].head);
+    }
+
+    #[tokio::test]
+    async fn a_changed_context_puts_again_with_the_last_head_in_if_match() {
+        let r = rig().await;
+        let first = r.prepare().await.unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        super::super::projection::fixtures::append(
+            &r.kernel,
+            r.voice,
+            ids.last().map(|b| &b.id),
+            kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text,
+            kaijutsu_types::Status::Done,
+            "and never force push",
+        );
+        let second = r.prepare().await.unwrap();
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(puts[1].0.as_deref(), Some(first.contexts[0].head.as_str()));
+        assert_eq!(puts[1].1["turns"].as_array().unwrap().len(), 3);
+        assert_eq!(second.contexts[0].head.as_str(), snap(2));
+    }
+
+    #[tokio::test]
+    async fn a_404_on_put_sends_the_context_again_without_if_match() {
+        let r = rig().await;
+        r.prepare().await.unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        super::super::projection::fixtures::append(
+            &r.kernel,
+            r.voice,
+            ids.last().map(|b| &b.id),
+            kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text,
+            kaijutsu_types::Status::Done,
+            "more guidance",
+        );
+        r.mock.force(
+            "PUT",
+            reply(404, json!({"error": {"type": "not_found", "message": "no such context"}}).to_string()),
+        );
+        let p = r.prepare().await.expect("recovers within the call");
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 3, "first, the refused one, the retry");
+        assert!(puts[1].0.is_some());
+        assert_eq!(puts[2].0, None);
+        assert_eq!(p.contexts[0].head.as_str(), snap(2));
+    }
+
+    #[tokio::test]
+    async fn a_412_is_a_miss_and_the_next_prepare_puts_fresh() {
+        let r = rig().await;
+        r.prepare().await.unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        super::super::projection::fixtures::append(
+            &r.kernel,
+            r.voice,
+            ids.last().map(|b| &b.id),
+            kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text,
+            kaijutsu_types::Status::Done,
+            "more guidance",
+        );
+        r.mock.force(
+            "PUT",
+            reply(
+                412,
+                json!({"error": {"type": "head_mismatch", "message": "moved", "head": snap(9)}})
+                    .to_string(),
+            ),
+        );
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("voice") && miss.0.contains(&snap(9)), "{}", miss.0);
+        let p = r.prepare().await.expect("recovers on the next call");
+        let puts = r.mock.puts();
+        assert_eq!(puts.last().unwrap().0, None, "fresh PUT carries no If-Match");
+        assert_eq!(p.contexts[0].label, "voice");
+    }
+
+    #[tokio::test]
+    async fn invalidate_makes_the_next_prepare_send_the_context_again() {
+        let r = rig().await;
+        r.prepare().await.unwrap();
+        r.kernel.council_sync().invalidate(r.voice);
+        r.prepare().await.unwrap();
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(puts[1].0, None);
+    }
+
+    #[tokio::test]
+    async fn a_label_naming_no_live_context_is_a_miss_naming_it() {
+        let mut r = rig().await;
+        r.council.contexts.push("missing-rules".into());
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("missing-rules"), "{}", miss.0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_spec_file_is_a_miss_naming_the_path() {
+        let r = rig().await;
+        std::fs::remove_file(r.config.path().join("council/shell-gate.json")).unwrap();
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("/config/kernel/council/shell-gate.json"), "{}", miss.0);
+        assert_eq!(r.mock.puts().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_spec_file_is_a_miss_naming_the_path() {
+        let r = rig().await;
+        std::fs::write(r.config.path().join("council/shell-gate.json"), "{not json").unwrap();
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("/config/kernel/council/shell-gate.json"), "{}", miss.0);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_disagrees_on_the_spec_id_is_a_miss() {
+        let r = rig().await;
+        let other = format!("sha256:{}", "0".repeat(64));
+        let spec: serde_json::Value = serde_json::from_str(SPEC).unwrap();
+        r.mock.force(
+            "POST",
+            reply(200, json!({"spec_id": other, "spec": spec, "template": "t"}).to_string()),
+        );
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains("spec id disagrees"), "{}", miss.0);
+    }
+
+    #[tokio::test]
+    async fn the_identity_is_cached_and_fetched_again_after_a_failure() {
+        let r = rig().await;
+        r.prepare().await.unwrap();
+        r.prepare().await.unwrap();
+        assert_eq!(r.mock.calls("GET").len(), 1, "cached across prepares");
+
+        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        super::super::projection::fixtures::append(
+            &r.kernel,
+            r.voice,
+            ids.last().map(|b| &b.id),
+            kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text,
+            kaijutsu_types::Status::Done,
+            "more guidance",
+        );
+        r.mock.force("PUT", reply(500, "boom"));
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains(&r.mock.base), "{}", miss.0);
+        r.prepare().await.expect("recovered");
+        assert_eq!(r.mock.calls("GET").len(), 2, "refetched after the failure");
+        assert_eq!(r.mock.calls("POST").len(), 2, "specs are posted again with it");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_a_miss_naming_it() {
+        let mut r = rig().await;
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+        r.council.server = format!("http://{addr}");
+        let miss = r.prepare().await.err().expect("a miss");
+        assert!(miss.0.contains(&addr.to_string()), "{}", miss.0);
+    }
+}
