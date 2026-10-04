@@ -96,6 +96,7 @@ per model turn, without adding a character lookup to every tool call.
 | MCP tools | `mcp.{tool}` | `mcp.block_read` | 10% (default) |
 | LLM | Auto-named with `llm.*` fields | `prompt{llm.model, llm.provider}` | 100% |
 | Turn outcome | `turn.{op}`, `turn.*` fields | `turn.events_push{turn.stop_reason}` | 100% |
+| Council | `council.{op}` | `council.decide{outcome, p_allow}` | 100% |
 
 ### Server RPC
 
@@ -214,6 +215,7 @@ The `KaijutsuSampler` applies differentiated rates based on span name prefix:
 | `engine.*`, `tool.*` | 100% | Critical for debugging |
 | `drift.*` | 100% | Cross-context operations |
 | `turn.*` | 100% | One span per turn ending — as rare as turns, and the whole story of how one ended |
+| `council.*` | 100% | One span per council decision, plus report events; every decision is monitored |
 | `rpc.*` | 10% | High volume |
 | Errors | 100% | Always captured |
 | Other | 10% | Default |

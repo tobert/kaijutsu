@@ -317,6 +317,7 @@ fn sampling_rate(name: &str) -> f64 {
         || name.starts_with("drift.")
         || name.starts_with("sftp.")
         || name.starts_with("turn.")
+        || name.starts_with("council.")
     {
         1.0 // 100% — high-value, low-volume namespaces (sftp control/metadata ops)
     } else if name.starts_with("rpc") {
@@ -344,6 +345,9 @@ mod tests {
     /// The dotted engine-style namespaces still sample at 100%.
     #[test]
     fn engine_style_namespaces_sample_full() {
+        assert_eq!(sampling_rate("council.decide"), 1.0);
+        assert_eq!(sampling_rate("council.report"), 1.0);
+        assert_eq!(sampling_rate("council_queue"), 0.1);
         assert_eq!(sampling_rate("drift.push"), 1.0);
         assert_eq!(sampling_rate("drift.register"), 1.0);
         assert_eq!(sampling_rate("engine.git"), 1.0);
