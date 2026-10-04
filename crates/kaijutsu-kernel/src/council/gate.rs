@@ -89,6 +89,61 @@ struct CaseState<'a> {
     context_type: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[ProgramOutcome]>::is_empty")]
+    programs: &'a [ProgramOutcome],
+}
+
+/// What the shell decision is told about one program the submission runs:
+/// how the program decision ended, or why there was none.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ProgramOutcome {
+    /// The planned statement it runs in.
+    pub(crate) statement: usize,
+    pub(crate) language: String,
+    /// The file it was read from; `None` for text the submission carries.
+    pub(crate) path: Option<String>,
+    /// `allow`, `ask`, `report`, `miss`, or `unread`.
+    pub(crate) outcome: String,
+    /// Why a `miss` or `unread` program has no answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) originals: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) network: Option<String>,
+}
+
+impl ProgramOutcome {
+    fn of(program: &ProgramVerdict) -> Self {
+        let path = match (&program.file, &program.run.source) {
+            (Some(file), _) => Some(file.path.clone()),
+            (None, super::programs::ProgramSource::File { path, .. }) => Some(path.clone()),
+            _ => None,
+        };
+        let mut outcome = ProgramOutcome {
+            statement: program.run.statement,
+            language: program.run.language.as_str().to_string(),
+            path,
+            outcome: "unread".into(),
+            cause: None,
+            originals: None,
+            network: None,
+        };
+        match &program.decision {
+            Err(why) => outcome.cause = Some(why.clone()),
+            Ok(decision) => {
+                outcome.outcome = other_word(&decision.outcome).to_string();
+                if let Outcome::Miss(cause) = &decision.outcome {
+                    outcome.cause = Some(cause.clone());
+                } else {
+                    let answer = |q: &str| decision.rubric.iter().find(|(r, _)| r == q).map(|(_, c)| c.clone());
+                    outcome.originals = answer("originals");
+                    outcome.network = answer("network");
+                }
+            }
+        }
+        outcome
+    }
 }
 
 #[derive(Serialize)]
@@ -123,7 +178,9 @@ fn elide(text: &str, programs: &[&str]) -> String {
 /// program decision reads, is shown as [`JUDGED_SEPARATELY`], so the shell
 /// decision judges the invocation and the program decision the text. A
 /// text the submission spells differently, such as with escapes, stays.
-pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str]) -> Json {
+/// `programs`, last, lists how each program's decision ended, so the rest
+/// of the submission is judged with them; it is left out when empty.
+pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs: &[ProgramOutcome]) -> Json {
     let command = elide(submission.command, judged);
     let state = CaseState {
         command: &command,
@@ -139,6 +196,7 @@ pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str]) -> Json {
             .collect(),
         context_type: submission.context_type,
         cwd: submission.cwd,
+        programs,
     };
     // A struct serializes its fields in declaration order, and `Json` keeps
     // the order it reads, so the round trip is the ordered object.
@@ -582,6 +640,8 @@ pub(crate) struct CouncilVerdict {
     /// On a submission's shell decision: each program the submission runs,
     /// with its own decision or the reason it has none.
     programs: Vec<ProgramVerdict>,
+    /// A program decision's pooled rubric answers ([`RUBRIC`] order).
+    rubric: Vec<(String, String)>,
 }
 
 /// One program a submission runs, as the gate judged it.
@@ -1043,6 +1103,7 @@ fn build_verdict(
         report: None,
         decide_span: None,
         programs: Vec::new(),
+        rubric: classification.rubric,
     }
 }
 
@@ -1348,8 +1409,7 @@ pub(crate) async fn consult(
         .filter_map(|p| p.text.as_ref().ok().map(|t| t.text.clone()))
         .collect();
     let judged: Vec<&str> = judged.iter().map(String::as_str).collect();
-    let shell_case = CaseInput { state: case_state(&submission, &judged), text: command.to_string() };
-    let shell_decision = decide(kernel, caller, shell_case, council, shell, chain.clone());
+    let started = Instant::now();
     let program_decisions = futures::future::join_all(read.into_iter().enumerate().map(|(i, program)| {
         let chain = chain.clone();
         let submission = &submission;
@@ -1381,8 +1441,25 @@ pub(crate) async fn consult(
             ProgramVerdict { run: program.run, file, imports_not_shown, decision }
         }
     }));
-    let (mut verdict, programs) = futures::future::join(shell_decision, program_decisions).await;
+    // The program decisions run first, together, each under its own
+    // deadline; the shell decision then reads their outcomes, under its
+    // own. A submission waits at most two deadlines.
+    let programs = program_decisions.await;
+    let program_ms = started.elapsed().as_millis() as u64;
+    let outcomes: Vec<ProgramOutcome> = programs.iter().map(ProgramOutcome::of).collect();
+    let shell_case = CaseInput { state: case_state(&submission, &judged, &outcomes), text: command.to_string() };
+    let mut verdict = decide(kernel, caller, shell_case, council, shell, chain).await;
     verdict.programs = programs;
+    tracing::info!(
+        target: "kaijutsu::council",
+        programs = outcomes.len(),
+        program_ms,
+        shell_ms = started.elapsed().as_millis() as u64 - program_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        allows = verdict.allows(),
+        context_id = %context_id,
+        "council consulted on a submission"
+    );
     Ok(Some(verdict))
 }
 
@@ -1756,7 +1833,7 @@ mod tests {
             planned: &planned,
             context_type: Some("coder"),
             cwd: Some("/src"),
-        }, &[]);
+        }, &[], &[]);
         let req = decision_request(&p, &council(0.98, -0.05, true), state);
         req.validate().unwrap();
         let body = serde_json::to_value(&req).unwrap();
@@ -1779,6 +1856,7 @@ mod tests {
         assert_eq!(state["statements"][1]["clauses"][0], "git push origin main");
         assert_eq!(state["context_type"], "coder");
         assert_eq!(state["cwd"], "/src");
+        assert!(state.get("programs").is_none(), "a submission with no programs has no programs field: {state}");
     }
 
     #[test]

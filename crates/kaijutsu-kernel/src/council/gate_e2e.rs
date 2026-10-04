@@ -1889,3 +1889,98 @@ async fn an_inline_program_the_program_decision_allows_is_not_judged_again_as_sh
         rig.finish().await;
     }
 }
+
+/// The shell decision's view of the submission's programs: the `programs`
+/// field of its case, empty when the case has none.
+fn programs_field(request: &DecisionRequest) -> Vec<serde_json::Value> {
+    let state = serde_json::to_value(&request.state).unwrap();
+    state.get("programs").and_then(|p| p.as_array().cloned()).unwrap_or_default()
+}
+
+/// A shell decision that follows the programs it is shown: it allows when
+/// every listed program allowed, and asks otherwise.
+fn shell_follows_programs(mock: &Mock, originals: [f64; 3]) {
+    mock.set(move |req| {
+        if is_program(req) {
+            Reply::ok(super::gate::test_support::program_answer(req, originals, FIRST, [-0.01, -5.0, -6.0]))
+        } else {
+            let programs = programs_field(req);
+            let all_allowed = !programs.is_empty() && programs.iter().all(|p| p["outcome"] == "allow");
+            Reply::ok(answer(req, if all_allowed { &ALLOW } else { &ASK }))
+        }
+    });
+}
+
+/// The program decisions run first, and the shell decision reads their
+/// outcomes in its case's `programs` field: each judged program's
+/// statement, language, path, outcome, and rubric answers. An allowed
+/// program with routine statements around it runs end to end.
+///
+/// Falsified by running the shell decision beside the program decisions:
+/// its case has no `programs` field and it asks.
+#[tokio::test]
+async fn the_shell_decision_reads_the_program_outcomes_and_an_allowed_program_runs() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        rig.write("/work/a.db", "data").await;
+        shell_follows_programs(&rig.mock, FIRST);
+        let submission = "cp /work/a.db /work/a.db.bak; python3 -c 'print(open(\"/work/a.db.bak\").read())'";
+        rig.submit_gate(submission).await.unwrap_or_else(|e| panic!("{via:?}: the program and the shell allow: {e:?}"));
+
+        let sent = rig.mock.decisions();
+        assert_eq!(sent.len(), 2, "{via:?}");
+        assert!(is_program(&sent[0]) && !is_program(&sent[1]), "{via:?}: the program decision runs first");
+        let programs = programs_field(&sent[1]);
+        assert_eq!(
+            programs,
+            [serde_json::json!({"statement": 1, "language": "python", "path": null, "outcome": "allow",
+                                "originals": "reads", "network": "none"})],
+            "{via:?}"
+        );
+        let state = serde_json::to_string(&sent[1].state).unwrap();
+        assert!(state.contains("<program judged separately>"), "{via:?}: the elision stays: {state}");
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// A program the rubric asks about reaches the shell decision as an ask,
+/// the shell decision asks too, and the ask names the program.
+#[tokio::test]
+async fn an_asked_program_yields_a_shell_ask_that_names_it() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        rig.write("/work/wipe.py", "import os\nos.remove('/work/a.db')\n").await;
+        shell_follows_programs(&rig.mock, LAST);
+        assert_pending(via, rig.submit_gate("echo start; python3 /work/wipe.py").await);
+        let sent = rig.mock.decisions();
+        let shell = sent.iter().find(|r| !is_program(r)).expect("a shell decision");
+        let programs = programs_field(shell);
+        assert_eq!(programs.len(), 1, "{via:?}: {programs:?}");
+        assert_eq!(programs[0]["outcome"], "ask");
+        assert_eq!(programs[0]["path"], "/work/wipe.py");
+        assert_eq!(programs[0]["originals"], "changes");
+        let ask = rig.only_ask();
+        let (decision, _) = shell_and_programs(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Ask, "{via:?}");
+        assert!(ask.description.contains("/work/wipe.py"), "{via:?}: {}", ask.description);
+        rig.finish().await;
+    }
+}
+
+/// A program the kernel cannot read is listed as unread with its cause.
+#[tokio::test]
+async fn an_unread_program_is_listed_with_its_cause() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        shell_follows_programs(&rig.mock, FIRST);
+        assert_pending(via, rig.submit_gate("python3 /work/missing.py").await);
+        let sent = rig.mock.decisions();
+        assert_eq!(sent.len(), 1, "{via:?}: only the shell decision");
+        let programs = programs_field(&sent[0]);
+        assert_eq!(programs[0]["outcome"], "unread", "{via:?}: {programs:?}");
+        assert!(programs[0]["cause"].as_str().unwrap().contains("could not be read"), "{programs:?}");
+        rig.finish().await;
+    }
+}

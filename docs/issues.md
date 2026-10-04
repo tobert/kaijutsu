@@ -170,9 +170,11 @@ WAL. Accept `-p`, or have the refusal name the fix.
 - **Imports are named, not read or hashed.** A local module listed in
   `imports_not_shown` can change between the decision and the run without
   the integrity check noticing.
-- **Program decisions run when the shell decision does not allow.** They
-  run concurrently for the record; skipping them after a shell ask would
-  save server time and lose the data.
+- **Two deadlines in sequence.** The shell decision waits for the program
+  decisions, so a submission with programs can wait twice `deadline_ms`.
+  One shared deadline would bound it but starve the shell decision after a
+  slow program decision. Measure from the logged `program_ms` and
+  `shell_ms`.
 - **`kj ledger show` does not render `council_programs`.** The signals and
   the ask's text carry the answers; the rows are reachable by SQL only.
 - **A program threshold's `allow_at` is required and unused.** The program

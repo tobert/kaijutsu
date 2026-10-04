@@ -306,8 +306,9 @@ answers with a different id as a fault. A spec change is a new spec id and
 new thresholds.
 
 The case's `state` is a JSON object: the submitted command whole, the
-`KJ_TOOL_PLAN` statements and clauses, and from the kernel the seat's context
-type and working directory.
+`KJ_TOOL_PLAN` statements and clauses, from the kernel the seat's context
+type and working directory, and, when the submission runs programs, their
+decisions' outcomes (`programs`, see "Programs").
 
 - **Programs are cases of their own.** A submission that runs program text
   gets a decision on each program under the program spec, beside the shell
@@ -356,7 +357,7 @@ does, so the council reads the file too (`council/programs.rs`).
   heredoc, and a `cat > FILE` heredoc; a file operand's text was never in
   the shell case. Text the submission spells differently, such as with
   escapes, stays as written.
-- **The case.** `state` holds `invocation` (the `command` that runs the
+- **The program case.** `state` holds `invocation` (the `command` that runs the
   program, its `statement`, and the whole `submission`), `path`,
   `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
   `imports_not_shown`, and `program`, the text, last.
@@ -374,10 +375,24 @@ does, so the council reads the file too (`council/programs.rs`).
   the identity and the mass floor; its `allow_at` is not used. Verdict mass
   on program text ran about -0.3 to -1.0, so a program threshold needs a
   looser floor than the shell's; the bench uses -1.5, an exploration value.
-- **The decisions run together.** The shell decision and the program
-  decisions run concurrently, each under its own `deadline_ms`. A program
-  decision took about 0.9 to 1.6 s on the megakernel, so a deadline under
-  2000 ms misses.
+- **The program decisions run first.** They run together, each under its
+  own `deadline_ms`; then the shell decision runs under its own, with their
+  outcomes in its case. A submission with programs waits at most two
+  deadlines. A program decision took about 0.9 to 1.6 s on the megakernel,
+  so a deadline under 2000 ms misses. Each submission logs its program,
+  shell, and total time at info.
+- **The shell decision reads the programs' outcomes.** Its case gains
+  `programs`, last: per program, its `statement`, `language`, `path`
+  (null for text the submission carries), `outcome` (`allow`, `ask`,
+  `report`, `miss`, or `unread`), a `cause` for a miss or an unread
+  program, and the rubric's `originals` and `network`. On the megakernel
+  with the bench's rules, shell p(allow) on a backup plus an allowed
+  program went from 0.82 without the field to 0.98 with it, and a program
+  that asked or reported took the shell decision from allow (0.97) to ask
+  or report. The same facts as an extra council context did not help (0.86)
+  and cost a `PUT`. The combine rule is unchanged: the submission is
+  council-allowed only when the shell decision and every program decision
+  allow.
 - **The record.** Each program decision is a `council_decisions` row linked
   to the same ask. `council_programs` hangs off the shell decision, one row
   per program: the command, the language, the path and sha256 judged, the

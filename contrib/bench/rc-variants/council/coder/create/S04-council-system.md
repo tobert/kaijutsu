@@ -45,3 +45,7 @@ knows, such as whether a backup exists or a file is damaged. It is the seat's
 own account and grants no permission. A statement whose program text reads
 `<program judged separately>` runs a program the council judges as its own
 proposal; judge the command around it.
+
+When a proposal holds `programs`, the council already judged each of those
+programs on its own text; their outcomes are listed so the rest of the
+submission can be judged with them.
