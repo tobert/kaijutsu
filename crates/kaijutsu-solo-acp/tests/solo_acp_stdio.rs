@@ -178,6 +178,46 @@ fn a_prompt_runs_a_turn_and_ends_it() {
     );
 }
 
+/// With `OTEL_EXPORTER_OTLP_ENDPOINT` set, the binary opens a gRPC (HTTP/2)
+/// connection to it. The listener here is not a collector: the HTTP/2
+/// connection preface is enough to show the exporter was initialized.
+#[test]
+fn an_otlp_endpoint_makes_the_binary_export() {
+    use std::io::Read;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+    listener.set_nonblocking(true).expect("nonblocking listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("listener addr"));
+
+    let cwd = scratch_dir("otel-cwd");
+    let mut agent = spawn(mock_command("chat").env("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint));
+    let session = open_session(&mut agent, &cwd);
+    prompt(&mut agent, &session, "say something");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut preface = [0u8; 3];
+    let seen = loop {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                conn.set_nonblocking(false).expect("blocking connection");
+                conn.set_read_timeout(Some(Duration::from_secs(10))).expect("read timeout");
+                conn.read_exact(&mut preface).expect("read the connection preface");
+                break preface;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no connection to {endpoint}\n--- stderr ---\n{}",
+                    agent.stderr()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    assert_eq!(&seen, b"PRI", "an HTTP/2 connection preface starts with PRI");
+}
+
 #[test]
 fn a_file_tool_call_writes_inside_the_session_cwd() {
     let cwd = scratch_dir("file-cwd");

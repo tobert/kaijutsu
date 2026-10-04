@@ -44,6 +44,7 @@ kaijutsu-acp = { path = "../kaijutsu-acp" }
 kaijutsu-client.workspace = true
 kaijutsu-kernel.workspace = true
 kaijutsu-server.workspace = true
+kaijutsu-telemetry.workspace = true
 kaijutsu-types.workspace = true
 # The same path helpers the kernel resolves its own locations with, so the
 # "already writable" check and the operator's XDG trees cannot disagree.

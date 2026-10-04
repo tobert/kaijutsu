@@ -52,6 +52,7 @@ Environment (all have defaults):
   KAIJUTSU_ACP_KEY_FILE KAIJUTSU_ACP_KEY_ENV (the variable the binary reads)
   KAIJUTSU_ACP_NO_KEY=1 (a local server with no key; needs KAIJUTSU_ACP_BASE_URL)
   KAIJUTSU_ACP_IDLE_TIMEOUT KAIJUTSU_ACP_REQUEST_TIMEOUT (seconds; unset: the kernel's)
+  KAIJUTSU_ACP_OTLP_ENDPOINT (unset: no trace export; docs/benchmarks.md)
   HARBOR_ENV_SH HARBOR_JOBS_DIR HARBOR_AGENT_TIMEOUT_MULTIPLIER
   HARBOR_CONCURRENCY (trials at once; default 1)
 USAGE

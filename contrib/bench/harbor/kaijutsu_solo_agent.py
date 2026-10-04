@@ -32,6 +32,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, override
+from urllib.parse import quote, urlparse
 
 from pydantic import Field
 
@@ -54,6 +55,7 @@ IDLE_TIMEOUT_ENV = "KAIJUTSU_ACP_IDLE_TIMEOUT"
 REQUEST_TIMEOUT_ENV = "KAIJUTSU_ACP_REQUEST_TIMEOUT"
 WORKSPACE_MOUNTS_ENV = "KAIJUTSU_ACP_WORKSPACE_MOUNTS"
 EGRESS_ALLOW_ENV = "KAIJUTSU_ACP_EGRESS_ALLOW"
+OTLP_ENDPOINT_ENV = "KAIJUTSU_ACP_OTLP_ENDPOINT"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -185,6 +187,64 @@ def _git(repo: Path, *args: str) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip()
+
+
+#: Hosts a task container cannot use to reach the machine running Harbor:
+#: each names the container's own loopback.
+_LOOPBACK_HOSTS = ("localhost", "::1", "0.0.0.0")
+
+
+def _otel_env(
+    endpoint: str | None,
+    logs_dir: Path | None,
+    commit: str | None,
+    dirty: bool,
+) -> dict[str, str]:
+    """The OTel environment the agent runs with; empty when `endpoint` is unset.
+
+    The resource attributes name the Harbor job, trial and task, taken from
+    the trial's agent log directory
+    (`<jobs_dir>/<job>/<trial>/agent`, trial `<task>__<suffix>`), so a run's
+    traces can be found by those values.
+    """
+    if endpoint is None or not endpoint.strip():
+        return {}
+    endpoint = endpoint.strip()
+    parsed = urlparse(endpoint)
+    host = parsed.hostname or ""
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError(
+            f"otlp_endpoint {endpoint!r} must be an http(s) URL "
+            f"(--ak otlp_endpoint=... or ${OTLP_ENDPOINT_ENV})"
+        )
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        raise ValueError(
+            f"otlp_endpoint {endpoint!r} names the container's own loopback. "
+            "Use an address the container can reach, such as "
+            "http://host.containers.internal:4317."
+        )
+    if logs_dir is None or logs_dir.name != "agent":
+        raise ValueError(
+            "otlp_endpoint is set, but the agent log directory "
+            f"{logs_dir!s} is not <job>/<trial>/agent, so the job and trial "
+            "names for the trace tags cannot be read from it."
+        )
+    trial = logs_dir.parent.name
+    job = logs_dir.parent.parent.name
+    task = trial.split("__")[0]
+    attributes = {
+        "harbor.job.name": job,
+        "harbor.trial.name": trial,
+        "harbor.task.name": task,
+    }
+    if commit:
+        attributes["kaijutsu.commit"] = commit + ("-dirty" if dirty else "")
+    return {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
+        "OTEL_RESOURCE_ATTRIBUTES": ",".join(
+            f"{k}={quote(v, safe='')}" for k, v in attributes.items()
+        ),
+    }
 
 
 def _positive_int(name: str, given: int | str | None, env: str | None) -> int | None:
@@ -325,6 +385,16 @@ class KaijutsuSoloOptions(AcpOptions):
             f"Default: ${EGRESS_ALLOW_ENV}, else {','.join(DEFAULT_EGRESS_ALLOW)}."
         ),
     )
+    otlp_endpoint: str | None = Field(
+        default=None,
+        description=(
+            "OTLP gRPC endpoint the agent exports traces to, as the task "
+            "container reaches it (http://host.containers.internal:4317). "
+            "Sets OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_RESOURCE_ATTRIBUTES "
+            "(harbor.job.name, harbor.trial.name, harbor.task.name, "
+            f"kaijutsu.commit). Default: ${OTLP_ENDPOINT_ENV}, else no export."
+        ),
+    )
 
 
 class KaijutsuSoloAcp(AcpAgent):
@@ -352,6 +422,7 @@ class KaijutsuSoloAcp(AcpAgent):
         workspace_mounts: str | None = None,
         rc_overlay: str | None = None,
         egress_allow: str | None = None,
+        otlp_endpoint: str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
         no_key: bool | str | None = None,
@@ -518,6 +589,15 @@ class KaijutsuSoloAcp(AcpAgent):
         self._git_dirty = bool(_git(self._worktree, "status", "--porcelain"))
         self._binary_sha256 = _sha256(self._local_binary)
 
+        self._otel_env = _otel_env(
+            otlp_endpoint
+            if otlp_endpoint is not None
+            else os.environ.get(OTLP_ENDPOINT_ENV),
+            kwargs.get("logs_dir"),
+            self._git_head,
+            self._git_dirty,
+        )
+
         kwargs.setdefault("registry_entry", self._registry_entry_payload())
         kwargs.setdefault("distribution_preference", ["local"])
 
@@ -644,7 +724,7 @@ class KaijutsuSoloAcp(AcpAgent):
                 "local": {
                     "cmd": self.REMOTE_BINARY.as_posix(),
                     "args": self._solo_command(),
-                    "env": {"RUST_LOG": self._rust_log},
+                    "env": {"RUST_LOG": self._rust_log, **self._otel_env},
                 }
             },
         }
@@ -754,6 +834,7 @@ class KaijutsuSoloAcp(AcpAgent):
                 "base_url": self._base_url,
                 "api_key_env": self._api_key_env,
             },
+            "otel": self._otel_env or None,
             "environment": {
                 "machine": machine,
                 "ca_bundle": ca_bundle,

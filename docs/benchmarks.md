@@ -217,6 +217,7 @@ Settings ride environment variables, each of which has a matching
 | `KAIJUTSU_ACP_WORKSPACE_MOUNTS` | `workspace_mounts` | Comma-separated directories mounted read-write and made if missing, written to the state directory's `config/mounts.toml`. Unset: `/app,/git,/srv`. Empty: none. |
 | `KAIJUTSU_ACP_RC_OVERLAY` | `rc_overlay` | A local rc variant directory, uploaded and applied before any context is created. |
 | `KAIJUTSU_ACP_EGRESS_ALLOW` | `egress_allow` | Comma-separated hosts the coder context's `curl` may reach (`docs/egress.md`). Unset: `*`, every host. Empty: none. The adapter adds `coder/create/S50-egress.kai` to the rc overlay; it runs `kj context set . --egress-allow HOST` as the root character `solo`, the context's lineage root. It refuses an overlay that already has that file, and a `--context-type` in `solo_args`. |
+| `KAIJUTSU_ACP_OTLP_ENDPOINT` | `otlp_endpoint` | OTLP gRPC endpoint the agent exports traces to, as the task container reaches it: `http://host.containers.internal:4317` on moltar. Sets `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_RESOURCE_ATTRIBUTES` (`harbor.job.name`, `harbor.trial.name`, `harbor.task.name`, `kaijutsu.commit`) in the agent's environment; the service name is `kaijutsu-solo-acp`. Unset: no export. A loopback address is refused, because inside the container it is the container's own. The collector must listen beyond loopback; run `contrib/bench/otel-collector-listen.sh` as root once. |
 | `KAIJUTSU_ACP_MODEL` | `solo_model` | The model id. Unset: `deepseek-v4-flash`. |
 | `KAIJUTSU_ACP_BACKEND` | `backend_kind` | The provider. Unset: `deepseek`. |
 | `KAIJUTSU_ACP_BASE_URL` | `base_url` | `--base-url URL`, an OpenAI-compatible endpoint. Unset: the provider's own. |
@@ -310,6 +311,14 @@ pass after a turn that fell over.
 
 `asks_orphaned` counts asks the turn raised and then outran, which is a stall
 with no ask visible to the client.
+
+**Expect some rejected and failed calls in every run.** Models already write
+good shell and JSON, so kaish lets them write what they know and refuses what
+falls outside its language before anything runs. The refusal names the fix,
+and the next call usually takes it. A rejection followed by a corrected call
+is kaish working as designed, not a defect. Count it as a problem when the same
+refusal repeats, when the model cannot find the fix from the message, or when
+the refusal costs the task.
 
 The **verdict line** is the driven-worker convention: the worker's final
 message ends with `RESULT: done`, `RESULT: blocked — …`, or

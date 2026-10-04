@@ -252,10 +252,20 @@ fn main() -> ExitCode {
 
     // stderr only — stdout carries the ACP protocol.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false))
-        .init();
+        .with(fmt::layer().with_writer(std::io::stderr).with_ansi(false));
+
+    // Export starts only when the standard OTel variables ask for it. The
+    // guard flushes pending spans when `main` returns.
+    let _otel_guard = if kaijutsu_telemetry::otel_enabled() {
+        let (otel_layer, guard) = kaijutsu_telemetry::otel_layer("kaijutsu-solo-acp");
+        registry.with(otel_layer).init();
+        Some(guard)
+    } else {
+        registry.init();
+        None
+    };
 
     let cli = Cli::parse();
     match run(cli) {
