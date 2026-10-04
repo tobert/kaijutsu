@@ -14,24 +14,45 @@ Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 /config/rc/director/create/S00-stance.kai
 /config/rc/director/create/S00-stance.md
 /config/rc/director/create/S06-kj-help.kai
+/config/rc/director/create/S06-kj-help.md
 ```
 
 Each context type owns its whole stance. No base is shared between types, and
 Kaijutsu never prepends a universal behavioral prompt. A stance is a Markdown
-companion read by a one-line `.kai`, so the text is the file. Coder, default,
-and director each state the collaboration rules in their own words: the
-person is accountable, follow their objective and corrections, separate
-observations from inferences and unknowns, and report only checks that ran.
+companion read by a one-line `.kai`, so the text is the file. Every stance
+says who is accountable for the work; `seed_scripts.rs` tests that each one
+does.
 
-Stances are written for every model in one register, after kaibo's preambles
-(`~/src/kaibo/src/consult/prompts.rs`): open on the role, use plain literal
-English with one instruction per sentence, say what to do rather than what to
-avoid, give no length cues, and end on what finishes the turn. Most readers
-are not English-first, so shipped stances are ASCII and carry no idiom or
-other language; `shipped_stances_are_plain_ascii_english` holds that for the
-rewritten stances. A stance may close with 頑張って on its own line: it is
-encouragement, not instruction. The coder stance does. A person's own prompts may use any language. No stance
-branches on the model name; per-model specializations are future work.
+We write stances as one of us talking to the rest of us. A stance opens on the
+system it belongs to: "We are a cybernetic system focused on software
+engineering" for the coder, "...on coordinating people and models across
+contexts" for the director. Then it says who answers for us: the human in our
+system is accountable for our work, and our work reflects on them. From there
+it speaks in the inclusive we. The seat, its performer, and the human are one
+system, so a stance says what we do, not what you must do. The default stance
+still speaks in the second person and is next to move.
+
+A stance describes the work as a feedback loop. We decide how we will know the
+work is complete, orient on the data, its structure, and who consumes it, act,
+check the result against what we decided, and report what we observed, what we
+infer, and where we guessed. Saying that we guessed, and how confident we are,
+is part of the loop: a wrong guess caught by our own check is the system
+working.
+
+A stance may give a seat a character to play when that helps the performer
+hold the role. The director plays a banto, the head clerk of an old merchant
+house who keeps the ledger and makes the house run. A character is written as
+behavior, never as a label, and its temper is about the work, never the
+person. Narrative is welcome where it carries behavior; procedure and syntax
+stay in tool schemas and `--help`, and examples are checked against the real
+command.
+
+Most readers are not English-first, so the prose stays plain: concrete nouns,
+one claim per sentence, no idiom that hides its meaning. Shipped stances are
+ASCII except a closing 頑張って on its own line, which is encouragement, not
+instruction; `shipped_stances_are_plain_ascii_english` holds that. A person's
+own prompts may use any language. No stance branches on the model name;
+per-model specializations wait for comparative evidence.
 
 The kernel adds runtime facts, including the performing character and its
 assigned reviewer (stable IDs and names); rc supplies the instruction
