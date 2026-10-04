@@ -699,7 +699,7 @@ fn test_rpc_created_context_runs_rc_create() {
         let has_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("You are a coder.")
+                && b.content.contains("We are a cybernetic system focused on software engineering.")
         });
         assert!(
             has_stance,
@@ -750,7 +750,7 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         // negative the default-context test makes, in the direction a
         // copy-pasted bucket would actually break.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("You are a coder.")),
+            !blocks.iter().any(|b| b.content.contains("We are a cybernetic system focused on software engineering.")),
             "assistant context must not get the coder stance"
         );
     });
@@ -773,7 +773,7 @@ fn test_rpc_default_context_type_is_default() {
         // (coder/create/S00-stance.md), so a real leak trips this; a stale
         // phrase would pass regardless.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("You are a coder.")),
+            !blocks.iter().any(|b| b.content.contains("We are a cybernetic system focused on software engineering.")),
             "default context must not get the coder stance; got {} blocks: {:#?}",
             blocks.len(),
             blocks
@@ -805,7 +805,7 @@ fn test_coder_stance_is_the_same_for_every_model() {
         );
         blocks
             .into_iter()
-            .find(|b| b.role == Role::System && b.kind == BlockKind::Text && b.content.starts_with("You are a coder."))
+            .find(|b| b.role == Role::System && b.kind == BlockKind::Text && b.content.starts_with("We are a cybernetic system focused on software engineering."))
             .unwrap_or_else(|| panic!("no coder stance for {model}"))
             .content
     };

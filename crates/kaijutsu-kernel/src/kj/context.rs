@@ -6813,7 +6813,7 @@ mod tests {
         assert!(
             before_sections
                 .iter()
-                .any(|section| section.contains("You are a coder.")),
+                .any(|section| section.contains("We are a cybernetic system focused on software engineering.")),
             "first context must receive the seeded coder stance: {before_sections:?}"
         );
 
