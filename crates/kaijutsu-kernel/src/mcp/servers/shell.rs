@@ -94,8 +94,8 @@ const ABOUT_KAISH: &str = "The shell is kaish (会sh), a shell for agents with \
      and use JSON where structure helps: a variable holds a string, a number, a \
      list, or a record, and builtins print JSON when you pass `--json`. Quote \
      words the way you quote JSON strings. A bare word holds only letters, \
-     digits, and the marks `_ . - / @ + ^ ~`, and globs such as `*.log` work \
-     as usual. Put any other text in quotes: double quotes for text with \
+     digits, and the marks `_ . - / @ + ^ ~`. List files with the `glob` \
+     builtin, as in `glob **/*.log`; `--json` returns a typed list. Put any other text in quotes: double quotes for text with \
      spaces, punctuation, or a variable, as in \"/tmp/$f.csv\", and single \
      quotes for text kaish should leave alone. A bare number follows JSON \
      rules, so `007` is a string. kaish checks the whole program before it runs any of it. When something is \
@@ -464,6 +464,8 @@ mod tests {
         assert!(text.contains("Write the shell you already know"), "{text}");
         assert!(text.contains("says what to write instead"), "{text}");
         assert!(text.contains("`help syntax`") && text.contains("script file"), "{text}");
+        // File lists come from the glob builtin: `**` recursion and a typed list.
+        assert!(text.contains("`glob **/*.log`") && text.contains("`--json`"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
         // kaish is described by what it is, never by comparison to another shell.
         for description in [text, ro_text] {
