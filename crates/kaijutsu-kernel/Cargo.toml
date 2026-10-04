@@ -51,6 +51,7 @@ rusqlite.workspace = true
 # (docs/issues.md — approval ledger slice 1a). DB-injected: KernelDb hands
 # the ledger crate its own `&Connection`, same pattern as `hook_scripts`.
 approval-ledger.workspace = true
+kaijutsu-council.workspace = true
 
 # Claude Code's per-session peer messaging socket: registry scan, liveness
 # guard, attribution envelope, frames, delivery (docs/cc-peer.md). Protocol

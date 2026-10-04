@@ -6736,6 +6736,7 @@ dependencies = [
  "kaijutsu-ansi",
  "kaijutsu-audio",
  "kaijutsu-cas",
+ "kaijutsu-council",
  "kaijutsu-diff",
  "kaijutsu-editor",
  "kaijutsu-hyoushigi",

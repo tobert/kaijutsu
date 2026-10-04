@@ -19,6 +19,7 @@ pub mod cc_inbox;
 pub mod image;
 pub mod config_seed;
 pub mod continuation;
+pub(crate) mod council;
 pub mod drift;
 pub mod editor;
 pub mod execution;
