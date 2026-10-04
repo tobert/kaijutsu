@@ -155,6 +155,15 @@ WAL. Accept `-p`, or have the refusal name the fix.
   span and the event only. Durable would mean an additive column written
   after the ask's transaction commits.
 
+## `kj context list --tree` draws siblings as children (2026-10-04)
+
+On zorak, `kj context list --tree` drew `tui-ask-stuck`, the banto contexts,
+and others one level under `council-setup-cf`, a context created that minute
+whose `kj context info` reports 0 children and `forked_from` = `amy`. Amy
+could not find her root context (`amy`, f8f4010b, 125 children) in the tui
+either; the root is not labeled as one, and about 150 contexts sit at the
+top level beside it.
+
 ## `blocks repair-order` does not converge on one conversation (2026-10-04)
 
 On zorak's deploy, the first `--apply` fixed 1099 conversations' worth of
