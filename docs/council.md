@@ -31,7 +31,8 @@ submission -> gate_policy::evaluate        (docs/gate-policy-tuning.md)
                 -> the Uncovered statements become council allows; the submission runs
                    with a durable auto-decision row naming the council
         ask     -> ledger ask, with the council's answer attached
-        report  -> ledger ask, plus a council report event
+        report  -> ledger ask, plus a council report event; an autonomous seat's
+                   running turn is interrupted
         miss    -> ledger ask; the row records why the council did not answer
 ```
 
@@ -60,9 +61,15 @@ should record the confidences too btw."
   means the submission spells a model's control token. That is suspicious in
   a shell statement, so the decision is recorded and the gate asks, whatever
   the probabilities say.
-- **Report is an ask for now.** It also publishes a kernel event that names
-  the submission, the seat, and the per-context answers, for logs and a later
-  alert channel. Making report stop an autonomous seat is a later choice.
+- **Report stops an autonomous seat.** A report opens the ask like any
+  other, publishes a kernel event that names the submission, the seat, and
+  the per-context answers, and, when the seat's turn is autonomous,
+  interrupts that turn the way `kj interrupt` does (`Kernel::interrupt_context`).
+  The seat stays stopped until someone answers the ask or drives it again.
+  A turn is autonomous when the kernel drove it (`TurnOrigin::Autonomous`)
+  or when its requester is not a live root character, so a swarm seat
+  driven over ACP counts. A person at the keyboard keeps the ordinary ask.
+  Amy, 2026-10-04: "report should stop autonomous seats".
 - **The council never lowers a static ask and never overrides a deny.** A
   static `ask` key stays firm (`assets/defaults/gate.toml`: "ask is firm — no
   lower layer can allow it"). The council's answer on it is recorded, which
@@ -310,25 +317,22 @@ would put an authority decision in a script.
    both servers run. The megakernel serves `/council/v1/`.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
    tables, one spec, the voice and system-rules contexts sent at boot and on
-   config change, traces, and the report event. Deployed on zorak against
+   config change, traces, the report event, and a report interrupting an
+   autonomous seat's turn. Deployed on zorak against
    the megakernel, with coder seats moved back to `uncovered = "ask"`.
 3. **Live contexts.** Change-feed sync with `warm`, so tuning by chat lands
    on the next decision. Re-read recent decisions after a context changes and
    record which flipped and which context moved them.
 4. **Programs.** The program spec and the second decision.
 5. **lfm2d and Jev.** lfm2d behind the port; a Jev comparison run.
-6. **System 2 and loud reports.** A reasoning reviewer on disagreement
-   (`agree` false or a high `spread`) before the ledger, and report alerts
-   past logging.
+6. **System 2 and loud reports.** A reasoning reviewer after the ledger:
+   it reads an open ask (first those where the council disagreed, `agree`
+   false or a high `spread`) and attaches its judgment to the ask as advice,
+   off the hot path. Amy, 2026-10-04: "system 2 after the ledger". Report
+   alerts past logging come with it.
 
 ## Open questions for Amy
 
-- **System 2's place.** Before the ledger on disagreement costs seconds per
-  disputed submission. After the ledger, as an advisor on the ask, costs
-  nothing on the hot path.
-- **Autonomous seats and report.** For now report is an ask. A swarm seat
-  with no human nearby waits on that ask; should report stop the seat's turn
-  instead?
 - **The ask's wait in a swarm.** A swarm seat whose submission the council
   sends to the ledger waits on a human. Is that the behavior we want, or
   should the seat get the refusal back and choose another command?
