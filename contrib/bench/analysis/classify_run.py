@@ -899,6 +899,10 @@ _STREAM_LINE_RE = re.compile(
     r"LLM stream completed: stop_reason=(?P<stop_reason>\S+?), "
     r"tokens_in=(?P<tokens_in>Some\(\d+\)|None), "
     r"tokens_out=(?P<tokens_out>Some\(\d+\)|None)"
+    # Anthropic only: cache traffic that tokens_in excludes.
+    r"(?:, cache_read=(?P<cache_read>\d+), cache_write=(?P<cache_write>\d+))?"
+    # OpenAI-compatible (DeepSeek): the hit is already inside tokens_in.
+    r"(?:, cache_hit=(?P<cache_hit>\d+), cache_miss=(?P<cache_miss>\d+))?"
 )
 _SOME_INT_RE = re.compile(r"Some\((\d+)\)")
 
@@ -924,6 +928,11 @@ def parse_kernel_log(path: Path, session_id: str | None) -> dict[str, Any]:
     lines_in_scope = 0
     tokens_in_total = 0
     tokens_out_total = 0
+    # None until a line in scope carries the field: old logs and providers
+    # without cache data stay "unknown", not zero.
+    cache_read_total: int | None = None
+    cache_write_total: int | None = None
+    cache_hit_total: int | None = None
     stop_reasons: Counter[str] = Counter()
 
     for lineno, raw_line in enumerate(raw.splitlines(), start=1):
@@ -949,6 +958,11 @@ def parse_kernel_log(path: Path, session_id: str | None) -> dict[str, Any]:
         tout = _SOME_INT_RE.search(match.group("tokens_out"))
         tokens_in_total += int(tin.group(1)) if tin else 0
         tokens_out_total += int(tout.group(1)) if tout else 0
+        if match.group("cache_read") is not None:
+            cache_read_total = (cache_read_total or 0) + int(match.group("cache_read"))
+            cache_write_total = (cache_write_total or 0) + int(match.group("cache_write"))
+        if match.group("cache_hit") is not None:
+            cache_hit_total = (cache_hit_total or 0) + int(match.group("cache_hit"))
 
     return {
         "kernel_log_lines_matched": lines_matched,
@@ -956,6 +970,13 @@ def parse_kernel_log(path: Path, session_id: str | None) -> dict[str, Any]:
         "kernel_log_scoped_to_session": target is not None,
         "tokens_in_total": tokens_in_total,
         "tokens_out_total": tokens_out_total,
+        "cache_read_total": cache_read_total,
+        "cache_write_total": cache_write_total,
+        "cache_hit_total": cache_hit_total,
+        # Everything sent to the model. Anthropic's tokens_in excludes cache
+        # reads and writes, so they are added; DeepSeek's tokens_in already
+        # includes its cache hits, so cache_hit is not.
+        "input_total": tokens_in_total + (cache_read_total or 0) + (cache_write_total or 0),
         "llm_stream_stop_reasons": dict(sorted(stop_reasons.items())),
     }
 
@@ -1228,6 +1249,8 @@ def format_text(report: dict[str, Any]) -> str:
     if "tokens_in_total" in report:
         lines.append(
             f"tokens: in={report['tokens_in_total']} out={report['tokens_out_total']} "
+            f"cache_read={report['cache_read_total']} cache_write={report['cache_write_total']} "
+            f"cache_hit={report['cache_hit_total']} input_total={report['input_total']} "
             f"(kernel log lines parsed: {report['kernel_log_lines_parsed']}"
             f"/{report['kernel_log_lines_matched']} matched, "
             f"scoped={report['kernel_log_scoped_to_session']})"

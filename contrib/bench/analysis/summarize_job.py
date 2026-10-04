@@ -42,7 +42,12 @@ When a trial's `agent/acp.txt` exists (a kaijutsu kernel log riding the
 agent's stderr, always present for a Harbor ACP trial since the adapter
 sets `RUST_LOG=info`), this parses it with classify_run's
 `parse_kernel_log` and fills `tokens_in`, `tokens_out`, and
-`llm_inferences` from it, overriding whatever `agent_result` carried. The
+`llm_inferences` from it, overriding whatever `agent_result` carried.
+It also fills `cache_read_tokens` and `cache_write_tokens` (Anthropic,
+which excludes them from `tokens_in`), `cache_hit_tokens` (DeepSeek, which
+includes them in `tokens_in`), and `input_total` = `tokens_in` +
+`cache_read_tokens` + `cache_write_tokens`. A cache column is null when no
+log line carried it (older logs, or a provider that reports none). The
 session id to scope that parse to is resolved in order (classify_run's
 `resolve_session_id`): `acp-summary.json`'s `session.sessionId`, when
 present; else `acp-events.jsonl`'s `session_update` events' `session_id`,
@@ -207,6 +212,10 @@ def acp_kernel_log_tokens(
         return {
             "tokens_in": None,
             "tokens_out": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "cache_hit_tokens": None,
+            "input_total": None,
             "llm_inferences": None,
             "reason": reason,
             "tokens_source": None,
@@ -231,6 +240,10 @@ def acp_kernel_log_tokens(
         return {
             "tokens_in": None,
             "tokens_out": None,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "cache_hit_tokens": None,
+            "input_total": None,
             "llm_inferences": None,
             "reason": reason,
             "tokens_source": None,
@@ -239,6 +252,10 @@ def acp_kernel_log_tokens(
     return {
         "tokens_in": parsed["tokens_in_total"],
         "tokens_out": parsed["tokens_out_total"],
+        "cache_read_tokens": parsed["cache_read_total"],
+        "cache_write_tokens": parsed["cache_write_total"],
+        "cache_hit_tokens": parsed["cache_hit_total"],
+        "input_total": parsed["input_total"],
         "llm_inferences": lines_in_scope,
         "reason": None,
         "tokens_source": tokens_source,
@@ -257,6 +274,10 @@ def _base_row(trial_dir: Path) -> dict[str, Any]:
         "tokens_in": None,
         "tokens_out": None,
         "tokens_cache": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_hit_tokens": None,
+        "input_total": None,
         "cost_usd": None,
         "exception_type": None,
         "exception_message": None,
@@ -364,6 +385,10 @@ def summarize_trial(trial_dir: Path) -> dict[str, Any]:
     if kernel_tokens is not None:
         row["tokens_in"] = kernel_tokens["tokens_in"]
         row["tokens_out"] = kernel_tokens["tokens_out"]
+        row["cache_read_tokens"] = kernel_tokens["cache_read_tokens"]
+        row["cache_write_tokens"] = kernel_tokens["cache_write_tokens"]
+        row["cache_hit_tokens"] = kernel_tokens["cache_hit_tokens"]
+        row["input_total"] = kernel_tokens["input_total"]
         row["llm_inferences"] = kernel_tokens["llm_inferences"]
         row["tokens_source"] = kernel_tokens["tokens_source"]
         row["tokens_absent_reason"] = kernel_tokens["reason"]
@@ -409,6 +434,10 @@ def compute_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         total_tokens = sum(r["tokens_in"] + r["tokens_out"] for r in solved_with_tokens)
         tokens_per_solved_task = total_tokens / len(solved_with_tokens)
 
+    def _sum_known(key: str) -> int | None:
+        known = [r[key] for r in completed if isinstance(r.get(key), (int, float))]
+        return sum(known) if known else None
+
     solved_durations = [r["duration_seconds"] for r in solved if isinstance(r["duration_seconds"], (int, float))]
     median_duration_seconds_solved = statistics.median(solved_durations) if solved_durations else None
 
@@ -445,6 +474,10 @@ def compute_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "pass_rate": pass_rate,
         "tokens_per_solved_task": tokens_per_solved_task,
         "n_solved_with_token_data": len(solved_with_tokens),
+        "cache_read_tokens": _sum_known("cache_read_tokens"),
+        "cache_write_tokens": _sum_known("cache_write_tokens"),
+        "cache_hit_tokens": _sum_known("cache_hit_tokens"),
+        "input_total": _sum_known("input_total"),
         "median_duration_seconds_solved": median_duration_seconds_solved,
         "ask_count": ask_count,
         "stall_count": stall_count,
@@ -476,6 +509,10 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "asks_orphaned",
         "tokens_in",
         "tokens_out",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_hit_tokens",
+        "input_total",
         "llm_inferences",
         "tokens_source",
         "cost_usd",
@@ -503,6 +540,10 @@ def format_markdown(rows: list[dict[str, Any]], totals: dict[str, Any]) -> str:
         "pass_rate",
         "tokens_per_solved_task",
         "n_solved_with_token_data",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_hit_tokens",
+        "input_total",
         "median_duration_seconds_solved",
         "ask_count",
         "stall_count",

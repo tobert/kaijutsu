@@ -405,6 +405,34 @@ class TestAcpKernelLogTokens(unittest.TestCase):
             self.assertEqual(row["tokens_source"], "kernel_log")
             self.assertIsNone(row["tokens_absent_reason"])
 
+    def test_cache_counts_reach_row_and_totals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            trial_dir = job_dir / "fix-git__aaa"
+            write_trial_result(
+                trial_dir,
+                agent_info={"name": "kaijutsu-solo-acp", "version": "0.1.0", "model_info": None},
+                agent_result={"n_input_tokens": None, "n_cache_tokens": None, "n_output_tokens": None, "cost_usd": None},
+                verifier_result={"rewards": {"reward": 1.0}},
+            )
+            write_acp_logs(trial_dir, session_id=self.SESSION_ID)
+            write_acp_kernel_log(
+                trial_dir,
+                KERNEL_LOG_TEMPLATE.format(ctx=dashed(self.SESSION_ID), stop="end_turn", tin=100, tout=10).replace(
+                    "\n", ", cache_read=4000, cache_write=500\n"
+                ),
+            )
+            row = sj.summarize_trial(trial_dir)
+            self.assertEqual(row["tokens_in"], 100)
+            self.assertEqual(row["cache_read_tokens"], 4000)
+            self.assertEqual(row["cache_write_tokens"], 500)
+            self.assertEqual(row["input_total"], 4600)
+            totals = sj.compute_totals([row])
+            self.assertEqual(totals["cache_read_tokens"], 4000)
+            self.assertEqual(totals["cache_write_tokens"], 500)
+            self.assertEqual(totals["input_total"], 4600)
+            self.assertEqual(totals["tokens_per_solved_task"], 110)
+
     def test_zero_matching_lines_reports_absent_not_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = Path(tmp)

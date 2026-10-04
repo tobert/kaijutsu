@@ -341,6 +341,22 @@ Totals worth watching:
   kaijutsu sends no `PromptResponse.usage`. The kernel log riding the agent's
   stderr into `agent/acp.txt` is the only token record, scoped to that trial's
   session id.
+- Token columns, from the kernel log's "LLM stream completed" line. Each
+  provider's own meaning is kept:
+  - `tokens_in` is the provider's input count. Anthropic excludes prompt-cache
+    reads and writes from it. DeepSeek includes its cache hits.
+  - `cache_read_tokens` and `cache_write_tokens` are Anthropic's cache reads
+    and writes, logged as `cache_read=` and `cache_write=`. They are not in
+    `tokens_in`.
+  - `cache_hit_tokens` is DeepSeek's cache hit count, logged as `cache_hit=`.
+    It is already in `tokens_in`, so it is never added.
+  - `input_total` is `tokens_in + cache_read_tokens + cache_write_tokens`: all
+    input sent to the model. For DeepSeek it equals `tokens_in`.
+  - A cache column is empty when no log line carried it: jobs run before these
+    fields existed, or a provider that reports no cache split. Empty means
+    unknown, not zero. `tokens_per_solved_task` still uses `tokens_in` plus
+    `tokens_out`, so it undercounts Anthropic runs; compare Anthropic runs on
+    `input_total`.
 
 **Provenance.** `<job>/kaijutsu-job-provenance.json` records what was asked
 for: job name, dataset or task path, task names, Harbor version, timeout

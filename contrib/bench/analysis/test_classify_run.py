@@ -530,6 +530,53 @@ class TestKernelLogParsing(unittest.TestCase):
             self.assertEqual(result["kernel_log_lines_matched"], 2)
             self.assertEqual(result["kernel_log_lines_parsed"], 1)
 
+    def test_old_lines_report_no_cache_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "kernel.log"
+            log_path.write_text(
+                self.LOG_TEMPLATE.format(ctx="a" * 8 + "-0000-0000-0000-000000000000", stop="end_turn", tin=5, tout=1)
+            )
+            result = cr.parse_kernel_log(log_path, None)
+            self.assertIsNone(result["cache_read_total"])
+            self.assertIsNone(result["cache_write_total"])
+            self.assertIsNone(result["cache_hit_total"])
+            self.assertEqual(result["input_total"], 5)
+
+    def test_anthropic_cache_counts_add_to_input_total(self):
+        ctx = "a" * 8 + "-0000-0000-0000-000000000000"
+        line = (
+            f'INFO llm.turn{{{{context.id={ctx}}}}}: kaijutsu_kernel::runtime::llm_stream: '
+            'LLM stream completed: stop_reason=Some("end_turn"), tokens_in=Some({tin}), '
+            'tokens_out=Some(10), cache_read={cr}, cache_write={cw}\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "kernel.log"
+            log_path.write_text(
+                line.format(tin=557, cr=0, cw=9000) + line.format(tin=20, cr=9000, cw=100)
+            )
+            result = cr.parse_kernel_log(log_path, None)
+            self.assertEqual(result["tokens_in_total"], 577)
+            self.assertEqual(result["cache_read_total"], 9000)
+            self.assertEqual(result["cache_write_total"], 9100)
+            self.assertIsNone(result["cache_hit_total"])
+            self.assertEqual(result["input_total"], 577 + 9000 + 9100)
+
+    def test_deepseek_cache_hit_is_not_added_to_input_total(self):
+        ctx = "a" * 8 + "-0000-0000-0000-000000000000"
+        line = (
+            f'INFO llm.turn{{{{context.id={ctx}}}}}: kaijutsu_kernel::runtime::llm_stream: '
+            'LLM stream completed: stop_reason=Some("stop"), tokens_in=Some(1000), '
+            'tokens_out=Some(10), cache_hit=900, cache_miss=100\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "kernel.log"
+            log_path.write_text(line)
+            result = cr.parse_kernel_log(log_path, None)
+            self.assertEqual(result["tokens_in_total"], 1000)
+            self.assertEqual(result["cache_hit_total"], 900)
+            self.assertIsNone(result["cache_read_total"])
+            self.assertEqual(result["input_total"], 1000)
+
     def test_unscoped_sums_whole_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "kernel.log"

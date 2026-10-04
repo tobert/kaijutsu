@@ -191,6 +191,28 @@ fn warn_if_near_context_window(
 /// Whether this turn takes input submitted while it runs. A stopping turn
 /// does not, nor does one a beat waits on: its caller budgeted one piece of
 /// work, and the input starts the next turn instead.
+/// Tail of the "LLM stream completed" log line carrying provider cache
+/// counts. Empty without an extra, so such lines keep their old shape.
+///
+/// Anthropic's `tokens_in` excludes cache traffic, so its counts are logged as
+/// `cache_read`/`cache_write` and a reader adds them to `tokens_in`.
+/// OpenAI-compatible providers (DeepSeek) count the hit inside `tokens_in`, so
+/// theirs are logged as `cache_hit`/`cache_miss`, which a reader must not add.
+fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
+    use crate::llm::UsageExtra;
+    match extra {
+        Some(UsageExtra::Claude(c)) => format!(
+            ", cache_read={}, cache_write={}",
+            c.cache_read_input_tokens, c.cache_creation_input_tokens
+        ),
+        Some(UsageExtra::OpenAiCompat(d)) => format!(
+            ", cache_hit={}, cache_miss={}",
+            d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens
+        ),
+        None => String::new(),
+    }
+}
+
 fn takes_live_input(interrupt: &ContextInterruptState, turn_lease: &TurnLease) -> bool {
     !interrupt.cancel.is_cancelled()
         && !interrupt.stop_after_turn.load(std::sync::atomic::Ordering::Relaxed)
@@ -3039,10 +3061,11 @@ async fn run_llm_stream(
                     };
                     output_ceiling_hit = stop_reason_out == TurnStopReason::MaxTokens;
                     tracing::info!(
-                        "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}",
+                        "LLM stream completed: stop_reason={:?}, tokens_in={:?}, tokens_out={:?}{}",
                         stop_reason,
                         input_tokens,
-                        output_tokens
+                        output_tokens,
+                        usage_log_suffix(&extra)
                     );
                     break 'stream true;
                 }
@@ -3384,6 +3407,36 @@ async fn run_llm_stream(
         reason: stop_reason_out,
         origin,
     })
+}
+
+#[cfg(test)]
+mod usage_log_tests {
+    use super::usage_log_suffix;
+    use crate::llm::{ClaudeUsageExtra, OpenAiCompatUsageExtra, UsageExtra};
+
+    #[test]
+    fn no_extra_leaves_the_line_unchanged() {
+        assert_eq!(usage_log_suffix(&None), "");
+    }
+
+    #[test]
+    fn claude_logs_additive_cache_counts() {
+        let extra = Some(UsageExtra::Claude(ClaudeUsageExtra {
+            cache_read_input_tokens: 12000,
+            cache_creation_input_tokens: 345,
+        }));
+        assert_eq!(usage_log_suffix(&extra), ", cache_read=12000, cache_write=345");
+    }
+
+    #[test]
+    fn openai_compat_logs_hit_and_miss_under_other_names() {
+        let extra = Some(UsageExtra::OpenAiCompat(OpenAiCompatUsageExtra {
+            prompt_cache_hit_tokens: 900,
+            prompt_cache_miss_tokens: 100,
+            reasoning_tokens: 7,
+        }));
+        assert_eq!(usage_log_suffix(&extra), ", cache_hit=900, cache_miss=100");
+    }
 }
 
 #[cfg(test)]
