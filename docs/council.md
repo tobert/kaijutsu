@@ -64,11 +64,19 @@ should record the confidences too btw."
   means the submission spells a model's control token. That is suspicious in
   a shell statement, so the decision is recorded and the gate asks, whatever
   the probabilities say.
-- **Report stops an autonomous seat.** A report opens the ask like any
-  other, publishes a kernel event that names the submission, the seat, and
-  the per-context answers, and, when the seat's turn is autonomous,
-  interrupts that turn the way `kj interrupt` does (`Kernel::interrupt_context`).
-  The seat stays stopped until someone answers the ask or drives it again.
+- **Report stops an autonomous seat and keeps its ask.** A report opens the
+  ask like any other and, when the seat's turn is autonomous, stops that
+  turn with `Kernel::interrupt_context_keeping_asks`: no further model
+  calls, and the ask stays redeemable. An allow runs the stored command once
+  in the approval worker; a deny runs nothing. The seat stays stopped until
+  someone drives it again. Amy, 2026-10-04: "report should keep the ask
+  redeemable; it will still come to an ask and we will likely have false
+  positives sometimes." After the ask exists, the kernel publishes the
+  `council.report` event, which names the submission, the seat, the
+  per-context answers, and `council.report_stop` (`not_autonomous`,
+  `nothing_running`, `interrupted`, `failed`, or `no_ask`); the
+  `council.decide` span carries the same value. The decision record does
+  not store it.
   A turn is autonomous when the kernel drove it (`TurnOrigin::Autonomous`)
   or when its requester is not a live root character, so a swarm seat
   driven over ACP counts. A person at the keyboard keeps the ordinary ask.

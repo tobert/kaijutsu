@@ -65,6 +65,13 @@ the wire: the MCP and RPC shell paths still return `Pending`.
   ask is abandoned and the pair settles `Error`; an answer nobody has run is
   spent without running. An answer the worker already claimed stays the
   worker's: its command is cancelled and the worker settles the pair.
+  The one exception is the council's stop for a report
+  (`Kernel::interrupt_context_keeping_asks`): it ends the turn but leaves
+  the held ask pending, so the ask is treated as one whose turn ended at
+  the gate. An allow runs the stored command once in the approval worker and
+  settles the pair in place, a deny settles it as the denial, and a
+  background call answers with its waiting receipt. `kj interrupt` and
+  every other interrupt keep the rule above.
 - **Restart.** Holds are not durable. Boot abandons pending asks and closes
   `Waiting` pairs, so a held call fails.
 - **Offline.** An offline `kj` command has no approval worker, so a model

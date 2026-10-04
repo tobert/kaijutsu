@@ -146,9 +146,14 @@ WAL. Accept `-p`, or have the refusal name the fix.
   them nullable or record the miss in its own shape.
 - **Untested path:** the unlinked-record fallback, used when the gate stops
   before an ask exists; reachable only on faults.
-- **Report-stop is built and not wired.** `council::report_stop` waits on
-  Amy: an interrupt abandons the turn's held ask (`runtime/interrupt.rs`), so
-  docs/council.md's "until someone answers the ask" is not true today.
+- **A kept ask can lose its notice to a narrow race.** The worker can claim
+  an answer after a turn's wait returned but before `leave_to_worker` runs;
+  it then still sees a holder and skips the completion notice and the
+  conversation-cache eviction while the command runs. In the report flow the
+  interrupt fires before the hold exists, so the window is microseconds.
+- **The decision record does not store the report stop.** It is on the
+  span and the event only. Durable would mean an additive column written
+  after the ask's transaction commits.
 
 ## `blocks repair-order` does not converge on one conversation (2026-10-04)
 

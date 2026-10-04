@@ -1132,6 +1132,26 @@ impl Kernel {
         Ok(InterruptOutcome { turn_interrupted, continuation_closed })
     }
 
+    /// Softly interrupt a context as [`Self::interrupt_context`] does, but
+    /// leave every ask its turns hold pending: the turns stop waiting and
+    /// end, and an allow lets the approval worker run each stored command
+    /// once and settle its call's result in place. A council report on an
+    /// autonomous seat stops it this way (`council::report_stop`).
+    pub(crate) fn interrupt_context_keeping_asks(
+        &self,
+        context_id: kaijutsu_types::ContextId,
+        by: kaijutsu_types::PrincipalId,
+    ) -> Result<InterruptOutcome, String> {
+        let now = kaijutsu_types::now_millis() as i64;
+        let continuation_closed = self
+            .kernel_db()
+            .lock()
+            .record_continuation_interrupt(context_id, by, now)
+            .map_err(|e| e.to_string())?;
+        let turn_interrupted = self.turn_state.interrupt_keeping_asks(context_id);
+        Ok(InterruptOutcome { turn_interrupted, continuation_closed })
+    }
+
     /// Get the content-addressed store.
     pub fn cas(&self) -> &Arc<FileStore> {
         &self.cas

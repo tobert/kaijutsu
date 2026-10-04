@@ -649,8 +649,8 @@ fn field<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 /// A report asks, emits a `council.report` event naming the submission,
-/// the seat, and each context's answer, and traces the decision with its
-/// probabilities.
+/// the seat, each context's answer, and what stopping the seat did, and
+/// traces the decision with its probabilities and the same stop.
 #[tokio::test]
 async fn a_council_report_asks_and_emits_the_report_event() {
     use tracing_subscriber::layer::SubscriberExt;
@@ -678,11 +678,15 @@ async fn a_council_report_asks_and_emits_the_report_event() {
         assert_eq!(field(report, "actor_id"), Some(rig.ctx.actor_id.to_string().as_str()));
         let answers = field(report, "answers").unwrap();
         assert!(answers.contains("voice") && answers.contains("system-rules") && answers.contains("report"), "{answers}");
+        // The submitter has no character sheet, so the seat is autonomous;
+        // no turn runs here and no continuation is open.
+        assert_eq!(field(report, "council.report_stop"), Some("nothing_running"), "{report:?}");
         drop(events);
 
         let spans = seen.spans.lock().unwrap();
         let (_, decide) = spans.iter().find(|(name, _)| name == "council.decide").unwrap_or_else(|| panic!("{via:?}: no council.decide span among {:?}", spans.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()));
         assert_eq!(field(decide, "council.outcome"), Some("report"), "{decide:?}");
+        assert_eq!(field(decide, "council.report_stop"), Some("nothing_running"), "{decide:?}");
         for name in ["council.p_allow", "council.p_ask", "council.p_report", "council.agree", "council.spread",
                      "council.weight_hash", "council.engine", "council.ms", "council.prepare_ms"] {
             assert!(field(decide, name).is_some(), "{via:?}: {name} missing from {decide:?}");
@@ -1242,4 +1246,286 @@ async fn one_deadline_bounds_prepare_and_the_decision_together() {
         assert!(cause.contains("deadline passed during the decision"), "{via:?}: {cause}");
         rig.finish().await;
     }
+}
+
+/// A model seat on a tool rig: the performer has a model character sheet, a
+/// scripted mock model is the default provider and records each request,
+/// and `/scratch` is a host directory the commands leave markers in.
+struct Seat {
+    rig: Rig,
+    sent: Arc<parking_lot::Mutex<Vec<Vec<crate::llm::Message>>>>,
+    turns: crate::flows::Subscription<crate::flows::TurnFlow>,
+    scratch: tempfile::TempDir,
+}
+
+fn shell_write_call(id: &str, command: &str, background: bool) -> Vec<crate::llm::stream::StreamEvent> {
+    use crate::llm::stream::StreamEvent;
+    let input = serde_json::json!({ "command": command, "run_in_background": background });
+    vec![
+        StreamEvent::ToolUse { id: id.into(), name: "shell_write".into(), input },
+        StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: None, output_tokens: None, extra: None },
+    ]
+}
+
+fn text_reply(text: &str) -> Vec<crate::llm::stream::StreamEvent> {
+    use crate::llm::stream::StreamEvent;
+    vec![
+        StreamEvent::TextStart,
+        StreamEvent::TextDelta(text.into()),
+        StreamEvent::TextEnd,
+        StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None },
+    ]
+}
+
+/// The marker command a seat's model submits: one line per run.
+const MARKER: &str = "echo report-ran >> /scratch/marker";
+
+impl Seat {
+    async fn new(council: &'static [[f64; 3]]) -> Self {
+        Self::calling(council, false).await
+    }
+
+    /// A seat whose model makes the call in the background when `background`.
+    async fn calling(council: &'static [[f64; 3]], background: bool) -> Self {
+        let rig = rig(Via::Tool, Setup::default()).await;
+        rig.mock.answers(council);
+        let kernel = rig.d.kernel();
+        kernel.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: rig.ctx.actor_id, name: "council-seat-performer".into(), created_at: 0,
+            retired_at: None, handoff_ctx: None, root_ctx: None, root: false,
+        }).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        kernel.mount("/scratch", crate::vfs::LocalBackend::new(scratch.path())).await;
+        let (mock, sent) = crate::llm::MockClient::new("")
+            .with_scripted_stream(vec![shell_write_call("report-1", MARKER, background), text_reply("continued")])
+            .recording_sent_messages();
+        {
+            let mut registry = kernel.llm().write().await;
+            registry.register("mock", Arc::new(crate::llm::Provider::Mock(mock)));
+            assert!(registry.set_default("mock"));
+            registry.set_default_model("mock-model");
+        }
+        kernel.start_approval_delivery().unwrap();
+        let turns = kernel.turn_flows().subscribe("turn.*");
+        Seat { rig, sent, turns, scratch }
+    }
+
+    fn kernel(&self) -> &Arc<crate::Kernel> {
+        self.rig.d.kernel()
+    }
+
+    /// Start one model turn on the seat, asked for by the live root `amy`.
+    async fn start(&self, origin: crate::flows::TurnOrigin) {
+        let kernel = self.kernel();
+        let context = self.rig.ctx.context_id;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let after = kernel.blocks().insert_block_as(context, None, None, kaijutsu_types::Role::User,
+            kaijutsu_types::BlockKind::Text, "run it", kaijutsu_types::Status::Done,
+            kaijutsu_types::ContentType::Plain, Some(amy)).unwrap();
+        let tool_ctx = crate::ExecContext::new(amy, context, "/", SessionId::new(), kernel.id());
+        let admission = kernel.admit_context(context).unwrap();
+        let slot = kernel.reserve_runtime_slot().unwrap();
+        crate::runtime::turn_request::queue_startup(kernel, crate::runtime::turn_request::StartupRequest {
+            admission, lease: kernel.turns().begin(context),
+            request: crate::runtime::turn_request::TurnRequest {
+                context_id: context, after_block_id: after, content: String::new(),
+                principal_id: amy, model: None, continuation_epoch: None, score: None,
+            },
+            origin, session: tool_ctx.session_id, tool_ctx: Some(tool_ctx), submit: None, joins_live_turn: false,
+        }, None, slot).unwrap().await.unwrap().unwrap();
+    }
+
+    /// The seat's next turn end, completed or failed.
+    async fn turn_end(&mut self) -> crate::flows::TurnFlow {
+        let context = self.rig.ctx.context_id;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = self.turns.recv().await.expect("the turn bus stays open").payload;
+                if matches!(event, crate::flows::TurnFlow::Completed { .. } | crate::flows::TurnFlow::Failed { .. })
+                    && event.context_id() == context
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the seat's turn ends")
+    }
+
+    async fn wait_for(&self, label: &str, check: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
+    }
+
+    async fn wait_for_ask(&self) -> ApprovalRow {
+        self.wait_for("the seat's ask", || !self.rig.asks().is_empty()).await;
+        self.rig.only_ask()
+    }
+
+    fn approval(&self, request_id: &str) -> ApprovalRow {
+        self.rig.d.kernel_db().lock().get_approval(request_id).unwrap().expect("the ask row")
+    }
+
+    fn marker(&self) -> String {
+        std::fs::read_to_string(self.scratch.path().join("marker")).unwrap_or_default()
+    }
+
+    fn result_block(&self) -> kaijutsu_types::BlockSnapshot {
+        self.kernel().blocks().block_snapshots(self.rig.ctx.context_id).unwrap().into_iter()
+            .find(|b| b.kind == kaijutsu_types::BlockKind::ToolResult && b.tool_use_id.as_deref() == Some("report-1"))
+            .expect("the call's result block")
+    }
+
+    /// Whether the approval worker settled the operation waiting on `ask`.
+    fn settled(&self, ask: &str) -> bool {
+        self.kernel().shell_operations().get_by_ask(ask, self.rig.ctx.context_id).unwrap()
+            .is_some_and(|operation| operation.completed_at.is_some())
+    }
+
+    /// Answer the pending ask and tell the worker.
+    fn answer(&self, allow: bool) {
+        self.rig.answer_pending(allow);
+        crate::kj::gate::announce_ledger_change(self.rig.d.kernel_db(), self.kernel().ledger_flows());
+    }
+
+    async fn finish(self) {
+        self.rig.finish().await;
+    }
+}
+
+/// A report on an autonomous seat stops its turn and keeps the ask: the
+/// turn ends without another model call, the ask stays pending and the
+/// call's result `Waiting`. An allow runs the stored command once through
+/// the approval worker, which settles that result in place; the seat stays
+/// stopped, and neither a second ledger scan nor a resubmission runs it
+/// again.
+///
+/// Falsified by `soft_keeping_asks` not setting its flag (the turn abandons
+/// the ask), and by `stop_if_autonomous` stopping nothing (the turn holds).
+#[tokio::test]
+async fn a_report_stops_an_autonomous_seat_and_an_allow_runs_the_kept_ask_once() {
+    let mut seat = Seat::new(&REPORT).await;
+    seat.start(crate::flows::TurnOrigin::Autonomous).await;
+    let ask = seat.wait_for_ask().await;
+    let ended = seat.turn_end().await;
+    assert!(matches!(ended, crate::flows::TurnFlow::Completed {
+        reason: crate::flows::TurnStopReason::Cancelled { immediate: false }, .. }), "{ended:?}");
+    assert!(!seat.kernel().turn_in_flight(seat.rig.ctx.context_id));
+    assert_eq!(seat.sent.lock().len(), 1, "the stopped turn asks the model nothing more");
+    assert_eq!(the_decision(&seat.rig, &ask).decision.outcome, CouncilOutcome::Report);
+    let ask = seat.rig.only_ask();
+    assert_eq!(ask.status, ApprovalStatus::Pending, "the report keeps the ask redeemable");
+    assert_eq!(seat.result_block().status, kaijutsu_types::Status::Waiting);
+    assert!(seat.marker().is_empty(), "nothing runs before the answer");
+
+    seat.answer(true);
+    seat.wait_for("the worker's run", || seat.settled(&ask.request_id)).await;
+    assert_eq!(seat.marker(), "report-ran\n", "the approval worker runs the stored command once");
+    assert_eq!(seat.result_block().status, kaijutsu_types::Status::Done, "its result settles on the call");
+
+    crate::kj::gate::announce_ledger_change(seat.rig.d.kernel_db(), seat.kernel().ledger_flows());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(seat.marker(), "report-ran\n", "a second scan does not run the spent answer");
+    assert!(!seat.kernel().turn_in_flight(seat.rig.ctx.context_id), "the seat stays stopped");
+    assert_eq!(seat.sent.lock().len(), 1, "nothing drove the seat");
+
+    seat.rig.mock.answers(&ASK);
+    assert_pending(Via::Tool, seat.rig.submit(MARKER).await);
+    assert_eq!(seat.marker(), "report-ran\n", "a resubmission asks again and runs nothing");
+    seat.finish().await;
+}
+
+/// A deny on a kept ask runs nothing; its result settles as the denial.
+#[tokio::test]
+async fn a_deny_leaves_a_kept_ask_unrun() {
+    let mut seat = Seat::new(&REPORT).await;
+    seat.start(crate::flows::TurnOrigin::Autonomous).await;
+    let ask = seat.wait_for_ask().await;
+    seat.turn_end().await;
+    assert_eq!(seat.rig.only_ask().status, ApprovalStatus::Pending);
+    seat.answer(false);
+    seat.wait_for("the denial to settle the call", || seat.result_block().status == kaijutsu_types::Status::Error).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(seat.marker().is_empty(), "a denied kept ask runs nothing");
+    assert_eq!(seat.approval(&ask.request_id).status, ApprovalStatus::Denied);
+    assert_eq!(seat.sent.lock().len(), 1);
+    seat.finish().await;
+}
+
+/// A root at the keyboard keeps the ordinary ask: the report stops
+/// nothing, the turn holds on its ask, and an allow continues the same turn
+/// with the command's real output.
+///
+/// Falsified by `stop_if_autonomous` treating every requester as
+/// autonomous: the turn ends at the report.
+#[tokio::test]
+async fn a_report_on_a_root_s_interactive_turn_keeps_the_ordinary_ask() {
+    let mut seat = Seat::new(&REPORT).await;
+    seat.start(crate::flows::TurnOrigin::Interactive).await;
+    let ask = seat.wait_for_ask().await;
+    assert_eq!(the_decision(&seat.rig, &ask).decision.outcome, CouncilOutcome::Report);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(seat.kernel().turn_in_flight(seat.rig.ctx.context_id), "the turn holds on its ask");
+    assert_eq!(seat.sent.lock().len(), 1);
+    seat.answer(true);
+    let ended = seat.turn_end().await;
+    assert!(matches!(ended, crate::flows::TurnFlow::Completed {
+        reason: crate::flows::TurnStopReason::EndTurn, .. }), "{ended:?}");
+    assert_eq!(seat.sent.lock().len(), 2, "the same turn continues");
+    assert_eq!(seat.marker(), "report-ran\n");
+    seat.finish().await;
+}
+
+/// `kj interrupt` still abandons the ask a turn holds: a late allow runs
+/// nothing.
+#[tokio::test]
+async fn kj_interrupt_still_abandons_a_held_ask() {
+    let mut seat = Seat::new(&ASK).await;
+    seat.start(crate::flows::TurnOrigin::Autonomous).await;
+    let ask = seat.wait_for_ask().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(seat.kernel().turn_in_flight(seat.rig.ctx.context_id), "an ask does not stop the seat");
+    let other = crate::kj::test_helpers::register_context(&seat.rig.d, Some("interrupter"), None, PrincipalId::new());
+    let result = seat.rig.d
+        .dispatch(&["interrupt".into(), seat.rig.ctx.context_id.to_string()], &crate::kj::test_helpers::caller_with_context(other))
+        .await;
+    assert!(result.is_ok(), "{}", result.message());
+    seat.turn_end().await;
+    assert_eq!(seat.approval(&ask.request_id).status, ApprovalStatus::Abandoned, "kj interrupt abandons the held ask");
+    assert_eq!(seat.result_block().status, kaijutsu_types::Status::Error);
+    crate::kj::gate::announce_ledger_change(seat.rig.d.kernel_db(), seat.kernel().ledger_flows());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(seat.marker().is_empty());
+    assert_eq!(seat.sent.lock().len(), 1);
+    seat.finish().await;
+}
+
+/// A background call's kept ask: the stopped turn answers with the waiting
+/// receipt, and an allow runs the command once.
+///
+/// Falsified by reading the kept background ask through
+/// `background_answer`: the receipt claims the command is running.
+#[tokio::test]
+async fn a_report_keeps_a_background_call_s_ask_and_an_allow_runs_it_once() {
+    let mut seat = Seat::calling(&REPORT, true).await;
+    seat.start(crate::flows::TurnOrigin::Autonomous).await;
+    let ask = seat.wait_for_ask().await;
+    seat.turn_end().await;
+    assert_eq!(seat.sent.lock().len(), 1);
+    assert_eq!(seat.rig.only_ask().status, ApprovalStatus::Pending, "the report keeps the background call's ask");
+    let block = seat.result_block();
+    let read = crate::llm::hydrate::model_tool_result_text(&block, &block.content);
+    assert!(read.contains("waiting for approval; not run yet") && read.contains(&ask.request_id),
+        "the model reads the waiting receipt: {read}");
+    assert!(seat.marker().is_empty());
+    seat.answer(true);
+    seat.wait_for("the worker's run", || seat.settled(&ask.request_id)).await;
+    assert_eq!(seat.marker(), "report-ran\n");
+    assert_eq!(seat.sent.lock().len(), 1, "the seat stays stopped");
+    seat.finish().await;
 }

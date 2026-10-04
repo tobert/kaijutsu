@@ -187,10 +187,21 @@ impl TurnState {
 
     /// Interrupt every accepted turn, including work waiting for the context lock.
     pub fn interrupt(&self, context: ContextId, immediate: bool) -> bool {
+        self.interrupt_with(context, |interrupt| if immediate { interrupt.hard() } else { interrupt.soft() })
+    }
+
+    /// Softly interrupt every accepted turn, leaving the asks their calls
+    /// hold pending for the approval worker
+    /// ([`ContextInterruptState::soft_keeping_asks`]).
+    pub(crate) fn interrupt_keeping_asks(&self, context: ContextId) -> bool {
+        self.interrupt_with(context, ContextInterruptState::soft_keeping_asks)
+    }
+
+    fn interrupt_with(&self, context: ContextId, signal: impl Fn(&ContextInterruptState)) -> bool {
         let active = self.active.lock();
         let Some(turns) = active.get(&context) else { return false; };
         for turn in turns.values() {
-            if immediate { turn.interrupt.hard(); } else { turn.interrupt.soft(); }
+            signal(turn.interrupt.as_ref());
         }
         true
     }

@@ -432,6 +432,19 @@ pub(crate) struct CouncilVerdict {
     council: CouncilConfig,
     /// The case state the decision read; the observations read it too.
     state: Json,
+    /// For a report: the submission and each read's answer, for the
+    /// `council.report` event [`Self::report`] emits.
+    report: Option<ReportedAnswers>,
+    /// For a report: the `council.decide` span, kept open until
+    /// [`Self::report`] records what the stop did.
+    decide_span: Option<tracing::Span>,
+}
+
+/// What the `council.report` event names besides the seat.
+#[derive(Clone, Debug)]
+struct ReportedAnswers {
+    submission: String,
+    answers: serde_json::Value,
 }
 
 impl CouncilVerdict {
@@ -466,6 +479,40 @@ impl CouncilVerdict {
     /// The voice skips recorded with the decision, in chain order.
     pub(crate) fn skips(&self) -> Vec<approval_ledger::council_observation::CouncilVoiceSkip> {
         self.skipped.iter().map(SkippedVoice::recorded).collect()
+    }
+
+    /// For a report, stop the seat when it is autonomous and `asked` (the
+    /// report's ask exists), then emit `council.report` and record the stop
+    /// on the `council.decide` span, both as `council.report_stop`. Any
+    /// other outcome does nothing. A stop that cannot be read or recorded
+    /// is logged with the report; the ask stands either way.
+    pub(crate) fn report(&mut self, kernel: &crate::Kernel, caller: &KjCaller, asked: bool) {
+        let Some(reported) = self.report.take() else { return };
+        let stop = match caller.context_id {
+            Some(context) if asked => super::report_stop::stop_if_autonomous(kernel, context, caller.principal_id),
+            _ => Err("the report left no ask, so nothing was stopped".to_string()),
+        };
+        let (word, error) = match &stop {
+            Ok(stop) => (stop.as_str(), None),
+            Err(error) if asked => ("failed", Some(error.as_str())),
+            Err(error) => ("no_ask", Some(error.as_str())),
+        };
+        if let Some(span) = self.decide_span.take() {
+            span.record("council.report_stop", word);
+        }
+        tracing::warn!(
+            name: "council.report",
+            target: "kaijutsu::council",
+            spec = %self.spec,
+            context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
+            actor_id = %caller.actor_id,
+            principal_id = %caller.principal_id,
+            submission = %reported.submission,
+            answers = %reported.answers,
+            council.report_stop = word,
+            council.report_stop_error = error,
+            "the council reports a shell submission; it goes to the ledger as an ask"
+        );
     }
 
     /// Read the observing voices against `decision_id` on a task of their
@@ -718,6 +765,8 @@ fn build_verdict(
         observing: carried.chain.observing,
         council: council.clone(),
         state: carried.state,
+        report: None,
+        decide_span: None,
     }
 }
 
@@ -759,6 +808,7 @@ pub(crate) async fn decide(
         council.tokenizer_hash = tracing::field::Empty,
         council.template = tracing::field::Empty,
         council.spec_id = tracing::field::Empty,
+        council.report_stop = tracing::field::Empty,
         council.deadline_ms = council.deadline_ms,
         council.prepare_ms = tracing::field::Empty,
         council.ms = tracing::field::Empty,
@@ -771,10 +821,13 @@ pub(crate) async fn decide(
     if let Some(context) = caller.context_id {
         span.record("context.id", context.to_string());
     }
-    let verdict = decide_inner(kernel, caller, submission, council, spec, chain).instrument(span.clone()).await;
+    let mut verdict = decide_inner(kernel, caller, submission, council, spec, chain).instrument(span.clone()).await;
     span.record("council.outcome", other_word(&verdict.outcome));
     if let Outcome::Miss(cause) = &verdict.outcome {
         span.record("council.miss_cause", cause.as_str());
+    }
+    if verdict.report.is_some() {
+        verdict.decide_span = Some(span);
     }
     verdict
 }
@@ -847,6 +900,7 @@ async fn decide_inner(
         span.record("council.agree", v.agree);
         span.record("council.spread", v.spread);
     }
+    let mut reported = None;
     if classification.outcome == Outcome::Report {
         let answers: Vec<serde_json::Value> = response
             .reads
@@ -862,19 +916,15 @@ async fn decide_inner(
                 serde_json::json!({"context": read.context, "label": label, "verdict": probabilities})
             })
             .collect();
-        tracing::warn!(
-            name: "council.report",
-            target: "kaijutsu::council",
-            spec = %spec.name,
-            context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
-            actor_id = %caller.actor_id,
-            principal_id = %caller.principal_id,
-            submission = %submission.command,
-            answers = %serde_json::Value::Array(answers),
-            "the council reports a shell submission; it goes to the ledger as an ask"
-        );
+        reported = Some(ReportedAnswers {
+            submission: submission.command.to_owned(),
+            answers: serde_json::Value::Array(answers),
+        });
     }
-    build_verdict(caller, &submission, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried)
+    let mut verdict =
+        build_verdict(caller, &submission, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
+    verdict.report = reported;
+    verdict
 }
 
 /// Why a spec cannot decide a gate ask, when it cannot: the gate acts on a

@@ -111,6 +111,14 @@ impl HeldAsk<'_> {
         };
         self.released
     }
+
+    /// End the hold and leave the ask to the approval worker: an answer
+    /// that arrives later is acted on as for an ask whose turn ended at the
+    /// gate. A command the worker already started for this hold keeps
+    /// running.
+    pub(crate) fn leave_to_worker(mut self) {
+        self.released = true;
+    }
 }
 
 impl Drop for HeldAsk<'_> {

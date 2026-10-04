@@ -587,8 +587,10 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 /// the allow. Every verdict is recorded with its voice
 /// skips: with the ask it led to, in the transaction that creates it, or
 /// unlinked when the gate stopped before an ask existed. A record that
-/// cannot be written refuses the call as gate unavailable. Once the record
-/// commits, the verdict's observing voices are read on a task of their own
+/// cannot be written refuses the call as gate unavailable. A report whose
+/// ask exists stops the seat when it is autonomous and leaves the ask
+/// redeemable (`CouncilVerdict::report`). Once the record commits, the
+/// verdict's observing voices are read on a task of their own
 /// (`CouncilVerdict::observe`); the gate does not wait for them.
 pub(crate) async fn run_gate_recorded(
     kernel: &Arc<crate::Kernel>,
@@ -601,7 +603,10 @@ pub(crate) async fn run_gate_recorded(
 ) -> GateOutcome {
     let recorded = std::sync::OnceLock::new();
     let outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
-    let Some(council) = council else { return outcome };
+    let Some(mut council) = council else { return outcome };
+    // A report stops an autonomous seat once its ask exists; the decision
+    // is recorded with the ask, so a linked record means the ask exists.
+    council.report(kernel, caller, recorded.get().is_some());
     if let Some(decision_id) = recorded.get() {
         council.observe(kernel.clone(), decision_id.clone());
         return outcome;

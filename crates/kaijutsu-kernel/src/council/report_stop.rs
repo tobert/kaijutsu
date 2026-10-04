@@ -8,13 +8,18 @@
 //! ([`crate::kernel_db::CharacterRow::is_live_root`]), so a swarm seat driven
 //! over ACP counts. A person at the keyboard keeps the ordinary ask.
 //!
-//! An autonomous seat is stopped through [`crate::Kernel::interrupt_context`],
-//! the method `kj interrupt` calls:
+//! An autonomous seat is stopped through
+//! [`crate::Kernel::interrupt_context_keeping_asks`]:
 //!
-//! - **Soft, not immediate.** Either interrupt ends the reported call's wait
+//! - **Soft, not immediate.** The interrupt ends the reported call's wait
 //!   on its ask, and the turn makes no further model call. A soft interrupt
 //!   lets the other tool calls of the same round finish; each passed its own
 //!   gate. An immediate one would cancel those commands part way through.
+//! - **The ask stays redeemable.** Unlike `kj interrupt`, which abandons the
+//!   asks the turn holds, this interrupt leaves them pending. An allow lets
+//!   the approval worker run the stored command once and settle the call's
+//!   result in place, as for an ask whose turn ended at the gate; a deny
+//!   runs nothing. The seat stays stopped until someone drives it again.
 //! - **By the system principal.** The interrupt is recorded on the context's
 //!   continuation as the interrupter. No person or seat asked for this
 //!   interrupt, so the record names the kernel (`PrincipalId::system()`),
@@ -71,7 +76,7 @@ pub(crate) fn stop_if_autonomous(
     if !driven && person {
         return Ok(ReportStop::NotAutonomous);
     }
-    let outcome = kernel.interrupt_context(context, false, PrincipalId::system())?;
+    let outcome = kernel.interrupt_context_keeping_asks(context, PrincipalId::system())?;
     Ok(match (outcome.turn_interrupted, outcome.continuation_closed) {
         (false, false) => ReportStop::NothingRunning,
         (turn, continuation) => ReportStop::Interrupted { turn, continuation },
@@ -100,6 +105,7 @@ mod tests {
         assert!(interrupt.stop_after_turn.load(Ordering::Relaxed), "soft: stop before the next model call");
         assert!(interrupt.stop_waiting.is_cancelled(), "the reported call stops waiting");
         assert!(!interrupt.cancel.is_cancelled(), "not immediate: sibling calls finish");
+        assert!(interrupt.keeps_held_asks(), "the reported call's ask stays pending");
     }
 
     #[tokio::test]
@@ -113,6 +119,22 @@ mod tests {
         let interrupt = lease.interrupt();
         assert!(!interrupt.stop_after_turn.load(Ordering::Relaxed));
         assert!(!interrupt.stop_waiting.is_cancelled());
+        assert!(!interrupt.keeps_held_asks());
+    }
+
+    /// `kj interrupt` and every other interrupt still abandon the asks a
+    /// turn holds.
+    #[tokio::test]
+    async fn a_plain_interrupt_does_not_keep_held_asks() {
+        let kernel = Kernel::new_ephemeral("report-plain").await;
+        let seat = live_context(&kernel, "seat");
+        for immediate in [false, true] {
+            let lease = kernel.turns().begin(seat);
+            kernel.interrupt_context(seat, immediate, PrincipalId::new()).unwrap();
+            let interrupt = lease.interrupt();
+            assert!(interrupt.stop_waiting.is_cancelled());
+            assert!(!interrupt.keeps_held_asks(), "immediate={immediate}");
+        }
     }
 
     #[tokio::test]
