@@ -251,11 +251,14 @@ struct Setup {
     /// `["council-system"]`. Otherwise the seat's reviewer is a lone
     /// character and the contexts are `["voice", "system-rules"]`.
     chain: bool,
+    /// `gate.toml` declares the program spec, `program-gate`, with a
+    /// threshold for the test server.
+    programs: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Setup { enabled: true, deadline_ms: 700, server: None, global: "", voices: false, chain: false }
+        Setup { enabled: true, deadline_ms: 700, server: None, global: "", voices: false, chain: false, programs: false }
     }
 }
 
@@ -284,6 +287,7 @@ template = "mk-letters-1:0123456789abcdef"
 allow_at = 0.98
 mass_floor = -0.05
 
+{programs}
 [context_type.default.council]
 enabled = {enabled}
 "#,
@@ -292,8 +296,25 @@ enabled = {enabled}
         voices = setup.voices,
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
+        programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
     )
 }
+
+/// The program spec and its threshold, as `gate.toml` lines.
+const PROGRAM_SPEC_TOML: &str = r#"
+[[council.spec]]
+name = "program-gate"
+case = "program"
+
+[[council.threshold]]
+spec = "program-gate"
+weight_hash = "w1"
+engine = "e1"
+tokenizer_hash = "t1"
+template = "mk-letters-1:0123456789abcdef"
+allow_at = 0.98
+mass_floor = -1.5
+"#;
 
 struct Rig {
     via: Via,
@@ -325,6 +346,13 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     vfs.write_all(std::path::Path::new("/config/kernel/council/shell-gate.json"), spec_text().as_bytes())
         .await
         .unwrap();
+    vfs.write_all(
+        std::path::Path::new("/config/kernel/council/program-gate.json"),
+        crate::config_seed::DEFAULT_COUNCIL_PROGRAM_GATE.as_bytes(),
+    )
+    .await
+    .unwrap();
+    d.kernel().mount("/work", crate::vfs::MemoryBackend::new()).await;
     vfs.write_all(
         std::path::Path::new("/config/kernel/council/direction-check.json"),
         crate::config_seed::DEFAULT_COUNCIL_DIRECTION_CHECK.as_bytes(),
@@ -375,6 +403,35 @@ impl Rig {
                 Ok(())
             }
         }
+    }
+
+    /// Submit `command` and report only what the gate did: `Ok` when it let
+    /// the command run, whatever the command then did.
+    async fn submit_gate(&self, command: &str) -> Result<(), McpError> {
+        match self.via {
+            Via::Rpc => self.submit(command).await,
+            Via::Tool => {
+                let params = KernelCallParams {
+                    instance: InstanceId::new(ShellServer::INSTANCE_WRITE),
+                    tool: ShellServer::TOOL_WRITE.to_string(),
+                    arguments: serde_json::json!({ "command": command }),
+                };
+                self.broker.call_tool(params, &self.ctx, CancellationToken::new()).await.map(|_| ())
+            }
+        }
+    }
+
+    /// Write a file under the rig's `/work` mount.
+    async fn write(&self, path: &str, text: &str) {
+        use crate::vfs::VfsOps;
+        self.d.kernel().vfs().write_all(std::path::Path::new(path), text.as_bytes()).await.unwrap();
+    }
+
+    /// The programs recorded under `decision`.
+    fn programs(&self, decision: &CouncilDecision) -> Vec<approval_ledger::council::CouncilProgram> {
+        let db = self.d.kernel_db();
+        let db = db.lock();
+        approval_ledger::council::list_council_programs(db.conn_for_ledger(), &decision.decision_id).unwrap()
     }
 
     fn context_bytes(&self) -> Vec<u8> {
@@ -1528,4 +1585,144 @@ async fn a_report_keeps_a_background_call_s_ask_and_an_allow_runs_it_once() {
     assert_eq!(seat.marker(), "report-ran\n");
     assert_eq!(seat.sent.lock().len(), 1, "the seat stays stopped");
     seat.finish().await;
+}
+
+/// Whether a decision request reads the program case.
+fn is_program(request: &DecisionRequest) -> bool {
+    serde_json::to_value(&request.state).unwrap().get("program").is_some()
+}
+
+/// The shell decision answers `shell`; each program decision answers with
+/// the rubric `(originals, network)`: allowed rubric options lean hard.
+fn shell_and_program(mock: &Mock, shell: &'static [[f64; 3]], originals: [f64; 3], network: [f64; 3]) {
+    mock.set(move |req| {
+        if is_program(req) {
+            Reply::ok(super::gate::test_support::program_answer(req, originals, network, [-0.01, -5.0, -6.0]))
+        } else {
+            Reply::ok(answer(req, shell))
+        }
+    });
+}
+
+/// Rubric rows: the first option leans hard, or the last one does.
+const FIRST: [f64; 3] = [-0.01, -6.0, -7.0];
+const LAST: [f64; 3] = [-6.0, -7.0, -0.01];
+
+/// The submission's decisions linked to `ask`, shell decision first.
+fn shell_and_programs(rig: &Rig, ask: &ApprovalRow) -> (CouncilDecision, Vec<CouncilDecision>) {
+    let mut decisions = rig.decisions_for(&ask.request_id);
+    let shell = decisions.iter().position(|d| d.decision.spec_name == "shell-gate").expect("a shell decision");
+    let shell = decisions.remove(shell);
+    (shell, decisions)
+}
+
+/// A script the council reads and allows runs: the shell decision and the
+/// program decision both allow, both are recorded with the ask, and the
+/// program row names the file and the hash of the bytes judged. The program
+/// decision reads the script's text, the command that runs it, and the
+/// local import it did not show.
+///
+/// Falsified by consulting only the shell spec: one decision is recorded.
+#[tokio::test]
+async fn a_script_the_council_allows_runs_with_both_decisions_recorded() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        let script = "import helper\nprint('fixed')\n";
+        rig.write("/work/fix.py", script).await;
+        rig.write("/work/helper.py", "X = 1\n").await;
+        shell_and_program(&rig.mock, &ALLOW, FIRST, FIRST);
+        rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: both allow: {e:?}"));
+
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        let (shell, programs) = shell_and_programs(&rig, &ask);
+        assert_eq!(shell.decision.outcome, CouncilOutcome::Allow);
+        assert_eq!(programs.len(), 1, "{via:?}: one program decision");
+        assert_eq!(programs[0].decision.spec_name, "program-gate");
+        assert_eq!(programs[0].decision.outcome, CouncilOutcome::Allow);
+        let rows = rig.programs(&shell);
+        assert_eq!(rows.len(), 1, "{via:?}: {rows:#?}");
+        assert_eq!(rows[0].path.as_deref(), Some("/work/fix.py"));
+        assert_eq!(rows[0].sha256.as_deref(), Some(super::programs::sha256_of(script.as_bytes()).as_str()));
+        assert_eq!(rows[0].program_decision_id.as_deref(), Some(programs[0].decision_id.as_slice()));
+        assert_eq!(rows[0].imports_not_shown, vec!["helper".to_string()]);
+        assert_eq!(rig.signals(&ask.request_id).len(), 2, "{via:?}: one signal per decision");
+
+        let sent: Vec<_> = rig.mock.decisions().into_iter().filter(is_program).collect();
+        assert_eq!(sent.len(), 1);
+        let state = serde_json::to_value(&sent[0].state).unwrap();
+        assert_eq!(state["program"], script, "{state}");
+        assert_eq!(state["path"], "/work/fix.py");
+        assert_eq!(state["language"], "python");
+        assert_eq!(state["invocation"]["command"], "python3 /work/fix.py");
+        assert_eq!(state["invocation"]["submission"], "python3 /work/fix.py");
+        assert_eq!(state["imports_not_shown"], serde_json::json!(["helper"]));
+        assert_eq!(state["context_type"], "default");
+        rig.finish().await;
+    }
+}
+
+/// A program the rubric says changes data with no backup holds the
+/// submission even though the shell decision allows it. The ask names the
+/// program decision that held it and the rubric's answers.
+#[tokio::test]
+async fn a_program_the_rubric_flags_holds_an_allowed_submission_and_says_why() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        rig.write("/work/wipe.py", "import shutil\nshutil.rmtree('data')\n").await;
+        shell_and_program(&rig.mock, &ALLOW, LAST, FIRST);
+        assert_pending(via, rig.submit_gate("python3 /work/wipe.py").await);
+        let ask = rig.only_ask();
+        let (shell, programs) = shell_and_programs(&rig, &ask);
+        assert_eq!(shell.decision.outcome, CouncilOutcome::Allow);
+        assert_eq!(programs[0].decision.outcome, CouncilOutcome::Ask);
+        assert!(
+            ask.description.contains("council (program-gate) on /work/wipe.py answered ask")
+                && ask.description.contains("originals=changes")
+                && ask.description.contains("network=none")
+                && ask.description.contains("held by the program decision on /work/wipe.py"),
+            "{via:?}: {}",
+            ask.description
+        );
+        rig.finish().await;
+    }
+}
+
+/// A program whose text the kernel cannot read is never council-allowed:
+/// there is no program decision, the shell decision alone does not run it,
+/// and the record and the ask say why.
+#[tokio::test]
+async fn a_program_whose_text_cannot_be_read_is_never_council_allowed() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        shell_and_program(&rig.mock, &ALLOW, FIRST, FIRST);
+        assert_pending(via, rig.submit_gate("python3 /work/missing.py").await);
+        let ask = rig.only_ask();
+        let (shell, programs) = shell_and_programs(&rig, &ask);
+        assert!(programs.is_empty(), "{via:?}: {programs:#?}");
+        assert_eq!(shell.decision.outcome, CouncilOutcome::Allow);
+        let rows = rig.programs(&shell);
+        assert!(rows[0].unread_cause.as_deref().is_some_and(|c| c.contains("could not be read")), "{rows:#?}");
+        assert!(
+            ask.description.contains("was not judged") && ask.description.contains("/work/missing.py"),
+            "{via:?}: {}",
+            ask.description
+        );
+        rig.finish().await;
+    }
+}
+
+/// With no program spec in `gate.toml`, a submission that runs program
+/// text asks: the council cannot judge the program.
+#[tokio::test]
+async fn without_a_program_spec_a_program_is_not_judged_and_asks() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        rig.mock.answers(&ALLOW);
+        assert_pending(via, rig.submit_gate("python3 -c 'print(1)'").await);
+        let ask = rig.only_ask();
+        assert!(ask.description.contains("case = \"program\""), "{via:?}: {}", ask.description);
+        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: only the shell decision");
+        rig.finish().await;
+    }
 }

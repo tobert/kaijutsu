@@ -640,8 +640,7 @@ fn record_unlinked_council_decision(
     council: &crate::council::gate::CouncilVerdict,
 ) -> approval_ledger::error::Result<Vec<u8>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let decision_id = approval_ledger::council::insert_council_decision_within(&tx, &council.record_for(None))?;
-    approval_ledger::council_observation::insert_council_voice_skips_within(&tx, &decision_id, &council.skips())?;
+    let decision_id = council.insert_within(&tx, None)?;
     tx.commit()?;
     Ok(decision_id)
 }
@@ -938,7 +937,7 @@ async fn run_gate_once(
             "approval gate could not capture command inputs: {error}")),
     };
     if let Some(council) = council {
-        ask.signals.push(council.signal());
+        ask.signals.extend(council.signals());
         ask.description = format!("{}\n\n{}", ask.description, council.note());
     }
 
@@ -977,9 +976,7 @@ async fn run_gate_once(
                 crate::kernel_db::record_approval_tool_call(conn, request, context, call)?;
             }
             if let Some(council) = council {
-                let id = approval_ledger::council::insert_council_decision_within(conn, &council.record_for(Some(request)))?;
-                approval_ledger::council_observation::insert_council_voice_skips_within(conn, &id, &council.skips())?;
-                decision_id = Some(id);
+                decision_id = Some(council.insert_within(conn, Some(request))?);
             }
             record(conn, request)
         };

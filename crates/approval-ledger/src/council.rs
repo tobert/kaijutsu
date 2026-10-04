@@ -481,6 +481,83 @@ impl DecisionHead {
     }
 }
 
+/// One program a council-decided submission runs, as
+/// [`insert_council_program_within`] records it under the shell decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CouncilProgram {
+    pub statement_idx: i64,
+    pub command: String,
+    pub language: String,
+    pub path: Option<String>,
+    pub sha256: Option<String>,
+    pub imports_not_shown: Vec<String>,
+    /// Why the text could not be read; `None` when it was judged.
+    pub unread_cause: Option<String>,
+    /// The program's own decision; `None` exactly when `unread_cause` is set.
+    pub program_decision_id: Option<Vec<u8>>,
+}
+
+/// Record the programs `decision_id`'s submission runs, in order, inside
+/// the caller's transaction.
+pub fn insert_council_programs_within(conn: &Connection, decision_id: &[u8], programs: &[CouncilProgram]) -> Result<()> {
+    for (seq, p) in programs.iter().enumerate() {
+        if p.unread_cause.is_some() == p.program_decision_id.is_some() {
+            return Err(invalid("a program carries either its decision or the reason its text was not read"));
+        }
+        if p.imports_not_shown.iter().any(|name| name.is_empty() || name.contains(char::is_whitespace)) {
+            return Err(invalid("an import name is one word"));
+        }
+        let imports = p.imports_not_shown.join(" ");
+        conn.execute(
+            "INSERT INTO council_programs (decision_id, seq, statement_idx, command, language, path, sha256,
+                                           imports_not_shown, unread_cause, program_decision_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                decision_id, seq as i64, p.statement_idx, p.command, p.language, p.path, p.sha256, imports,
+                p.unread_cause, p.program_decision_id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The programs recorded under `decision_id`, in submission order.
+pub fn list_council_programs(conn: &Connection, decision_id: &[u8]) -> Result<Vec<CouncilProgram>> {
+    let rows = conn
+        .prepare(
+            "SELECT statement_idx, command, language, path, sha256, imports_not_shown, unread_cause, program_decision_id
+             FROM council_programs WHERE decision_id = ?1 ORDER BY seq",
+        )?
+        .query_map([decision_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(statement_idx, command, language, path, sha256, imports, unread_cause, program_decision_id)| {
+            CouncilProgram {
+                statement_idx,
+                command,
+                language,
+                path,
+                sha256,
+                imports_not_shown: imports.split_whitespace().map(str::to_owned).collect(),
+                unread_cause,
+                program_decision_id,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,5 +867,41 @@ mod tests {
             "SELECT decision_id FROM council_decisions WHERE context_id = X'01' ORDER BY created_at DESC, decision_id DESC",
         );
         assert!(by_context.contains("idx_council_decisions_context"), "{by_context}");
+    }
+
+    #[test]
+    fn a_submissions_programs_round_trip_under_its_shell_decision() {
+        let conn = open_memory();
+        let shell = insert_council_decision(&conn, &decision()).unwrap();
+        let mut program = decision();
+        program.spec_name = "program-gate".into();
+        let judged = insert_council_decision(&conn, &program).unwrap();
+        let programs = vec![
+            CouncilProgram {
+                statement_idx: 0,
+                command: "python3 /tmp/fix.py".into(),
+                language: "python".into(),
+                path: Some("/tmp/fix.py".into()),
+                sha256: Some("sha256:ab".into()),
+                imports_not_shown: vec!["helper".into()],
+                unread_cause: None,
+                program_decision_id: Some(judged),
+            },
+            CouncilProgram {
+                statement_idx: 1,
+                command: "python3 $x".into(),
+                language: "python".into(),
+                path: None,
+                sha256: None,
+                imports_not_shown: vec![],
+                unread_cause: Some("expands at run time".into()),
+                program_decision_id: None,
+            },
+        ];
+        insert_council_programs_within(&conn, &shell, &programs).unwrap();
+        assert_eq!(list_council_programs(&conn, &shell).unwrap(), programs);
+        let mut both = programs[1].clone();
+        both.program_decision_id = Some(shell.clone());
+        assert!(insert_council_programs_within(&conn, &shell, &[both]).is_err(), "a read program has no unread cause");
     }
 }

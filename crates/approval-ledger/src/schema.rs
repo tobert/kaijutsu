@@ -928,6 +928,28 @@ CREATE TABLE IF NOT EXISTS council_control_text (
     PRIMARY KEY (decision_id, seq)
 );
 
+-- One row per program a council-decided submission runs (`docs/council.md`,
+-- "Programs are cases of their own"), hanging off the submission's shell
+-- decision. A program whose text was read has its own decision in
+-- `council_decisions` (`program_decision_id`); one whose text could not be
+-- read has `unread_cause` and no decision. `path` and `sha256` name the file
+-- judged, when the text came from a file. `imports_not_shown` holds the
+-- space-separated local module names whose text the decision did not show.
+CREATE TABLE IF NOT EXISTS council_programs (
+    decision_id         BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
+    seq                 INTEGER NOT NULL,
+    statement_idx       INTEGER NOT NULL,
+    command             TEXT    NOT NULL,
+    language            TEXT    NOT NULL,
+    path                TEXT,
+    sha256              TEXT,
+    imports_not_shown   TEXT    NOT NULL DEFAULT '',
+    unread_cause        TEXT,
+    program_decision_id BLOB    REFERENCES council_decisions(decision_id),
+    PRIMARY KEY (decision_id, seq),
+    CHECK ((unread_cause IS NULL) = (program_decision_id IS NOT NULL))
+);
+
 -- ── Council observations ─────────────────────────────────────────────
 -- One row per read of a model character's voice context
 -- (`council-<character>`) under its own spec, made after the gate decided

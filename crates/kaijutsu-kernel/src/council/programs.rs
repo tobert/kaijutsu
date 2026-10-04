@@ -420,13 +420,16 @@ pub(crate) fn programs_in(planned: &[PlannedStatement], cwd: &str) -> Vec<Progra
                         {
                             Some(Ok(text.clone()))
                         }
-                        _ => Some(Err(())),
+                        [.., (_, _, last)] => Some(Err(match last {
+                            Write::Other(writer) => format!(" with `{writer}`"),
+                            Write::Heredoc(_) => String::new(),
+                        })),
                     };
                     source = match heredoc {
                         None => source,
                         Some(Ok(text)) => ProgramSource::Written { path: path.clone(), text },
-                        Some(Err(())) => ProgramSource::Unknown(format!(
-                            "the submission writes {path} before `{}` runs it",
+                        Some(Err(writer)) => ProgramSource::Unknown(format!(
+                            "the submission writes {path}{writer} before `{}` runs it",
                             rendered(command)
                         )),
                     };

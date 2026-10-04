@@ -386,6 +386,9 @@ pub(crate) enum CouncilPoolWeights {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CouncilCase {
     Shell,
+    /// The program text a submission runs (`docs/council.md`, "Programs
+    /// are cases of their own").
+    Program,
 }
 
 /// A spec the council holds: `name` is the stem of
@@ -670,13 +673,20 @@ impl GateConfig {
             }
             let case = match s.case.as_str() {
                 "shell" => CouncilCase::Shell,
+                "program" => CouncilCase::Program,
                 other => {
                     return Err(err(format!(
-                        "[[council.spec]] {} case: `{other}` is not one of shell",
+                        "[[council.spec]] {} case: `{other}` is not one of shell, program",
                         s.name
                     )))
                 }
             };
+            if specs.iter().any(|p| p.case == case) {
+                return Err(err(format!(
+                    "[[council.spec]] {}: case `{}` already has a spec; declare one spec per case",
+                    s.name, s.case
+                )));
+            }
             specs.push(CouncilSpec { name: s.name.clone(), case });
         }
         let mut thresholds: Vec<CouncilThreshold> = Vec::new();
@@ -2583,8 +2593,15 @@ enabled = false
             let m = council_err(&council_with("name = \"shell-gate\"", &format!("name = \"{bad}\"")));
             assert!(m.contains("[[council.spec]] name") && m.contains("[A-Za-z0-9_-]+"), "{bad}: {m}");
         }
-        let m = council_err(&council_with("case = \"shell\"", "case = \"program\""));
-        assert!(m.contains("case") && m.contains("program") && m.contains("shell"), "{m}");
+        let m = council_err(&council_with("case = \"shell\"", "case = \"file\""));
+        assert!(m.contains("case") && m.contains("file") && m.contains("shell, program"), "{m}");
+        let second = COUNCIL_FULL.replacen(
+            "[[council.threshold]]",
+            "[[council.spec]]\nname = \"other-shell\"\ncase = \"shell\"\n\n[[council.threshold]]",
+            1,
+        );
+        let m = council_err(&second);
+        assert!(m.contains("other-shell") && m.contains("one spec per case"), "{m}");
         let dup = COUNCIL_FULL.replacen(
             "[[council.threshold]]",
             "[[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n[[council.threshold]]",
@@ -2592,6 +2609,28 @@ enabled = false
         );
         let m = council_err(&dup);
         assert!(m.contains("shell-gate") && m.contains("twice"), "{m}");
+    }
+
+    /// A program spec sits beside the shell spec, with thresholds of its own.
+    #[test]
+    fn a_program_spec_parses_beside_the_shell_spec() {
+        let text = COUNCIL_FULL.replacen(
+            "[[council.threshold]]",
+            "[[council.spec]]\nname = \"program-gate\"\ncase = \"program\"\n\n[[council.threshold]]\nspec = \"program-gate\"\n\
+             weight_hash = \"wh1\"\nengine = \"mk-1\"\ntokenizer_hash = \"tk1\"\ntemplate = \"mk-letters-1:abc\"\n\
+             allow_at = 0.98\nmass_floor = -1.5\n\n[[council.threshold]]",
+            1,
+        );
+        let cfg = config(&text);
+        let c = cfg.council().unwrap();
+        assert_eq!(
+            c.specs,
+            vec![
+                CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell },
+                CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program },
+            ]
+        );
+        assert_eq!(c.threshold_for("program-gate", &identity("wh1")).unwrap().mass_floor, -1.5);
     }
 
     #[test]

@@ -33,6 +33,12 @@ pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gat
 pub const DEFAULT_COUNCIL_SHELL_GATE: &str =
     include_str!("../../../assets/defaults/council/shell-gate.json");
 
+/// Embedded council spec for the programs a submission runs, seeded to
+/// `/config/kernel/council/program-gate.json` (`docs/council.md`, "Programs
+/// are cases of their own").
+pub const DEFAULT_COUNCIL_PROGRAM_GATE: &str =
+    include_str!("../../../assets/defaults/council/program-gate.json");
+
 /// Embedded council spec a director's seat is read under, seeded to
 /// `/config/kernel/council/direction-check.json` (`docs/council.md`,
 /// "Council contexts are kaijutsu contexts").
@@ -90,6 +96,7 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
         (config_path("council/shell-gate.json"), DEFAULT_COUNCIL_SHELL_GATE),
+        (config_path("council/program-gate.json"), DEFAULT_COUNCIL_PROGRAM_GATE),
         (config_path("council/direction-check.json"), DEFAULT_COUNCIL_DIRECTION_CHECK),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
         (config_path("distillation.md"), DEFAULT_DISTILLATION_PROMPT),
@@ -218,6 +225,7 @@ mod tests {
         assert!(names.contains(&config_path("gate.toml").as_str()));
         assert!(!names.contains(&config_path("approval.toml").as_str()), "review has no configured default");
         assert!(names.contains(&config_path("council/shell-gate.json").as_str()));
+        assert!(names.contains(&config_path("council/program-gate.json").as_str()));
         assert!(names.contains(&config_path("council/direction-check.json").as_str()));
         assert!(names.contains(&config_path("continuation.toml").as_str()));
         assert!(names.contains(&config_path("distillation.md").as_str()));
@@ -326,6 +334,20 @@ mod tests {
             Some(DEFAULT_SCROLL),
             "resetting a per-client scroll override restores the shared default",
         );
+    }
+
+    /// The program spec decodes as a council spec, asks only choice
+    /// questions (the megakernel does not answer `text`), and holds the
+    /// rubric the gate decides a program from.
+    #[test]
+    fn council_program_gate_spec_holds_the_rubric_and_the_verdict() {
+        let spec: kaijutsu_council::wire::Spec =
+            serde_json::from_str(DEFAULT_COUNCIL_PROGRAM_GATE).expect("a council spec");
+        assert_eq!(spec.name, "program-gate");
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
+        assert_eq!(ids, ["originals", "network", "verdict"]);
+        assert!(spec.questions.iter().all(|q| matches!(q, kaijutsu_council::wire::SpecQuestion::Choice(_))));
+        kaijutsu_council::canon::spec_id(&spec).expect("the spec canonicalizes");
     }
 
     #[test]

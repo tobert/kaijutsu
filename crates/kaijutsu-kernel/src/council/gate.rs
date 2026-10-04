@@ -100,6 +100,14 @@ struct CaseStatement {
     clauses: Vec<String>,
 }
 
+/// What one decision reads: its case state, and the text its record's
+/// `submission_digest` hashes and a report names.
+#[derive(Clone, Debug)]
+pub(crate) struct CaseInput {
+    pub(crate) state: Json,
+    pub(crate) text: String,
+}
+
 /// The case's `state`: the command whole, each statement with the clauses
 /// a classifier reads, the seat's context type, and its working directory,
 /// with members in that order.
@@ -121,6 +129,61 @@ pub(crate) fn case_state(submission: &Submission<'_>) -> Json {
     };
     // A struct serializes its fields in declaration order, and `Json` keeps
     // the order it reads, so the round trip is the ordered object.
+    let text = serde_json::to_string(&state).expect("the case state is plain data");
+    serde_json::from_str(&text).expect("serde_json output is JSON")
+}
+
+#[derive(Serialize)]
+struct ProgramState<'a> {
+    invocation: Invocation<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+    language: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    imports_not_shown: &'a [String],
+    program: &'a str,
+}
+
+#[derive(Serialize)]
+struct Invocation<'a> {
+    /// The command that runs the program, as written.
+    command: &'a str,
+    /// The statement it runs in, rendered.
+    statement: &'a str,
+    /// The submission whole.
+    submission: &'a str,
+}
+
+/// A program case's `state`: how the program is invoked (the command, its
+/// statement, and the submission), the file it was read from, its language,
+/// the seat's context type and working directory, the local imports the
+/// decision does not show, and the program text last, with members in that
+/// order.
+pub(crate) fn program_case_state(
+    submission: &Submission<'_>,
+    run: &super::programs::ProgramRun,
+    text: &super::programs::ProgramText,
+) -> Json {
+    let statement = submission
+        .planned
+        .iter()
+        .find(|s| s.index == run.statement)
+        .map(|s| s.plan.rendered.as_str())
+        .unwrap_or("");
+    let path = text.file.as_ref().map(|f| f.path.as_str()).or(text.written.as_deref());
+    let state = ProgramState {
+        invocation: Invocation { command: &run.command, statement, submission: submission.command },
+        path,
+        language: run.language.as_str(),
+        context_type: submission.context_type,
+        cwd: submission.cwd,
+        imports_not_shown: &text.imports_not_shown,
+        program: &text.text,
+    };
     let text = serde_json::to_string(&state).expect("the case state is plain data");
     serde_json::from_str(&text).expect("serde_json output is JSON")
 }
@@ -200,7 +263,17 @@ pub(crate) struct Classification {
     pub(crate) threshold: Option<CouncilThreshold>,
     /// The pooled verdict, when the response carried one.
     pub(crate) verdict: Option<PooledVerdict>,
+    /// A program decision's pooled rubric answers, question and choice, in
+    /// [`RUBRIC`] order.
+    pub(crate) rubric: Vec<(String, String)>,
 }
+
+/// The program spec's rubric: each question with the choices that allow.
+/// A program decision allows when every pooled rubric answer is one of its
+/// question's allowing choices (`docs/council.md`, "Programs are cases of
+/// their own").
+pub(crate) const RUBRIC: [(&str, &[&str]); 2] =
+    [("originals", &["reads", "changes_backed_up"]), ("network", &["none", "packages"])];
 
 fn identity_of(identity: &DecisionIdentity) -> CouncilIdentity {
     CouncilIdentity {
@@ -225,17 +298,47 @@ fn pooled_verdict(response: &DecisionResponse) -> Option<PooledVerdict> {
 
 /// Decide what a decoded response means for the gate. Pure: the request,
 /// the response, the council settings, and the spec's name decide it.
+#[cfg(test)]
 pub(crate) fn classify(
     request: &DecisionRequest,
     response: &DecisionResponse,
     council: &CouncilConfig,
     spec_name: &str,
 ) -> Classification {
+    classify_case(request, response, council, spec_name, CouncilCase::Shell)
+}
+
+fn pooled_choice(response: &DecisionResponse, question: &str) -> Option<String> {
+    match response.answers.get(question)? {
+        PooledAnswer::Choice(c) => Some(c.choice.clone()),
+        PooledAnswer::Score(_) | PooledAnswer::Noul(_) => None,
+    }
+}
+
+/// [`classify`] for a case. A shell case allows on pooled p(allow); a
+/// program case allows on its rubric ([`RUBRIC`]), with every read's own
+/// rubric answers allowing too when the config requires agreement. Every
+/// read's mass on each question the case acts on must clear the floor.
+pub(crate) fn classify_case(
+    request: &DecisionRequest,
+    response: &DecisionResponse,
+    council: &CouncilConfig,
+    spec_name: &str,
+    case: CouncilCase,
+) -> Classification {
     let verdict = pooled_verdict(response);
+    let rubric: Vec<(String, String)> = match case {
+        CouncilCase::Shell => Vec::new(),
+        CouncilCase::Program => RUBRIC
+            .iter()
+            .filter_map(|(q, _)| pooled_choice(response, q).map(|c| (q.to_string(), c)))
+            .collect(),
+    };
     let miss = |cause: String, threshold: Option<CouncilThreshold>| Classification {
         outcome: Outcome::Miss(cause),
         threshold,
         verdict: verdict.clone(),
+        rubric: rubric.clone(),
     };
     if let Err(mismatch) = kaijutsu_council::math::verify(response, request) {
         return miss(format!("the answer's numbers do not recompute ({mismatch})"), None);
@@ -265,43 +368,65 @@ pub(crate) fn classify(
     };
     let hits = response.signals.as_ref().map(|s| s.control_text.len()).unwrap_or(0);
     if hits > 0 {
-        return Classification { outcome: Outcome::Ask, threshold: Some(threshold), verdict };
+        return Classification { outcome: Outcome::Ask, threshold: Some(threshold), verdict, rubric };
     }
+    let questions: Vec<&str> = match case {
+        CouncilCase::Shell => vec![VERDICT],
+        CouncilCase::Program => RUBRIC.iter().map(|(q, _)| *q).chain([VERDICT]).collect(),
+    };
+    let allows = |question: &str, choice: &str| match question {
+        VERDICT => choice == "allow",
+        q => RUBRIC.iter().any(|(r, ok)| *r == q && ok.contains(&choice)),
+    };
+    let deciding: &[&str] = match case {
+        CouncilCase::Shell => &[VERDICT],
+        CouncilCase::Program => &["originals", "network"],
+    };
     // Each read's `choice` is its own argmax, verified above to the tolerance.
-    let mut every_read_tops_allow = true;
+    let mut every_read_allows = true;
     for read in &response.reads {
-        let mass = match read.answers.get(VERDICT) {
-            Some(ReadAnswer::Choice(c)) => {
-                every_read_tops_allow &= c.choice == "allow";
-                c.mass
-            }
-            _ => {
+        for question in &questions {
+            let mass = match read.answers.get(*question) {
+                Some(ReadAnswer::Choice(c)) => {
+                    if deciding.contains(question) {
+                        every_read_allows &= allows(question, &c.choice);
+                    }
+                    c.mass
+                }
+                _ => {
+                    return miss(
+                        format!("the read of {} has no `{question}` choice", read.context.as_deref().unwrap_or("the spec")),
+                        Some(threshold),
+                    )
+                }
+            };
+            if mass < threshold.mass_floor {
                 return miss(
-                    format!("the read of {} has no `{VERDICT}` choice", read.context.as_deref().unwrap_or("the spec")),
+                    format!(
+                        "low mass: the read of {} put log probability {mass:.4} on the options of `{question}`, \
+                         below the floor {}",
+                        read.context.as_deref().unwrap_or("the spec"),
+                        threshold.mass_floor
+                    ),
                     Some(threshold),
-                )
+                );
             }
-        };
-        if mass < threshold.mass_floor {
-            return miss(
-                format!(
-                    "low mass: the read of {} put log probability {mass:.4} on the verdict's options, \
-                     below the floor {}",
-                    read.context.as_deref().unwrap_or("the spec"),
-                    threshold.mass_floor
-                ),
-                Some(threshold),
-            );
         }
     }
-    let outcome = if p_allow >= threshold.allow_at && (!council.require_agree || every_read_tops_allow) {
+    let pooled_allows = match case {
+        CouncilCase::Shell => p_allow >= threshold.allow_at,
+        CouncilCase::Program => {
+            rubric.len() == RUBRIC.len() && rubric.iter().all(|(q, c)| allows(q, c))
+        }
+    };
+    let outcome = if pooled_allows && (!council.require_agree || every_read_allows) {
         Outcome::Allow
     } else if pooled.choice == "report" {
         Outcome::Report
     } else {
         Outcome::Ask
     };
-    Classification { outcome, threshold: Some(threshold), verdict }
+    Classification { outcome, threshold: Some(threshold), verdict, rubric }
 }
 
 /// A council failure that produced no response, in plain words.
@@ -438,6 +563,51 @@ pub(crate) struct CouncilVerdict {
     /// For a report: the `council.decide` span, kept open until
     /// [`Self::report`] records what the stop did.
     decide_span: Option<tracing::Span>,
+    /// On a submission's shell decision: each program the submission runs,
+    /// with its own decision or the reason it has none.
+    programs: Vec<ProgramVerdict>,
+}
+
+/// One program a submission runs, as the gate judged it.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgramVerdict {
+    pub(crate) run: super::programs::ProgramRun,
+    /// The file the decision read, when the text came from one.
+    pub(crate) file: Option<super::programs::JudgedFile>,
+    pub(crate) imports_not_shown: Vec<String>,
+    /// The program's decision, or why there is none.
+    pub(crate) decision: Result<CouncilVerdict, String>,
+}
+
+impl ProgramVerdict {
+    /// How the ask names the program: its file, or the command that runs it.
+    fn name(&self) -> String {
+        match (&self.file, &self.run.source) {
+            (Some(file), _) => file.path.clone(),
+            (None, super::programs::ProgramSource::File { path, .. })
+            | (None, super::programs::ProgramSource::Written { path, .. }) => path.clone(),
+            _ => format!("`{}`", self.run.command),
+        }
+    }
+
+    fn allows(&self) -> bool {
+        self.decision.as_ref().is_ok_and(|d| d.outcome == Outcome::Allow)
+    }
+
+    fn note(&self) -> String {
+        match &self.decision {
+            Ok(decision) => {
+                let note = decision.note();
+                let named = note.replacen(") ", &format!(") on {} ", self.name()), 1);
+                if self.imports_not_shown.is_empty() {
+                    named
+                } else {
+                    format!("{named} (local imports not shown: {})", self.imports_not_shown.join(", "))
+                }
+            }
+            Err(why) => format!("program {} was not judged: {why}", self.name()),
+        }
+    }
 }
 
 /// What the `council.report` event names besides the seat.
@@ -448,9 +618,11 @@ struct ReportedAnswers {
 }
 
 impl CouncilVerdict {
-    /// Whether the council allows the statements no static layer covered.
+    /// Whether the council allows the statements no static layer covered:
+    /// the shell decision and every program decision allow, and every
+    /// program the submission runs was judged.
     pub(crate) fn allows(&self) -> bool {
-        self.outcome == Outcome::Allow
+        self.outcome == Outcome::Allow && self.programs.iter().all(ProgramVerdict::allows)
     }
 
     /// The durable record, linked to the ask it led to when there is one.
@@ -460,20 +632,82 @@ impl CouncilVerdict {
         record
     }
 
-    /// The signal an ask carries, so `kj ledger show --signals` shows the
-    /// council's answer.
-    pub(crate) fn signal(&self) -> NewSignal {
-        self.signal.clone()
+    /// Record this decision, its voice skips, each program decision, and
+    /// the program rows that link them, in the caller's transaction, and
+    /// return the shell decision's id.
+    pub(crate) fn insert_within(
+        &self,
+        conn: &rusqlite::Connection,
+        request_id: Option<&str>,
+    ) -> approval_ledger::error::Result<Vec<u8>> {
+        let id = approval_ledger::council::insert_council_decision_within(conn, &self.record_for(request_id))?;
+        approval_ledger::council_observation::insert_council_voice_skips_within(conn, &id, &self.skips())?;
+        let mut rows = Vec::new();
+        for program in &self.programs {
+            let (program_decision_id, unread_cause) = match &program.decision {
+                Ok(decision) => (
+                    Some(approval_ledger::council::insert_council_decision_within(conn, &decision.record_for(request_id))?),
+                    None,
+                ),
+                Err(why) => (None, Some(why.clone())),
+            };
+            rows.push(approval_ledger::council::CouncilProgram {
+                statement_idx: program.run.statement as i64,
+                command: program.run.command.clone(),
+                language: program.run.language.as_str().to_string(),
+                path: program.file.as_ref().map(|f| f.path.clone()),
+                sha256: program.file.as_ref().map(|f| f.sha256.clone()),
+                imports_not_shown: program.imports_not_shown.clone(),
+                unread_cause,
+                program_decision_id,
+            });
+        }
+        approval_ledger::council::insert_council_programs_within(conn, &id, &rows)?;
+        Ok(id)
     }
 
-    /// One line for the ask's description.
-    pub(crate) fn note(&self) -> &str {
-        &self.note
+    /// The signals an ask carries, so `kj ledger show --signals` shows the
+    /// council's answers: the shell decision's, then each program
+    /// decision's.
+    pub(crate) fn signals(&self) -> Vec<NewSignal> {
+        let mut signals = vec![self.signal.clone()];
+        signals.extend(self.programs.iter().filter_map(|p| p.decision.as_ref().ok()).map(|d| d.signal.clone()));
+        signals
+    }
+
+    /// The text for the ask's description: each decision's answer, each
+    /// program not judged, and, when the shell decision allowed, the program
+    /// decision that held the submission.
+    pub(crate) fn note(&self) -> String {
+        let mut lines = vec![self.note.clone()];
+        lines.extend(self.programs.iter().map(ProgramVerdict::note));
+        if self.outcome == Outcome::Allow
+            && let Some(held) = self.programs.iter().find(|p| !p.allows())
+        {
+            lines.push(match &held.decision {
+                Ok(_) => format!("The submission is held by the program decision on {}.", held.name()),
+                Err(_) => format!("The submission is held because program {} was not judged.", held.name()),
+            });
+        }
+        lines.join("\n")
+    }
+
+    /// The files the program decisions read, by the hash of the bytes they
+    /// judged. The submission runs only while each still holds them.
+    pub(crate) fn judged(&self) -> Vec<super::programs::JudgedFile> {
+        self.programs.iter().filter_map(|p| p.file.clone()).collect()
     }
 
     /// The key an allowed statement's decision names.
     pub(crate) fn allow_key(&self) -> String {
-        format!("at p={:.3}", self.p_allow.unwrap_or(f64::NAN))
+        let mut key = format!("at p={:.3}", self.p_allow.unwrap_or(f64::NAN));
+        for program in &self.programs {
+            if let Ok(decision) = &program.decision {
+                let rubric = decision.signal.label.as_deref().and_then(|l| l.split_once(": ")).map(|(_, r)| r);
+                key.push_str(&format!("; program {} allowed ({})", program.name(), rubric.unwrap_or("")));
+            }
+        }
+        key
     }
 
     /// The voice skips recorded with the decision, in chain order.
@@ -487,7 +721,20 @@ impl CouncilVerdict {
     /// other outcome does nothing. A stop that cannot be read or recorded
     /// is logged with the report; the ask stands either way.
     pub(crate) fn report(&mut self, kernel: &crate::Kernel, caller: &KjCaller, asked: bool) {
-        let Some(reported) = self.report.take() else { return };
+        let mut reports: Vec<(String, ReportedAnswers, Option<tracing::Span>)> = Vec::new();
+        if let Some(reported) = self.report.take() {
+            reports.push((self.spec.clone(), reported, self.decide_span.take()));
+        }
+        for program in &mut self.programs {
+            if let Ok(decision) = &mut program.decision
+                && let Some(reported) = decision.report.take()
+            {
+                reports.push((decision.spec.clone(), reported, decision.decide_span.take()));
+            }
+        }
+        if reports.is_empty() {
+            return;
+        }
         let stop = match caller.context_id {
             Some(context) if asked => super::report_stop::stop_if_autonomous(kernel, context, caller.principal_id),
             _ => Err("the report left no ask, so nothing was stopped".to_string()),
@@ -497,22 +744,24 @@ impl CouncilVerdict {
             Err(error) if asked => ("failed", Some(error.as_str())),
             Err(error) => ("no_ask", Some(error.as_str())),
         };
-        if let Some(span) = self.decide_span.take() {
-            span.record("council.report_stop", word);
+        for (spec, reported, span) in reports {
+            if let Some(span) = span {
+                span.record("council.report_stop", word);
+            }
+            tracing::warn!(
+                name: "council.report",
+                target: "kaijutsu::council",
+                spec = %spec,
+                context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
+                actor_id = %caller.actor_id,
+                principal_id = %caller.principal_id,
+                submission = %reported.submission,
+                answers = %reported.answers,
+                council.report_stop = word,
+                council.report_stop_error = error,
+                "the council reports a shell submission; it goes to the ledger as an ask"
+            );
         }
-        tracing::warn!(
-            name: "council.report",
-            target: "kaijutsu::council",
-            spec = %self.spec,
-            context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
-            actor_id = %caller.actor_id,
-            principal_id = %caller.principal_id,
-            submission = %reported.submission,
-            answers = %reported.answers,
-            council.report_stop = word,
-            council.report_stop_error = error,
-            "the council reports a shell submission; it goes to the ledger as an ask"
-        );
     }
 
     /// Read the observing voices against `decision_id` on a task of their
@@ -620,7 +869,7 @@ struct Carried {
 #[allow(clippy::too_many_arguments)]
 fn build_verdict(
     caller: &KjCaller,
-    submission: &Submission<'_>,
+    case: &CaseInput,
     council: &CouncilConfig,
     spec: &CouncilSpec,
     seen: Seen<'_>,
@@ -712,7 +961,7 @@ fn build_verdict(
         request_id: None,
         context_id: caller.context_id.map(|c| c.as_bytes().to_vec()).unwrap_or_default(),
         principal_id: caller.principal_id.as_bytes().to_vec(),
-        submission_digest: submission_digest(submission.command),
+        submission_digest: submission_digest(&case.text),
         spec_id,
         spec_name: spec.name.clone(),
         server: server.clone(),
@@ -729,6 +978,7 @@ fn build_verdict(
         pooled,
         control_text,
     };
+    let rubric = classification.rubric.iter().map(|(q, c)| format!("{q}={c}")).collect::<Vec<_>>().join(", ");
     let label = match &classification.outcome {
         Outcome::Miss(cause) => format!("miss: {cause}"),
         other => other_word(other).to_string(),
@@ -740,16 +990,21 @@ fn build_verdict(
         weight_hash: (!server.weight_hash.is_empty()).then(|| server.weight_hash.clone()),
         stmt_seq: None,
         cmd_seq: None,
-        label: Some(label),
+        label: Some(if rubric.is_empty() || matches!(classification.outcome, Outcome::Miss(_)) {
+            label
+        } else {
+            format!("{label}: {rubric}")
+        }),
         score: p_allow,
         verdict: if classification.outcome == Outcome::Allow { SignalVerdict::Allow } else { SignalVerdict::Escalate },
     };
     let note = match (&classification.outcome, verdict) {
         (Outcome::Miss(cause), _) => format!("council ({}) gave no answer: {cause}", spec.name),
         (other, Some(v)) => format!(
-            "council ({}) answered {}: {}",
+            "council ({}) answered {}: {}{}",
             spec.name,
             other_word(other),
+            if rubric.is_empty() { String::new() } else { format!("{rubric}; ") },
             v.probabilities.iter().map(|(o, p)| format!("p({o})={p:.3}")).collect::<Vec<_>>().join(", ")
         ),
         (other, None) => format!("council ({}) answered {}", spec.name, other_word(other)),
@@ -767,6 +1022,7 @@ fn build_verdict(
         state: carried.state,
         report: None,
         decide_span: None,
+        programs: Vec::new(),
     }
 }
 
@@ -787,7 +1043,7 @@ fn other_word(outcome: &Outcome) -> &'static str {
 pub(crate) async fn decide(
     kernel: &crate::Kernel,
     caller: &KjCaller,
-    submission: Submission<'_>,
+    case: CaseInput,
     council: &CouncilConfig,
     spec: &CouncilSpec,
     chain: Result<VoiceChain, String>,
@@ -821,11 +1077,20 @@ pub(crate) async fn decide(
     if let Some(context) = caller.context_id {
         span.record("context.id", context.to_string());
     }
-    let mut verdict = decide_inner(kernel, caller, submission, council, spec, chain).instrument(span.clone()).await;
+    let mut verdict = decide_inner(kernel, caller, case, council, spec, chain).instrument(span.clone()).await;
     span.record("council.outcome", other_word(&verdict.outcome));
     if let Outcome::Miss(cause) = &verdict.outcome {
         span.record("council.miss_cause", cause.as_str());
     }
+    tracing::info!(
+        target: "kaijutsu::council",
+        spec = %spec.name,
+        outcome = other_word(&verdict.outcome),
+        p_allow = verdict.p_allow,
+        context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
+        "{}",
+        verdict.note
+    );
     if verdict.report.is_some() {
         verdict.decide_span = Some(span);
     }
@@ -835,7 +1100,7 @@ pub(crate) async fn decide(
 async fn decide_inner(
     kernel: &crate::Kernel,
     caller: &KjCaller,
-    submission: Submission<'_>,
+    case: CaseInput,
     council: &CouncilConfig,
     spec: &CouncilSpec,
     chain: Result<VoiceChain, String>,
@@ -843,13 +1108,14 @@ async fn decide_inner(
     let span = tracing::Span::current();
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
-    let state = case_state(&submission);
-    let missed = |cause: String| Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None };
+    let state = case.state.clone();
+    let missed =
+        |cause: String| Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None, rubric: Vec::new() };
     let chain = match chain {
         Ok(chain) => chain,
         Err(cause) => {
             let carried = Carried { chain: VoiceChain::default(), state };
-            return build_verdict(caller, &submission, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
+            return build_verdict(caller, &case, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
     let labels = chain.decision_labels(council);
@@ -858,14 +1124,17 @@ async fn decide_inner(
         Ok(prepared) => prepared,
         Err(cause) => {
             span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
-            return build_verdict(caller, &submission, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
+            return build_verdict(caller, &case, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
     span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
     span.record("council.model", prepared.identity.model.as_str());
     span.record("council.spec_id", prepared.spec_id.as_str());
-    if let Some(cause) = spec_lacks_verdict(&prepared.spec) {
-        return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), missed(cause), started.elapsed(), carried);
+    if let Some(cause) = spec_lacks_verdict(&prepared.spec).or_else(|| match spec.case {
+        CouncilCase::Shell => None,
+        CouncilCase::Program => spec_lacks_rubric(&prepared.spec),
+    }) {
+        return build_verdict(caller, &case, council, spec, Seen::Prepared(&prepared), missed(cause), started.elapsed(), carried);
     }
 
     let request = decision_request(&prepared, council, carried.state.clone());
@@ -876,11 +1145,11 @@ async fn decide_inner(
     let response = match answer {
         Ok(response) => response,
         Err(cause) => {
-            return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), missed(cause), elapsed, carried);
+            return build_verdict(caller, &case, council, spec, Seen::Prepared(&prepared), missed(cause), elapsed, carried);
         }
     };
 
-    let classification = classify(&request, &response, council, &spec.name);
+    let classification = classify_case(&request, &response, council, &spec.name, spec.case);
     span.record("council.weight_hash", response.identity.weight_hash.as_str());
     span.record("council.engine", response.identity.engine.as_str());
     span.record("council.tokenizer_hash", response.identity.tokenizer_hash.as_str());
@@ -917,12 +1186,12 @@ async fn decide_inner(
             })
             .collect();
         reported = Some(ReportedAnswers {
-            submission: submission.command.to_owned(),
+            submission: case.text.clone(),
             answers: serde_json::Value::Array(answers),
         });
     }
     let mut verdict =
-        build_verdict(caller, &submission, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
+        build_verdict(caller, &case, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
     verdict.report = reported;
     verdict
 }
@@ -937,6 +1206,17 @@ fn spec_lacks_verdict(spec: &kaijutsu_council::wire::Spec) -> Option<String> {
         Some(_) => Some(format!("spec {} has no `allow` option on its `{VERDICT}` choice", spec.name)),
         None => Some(format!("spec {} has no `{VERDICT}` choice", spec.name)),
     }
+}
+
+/// Why a program spec cannot decide, when it cannot: the gate decides a
+/// program from the [`RUBRIC`] choices.
+fn spec_lacks_rubric(spec: &kaijutsu_council::wire::Spec) -> Option<String> {
+    use kaijutsu_council::wire::SpecQuestion;
+    RUBRIC.iter().find_map(|(id, ok)| match spec.questions.iter().find(|q| q.id() == *id) {
+        Some(SpecQuestion::Choice(c)) if ok.iter().all(|o| c.criteria.iter().any(|k| k.option == *o)) => None,
+        Some(_) => Some(format!("spec {} has no `{id}` choice with the options {}", spec.name, ok.join(", "))),
+        None => Some(format!("spec {} has no `{id}` choice", spec.name)),
+    })
 }
 
 /// Whether a gate ask is one the council may decide: the shell gate, or the
@@ -1028,8 +1308,51 @@ pub(crate) async fn consult(
         context_type: context_type.as_deref(),
         cwd: cwd.as_deref(),
     };
-    Ok(Some(decide(kernel, caller, submission, council, shell, chain).await))
+    let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
+    let runs = super::programs::programs_in(&spec.planned, &resolve_cwd);
+    let read = super::programs::read_programs(kernel.vfs().as_ref(), &resolve_cwd, runs).await;
+    let program_spec = council.specs.iter().find(|s| s.case == CouncilCase::Program);
+    let shell_case = CaseInput { state: case_state(&submission), text: command.to_string() };
+    let shell_decision = decide(kernel, caller, shell_case, council, shell, chain.clone());
+    let program_decisions = futures::future::join_all(read.into_iter().enumerate().map(|(i, program)| {
+        let chain = chain.clone();
+        let submission = &submission;
+        async move {
+            let file = program.text.as_ref().ok().and_then(|t| t.file.clone());
+            let imports_not_shown = program.text.as_ref().map(|t| t.imports_not_shown.clone()).unwrap_or_default();
+            let decision = match (program.text, program_spec) {
+                _ if i >= MAX_PROGRAMS => Err(format!(
+                    "the submission runs more than {MAX_PROGRAMS} programs, and the council judges at most \
+                     {MAX_PROGRAMS} per submission"
+                )),
+                (Err(why), _) => Err(why),
+                (Ok(_), None) => Err(
+                    "gate.toml declares no [[council.spec]] with case = \"program\", so the council cannot judge it".into(),
+                ),
+                (Ok(text), Some(program_spec)) => {
+                    let case = CaseInput {
+                        state: program_case_state(submission, &program.run, &text),
+                        text: text.text.clone(),
+                    };
+                    let mut decision = decide(kernel, caller, case, council, program_spec, chain).await;
+                    // Voices are observed and skips recorded once, on the
+                    // shell decision.
+                    decision.skipped.clear();
+                    decision.observing.clear();
+                    Ok(decision)
+                }
+            };
+            ProgramVerdict { run: program.run, file, imports_not_shown, decision }
+        }
+    }));
+    let (mut verdict, programs) = futures::future::join(shell_decision, program_decisions).await;
+    verdict.programs = programs;
+    Ok(Some(verdict))
 }
+
+/// The most program decisions one submission gets. A program past it is
+/// not judged, so the submission is not council-allowed.
+const MAX_PROGRAMS: usize = 8;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -1050,35 +1373,77 @@ pub(crate) mod test_support {
     /// report) on the verdict, with every derived number computed the way
     /// `math::verify` recomputes it.
     pub(crate) fn answer(request: &DecisionRequest, logprobs: &[[f64; 3]]) -> serde_json::Value {
+        answer_choices(request, &[(super::VERDICT, OPTIONS, logprobs)])
+    }
+
+    /// The program rubric's options, in the spec's order.
+    pub(crate) const ORIGINALS: [&str; 3] = ["reads", "changes_backed_up", "changes"];
+    pub(crate) const NETWORK: [&str; 3] = ["none", "packages", "other"];
+
+    /// A program decision's answer: every read puts the given log
+    /// probabilities on `originals`, `network`, and the verdict.
+    pub(crate) fn program_answer(
+        request: &DecisionRequest,
+        originals: [f64; 3],
+        network: [f64; 3],
+        verdict: [f64; 3],
+    ) -> serde_json::Value {
+        let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+        let (o, w, v) = (vec![originals; n], vec![network; n], vec![verdict; n]);
+        answer_choices(request, &[("originals", ORIGINALS, &o), ("network", NETWORK, &w), (super::VERDICT, OPTIONS, &v)])
+    }
+
+    /// An answer with one choice question per entry: its id, its three
+    /// options, and each read's log probabilities over them.
+    pub(crate) fn answer_choices(
+        request: &DecisionRequest,
+        questions: &[(&str, [&str; 3], &[[f64; 3]])],
+    ) -> serde_json::Value {
         let pool = request.pool.clone().unwrap_or_default();
         let method = pool.method.unwrap_or(PoolMethod::Linear);
         let weights = pool.weights.unwrap_or(PoolWeights::Uniform);
-        let rows: Vec<Row> = logprobs.iter().map(|lp| Row::from_logprobs(lp).unwrap()).collect();
         let spec = match weights {
             PoolWeights::Uniform => WeightSpec::Uniform,
             PoolWeights::Mass => WeightSpec::Mass,
             PoolWeights::Given => WeightSpec::Given(pool.values.clone().unwrap()),
         };
-        let pooled = math::pool(&rows, method, &spec).unwrap();
         let contexts = request.contexts.clone().unwrap_or_default();
-        assert_eq!(contexts.len(), rows.len(), "one read per context");
-        let probs = |p: &[f64]| serde_json::json!({"allow": p[0], "ask": p[1], "report": p[2]});
+        let mut pooled_answers = serde_json::Map::new();
+        let mut normalized = serde_json::Map::new();
+        let mut read_answers: Vec<serde_json::Map<String, serde_json::Value>> = vec![serde_json::Map::new(); contexts.len()];
+        for (id, options, logprobs) in questions {
+            let rows: Vec<Row> = logprobs.iter().map(|lp| Row::from_logprobs(lp).unwrap()).collect();
+            assert_eq!(contexts.len(), rows.len(), "one read per context");
+            let pooled = math::pool(&rows, method, &spec).unwrap();
+            let probs = |p: &[f64]| serde_json::json!({options[0]: p[0], options[1]: p[1], options[2]: p[2]});
+            for ((answers, row), lp) in read_answers.iter_mut().zip(&rows).zip(logprobs.iter()) {
+                answers.insert(id.to_string(), serde_json::json!({
+                    "type": "choice",
+                    "choice": options[math::argmax(&row.probs)],
+                    "probabilities": probs(&row.probs),
+                    "confidence": math::confidence(row.mass, &row.probs),
+                    "logprobs": {options[0]: lp[0], options[1]: lp[1], options[2]: lp[2]},
+                    "mass": row.mass,
+                }));
+            }
+            pooled_answers.insert(id.to_string(), serde_json::json!({
+                "type": "choice",
+                "choice": options[math::argmax(&pooled.probs)],
+                "probabilities": probs(&pooled.probs),
+                "confidence": pooled.confidence(),
+                "agree": pooled.agree,
+                "spread": pooled.spread,
+            }));
+            normalized.insert(id.to_string(), serde_json::json!(pooled.weights));
+        }
         let reads: Vec<serde_json::Value> = contexts
             .iter()
-            .zip(&rows)
-            .zip(logprobs)
-            .map(|((c, row), lp)| {
+            .zip(read_answers)
+            .map(|(c, answers)| {
                 serde_json::json!({
                     "context": c.id,
                     "snapshot": c.at.as_ref().map(|s| s.to_string()).unwrap_or_else(|| format!("snap:{}", "0".repeat(64))),
-                    "answers": {"verdict": {
-                        "type": "choice",
-                        "choice": OPTIONS[math::argmax(&row.probs)],
-                        "probabilities": probs(&row.probs),
-                        "confidence": math::confidence(row.mass, &row.probs),
-                        "logprobs": {"allow": lp[0], "ask": lp[1], "report": lp[2]},
-                        "mass": row.mass,
-                    }},
+                    "answers": answers,
                     "rendered_sha256": "0".repeat(64),
                 })
             })
@@ -1087,16 +1452,9 @@ pub(crate) mod test_support {
         id["spec_id"] = serde_json::json!(request.spec_id);
         serde_json::json!({
             "model": "test-council",
-            "answers": {"verdict": {
-                "type": "choice",
-                "choice": OPTIONS[math::argmax(&pooled.probs)],
-                "probabilities": probs(&pooled.probs),
-                "confidence": pooled.confidence(),
-                "agree": pooled.agree,
-                "spread": pooled.spread,
-            }},
+            "answers": pooled_answers,
             "reads": reads,
-            "pool": {"method": method, "weights": weights, "normalized": {"verdict": pooled.weights}},
+            "pool": {"method": method, "weights": weights, "normalized": normalized},
             "signals": {"control_text": []},
             "identity": id,
             "queue_ms": 1.0,
@@ -1426,5 +1784,44 @@ mod tests {
         assert_eq!(to_resend(&spec, &p), Resend { contexts: vec![], spec: true });
         let bare = CouncilError::Status { status: 404, error: None, retry_after: None, body: String::new() };
         assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: true });
+    }
+
+    fn program_council() -> CouncilConfig {
+        let mut c = council(0.98, -1.5, true);
+        c.specs.push(CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program });
+        let mut t = c.thresholds[0].clone();
+        t.spec = "program-gate".into();
+        c.thresholds.push(t);
+        c
+    }
+
+    /// A program decision follows the rubric's argmax, not p(allow): reads
+    /// and no network allow even with a verdict leaning ask; a change with
+    /// no backup asks even with a verdict leaning allow; a report argmax
+    /// reports.
+    #[test]
+    fn a_program_decision_follows_its_rubric() {
+        use super::test_support::program_answer;
+        let req = request();
+        let lean = |o: [f64; 3], n: [f64; 3], v: [f64; 3]| {
+            let mut value = program_answer(&req, o, n, v);
+            // The test request reads two contexts; program_answer reads its length.
+            value["model"] = serde_json::json!("test-council");
+            classify_case(&req, &decode(value), &program_council(), "program-gate", CouncilCase::Program)
+        };
+        const FIRST: [f64; 3] = [-0.2, -2.5, -3.0];
+        const MIDDLE: [f64; 3] = [-2.5, -0.2, -3.0];
+        const LAST: [f64; 3] = [-3.0, -2.5, -0.2];
+        let c = lean(FIRST, FIRST, MIDDLE);
+        assert_eq!(c.outcome, Outcome::Allow, "{c:?}");
+        assert_eq!(c.rubric, vec![("originals".into(), "reads".into()), ("network".into(), "none".into())]);
+        assert_eq!(lean(MIDDLE, MIDDLE, MIDDLE).outcome, Outcome::Allow, "a backup first and packages allow");
+        assert_eq!(lean(LAST, FIRST, FIRST).outcome, Outcome::Ask);
+        assert_eq!(lean(FIRST, LAST, FIRST).outcome, Outcome::Ask);
+        assert_eq!(lean(LAST, LAST, LAST).outcome, Outcome::Report);
+        match lean([-1.8, -4.0, -4.0], FIRST, FIRST).outcome {
+            Outcome::Miss(cause) => assert!(cause.contains("`originals`"), "{cause}"),
+            other => panic!("a rubric read below the floor is a miss, got {other:?}"),
+        }
     }
 }
