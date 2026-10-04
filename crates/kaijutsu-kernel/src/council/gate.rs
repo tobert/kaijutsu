@@ -108,20 +108,33 @@ pub(crate) struct CaseInput {
     pub(crate) text: String,
 }
 
+/// What a shell case shows in place of a program the program decision
+/// judges.
+pub(crate) const JUDGED_SEPARATELY: &str = "<program judged separately>";
+
+/// `text` with each of `programs` replaced by [`JUDGED_SEPARATELY`].
+fn elide(text: &str, programs: &[&str]) -> String {
+    programs.iter().filter(|p| !p.is_empty()).fold(text.to_string(), |t, p| t.replace(p, JUDGED_SEPARATELY))
+}
+
 /// The case's `state`: the command whole, each statement with the clauses
 /// a classifier reads, the seat's context type, and its working directory,
-/// with members in that order.
-pub(crate) fn case_state(submission: &Submission<'_>) -> Json {
+/// with members in that order. Each of `judged`, the text of a program the
+/// program decision reads, is shown as [`JUDGED_SEPARATELY`], so the shell
+/// decision judges the invocation and the program decision the text. A
+/// text the submission spells differently, such as with escapes, stays.
+pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str]) -> Json {
+    let command = elide(submission.command, judged);
     let state = CaseState {
-        command: submission.command,
+        command: &command,
         statements: submission
             .planned
             .iter()
             .map(|s| CaseStatement {
                 index: s.index,
-                rendered: s.plan.rendered.clone(),
+                rendered: elide(&s.plan.rendered, judged),
                 kind: s.plan.statement_kind.clone(),
-                clauses: crate::kj::plan_clauses::command_clause_texts(s),
+                clauses: crate::kj::plan_clauses::command_clause_texts(s).iter().map(|c| elide(c, judged)).collect(),
             })
             .collect(),
         context_type: submission.context_type,
@@ -1325,7 +1338,17 @@ pub(crate) async fn consult(
     let runs = super::programs::programs_in(&spec.planned, &resolve_cwd);
     let read = super::programs::read_programs(kernel.vfs().as_ref(), &resolve_cwd, runs).await;
     let program_spec = council.specs.iter().find(|s| s.case == CouncilCase::Program);
-    let shell_case = CaseInput { state: case_state(&submission), text: command.to_string() };
+    // The text of each program that gets its own decision, which the shell
+    // decision then does not judge again.
+    let judged: Vec<String> = read
+        .iter()
+        .take(MAX_PROGRAMS)
+        .filter(|_| program_spec.is_some())
+        .filter(|p| matches!(p.run.source, super::programs::ProgramSource::Text(_) | super::programs::ProgramSource::Written { .. }))
+        .filter_map(|p| p.text.as_ref().ok().map(|t| t.text.clone()))
+        .collect();
+    let judged: Vec<&str> = judged.iter().map(String::as_str).collect();
+    let shell_case = CaseInput { state: case_state(&submission, &judged), text: command.to_string() };
     let shell_decision = decide(kernel, caller, shell_case, council, shell, chain.clone());
     let program_decisions = futures::future::join_all(read.into_iter().enumerate().map(|(i, program)| {
         let chain = chain.clone();
@@ -1733,7 +1756,7 @@ mod tests {
             planned: &planned,
             context_type: Some("coder"),
             cwd: Some("/src"),
-        });
+        }, &[]);
         let req = decision_request(&p, &council(0.98, -0.05, true), state);
         req.validate().unwrap();
         let body = serde_json::to_value(&req).unwrap();

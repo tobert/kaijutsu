@@ -1851,3 +1851,41 @@ async fn the_seat_context_joins_the_shell_and_program_decisions() {
         rig.finish().await;
     }
 }
+
+/// An inline program the program decision judged reaches the shell
+/// decision elided: the shell decision judges the invocation, and the
+/// program decision judges the text. A shell decision that would ask about
+/// the program's own text no longer refuses a program the rubric allows.
+///
+/// Falsified by a shell case that carries the program text: the shell
+/// decision asks and the submission does not run.
+#[tokio::test]
+async fn an_inline_program_the_program_decision_allows_is_not_judged_again_as_shell() {
+    const PROGRAM: &str = "import shutil\nshutil.copy(\"a.db\", \"/tmp/a.db\")\nprint(\"copied to scratch\")";
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        rig.mock.set(|req| {
+            let state = serde_json::to_string(&req.state).unwrap();
+            if is_program(req) {
+                Reply::ok(super::gate::test_support::program_answer(req, FIRST, FIRST, [-0.01, -5.0, -6.0]))
+            } else if state.contains("shutil.copy") {
+                Reply::ok(answer(req, &ASK))
+            } else {
+                Reply::ok(answer(req, &ALLOW))
+            }
+        });
+        let submission = format!("echo start; python3 -c '{PROGRAM}'");
+        rig.submit_gate(&submission).await.unwrap_or_else(|e| panic!("{via:?}: the program decision allows it: {e:?}"));
+
+        let sent = rig.mock.decisions();
+        let shell = sent.iter().find(|r| !is_program(r)).unwrap_or_else(|| panic!("{via:?}: a shell decision among {} with asks {:#?}", sent.len(), rig.asks()));
+        let state = serde_json::to_value(&shell.state).unwrap();
+        let command = state["command"].as_str().unwrap();
+        assert_eq!(command, "echo start; python3 -c '<program judged separately>'", "{via:?}: {state}");
+        assert!(!serde_json::to_string(&state).unwrap().contains("shutil"), "{via:?}: {state}");
+        let program = sent.iter().find(|r| is_program(r)).expect("a program decision");
+        let program_state = serde_json::to_value(&program.state).unwrap();
+        assert_eq!(program_state["program"], PROGRAM, "{via:?}: the program decision reads the text");
+        rig.finish().await;
+    }
+}
