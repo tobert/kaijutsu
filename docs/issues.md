@@ -84,6 +84,25 @@ work history remain live state, not restart recovery or durable work provenance.
 A persistent write fault also holds later feedback behind the failed event.
 Measure and design recovery before promising durable admission or delivery.
 
+## Council gate: what 43c4a61c left open (2026-10-04)
+
+- **The worker-run guard has a window.** `approved_run_unsettled`
+  (`kj/gate.rs`) runs only in `consult`'s pre-check, because
+  `shell_operations().get_by_ask()` takes the database lock itself. The
+  in-lock re-check in `run_gate_once` covers open and uncollected asks,
+  not runs. The race needs a new identical ask raised, answered, and
+  claimed within one council call.
+- **A prepare miss records empty identity fields.** `council_decisions`
+  makes `server_*` and `spec_id` NOT NULL, but a miss inside `prepare` has
+  neither, so the gate writes empty strings and the cause explains. Make
+  them nullable or record the miss in its own shape.
+- **Untested paths:** the unlinked-record fallback, used when the gate stops
+  before an ask exists, and the in-lock re-check. Both are reachable only on
+  faults or races.
+- **Report-stop is built and not wired.** `council::report_stop` waits on
+  Amy: an interrupt abandons the turn's held ask (`runtime/interrupt.rs`), so
+  docs/council.md's "until someone answers the ask" is not true today.
+
 ## The coder-stance sentinel tests fail on main (2026-10-04)
 
 2a6a0a5c rewrote `assets/defaults/rc/coder/create/S00-stance.md`, which now
