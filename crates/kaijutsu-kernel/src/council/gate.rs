@@ -25,9 +25,18 @@
 //!   **ask**.
 //!
 //! A transport, status, decode or deadline failure is a miss with its cause.
+//! One deadline, `deadline_ms`, bounds the whole decision: preparing the
+//! server and the decision call together.
 //! Only an allow changes what the gate does, and only for statements no
 //! static layer covered.
+//!
+//! With `[council] voices` on, [`consult`] walks the reviewer chain
+//! (`super::voices`): the voting voices join the decision's contexts, the
+//! skipped characters are recorded with the decision, and the observing
+//! voices are read after the decision's record commits
+//! ([`CouncilVerdict::observe`]).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use approval_ledger::council::{
@@ -46,6 +55,7 @@ use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
 use super::sync::{PrepareMiss, Prepared};
+use super::voices::{SkippedVoice, VoiceChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
     CouncilCase, CouncilConfig, CouncilIdentity, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
@@ -308,11 +318,25 @@ pub(crate) fn failure_cause(error: &CouncilError, deadline_ms: u64) -> String {
     }
 }
 
-/// The contexts a 404 or 409 names, or every prepared one when it names
-/// none: the server forgot what it held, and sending a context again is
-/// idempotent.
-fn contexts_to_resend(error: &CouncilError, prepared: &Prepared) -> Vec<ContextId> {
-    let Some(404 | 409) = error.status() else { return Vec::new() };
+/// The miss cause for a decision stopped at its deadline during `phase`.
+fn deadline_cause(deadline_ms: u64, phase: &str) -> String {
+    format!("no answer within the {deadline_ms} ms deadline: the deadline passed during {phase}")
+}
+
+/// What a decision's failure says the server no longer holds.
+#[derive(Debug, Default, PartialEq)]
+struct Resend {
+    contexts: Vec<ContextId>,
+    spec: bool,
+}
+
+/// What to send again after a 404 or 409: the contexts and the spec it
+/// names, or, when it names neither, every prepared context, and the spec
+/// too after a 404. The server forgot what it held, and sending either
+/// again is idempotent. A 409 is about a context's snapshot, never the spec.
+fn to_resend(error: &CouncilError, prepared: &Prepared) -> Resend {
+    let status = error.status();
+    let Some(404 | 409) = status else { return Resend::default() };
     let text = match error {
         CouncilError::Status { error: Some(d), body, .. } => format!("{} {} {body}", d.message, d.param.as_deref().unwrap_or("")),
         CouncilError::Status { body, .. } => body.clone(),
@@ -324,7 +348,65 @@ fn contexts_to_resend(error: &CouncilError, prepared: &Prepared) -> Vec<ContextI
         .filter(|c| text.contains(&c.context_id.to_string()))
         .map(|c| c.context_id)
         .collect();
-    if named.is_empty() { prepared.contexts.iter().map(|c| c.context_id).collect() } else { named }
+    let not_found = status == Some(404);
+    let spec_named = not_found && text.contains(prepared.spec_id.as_str());
+    match (named.is_empty(), spec_named) {
+        (true, false) => Resend { contexts: prepared.contexts.iter().map(|c| c.context_id).collect(), spec: not_found },
+        (_, spec) => Resend { contexts: named, spec },
+    }
+}
+
+/// Forget what a decision's failure says the server no longer holds, so the
+/// next prepare sends it again.
+fn forget_after(kernel: &crate::Kernel, error: &CouncilError, prepared: &Prepared) {
+    let resend = to_resend(error, prepared);
+    for context in resend.contexts {
+        kernel.council_sync().invalidate(context);
+    }
+    if resend.spec {
+        kernel.council_sync().invalidate_spec(&prepared.spec_id);
+    }
+}
+
+/// Prepare the server for a decision on `spec_name` over `labels`, stopping
+/// at `deadline`. Every failure is a miss cause.
+pub(crate) async fn prepare_within(
+    kernel: &crate::Kernel,
+    council: &CouncilConfig,
+    spec_name: &str,
+    labels: &[String],
+    deadline: tokio::time::Instant,
+) -> Result<Prepared, String> {
+    match tokio::time::timeout_at(deadline, kernel.council_sync().prepare_labels(kernel, council, spec_name, labels)).await {
+        Err(_) => Err(deadline_cause(council.deadline_ms, "prepare")),
+        Ok(Err(PrepareMiss(cause))) => Err(cause),
+        Ok(Ok(prepared)) => Ok(prepared),
+    }
+}
+
+/// Send `request` and wait for the answer until `deadline`, with the time
+/// left as the call's own timeout. A 404 or 409 forgets what the server no
+/// longer holds ([`to_resend`]). Every failure is a miss cause.
+pub(crate) async fn ask_within(
+    kernel: &crate::Kernel,
+    prepared: &Prepared,
+    request: &DecisionRequest,
+    council: &CouncilConfig,
+    deadline: tokio::time::Instant,
+) -> Result<DecisionResponse, String> {
+    let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
+    let traceparent = (!traceparent.is_empty()).then_some(traceparent);
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let answer =
+        tokio::time::timeout_at(deadline, prepared.client.decide_traced(request, left, traceparent.as_deref())).await;
+    match answer {
+        Err(_) | Ok(Err(CouncilError::Timeout)) => Err(deadline_cause(council.deadline_ms, "the decision")),
+        Ok(Err(error)) => {
+            forget_after(kernel, &error, prepared);
+            Err(failure_cause(&error, council.deadline_ms))
+        }
+        Ok(Ok(response)) => Ok(response),
+    }
 }
 
 /// A council verdict for the gate, with the record and the signal it leaves.
@@ -338,6 +420,13 @@ pub(crate) struct CouncilVerdict {
     record: NewCouncilDecision,
     signal: NewSignal,
     note: String,
+    /// Characters on the reviewer chain with no voice context.
+    skipped: Vec<SkippedVoice>,
+    /// Voice labels read after the decision, under the `direction-check` spec.
+    observing: Vec<String>,
+    council: CouncilConfig,
+    /// The case state the decision read; the observations read it too.
+    state: Json,
 }
 
 impl CouncilVerdict {
@@ -368,6 +457,24 @@ impl CouncilVerdict {
     pub(crate) fn allow_key(&self) -> String {
         format!("at p={:.3}", self.p_allow.unwrap_or(f64::NAN))
     }
+
+    /// The voice skips recorded with the decision, in chain order.
+    pub(crate) fn skips(&self) -> Vec<approval_ledger::council_observation::CouncilVoiceSkip> {
+        self.skipped.iter().map(SkippedVoice::recorded).collect()
+    }
+
+    /// Read the observing voices against `decision_id` on a task of their
+    /// own. Call it once the decision's record has committed; nothing waits
+    /// for the task, and its failures are its own records.
+    pub(crate) fn observe(&self, kernel: Arc<crate::Kernel>, decision_id: Vec<u8>) {
+        let _detached = super::observe::spawn_observe(
+            kernel,
+            self.council.clone(),
+            decision_id,
+            self.observing.clone(),
+            self.state.clone(),
+        );
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -392,7 +499,10 @@ fn pool_words(council: &CouncilConfig) -> (&'static str, &'static str) {
     )
 }
 
-fn read_question(id: &str, answer: &ReadAnswer) -> CouncilQuestion {
+/// One read's answer to one question, as the ledger stores it: each
+/// option's log probability, and its probability renormalized over the
+/// options.
+pub(crate) fn read_question(id: &str, answer: &ReadAnswer) -> CouncilQuestion {
     let options = |logprobs: &mut dyn Iterator<Item = (&String, &f64)>, mass: f64| {
         logprobs
             .map(|(o, lp)| CouncilOption { option: o.clone(), logprob: *lp, probability: (lp - mass).exp() })
@@ -448,6 +558,13 @@ enum Seen<'a> {
     Answered(&'a Prepared, &'a DecisionResponse),
 }
 
+/// The voices and case state a verdict carries to its record and its
+/// observation.
+struct Carried {
+    chain: VoiceChain,
+    state: Json,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_verdict(
     caller: &KjCaller,
@@ -457,6 +574,7 @@ fn build_verdict(
     seen: Seen<'_>,
     classification: Classification,
     elapsed: Duration,
+    carried: Carried,
 ) -> CouncilVerdict {
     let (outcome, miss_cause) = classification.outcome.recorded();
     let (pool_method, pool_weights) = pool_words(council);
@@ -584,7 +702,18 @@ fn build_verdict(
         ),
         (other, None) => format!("council ({}) answered {}", spec.name, other_word(other)),
     };
-    CouncilVerdict { spec: spec.name.clone(), outcome: classification.outcome, p_allow, record, signal, note }
+    CouncilVerdict {
+        spec: spec.name.clone(),
+        outcome: classification.outcome,
+        p_allow,
+        record,
+        signal,
+        note,
+        skipped: carried.chain.skipped,
+        observing: carried.chain.observing,
+        council: council.clone(),
+        state: carried.state,
+    }
 }
 
 fn other_word(outcome: &Outcome) -> &'static str {
@@ -597,14 +726,17 @@ fn other_word(outcome: &Outcome) -> &'static str {
 }
 
 /// Ask the council once about `submission` and return its verdict. Every
-/// failure is a verdict too: a miss with its cause. Runs with no database
-/// lock held; the deadline bounds the decision call.
+/// failure is a verdict too: a miss with its cause, including a reviewer
+/// chain that could not be walked (`chain`). Runs with no database lock
+/// held; `deadline_ms` bounds preparing the server and the decision call
+/// together.
 pub(crate) async fn decide(
     kernel: &crate::Kernel,
     caller: &KjCaller,
     submission: Submission<'_>,
     council: &CouncilConfig,
     spec: &CouncilSpec,
+    chain: Result<VoiceChain, String>,
 ) -> CouncilVerdict {
     let span = tracing::info_span!(
         "council.decide",
@@ -634,7 +766,7 @@ pub(crate) async fn decide(
     if let Some(context) = caller.context_id {
         span.record("context.id", context.to_string());
     }
-    let verdict = decide_inner(kernel, caller, submission, council, spec).instrument(span.clone()).await;
+    let verdict = decide_inner(kernel, caller, submission, council, spec, chain).instrument(span.clone()).await;
     span.record("council.outcome", other_word(&verdict.outcome));
     if let Outcome::Miss(cause) = &verdict.outcome {
         span.record("council.miss_cause", cause.as_str());
@@ -648,53 +780,45 @@ async fn decide_inner(
     submission: Submission<'_>,
     council: &CouncilConfig,
     spec: &CouncilSpec,
+    chain: Result<VoiceChain, String>,
 ) -> CouncilVerdict {
     let span = tracing::Span::current();
     let started = Instant::now();
-    let prepared = match kernel.council_sync().prepare(kernel, council, spec).await {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
+    let state = case_state(&submission);
+    let missed = |cause: String| Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None };
+    let chain = match chain {
+        Ok(chain) => chain,
+        Err(cause) => {
+            let carried = Carried { chain: VoiceChain::default(), state };
+            return build_verdict(caller, &submission, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
+        }
+    };
+    let labels = chain.decision_labels(council);
+    let carried = Carried { chain, state };
+    let prepared = match prepare_within(kernel, council, &spec.name, &labels, deadline).await {
         Ok(prepared) => prepared,
-        Err(PrepareMiss(cause)) => {
+        Err(cause) => {
             span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
-            let classification = Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None };
-            return build_verdict(caller, &submission, council, spec, Seen::Nothing, classification, started.elapsed());
+            return build_verdict(caller, &submission, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
     span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
     span.record("council.model", prepared.identity.model.as_str());
     span.record("council.spec_id", prepared.spec_id.as_str());
     if let Some(cause) = spec_lacks_verdict(&prepared.spec) {
-        let classification = Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None };
-        return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), classification, started.elapsed());
+        return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), missed(cause), started.elapsed(), carried);
     }
 
-    let request = decision_request(&prepared, council, case_state(&submission));
-    let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
-    let traceparent = (!traceparent.is_empty()).then_some(traceparent);
-    let deadline = Duration::from_millis(council.deadline_ms);
+    let request = decision_request(&prepared, council, carried.state.clone());
     let asked = Instant::now();
-    let answer = tokio::time::timeout(
-        deadline,
-        prepared.client.decide_traced(&request, deadline, traceparent.as_deref()),
-    )
-    .await;
+    let answer = ask_within(kernel, &prepared, &request, council, deadline).await;
     let elapsed = asked.elapsed();
     span.record("council.ms", elapsed.as_millis() as u64);
-
     let response = match answer {
-        Err(_) => Err(format!("no answer within the {} ms deadline", council.deadline_ms)),
-        Ok(Err(error)) => {
-            for context in contexts_to_resend(&error, &prepared) {
-                kernel.council_sync().invalidate(context);
-            }
-            Err(failure_cause(&error, council.deadline_ms))
-        }
-        Ok(Ok(response)) => Ok(response),
-    };
-    let response = match response {
         Ok(response) => response,
         Err(cause) => {
-            let classification = Classification { outcome: Outcome::Miss(cause), threshold: None, verdict: None };
-            return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), classification, elapsed);
+            return build_verdict(caller, &submission, council, spec, Seen::Prepared(&prepared), missed(cause), elapsed, carried);
         }
     };
 
@@ -745,7 +869,7 @@ async fn decide_inner(
             "the council reports a shell submission; it goes to the ledger as an ask"
         );
     }
-    build_verdict(caller, &submission, council, spec, Seen::Answered(&prepared, &response), classification, elapsed)
+    build_verdict(caller, &submission, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried)
 }
 
 /// Why a spec cannot decide a gate ask, when it cannot: the gate acts on a
@@ -841,13 +965,14 @@ pub(crate) async fn consult(
         return Ok(None);
     }
     let Some(shell) = shell_spec(council) else { return Ok(None) };
+    let chain = super::voices::voice_chain(&kernel.kernel_db().lock(), council, context_id, caller.actor_id);
     let submission = Submission {
         command,
         planned: &spec.planned,
         context_type: context_type.as_deref(),
         cwd: cwd.as_deref(),
     };
-    Ok(Some(decide(kernel, caller, submission, council, shell).await))
+    Ok(Some(decide(kernel, caller, submission, council, shell, chain).await))
 }
 
 #[cfg(test)]
@@ -949,6 +1074,7 @@ mod tests {
             pool_weights: CouncilPoolWeights::Mass,
             deadline_ms: 700,
             require_agree,
+            voices: false,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
@@ -1188,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_404_naming_a_context_resends_it_and_one_naming_none_resends_all() {
+    fn a_404_naming_a_context_resends_it_and_a_409_naming_none_resends_every_context() {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
         let named = CouncilError::Status {
@@ -1202,10 +1328,32 @@ mod tests {
             retry_after: None,
             body: String::new(),
         };
-        assert_eq!(contexts_to_resend(&named, &p), vec![ids[1]]);
+        assert_eq!(to_resend(&named, &p), Resend { contexts: vec![ids[1]], spec: false });
         let bare = CouncilError::Status { status: 409, error: None, retry_after: None, body: String::new() };
-        assert_eq!(contexts_to_resend(&bare, &p), ids.to_vec());
+        assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: false });
         let busy = CouncilError::Status { status: 503, error: None, retry_after: None, body: String::new() };
-        assert!(contexts_to_resend(&busy, &p).is_empty());
+        assert_eq!(to_resend(&busy, &p), Resend::default());
+    }
+
+    /// A 404 naming the spec sends the spec again and leaves the contexts;
+    /// one naming nothing sends both.
+    #[test]
+    fn a_404_naming_the_spec_resends_only_the_spec() {
+        let ids = [ContextId::new(), ContextId::new()];
+        let p = prepared(&ids);
+        let spec = CouncilError::Status {
+            status: 404,
+            error: Some(kaijutsu_council::wire::ErrorDetail {
+                r#type: kaijutsu_council::wire::ErrorType::NotFound,
+                message: format!("unknown spec {}", p.spec_id.as_str()),
+                param: None,
+                head: None,
+            }),
+            retry_after: None,
+            body: String::new(),
+        };
+        assert_eq!(to_resend(&spec, &p), Resend { contexts: vec![], spec: true });
+        let bare = CouncilError::Status { status: 404, error: None, retry_after: None, body: String::new() };
+        assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: true });
     }
 }

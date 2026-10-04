@@ -444,7 +444,7 @@ pub(crate) fn announce_ledger_change(
 /// (`crate::council::gate::consult`); every other origin goes straight to
 /// [`run_gate_recorded`].
 pub(crate) async fn run_gate(
-    kernel: &crate::Kernel,
+    kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
@@ -567,12 +567,14 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 /// `council` is the council's verdict on this submission, when one was
 /// consulted. An allow turns the statements no other layer covered into
 /// council allows, unless an earlier ask still holds the submission
-/// ([`ask_holding_submission`]). Every verdict is recorded: with the ask it
-/// led to, in the transaction that creates it, or unlinked when the gate
-/// stopped before an ask existed. A record that cannot be written refuses
-/// the call as gate unavailable.
+/// ([`ask_holding_submission`]). Every verdict is recorded with its voice
+/// skips: with the ask it led to, in the transaction that creates it, or
+/// unlinked when the gate stopped before an ask existed. A record that
+/// cannot be written refuses the call as gate unavailable. Once the record
+/// commits, the verdict's observing voices are read on a task of their own
+/// (`CouncilVerdict::observe`); the gate does not wait for them.
 pub(crate) async fn run_gate_recorded(
-    kernel: &crate::Kernel,
+    kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
     spec: GateSpec,
     ledger_flows: &SharedLedgerFlowBus,
@@ -580,18 +582,22 @@ pub(crate) async fn run_gate_recorded(
     council: Option<crate::council::gate::CouncilVerdict>,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
-    let recorded = std::sync::atomic::AtomicBool::new(false);
+    let recorded = std::sync::OnceLock::new();
     let outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
     let Some(council) = council else { return outcome };
-    if recorded.load(std::sync::atomic::Ordering::Acquire) {
+    if let Some(decision_id) = recorded.get() {
+        council.observe(kernel.clone(), decision_id.clone());
         return outcome;
     }
     let written = {
         let db = kernel.kernel_db().lock();
-        approval_ledger::council::insert_council_decision(db.conn_for_ledger(), &council.record_for(None))
+        record_unlinked_council_decision(db.conn_for_ledger(), &council)
     };
     match written {
-        Ok(_) => outcome,
+        Ok(decision_id) => {
+            council.observe(kernel.clone(), decision_id);
+            outcome
+        }
         Err(e) => GateOutcome {
             verdict: GateVerdict::Unavailable,
             ask: outcome.ask,
@@ -603,6 +609,19 @@ pub(crate) async fn run_gate_recorded(
             ),
         },
     }
+}
+
+/// Record a council decision no ask links to, with its voice skips, in one
+/// transaction, and return its id.
+fn record_unlinked_council_decision(
+    conn: &rusqlite::Connection,
+    council: &crate::council::gate::CouncilVerdict,
+) -> approval_ledger::error::Result<Vec<u8>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let decision_id = approval_ledger::council::insert_council_decision_within(&tx, &council.record_for(None))?;
+    approval_ledger::council_observation::insert_council_voice_skips_within(&tx, &decision_id, &council.skips())?;
+    tx.commit()?;
+    Ok(decision_id)
 }
 
 #[tracing::instrument(
@@ -624,7 +643,7 @@ async fn run_gate_once(
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
     council: Option<&crate::council::gate::CouncilVerdict>,
-    council_recorded: &std::sync::atomic::AtomicBool,
+    council_recorded: &std::sync::OnceLock<Vec<u8>>,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
     let db = kernel.kernel_db();
@@ -923,18 +942,23 @@ async fn run_gate_once(
         let mut ask = ask;
         ask.reviewer_id = reviewer.as_bytes().to_vec();
         let tool_call = spec.tool_call;
+        let mut decision_id = None;
         let recorded = |conn: &rusqlite::Connection, request: &str| {
             if let Some(call) = &tool_call {
                 crate::kernel_db::record_approval_tool_call(conn, request, context, call)?;
             }
             if let Some(council) = council {
-                approval_ledger::council::insert_council_decision_within(conn, &council.record_for(Some(request)))?;
+                let id = approval_ledger::council::insert_council_decision_within(conn, &council.record_for(Some(request)))?;
+                approval_ledger::council_observation::insert_council_voice_skips_within(conn, &id, &council.skips())?;
+                decision_id = Some(id);
             }
             record(conn, request)
         };
         match db.create_approval_ask_recorded(&ask, spec.publishes_pair, recorded) {
             Ok(id) => {
-                council_recorded.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(decision) = decision_id {
+                    council_recorded.set(decision).expect("the gate records one council decision per call");
+                }
                 id
             }
             Err(e) => return GateOutcome::unavailable_without_row(format!("approval gate could not record the ask: {e} (fail-closed — this is a ledger fault, not a decision)")),

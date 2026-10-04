@@ -252,14 +252,22 @@ pub fn list_council_observations_for_decision(conn: &Connection, decision_id: &[
 /// A `decision_id` that names no decision is refused.
 pub fn insert_council_voice_skips(conn: &Connection, decision_id: &[u8], skips: &[CouncilVoiceSkip]) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    require_decision(&tx, decision_id)?;
+    insert_council_voice_skips_within(&tx, decision_id, skips)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`insert_council_voice_skips`] for a caller that already holds a
+/// transaction on `conn`, such as the one that records the decision.
+/// Nothing commits here.
+pub fn insert_council_voice_skips_within(conn: &Connection, decision_id: &[u8], skips: &[CouncilVoiceSkip]) -> Result<()> {
+    require_decision(conn, decision_id)?;
     for (seq, skip) in skips.iter().enumerate() {
-        tx.execute(
+        conn.execute(
             "INSERT INTO council_voice_skips (decision_id, seq, principal_id, character_name) VALUES (?1, ?2, ?3, ?4)",
             params![decision_id, seq as i64, skip.principal_id, skip.character_name],
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 

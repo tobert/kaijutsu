@@ -1,13 +1,17 @@
 //! Keeps the council server holding the council contexts and specs, and
 //! hands the gate what a decision needs.
 //!
-//! [`CouncilSync::prepare`] (or [`CouncilSync::prepare_labels`], for a
-//! decision that also reads voices) runs before each decision. It does only the
-//! requests the server is not already believed to have answered: the identity
-//! once per server, a spec once per spec id, and a context only when its
-//! projected body changed. This kernel is the only writer of its council
+//! [`CouncilSync::prepare_labels`] runs before each decision. It does only
+//! the requests the server is not already believed to have answered: the
+//! identity once per server, a spec once per spec id, and a context only when
+//! its projected body changed. This kernel is the only writer of its council
 //! contexts, so a `PUT` carries the head the server last reported as
 //! `If-Match`; a head that moved anyway is a miss, not a retry.
+//!
+//! The caller bounds `prepare_labels` with the decision's deadline and may
+//! drop it part way. A `PUT` dropped before its answer may still have
+//! landed, so the context is forgotten and the next `PUT` carries no
+//! `If-Match`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -19,11 +23,13 @@ use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
 use super::projection::project;
-use crate::kj::gate_policy::{CouncilConfig, CouncilSpec};
+use crate::kj::gate_policy::CouncilConfig;
 
 /// Everything one decision needs from the server's side.
 pub(crate) struct Prepared {
-    /// Addresses `CouncilConfig.server`; its timeout is `deadline_ms`.
+    /// Addresses `CouncilConfig.server`. Its timeout, `deadline_ms`, bounds
+    /// each call `prepare_labels` makes; a decision passes the time its
+    /// deadline leaves.
     pub(crate) client: CouncilClient,
     pub(crate) identity: ServerIdentity,
     pub(crate) spec: Spec,
@@ -68,18 +74,29 @@ pub(crate) struct CouncilSync {
     state: parking_lot::Mutex<State>,
 }
 
-impl CouncilSync {
-    /// Brings the server up to date for a decision on `spec` over the
-    /// contexts `[council] contexts` lists.
-    pub(crate) async fn prepare(
-        &self,
-        kernel: &crate::Kernel,
-        council: &CouncilConfig,
-        spec: &CouncilSpec,
-    ) -> Result<Prepared, PrepareMiss> {
-        self.prepare_labels(kernel, council, &spec.name, &council.contexts).await
-    }
+/// Forgets a context whose `PUT` was dropped before it answered: the server
+/// may hold the new body under a head this kernel never saw.
+struct PutInFlight<'a> {
+    state: &'a parking_lot::Mutex<State>,
+    key: Option<(String, ContextId)>,
+}
 
+impl PutInFlight<'_> {
+    /// The `PUT` answered; the caller records what it learned.
+    fn answered(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for PutInFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.state.lock().contexts.remove(&key);
+        }
+    }
+}
+
+impl CouncilSync {
     /// Brings the server up to date for a decision on the spec named
     /// `spec_name` (`/config/kernel/council/<spec_name>.json`) over exactly
     /// `labels`, in that order. A gate decision passes `[council] contexts`
@@ -151,6 +168,7 @@ impl CouncilSync {
             }
             let id = context_id.to_string();
             let mut if_match = held.as_ref().map(|h| h.head.clone());
+            let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
             let result = loop {
                 match client.put_context(&id, &body, if_match.as_ref()).await {
                     Err(e) if e.status() == Some(404) && if_match.is_some() => {
@@ -159,6 +177,7 @@ impl CouncilSync {
                     other => break other,
                 }
             };
+            in_flight.answered();
             match result {
                 Ok(put) => {
                     self.state
@@ -184,10 +203,16 @@ impl CouncilSync {
     }
 
     /// Forgets what the server is believed to hold for `context_id`, so the
-    /// next `prepare` sends it again without `If-Match`. Call it after a 404
-    /// or 409 from a decision.
+    /// next `prepare_labels` sends it again without `If-Match`. Call it after
+    /// a 404 or 409 from a decision.
     pub(crate) fn invalidate(&self, context_id: ContextId) {
         self.state.lock().contexts.retain(|(_, id), _| *id != context_id);
+    }
+
+    /// Forgets that `spec_id` was posted, so the next `prepare_labels` for it
+    /// posts it again. Call it after a decision's 404 names the spec.
+    pub(crate) fn invalidate_spec(&self, spec_id: &SpecId) {
+        self.state.lock().specs.retain(|(_, id)| id != spec_id);
     }
 
     async fn identity(&self, client: &CouncilClient, server: &str) -> Result<ServerIdentity, PrepareMiss> {
@@ -219,7 +244,7 @@ impl CouncilSync {
     }
 
     /// A call to `server` failed: forget its identity and posted specs, so
-    /// the next `prepare` asks again, and name the failure.
+    /// the next `prepare_labels` asks again, and name the failure.
     fn failed(&self, server: &str, what: &str, e: CouncilError) -> PrepareMiss {
         let mut state = self.state.lock();
         state.identities.remove(server);
@@ -276,10 +301,13 @@ pub(super) mod mock {
     pub(crate) struct Reply {
         pub(crate) status: u16,
         pub(crate) body: String,
+        /// How long the server holds the reply. Requests are served one at
+        /// a time, so a held reply holds every later request too.
+        pub(crate) delay: std::time::Duration,
     }
 
     pub(crate) fn reply(status: u16, body: impl Into<String>) -> Reply {
-        Reply { status, body: body.into() }
+        Reply { status, body: body.into(), delay: std::time::Duration::ZERO }
     }
 
     #[derive(Debug)]
@@ -446,6 +474,7 @@ pub(super) mod mock {
                     (None, None) => default_reply(&captured, &mut puts),
                 };
                 log.lock().unwrap().push(captured);
+                tokio::time::sleep(r.delay).await;
                 let out = format!(
                     "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     r.status,
@@ -470,7 +499,7 @@ mod tests {
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::*;
     use crate::Kernel;
-    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights};
+    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec};
     use crate::vfs::LocalBackend;
 
     /// The shipped shell spec: no `text` question, so it needs no
@@ -508,6 +537,7 @@ mod tests {
             pool_weights: CouncilPoolWeights::Uniform,
             deadline_ms: 5000,
             require_agree: false,
+            voices: false,
             specs: vec![spec.clone()],
             thresholds: vec![],
         };
@@ -516,8 +546,60 @@ mod tests {
 
     impl Rig {
         async fn prepare(&self) -> Result<Prepared, PrepareMiss> {
-            self.kernel.council_sync().prepare(&self.kernel, &self.council, &self.spec).await
+            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts).await
         }
+
+        fn grow(&self, text: &str) {
+            let ids = self.kernel.blocks().block_snapshots(self.voice).unwrap();
+            super::super::projection::fixtures::append(
+                &self.kernel,
+                self.voice,
+                ids.last().map(|b| &b.id),
+                kaijutsu_types::Role::User,
+                kaijutsu_types::BlockKind::Text,
+                kaijutsu_types::Status::Done,
+                text,
+            );
+        }
+    }
+
+    /// A prepare dropped while a `PUT` waits forgets the context: the server
+    /// may hold the new body, so the next `PUT` carries no `If-Match`.
+    ///
+    /// Falsified by a prepare that keeps the old head when it is dropped:
+    /// the next `PUT` names it, and the server answers 412.
+    #[tokio::test]
+    async fn a_prepare_dropped_during_a_put_sends_the_context_fresh_next_time() {
+        let r = rig().await;
+        r.prepare().await.unwrap();
+        r.grow("and never force push");
+        let mut slow = reply(
+            200,
+            json!({"id": r.voice.to_string(), "head": snap(7), "tokens": 1, "kept": 0, "fed": 1,
+                   "dry_run": false, "snapshots": []})
+            .to_string(),
+        );
+        slow.delay = std::time::Duration::from_millis(400);
+        r.mock.force("PUT", slow);
+        let dropped = tokio::time::timeout(std::time::Duration::from_millis(100), r.prepare()).await;
+        assert!(dropped.is_err(), "the prepare is dropped while its PUT waits");
+        r.prepare().await.expect("prepared");
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 3, "first, the dropped one, the fresh one");
+        assert!(puts[1].0.is_some(), "the dropped PUT named the head it knew");
+        assert_eq!(puts[2].0, None, "the next PUT carries no If-Match");
+    }
+
+    #[tokio::test]
+    async fn invalidate_spec_makes_the_next_prepare_post_the_spec_again() {
+        let r = rig().await;
+        let p = r.prepare().await.unwrap();
+        r.prepare().await.unwrap();
+        assert_eq!(r.mock.calls("POST").len(), 1);
+        r.kernel.council_sync().invalidate_spec(&p.spec_id);
+        r.prepare().await.unwrap();
+        assert_eq!(r.mock.calls("POST").len(), 2, "posted again");
+        assert_eq!(r.mock.puts().len(), 1, "the context is still held");
     }
 
     #[tokio::test]

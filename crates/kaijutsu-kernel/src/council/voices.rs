@@ -20,7 +20,7 @@ use kaijutsu_types::{ContextId, PrincipalId};
 
 use super::projection::{SYSTEM_RULES, VOICE_PREFIX};
 use crate::kernel_db::KernelDb;
-use crate::kj::gate_policy::{CouncilConfig, GateConfig};
+use crate::kj::gate_policy::CouncilConfig;
 
 /// A character on the chain with no `council-<character>` context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,18 +69,18 @@ pub(crate) fn voice_label(name: &str) -> String {
 }
 
 /// Walk the reviewer chain above `actor` in `context` and collect each
-/// character's voice. Empty when `gate.toml` leaves `[council] voices` off.
+/// character's voice. Empty when `[council] voices` is off.
 /// `Err` when the reviewer cannot be resolved, the walk refuses (a retired
 /// responsible character, a broken forest), or a character's voice label
 /// would be the system rules context.
 pub(crate) fn voice_chain(
     db: &KernelDb,
-    config: &GateConfig,
+    council: &CouncilConfig,
     context: ContextId,
     actor: PrincipalId,
 ) -> Result<VoiceChain, String> {
     let mut chain = VoiceChain::default();
-    if !config.council_voices() {
+    if !council.voices {
         return Ok(chain);
     }
     let first = db
@@ -144,8 +144,8 @@ name = "shell-gate"
 case = "shell"
 "#;
 
-    fn config(text: &str) -> GateConfig {
-        GateConfig::parse(text).expect("parses")
+    fn config(text: &str) -> crate::kj::gate_policy::GateConfig {
+        crate::kj::gate_policy::GateConfig::parse(text).expect("parses")
     }
 
     /// amy (root) plays her root context; banto plays a seat forked from it;
@@ -180,7 +180,7 @@ case = "shell"
 
     impl Forest {
         fn chain(&self, text: &str, context: ContextId, actor: PrincipalId) -> Result<VoiceChain, String> {
-            voice_chain(&self.kernel.kernel_db().lock(), &config(text), context, actor)
+            voice_chain(&self.kernel.kernel_db().lock(), config(text).council().expect("[council]"), context, actor)
         }
     }
 
@@ -246,7 +246,6 @@ case = "shell"
         live_context(&f.kernel, "council-banto");
         let off = VOICES_ON.replace("voices = true\n", "");
         assert_eq!(f.chain(&off, f.lane, f.coder).unwrap(), VoiceChain::default());
-        assert_eq!(f.chain("[global]\nallow = [\"rg\"]\n", f.lane, f.coder).unwrap(), VoiceChain::default());
     }
 
     #[tokio::test]

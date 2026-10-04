@@ -51,9 +51,11 @@
 #   server = "http://zorak:8090"            # http:// or https:// URL
 #   contexts = ["council-system"]           # distinct context labels, at least one
 #   pool = { method = "loglinear", weights = "mass" }   # linear|loglinear, uniform|mass
-#   deadline_ms = 700                       # integer > 0; sent as timeout_ms
+#   deadline_ms = 700                       # integer > 0; bounds the whole decision, preparing the server included; sent as timeout_ms
 #   require_agree = true                    # default true: every read must agree to allow
-#   voices = false                          # default false; true reads council-<character> along the reviewer chain
+#   voices = false                          # default false; true composes council-<character> along the reviewer chain:
+#                                           # a live root's voice joins the decision, a model character's is read after it
+#                                           # under direction-check, and a character with no voice context is recorded as skipped
 #
 #   [[council.spec]]
 #   name = "shell-gate"                     # /config/kernel/council/shell-gate.json

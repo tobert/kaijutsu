@@ -366,10 +366,6 @@ pub(crate) struct GateConfig {
     council: Option<CouncilConfig>,
     /// Context types whose `[context_type.<type>.council]` says `enabled = true`.
     council_enabled: std::collections::BTreeSet<String>,
-    /// `[council] voices`: compose `council-<character>` contexts along the
-    /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
-    /// contexts").
-    council_voices: bool,
 }
 
 /// How the kernel pools the council's per-context reads.
@@ -429,8 +425,13 @@ pub(crate) struct CouncilConfig {
     pub(crate) contexts: Vec<String>,
     pub(crate) pool_method: CouncilPoolMethod,
     pub(crate) pool_weights: CouncilPoolWeights,
+    /// Bounds a whole decision: preparing the server and the decision call.
     pub(crate) deadline_ms: u64,
     pub(crate) require_agree: bool,
+    /// `[council] voices`: compose `council-<character>` contexts along the
+    /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
+    /// contexts"). Off by default.
+    pub(crate) voices: bool,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
 }
@@ -575,7 +576,6 @@ impl GateConfig {
             context_types: BTreeMap::new(),
             council: None,
             council_enabled: Default::default(),
-            council_voices: false,
         };
         if raw.global.council.is_some() {
             return Err(GateConfigError::Parse(
@@ -595,7 +595,6 @@ impl GateConfig {
         }
         if let Some(council) = &raw.council {
             config.council = Some(Self::council_from(council)?);
-            config.council_voices = council.voices;
         } else if let Some(name) = config.council_enabled.iter().next() {
             return Err(GateConfigError::Parse(format!(
                 "[context_type.{name}.council] enabled = true: the file has no [council] section \
@@ -737,6 +736,7 @@ impl GateConfig {
             pool_weights,
             deadline_ms: raw.deadline_ms as u64,
             require_agree: raw.require_agree,
+            voices: raw.voices,
             specs,
             thresholds,
         })
@@ -753,13 +753,6 @@ impl GateConfig {
     pub(crate) fn council_enabled_for(&self, context_type: Option<&str>) -> bool {
         self.council.is_some()
             && context_type.is_some_and(|t| self.council_enabled.contains(t))
-    }
-
-    /// Whether a decision composes `council-<character>` voices along the
-    /// reviewer chain: the file declares `[council]` with `voices = true`.
-    /// Off by default.
-    pub(crate) fn council_voices(&self) -> bool {
-        self.council.is_some() && self.council_voices
     }
 
     fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
@@ -2482,10 +2475,9 @@ enabled = false
 
     #[test]
     fn voices_are_off_unless_the_council_turns_them_on() {
-        assert!(!config(COUNCIL_FULL).council_voices(), "voices default to false");
+        assert!(!config(COUNCIL_FULL).council().unwrap().voices, "voices default to false");
         let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = true"));
-        assert!(on.council_voices());
-        assert!(!config("[global]\nallow = [\"rg\"]\n").council_voices(), "no [council], no voices");
+        assert!(on.council().unwrap().voices);
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = \"yes\""));
         assert!(m.contains("voices"), "{m}");
     }

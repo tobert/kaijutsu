@@ -17,12 +17,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use approval_ledger::council::{CouncilOption, CouncilQuestion, CouncilServer};
+use approval_ledger::council::{CouncilQuestion, CouncilServer};
 use approval_ledger::council_observation::{CouncilObservationOutcome, NewCouncilObservation, insert_council_observation};
 use kaijutsu_council::Json;
 use kaijutsu_council::wire::{DecisionResponse, ReadAnswer, SpecQuestion};
 
-use super::sync::{PrepareMiss, Prepared};
+use super::sync::Prepared;
 use crate::kj::gate_policy::CouncilConfig;
 
 /// The spec an observing voice is read under,
@@ -48,6 +48,34 @@ pub(crate) struct Observed {
     pub(crate) seen: Seen,
     /// The observation id, or why the record could not be written.
     pub(crate) record: Result<Vec<u8>, String>,
+}
+
+impl Observed {
+    /// One log line for this observation: an error when its record could
+    /// not be written, a warning for a miss, and otherwise its choice.
+    fn log(&self) {
+        let label = &self.label;
+        match (&self.record, &self.seen) {
+            (Err(error), _) => tracing::error!(
+                target: "kaijutsu::council",
+                voice = %label,
+                error = %error,
+                "a council observation could not be recorded; the gate's decision stands"
+            ),
+            (Ok(_), Seen::Miss(cause)) => tracing::warn!(
+                target: "kaijutsu::council",
+                voice = %label,
+                miss_cause = %cause,
+                "a council voice gave no observation"
+            ),
+            (Ok(_), Seen::Answered(choice)) => tracing::info!(
+                target: "kaijutsu::council",
+                voice = %label,
+                choice = %choice,
+                "a council voice observed a decision"
+            ),
+        }
+    }
 }
 
 /// Read each of `labels` under [`DIRECTION_CHECK`] on a task of its own, and
@@ -85,27 +113,9 @@ pub(crate) async fn observe_voices(
         };
         let record = insert_council_observation(kernel.kernel_db().lock().conn_for_ledger(), &row)
             .map_err(|e| e.to_string());
-        match (&record, &seen) {
-            (Err(error), _) => tracing::error!(
-                target: "kaijutsu::council",
-                voice = %label,
-                error = %error,
-                "a council observation could not be recorded; the gate's decision stands"
-            ),
-            (Ok(_), Seen::Miss(cause)) => tracing::warn!(
-                target: "kaijutsu::council",
-                voice = %label,
-                miss_cause = %cause,
-                "a council voice gave no observation"
-            ),
-            (Ok(_), Seen::Answered(choice)) => tracing::info!(
-                target: "kaijutsu::council",
-                voice = %label,
-                choice = %choice,
-                "a council voice observed a decision"
-            ),
-        }
-        observed.push(Observed { label: label.clone(), seen, record });
+        let one = Observed { label: label.clone(), seen, record };
+        one.log();
+        observed.push(one);
     }
     observed
 }
@@ -151,13 +161,11 @@ async fn observe_one(
         row.ms = elapsed.as_millis() as i64;
         row
     };
-    let prepared = match kernel
-        .council_sync()
-        .prepare_labels(kernel, council, DIRECTION_CHECK, std::slice::from_ref(&label.to_string()))
-        .await
-    {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
+    let labels = [label.to_string()];
+    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, deadline).await {
         Ok(prepared) => prepared,
-        Err(PrepareMiss(cause)) => return miss(row, cause, started.elapsed()),
+        Err(cause) => return miss(row, cause, started.elapsed()),
     };
     let seat = &prepared.contexts[0];
     row.seat_context_id = Some(seat.context_id.as_bytes().to_vec());
@@ -175,22 +183,12 @@ async fn observe_one(
     }
 
     let request = super::gate::decision_request(&prepared, council, state.clone());
-    let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
-    let traceparent = (!traceparent.is_empty()).then_some(traceparent);
-    let deadline = Duration::from_millis(council.deadline_ms);
     let asked = Instant::now();
-    let answer =
-        tokio::time::timeout(deadline, prepared.client.decide_traced(&request, deadline, traceparent.as_deref())).await;
+    let answer = super::gate::ask_within(kernel, &prepared, &request, council, deadline).await;
     let elapsed = asked.elapsed();
     let response = match answer {
-        Err(_) => return miss(row, format!("no answer within the {} ms deadline", council.deadline_ms), elapsed),
-        Ok(Err(error)) => {
-            if matches!(error.status(), Some(404 | 409)) {
-                kernel.council_sync().invalidate(seat.context_id);
-            }
-            return miss(row, super::gate::failure_cause(&error, council.deadline_ms), elapsed);
-        }
-        Ok(Ok(response)) => response,
+        Ok(response) => response,
+        Err(cause) => return miss(row, cause, elapsed),
     };
     row.server = CouncilServer {
         model: response.identity.model.clone(),
@@ -251,48 +249,22 @@ fn read_answer(
         Some(ReadAnswer::Choice(c)) => c.choice.clone(),
         _ => return Err(format!("the answer has no `{FOLLOWS}` choice")),
     };
-    let questions = read.answers.iter().map(|(id, answer)| question_row(id, answer)).collect();
+    let questions = read.answers.iter().map(|(id, answer)| super::gate::read_question(id, answer)).collect();
     Ok((read.snapshot.as_ref().map(|s| s.to_string()), questions, choice))
 }
 
-fn question_row(id: &str, answer: &ReadAnswer) -> CouncilQuestion {
-    let (mass, confidence, logprobs) = match answer {
-        ReadAnswer::Choice(c) => (c.mass, Some(c.confidence), &c.logprobs),
-        ReadAnswer::Score(c) => (c.mass, Some(c.confidence), &c.logprobs),
-        ReadAnswer::Noul(c) => (c.mass, None, &c.logprobs),
-    };
-    CouncilQuestion {
-        question_id: id.to_string(),
-        mass,
-        confidence,
-        options: logprobs
-            .iter()
-            .map(|(option, lp)| CouncilOption { option: option.clone(), logprob: *lp, probability: (lp - mass).exp() })
-            .collect(),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
+pub(crate) mod test_support {
+    //! verify()-consistent `direction-check` answers for tests.
 
-    use approval_ledger::council::{CouncilOutcome, NewCouncilDecision, insert_council_decision, load_council_decision};
-    use approval_ledger::council_observation::list_council_observations_for_decision;
     use kaijutsu_council::math::{self, Row, WeightSpec};
     use kaijutsu_council::wire::{DecisionRequest, PoolMethod, PoolWeights};
 
-    use super::super::projection::fixtures::{append_dialogue, live_context};
-    use super::super::sync::mock::{Mock, reply, serve};
-    use super::*;
-    use crate::Kernel;
-    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec};
-    use crate::vfs::LocalBackend;
+    pub(crate) const OPTIONS: [&str; 3] = ["follows", "strays", "unclear"];
 
-    const OPTIONS: [&str; 3] = ["follows", "strays", "unclear"];
-
-    /// A verify()-consistent answer to `request` whose one read puts
-    /// `logprobs` (follows, strays, unclear) on the `follows` question.
-    fn answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
+    /// An answer to `request` whose one read puts `logprobs` (follows,
+    /// strays, unclear) on the `follows` question.
+    pub(crate) fn follows_answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
         let pool = request.pool.clone().unwrap_or_default();
         let method = pool.method.unwrap_or(PoolMethod::Linear);
         let weights = pool.weights.unwrap_or(PoolWeights::Uniform);
@@ -336,6 +308,26 @@ mod tests {
             "ms": 4.0,
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use approval_ledger::council::{CouncilOutcome, NewCouncilDecision, insert_council_decision, load_council_decision};
+    use approval_ledger::council_observation::list_council_observations_for_decision;
+    use kaijutsu_council::wire::DecisionRequest;
+
+    use super::super::projection::fixtures::{append_dialogue, live_context};
+    use super::super::sync::mock::{Mock, reply, serve};
+    use super::*;
+    use crate::Kernel;
+    use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec};
+    use crate::vfs::LocalBackend;
+
+    fn answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
+        super::test_support::follows_answer(request, logprobs)
+    }
 
     struct Rig {
         kernel: Arc<Kernel>,
@@ -375,6 +367,7 @@ mod tests {
             pool_weights: CouncilPoolWeights::Mass,
             deadline_ms: 5000,
             require_agree: true,
+            voices: false,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
             thresholds: vec![],
         };

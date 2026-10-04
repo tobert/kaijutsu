@@ -5,10 +5,14 @@
 //! whose gate-policy ask the council decides) and the `shell_write` tool
 //! (`run_gate` for `Origin::ShellGate`).
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use approval_ledger::council::{CouncilDecision, CouncilOutcome};
+use approval_ledger::council_observation::{
+    CouncilObservation, CouncilObservationOutcome, list_council_observations_for_decision, list_council_voice_skips,
+};
 use approval_ledger::types::{ApprovalRow, ApprovalStatus, SignalRow, SignalSourceKind, SignalVerdict};
 use kaijutsu_council::wire::DecisionRequest;
 use kaijutsu_types::{PrincipalId, RefusalKind, SessionId};
@@ -17,7 +21,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use super::gate::test_support::{answer, identity};
-use super::projection::fixtures::live_context;
+use super::observe::test_support::follows_answer;
+use super::projection::fixtures::{append_dialogue, character, live_context};
 use crate::kj::KjDispatcher;
 use crate::mcp::binding::{Capability, ContextToolBinding};
 use crate::mcp::servers::ShellServer;
@@ -62,9 +67,23 @@ struct Mock {
     base: String,
     decisions: Arc<Mutex<Vec<DecisionRequest>>>,
     behavior: Arc<Mutex<Behavior>>,
+    /// Every request's method and path, in arrival order.
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+    /// Delays for the next `PUT`s, one each, in order.
+    put_delays: Arc<Mutex<VecDeque<Duration>>>,
 }
 
 impl Mock {
+    /// How many requests used `method` on `path`.
+    fn count(&self, method: &str, path: &str) -> usize {
+        self.calls.lock().unwrap().iter().filter(|(m, p)| m == method && p.starts_with(path)).count()
+    }
+
+    /// Hold each of the next `PUT`s for the given delay before it answers.
+    fn delay_puts(&self, delays: &[Duration]) {
+        self.put_delays.lock().unwrap().extend(delays.iter().copied());
+    }
+
     fn set(&self, behavior: impl Fn(&DecisionRequest) -> Reply + Send + Sync + 'static) {
         *self.behavior.lock().unwrap() = Arc::new(behavior);
     }
@@ -132,14 +151,17 @@ async fn serve() -> Mock {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let decisions: Arc<Mutex<Vec<DecisionRequest>>> = Arc::default();
     let behavior: Arc<Mutex<Behavior>> = Arc::new(Mutex::new(Arc::new(|req: &DecisionRequest| Reply::ok(answer(req, &ALLOW)))));
-    let (log, how) = (decisions.clone(), behavior.clone());
+    let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let put_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
+    let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
     tokio::spawn(async move {
         let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
-            let (log, how, puts) = (log.clone(), how.clone(), puts.clone());
+            let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
+                seen.lock().unwrap().push((method.clone(), path.clone()));
                 let reply = match (method.as_str(), path.as_str()) {
                     ("GET", "/council/v1/identity") => Reply { status: 200, body: server_identity(), delay: Duration::ZERO },
                     ("POST", "/council/v1/specs") => {
@@ -149,8 +171,12 @@ async fn serve() -> Mock {
                     }
                     ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
                         let n = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        Reply::ok(serde_json::json!({"id": p.rsplit('/').next().unwrap(), "head": format!("snap:{n:064x}"),
-                                                     "tokens": 1, "kept": 0, "fed": 1, "dry_run": false, "snapshots": []}))
+                        let delay = held.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
+                        Reply {
+                            delay,
+                            ..Reply::ok(serde_json::json!({"id": p.rsplit('/').next().unwrap(), "head": format!("snap:{n:064x}"),
+                                                           "tokens": 1, "kept": 0, "fed": 1, "dry_run": false, "snapshots": []}))
+                        }
                     }
                     ("POST", "/council/v1/decisions") => {
                         let request: DecisionRequest = serde_json::from_str(&body).unwrap();
@@ -172,7 +198,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior }
+    Mock { base, decisions, behavior, calls, put_delays }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,11 +217,18 @@ struct Setup {
     /// Replaces the mock's address, for a server that is down.
     server: Option<String>,
     global: &'static str,
+    /// `[council] voices`.
+    voices: bool,
+    /// The seat is reviewed by banto, a model character, and forked from a
+    /// context Amy, a live root, plays; `[council] contexts` is
+    /// `["council-system"]`. Otherwise the seat's reviewer is a lone
+    /// character and the contexts are `["voice", "system-rules"]`.
+    chain: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Setup { enabled: true, deadline_ms: 700, server: None, global: "" }
+        Setup { enabled: true, deadline_ms: 700, server: None, global: "", voices: false, chain: false }
     }
 }
 
@@ -206,7 +239,8 @@ fn gate_toml(server: &str, setup: &Setup) -> String {
 
 [council]
 server = "{server}"
-contexts = ["voice", "system-rules"]
+contexts = {contexts}
+voices = {voices}
 pool = {{ method = "loglinear", weights = "mass" }}
 deadline_ms = {deadline}
 
@@ -227,6 +261,8 @@ mass_floor = -0.05
 enabled = {enabled}
 "#,
         global = setup.global,
+        contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
+        voices = setup.voices,
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
     )
@@ -262,23 +298,28 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     vfs.write_all(std::path::Path::new("/config/kernel/council/shell-gate.json"), spec_text().as_bytes())
         .await
         .unwrap();
-    live_context(d.kernel(), "voice");
-    live_context(d.kernel(), "system-rules");
+    vfs.write_all(
+        std::path::Path::new("/config/kernel/council/direction-check.json"),
+        crate::config_seed::DEFAULT_COUNCIL_DIRECTION_CHECK.as_bytes(),
+    )
+    .await
+    .unwrap();
 
     let actor = PrincipalId::new();
-    let reviewer = PrincipalId::new();
-    let context_id = crate::kj::test_helpers::register_context(&d, Some("council-seat"), None, actor);
+    let (reviewer, parent) = if setup.chain {
+        let system = live_context(d.kernel(), "council-system");
+        append_dialogue(d.kernel(), system, &["never force push"]);
+        // The test dispatcher seeds `amy`, a live root, and her root context.
+        let banto = character(d.kernel(), "banto", false);
+        (banto, Some(crate::kj::test_helpers::register_root_context(&d)))
+    } else {
+        live_context(d.kernel(), "voice");
+        live_context(d.kernel(), "system-rules");
+        (character(d.kernel(), "council-seat-reviewer", false), None)
+    };
+    let context_id = crate::kj::test_helpers::register_context(&d, Some("council-seat"), parent, actor);
     d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
-    {
-        let db = d.kernel_db();
-        let db = db.lock();
-        db.insert_character(&crate::kernel_db::CharacterRow {
-            principal_id: reviewer, name: "council-seat-reviewer".into(), created_at: 0, retired_at: None,
-            handoff_ctx: None, root_ctx: None, root: false,
-        })
-        .unwrap();
-        db.update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
-    }
+    d.kernel_db().lock().update_context_review(context_id, Some(actor), Some(reviewer)).unwrap();
     let mut binding = ContextToolBinding::new();
     binding.grant(Capability::Facade("shell_write".into()));
     broker.set_binding(context_id, binding).await.unwrap();
@@ -384,6 +425,56 @@ impl Rig {
     async fn finish(self) {
         self.d.kernel().shutdown_runtime_worker().await.unwrap();
     }
+
+    /// The id of the live context labeled `label`.
+    fn context_of(&self, label: &str) -> String {
+        let db = self.d.kernel_db();
+        let db = db.lock();
+        db.find_context_by_label(label).unwrap().unwrap_or_else(|| panic!("no context {label}")).context_id.to_string()
+    }
+
+    /// The ids a decision request read, in order.
+    fn read_ids(request: &DecisionRequest) -> Vec<String> {
+        request.contexts.iter().flatten().map(|c| c.id.clone()).collect()
+    }
+
+    /// Every decision request except the reads of the voice `observed` alone.
+    fn gate_requests(&self, observed: &str) -> Vec<DecisionRequest> {
+        self.mock.decisions().into_iter().filter(|r| Self::read_ids(r) != [observed.to_string()]).collect()
+    }
+
+    /// The observations recorded against `decision_id`, once there are
+    /// `want` of them; the observation runs on its own task.
+    async fn observations(&self, decision_id: &[u8], want: usize) -> Vec<CouncilObservation> {
+        let read = || {
+            let db = self.d.kernel_db();
+            let db = db.lock();
+            list_council_observations_for_decision(db.conn_for_ledger(), decision_id).unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let rows = read();
+                if rows.len() >= want {
+                    return rows;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{:?}: {want} observation(s) expected, found {:?}", self.via, read()))
+    }
+
+    fn skips(&self, decision_id: &[u8]) -> Vec<String> {
+        let db = self.d.kernel_db();
+        let db = db.lock();
+        list_council_voice_skips(db.conn_for_ledger(), decision_id).unwrap().into_iter().map(|s| s.character_name).collect()
+    }
+}
+
+/// A confident allow from each context the request reads.
+fn allow_each(request: &DecisionRequest) -> Reply {
+    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    Reply::ok(answer(request, &vec![[-0.001, -8.0, -9.0]; n]))
 }
 
 fn assert_pending(via: Via, result: Result<(), McpError>) {
@@ -874,6 +965,214 @@ async fn a_decision_that_cannot_be_recorded_refuses_the_submission() {
             Ok(()) => panic!("{via:?}: an unrecorded decision allowed a submission"),
         }
         assert!(rig.asks().is_empty(), "{via:?}: the ask rolled back with its decision: {:#?}", rig.asks());
+        rig.finish().await;
+    }
+}
+
+/// The decision the gate made for the one submission in `rig`: the newest
+/// for its context.
+fn latest_decision(rig: &Rig) -> CouncilDecision {
+    rig.decisions().into_iter().max_by_key(|d| d.created_at).expect("a council decision")
+}
+
+/// With voices on, a seat reviewed by banto for Amy reads the system rules
+/// and Amy's voice in the decision, and banto's voice is read after it,
+/// alone under `direction-check`, recorded against the decision.
+///
+/// Falsified by `consult` reading only `[council] contexts`: the request
+/// reads one context. Falsified by no observation spawn: nothing is
+/// recorded against the decision.
+#[tokio::test]
+async fn voices_compose_amy_into_the_decision_and_banto_observes_it() {
+    for via in BOTH {
+        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        let amy = live_context(rig.d.kernel(), "council-amy");
+        append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
+        let banto = live_context(rig.d.kernel(), "council-banto");
+        append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
+        let banto_id = banto.to_string();
+        let observed = banto_id.clone();
+        rig.mock.set(move |req| {
+            if Rig::read_ids(req) == [observed.clone()] {
+                Reply::ok(follows_answer(req, [-2.0, -0.2, -3.0]))
+            } else {
+                allow_each(req)
+            }
+        });
+        rig.submit("echo voices").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
+
+        let sent = rig.gate_requests(&banto_id);
+        assert_eq!(sent.len(), 1, "{via:?}: one gate decision");
+        assert_eq!(
+            Rig::read_ids(&sent[0]),
+            [rig.context_of("council-system"), rig.context_of("council-amy")],
+            "{via:?}: the decision reads the system rules, then Amy's voice"
+        );
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+        assert!(rig.skips(&decision.decision_id).is_empty(), "{via:?}: every voice is held");
+
+        let rows = rig.observations(&decision.decision_id, 1).await;
+        assert_eq!(rows.len(), 1, "{via:?}: {rows:#?}");
+        let o = &rows[0].observation;
+        assert_eq!(o.seat_label, "council-banto");
+        assert_eq!(o.spec_name, "direction-check");
+        assert_eq!(o.outcome, CouncilObservationOutcome::Answered, "{via:?}: {o:?}");
+        assert_eq!(o.choice.as_deref(), Some("strays"));
+        let observed: Vec<DecisionRequest> =
+            rig.mock.decisions().into_iter().filter(|r| Rig::read_ids(r) == [banto_id.clone()]).collect();
+        assert_eq!(observed.len(), 1, "{via:?}: banto's voice is read once, alone");
+        assert_eq!(serde_json::to_value(&observed[0].state).unwrap()["command"], "echo voices");
+        assert_ne!(observed[0].spec_id, sent[0].spec_id, "the observation reads its own spec");
+        rig.finish().await;
+    }
+}
+
+/// A character on the chain with no voice context is skipped, and the skip
+/// is recorded with the decision; the decision still reads Amy's voice.
+///
+/// Falsified by a decision record written without the chain's skips.
+#[tokio::test]
+async fn a_character_without_a_voice_is_recorded_as_a_skip() {
+    for via in BOTH {
+        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        live_context(rig.d.kernel(), "council-amy");
+        rig.mock.set(allow_each);
+        rig.submit("echo skipped").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(rig.skips(&decision.decision_id), ["banto"], "{via:?}");
+        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: nothing to observe");
+        assert_eq!(Rig::read_ids(&rig.mock.decisions()[0]).len(), 2, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// An observation the server refuses is the observation's own miss: the
+/// gate's outcome stands and the miss is recorded with its cause.
+#[tokio::test]
+async fn an_observation_that_fails_leaves_the_gate_alone() {
+    for via in BOTH {
+        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        live_context(rig.d.kernel(), "council-amy");
+        let banto = live_context(rig.d.kernel(), "council-banto").to_string();
+        let observed = banto.clone();
+        rig.mock.set(move |req| {
+            if Rig::read_ids(req) == [observed.clone()] {
+                Reply { status: 500, body: "boom".into(), delay: Duration::ZERO }
+            } else {
+                allow_each(req)
+            }
+        });
+        rig.submit("echo observed").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+        let rows = rig.observations(&decision.decision_id, 1).await;
+        let o = &rows[0].observation;
+        assert_eq!(o.outcome, CouncilObservationOutcome::Miss, "{via:?}: {o:?}");
+        assert!(o.miss_cause.as_deref().unwrap().contains("500"), "{via:?}: {o:?}");
+        rig.finish().await;
+    }
+}
+
+/// With voices off, a decision reads exactly `[council] contexts`, even
+/// when the reviewer chain has voices, and nothing observes it.
+#[tokio::test]
+async fn with_voices_off_the_decision_reads_the_configured_contexts() {
+    for via in BOTH {
+        let rig = rig(via, Setup { chain: true, ..Setup::default() }).await;
+        live_context(rig.d.kernel(), "council-amy");
+        live_context(rig.d.kernel(), "council-banto");
+        rig.mock.set(allow_each);
+        rig.submit("echo configured").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
+        let sent = rig.mock.decisions();
+        assert_eq!(sent.len(), 1, "{via:?}");
+        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("council-system")], "{via:?}");
+        let decision = latest_decision(&rig);
+        assert!(rig.skips(&decision.decision_id).is_empty());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: no observation is read");
+        rig.finish().await;
+
+        let rig = self::rig(via, Setup::default()).await;
+        rig.mock.answers(&ALLOW);
+        rig.submit("echo configured").await.unwrap();
+        let sent = rig.mock.decisions();
+        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// A decision's 404 naming the spec is a miss, and the next decision posts
+/// the spec again before it asks. The contexts the server still holds are
+/// not sent again.
+///
+/// Falsified by a decision failure that leaves the spec marked posted: the
+/// second decision is another 404.
+#[tokio::test]
+async fn a_spec_404_posts_the_spec_again_on_the_next_decision() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        let forgot = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let once = forgot.clone();
+        rig.mock.set(move |req| {
+            let spec = req.spec_id.as_ref().unwrap().to_string();
+            if once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let body = serde_json::json!({"error": {"type": "not_found", "message": format!("unknown spec {spec}")}});
+                Reply { status: 404, body: body.to_string(), delay: Duration::ZERO }
+            } else {
+                Reply::ok(answer(req, &ALLOW))
+            }
+        });
+        assert_pending(via, rig.submit("touch first.txt").await);
+        let first = latest_decision(&rig);
+        assert_eq!(first.decision.outcome, CouncilOutcome::Miss, "{via:?}");
+        assert!(first.decision.miss_cause.as_deref().unwrap().contains("404"), "{first:?}");
+        assert_eq!(rig.mock.count("POST", "/council/v1/specs"), 1);
+        let puts = rig.mock.count("PUT", "/council/v1/contexts/");
+
+        rig.submit("echo second").await.unwrap_or_else(|e| panic!("{via:?}: the second decision allows: {e:?}"));
+        assert_eq!(rig.mock.count("POST", "/council/v1/specs"), 2, "{via:?}: the spec is posted again");
+        assert_eq!(rig.mock.count("PUT", "/council/v1/contexts/"), puts, "{via:?}: the contexts are still held");
+        rig.finish().await;
+    }
+}
+
+/// One deadline bounds the whole decision, prepare included. A server
+/// slow on every `PUT`, each call inside the deadline on its own, is a miss
+/// at the deadline, during prepare. A prepare that spends most of the
+/// deadline leaves the decision only what remains.
+///
+/// Falsified by a deadline per call: the first case waits for both `PUT`s
+/// and then decides, and the second waits a whole deadline for the answer.
+#[tokio::test]
+async fn one_deadline_bounds_prepare_and_the_decision_together() {
+    const DEADLINE: u64 = 1000;
+    let bound = Duration::from_millis(DEADLINE + 400);
+    for via in BOTH {
+        let rig = rig(via, Setup { deadline_ms: DEADLINE, ..Setup::default() }).await;
+        rig.mock.answers(&ALLOW);
+        rig.mock.delay_puts(&[Duration::from_millis(900), Duration::from_millis(900)]);
+        let started = std::time::Instant::now();
+        assert_pending(via, rig.submit("touch slow.txt").await);
+        let took = started.elapsed();
+        assert!(took < bound, "{via:?}: the decision took {took:?}, past one {DEADLINE} ms deadline");
+        let decision = latest_decision(&rig);
+        let cause = decision.decision.miss_cause.clone().unwrap_or_default();
+        assert!(cause.contains("deadline passed during prepare"), "{via:?}: {cause}");
+        assert!(rig.mock.decisions().is_empty(), "{via:?}: no decision was asked");
+        rig.finish().await;
+
+        let rig = self::rig(via, Setup { deadline_ms: DEADLINE, ..Setup::default() }).await;
+        rig.mock.set(|req| Reply { delay: Duration::from_millis(900), ..Reply::ok(answer(req, &ALLOW)) });
+        rig.mock.delay_puts(&[Duration::from_millis(300), Duration::from_millis(300)]);
+        let started = std::time::Instant::now();
+        assert_pending(via, rig.submit("touch slow.txt").await);
+        let took = started.elapsed();
+        assert!(took < bound, "{via:?}: the decision took {took:?}, past one {DEADLINE} ms deadline");
+        let cause = latest_decision(&rig).decision.miss_cause.unwrap_or_default();
+        assert!(cause.contains("deadline passed during the decision"), "{via:?}: {cause}");
         rig.finish().await;
     }
 }
