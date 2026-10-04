@@ -99,7 +99,8 @@ mandatory behavioral prepend. Rc creates durable
 Read `docs/prompts.md` before changing prompt composition or rc instructions.
 It owns the implemented contract; `docs/oss-comparisons.md` owns the research.
 Write stances in kaibo's register: plain literal ASCII English, one
-instruction per sentence, one register for every model. Keep collaboration
+instruction per sentence, one register for every model. A closing 頑張って
+is the one exception. Keep collaboration
 guidance and task procedure in the type, syntax in help/schema, and changing
 observations in notifications. Character-specific rc is a design direction,
 not an available loader feature. Per-model specializations await comparative

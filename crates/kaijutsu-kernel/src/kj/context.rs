@@ -6730,17 +6730,17 @@ mod tests {
             !msg.contains("LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR"),
             "the old /config/kernel/system.md input must be ignored: {msg}"
         );
-        // The coder stance carries the collaboration rules, test-first work,
-        // the building rules, and the script rule.
-        for rule in ["Follow their objective", "least privilege", "one small program you own",
-            "Use the program the task names", "short, simple script file that reads top-down",
-            "write the lines out", "Pass a script file, not inline text",
-            "Copy an important file before any program opens or changes it",
-            "tested and verified", "Stop when the task is finished",
-            "report blocked or gave_up", "cancel the rest",
-            "Write a large file in parts", "watch it fail", "grep in the shell",
-            "ask with blocked", "Continue any work that does not depend on the answer"] {
-            assert!(msg.contains(rule), "coder stance is missing {rule:?}: {msg}");
+        // The coder stance carries the collaboration rules, the orient and
+        // define-done rhythm, the working rules, and the ending calls.
+        for rule in ["Follow their objective", "ask with blocked",
+            "continue any work that does not depend on the answer",
+            "Start each task by orienting", "record that before you begin",
+            "Search file contents with grep", "Pass a script file, not inline text",
+            "kj wait --operation", "Difficulty and uncertainty are not reasons to stop",
+            "use the done tool to let us know", "頑張って"] {
+            // Prose wraps freely; compare with line breaks folded to spaces.
+            let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains(rule), "coder stance is missing {rule:?}: {msg}");
         }
 
         // Order is the rc sort order: coder S00-stance, then the situation.

@@ -484,7 +484,9 @@ mod tests {
 
     /// Instruction text is read by models that are mostly not English-first.
     /// Shipped stances use plain ASCII English: no em dashes and no other
-    /// languages. A person's own prompts may use any language.
+    /// languages. The one exception is a closing 頑張って line, which is
+    /// encouragement, not instruction. A person's own prompts may use any
+    /// language.
     #[test]
     fn shipped_stances_are_plain_ascii_english() {
         for path in [
@@ -495,9 +497,17 @@ mod tests {
             "/config/rc/assistant/create/S00-stance.kai",
         ] {
             let body = seed_body(path).unwrap_or_else(|| panic!("missing {path}"));
+            let trimmed = body.trim_end();
+            let body = trimmed.strip_suffix("頑張って").unwrap_or(trimmed);
             let foreign: Vec<char> = body.chars().filter(|c| !c.is_ascii()).collect();
             assert!(foreign.is_empty(), "{path} has non-ASCII characters: {foreign:?}");
         }
+    }
+
+    #[test]
+    fn coder_stance_closes_with_ganbatte() {
+        let stance = seed_body("/config/rc/coder/create/S00-stance.md").expect("coder stance");
+        assert!(stance.trim_end().ends_with("\n\n頑張って"), "coder stance closes with 頑張って");
     }
 
     #[test]

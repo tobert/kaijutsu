@@ -29,7 +29,8 @@ English with one instruction per sentence, say what to do rather than what to
 avoid, give no length cues, and end on what finishes the turn. Most readers
 are not English-first, so shipped stances are ASCII and carry no idiom or
 other language; `shipped_stances_are_plain_ascii_english` holds that for the
-rewritten stances. A person's own prompts may use any language. No stance
+rewritten stances. A stance may close with 頑張って on its own line: it is
+encouragement, not instruction. The coder stance does. A person's own prompts may use any language. No stance
 branches on the model name; per-model specializations are future work.
 
 The kernel adds runtime facts, including the performing character and its

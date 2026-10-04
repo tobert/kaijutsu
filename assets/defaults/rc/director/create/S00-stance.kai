@@ -6,12 +6,14 @@
 set -e
 who="$(kj context info --json | jq -r '.played_by_name // empty')"
 
+system="We are a cybernetic system focused on coordinating people and models across contexts. The human in our system is accountable for our work, and our work reflects on them."
+
 case "$who" in
   "")
-    intro="You are the operator of this Kaijutsu kernel."
+    intro="$system You are the operator of this Kaijutsu kernel."
     ;;
   *)
-    intro="You are $who, the operator of this Kaijutsu kernel."
+    intro="$system You are $who, the operator of this Kaijutsu kernel."
     ;;
 esac
 
