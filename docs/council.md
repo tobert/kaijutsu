@@ -166,12 +166,19 @@ reason. These let us tune in real time."
 
 | Context | Holds | Fed by |
 |---|---|---|
-| voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy; banto by drift |
+| voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy |
 | system rules | the house rules every seat shares | Amy and banto, by chat |
-| (later) | one or two more, when evidence asks for them | |
+| banto | banto's own judgment as the house's head clerk | banto, writing text blocks in it |
+| (later) | one more, when evidence asks for it | |
 
 - **One voice context for every seat.** It is one set of snapshots and one
   fit. Amy, 2026-10-04: "one global voice context is fine".
+- **Banto has its own seat.** Its view reaches the council as a context of
+  its own, not as drifts into Amy's voice, so the reads keep Amy's words and
+  banto's apart and `leave_one_out` can say which of them moved a decision.
+  Amy, 2026-10-04: "I think we'd give banto its own seat on the council".
+  Banto writes that context's text blocks itself; the projection reads them
+  like any other.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
@@ -248,7 +255,7 @@ before any host file gains these lines.
 ```toml
 [council]
 server = "http://zorak:8090"
-contexts = ["voice", "system-rules"]
+contexts = ["voice", "system-rules", "banto"]
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 
