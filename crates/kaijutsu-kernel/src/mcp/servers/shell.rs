@@ -84,44 +84,46 @@ pub(crate) fn resolve_command_timeout(
     }
 }
 
-// One short statement of what the shell is and what a call returns. The
-// language reference stays in kaish (`help syntax`), so the description every
-// request carries stays small. It names only the bash habits models still
-// bring after kaish accepts what it can: unquoted mixed words, `( … )`
-// subshells, `[ … ]` tests, and text handed to a second shell, which the
-// shell-escape guard denies.
-const ABOUT_KAISH: &str = "kaish (会sh) is a small shell, not bash: a subset \
-     with a JSON data model. Values keep their types (strings, numbers, \
-     booleans, lists `[a b c]`, records `{k: v}`) through variables and pipes, \
-     and builtins return structured data. It checks a whole command before \
-     running it and refuses anything outside its language, so a command never \
-     half-runs. Quote a word that mixes text with `$var` or `$(…)`: write \
-     \"/tmp/$f.csv\", not /tmp/$f.csv. Group commands with `{ …; }`; there are \
-     no `( … )` subshells. Test with `[[ … ]]` or `test`; `[` starts a list. \
-     Do not pass text to `sh -c` or `bash -c`: write a short script file that \
-     reads top-down, then run the file. Builtins run in-process; other programs run from PATH. `help syntax` lists \
-     the language.";
+// What the shell is and what a call returns, in one short statement every
+// request carries. Models already write good shell and JSON, so the
+// description invites the shell they know and leans on kaish to refuse what
+// is outside its language with the fix named. Language detail stays in
+// `help`, and the text describes kaish by what it is, never by another shell.
+const ABOUT_KAISH: &str = "The shell is kaish (会sh), a shell for agents with \
+     familiar syntax and a JSON data model. Write the shell you already know, \
+     and use JSON where structure helps: a variable holds a string, a number, a \
+     list, or a record, and builtins print JSON when you pass `--json`. Quote \
+     words the way you quote JSON strings. A bare word holds only letters, \
+     digits, and the marks `_ . - / @ + ^ ~`, and globs such as `*.log` work \
+     as usual. Put any other text in quotes: double quotes for text with \
+     spaces, punctuation, or a variable, as in \"/tmp/$f.csv\", and single \
+     quotes for text kaish should leave alone. A bare number follows JSON \
+     rules, so `007` is a string. kaish checks the whole program before it runs any of it. When something is \
+     outside its language, kaish refuses, nothing runs, and the message says \
+     what to write instead; make that change and send it again. Builtins such \
+     as grep, sed, awk, find, and jq run inside the shell; other programs run \
+     from PATH. Put a multi-step job in a script file and run the file. `help` \
+     lists the topics, `help syntax` covers the language, and `help <command>` \
+     explains one builtin.";
 
 // What a call returns, as a model turn reads it (`ShellEnvelope::model_text`)
 // and as an MCP caller receives it (the envelope). Both flavours share it.
-const RESULT_CONTRACT: &str = "The result is the command's stdout, then a \
-     `[stderr]` line and stderr when the command wrote any. One bracketed line \
-     follows for each fact that changes your next step: `[exit N]`; \
-     `[rejected: the program did not run]` (kaish refused the text: fix it and \
-     retry); `[running in the background: operation ID]`; `[output truncated: \
-     N bytes; the full output is at /v/cas/…]` (read that path with `grep`, \
-     `sed -n`, or `read`); `[cwd now DIR]` (the call changed your working \
-     directory); `[warning: …]` (correct it first; a cwd of `/` draws one on \
-     every call). A clean success is its output alone; a command that printed \
-     nothing reads `[no output]`. An MCP caller \
-     receives one JSON object with the keys {stdout, stderr, exit_code, status, \
-     did_spill, data, latch, block_id, operation_id, ask_id, content_type, \
-     ephemeral, elapsed_ms, error, cwd, warning}; `exit_code` null is never evidence of success.";
+const RESULT_CONTRACT: &str = "Each call returns the command's output. If the \
+     command wrote to stderr, a `[stderr]` line comes next, then the stderr \
+     text. After that, one bracketed line reports each fact that changes your \
+     next step: `[exit N]` when the command failed; `[rejected: the program did \
+     not run]` when kaish refused it; `[running in the background: operation \
+     ID]`; `[output truncated: N bytes; the full output is at /v/cas/…]`, which \
+     you can read with `grep`, `sed -n`, or `read`; `[cwd now DIR]` when the \
+     command changed your directory; and `[warning: …]`, which you fix first. \
+     A command that printed nothing returns `[no output]`. An MCP caller \
+     receives the same facts as one JSON object; `exit_code` null is never \
+     evidence of success.";
 
 static DESCRIPTION: LazyLock<String> = LazyLock::new(|| {
     format!(
         "Run a command in your current kernel context. {ABOUT_KAISH} `kj` manages \
-         contexts, drift, and forks. {RESULT_CONTRACT}"
+         contexts, drift, and forks; `kj help` explains it. {RESULT_CONTRACT}"
     )
 });
 
@@ -456,13 +458,20 @@ mod tests {
         let text = DESCRIPTION.as_str();
         assert!(text.len() < 2000, "{} chars: {text}", text.len());
         assert!(text.contains("current kernel context") && text.contains("`kj` manages"), "{text}");
-        assert!(text.contains("JSON data") && text.contains("help syntax"), "{text}");
-        // The habits a DeepSeek A/B still showed after the lexer fixes: name
-        // the language as a subset, and the bash forms it refuses.
-        assert!(text.contains("not bash") && text.contains("`[[ … ]]`") && text.contains("`{ …; }`"), "{text}");
-        // The shell-escape guard's rule, stated before a call meets it.
-        assert!(text.contains("`sh -c`") && text.contains("write a short script file"), "{text}");
+        assert!(text.contains("familiar syntax and a JSON data model"), "{text}");
+        // Models write the shell they know; kaish refuses what is outside its
+        // language and names the fix. The details live in `help`.
+        assert!(text.contains("Write the shell you already know"), "{text}");
+        assert!(text.contains("says what to write instead"), "{text}");
+        assert!(text.contains("`help syntax`") && text.contains("script file"), "{text}");
         let ro_text = DESCRIPTION_READ_ONLY.as_str();
+        // kaish is described by what it is, never by comparison to another shell.
+        for description in [text, ro_text] {
+            let lower = description.to_lowercase();
+            for other in ["bash", "zsh", "posix", "bourne", "fish"] {
+                assert!(!lower.contains(other), "names {other}: {description}");
+            }
+        }
         assert!(ro_text.len() < 2500, "{} chars: {ro_text}", ro_text.len());
         assert!(ro_text.contains("cannot mutate shared state") && ro_text.contains("/v/docs"), "{ro_text}");
         assert!(ro_text.contains("`shell_write`") && ro_text.contains("`which` finds host programs on PATH"), "{ro_text}");
