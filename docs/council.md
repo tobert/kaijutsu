@@ -168,26 +168,30 @@ reason. These let us tune in real time."
 |---|---|---|
 | voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy |
 | system rules | the house rules every seat shares | Amy and banto, by chat |
-| the reviewer's seat | the judgment of the director that reviews this coder, such as banto | that director, writing text blocks in it |
+| a director's seat (observes) | the directions of the director that reviews this coder, such as banto | that director, by drift |
 | (later) | one more, when evidence asks for it | |
 
 - **One voice context for every seat.** It is one set of snapshots and one
   fit. Amy, 2026-10-04: "one global voice context is fine".
-- **A director has its own seat, shared by the coders it reviews.** Banto's
-  view reaches the council as a context of its own, not as drifts into Amy's
-  voice, so the reads keep Amy's words and banto's apart and `leave_one_out`
-  can say which of them moved a decision. Amy, 2026-10-04: "I think we'd give
-  banto its own seat on the council" and "if banto has several coders they
-  would share that banto's council seat". The director writes that context's
-  text blocks itself; the projection reads them like any other.
+- **A director's seat observes; it does not vote.** A director such as banto
+  gives directions, so its question is different from the safety verdict:
+  "is this action following my directions?" Amy, 2026-10-04: "It's an
+  experiment; I'm unsure where it'll in authority." So the seat:
+  - is a context of its own, labeled `council-<character>`, shared by every
+    coder that director reviews ("if banto has several coders they would
+    share that banto's council seat");
+  - is fed by drift: the director drifts its directions into it as it goes,
+    or when Amy asks it to, so the projection reads drift blocks in seat
+    contexts;
+  - is read under its own spec (`direction-check`), after the gate has
+    decided, off the hot path, and its answer is recorded with the decision;
+  - never enters the pool and never changes what the gate does. Giving it
+    authority is a later choice, made from the recorded answers.
 - **The seat follows the ask's reviewer.** Every ask already resolves a
   reviewer (`docs/approval-identity.md`, reviewer resolution). When that
-  reviewer is a model character, the decision adds the context labeled
-  `council-<character>`, so every coder banto reviews reads `council-banto`.
-  When the reviewer is a live root character (Amy at her own root), the
-  voice context already speaks for her and no seat is added. A model
-  reviewer with no seat context is recorded on the decision and read
-  without one; it is not a miss.
+  reviewer is a model character with a `council-<character>` context, the
+  decision schedules the seat's read. A root reviewer has no seat; Amy's
+  voice context already speaks for her.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
@@ -265,7 +269,7 @@ before any host file gains these lines.
 [council]
 server = "http://zorak:8090"
 contexts = ["voice", "system-rules"]
-reviewer_seat = true           # add council-<reviewer> when the reviewer is a model
+director_seats = true          # read council-<reviewer> after deciding, recorded only
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 
