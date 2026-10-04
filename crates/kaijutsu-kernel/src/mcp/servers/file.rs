@@ -91,23 +91,6 @@ pub struct GlobParams {
     pub path: Option<String>,
 }
 
-/// Parameters for the `grep` tool.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GrepParams {
-    /// Regex pattern to search for.
-    pub pattern: String,
-    /// Optional directory to restrict search.
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Optional glob filter for filenames.
-    #[serde(default)]
-    pub glob: Option<String>,
-    /// Lines of context before/after each match.
-    #[serde(default)]
-    pub context_lines: u32,
-}
-
 // ── Server ─────────────────────────────────────────────────────────────────
 
 pub struct FileToolsServer {
@@ -175,9 +158,6 @@ impl McpServerLike for FileToolsServer {
             )?,
             tool_def::<GlobParams>(&self.instance_id, "glob",
                 "Find files matching a glob pattern (supports **, gitignore)"
-            )?,
-            tool_def::<GrepParams>(&self.instance_id, "grep",
-                "Search file content with regex, document-aware (sees unflushed edits). Files over 1,000,000 bytes are skipped, each named in a `# WARNING: skipped` line; stops at 200 matches."
             )?,
         ])
     }
@@ -315,156 +295,6 @@ impl McpServerLike for FileToolsServer {
                             }
                         }
                         Err(e) => ExecResult::failure(1, format!("Glob walk failed: {}", e)),
-                    }
-                }
-            }
-            "grep" => {
-                let p: GrepParams =
-                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-                let re = match regex::Regex::new(&p.pattern) {
-                    Ok(r) => r,
-                    Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid regex pattern: {}", e)))),
-                };
-                let search_root = match &p.path {
-                    Some(pp) => match resolve_str(&cwd, pp) {
-                        Ok(s) => s,
-                        Err(e) => return Ok(from_exec_result(ExecResult::failure(1, e.to_string()))),
-                    },
-                    None => cwd.to_string_lossy().into_owned(),
-                };
-                if let Some(refusal) = refuse_filesystem_root_walk("grep", &search_root) {
-                    return Ok(from_exec_result(refusal));
-                }
-                if let Some(ref guard) = self.guard
-                    && let Err(denied) = guard.check_read(&tool_ctx, &search_root)
-                {
-                    denied
-                } else {
-                    let adapter = VfsWalkerAdapter(&self.vfs);
-                    let options = kaish_glob::WalkOptions {
-                        respect_gitignore: true,
-                        ..Default::default()
-                    };
-                    let mut walker = kaish_glob::FileWalker::new(&adapter, &search_root).with_options(options);
-                    if let Some(ref glob_pattern) = p.glob {
-                        match kaish_glob::GlobPath::new(glob_pattern) {
-                            Ok(g) => walker = walker.with_pattern(g),
-                            Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Invalid glob: {}", e)))),
-                        }
-                    }
-                    let files = match walker.collect().await {
-                        Ok(f) => f,
-                        Err(e) => return Ok(from_exec_result(ExecResult::failure(1, format!("Walk failed: {}", e)))),
-                    };
-                    const MAX_MATCHES: usize = 200;
-                    const MAX_FILE_SIZE: usize = 1_000_000;
-                    // Above this many oversize files, stop printing one
-                    // warning line each and fold the rest into a trailing
-                    // count — a search over a tree with hundreds of large
-                    // files must not drown its actual matches in warnings.
-                    const MAX_SKIP_WARNINGS: usize = 20;
-                    let mut output = String::new();
-                    let mut total_matches = 0;
-                    let mut skipped_for_size = 0usize;
-                    for file_path in &files {
-                        if total_matches >= MAX_MATCHES {
-                            break;
-                        }
-                        let path_str = file_path.display().to_string();
-                        let mut warn_oversize = |size: u64| {
-                            skipped_for_size += 1;
-                            if skipped_for_size <= MAX_SKIP_WARNINGS {
-                                output.push_str(&format!(
-                                    "# WARNING: skipped {} ({} bytes exceeds the {}-byte search limit)\n",
-                                    path_str, size, MAX_FILE_SIZE
-                                ));
-                            }
-                        };
-                        let content = match self.cache.try_read_content(&path_str).await {
-                            Ok(c) => {
-                                if c.len() > MAX_FILE_SIZE {
-                                    warn_oversize(c.len() as u64);
-                                    continue;
-                                }
-                                c
-                            }
-                            Err(CacheReadError::Backend(e)) => {
-                                output.push_str(&format!("# WARNING: skipped {} (document error: {})\n", path_str, e));
-                                continue;
-                            }
-                            Err(CacheReadError::NotCached) => {
-                                if let Ok(attr) = self.vfs.getattr(file_path).await
-                                    && attr.size as usize > MAX_FILE_SIZE
-                                {
-                                    warn_oversize(attr.size);
-                                    continue;
-                                }
-                                match self.vfs.read_all(file_path).await {
-                                    Ok(bytes) => match String::from_utf8(bytes) {
-                                        Ok(s) => s,
-                                        Err(_) => continue,
-                                    },
-                                    Err(_) => continue,
-                                }
-                            }
-                        };
-                        let lines: Vec<&str> = content.lines().collect();
-                        let ctx_lines = p.context_lines as usize;
-                        for (line_idx, line) in lines.iter().enumerate() {
-                            if total_matches >= MAX_MATCHES {
-                                break;
-                            }
-                            if re.is_match(line) {
-                                total_matches += 1;
-                                if ctx_lines > 0 {
-                                    let start = line_idx.saturating_sub(ctx_lines);
-                                    let end = (line_idx + ctx_lines + 1).min(lines.len());
-                                    for (i, line_text) in lines[start..end].iter().enumerate() {
-                                        let abs_idx = start + i;
-                                        let prefix = if abs_idx == line_idx { ">" } else { " " };
-                                        output.push_str(&format!(
-                                            "{}{}:{}:{}\n",
-                                            prefix,
-                                            path_str,
-                                            abs_idx + 1,
-                                            line_text
-                                        ));
-                                    }
-                                    output.push_str("--\n");
-                                } else {
-                                    output.push_str(&format!("{}:{}:{}\n", path_str, line_idx + 1, line));
-                                }
-                            }
-                        }
-                    }
-                    if skipped_for_size > MAX_SKIP_WARNINGS {
-                        output.push_str(&format!(
-                            "# WARNING: {} more file(s) skipped for exceeding the {}-byte search limit\n",
-                            skipped_for_size - MAX_SKIP_WARNINGS,
-                            MAX_FILE_SIZE
-                        ));
-                    }
-                    if total_matches == 0 {
-                        if output.is_empty() {
-                            ExecResult::success("No matches found.")
-                        } else {
-                            ExecResult::success(format!("{}\nNo matches found.", output.trim_end()))
-                        }
-                    } else {
-                        let truncated = if total_matches >= MAX_MATCHES {
-                            format!(" (truncated at {} matches)", MAX_MATCHES)
-                        } else {
-                            String::new()
-                        };
-                        ExecResult::success(format!(
-                            "{}\n{} match{} in {} file{}{}",
-                            output.trim_end(),
-                            total_matches,
-                            if total_matches == 1 { "" } else { "es" },
-                            files.len(),
-                            if files.len() == 1 { "" } else { "s" },
-                            truncated
-                        ))
                     }
                 }
             }
@@ -1120,6 +950,20 @@ mod tests {
         Arc::new(parking_lot::Mutex::new(KernelDb::temporary().unwrap()))
     }
 
+    /// The file server's tools. `grep` is gone: it searched cached copies
+    /// that could be stale, and the shell's `grep` reads the files
+    /// (`docs/file-buffers.md`, "`grep` is removed").
+    #[tokio::test]
+    async fn the_file_tools_are_read_edit_write_and_glob() {
+        let blocks = shared_block_store(PrincipalId::system());
+        let vfs = Arc::new(MountTable::new());
+        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
+        let server = FileToolsServer::new(cache, vfs, None);
+        let names: Vec<String> = server.list_tools(&CallContext::test()).await.unwrap()
+            .into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["read", "edit", "write", "glob"]);
+    }
+
     async fn broker_with_file(path: &str, content: &str) -> (Arc<Broker>, Arc<FileDocumentCache>) {
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
@@ -1363,7 +1207,7 @@ mod tests {
     async fn every_tool_rejects_a_context_with_no_cwd() {
         let (broker, _cache) = broker_with_file("/tmp/a.rs", "fn main() {}\n").await;
 
-        for tool in ["read", "edit", "write", "glob", "grep"] {
+        for tool in ["read", "edit", "write", "glob"] {
             let res = call_with_ctx(&broker, tool, serde_json::json!({}), &CallContext::test()).await;
             assert!(res.is_error, "{tool}: expected refusal, got: {}", text_of(&res));
             let msg = text_of(&res);
@@ -1428,21 +1272,6 @@ mod tests {
         );
     }
 
-    /// Same guard on `grep` — it reached the walk by a different line.
-    #[tokio::test]
-    async fn grep_without_path_refuses_a_filesystem_root_walk() {
-        let (broker, _cache) = broker_with_file("/tmp/b.rs", "fn main() {}\n").await;
-        let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/"));
-
-        let res = call_with_ctx(&broker, "grep", serde_json::json!({ "pattern": "fn" }), &ctx).await;
-
-        assert!(res.is_error, "expected refusal, got: {}", text_of(&res));
-        assert!(
-            text_of(&res).contains("refusing to walk the filesystem root"),
-            "grep must refuse a rootless walk too: {}",
-            text_of(&res)
-        );
-    }
 
     /// A path that CLIMBS OUT of its workspace reaches the root walk the
     /// guard exists to stop, even from a context with a perfectly ordinary
@@ -1541,65 +1370,6 @@ mod tests {
         broker
     }
 
-    /// Reproduces the 2026-08-18 backlog entry, pinned as a KNOWN, UNFIXED
-    /// defect rather than a required behavior: `grep` given a `path` that
-    /// names a specific *file* (the same shape `read` and shell `grep` both
-    /// accept) silently reports no matches, even when the pattern is
-    /// present, instead of searching the file or failing loudly.
-    ///
-    /// Root cause, not the entry's "document-aware" working theory: `grep`'s
-    /// `path` is always walked as a directory root
-    /// (`crates/kaijutsu-kernel/src/mcp/servers/file.rs`, the `grep` arm's
-    /// `kaish_glob::FileWalker::new(&adapter, &search_root)` — no
-    /// file-vs-directory check precedes it). `FileWalker::collect` opens
-    /// that root with `WalkerFs::list_dir` before it ever looks at file
-    /// contents (`kaish-glob-0.15.0/src/walker.rs:233`); handed a file path,
-    /// every VFS backend's `readdir` fails — `not_a_directory` in
-    /// `crates/kaijutsu-kernel/src/vfs/backends/memory.rs:160`, ENOTDIR via
-    /// `fs::read_dir` in `crates/kaijutsu-kernel/src/vfs/backends/local.rs`
-    /// (real files, so this reaches the live-repro backend too, not just
-    /// this test's in-memory one). `FileToolsServer` never installs a
-    /// `WalkOptions::on_error` callback, and the walker's own `Err(err) => {
-    /// ...; continue }` arm on that `list_dir` call
-    /// (`kaish-glob-0.15.0/src/walker.rs:233-240`) silently drops the error
-    /// when there is no callback and treats the root as an empty directory —
-    /// so `collect()` returns `Ok(vec![])`, `grep`'s `files` list is empty,
-    /// and the tool reports "No matches found": a confident, wrong answer
-    /// masking a walk that never happened. Pattern, anchoring, and file size
-    /// are all irrelevant to this path — only whether `path` names a file.
-    ///
-    /// Not fixed here: the MCP file tools (`read`/`edit`/`write`/`glob`/`grep`
-    /// in this module) are being removed in favor of kaish (Amy, 2026-08-21)
-    /// — a fix to code slated for deletion is waste. This test exists to
-    /// document the mechanism before the tool goes away, and to falsify the
-    /// entry's "document-aware"/"different view" theory, which this shows is
-    /// not what is happening: no document view is involved, just a directory
-    /// walk over a file path.
-    #[tokio::test]
-    async fn grep_is_blind_when_path_names_a_specific_file() {
-        let path = "/tmp/issues.md";
-        let content = "intro\n## SFTP\nbody\n## Another heading\n";
-        let broker = broker_with_vfs_file(path, content).await;
-
-        let res = call(
-            &broker,
-            "grep",
-            serde_json::json!({ "pattern": "## SFTP", "path": path }),
-        )
-        .await;
-
-        assert!(!res.is_error, "the walk-empty case reports success, not an error: {}", text_of(&res));
-        assert_eq!(
-            text_of(&res),
-            "No matches found.",
-            "documents the live defect: a pattern that IS in the file comes back \
-             as no matches because `path` names a file, not a directory. If this \
-             ever starts finding \"## SFTP\", the walker/VFS behavior this test \
-             pins has changed — update or remove this test rather than treating \
-             the change as a break: {}",
-            text_of(&res)
-        );
-    }
 
     /// Mounts several files directly on the VFS backend, the way
     /// `broker_with_vfs_file` does for one file, so the walker `grep` and
@@ -1621,95 +1391,6 @@ mod tests {
         (broker, cache)
     }
 
-    /// A file over the 1,000,000-byte search limit must be named in a
-    /// warning, not silently dropped from the walk — the model asking for
-    /// the search otherwise has no way to know part of its query never ran.
-    /// This file is never loaded into the document cache, so it exercises
-    /// the `CacheReadError::NotCached` branch that sizes the file through
-    /// `vfs.getattr`.
-    #[tokio::test]
-    async fn grep_warns_when_an_uncached_file_exceeds_the_search_limit() {
-        let huge = "x".repeat(1_000_001);
-        let (broker, _cache) = broker_with_vfs_files(&[
-            ("/tmp/huge.txt", huge.as_str()),
-            ("/tmp/small.txt", "needle here\n"),
-        ])
-        .await;
-
-        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
-
-        assert!(!res.is_error, "grep failed: {}", text_of(&res));
-        let text = text_of(&res);
-        assert!(
-            text.contains(
-                "# WARNING: skipped /tmp/huge.txt (1000001 bytes exceeds the 1000000-byte search limit)"
-            ),
-            "warning must name the path, size, and limit: {text}"
-        );
-        assert!(
-            text.contains("/tmp/small.txt:1:needle here"),
-            "a small file's match must still return alongside the warning: {text}"
-        );
-    }
-
-    /// Same oversize warning, but for a file already loaded into the
-    /// document cache (as `read` or `edit` would leave it) — the
-    /// cached-content branch, checked before the `vfs.getattr` fallback.
-    #[tokio::test]
-    async fn grep_warns_when_a_cached_file_exceeds_the_search_limit() {
-        let huge = "y".repeat(1_500_000);
-        let (broker, cache) = broker_with_vfs_files(&[
-            ("/tmp/huge-cached.txt", huge.as_str()),
-            ("/tmp/small.txt", "needle here\n"),
-        ])
-        .await;
-        cache.create_or_replace("/tmp/huge-cached.txt", &huge, PrincipalId::system()).await.unwrap();
-
-        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
-
-        assert!(!res.is_error, "grep failed: {}", text_of(&res));
-        let text = text_of(&res);
-        assert!(
-            text.contains(
-                "# WARNING: skipped /tmp/huge-cached.txt (1500000 bytes exceeds the 1000000-byte search limit)"
-            ),
-            "the cached branch must warn too: {text}"
-        );
-        assert!(text.contains("/tmp/small.txt:1:needle here"), "{text}");
-    }
-
-    /// Many oversize files must not flood the output with one warning line
-    /// each — the skip warnings are capped, and the remainder is reported
-    /// as a count instead of a wall of near-identical lines.
-    #[tokio::test]
-    async fn grep_caps_skip_warnings_and_counts_the_rest() {
-        let huge = "z".repeat(1_000_001);
-        let mut files: Vec<(String, String)> = (0..30)
-            .map(|i| (format!("/tmp/huge-{i:02}.txt"), huge.clone()))
-            .collect();
-        files.push(("/tmp/small.txt".to_string(), "needle here\n".to_string()));
-        let file_refs: Vec<(&str, &str)> =
-            files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
-        let (broker, _cache) = broker_with_vfs_files(&file_refs).await;
-
-        let res = call(&broker, "grep", serde_json::json!({ "pattern": "needle" })).await;
-
-        assert!(!res.is_error, "grep failed: {}", text_of(&res));
-        let text = text_of(&res);
-        let warning_lines = text.lines().filter(|l| l.starts_with("# WARNING: skipped /tmp/huge")).count();
-        assert!(
-            warning_lines < 30,
-            "30 oversize files must not each get their own warning line: {warning_lines} lines in {text}"
-        );
-        assert!(
-            text.contains("more file(s) skipped"),
-            "the files beyond the cap must be summarized by count: {text}"
-        );
-        assert!(
-            text.contains("/tmp/small.txt:1:needle here"),
-            "the small file's match must still return: {text}"
-        );
-    }
 
     /// The guard must not over-refuse: an explicit path is let through.
     /// Without this, "refuse the root" could be satisfied by refusing

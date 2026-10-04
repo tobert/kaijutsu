@@ -308,12 +308,14 @@ via a file tool gets a tool *result*; the announcement rides that text.
 3. **`:w` guard — done.** W12 is implemented as `flush_one_guarded`: `:w`
    refuses when the disk generation moved past the load generation, `:w!`
    overrides.
-4. **Tool surface — open.** `write` and `grep` still exist as MCP tools;
+4. **Tool surface — open.** The MCP `grep` tool is removed (2026-10-03); the
+   coder stance points at the shell's `grep`. `write` still exists as an MCP
+   tool;
    `edit` still has both string mode (`old_string`/`new_string`) and hashline
    mode. The target is now kaish's own `edit` builtin with hashline anchors
    (Amy, 2026-09-25: "kaish gets edit and hashline support throughout"):
    once it ships, the MCP `read` and `edit` tools reduce onto kaish instead
-   of `edit` becoming hashline-only here. Removing `write` and `grep`, adding
+   of `edit` becoming hashline-only here. Removing `write`, adding
    `create_file` if wanted, dropping our `edit` alias for vi, and updating
    `docs/kj-help/` and every published `///` are still ahead. See
    `docs/issues.md`, "File buffers: reduce the MCP file tools to kaish".

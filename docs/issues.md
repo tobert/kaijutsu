@@ -589,7 +589,7 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   picker, ledger, and prefilled prompts are held because nothing draws them
   there. The hold notice is only visible after leaving the surface.
 - Whether seats write their handoff note before stopping is prompt guidance
-  (`S00-base.md`), unmeasured. Tune it from what the morning rotation finds.
+  in the default and director stances, unmeasured. Tune it from what the morning rotation finds.
 - `kj::ledger::tests::decision_span_keeps_the_ask_and_deciding_actor_separate`
   is flaky under the parallel test runner and passes single-threaded.
 - `mcp::broker::tests::tool_call_spans_keep_requester_actor_and_reviewer_distinct`
@@ -2236,7 +2236,9 @@ Re-verified against the tree the same day:
 ## File buffers: reduce the MCP file tools to kaish (low priority)
 
 Slices 1-3 of `docs/file-buffers.md` shipped. `mcp/servers/file.rs` still
-registers `read`, `edit`, `write`, `glob` and `grep`. Amy, 2026-08-21: remove
+registers `read`, `edit`, `write`, and `glob`; `grep` was removed 2026-10-03
+and the coder's person-input facades with it (Amy: "we'll get the final
+kaish edit work going tomorrow"). Amy, 2026-08-21: remove
 them outright, "It's ok if we don't have them for a short period while we
 finish the kaish upgrade." Amy, 2026-09-20: low priority, and "a focused
 session where we think through the reduction to kaish."
@@ -3469,3 +3471,13 @@ regression test asserting the *current* buggy divergence:
 upgrade that fixes it fails this test loudly. Not worked around in
 `kaijutsu-ansi` (would mean reimplementing vte's UTF-8 resumption). Fix:
 file upstream against `alacritty/vte`, or vendor-patch if needed sooner.
+
+## Zorak's rc tree still holds the shared base (2026-10-03)
+
+Stances moved into each context type and the shared base was removed. Reseed
+does not remove files the seed no longer carries, so zorak's rc tree still
+holds `lib/create/S00-base.{kai,md}`, the `S00-base` links under `coder`,
+`default`, and `director`, and `mcp/create/S00-stance.{kai,md}`. A coder created
+there would run both the old base and the old tiered `S00-stance.kai`. When we
+next deploy zorak, delete those files by hand, then run
+`kaijutsu-server rc reseed --force`. Delete this entry once that is done.
