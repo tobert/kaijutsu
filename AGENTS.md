@@ -109,8 +109,9 @@ instructions. It owns the implemented contract and the register;
 `docs/oss-comparisons.md` owns the research. Stances speak in our voice: they
 open on the cybernetic system the seat belongs to, name the human who is
 accountable, and say what we do in the inclusive we. They stay plain and
-literal for readers who are not English-first, they are ASCII except a closing
-頑張って, and they may give a seat a character written as behavior.
+literal for readers who are not English-first, they are ASCII except Japanese terms glossed
+with romaji and a closing 頑張って, and they may give a seat a character
+written as behavior.
 Collaboration guidance and task procedure live in the type, syntax in
 help/schema, and changing observations in notifications. Character-specific rc
 is a design direction, not an available loader feature. Per-model

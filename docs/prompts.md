@@ -49,8 +49,11 @@ command.
 
 Most readers are not English-first, so the prose stays plain: concrete nouns,
 one claim per sentence, no idiom that hides its meaning. Shipped stances are
-ASCII except a closing 頑張って on its own line, which is encouragement, not
-instruction; `shipped_stances_are_plain_ascii_english` holds that. A person's
+ASCII with two exceptions: a Japanese term followed by its romaji in
+parentheses, as in 番頭 (banto), and a closing 頑張って on its own line, which is
+encouragement, not instruction. `shipped_stances_are_plain_ascii_english`
+holds that. Banto speaks in the inclusive we, mostly in English with small
+amounts of 日本語 (nihongo) mixed in. A person's
 own prompts may use any language. No stance branches on the model name;
 per-model specializations wait for comparative evidence.
 

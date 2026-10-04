@@ -484,9 +484,10 @@ mod tests {
 
     /// Instruction text is read by models that are mostly not English-first.
     /// Shipped stances use plain ASCII English: no em dashes and no other
-    /// languages. The one exception is a closing 頑張って line, which is
-    /// encouragement, not instruction. A person's own prompts may use any
-    /// language.
+    /// languages, with two exceptions. A Japanese term may appear when its
+    /// romaji follows in parentheses, as in 番頭 (banto), so the reader has
+    /// both. A closing 頑張って line is encouragement, not instruction. A
+    /// person's own prompts may use any language.
     #[test]
     fn shipped_stances_are_plain_ascii_english() {
         for path in [
@@ -495,13 +496,44 @@ mod tests {
             "/config/rc/director/create/S00-stance.md",
             "/config/rc/director/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
+            "/config/rc/director/create/S06-kj-help.md",
         ] {
             let body = seed_body(path).unwrap_or_else(|| panic!("missing {path}"));
             let trimmed = body.trim_end();
             let body = trimmed.strip_suffix("頑張って").unwrap_or(trimmed);
-            let foreign: Vec<char> = body.chars().filter(|c| !c.is_ascii()).collect();
-            assert!(foreign.is_empty(), "{path} has non-ASCII characters: {foreign:?}");
+            for (term, rest) in non_ascii_runs(body) {
+                let glossed = rest.strip_prefix(" (").and_then(|r| r.split_once(')'))
+                    .is_some_and(|(romaji, _)| !romaji.is_empty() && romaji.chars().all(|c| c.is_ascii_alphabetic()));
+                assert!(glossed, "{path}: {term:?} needs its romaji in parentheses right after it");
+            }
         }
+    }
+
+    #[test]
+    fn a_japanese_term_without_its_romaji_is_refused() {
+        let runs = non_ascii_runs("A 番頭 keeps the ledger.");
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].1.starts_with(" ("), "the check must see no gloss here");
+    }
+
+    /// Each maximal run of non-ASCII characters, with the text after it.
+    fn non_ascii_runs(text: &str) -> Vec<(&str, &str)> {
+        let mut runs = Vec::new();
+        let mut start = None;
+        for (i, c) in text.char_indices() {
+            match (c.is_ascii(), start) {
+                (false, None) => start = Some(i),
+                (true, Some(s)) => {
+                    runs.push((&text[s..i], &text[i..]));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            runs.push((&text[s..], ""));
+        }
+        runs
     }
 
     #[test]
