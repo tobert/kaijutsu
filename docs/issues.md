@@ -268,17 +268,6 @@ it. It was applied twice; don't keep applying. Look at that run's ticks
 before deciding: a per-pair repair (move each result after its call), or
 archive the conversation as-is.
 
-## The coder-stance sentinel tests fail on main (2026-10-04)
-
-2a6a0a5c rewrote `assets/defaults/rc/coder/create/S00-stance.md`, which now
-opens "We are a cybernetic system focused on software engineering." Five
-assertions still look for "You are a coder.":
-`kj/context.rs:6816` (`rc_source_edit_applies_only_to_later_lifecycle_runs`,
-red in `cargo test -p kaijutsu-kernel --lib`) and
-`kaijutsu-server/tests/e2e_kj_workflow.rs:702,753,776,808` (two positive,
-two negative). Pick a sentinel that survives stance edits, such as a marker
-the test writes into its own rc source, rather than the stance's prose.
-
 ## "Context" means two things once the council lands (2026-10-04)
 
 `docs/council-api.md` uses context for a held model context, as the
