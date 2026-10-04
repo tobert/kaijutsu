@@ -159,10 +159,12 @@ reason. These let us tune in real time."
 
 | Context | Holds | Fed by |
 |---|---|---|
-| voice | Amy's prompts, and guidance she adds | the kernel copying her prompts; Amy; banto by drift |
+| voice | Amy's prompts, and guidance she adds; one context shared by every seat | the kernel copying her prompts; Amy; banto by drift |
 | system rules | the house rules every seat shares | Amy and banto, by chat |
 | (later) | one or two more, when evidence asks for them | |
 
+- **One voice context for every seat.** It is one set of snapshots and one
+  fit. Amy, 2026-10-04: "one global voice context is fine".
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
@@ -223,6 +225,9 @@ type and working directory.
 - **The starting threshold is a guess.** We have no fitted data. `allow_at =
   0.98` with a mass floor is where we start; the recorded decisions are what
   we fit the next one from.
+- **An allow needs every read to agree.** `require_agree` defaults to true:
+  the pooled answer allows only when every context's top answer is allow.
+  Amy, 2026-10-04: "require agree yes".
 - **The gate never narrows options.** Narrowing changes the distribution, so
   the gate always reads the spec's full option set.
 
@@ -318,17 +323,12 @@ would put an authority decision in a script.
 
 ## Open questions for Amy
 
-- **The voice context: one global, or one per seat?** One global context is
-  one set of snapshots and one fit. Per seat follows the conversation it
-  judges but multiplies both.
 - **System 2's place.** Before the ledger on disagreement costs seconds per
   disputed submission. After the ledger, as an advisor on the ask, costs
   nothing on the hot path.
 - **Autonomous seats and report.** For now report is an ask. A swarm seat
   with no human nearby waits on that ask; should report stop the seat's turn
   instead?
-- **The first deployment's allow rule.** `allow_at = 0.98` with every read's
-  mass above the floor. Should it also require `agree`?
 - **The ask's wait in a swarm.** A swarm seat whose submission the council
   sends to the ledger waits on a human. Is that the behavior we want, or
   should the seat get the refusal back and choose another command?
