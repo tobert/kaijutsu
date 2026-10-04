@@ -400,6 +400,7 @@ mod tests {
                 ms: 3,
                 reads: vec![],
                 pooled: vec![],
+                seat_head: None,
                 control_text: vec![],
             },
         )

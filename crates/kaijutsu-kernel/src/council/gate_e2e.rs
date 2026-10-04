@@ -1789,13 +1789,20 @@ async fn a_script_changed_after_the_council_judged_it_does_not_run() {
 /// With `[council] seat` on, the shell decision and each program decision
 /// read the submitting seat's own context after the configured contexts,
 /// under the seat's context id and pinned at the head the kernel prepared.
-/// A seat with no narration yet reads no seat context.
+/// A seat with no narration yet reads no seat context. Each decision
+/// records the seat head it read, and its info log line says whether it
+/// read one.
 ///
 /// Falsified by a gate that leaves the seat out of the program decision:
 /// its request reads two contexts.
 #[tokio::test]
 async fn the_seat_context_joins_the_shell_and_program_decisions() {
+    use tracing_subscriber::layer::SubscriberExt;
     for via in BOTH {
+        let seen = Arc::new(Seen::default());
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Capture(seen.clone())));
+        tracing::callsite::rebuild_interest_cache();
         let rig = rig(via, Setup { seat: true, programs: true, ..Setup::default() }).await;
         rig.mock.set(allow_each);
         rig.submit("echo before-any-narration").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
@@ -1825,6 +1832,22 @@ async fn the_seat_context_joins_the_shell_and_program_decisions() {
             let at = request.contexts.as_ref().unwrap()[2].at.as_ref().expect("the seat is pinned");
             assert_eq!(at, sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap(), "{via:?}: one head for both");
         }
+        let head = sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap().to_string();
+        let decisions = rig.decisions();
+        let heads: Vec<Option<&str>> = decisions.iter().map(|d| d.decision.seat_head.as_deref()).collect();
+        assert_eq!(heads.len(), 3, "{via:?}: {heads:?}");
+        assert_eq!(heads.iter().filter(|h| **h == Some(head.as_str())).count(), 2, "{via:?}: {heads:?}");
+        assert_eq!(heads.iter().filter(|h| h.is_none()).count(), 1, "{via:?}: the first read no seat: {heads:?}");
+
+        let events = seen.events.lock().unwrap();
+        let logged: Vec<&str> = events
+            .iter()
+            .filter(|(_, f)| field(f, "outcome").is_some() && field(f, "spec").is_some())
+            .filter_map(|(_, f)| field(f, "seat_head"))
+            .collect();
+        assert_eq!(logged.iter().filter(|h| **h == head).count(), 2, "{via:?}: {logged:?}");
+        assert_eq!(logged.iter().filter(|h| **h == "none").count(), 1, "{via:?}: {logged:?}");
+        drop(events);
         rig.finish().await;
     }
 }

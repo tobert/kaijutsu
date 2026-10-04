@@ -131,6 +131,11 @@ pub struct NewCouncilDecision {
     pub agreement: Option<CouncilAgreement>,
     pub queue_ms: i64,
     pub ms: i64,
+    /// The head of the submitting seat's own context the decision read
+    /// (`docs/council.md`, "The seat context"); `None` when it read none.
+    /// That read's row is the one whose context is `context_id`.
+    #[serde(default)]
+    pub seat_head: Option<String>,
     pub reads: Vec<CouncilRead>,
     pub pooled: Vec<CouncilPooled>,
     pub control_text: Vec<CouncilControlText>,
@@ -198,9 +203,9 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             decision_id, request_id, context_id, principal_id, submission_digest, spec_id, spec_name,
             server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
             allow_at, mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread,
-            control_text_hits, queue_ms, ms, created_at
+            control_text_hits, queue_ms, ms, created_at, seat_head
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                   ?21, ?22, ?23, ?24, ?25, ?26)",
+                   ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             decision_id,
             d.request_id,
@@ -228,6 +233,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             d.queue_ms,
             d.ms,
             crate::time::now_millis(),
+            d.seat_head,
         ],
     )?;
     for (read_idx, read) in d.reads.iter().enumerate() {
@@ -276,7 +282,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
 const DECISION_COLUMNS: &str = "decision_id, request_id, context_id, principal_id, submission_digest, spec_id, \
     spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights, allow_at, \
     mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread, control_text_hits, queue_ms, ms, \
-    created_at";
+    created_at, seat_head";
 
 /// Load one decision with its reads, pooled probabilities, and control-text
 /// hits. `None` when no decision has this id.
@@ -382,6 +388,7 @@ fn decode_decision(row: &Row<'_>) -> rusqlite::Result<DecisionHead> {
             agreement,
             queue_ms: row.get("queue_ms")?,
             ms: row.get("ms")?,
+            seat_head: row.get("seat_head")?,
             reads: Vec::new(),
             pooled: Vec::new(),
             control_text: Vec::new(),
@@ -615,6 +622,7 @@ mod tests {
             agreement: Some(CouncilAgreement { agree: true, spread: 0.125 }),
             queue_ms: 3,
             ms: 41,
+            seat_head: Some("snap:seat".into()),
             reads: vec![read(Some(&[1, 1]), "a"), read(None, "b")],
             pooled: vec![
                 CouncilPooled { question_id: "undo".into(), option: "yes".into(), probability: 0.8 },
@@ -666,6 +674,7 @@ mod tests {
         let mut input = decision();
         input.threshold = None;
         input.agreement = None;
+        input.seat_head = None;
         input.reads.clear();
         input.pooled.clear();
         input.control_text.clear();

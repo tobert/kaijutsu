@@ -840,6 +840,7 @@ CREATE TABLE IF NOT EXISTS council_decisions (
     control_text_hits INTEGER NOT NULL,
     queue_ms          INTEGER NOT NULL,
     ms                INTEGER NOT NULL,
+    seat_head         TEXT,
     created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     CHECK ((outcome = 'miss') = (miss_cause IS NOT NULL)),
@@ -1036,7 +1037,8 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // Before the rebuild, not after: a rebuild spec copies a named column
     // list, so any column an old database is missing has to exist before
     // that copy runs or the SELECT names a column that is not there.
-    add_approvals_columns_if_missing(conn)?;
+    add_columns_if_missing(conn, "approvals", APPROVALS_ADDED_COLUMNS)?;
+    add_columns_if_missing(conn, "council_decisions", &[("seat_head", "TEXT")])?;
     add_rc_runs_script_count_column_if_missing(conn)?;
     add_rc_runs_intended_outcome_column_if_missing(conn)?;
     add_rc_run_script_settlement_columns_if_missing(conn)?;
@@ -1065,27 +1067,30 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
 /// `approvals` has six cascading children and a rebuild would fire every one
 /// of them under `PRAGMA foreign_keys = ON`.
 ///
-/// This is the crate's second ALTER-TABLE step. A third is the point to
-/// build the ladder `kaijutsu-kernel/src/kernel_db.rs` already has rather
-/// than adding a fourth one-off function here.
-fn add_approvals_columns_if_missing(conn: &Connection) -> SqliteResult<()> {
+/// New nullable columns use [`add_columns_if_missing`] rather than another
+/// one-off function.
+const APPROVALS_ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("actor_id", "BLOB"),
+    ("reviewer_id", "BLOB"),
+    ("cwd", "TEXT"),
+    ("exec_source", "TEXT"),
+    ("exec_stdin", "TEXT"),
+    ("command_block_id", "TEXT"),
+    ("output_block_id", "TEXT"),
+    ("pair_owner", "TEXT"),
+    ("continuation_epoch", "INTEGER"),
+];
+
+/// Adds each of `columns` (name, type) that `table` lacks, with
+/// `ALTER TABLE ... ADD COLUMN`. Existing rows read the new column as NULL.
+fn add_columns_if_missing(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> SqliteResult<()> {
     let existing: Vec<String> = conn
-        .prepare("PRAGMA table_info(approvals)")?
+        .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<SqliteResult<Vec<String>>>()?;
-    for (column, ty) in [
-        ("actor_id", "BLOB"),
-        ("reviewer_id", "BLOB"),
-        ("cwd", "TEXT"),
-        ("exec_source", "TEXT"),
-        ("exec_stdin", "TEXT"),
-        ("command_block_id", "TEXT"),
-        ("output_block_id", "TEXT"),
-        ("pair_owner", "TEXT"),
-        ("continuation_epoch", "INTEGER"),
-    ] {
+    for (column, ty) in columns {
         if !existing.iter().any(|name| name == column) {
-            conn.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {column} {ty}"))?;
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
         }
     }
     Ok(())
@@ -1591,6 +1596,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending_index, 1, "the pending-projection index must follow the column upgrade");
+    }
+
+    /// A database whose `council_decisions` predates `seat_head` gains the
+    /// column, as NULL for the rows it holds, and a second `migrate` is a
+    /// no-op.
+    #[test]
+    fn migrate_adds_seat_head_to_council_decisions_created_without_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        let ddl = DDL.replace("    seat_head         TEXT,\n", "");
+        assert_ne!(ddl, DDL, "the fixture removes seat_head from the shipped DDL");
+        conn.execute_batch(&ddl).unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'miss', 'down', 0, 0, 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let seat: Option<String> =
+            conn.query_row("SELECT seat_head FROM council_decisions", [], |row| row.get(0)).unwrap();
+        assert_eq!(seat, None);
     }
 
     /// The same regression as

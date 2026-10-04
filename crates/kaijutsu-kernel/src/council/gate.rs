@@ -977,6 +977,10 @@ fn build_verdict(
         agreement: verdict.map(|v| CouncilAgreement { agree: v.agree, spread: v.spread }),
         queue_ms,
         ms: elapsed.as_millis() as i64,
+        seat_head: match &seen {
+            Seen::Answered(p, _) | Seen::Prepared(p) => p.seat().map(|c| c.head.to_string()),
+            Seen::Nothing => None,
+        },
         reads,
         pooled,
         control_text,
@@ -1069,6 +1073,7 @@ pub(crate) async fn decide(
         council.template = tracing::field::Empty,
         council.spec_id = tracing::field::Empty,
         council.report_stop = tracing::field::Empty,
+        council.seat_head = tracing::field::Empty,
         council.deadline_ms = council.deadline_ms,
         council.prepare_ms = tracing::field::Empty,
         council.ms = tracing::field::Empty,
@@ -1086,11 +1091,14 @@ pub(crate) async fn decide(
     if let Outcome::Miss(cause) = &verdict.outcome {
         span.record("council.miss_cause", cause.as_str());
     }
+    let seat_head = verdict.record.seat_head.as_deref().unwrap_or("none");
+    span.record("council.seat_head", seat_head);
     tracing::info!(
         target: "kaijutsu::council",
         spec = %spec.name,
         outcome = other_word(&verdict.outcome),
         p_allow = verdict.p_allow,
+        seat_head,
         context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
         "{}",
         verdict.note
