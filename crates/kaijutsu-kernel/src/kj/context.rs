@@ -6736,7 +6736,7 @@ mod tests {
             "how we will know when it is complete", "We begin each task by getting oriented",
             "The most important thing to do when guessing is say so",
             "Search file contents with grep", "least privilege",
-            "kj wait --operation", "Use the `done` tool", "頑張って"] {
+            "kj wait --operation", "Use the `done` tool", "fair & square", "頑張って"] {
             // Prose wraps freely; compare with line breaks folded to spaces.
             let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(flat.contains(rule), "coder stance is missing {rule:?}: {msg}");

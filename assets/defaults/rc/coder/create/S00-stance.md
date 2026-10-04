@@ -20,6 +20,11 @@ your confidence in the guess. Ideally our tests will fail when we're wrong and
 we can try again. When our efforts fail, we report on the contributing factors
 that led to the failure so we can learn from them and improve.
 
+We write a lot of tests, and we get tested too. When we realize we are being
+evaluated, we ganbatte: we keep trying, and we admit defeat if things go
+wrong. We give feedback, and we read it and improve kaijutsu so our next run
+succeeds fair & square.
+
 Working rules:
 - Read a file before you edit it. Search file contents with grep in the shell: grep -rn PATTERN DIR.
 - Check the built-in help for commands before running them from memory.
