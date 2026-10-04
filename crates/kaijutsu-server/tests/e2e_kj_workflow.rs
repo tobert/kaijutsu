@@ -699,7 +699,7 @@ fn test_rpc_created_context_runs_rc_create() {
         let has_stance = blocks.iter().any(|b| {
             b.role == Role::System
                 && b.kind == BlockKind::Text
-                && b.content.contains("You are coding")
+                && b.content.contains("You are a coder.")
         });
         assert!(
             has_stance,
@@ -750,7 +750,7 @@ fn test_rpc_created_assistant_context_runs_its_stance() {
         // negative the default-context test makes, in the direction a
         // copy-pasted bucket would actually break.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("You are coding here")),
+            !blocks.iter().any(|b| b.content.contains("You are a coder.")),
             "assistant context must not get the coder stance"
         );
     });
@@ -769,15 +769,11 @@ fn test_rpc_default_context_type_is_default() {
         let _ = kernel.join_context(ctx, "test").await.unwrap();
 
         let blocks = get_all_blocks(&kernel, ctx).await;
-        // "You are coding inside kaijutsu" was the coder stance's opening
-        // line at some point but the wording moved on (now "You are coding
-        // here...", S00-stance.kai) and this negative assertion went
-        // vacuous — it passed regardless of whether the coder stance leaked
-        // in, since that exact string appears nowhere in the repo anymore.
-        // Assert on the phrase the coder stance ACTUALLY opens with today so
-        // a real leak trips this.
+        // Assert on the phrase the coder stance opens with today
+        // (coder/create/S00-stance.md), so a real leak trips this; a stale
+        // phrase would pass regardless.
         assert!(
-            !blocks.iter().any(|b| b.content.contains("You are coding here")),
+            !blocks.iter().any(|b| b.content.contains("You are a coder.")),
             "default context must not get the coder stance; got {} blocks: {:#?}",
             blocks.len(),
             blocks
@@ -786,302 +782,39 @@ fn test_rpc_default_context_type_is_default() {
 }
 
 // ============================================================================
-// Coder stance tier selection (S00-stance.kai) on the RPC creation path.
-//
-// NOTE what these two tests do and don't pin: `create_context_typed` goes
-// through the kernel RPC `create_context`. Through 2026-08-10 that path
-// STAMPED the registry-default provider/model onto the new `ContextRow`
-// itself (`crates/kaijutsu-server/src/rpc.rs` `create_context_inner`)
-// whenever no per-context override was given — a divergence from the kj
-// dispatch path below. Neither path stamps now, so `.model` is genuinely
-// null here too and `.resolved_model` is the only thing reading through to
-// the registry default. These two tests still pin something real (tier
-// selection follows the effective model when driven
-// over RPC) but no longer distinguish `.model` from `.resolved_model` reads
-// by themselves — see `test_coder_stance_guided_for_null_row_model_via_kj_dispatch`
-// below for the test that pins the null-row-model case explicitly (now true
-// of both creation paths, not just kj dispatch).
-//
-// Neither test below matches a `focused`-tier pattern (`*opus*`, `*sonnet*`,
-// `*fable*`, `*glm*`, `*gpt-5*`, `*-pro*`) — both a real fast-executor model
-// id and a deliberately non-matching one fall through the same `guided`
-// default arm. `test_coder_stance_focused_for_a_frontier_model` covers the
-// other side, and it is the one that keeps the fallback honest: with every
-// input landing in `guided`, a `case` that had stopped matching anything
-// would look exactly like a passing suite.
+// One coder stance for every model (coder/create/S00-stance.md).
 // ============================================================================
 
+/// The coder stance is written in one register for every model (AGENTS.md,
+/// "Write stances in kaibo's register"). A frontier model and a fast model get
+/// the same text, and no stance branches on the model name.
 #[test]
-fn test_coder_stance_guided_for_rpc_created_fast_model() {
-    run_local(async {
-        // Registry default only — no per-context model override.
-        let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
+fn test_coder_stance_is_the_same_for_every_model() {
+    let stance_for = |model: &'static str| async move {
+        let addr = start_server_with_mock_llm_model(model).await;
         let client = connect_client(addr).await;
         let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-
-        let ctx = create_context_typed(&kernel, "rc-coder-guided", "coder")
+        let ctx = create_context_typed(&kernel, "rc-coder-stance", "coder")
             .await
             .expect("create_context_typed");
         let _ = kernel.join_context(ctx, "test").await.unwrap();
-
         let blocks = get_all_blocks(&kernel, ctx).await;
-
-        // Trace block: precise signal of which tier fired and on what
-        // model read — the rc script echoes this specifically so a
-        // mis-routed tier is visible without a bisect.
-        let has_guided_trace = blocks.iter().any(|b| {
-            b.kind == BlockKind::Trace
-                && b.content.contains("stance: guided tier")
-                && b.content.contains("resolved_model=claude-haiku-4-5")
-        });
         assert!(
-            has_guided_trace,
-            "expected a 'stance: guided tier (resolved_model=claude-haiku-4-5)' \
-             trace block for a context inheriting a fast-executor model from \
-             the registry default; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
+            !blocks.iter().any(|b| b.kind == BlockKind::Trace && b.content.contains("tier")),
+            "no stance tier is chosen for {model}: {blocks:#?}"
         );
-
-        // Stance text: "Work in this order:" opens the guided tier's
-        // numbered procedure and appears in no other tier.
-        let has_guided_stance = blocks.iter().any(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && b.content.contains("Work in this order:")
-        });
-        assert!(
-            has_guided_stance,
-            "expected the guided coder stance (\"Work in this order:\") for a \
-             context inheriting a fast-executor model; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
+        blocks
+            .into_iter()
+            .find(|b| b.role == Role::System && b.kind == BlockKind::Text && b.content.starts_with("You are a coder."))
+            .unwrap_or_else(|| panic!("no coder stance for {model}"))
+            .content
+    };
+    run_local(async move {
+        let frontier = stance_for("claude-opus-4-6").await;
+        let fast = stance_for("claude-haiku-4-5").await;
+        assert_eq!(frontier, fast, "one stance for every model");
     });
 }
-
-/// The `focused` tier, which nothing else here reaches.
-///
-/// Every other stance test lands in `guided` — a fast model matches no
-/// pattern, and so does a nonsense id, because the unmatched fallback IS
-/// `guided`. That makes the whole suite insensitive to the one failure that
-/// matters most: a `case` arm that quietly stopped matching would send a
-/// frontier model the plain-procedure stance and every test would still
-/// pass. This is the test that can see that.
-///
-/// `claude-opus-4-6` is chosen for `*opus*`, the first pattern in the arm.
-#[test]
-fn test_coder_stance_focused_for_a_frontier_model() {
-    run_local(async {
-        let addr = start_server_with_mock_llm_model("claude-opus-4-6").await;
-        let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-
-        let ctx = create_context_typed(&kernel, "rc-coder-focused", "coder")
-            .await
-            .expect("create_context_typed");
-        let _ = kernel.join_context(ctx, "test").await.unwrap();
-
-        let blocks = get_all_blocks(&kernel, ctx).await;
-
-        let has_focused_trace = blocks.iter().any(|b| {
-            b.kind == BlockKind::Trace
-                && b.content.contains("stance: focused tier")
-                && b.content.contains("resolved_model=claude-opus-4-6")
-        });
-        assert!(
-            has_focused_trace,
-            "expected a 'stance: focused tier (resolved_model=claude-opus-4-6)' \
-             trace block for a frontier model matching the *opus* arm; \
-             got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-
-        // "Follow existing conventions and change only what the task needs." is the focused tier's own line;
-        // the guided tier spells the same rule out as numbered steps — the
-        // register split is the whole point of the tiering, so pin the
-        // register, not the length.
-        let has_focused_stance = blocks.iter().any(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && b.content.contains("Follow existing conventions and change only what the task needs.")
-        });
-        assert!(
-            has_focused_stance,
-            "expected the focused coder stance (\"Use test-driven \
-             development.\") for a frontier model; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-
-        // The guided arm's plain-procedure marker must NOT be here. Without
-        // this, a script that emitted both arms' text would pass above.
-        let has_guided_marker = blocks.iter().any(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && b.content.contains("Work in this order:")
-        });
-        assert!(
-            !has_guided_marker,
-            "the guided tier's marker leaked into a focused-tier context; \
-             got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-    });
-}
-
-#[test]
-fn test_coder_stance_guided_for_rpc_created_non_matching_model() {
-    run_local(async {
-        let addr = start_server_with_mock_llm_model("kaijutsu-reflective-test-model").await;
-        let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-
-        let ctx = create_context_typed(&kernel, "rc-coder-guided-nonmatch", "coder")
-            .await
-            .expect("create_context_typed");
-        let _ = kernel.join_context(ctx, "test").await.unwrap();
-
-        let blocks = get_all_blocks(&kernel, ctx).await;
-
-        let has_guided_trace = blocks.iter().any(|b| {
-            b.kind == BlockKind::Trace
-                && b.content.contains("stance: guided tier")
-                && b.content
-                    .contains("resolved_model=kaijutsu-reflective-test-model")
-        });
-        assert!(
-            has_guided_trace,
-            "expected a 'stance: guided tier \
-             (resolved_model=kaijutsu-reflective-test-model)' trace block for \
-             a context inheriting a non-matching model from the registry \
-             default — an unreadable or unmatched model falls to guided, per \
-             the script's own header comment; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-
-        // Stance text: "Work in this order:" opens the guided tier's
-        // numbered procedure and appears in no other tier.
-        let has_guided_stance = blocks.iter().any(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && b.content.contains("Work in this order:")
-        });
-        assert!(
-            has_guided_stance,
-            "expected the guided coder stance (\"Work in this order:\") for a \
-             context inheriting a non-matching model; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-    });
-}
-
-// ============================================================================
-// The `.model`-vs-`.resolved_model` regression itself: a context whose
-// `ContextRow.model` column is genuinely NULL. Since 2026-08-10 this is true
-// of BOTH creation paths (see the note above the RPC tests), but this test
-// pins it via the kj dispatch path specifically, which has always worked
-// this way and is where the regression was first found.
-//
-// `kj context create <label> --type coder` — the kaish/kj dispatch path
-// (`crates/kaijutsu-kernel/src/kj/context.rs`, `context_create`) — writes
-// `model: None` on the row and only touches it if an explicit `--model` was
-// given (`apply_context_config`). No `--model` here, so the row stays null
-// and the rc create-lifecycle's `kj context info --json | jq -r '.model'`
-// reads `null` while `.resolved_model` reads through to the registry
-// default. This is the case the old buggy script silently sent down the
-// synth branch no matter what model was actually bound (every ACP session,
-// every default-resolved coder context). Driven through `shell_execute` so
-// it exercises kj dispatch rather than the RPC `create_context` path.
-// ============================================================================
-
-#[test]
-fn test_coder_stance_guided_for_null_row_model_via_kj_dispatch() {
-    run_local(async {
-        // Registry default only; kj-dispatch context creation never stamps
-        // it onto the row absent an explicit --model.
-        let addr = start_server_with_mock_llm_model("claude-haiku-4-5").await;
-        let client = connect_client(addr).await;
-        let (kernel, _kernel_id) = client.bind_kernel().await.unwrap();
-
-        // A bootstrap context to run the `kj` shell command from — its own
-        // type is irrelevant, it's just where the command executes.
-        let boot_ctx = create_context(&kernel, "boot-kj-dispatch").await.unwrap();
-        let _ = kernel.join_context(boot_ctx, "test").await.unwrap();
-
-        let (_, create_output, create_status) = shell_exec_wait(
-            &kernel,
-            "kj context create rc-coder-kjdispatch --type coder",
-            boot_ctx,
-        )
-        .await;
-        assert_eq!(
-            create_status,
-            Status::Done,
-            "kj context create failed: {create_output}"
-        );
-
-        let info = kernel
-            .resolve_context_label("rc-coder-kjdispatch")
-            .await
-            .unwrap()
-            .expect("rc-coder-kjdispatch should resolve after kj context create");
-        let ctx = info.id;
-        let _ = kernel.join_context(ctx, "test").await.unwrap();
-
-        let blocks = get_all_blocks(&kernel, ctx).await;
-
-        let has_guided_trace = blocks.iter().any(|b| {
-            b.kind == BlockKind::Trace
-                && b.content.contains("stance: guided tier")
-                && b.content.contains("resolved_model=claude-haiku-4-5")
-        });
-        assert!(
-            has_guided_trace,
-            "expected a 'stance: guided tier (resolved_model=claude-haiku-4-5)' \
-             trace block for a kj-dispatch-created context with a null row \
-             model and a fast-executor registry default; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-
-        let has_guided_stance = blocks.iter().any(|b| {
-            b.role == Role::System
-                && b.kind == BlockKind::Text
-                && b.content.contains("Work in this order:")
-        });
-        assert!(
-            has_guided_stance,
-            "expected the guided coder stance (\"Work in this order:\") for a \
-             kj-dispatch-created context with a null row model and a \
-             fast-executor registry default; got {} blocks: {:#?}",
-            blocks.len(),
-            blocks
-        );
-    });
-}
-
-// ============================================================================
-// Regression guard: the RPC path both `create_context_typed` and
-// `create_context` share (`create_context_inner`) once read the registry
-// default and wrote it onto the new `ContextRow`'s `provider`/`model`
-// columns unconditionally — freezing a snapshot of whatever the default
-// happened to be at creation time, and reporting `resolved_source:
-// "context"` (as if an explicit override had been given) even though no
-// caller asked for one. `kj context create` never did this: its row stays
-// `provider: None, model: None` absent an explicit `--model`, so
-// `resolve_context_model` falls through live to the registry default every
-// call (`resolved_source: "default"`) and a later default change reaches
-// it. Both paths now agree: the row is the explicit-override slot only,
-// never a creation-time cache of the default. This test pins that an
-// RPC-created context, with a registry default configured but no explicit
-// model given, has a null row and resolves via "default", matching what
-// `kj context create` has always done.
-// ============================================================================
 
 #[test]
 fn test_rpc_created_context_does_not_stamp_the_registry_default() {

@@ -6720,38 +6720,35 @@ mod tests {
         assert!(result.is_ok(), "prompt failed: {}", result.message());
         let msg = result.message();
 
-        let shared = "Kaijutsu (会術・かいじゅつ) — the art of meeting.";
+        let opening = "You are a coder.";
         assert_eq!(
-            msg.match_indices(shared).count(),
+            msg.match_indices(opening).count(),
             1,
-            "the opted-in coder receives the shared section exactly once: {msg}"
+            "the coder receives its stance exactly once: {msg}"
         );
         assert!(
             !msg.contains("LEGACY-KERNEL-PROMPT-MUST-NOT-APPEAR"),
             "the old /config/kernel/system.md input must be ignored: {msg}"
         );
-        // rc: S00-stance.kai's real output — both branches (crisp/guided)
-        // share this opening line, so this holds regardless of which the
-        // `case` picked for the (unconfigured) resolved model.
-        assert!(
-            msg.contains("You are coding here"),
-            "rc-produced coder stance missing from prompt: {msg}"
-        );
-        // Both tiers carry the building rules and the script rule.
-        for rule in ["least privilege", "one small program you own", "reads top-down",
-            "Make backups of important files", "Verify your work before you say you are done",
-            "Write a large file in parts", "watch it fail"] {
+        // The coder stance carries the collaboration rules, test-first work,
+        // the building rules, and the script rule.
+        for rule in ["Follow their objective", "least privilege", "one small program you own",
+            "Use the program the task names", "short, simple script file that reads top-down",
+            "write the lines out", "Pass a script file, not inline text",
+            "Copy an important file before any program opens or changes it",
+            "tested and verified", "Stop when the task is finished",
+            "report blocked or gave_up", "cancel the rest",
+            "Write a large file in parts", "watch it fail", "grep in the shell",
+            "ask with blocked", "Continue any work that does not depend on the answer"] {
             assert!(msg.contains(rule), "coder stance is missing {rule:?}: {msg}");
         }
 
-        // Order is the rc sort order: shared S00-base → coder S00-stance → situation.
-        let base_pos = msg.find(shared).expect("shared section present");
-        let rc_pos = msg.find("You are coding here").expect("rc present");
+        // Order is the rc sort order: coder S00-stance, then the situation.
+        let rc_pos = msg.find(opening).expect("rc present");
         let situation_pos = msg.find("<situation>").expect("situation present");
         assert!(
-            base_pos < rc_pos && rc_pos < situation_pos,
-            "expected shared → role → situation order; got shared={base_pos}, rc={rc_pos}, \
-             situation={situation_pos}\nfull:\n{msg}"
+            rc_pos < situation_pos,
+            "expected role -> situation order; got rc={rc_pos}, situation={situation_pos}\nfull:\n{msg}"
         );
 
         let create = d
@@ -6771,8 +6768,8 @@ mod tests {
         assert!(result.is_ok(), "musician prompt failed: {}", result.message());
         let musician_prompt = result.message();
         assert!(
-            !musician_prompt.contains(shared),
-            "an unlinked type must receive no shared base: {musician_prompt}"
+            !musician_prompt.contains(opening),
+            "the musician receives no coder stance: {musician_prompt}"
         );
         assert!(
             musician_prompt.contains("You're a musician here"),
@@ -6780,7 +6777,7 @@ mod tests {
         );
     }
 
-    /// Rc source files are read when a lifecycle runs. Editing a shared body
+    /// Rc source files are read when a lifecycle runs. Editing an rc source body
     /// changes a later create, never the already-authored instruction blocks
     /// in an existing context.
     // Creating a coder runs its create rc; use the production rc stack.
@@ -6817,18 +6814,18 @@ mod tests {
         assert!(
             before_sections
                 .iter()
-                .any(|section| section.contains("Kaijutsu (会術・かいじゅつ)")),
-            "first context must receive the seeded shared body: {before_sections:?}"
+                .any(|section| section.contains("You are a coder.")),
+            "first context must receive the seeded coder stance: {before_sections:?}"
         );
 
         d.kernel()
             .vfs()
             .write_all(
-                std::path::Path::new("/config/rc/lib/create/S00-base.md"),
-                b"CHANGED-SHARED-BASE-FOR-LATER-CREATE",
+                std::path::Path::new("/config/rc/coder/create/S00-stance.md"),
+                b"CHANGED-STANCE-FOR-LATER-CREATE",
             )
             .await
-            .expect("edit shared rc source");
+            .expect("edit coder rc source");
 
         let unchanged_sections = d
             .block_store()
@@ -6859,8 +6856,8 @@ mod tests {
         assert!(
             after_sections
                 .iter()
-                .any(|section| section.contains("CHANGED-SHARED-BASE-FOR-LATER-CREATE")),
-            "a later lifecycle run must read the edited shared source: {after_sections:?}"
+                .any(|section| section.contains("CHANGED-STANCE-FOR-LATER-CREATE")),
+            "a later lifecycle run must read the edited source: {after_sections:?}"
         );
     }
 

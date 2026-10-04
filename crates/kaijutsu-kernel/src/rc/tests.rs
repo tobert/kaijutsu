@@ -111,7 +111,7 @@
 
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
-        for context_type in ["default", "coder", "director", "mcp", "toolie", "musician"] {
+        for context_type in ["default", "coder", "director", "toolie", "musician"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let prefix = format!("/config/rc/{context_type}/create/");
@@ -145,9 +145,6 @@
             for instruction in &expected {
                 assert!(prompt.message().contains(instruction.trim()), "{context_type}: missing rendered instruction");
             }
-            let base = include_str!("../../../../assets/defaults/rc/lib/create/S00-base.md").trim();
-            assert_eq!(prompt.message().contains(base), ["default", "coder", "director"].contains(&context_type),
-                "{context_type}: optional base composition changed");
         }
     }
 
@@ -2981,6 +2978,30 @@ esac
     fn submit_is_a_canonical_wired_verb() {
         assert!(RC_VERBS.contains(&VERB_SUBMIT));
         assert!(verb_is_wired("submit"));
+    }
+
+    // ── Coder loadout (coder/create/S10-binding.kai) ──────────────────────
+
+    /// The coder's loadout is pinned: the writable shell, the file, task, and
+    /// turn tools, and the person's input facades. Those facades are not
+    /// model tools; the client's `editInput` and submit RPCs check them, so
+    /// an ACP client cannot deliver a prompt without them (`rpc.rs`,
+    /// `check_facade(.., "edit_input")`).
+    #[test]
+    fn coder_loadout_is_the_shell_files_tasks_turn_and_input() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let args: Vec<String> = ["context", "create", "loadout", "--type", "coder"].map(String::from).to_vec();
+            let r = d.dispatch(&args, &caller).await;
+            assert!(r.is_ok(), "create failed: {}", r.message());
+            let ctx = lookup_context_id(&d, "loadout");
+            let binding = d.kernel().broker().binding(&ctx).await.expect("the coder rc binds the context");
+            assert_eq!(binding.allowed_facades, ["shell_write", "edit_input", "submit_input", "commit_capture"], "facades");
+            let instances: Vec<&str> = binding.allowed_instances.iter().map(|i| i.as_str()).collect();
+            assert_eq!(instances, ["builtin.file", "builtin.tasks", "builtin.turn"], "instances");
+        });
     }
 
     // ── Working-directory orientation (coder/create/S35-orient.kai) ───────

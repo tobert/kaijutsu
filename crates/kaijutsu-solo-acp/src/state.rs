@@ -344,7 +344,7 @@ pub fn install_gate_config(state: &SoloState, source: &Path) -> Result<()> {
 /// caller runs it after `kernel::start` and before the ACP bridge serves.
 ///
 /// The destination is unlinked before the copy, never written through: a
-/// reseed writes some rc entries (`coder/create/S00-base.kai` and the like)
+/// reseed writes some rc entries (`coder/create/S20-cache.kai` and the like)
 /// as symlinks into `lib/`, and copying over a symlink would edit the shared
 /// base every other context type reads.
 ///
@@ -630,7 +630,7 @@ mod tests {
     // ---- rc overlay -------------------------------------------------------
 
     /// A minimal stand-in for what a real reseed leaves under `<state>/config/
-    /// rc`: `coder/create/S00-base.kai` linked to a shared script under
+    /// rc`: `coder/create/S20-cache.kai` linked to a shared script under
     /// `lib/`, and one real (non-linked) `coder/create/S00-stance.kai`.
     /// Returns the state and the path of the shared `lib` script, so a test
     /// can prove it was not written through.
@@ -642,12 +642,12 @@ mod tests {
         fs::create_dir_all(&lib_dir).expect("create the lib dir");
         fs::create_dir_all(&coder_dir).expect("create the coder dir");
 
-        let lib_script = lib_dir.join("S00-base.kai");
-        fs::write(&lib_script, "# shared base script\n").expect("write the shared base");
+        let lib_script = lib_dir.join("S20-cache.kai");
+        fs::write(&lib_script, "# shared cache script\n").expect("write the shared script");
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&lib_script, coder_dir.join("S00-base.kai"))
-            .expect("link coder/create/S00-base.kai to the shared base");
+        std::os::unix::fs::symlink(&lib_script, coder_dir.join("S20-cache.kai"))
+            .expect("link coder/create/S20-cache.kai to the shared script");
 
         fs::write(coder_dir.join("S00-stance.kai"), "# shipped stance\n")
             .expect("write the shipped stance");
@@ -657,22 +657,22 @@ mod tests {
 
     /// An overlay directory under the test's own scratch parent (never
     /// `/tmp`), holding a top-level `README.md` (must be skipped) plus
-    /// `coder/create/S00-base.kai` and a brand-new `coder/create/S00-base.md`
+    /// `coder/create/S20-cache.kai` and a brand-new `coder/create/S20-cache.md`
     /// companion.
     fn write_overlay(dir: &Path) {
         let coder_dir = dir.join("coder").join("create");
         fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
         fs::write(dir.join("README.md"), "not applied\n").expect("write the overlay README");
-        fs::write(coder_dir.join("S00-base.kai"), "# overlay base script\n")
-            .expect("write the overlay base script");
-        fs::write(coder_dir.join("S00-base.md"), "overlay marker prose\n")
-            .expect("write the overlay base companion");
+        fs::write(coder_dir.join("S20-cache.kai"), "# overlay script\n")
+            .expect("write the overlay script");
+        fs::write(coder_dir.join("S20-cache.md"), "overlay marker prose\n")
+            .expect("write the overlay companion");
     }
 
     #[test]
     fn an_overlay_replaces_a_symlink_without_writing_through_it() {
         let (_seed_parent, state, lib_script) = seeded_rc_tree();
-        let lib_before = fs::read(&lib_script).expect("read the shared base before");
+        let lib_before = fs::read(&lib_script).expect("read the shared script before");
 
         let overlay_parent = tempfile::tempdir().expect("overlay parent");
         let overlay = overlay_parent.path().join("variant");
@@ -680,17 +680,17 @@ mod tests {
 
         install_rc_overlay(&state, &overlay).expect("apply the overlay");
 
-        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S20-cache.kai");
         assert!(
             !fs::symlink_metadata(&dest).expect("stat the destination").file_type().is_symlink(),
             "the destination must be a plain file, not the seeded symlink"
         );
         assert_eq!(
             fs::read_to_string(&dest).expect("read the replaced file"),
-            "# overlay base script\n"
+            "# overlay script\n"
         );
 
-        let lib_after = fs::read(&lib_script).expect("read the shared base after");
+        let lib_after = fs::read(&lib_script).expect("read the shared script after");
         assert_eq!(
             lib_before, lib_after,
             "unlinking the symlink first must leave the shared lib script untouched"
@@ -701,7 +701,7 @@ mod tests {
             .join("rc")
             .join("coder")
             .join("create")
-            .join("S00-base.md");
+            .join("S20-cache.md");
         assert_eq!(
             fs::read_to_string(&companion).expect("read the new companion"),
             "overlay marker prose\n",
@@ -722,10 +722,10 @@ mod tests {
         install_rc_overlay(&state, &overlay).expect("first apply");
         install_rc_overlay(&state, &overlay).expect("second apply must succeed the same way");
 
-        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S20-cache.kai");
         assert_eq!(
             fs::read_to_string(&dest).expect("read the replaced file"),
-            "# overlay base script\n"
+            "# overlay script\n"
         );
     }
 
@@ -778,13 +778,13 @@ mod tests {
         let outside = overlay_parent.path().join("outside.kai");
         fs::write(&outside, "# not from the overlay\n").expect("write a file outside");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, coder_dir.join("S00-base.kai"))
+        std::os::unix::fs::symlink(&outside, coder_dir.join("S20-cache.kai"))
             .expect("symlink into the overlay");
 
         let error = install_rc_overlay(&state, &overlay).expect_err("a symlink must refuse");
         assert!(error.to_string().contains("symlink"), "{error}");
 
-        let dest = state.config_root().join("rc").join("coder").join("create").join("S00-base.kai");
+        let dest = state.config_root().join("rc").join("coder").join("create").join("S20-cache.kai");
         assert!(
             fs::symlink_metadata(&dest).expect("stat the destination").file_type().is_symlink(),
             "a refused overlay must not have replaced anything"
@@ -800,7 +800,7 @@ mod tests {
 
         let escape_target = overlay_parent.path().join("escape");
         fs::create_dir_all(escape_target.join("create")).expect("create an escape target");
-        fs::write(escape_target.join("create").join("S00-base.kai"), "# escaped\n")
+        fs::write(escape_target.join("create").join("S20-cache.kai"), "# escaped\n")
             .expect("write a file the walk must never reach");
 
         #[cfg(unix)]
@@ -821,7 +821,7 @@ mod tests {
         let coder_dir = overlay.join("coder").join("create");
         fs::create_dir_all(&coder_dir).expect("create the overlay's coder dir");
 
-        let fifo = coder_dir.join("S00-base.kai");
+        let fifo = coder_dir.join("S20-cache.kai");
         let c_path = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("cstring");
         // SAFETY: mkfifo takes a NUL-terminated path and a mode; it creates a
         // FIFO at a path this test owns and touches nothing else.
@@ -840,7 +840,7 @@ mod tests {
         let overlay = overlay_parent.path().join("variant");
         let typo_dir = overlay.join("coderr").join("create");
         fs::create_dir_all(&typo_dir).expect("create the overlay's typo'd dir");
-        fs::write(typo_dir.join("S00-base.kai"), "# typo'd type\n").expect("write the file");
+        fs::write(typo_dir.join("S20-cache.kai"), "# typo'd type\n").expect("write the file");
 
         let error = install_rc_overlay(&state, &overlay)
             .expect_err("a directory absent from the seeded tree must refuse");

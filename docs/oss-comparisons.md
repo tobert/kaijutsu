@@ -10,10 +10,7 @@ can build up over time.” The first pass emphasizes omp's prompting and setup,
 then compaction and other auxiliary prompts. No shipped Kaijutsu prompts
 were changed as part of this pass.
 
-For complete before/after Kaijutsu prompt bodies, open the
-[side-by-side comparison](prompt-comparison.html). It reads the pinned old
-baseline and current seeds, with optional shared-base inclusion and wording
-diffs. [Prompt configuration](prompts.md) owns the implemented contract.
+[Prompt configuration](prompts.md) owns the implemented contract.
 This is not a complete provider-request capture. Upstream prompt text remains
 in the pinned source links below; this dossier does not reproduce every template.
 

@@ -167,8 +167,20 @@ pub struct RcSeedReport {
 /// hook (`docs/gate-policy-tuning.md`). The kaish primer moved into the shell
 /// tools' descriptions, one statement for every seat; the coder's `done` grant
 /// moved into its own binding. The toolie holds no exec, so it ships no shell
-/// guard.
+/// guard. Each context type now owns its whole stance, so the shared base and
+/// its links are gone; the mcp stance went because an outside agent's own
+/// system prompt is the only one its model reads.
 pub const RETIRED_RC_SEEDS: &[&str] = &[
+    "lib/create/S00-base.kai",
+    "lib/create/S00-base.md",
+    "coder/create/S00-base.kai",
+    "coder/create/S00-base.md",
+    "default/create/S00-base.kai",
+    "default/create/S00-base.md",
+    "director/create/S00-base.kai",
+    "director/create/S00-base.md",
+    "mcp/create/S00-stance.kai",
+    "mcp/create/S00-stance.md",
     "coder/create/S05-kaish.kai",
     "coder/create/S11-done.kai",
     "default/create/S05-kaish.kai",
@@ -407,8 +419,7 @@ mod tests {
         assert!(report.diverged.contains(&"default/create/S00-stance.md".to_string()));
         assert_eq!(std::fs::read_to_string(&data).unwrap(), "custom instructions\n");
         assert!(read(dir.path(), "default/create/S00-stance.kai").unwrap().contains("kj block create"));
-        assert!(dir.path().join("default/create/S00-base.kai").is_symlink());
-        assert!(dir.path().join("default/create/S00-base.md").is_symlink());
+        assert!(dir.path().join("default/create/S20-cache.kai").is_symlink());
         reseed_rc_files(dir.path(), true).unwrap();
         assert_eq!(std::fs::read_to_string(data).unwrap(), seed_body("/config/rc/default/create/S00-stance.md").unwrap());
     }
@@ -445,50 +456,46 @@ mod tests {
         );
     }
 
-    /// The shared working contract is an ordinary rc body. Context types opt
-    /// in by linking their create entry; no registry or kernel-wide prompt
-    /// layer supplies it behind their back.
+    /// Each context type owns its whole instruction text. No shared base is
+    /// linked into several types, and no kernel-wide prompt layer supplies one.
     #[test]
-    fn rc_shared_base_is_opted_into_by_coder_default_and_director_only() {
-        const BASE: &str = "/config/rc/lib/create/S00-base.md";
+    fn rc_ships_no_shared_base_and_each_role_owns_its_stance() {
         let seeds = seed_files();
-        let known: std::collections::HashSet<String> =
-            seeds.iter().map(|(path, _)| path.clone()).collect();
+        let shared: Vec<&String> = seeds.iter().map(|(path, _)| path)
+            .filter(|path| path.contains("S00-base")).collect();
+        assert!(shared.is_empty(), "no shared base seed may ship: {shared:?}");
 
-        let base = seed_body(BASE).expect("shared base seed");
-        assert!(
-            base.ends_with("頑張（がんば）って！\n"),
-            "the shared base owns its accepted closing"
-        );
+        // An mcp context's performer is an outside agent with its own system
+        // prompt; nothing reads instruction text stored in that context.
+        assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
+        assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
         for context_type in ["coder", "default", "director"] {
-            let link_path = format!("/config/rc/{context_type}/create/S00-base.md");
-            assert_eq!(
-                seed_link_target(&link_path, seed_body(&link_path).expect("base link"), &known),
-                Some(BASE.to_string()),
-                "{context_type} must choose the shared base through a real seed link"
+            let path = format!("/config/rc/{context_type}/create/S00-stance.md");
+            let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
+            let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                stance.contains("Follow their objective and apply their corrections."),
+                "{context_type} carries the collaboration rules in its own stance"
             );
         }
+    }
 
-        assert!(
-            seed_body("/config/rc/coder/create/S00-stance.kai").is_some(),
-            "the coder role follows the shared S00-base by lexical order"
-        );
-        assert!(
-            seed_body("/config/rc/default/create/S00-stance.md").is_some(),
-            "the default role follows the shared S00-base by lexical order"
-        );
-        assert!(
-            seed_body("/config/rc/director/create/S00-stance.kai").is_some(),
-            "the director role follows the shared S00-base by lexical order"
-        );
-
-        for context_type in ["assistant", "mcp", "musician", "root", "toolie"] {
-            let path = format!("/config/rc/{context_type}/create/S00-base.md");
-            assert!(
-                seed_body(&path).is_none(),
-                "{context_type} has not opted into the shared base"
-            );
+    /// Instruction text is read by models that are mostly not English-first.
+    /// Shipped stances use plain ASCII English: no em dashes and no other
+    /// languages. A person's own prompts may use any language.
+    #[test]
+    fn shipped_stances_are_plain_ascii_english() {
+        for path in [
+            "/config/rc/coder/create/S00-stance.md",
+            "/config/rc/default/create/S00-stance.md",
+            "/config/rc/director/create/S00-stance.md",
+            "/config/rc/director/create/S00-stance.kai",
+            "/config/rc/assistant/create/S00-stance.kai",
+        ] {
+            let body = seed_body(path).unwrap_or_else(|| panic!("missing {path}"));
+            let foreign: Vec<char> = body.chars().filter(|c| !c.is_ascii()).collect();
+            assert!(foreign.is_empty(), "{path} has non-ASCII characters: {foreign:?}");
         }
     }
 

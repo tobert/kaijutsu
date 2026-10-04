@@ -92,17 +92,18 @@ read by the shipped scripts. `kj context rotate` replaces a seat and sets
 `ROTATED_FROM`, which loads predecessor prose. See `docs/prompts.md`,
 "Rotating a context".
 
-Each context type chooses its instructions through rc. Coder, default, and
-director link to `lib/create/S00-base.kai` and its Markdown companion; other types choose their own
-contracts. There is no mandatory behavioral prepend. Rc creates durable
+Each context type owns its whole stance through rc, with no shared base and no
+mandatory behavioral prepend. Rc creates durable
 `(System, Text)` instruction blocks; the kernel adds runtime facts.
 
 Read `docs/prompts.md` before changing prompt composition or rc instructions.
 It owns the implemented contract; `docs/oss-comparisons.md` owns the research.
-Keep collaboration guidance in the optional shared base, task procedure in the
-type, syntax in help/schema, and changing observations in notifications.
-Character-specific rc is a design direction, not an available loader feature.
-Model-name tiers are policy choices awaiting comparative evidence.
+Write stances in kaibo's register: plain literal ASCII English, one
+instruction per sentence, one register for every model. Keep collaboration
+guidance and task procedure in the type, syntax in help/schema, and changing
+observations in notifications. Character-specific rc is a design direction,
+not an available loader feature. Per-model specializations await comparative
+evidence.
 
 ## State and interfaces
 

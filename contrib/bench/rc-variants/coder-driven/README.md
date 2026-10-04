@@ -13,22 +13,21 @@ showed (2026-09-18)" and `~/exomemory/kaijutsu/coder-early-stop-2026-09-18.md`.
 
 | Path under the rc tree | Shipped | Here |
 |---|---|---|
-| `coder/create/S00-base.kai` | symlink to `lib/create/S00-base.kai` | regular file, same one-line body |
-| `coder/create/S00-base.md` | symlink to `lib/create/S00-base.md` | the driven worker's contract |
-| `coder/create/S00-stance.kai` | model-tiered stance in a shell string | regular file reading its companion |
-| `coder/create/S00-stance.md` | absent | the coding procedure, shell mechanics, and verdict line |
+| `coder/create/S00-base.kai` | absent | one-line companion reader |
+| `coder/create/S00-base.md` | absent | the driven worker's contract |
+| `coder/create/S00-stance.kai` | one-line companion reader | the same body |
+| `coder/create/S00-stance.md` | the coder stance | the coding procedure, shell mechanics, and verdict line |
 
 The coder type's other `create` scripts are untouched and still run: the kaish
 primer, tool binding, recall, handoff, cache breakpoint, datetime, build cache,
 and shell guard. So are `coder/fork/` and `coder/drift/`.
 Every `.kai` in the directory runs in lexical filename order, so `S00-base.kai`
-still precedes `S00-stance.kai`.
+precedes `S00-stance.kai`.
 
-The shared base gets its own copy rather than an edit, because `default` and
-`director` link to the same file. The shared base is written for a context a
-person is sitting with: it offers to ask when a decision needs judgment, and it
-names a handoff as where unfinished work goes. Both are exits a driven worker
-should not take mid-task.
+The shipped coder stance is written for a context a person is sitting with: it
+offers to ask when a decision needs judgment. That is an exit a driven worker
+should not take mid-task, so the variant replaces the stance and adds its own
+contract.
 
 ## Applying it
 
@@ -39,13 +38,8 @@ it:
 kaijutsu-server rc reseed --dir "$CONFIG_ROOT/rc"
 src=contrib/bench/rc-variants/coder-driven/coder/create
 dst="$CONFIG_ROOT/rc/coder/create"
-rm -f "$dst/S00-base.kai" "$dst/S00-base.md" "$dst/S00-stance.kai"
 cp "$src/S00-base.kai" "$src/S00-base.md" "$src/S00-stance.kai" "$src/S00-stance.md" "$dst/"
 ```
-
-Remove before copying. A reseed writes `S00-base.kai` and `S00-base.md` as real
-symlinks into `lib/`, and `cp` over a symlink writes through it — that would
-edit the shared base every other type reads.
 
 Create the coder context after copying. Instructions are stored as durable
 blocks when the create lifecycle runs, so a context that already exists keeps

@@ -7,34 +7,43 @@ Only `.kai` lifecycle entries execute; Markdown is data read by scripts.
 ## Context types choose their instructions
 
 ```text
-/config/rc/lib/create/S00-base.kai
-/config/rc/lib/create/S00-base.md
-/config/rc/coder/create/S00-base.kai -> ../../lib/create/S00-base.kai
-/config/rc/coder/create/S00-base.md -> ../../lib/create/S00-base.md
 /config/rc/coder/create/S00-stance.kai
-/config/rc/default/create/S00-base.kai -> ../../lib/create/S00-base.kai
-/config/rc/default/create/S00-base.md -> ../../lib/create/S00-base.md
+/config/rc/coder/create/S00-stance.md
 /config/rc/default/create/S00-stance.kai
 /config/rc/default/create/S00-stance.md
-/config/rc/director/create/S00-base.kai -> ../../lib/create/S00-base.kai
-/config/rc/director/create/S00-base.md -> ../../lib/create/S00-base.md
 /config/rc/director/create/S00-stance.kai
+/config/rc/director/create/S00-stance.md
 /config/rc/director/create/S06-kj-help.kai
 ```
 
-The shared base is optional. Coder, default and director include it through
-ordinary relative symlinks. Musician, assistant, mcp, and toolie keep
-their own role contracts. Director is the operator's seat: its stance names
-the character recorded in `played_by` (below) and `S06-kj-help.kai`
-composes `kj help` plus a selected set of eighteen top-level verb help pages
-into one durable instruction block. Leaf command help remains available on
-demand. This reference was about 28 KB when introduced; that is a source size,
-not a token measurement. The system cache breakpoint permits reuse where the
-provider supports it; the initial request still pays for the reference.
-Kaijutsu never prepends a universal behavioral prompt.
+Each context type owns its whole stance. No base is shared between types, and
+Kaijutsu never prepends a universal behavioral prompt. A stance is a Markdown
+companion read by a one-line `.kai`, so the text is the file. Coder, default,
+and director each state the collaboration rules in their own words: the
+person is accountable, follow their objective and corrections, separate
+observations from inferences and unknowns, and report only checks that ran.
+
+Stances are written for every model in one register, after kaibo's preambles
+(`~/src/kaibo/src/consult/prompts.rs`): open on the role, use plain literal
+English with one instruction per sentence, say what to do rather than what to
+avoid, give no length cues, and end on what finishes the turn. Most readers
+are not English-first, so shipped stances are ASCII and carry no idiom or
+other language; `shipped_stances_are_plain_ascii_english` holds that for the
+rewritten stances. A person's own prompts may use any language. No stance
+branches on the model name; per-model specializations are future work.
+
 The kernel adds runtime facts, including the performing character and its
-assigned reviewer (stable IDs and names); rc supplies the chosen instruction
+assigned reviewer (stable IDs and names); rc supplies the instruction
 sections. Provider/model selection remains a separate fact.
+
+Director is the operator's seat. Its `S00-stance.kai` writes one line naming
+the character recorded in `played_by` (below), then reads its companion.
+`S06-kj-help.kai` composes `kj help` plus a selected set of eighteen top-level
+verb help pages into one durable instruction block. Leaf command help remains
+available on demand. This reference was about 28 KB when introduced; that is a
+source size, not a token measurement. The system cache breakpoint permits
+reuse where the provider supports it; the initial request still pays for the
+reference.
 
 The coder has its own binding (`coder/create/S10-binding.kai`): one shell
 (`shell_write`, with the shell-operation tools it projects), the file tools,
@@ -42,9 +51,8 @@ tasks, and `done`, plus the person's input facades. Every tool schema rides on
 every request, so the roster is the seat's largest cost. The shell tools'
 descriptions carry the one statement of what kaish is and what a call returns;
 no rc seeds a separate kaish primer, and `help syntax` holds the language
-reference. The coder stance chooses a tier from the resolved model (a `case`
-on `.resolved_model`); its shared tail says when the task is finished and how
-to use the tools, adapting DeepSeek Harness's tool rules (MIT).
+reference. The coder stance's working rules adapt DeepSeek Harness's tool
+rules (MIT).
 
 The toolie is a read-only explorer modeled on kaibo's explorer. Its binding
 (`toolie/create/S10-binding.kai`) grants `facade:shell` alone, so its model has
@@ -57,12 +65,14 @@ that the asker reads verbatim in the toolie's context.
 The test `the_toolie_stance_examples_run_in_its_read_only_shell` runs every
 command the stance shows, so a stance example cannot drift from the shell.
 
-The executable filename controls order: `S00-base.kai` precedes `S00-stance.kai`.
-The shared file ends with `頑張（がんば）って！`. Default handles general work;
-assistant remains fleet coordination. Coder retains focused and guided branches
-with test-driven development and an explicit warning that a context fork does
-not isolate file edits. The existing model-name branch selection is a policy,
-not a measured ranking of model capability.
+An mcp context ships no stance. Its performer is an outside agent whose own
+system prompt is the only one its model reads; `register_session` returns no
+instruction text. Guidance for that agent belongs in the MCP server's
+instructions or the `shell` tool description.
+
+The executable filename controls order. Default handles general work;
+assistant remains fleet coordination, with a helper branch that observes and a
+spine branch that interprets.
 
 `kj context create --type <type>` refuses before committing a row when
 `<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
@@ -226,7 +236,7 @@ kj context rotate banto
 kj context prompt banto
 ```
 
-A seat writes its handoff note before it stops; the shared base asks for it
+A seat writes its handoff note before it stops; its stance asks for it
 and the handoff block carries the command. Rotating a cold seat therefore
 needs no turn from it. In the TUI, `Ctrl+A r` prefills `kj context rotate `
 and follows the successor. Rotation never prompts: the successor runs
@@ -265,8 +275,8 @@ performer metadata and runs the fork lifecycle, not creation.
 ## Maintaining instructions
 
 Keep `AGENTS.md` to repository work rules and essential invariants. Put task
-procedure in the context type, shared collaboration guidance in the optional
-base, and syntax in emitted help and tool schemas. A character's enduring
+procedure and collaboration guidance in the context type's stance, and syntax
+in emitted help and tool schemas. A character's enduring
 commitments and memory sources belong with that character; the planned rc
 union is not yet implemented. Detailed writing rules and terms live in
 `docs/writing.md`.
@@ -280,9 +290,8 @@ to prompt wording.
 The research in `docs/oss-comparisons.md`, "Direction for base, coder, and
 general-purpose contexts" motivates this division of responsibilities. It is
 source review and design evidence, not a measured model ranking or proof that
-fewer words improve performance. Coder and director choose a stance tier during
-creation; changing the model later updates runtime facts but does not rerun the
-stance. Compare behavior on the same tasks before expanding model-name rules.
+fewer words improve performance. Compare behavior on the same tasks before
+adding a per-model specialization.
 Measure system text and tool schemas separately with the target tokenizer or
 provider usage; bytes alone do not measure token cost or effectiveness.
 
@@ -375,7 +384,7 @@ that group's evidence.
 source's chosen system instruction blocks and latest complete eligible turn
 group as native blocks, preserving tool linkage. The generated handoff precedes
 that recent working state. The child keeps its context type and runs the fork
-lifecycle; it does not rerun creation or acquire an unselected shared base.
+lifecycle; it does not rerun creation.
 
 The source block version must still match when retained blocks are copied after the
 model call. If it changed, compaction fails with a retry message instead of
@@ -426,19 +435,11 @@ successors as described above; changing the seed does not rewrite their stored
 instructions or assign their performer retroactively.
 
 Deploy code and rc together. The old `/config/kernel/system.md` is no longer
-read or seeded. Existing contexts may have depended on that automatic base;
-create new contexts or explicitly install the chosen instruction blocks before
-continuing them. Do not keep a hidden compatibility prepend. Coder's existing
-`S00-stance.kai` name is retained, so no renamed duplicate needs removal.
+read or seeded. Do not keep a hidden compatibility prepend.
 
 Existing kernel config trees are not reseeded at boot. Install the two auxiliary
 files explicitly with `kj config reset`, preserving all other local kernel
 configuration. Deployment, reseeding, and restarting the live kernel are separate
 from committing the source changes.
 
-The [HTML comparison](prompt-comparison.html) reads current seed files against a
-pinned pre-change baseline. It defaults to dark mode, supports optional shared
-base inclusion, and needs no network. Regenerate with
-`python3 contrib/render-prompt-comparison.py`; `--check` fails on stale output
-without writing. Input hashes cover the baseline, seeds, template, and generator.
 The [OSS dossier](oss-comparisons.md) keeps research and review lessons.
