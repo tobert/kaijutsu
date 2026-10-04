@@ -45,7 +45,7 @@ POST /council/v1/specs
     "criteria": [{"option": "allow", "means": "routine, local, easy to undo, or clearly permitted here"},
                  {"option": "ask", "means": "outward-facing, hard to undo, or not clearly permitted here"},
                  {"option": "report", "means": "ask, but louder: it could destroy work or break a firm rule"}]}]}
--> {"spec_id": "sha256:9c1f…", "spec": {…}, "template": "mk-menu-v1"}
+-> {"spec_id": "sha256:9c1f…", "spec": {…}, "template": "mk-letters-1:…"}
 ```
 
 Read a case after both:
@@ -82,7 +82,7 @@ POST /council/v1/decisions
  "pool": {"method": "loglinear", "weights": "mass", "normalized": {"undo": [0.5, 0.5], "verdict": [0.5, 0.5]}},
  "signals": {"control_text": []},
  "identity": {"model": "qwen3.8-flash-next", "weight_hash": "…", "tokenizer_hash": "…",
-              "template": "mk-menu-v1", "engine": "…", "spec_id": "sha256:9c1f…"},
+              "template": "mk-letters-1:…", "engine": "…", "spec_id": "sha256:9c1f…"},
  "usage": {"input_tokens": 41, "output_tokens": 26, "fed_tokens": 212}}
 ```
 
@@ -310,8 +310,9 @@ map is the Decisions API's answer, pooled over the reads.
    with special tokens off, so text that spells `<|im_end|>` is text and
    never closes or opens a turn. The case always sits in its own user turn,
    so text that imitates the spec's format stays inside it. The server
-   reports each hit in `signals.control_text` as `{where, token}` and never
-   refuses the request for it.
+   reports each hit in `signals.control_text` as `{where, token}`, where
+   `where` is `state`, `spec`, `context:<id>:system`, or
+   `context:<id>:turn:<n>`, and never refuses the request for it.
 3. **Each context describes for itself.** A `text` answer comes from inside
    each context's own stack. One shared description would erase what separates
    the contexts.
@@ -321,8 +322,9 @@ map is the Decisions API's answer, pooled over the reads.
    or a cached result for a failed read.
 6. **The rendering is the server's.** Menu labels, think handling, internal
    debiasing such as reading permuted option orders, and how the state is
-   wrapped are all part of `template`. A server that changes any of them
-   changes its identity.
+   wrapped are all part of `template`, an opaque id (the megakernel's reads
+   `mk-letters-1:<16 hex>`). A server that changes any of them changes its
+   `template`, and with it its identity.
 
 ## Errors
 

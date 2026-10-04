@@ -249,7 +249,7 @@ spec = "shell-gate"
 weight_hash = "…"
 engine = "…"
 tokenizer_hash = "…"
-template = "mk-menu-v1"
+template = "mk-letters-1:…"
 allow_at = 0.98                # pooled p(allow)
 mass_floor = -0.05             # each read's verdict mass, a log probability
 
@@ -264,7 +264,11 @@ The council's settings live only here. The kernel sends `deadline_ms` as
 
 - **Megakernel first.** Qwen3.8-Flash-Next on zorak has given more
   consistent reads than lfm2d. Amy, 2026-10-04: "mk seems to be overall
-  better". Its council routes are in progress (megakernel `docs/council-v1.md`).
+  better". It serves `/council/v1/` (megakernel `docs/council-v1.md`) with
+  the `leave_one_out` capability; context records are not parked yet, so
+  the kernel sends every council context again after the server restarts.
+  Long runs against it on zorak take the heavy lock
+  (`flock -w 900 ~/.cache/zorak-heavy.lock`).
 - **lfm2d second,** behind the same port once it serves `/council/v1/`.
 - **Jev through OpenRouter, for comparison only.** It speaks the Decisions
   API, which our contract includes, but it holds no contexts, so a

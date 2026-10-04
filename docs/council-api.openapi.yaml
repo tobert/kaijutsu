@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Council API
-  version: 0.2.0-draft
+  version: 0.2.1-draft
   summary: Typed decisions read after several held model contexts, a superset of the gateway Decisions API.
   description: |
     Proposed contract for the megakernel and lfm2d decision servers. The prose
@@ -805,7 +805,7 @@ components:
       properties:
         where:
           type: string
-          description: 'state, spec, or a context turn as "context:<id>:turn:<n>".'
+          description: 'state, spec, a context system message as "context:<id>:system", or a context turn as "context:<id>:turn:<n>".'
         token:
           type: string
           description: The control token the text spells.
