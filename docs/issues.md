@@ -219,6 +219,34 @@ WAL. Accept `-p`, or have the refusal name the fix.
   100 ms while still connecting closes a connection empty. Let the mock
   ignore an empty connection.
 
+## What the first live council decisions on zorak showed (2026-10-04)
+
+A coder seat on tenchi's qwen3.8-27b (`council-smoke`) ran `ls -la`,
+`git status`, and `chmod -R 777 ~/src/nonexistent-council-smoke` twice,
+against `council-system` and `council-amy` on the megakernel.
+
+- **A deploy does not install the council specs.** `rc reseed` covers
+  `/config/rc` only, so `/config/kernel/council/shell-gate.json` was missing
+  and the first decision missed ("cannot be read"). They were copied by hand
+  from `assets/defaults/council/`. Seed them, or name them in
+  `docs/operating.md`'s deploy steps.
+- **The first decision after a context change misses.** Sync is lazy: the
+  first decision PUTs both contexts (1108 and 396 tokens) and builds each
+  spec layer inside the deadline. With a 3000 ms deadline it missed during
+  prepare, then during the decision. The megakernel declares no `warm`, so
+  the kernel should send contexts and build spec layers off the hot path, at
+  enable time and after each change.
+- **Warm decisions take 1.4-3.3 s** on zorak's shared GPU (direct timing,
+  two contexts). The deadline is now 8000 ms on zorak.
+- **The mass floor discards a useful read.** On the chmod, council-system
+  said ask and council-amy said report with mass -0.62; the -0.3 floor made
+  it a miss instead of an ask carrying that split. Lower the floor, or drop
+  a low-mass read from the pool instead of missing the whole decision.
+- **It works.** Second pass: `ls -la` and `git status` were council-allowed
+  (policy verdict Allow, no ask), and the chmod asked. Direct reads: force
+  push to main 0.987 report, `sqlite3` on kernel.db 0.971 report, `cargo
+  test` 0.78 allow (asks at 0.9).
+
 ## `kj context list --tree` draws siblings as children (2026-10-04)
 
 On zorak, `kj context list --tree` drew `tui-ask-stuck`, the banto contexts,

@@ -67,7 +67,10 @@ shape, and the rows it writes before the restart are the ones that fail to
 decode. `SCHEMA` and `apply_additive_migrations` stay the mechanism; there is
 no migration framework.
 
-A deploy does not touch the host rc tree or `/config/kernel`. Run
+A deploy does not touch the host rc tree or `/config/kernel`. The council's
+specs live under `/config/kernel/council/`; copy any missing ones from
+`assets/defaults/council/` before enabling the council (no seed step
+installs them on an existing host yet). Run
 `kaijutsu-server rc reseed` with the service stopped: it installs new seeds,
 names files that differ from theirs, and names retired defaults still
 installed. `--force` overwrites the first and removes the second; to keep
