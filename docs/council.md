@@ -1,6 +1,8 @@
 # The council: System 1 in the gate
 
-**Status: design, not built.** The wire contract is `docs/council-api.md`
+**Status: built, off by default.** The gate consults the council on both
+paths when `gate.toml` enables it for a context type; report-stop is built
+but not wired (`docs/issues.md`, "Council gate: what 43c4a61c left open"). The wire contract is `docs/council-api.md`
 (with `docs/council-api.openapi.yaml`); outside source material is
 `docs/council-dossier.md`.
 
@@ -303,8 +305,11 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 enabled = true
 ```
 
-The council's settings live only here. The kernel sends `deadline_ms` as
-`timeout_ms` and stops waiting at the same deadline.
+The council's settings live only here. One `deadline_ms` bounds the whole
+decision, preparing the contexts and spec included: the kernel sends it as
+`timeout_ms` and stops waiting when it passes, and the miss names the phase
+it passed in. A 404 naming the spec makes the next decision post the spec
+again; a 404 naming a context sends that context again.
 
 ## Servers
 
