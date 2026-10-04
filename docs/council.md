@@ -29,6 +29,7 @@ submission -> gate_policy::evaluate        (docs/gate-policy-tuning.md)
      a hook denies or asks -> as today; the council never lowers a hook's ask
      hooks continue        -> one council decision for the submission, under a deadline
         allow   pooled p(allow) >= allow_at, every read's verdict mass >= mass_floor,
+                with require_agree every read's top answer is allow,
                 no control-text hit, identity matches its threshold
                 -> the Uncovered statements become council allows; the submission runs
                    with a durable auto-decision row naming the council

@@ -86,11 +86,6 @@ Measure and design recovery before promising durable admission or delivery.
 
 ## Council gate: what 43c4a61c left open (2026-10-04)
 
-- **require_agree checks the wrong agreement** (kaibo deepseek, job-3).
-  `classify` (`council/gate.rs`) uses the pool's `agree`, "every read has the
-  same top option"; docs/council.md says every read's top answer must be
-  allow. Unreachable at `allow_at = 0.98`, live after a refit below 0.5:
-  every read topping ask at p(allow) 0.45 with `allow_at = 0.4` allows.
 - **The observation shares the sync lock with the next decision.** A slow
   observation's prepare can delay the next gate decision into a "deadline
   passed during prepare" miss. Bounded by both deadlines; measure before
@@ -99,21 +94,26 @@ Measure and design recovery before promising durable admission or delivery.
   prepare, the server may work past the point the kernel stops waiting.
 - **Observing after a miss.** Observations run whatever the gate's outcome,
   a miss included; docs/council.md does not say whether they should.
-- **The worker-run guard has a window.** `approved_run_unsettled`
-  (`kj/gate.rs`) runs only in `consult`'s pre-check, because
-  `shell_operations().get_by_ask()` takes the database lock itself. The
-  in-lock re-check in `run_gate_once` covers open and uncollected asks,
-  not runs. The race needs a new identical ask raised, answered, and
-  claimed within one council call; kaibo (job-3) confirmed it, and a root
-  self-confirming or an automated reviewer can fit the window. Fix with an
-  in-lock read of redeemed allowed asks for the context and command.
+- **A collected allow that never ran blocks the council for good.** The
+  worker-run guard counts an allowed, redeemed ask with no shell operation
+  as unsettled. An ask spent without running (`KernelDb::end_held_ask` →
+  `Spent`) links no operation, so that command (or the same statements
+  under the same label) in that context is never council-allowed again.
+  It fails toward the ask, but permanently. Record a no-run settlement, or
+  exclude spent-without-run asks.
+- **The worker-run check scans under the lock.** On the RPC path the label
+  is the tool label, shared by many asks, so each check reads every
+  collected allow with a stored command under that label in the context.
+  The cost grows with approval history; unmeasured.
+- **No kernel test for the same-statements match.** `asks_about_submission`'s
+  digest-set-under-one-label branch is tested only through the ledger query,
+  not as `approved_run_unsettled` uses it (e.g. `touch  x` against `touch x`).
 - **A prepare miss records empty identity fields.** `council_decisions`
   makes `server_*` and `spec_id` NOT NULL, but a miss inside `prepare` has
   neither, so the gate writes empty strings and the cause explains. Make
   them nullable or record the miss in its own shape.
-- **Untested paths:** the unlinked-record fallback, used when the gate stops
-  before an ask exists, and the in-lock re-check. Both are reachable only on
-  faults or races.
+- **Untested path:** the unlinked-record fallback, used when the gate stops
+  before an ask exists; reachable only on faults.
 - **Report-stop is built and not wired.** `council::report_stop` waits on
   Amy: an interrupt abandons the turn's held ask (`runtime/interrupt.rs`), so
   docs/council.md's "until someone answers the ask" is not true today.

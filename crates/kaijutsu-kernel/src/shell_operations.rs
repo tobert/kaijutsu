@@ -661,10 +661,15 @@ impl ShellOperationRegistry {
     }
 
     pub fn get_by_ask(&self, ask: &str, context: ContextId) -> OperationResult<Option<ShellOperationState>> {
-        self.db.lock().conn_for_ledger().query_row(
+        Self::get_by_ask_in(&self.db.lock(), ask, context).map_err(|e| e.to_string())
+    }
+
+    /// [`Self::get_by_ask`] under a database guard the caller already holds.
+    pub(crate) fn get_by_ask_in(db: &KernelDb, ask: &str, context: ContextId) -> KernelDbResult<Option<ShellOperationState>> {
+        Ok(db.conn_for_ledger().query_row(
             &format!("{SELECT_STATE} WHERE context_id=?2 AND ({ASK_OPERATION})"),
             rusqlite::params![ask, context.as_bytes()], decode_state,
-        ).optional().map_err(|e| e.to_string())
+        ).optional()?)
     }
 
     /// Read the execution record without adding raw output to ordinary receipt polls.

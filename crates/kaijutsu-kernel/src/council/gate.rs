@@ -19,8 +19,8 @@
 //!   leaves `identity.spec_id` optional, so only a named spec is compared);
 //! - any control-text hit is an **ask**;
 //! - any read's verdict mass below the floor is a **miss**;
-//! - pooled p(allow) at or above `allow_at`, with agreement when the config
-//!   requires it, is an **allow**;
+//! - pooled p(allow) at or above `allow_at`, with every read's own top
+//!   answer `allow` when the config requires agreement, is an **allow**;
 //! - a pooled argmax of `report` is a **report**; anything else is an
 //!   **ask**.
 //!
@@ -267,9 +267,14 @@ pub(crate) fn classify(
     if hits > 0 {
         return Classification { outcome: Outcome::Ask, threshold: Some(threshold), verdict };
     }
+    // Each read's `choice` is its own argmax, verified above to the tolerance.
+    let mut every_read_tops_allow = true;
     for read in &response.reads {
         let mass = match read.answers.get(VERDICT) {
-            Some(ReadAnswer::Choice(c)) => c.mass,
+            Some(ReadAnswer::Choice(c)) => {
+                every_read_tops_allow &= c.choice == "allow";
+                c.mass
+            }
             _ => {
                 return miss(
                     format!("the read of {} has no `{VERDICT}` choice", read.context.as_deref().unwrap_or("the spec")),
@@ -289,7 +294,7 @@ pub(crate) fn classify(
             );
         }
     }
-    let outcome = if p_allow >= threshold.allow_at && (!council.require_agree || pooled.agree) {
+    let outcome = if p_allow >= threshold.allow_at && (!council.require_agree || every_read_tops_allow) {
         Outcome::Allow
     } else if pooled.choice == "report" {
         Outcome::Report
@@ -949,21 +954,22 @@ pub(crate) async fn consult(
             );
             return Ok(None);
         }
+        let running = crate::kj::gate::approved_run_unsettled(&db, spec, caller).map_err(|e| {
+            format!("the council could not read approved runs of this command: {e} (fail-closed — a ledger fault, not a decision)")
+        })?;
+        if let Some(request_id) = running {
+            tracing::info!(
+                ask.held_by = %request_id,
+                "the council is not consulted: the approval worker has not finished running this command"
+            );
+            return Ok(None);
+        }
         let cwd = db
             .get_context_shell(context_id)
             .map_err(|e| format!("the council could not read the context's working directory: {e}"))?
             .and_then(|row| row.cwd);
         (context_type, cwd)
     };
-    let running = crate::kj::gate::approved_run_unsettled(kernel, spec, caller)
-        .map_err(|e| format!("the council {e} (fail-closed — a ledger fault, not a decision)"))?;
-    if let Some(request_id) = running {
-        tracing::info!(
-            ask.held_by = %request_id,
-            "the council is not consulted: the approval worker has not finished running this command"
-        );
-        return Ok(None);
-    }
     let Some(shell) = shell_spec(council) else { return Ok(None) };
     let chain = super::voices::voice_chain(&kernel.kernel_db().lock(), council, context_id, caller.actor_id);
     let submission = Submission {
@@ -1145,6 +1151,21 @@ mod tests {
         assert!(!c.verdict.as_ref().unwrap().agree, "{c:?}");
         assert_eq!(c.outcome, Outcome::Allow, "{c:?}");
         assert_eq!(classified(&split, &council(0.5, -2.0, true)).outcome, Outcome::Ask);
+    }
+
+    /// Agreement means every read tops allow, not that the reads share a
+    /// top: two reads that both top ask, pooled to p(allow) 0.45, ask under
+    /// `allow_at = 0.4` when agreement is required, and allow when it is not.
+    #[test]
+    fn reads_that_agree_on_ask_never_allow_when_agreement_is_required() {
+        let lean_ask = [[-0.81, -0.70, -3.2], [-0.81, -0.70, -3.2]];
+        let c = classified(&lean_ask, &council(0.4, -0.05, true));
+        let verdict = c.verdict.as_ref().unwrap();
+        assert!(verdict.agree, "both reads top the same option: {c:?}");
+        let p = verdict.p("allow").unwrap();
+        assert!((0.44..0.46).contains(&p), "{c:?}");
+        assert_eq!(c.outcome, Outcome::Ask, "{c:?}");
+        assert_eq!(classified(&lean_ask, &council(0.4, -0.05, false)).outcome, Outcome::Allow);
     }
 
     #[test]

@@ -994,20 +994,28 @@ pub fn redeemed_at(conn: &Connection, request_id: &str) -> Result<Option<i64>> {
     .map_err(LedgerError::from)
 }
 
-/// Asks in `context_id` that a human allowed for `exec_source` and whose
-/// answer has been collected, oldest first. An executable answer is
-/// collected by the approval worker's claim, before its run settles, so
-/// these are the runs a caller cannot see through [`find_redeemable`] or
-/// [`undelivered_answers`]. Rule- and classifier-decided rows are excluded.
-pub fn list_collected_allows(conn: &Connection, context_id: &[u8], exec_source: &str) -> Result<Vec<String>> {
+/// Asks in `context_id` with a stored command that a human allowed and whose
+/// answer has been collected, for `exec_source` or under `authorized_label`,
+/// oldest first. An executable answer is collected by the approval worker's
+/// claim, before its run settles, so these are the runs a caller cannot see
+/// through [`find_redeemable`] or [`undelivered_answers`]. Rule- and
+/// classifier-decided rows are excluded. A row matched only by its label
+/// asked about other source text; the caller compares its statements.
+pub fn list_collected_allows(
+    conn: &Connection,
+    context_id: &[u8],
+    exec_source: &str,
+    authorized_label: &str,
+) -> Result<Vec<String>> {
     let mut q = conn.prepare(
         "SELECT request_id FROM approvals
-         WHERE status = 'allowed' AND auto_reason IS NULL AND context_id = ?1 AND exec_source = ?2
+         WHERE status = 'allowed' AND auto_reason IS NULL AND context_id = ?1 AND exec_source IS NOT NULL
+           AND (exec_source = ?2 OR authorized_label = ?3)
            AND request_id IN (SELECT request_id FROM approval_redemptions)
          ORDER BY created_at ASC",
     )?;
     let rows = q
-        .query_map(params![context_id, exec_source], |row| row.get(0))?
+        .query_map(params![context_id, exec_source, authorized_label], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(rows)
 }
@@ -2091,17 +2099,20 @@ mod tests {
         );
     }
 
-    /// Only a human's allow, already collected, for the same source in the
-    /// same context: the approval worker's claim, before its run settles.
+    /// Only a human's allow of a stored command, already collected, for the
+    /// same source or under the same label in the same context: the approval
+    /// worker's claim, before its run settles.
     #[test]
     fn collected_allows_are_human_redeemed_allows_of_the_same_source_in_the_context() {
         let conn = open_memory();
-        let raise = |source: &str, context: &[u8]| {
+        let raise_labeled = |source: Option<&str>, label: &str, context: &[u8]| {
             let mut ask = minimal_ask();
-            ask.exec_source = Some(source.into());
+            ask.exec_source = source.map(str::to_owned);
+            ask.authorized_label = Some(label.into());
             ask.context_id = context.to_vec();
             create_ask(&conn, &ask).unwrap()
         };
+        let raise = |source: &str, context: &[u8]| raise_labeled(Some(source), "shell", context);
         let answer = |id: &str, allow: bool, auto: Option<&str>| {
             crate::decide::decide(&conn, id, crate::decide::DecideInput { allow, auto_reason: auto, ..Default::default() })
                 .unwrap();
@@ -2116,15 +2127,20 @@ mod tests {
         answer(&automatic, true, Some("gate policy: builtin allows touch"));
         let elsewhere = raise("touch x", crate::fixtures::PEER_CONTEXT);
         answer(&elsewhere, true, None);
-        let other = raise("touch y", crate::fixtures::ASKING_CONTEXT);
+        let same_label = raise("touch  x", crate::fixtures::ASKING_CONTEXT);
+        answer(&same_label, true, None);
+        let other = raise_labeled(Some("touch y"), "other", crate::fixtures::ASKING_CONTEXT);
         answer(&other, true, None);
-        for id in [&collected, &denied, &automatic, &elsewhere, &other] {
+        let no_command = raise_labeled(None, "shell", crate::fixtures::ASKING_CONTEXT);
+        answer(&no_command, true, None);
+        for id in [&collected, &denied, &automatic, &elsewhere, &same_label, &other, &no_command] {
             crate::decide::redeem_ask(&conn, id).unwrap();
         }
-        assert_eq!(
-            list_collected_allows(&conn, crate::fixtures::ASKING_CONTEXT, "touch x").unwrap(),
-            vec![collected]
-        );
+        let mut found = list_collected_allows(&conn, crate::fixtures::ASKING_CONTEXT, "touch x", "shell").unwrap();
+        found.sort();
+        let mut want = vec![collected, same_label];
+        want.sort();
+        assert_eq!(found, want);
     }
 
     /// A denial is an answer. A denied caller that is never woken keeps

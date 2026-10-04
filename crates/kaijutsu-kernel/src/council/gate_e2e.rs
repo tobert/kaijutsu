@@ -61,6 +61,13 @@ impl Reply {
 
 type Behavior = Arc<dyn Fn(&DecisionRequest) -> Reply + Send + Sync>;
 
+/// A hold on the next decision: the server signals `reached` once it has the
+/// request and its reply, then answers only after `release` fires.
+struct Hold {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// A council server on 127.0.0.1 that holds whatever it is sent and answers
 /// decisions the way the test says.
 struct Mock {
@@ -71,6 +78,8 @@ struct Mock {
     calls: Arc<Mutex<Vec<(String, String)>>>,
     /// Delays for the next `PUT`s, one each, in order.
     put_delays: Arc<Mutex<VecDeque<Duration>>>,
+    /// Holds the next decision until the test releases it.
+    hold: Arc<Mutex<Option<Hold>>>,
 }
 
 impl Mock {
@@ -82,6 +91,15 @@ impl Mock {
     /// Hold each of the next `PUT`s for the given delay before it answers.
     fn delay_puts(&self, delays: &[Duration]) {
         self.put_delays.lock().unwrap().extend(delays.iter().copied());
+    }
+
+    /// Hold the next decision: the first receiver fires when the server has
+    /// it, and the server answers once the sender fires.
+    fn hold_next_decision(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached, at) = tokio::sync::oneshot::channel();
+        let (go, release) = tokio::sync::oneshot::channel();
+        *self.hold.lock().unwrap() = Some(Hold { reached, release });
+        (at, go)
     }
 
     fn set(&self, behavior: impl Fn(&DecisionRequest) -> Reply + Send + Sync + 'static) {
@@ -153,12 +171,15 @@ async fn serve() -> Mock {
     let behavior: Arc<Mutex<Behavior>> = Arc::new(Mutex::new(Arc::new(|req: &DecisionRequest| Reply::ok(answer(req, &ALLOW)))));
     let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let put_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
+    let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
     let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
+    let holding = hold.clone();
     tokio::spawn(async move {
         let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
+            let holding = holding.clone();
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
@@ -182,7 +203,13 @@ async fn serve() -> Mock {
                         let request: DecisionRequest = serde_json::from_str(&body).unwrap();
                         log.lock().unwrap().push(request.clone());
                         let behavior = how.lock().unwrap().clone();
-                        behavior(&request)
+                        let reply = behavior(&request);
+                        let hold = holding.lock().unwrap().take();
+                        if let Some(Hold { reached, release }) = hold {
+                            let _ = reached.send(());
+                            let _ = release.await;
+                        }
+                        reply
                     }
                     _ => Reply { status: 500, body: "unexpected".into(), delay: Duration::ZERO },
                 };
@@ -198,7 +225,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, put_delays }
+    Mock { base, decisions, behavior, calls, put_delays, hold }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -840,6 +867,46 @@ async fn a_retry_while_the_approval_worker_runs_the_command_is_never_council_all
         }
         rig.submit(command).await.unwrap_or_else(|e| panic!("{via:?}: once the run settled the council may allow it: {e:?}"));
         assert_eq!(rig.mock.decisions().len(), 2, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// An identical ask raised, answered, and collected while a council decision
+/// is in flight holds the submission: the approval worker owns that run, so
+/// the council's allow is not applied and the submission asks. The ask is
+/// collected without a recorded run, which counts as unsettled.
+///
+/// Falsified by an in-lock re-check that reads only open asks and
+/// uncollected answers: the council-allowed submission runs beside the
+/// worker's run.
+#[tokio::test]
+async fn an_identical_ask_collected_during_the_decision_holds_the_council_allow() {
+    for via in BOTH {
+        let rig = rig(via, Setup { deadline_ms: 30_000, ..Setup::default() }).await;
+        rig.mock.answers(&ALLOW);
+        let (reached, release) = rig.mock.hold_next_decision();
+        let command = "echo raced";
+        let allowed = rig.submit(command);
+        let race = async {
+            reached.await.expect("the first decision reaches the council");
+            rig.mock.set(|_| Reply { status: 503, body: "{}".into(), delay: Duration::ZERO });
+            assert_pending(via, rig.submit(command).await);
+            let collected = rig.only_ask().request_id;
+            rig.answer_pending(true);
+            assert!(rig.d.kernel_db().lock().redeem_ask(&collected).unwrap(), "{via:?}: the worker's claim");
+            release.send(()).expect("the held decision is still waiting");
+            collected
+        };
+        let (allowed, collected) = tokio::join!(allowed, race);
+        assert_pending(via, allowed);
+
+        assert_eq!(rig.mock.decisions().len(), 2, "{via:?}");
+        let asks = rig.asks();
+        assert_eq!(asks.len(), 2, "{via:?}: {asks:#?}");
+        assert!(asks.iter().all(|a| a.auto_reason.is_none()), "{via:?}: nothing was council-allowed: {asks:#?}");
+        let held = asks.iter().find(|a| a.request_id != collected).unwrap();
+        assert_eq!(held.status, ApprovalStatus::Pending, "{via:?}");
+        assert_eq!(the_decision(&rig, held).decision.outcome, CouncilOutcome::Allow, "{via:?}: the council allowed it");
         rig.finish().await;
     }
 }

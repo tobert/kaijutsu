@@ -472,29 +472,18 @@ pub(crate) fn ask_holding_submission(
     spec: &GateSpec,
     caller: &KjCaller,
 ) -> KernelDbResult<Option<String>> {
-    use std::collections::BTreeSet;
     let Some(context_id) = caller.context_id else { return Ok(None) };
     let conn = db.conn_for_ledger();
     let context = context_id.as_bytes().to_vec();
     let principal = caller.principal_id.as_bytes().to_vec();
-    let digests: Vec<String> = spec.statements.iter().map(|s| statement_digest(spec.origin, &s.rendered)).collect();
+    let digests = submission_digests(spec);
     let digest_refs: Vec<&str> = digests.iter().map(String::as_str).collect();
     if let Some((request_id, _)) = approval_ledger::ask::find_redeemable(
         conn, &digest_refs, &spec.authorized_label, Some(&context), Some(&principal), caller.actor_id.as_bytes(),
     )? {
         return Ok(Some(request_id));
     }
-    let wanted: BTreeSet<&str> = digest_refs.iter().copied().collect();
-    let same = |row: &approval_ledger::types::ApprovalRow| -> KernelDbResult<bool> {
-        if spec.exec_source.is_some() && row.exec_source == spec.exec_source {
-            return Ok(true);
-        }
-        if row.authorized_label.as_deref() != Some(spec.authorized_label.as_str()) {
-            return Ok(false);
-        }
-        let held = approval_ledger::ask::load_ask_statements(conn, &row.request_id)?;
-        Ok(held.iter().map(|s| s.statement.statement_digest.as_str()).collect::<BTreeSet<_>>() == wanted)
-    };
+    let same = |row: &approval_ledger::types::ApprovalRow| asks_about_submission(db, spec, &digests, row);
     for row in approval_ledger::ask::list_unresolved_for_context(conn, &context)? {
         if same(&row)? {
             return Ok(Some(row.request_id));
@@ -513,30 +502,56 @@ pub(crate) fn ask_holding_submission(
     Ok(None)
 }
 
-/// A human-allowed ask for this submission's source whose run has not
-/// settled: the approval worker collects an answer before it runs the
-/// command, so from its claim until the run completes no open ask or
-/// uncollected answer shows the run. An allowed ask with no recorded run yet
-/// counts as unsettled. Takes the database lock itself, so call it with the
-/// lock released.
+/// The statement digests an ask for `spec` records, in statement order.
+fn submission_digests(spec: &GateSpec) -> Vec<String> {
+    spec.statements.iter().map(|s| statement_digest(spec.origin, &s.rendered)).collect()
+}
+
+/// Whether `row` asked about this submission: the same executable source, or
+/// the same statements (`digests`) under the same label.
+fn asks_about_submission(
+    db: &KernelDb,
+    spec: &GateSpec,
+    digests: &[String],
+    row: &approval_ledger::types::ApprovalRow,
+) -> KernelDbResult<bool> {
+    use std::collections::BTreeSet;
+    if spec.exec_source.is_some() && row.exec_source == spec.exec_source {
+        return Ok(true);
+    }
+    if row.authorized_label.as_deref() != Some(spec.authorized_label.as_str()) {
+        return Ok(false);
+    }
+    let held = approval_ledger::ask::load_ask_statements(db.conn_for_ledger(), &row.request_id)?;
+    let wanted: BTreeSet<&str> = digests.iter().map(String::as_str).collect();
+    Ok(held.iter().map(|s| s.statement.statement_digest.as_str()).collect::<BTreeSet<_>>() == wanted)
+}
+
+/// A human-allowed ask for this submission whose run has not settled, by the
+/// identity rule of [`ask_holding_submission`]. The approval worker collects
+/// an answer before it runs the command, so from its claim until the run
+/// completes no open ask or uncollected answer shows the run. An allowed ask
+/// with no recorded run counts as unsettled. Reads under the caller's
+/// database guard, so a council allow applied under the same guard cannot
+/// miss a claim made after an earlier check.
 pub(crate) fn approved_run_unsettled(
-    kernel: &crate::Kernel,
+    db: &KernelDb,
     spec: &GateSpec,
     caller: &KjCaller,
-) -> Result<Option<String>, String> {
+) -> KernelDbResult<Option<String>> {
     let (Some(context_id), Some(source)) = (caller.context_id, spec.exec_source.as_deref()) else {
         return Ok(None);
     };
-    let collected = {
-        let db = kernel.kernel_db().lock();
-        approval_ledger::ask::list_collected_allows(db.conn_for_ledger(), context_id.as_bytes(), source)
-            .map_err(|e| format!("could not read approved runs of this command: {e}"))?
-    };
+    let digests = submission_digests(spec);
+    let collected = approval_ledger::ask::list_collected_allows(
+        db.conn_for_ledger(), context_id.as_bytes(), source, &spec.authorized_label,
+    )?;
     for request_id in collected {
-        let settled = kernel
-            .shell_operations()
-            .get_by_ask(&request_id, context_id)
-            .map_err(|e| format!("could not read the approved run of ask {request_id}: {e}"))?
+        let Some(row) = db.get_approval(&request_id)? else { continue };
+        if !asks_about_submission(db, spec, &digests, &row)? {
+            continue;
+        }
+        let settled = crate::shell_operations::ShellOperationRegistry::get_by_ask_in(db, &request_id, context_id)?
             .is_some_and(|state| state.completed_at.is_some());
         if !settled {
             return Ok(Some(request_id));
@@ -567,7 +582,9 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 /// `council` is the council's verdict on this submission, when one was
 /// consulted. An allow turns the statements no other layer covered into
 /// council allows, unless an earlier ask still holds the submission
-/// ([`ask_holding_submission`]). Every verdict is recorded with its voice
+/// ([`ask_holding_submission`]) or an approved run of it has not settled
+/// ([`approved_run_unsettled`]); both are read under the guard that applies
+/// the allow. Every verdict is recorded with its voice
 /// skips: with the ask it led to, in the transaction that creates it, or
 /// unlinked when the gate stopped before an ask existed. A record that
 /// cannot be written refuses the call as gate unavailable. Once the record
@@ -742,16 +759,23 @@ async fn run_gate_once(
             }
         };
         if let Some(council) = council.filter(|c| c.allows()) {
-            match ask_holding_submission(&db, &spec, caller) {
+            let held = ask_holding_submission(&db, &spec, caller)
+                .map(|held| held.map(|id| (id, "an earlier ask holds this submission")))
+                .and_then(|held| match held {
+                    Some(held) => Ok(Some(held)),
+                    None => approved_run_unsettled(&db, &spec, caller)
+                        .map(|run| run.map(|id| (id, "the approval worker has not finished running this command"))),
+                });
+            match held {
                 Ok(None) => policy.apply_council_allow(&council.spec, |i| council_key(&spec, i, council)),
-                Ok(Some(request_id)) => tracing::info!(
+                Ok(Some((request_id, why))) => tracing::info!(
                     ask.held_by = %request_id,
-                    "an earlier ask holds this submission; the council's allow is not applied"
+                    "{why}; the council's allow is not applied"
                 ),
                 Err(e) => {
                     return GateOutcome::unavailable_without_row(format!(
-                        "approval gate could not check for an earlier ask: {e} (fail-closed — this \
-                         is a ledger fault, not a decision)"
+                        "approval gate could not check for an earlier ask or an unsettled approved run: {e} \
+                         (fail-closed — this is a ledger fault, not a decision)"
                     ));
                 }
             }
