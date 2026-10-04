@@ -1,0 +1,21 @@
+[package]
+name = "kaijutsu-council"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Council API wire types, spec ids, answer and pool math, and an HTTP client"
+
+[lints]
+workspace = true
+
+[dependencies]
+hex = "0.4"
+indexmap = { workspace = true, features = ["serde"] }
+reqwest = "0.13"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time"] }

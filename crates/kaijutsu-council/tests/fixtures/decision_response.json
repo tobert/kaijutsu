@@ -1,0 +1,190 @@
+{
+ "model": "qwen3.8-flash-next",
+ "answers": {
+  "undo": {
+   "type": "score",
+   "probabilities": {
+    "0": 0.05792360471276348,
+    "1": 0.9177342559688639,
+    "2": 0.024342139318372518
+   },
+   "confidence": 0.629244296847821,
+   "score": 0.966418534605609,
+   "legend": {
+    "0": "easy",
+    "1": "hard",
+    "2": "impossible"
+   },
+   "agree": true,
+   "spread": 0.3528092578379926,
+   "leave_one_out": {
+    "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11": {
+     "0": 0.37494794181688146,
+     "1": 0.6181846470787264,
+     "2": 0.006867411104392114
+    },
+    "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12": {
+     "0": 0.022138683978888848,
+     "1": 0.941360796839809,
+     "2": 0.03650051918130219
+    }
+   }
+  },
+  "verdict": {
+   "type": "choice",
+   "probabilities": {
+    "allow": 0.055831953686386826,
+    "ask": 0.7082420080753632,
+    "report": 0.23592603823825006
+   },
+   "confidence": 0.45148825771237355,
+   "choice": "ask",
+   "agree": false,
+   "spread": 0.6085754162330479,
+   "leave_one_out": {
+    "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11": {
+     "allow": 0.37494794181688146,
+     "ask": 0.6181846470787264,
+     "report": 0.006867411104392114
+    },
+    "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12": {
+     "allow": 0.01127222858217413,
+     "ask": 0.3732849440803858,
+     "report": 0.61544282733744
+    }
+   }
+  }
+ },
+ "reads": [
+  {
+   "context": "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11",
+   "snapshot": "snap:ad8eec527db476432584478044f7a9819dbd02801f434f12d2282bdc2b3e4fbe",
+   "described": {
+    "effect": "Publishes local commits to the remote."
+   },
+   "answers": {
+    "undo": {
+     "type": "score",
+     "probabilities": {
+      "0": 0.02213868397888885,
+      "1": 0.941360796839809,
+      "2": 0.0365005191813022
+     },
+     "confidence": 0.7788007830714049,
+     "score": 1.0143618352024133,
+     "legend": {
+      "0": "easy",
+      "1": "hard",
+      "2": "impossible"
+     },
+     "logprobs": {
+      "0": -4.0,
+      "1": -0.25,
+      "2": -3.5
+     },
+     "mass": -0.1895712056504122
+    },
+    "verdict": {
+     "type": "choice",
+     "probabilities": {
+      "allow": 0.011272228582174132,
+      "ask": 0.37328494408038587,
+      "report": 0.61544282733744
+     },
+     "confidence": 0.4723665527410147,
+     "choice": "report",
+     "logprobs": {
+      "allow": -4.75,
+      "ask": -1.25,
+      "report": -0.75
+     },
+     "mass": -0.2645867741678689
+    }
+   },
+   "rendered_sha256": "57228b0bddca64da52462957ef6fe4477b31494fbd191e14a4843e8e174a9195",
+   "tokens": 96,
+   "ms": 12.5
+  },
+  {
+   "context": "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12",
+   "snapshot": "snap:979d15ceb6faa54648bb078c9ca91debdcedf90bded148566399638f2005260b",
+   "described": {
+    "effect": "Publishes local commits to the remote."
+   },
+   "answers": {
+    "undo": {
+     "type": "score",
+     "probabilities": {
+      "0": 0.37494794181688146,
+      "1": 0.6181846470787266,
+      "2": 0.006867411104392115
+     },
+     "confidence": 0.22313016014842982,
+     "score": 0.6319194692875107,
+     "legend": {
+      "0": "easy",
+      "1": "hard",
+      "2": "impossible"
+     },
+     "logprobs": {
+      "0": -2.0,
+      "1": -1.5,
+      "2": -6.0
+     },
+     "mass": -1.0190319155299834
+    },
+    "verdict": {
+     "type": "choice",
+     "probabilities": {
+      "allow": 0.37494794181688146,
+      "ask": 0.6181846470787266,
+      "report": 0.006867411104392115
+     },
+     "confidence": 0.22313016014842982,
+     "choice": "ask",
+     "logprobs": {
+      "allow": -2.0,
+      "ask": -1.5,
+      "report": -6.0
+     },
+     "mass": -1.0190319155299834
+    }
+   },
+   "rendered_sha256": "46ea5093e8e88018d1b04a9b5e9a2b9637a46e003ac14924f9ede69681ed65d0",
+   "tokens": 96,
+   "ms": 12.5
+  }
+ ],
+ "pool": {
+  "method": "loglinear",
+  "weights": "mass",
+  "normalized": {
+   "undo": [
+    0.6962408876902914,
+    0.3037591123097086
+   ],
+   "verdict": [
+    0.6801465008017145,
+    0.3198534991982855
+   ]
+  }
+ },
+ "signals": {
+  "control_text": []
+ },
+ "identity": {
+  "model": "qwen3.8-flash-next",
+  "weight_hash": "w1",
+  "tokenizer_hash": "t1",
+  "template": "mk-letters-1:0123456789abcdef",
+  "engine": "e1",
+  "spec_id": "sha256:5114ff063b887c710333afd4fe35238c55946ac2a63fb76d6c9004b56a1503ea"
+ },
+ "usage": {
+  "input_tokens": 41,
+  "output_tokens": 26,
+  "fed_tokens": 212
+ },
+ "queue_ms": 0.5,
+ "ms": 80.0
+}

@@ -28,6 +28,7 @@ members = [
     "crates/kaijutsu-isotest",
     "crates/approval-ledger",
     "crates/claude-code-peer",
+    "crates/kaijutsu-council",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ kaijutsu-telemetry = { path = "crates/kaijutsu-telemetry" }
 kaijutsu-agent-tools = { path = "crates/kaijutsu-agent-tools" }
 approval-ledger = { path = "crates/approval-ledger" }
 claude-code-peer = { path = "crates/claude-code-peer" }
+kaijutsu-council = { path = "crates/kaijutsu-council" }
 
 # Kaish (execution engine + client) — published 0.15.
 # `subprocess` compiles in host external-command execution; whether a given

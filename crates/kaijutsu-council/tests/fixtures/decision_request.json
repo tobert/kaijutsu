@@ -1,0 +1,16 @@
+{
+ "spec_id": "sha256:5114ff063b887c710333afd4fe35238c55946ac2a63fb76d6c9004b56a1503ea",
+ "contexts": [
+  {
+   "id": "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11"
+  },
+  {
+   "id": "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12"
+  }
+ ],
+ "state": "git push origin main",
+ "pool": {
+  "method": "loglinear",
+  "weights": "mass"
+ }
+}
