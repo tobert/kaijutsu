@@ -435,6 +435,13 @@ pub(crate) struct CouncilConfig {
     /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
     /// contexts"). Off by default.
     pub(crate) voices: bool,
+    /// `[council] seat`: each decision also reads the submitting seat's own
+    /// context, its brief and newest narration (`docs/council.md`, "The
+    /// seat context"). Off by default.
+    pub(crate) seat: bool,
+    /// `[council] seat_tokens`: the seat context's budget for the brief and
+    /// for the narration, each, estimated at four bytes a token.
+    pub(crate) seat_tokens: u64,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
 }
@@ -463,6 +470,10 @@ struct CouncilToml {
     #[serde(default)]
     voices: bool,
     #[serde(default)]
+    seat: bool,
+    #[serde(default = "default_seat_tokens")]
+    seat_tokens: i64,
+    #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
     threshold: Vec<CouncilThresholdToml>,
@@ -470,6 +481,14 @@ struct CouncilToml {
 
 fn default_require_agree() -> bool {
     true
+}
+
+/// The seat context's default budget, in tokens, for the brief and for the
+/// narration each.
+pub(crate) const DEFAULT_SEAT_TOKENS: u64 = 2000;
+
+fn default_seat_tokens() -> i64 {
+    DEFAULT_SEAT_TOKENS as i64
 }
 
 #[derive(Deserialize)]
@@ -654,6 +673,12 @@ impl GateConfig {
                 raw.deadline_ms
             )));
         }
+        if raw.seat_tokens <= 0 {
+            return Err(err(format!(
+                "[council] seat_tokens: {} must be an integer greater than 0",
+                raw.seat_tokens
+            )));
+        }
         if raw.spec.is_empty() {
             return Err(err("[council]: declare at least one [[council.spec]]".into()));
         }
@@ -747,6 +772,8 @@ impl GateConfig {
             deadline_ms: raw.deadline_ms as u64,
             require_agree: raw.require_agree,
             voices: raw.voices,
+            seat: raw.seat,
+            seat_tokens: raw.seat_tokens as u64,
             specs,
             thresholds,
         })
@@ -2490,6 +2517,20 @@ enabled = false
         assert!(on.council().unwrap().voices);
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = \"yes\""));
         assert!(m.contains("voices"), "{m}");
+    }
+
+    #[test]
+    fn the_seat_context_is_off_unless_the_council_turns_it_on() {
+        let c = config(COUNCIL_FULL);
+        assert!(!c.council().unwrap().seat, "the seat context defaults to off");
+        assert_eq!(c.council().unwrap().seat_tokens, DEFAULT_SEAT_TOKENS);
+        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = true\nseat_tokens = 500"));
+        assert!(on.council().unwrap().seat);
+        assert_eq!(on.council().unwrap().seat_tokens, 500);
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat_tokens = 0"));
+        assert!(m.contains("seat_tokens"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = \"yes\""));
+        assert!(m.contains("seat"), "{m}");
     }
 
     #[test]

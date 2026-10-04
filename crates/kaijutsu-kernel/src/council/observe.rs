@@ -163,7 +163,7 @@ async fn observe_one(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
     let labels = [label.to_string()];
-    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, deadline).await {
+    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, None, deadline).await {
         Ok(prepared) => prepared,
         Err(cause) => return miss(row, cause, started.elapsed()),
     };
@@ -368,6 +368,8 @@ mod tests {
             deadline_ms: 5000,
             require_agree: true,
             voices: false,
+            seat: false,
+            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
             thresholds: vec![],
         };

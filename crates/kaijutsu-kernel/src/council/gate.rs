@@ -498,16 +498,19 @@ fn forget_after(kernel: &crate::Kernel, error: &CouncilError, prepared: &Prepare
     }
 }
 
-/// Prepare the server for a decision on `spec_name` over `labels`, stopping
-/// at `deadline`. Every failure is a miss cause.
+/// Prepare the server for a decision on `spec_name` over `labels` and, when
+/// given, the seat context of `seat`, stopping at `deadline`. Every failure
+/// is a miss cause.
 pub(crate) async fn prepare_within(
     kernel: &crate::Kernel,
     council: &CouncilConfig,
     spec_name: &str,
     labels: &[String],
+    seat: Option<ContextId>,
     deadline: tokio::time::Instant,
 ) -> Result<Prepared, String> {
-    match tokio::time::timeout_at(deadline, kernel.council_sync().prepare_labels(kernel, council, spec_name, labels)).await {
+    let prepare = kernel.council_sync().prepare_labels(kernel, council, spec_name, labels, seat);
+    match tokio::time::timeout_at(deadline, prepare).await {
         Err(_) => Err(deadline_cause(council.deadline_ms, "prepare")),
         Ok(Err(PrepareMiss(cause))) => Err(cause),
         Ok(Ok(prepared)) => Ok(prepared),
@@ -1037,9 +1040,10 @@ fn other_word(outcome: &Outcome) -> &'static str {
 
 /// Ask the council once about `submission` and return its verdict. Every
 /// failure is a verdict too: a miss with its cause, including a reviewer
-/// chain that could not be walked (`chain`). Runs with no database lock
-/// held; `deadline_ms` bounds preparing the server and the decision call
-/// together.
+/// chain that could not be walked (`chain`). With `[council] seat` on, the
+/// decision also reads the caller's seat context. Runs with no database
+/// lock held; `deadline_ms` bounds preparing the server and the decision
+/// call together.
 pub(crate) async fn decide(
     kernel: &crate::Kernel,
     caller: &KjCaller,
@@ -1120,7 +1124,8 @@ async fn decide_inner(
     };
     let labels = chain.decision_labels(council);
     let carried = Carried { chain, state };
-    let prepared = match prepare_within(kernel, council, &spec.name, &labels, deadline).await {
+    let seat = caller.context_id.filter(|_| council.seat);
+    let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline).await {
         Ok(prepared) => prepared,
         Err(cause) => {
             span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
@@ -1489,6 +1494,8 @@ mod tests {
             deadline_ms: 700,
             require_agree,
             voices: false,
+            seat: false,
+            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
@@ -1702,6 +1709,7 @@ mod tests {
                     label: format!("c{i}"),
                     context_id: *id,
                     head: kaijutsu_council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
+                    seat: false,
                 })
                 .collect(),
         }

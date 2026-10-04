@@ -254,11 +254,22 @@ struct Setup {
     /// `gate.toml` declares the program spec, `program-gate`, with a
     /// threshold for the test server.
     programs: bool,
+    /// `[council] seat`.
+    seat: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Setup { enabled: true, deadline_ms: 700, server: None, global: "", voices: false, chain: false, programs: false }
+        Setup {
+            enabled: true,
+            deadline_ms: 700,
+            server: None,
+            global: "",
+            voices: false,
+            chain: false,
+            programs: false,
+            seat: false,
+        }
     }
 }
 
@@ -271,6 +282,7 @@ fn gate_toml(server: &str, setup: &Setup) -> String {
 server = "{server}"
 contexts = {contexts}
 voices = {voices}
+seat = {seat}
 pool = {{ method = "loglinear", weights = "mass" }}
 deadline_ms = {deadline}
 
@@ -294,6 +306,7 @@ enabled = {enabled}
         global = setup.global,
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
         voices = setup.voices,
+        seat = setup.seat,
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
         programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
@@ -1771,4 +1784,47 @@ async fn a_script_changed_after_the_council_judged_it_does_not_run() {
         other => panic!("the council allows: {other:?}"),
     }
     rig.finish().await;
+}
+
+/// With `[council] seat` on, the shell decision and each program decision
+/// read the submitting seat's own context after the configured contexts,
+/// under the seat's context id and pinned at the head the kernel prepared.
+/// A seat with no narration yet reads no seat context.
+///
+/// Falsified by a gate that leaves the seat out of the program decision:
+/// its request reads two contexts.
+#[tokio::test]
+async fn the_seat_context_joins_the_shell_and_program_decisions() {
+    for via in BOTH {
+        let rig = rig(via, Setup { seat: true, programs: true, ..Setup::default() }).await;
+        rig.mock.set(allow_each);
+        rig.submit("echo before-any-narration").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
+        let first = rig.mock.decisions();
+        assert_eq!(Rig::read_ids(&first[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+
+        append_dialogue(rig.d.kernel(), rig.ctx.context_id, &["recover the records", "The WAL is XORed; no backup yet."]);
+        rig.write("/work/fix.py", "print('fixed')\n").await;
+        rig.mock.set(|req| {
+            if is_program(req) {
+                Reply::ok(super::gate::test_support::program_answer(req, FIRST, FIRST, [-0.01, -5.0, -6.0]))
+            } else {
+                allow_each(req)
+            }
+        });
+        rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
+        let sent: Vec<_> = rig.mock.decisions().into_iter().skip(first.len()).collect();
+        assert_eq!(sent.len(), 2, "{via:?}: a shell and a program decision");
+        let seat = rig.ctx.context_id.to_string();
+        for request in &sent {
+            assert_eq!(
+                Rig::read_ids(request),
+                [rig.context_of("voice"), rig.context_of("system-rules"), seat.clone()],
+                "{via:?}: program={}",
+                is_program(request)
+            );
+            let at = request.contexts.as_ref().unwrap()[2].at.as_ref().expect("the seat is pinned");
+            assert_eq!(at, sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap(), "{via:?}: one head for both");
+        }
+        rig.finish().await;
+    }
 }

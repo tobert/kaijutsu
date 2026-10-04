@@ -22,7 +22,7 @@ use kaijutsu_council::{CouncilClient, CouncilError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
-use super::projection::project;
+use super::projection::{project, project_seat};
 use crate::kj::gate_policy::CouncilConfig;
 
 /// Everything one decision needs from the server's side.
@@ -34,8 +34,16 @@ pub(crate) struct Prepared {
     pub(crate) identity: ServerIdentity,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
-    /// In `CouncilConfig.contexts` order.
+    /// In the order the labels were given, then the seat context when one
+    /// is read.
     pub(crate) contexts: Vec<PreparedContext>,
+}
+
+impl Prepared {
+    /// The seat context this decision reads, when it reads one.
+    pub(crate) fn seat(&self) -> Option<&PreparedContext> {
+        self.contexts.iter().find(|c| c.seat)
+    }
 }
 
 /// One council context as the server holds it.
@@ -44,7 +52,13 @@ pub(crate) struct PreparedContext {
     pub(crate) context_id: ContextId,
     /// The head the server reported for the body this kernel sent.
     pub(crate) head: SnapshotId,
+    /// The submitting seat's own context (`docs/council.md`, "The seat
+    /// context"), not a labeled council context.
+    pub(crate) seat: bool,
 }
+
+/// The label a seat context goes by in reports and miss causes.
+pub(crate) const SEAT_LABEL: &str = "seat";
 
 /// Why the council cannot be asked right now, in plain words; the gate
 /// records it as a miss cause.
@@ -103,15 +117,22 @@ impl CouncilSync {
     /// followed by its voting voices ([`super::voices::VoiceChain::decision_labels`]);
     /// an observation passes the one voice it reads.
     ///
+    /// `seat` names the submitting seat's context when `[council] seat` is
+    /// on. Its projection ([`project_seat`]) is held under the seat's own
+    /// context id and read after the labels. A seat with no narration yet,
+    /// or one that is itself among the labels, adds no context.
+    ///
     /// A miss, before any context is sent: a spec holding a `text` question
     /// when the server lacks the `describe` capability, a label listed twice,
-    /// and more labels than the server's `contexts_per_decision`.
+    /// and more contexts, the seat's included, than the server's
+    /// `contexts_per_decision`.
     pub(crate) async fn prepare_labels(
         &self,
         kernel: &crate::Kernel,
         council: &CouncilConfig,
         spec_name: &str,
         labels: &[String],
+        seat: Option<ContextId>,
     ) -> Result<Prepared, PrepareMiss> {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
@@ -136,18 +157,31 @@ impl CouncilSync {
                 i + 1
             )));
         }
-        if labels.len() as u64 > identity.limits.contexts_per_decision {
+        let seat = match seat {
+            None => None,
+            Some(context_id) => {
+                let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
+                    PrepareMiss(format!("the seat context of {} cannot be read: {e}", context_id.short()))
+                })?;
+                project_seat(&blocks, council.seat_tokens).map(|body| (context_id, body))
+            }
+        };
+        let reads = labels.len() + usize::from(seat.is_some());
+        if reads as u64 > identity.limits.contexts_per_decision {
+            let mut named = labels.to_vec();
+            if seat.is_some() {
+                named.push("the seat context".to_string());
+            }
             return Err(PrepareMiss(format!(
-                "a decision on spec {spec_name} reads {} contexts ({}), and council server {server} \
-                 reads at most {} per decision",
-                labels.len(),
-                labels.join(", "),
+                "a decision on spec {spec_name} reads {reads} contexts ({}), and council server {server} \
+                 reads at most {} per decision (identity.limits.contexts_per_decision)",
+                named.join(", "),
                 identity.limits.contexts_per_decision
             )));
         }
         self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
 
-        let mut contexts = Vec::with_capacity(labels.len());
+        let mut contexts = Vec::with_capacity(reads);
         for label in labels {
             let context_id = resolve_label(kernel, label)?;
             let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
@@ -155,51 +189,70 @@ impl CouncilSync {
             })?;
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
-            let hash = body_hash(&body)?;
-            let key = (server.to_string(), context_id);
-            let held = self.state.lock().contexts.get(&key).cloned();
-            if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
-                contexts.push(PreparedContext { label: label.clone(), context_id, head: h.head.clone() });
-                continue;
-            }
-            let mut body = body;
-            if identity.capabilities.contains(&Capability::Warm) {
-                body.warm = Some(vec![spec_id.clone()]);
-            }
-            let id = context_id.to_string();
-            let mut if_match = held.as_ref().map(|h| h.head.clone());
-            let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
-            let result = loop {
-                match client.put_context(&id, &body, if_match.as_ref()).await {
-                    Err(e) if e.status() == Some(404) && if_match.is_some() => {
-                        if_match = None;
-                    }
-                    other => break other,
-                }
-            };
-            in_flight.answered();
-            match result {
-                Ok(put) => {
-                    self.state
-                        .lock()
-                        .contexts
-                        .insert(key, Held { body: hash, head: put.head.clone() });
-                    contexts.push(PreparedContext { label: label.clone(), context_id, head: put.head });
-                }
-                Err(e) if e.status() == Some(412) => {
-                    self.state.lock().contexts.remove(&key);
-                    return Err(PrepareMiss(format!(
-                        "council context \"{label}\" moved on {server} under If-Match \
-                         (server head {}); the next decision sends it fresh",
-                        e.head().map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
-                    )));
-                }
-                Err(e) => return Err(self.failed(server, &format!("PUT of context \"{label}\""), e)),
-            }
+            let head = self.hold(&client, server, &identity, &spec_id, label, context_id, body).await?;
+            contexts.push(PreparedContext { label: label.clone(), context_id, head, seat: false });
+        }
+        if let Some((context_id, body)) = seat
+            && !contexts.iter().any(|c| c.context_id == context_id)
+        {
+            let head = self.hold(&client, server, &identity, &spec_id, SEAT_LABEL, context_id, body).await?;
+            contexts.push(PreparedContext { label: SEAT_LABEL.to_string(), context_id, head, seat: true });
         }
 
         let spec = spec_body;
         Ok(Prepared { client, identity, spec, spec_id, contexts })
+    }
+
+    /// Makes the server hold `body` as `context_id` and returns its head.
+    /// Sends nothing when the server already holds this body.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold(
+        &self,
+        client: &CouncilClient,
+        server: &str,
+        identity: &ServerIdentity,
+        spec_id: &SpecId,
+        label: &str,
+        context_id: ContextId,
+        body: kaijutsu_council::wire::ContextPut,
+    ) -> Result<SnapshotId, PrepareMiss> {
+        let hash = body_hash(&body)?;
+        let key = (server.to_string(), context_id);
+        let held = self.state.lock().contexts.get(&key).cloned();
+        if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
+            return Ok(h.head.clone());
+        }
+        let mut body = body;
+        if identity.capabilities.contains(&Capability::Warm) {
+            body.warm = Some(vec![spec_id.clone()]);
+        }
+        let id = context_id.to_string();
+        let mut if_match = held.as_ref().map(|h| h.head.clone());
+        let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
+        let result = loop {
+            match client.put_context(&id, &body, if_match.as_ref()).await {
+                Err(e) if e.status() == Some(404) && if_match.is_some() => {
+                    if_match = None;
+                }
+                other => break other,
+            }
+        };
+        in_flight.answered();
+        match result {
+            Ok(put) => {
+                self.state.lock().contexts.insert(key, Held { body: hash, head: put.head.clone() });
+                Ok(put.head)
+            }
+            Err(e) if e.status() == Some(412) => {
+                self.state.lock().contexts.remove(&key);
+                Err(PrepareMiss(format!(
+                    "council context \"{label}\" moved on {server} under If-Match \
+                     (server head {}); the next decision sends it fresh",
+                    e.head().map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
+                )))
+            }
+            Err(e) => Err(self.failed(server, &format!("PUT of context \"{label}\""), e)),
+        }
     }
 
     /// Forgets what the server is believed to hold for `context_id`, so the
@@ -538,6 +591,8 @@ mod tests {
             deadline_ms: 5000,
             require_agree: false,
             voices: false,
+            seat: false,
+            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             specs: vec![spec.clone()],
             thresholds: vec![],
         };
@@ -546,7 +601,7 @@ mod tests {
 
     impl Rig {
         async fn prepare(&self) -> Result<Prepared, PrepareMiss> {
-            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts).await
+            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts, None).await
         }
 
         fn grow(&self, text: &str) {
@@ -824,24 +879,113 @@ mod tests {
         let amy = live_context(&r.kernel, "council-amy");
         append_dialogue(&r.kernel, amy, &["keep main green"]);
         let labels = vec!["voice".to_string(), "council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None).await.unwrap();
         assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["voice", "council-amy"]);
         assert_eq!(p.contexts[1].context_id, amy);
 
         let one = vec!["council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None).await.unwrap();
         assert_eq!(p.contexts.len(), 1, "a single voice, without [council] contexts");
         assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
+    }
+
+    /// A seat with a brief and narration, labeled `lane-a`.
+    fn narrating_seat(r: &Rig) -> ContextId {
+        let seat = live_context(&r.kernel, "lane-a");
+        append_dialogue(&r.kernel, seat, &["recover the records", "The WAL is XORed."]);
+        seat
+    }
+
+    fn append_to(r: &Rig, ctx: ContextId, role: kaijutsu_types::Role, kind: kaijutsu_types::BlockKind, text: &str) {
+        let ids = r.kernel.blocks().block_snapshots(ctx).unwrap();
+        super::super::projection::fixtures::append(
+            &r.kernel,
+            ctx,
+            ids.last().map(|b| &b.id),
+            role,
+            kind,
+            kaijutsu_types::Status::Done,
+            text,
+        );
+    }
+
+    async fn prepare_seat(r: &Rig, seat: ContextId) -> Result<Prepared, PrepareMiss> {
+        r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat)).await
+    }
+
+    /// The seat context is held under the seat's own id, read after the
+    /// labels, and sent again only when its narration changes: a tool call
+    /// and its result send nothing, a finished narration block sends it
+    /// with the last head in `If-Match`.
+    ///
+    /// Falsified by a sync that hashes every block of the seat: the tool
+    /// call sends a `PUT`.
+    #[tokio::test]
+    async fn the_seat_context_is_held_under_the_seat_id_and_sent_when_its_narration_changes() {
+        let r = rig().await;
+        let seat = narrating_seat(&r);
+        let p = prepare_seat(&r, seat).await.expect("prepared");
+        assert_eq!(p.contexts.iter().map(|c| (c.label.as_str(), c.seat)).collect::<Vec<_>>(), [("voice", false), ("seat", true)]);
+        assert_eq!(p.seat().unwrap().context_id, seat);
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 2);
+        assert!(puts[1].1["system"].as_str().unwrap().contains("proposing seat"), "{}", puts[1].1);
+
+        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::ToolCall, "xxd main.db-wal");
+        append_to(&r, seat, kaijutsu_types::Role::Tool, kaijutsu_types::BlockKind::ToolResult, "00000000: 3d");
+        let again = prepare_seat(&r, seat).await.unwrap();
+        assert_eq!(r.mock.puts().len(), 2, "a tool call is not narration");
+        assert_eq!(again.seat().unwrap().head, p.seat().unwrap().head);
+
+        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "No backup exists yet.");
+        let moved = prepare_seat(&r, seat).await.unwrap();
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 3, "new narration sends the seat context");
+        assert_eq!(puts[2].0.as_deref(), Some(p.seat().unwrap().head.as_str()));
+        assert_ne!(moved.seat().unwrap().head, p.seat().unwrap().head);
+    }
+
+    #[tokio::test]
+    async fn a_seat_with_no_narration_or_one_already_listed_adds_no_context() {
+        let r = rig().await;
+        let quiet = live_context(&r.kernel, "lane-b");
+        append_dialogue(&r.kernel, quiet, &["the brief"]);
+        let p = prepare_seat(&r, quiet).await.unwrap();
+        assert!(p.seat().is_none());
+        assert_eq!(r.mock.puts().len(), 1, "only the labeled context");
+
+        // A seat that is itself a council context is read once, as its label.
+        append_to(&r, r.voice, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "noted");
+        let p = prepare_seat(&r, r.voice).await.unwrap();
+        assert_eq!(p.contexts.len(), 1);
+        assert!(p.seat().is_none());
+    }
+
+    /// The labels and the seat context together must fit the server's
+    /// `contexts_per_decision`; a miss names the limit and the seat.
+    #[tokio::test]
+    async fn the_seat_context_counts_against_contexts_per_decision() {
+        let mut r = rig().await;
+        for label in ["rules-a", "rules-b", "rules-c"] {
+            live_context(&r.kernel, label);
+            r.council.contexts.push(label.into());
+        }
+        let quiet = live_context(&r.kernel, "lane-b");
+        prepare_seat(&r, quiet).await.expect("four labels and no narration fit");
+        let seat = narrating_seat(&r);
+        let miss = prepare_seat(&r, seat).await.err().expect("a miss");
+        assert!(miss.0.contains("reads 5 contexts"), "{}", miss.0);
+        assert!(miss.0.contains("the seat context") && miss.0.contains("contexts_per_decision"), "{}", miss.0);
     }
 
     #[tokio::test]
     async fn more_labels_than_the_server_reads_or_a_repeated_label_is_a_miss() {
         let r = rig().await;
         let labels: Vec<String> = (0..5).map(|i| format!("ctx-{i}")).collect();
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None).await.err().unwrap();
         assert!(miss.0.contains("at most 4"), "{}", miss.0);
         let twice = vec!["voice".to_string(), "voice".to_string()];
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None).await.err().unwrap();
         assert!(miss.0.contains("\"voice\" twice"), "{}", miss.0);
         assert!(r.mock.puts().is_empty());
     }
