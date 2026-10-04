@@ -1,0 +1,3 @@
+# The council context type: a context the gate reads as council guidance.
+# It carries no instruction blocks of its own and takes no turns.
+true
