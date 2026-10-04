@@ -9,6 +9,7 @@ pub(crate) mod gate;
 #[cfg(test)]
 mod gate_e2e;
 pub(crate) mod observe;
+pub(crate) mod programs;
 mod projection;
 pub(crate) mod report_stop;
 pub(crate) mod sync;

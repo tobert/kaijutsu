@@ -160,6 +160,55 @@ impl Tool for PythonTool {
 /// at `-c`, `-m`, `-`, `--`, or the first operand. A word in option position
 /// that kaish expands at run time makes the source `unknown`.
 pub(crate) fn interpreter_source(command: &PlannedCommand) -> Option<serde_json::Value> {
+    let PythonArgv { program, informational, rest } = python_argv(command)?;
+    let args = &command.args;
+    let mut source = serde_json::json!({ "language": "python" });
+    let fields = source.as_object_mut()?;
+    let mut set = |key: &str, value: serde_json::Value| { fields.insert(key.to_string(), value); };
+    let json = |value: &PlannedValue| serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+    match program {
+        _ if informational => set("source", "none".into()),
+        Program::Inline(code) => {
+            set("source", "inline".into());
+            set("exact", code.literal_value().is_some().into());
+            set("code", json(&code));
+        }
+        Program::Module(module) => {
+            set("source", "module".into());
+            set("module", json(&module));
+        }
+        Program::Script(script) => {
+            set("source", "script".into());
+            set("script", json(&script));
+        }
+        Program::Stdin => {
+            set("source", "stdin".into());
+            if let Some(heredoc) = command.heredocs.first() {
+                set("exact", heredoc.literal.into());
+                set("heredoc", heredoc.index.into());
+                set("code", json(&heredoc.body));
+            }
+        }
+        Program::Unknown => set("source", "unknown".into()),
+    }
+    let rest = if matches!(source["source"].as_str(), Some("unknown" | "none")) { args.clone() } else { rest };
+    source["args"] = serde_json::Value::Array(rest.iter().map(json).collect());
+    Some(source)
+}
+
+/// What a python command line runs, read as CPython reads its options.
+pub(crate) struct PythonArgv {
+    pub(crate) program: Program,
+    /// `-h`, `-V`, `--version` and the like: the interpreter prints and
+    /// exits without running the program.
+    pub(crate) informational: bool,
+    /// The program's own arguments.
+    pub(crate) rest: Vec<PlannedValue>,
+}
+
+/// Read a planned python command's argv, or `None` when the command does
+/// not name a python interpreter.
+pub(crate) fn python_argv(command: &PlannedCommand) -> Option<PythonArgv> {
     let base = command.name.rsplit('/').next().unwrap_or(&command.name);
     if !is_python_name(base) {
         return None;
@@ -221,42 +270,11 @@ pub(crate) fn interpreter_source(command: &PlannedCommand) -> Option<serde_json:
         }
     };
     let rest = args.get(index..).unwrap_or_default().to_vec();
-    let mut source = serde_json::json!({ "language": "python" });
-    let fields = source.as_object_mut()?;
-    let mut set = |key: &str, value: serde_json::Value| { fields.insert(key.to_string(), value); };
-    let json = |value: &PlannedValue| serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
-    match program {
-        _ if informational => set("source", "none".into()),
-        Program::Inline(code) => {
-            set("source", "inline".into());
-            set("exact", code.literal_value().is_some().into());
-            set("code", json(&code));
-        }
-        Program::Module(module) => {
-            set("source", "module".into());
-            set("module", json(&module));
-        }
-        Program::Script(script) => {
-            set("source", "script".into());
-            set("script", json(&script));
-        }
-        Program::Stdin => {
-            set("source", "stdin".into());
-            if let Some(heredoc) = command.heredocs.first() {
-                set("exact", heredoc.literal.into());
-                set("heredoc", heredoc.index.into());
-                set("code", json(&heredoc.body));
-            }
-        }
-        Program::Unknown => set("source", "unknown".into()),
-    }
-    let rest = if matches!(source["source"].as_str(), Some("unknown" | "none")) { args.clone() } else { rest };
-    source["args"] = serde_json::Value::Array(rest.iter().map(json).collect());
-    Some(source)
+    Some(PythonArgv { program, informational, rest })
 }
 
 /// What a python command line runs.
-enum Program {
+pub(crate) enum Program {
     Inline(PlannedValue),
     Module(PlannedValue),
     Script(PlannedValue),
@@ -265,7 +283,7 @@ enum Program {
 }
 
 /// `python`, `python3`, `python3.14`, `python2`.
-fn is_python_name(name: &str) -> bool {
+pub(crate) fn is_python_name(name: &str) -> bool {
     match name.strip_prefix("python") {
         Some("") => true,
         Some(version) => version.starts_with(|c: char| c.is_ascii_digit())
