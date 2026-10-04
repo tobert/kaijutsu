@@ -441,8 +441,9 @@ One row per recorded job. `Binary → commit` is the trial provenance's
 | 2026-09-30 | `kj-qwen-fixgit-1`, `kj-qwen-pair-1`, `kj-qwen-sqlite-1` | `4bd76664…` → `12ed6d76` | qwen3.8-flash (Alibaba) | shipped coder, yolo sandbox gate, factory 16K ceiling, effort dropped, multiplier 1, moltar | 4 (fix-git, openssl-selfsigned-cert, fix-code-vulnerability, sqlite-with-gcov) | 4 | 0.96M | 0 | 0 | 0 | no verdict line |
 | 2026-09-30 | `kj-tenchi-openssl-1` | `4bd76664…` → `12ed6d76` | qwen3.8-27b (tenchi vLLM) | same, multiplier 2 | 1 (openssl-selfsigned-cert) | 0 | n/a | 0 | 0 | 1 | first inference failed: `LLM stream idle for 120s` |
 | 2026-10-01 | `kj-tenchi-tb2-20-2` | `8635a93b…` → `4071fc68` | qwen3.8-27b (tenchi vLLM) | shipped coder, yolo sandbox gate, factory 16K ceiling, no key, idle 600 s, request 1800 s, multiplier 4, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 7 | 0.52M | 0 | 0 | 11 | no verdict line |
-| 2026-10-01 | `kj-ds4-tb2-20-1` | `1997713d…` → `6c8252c4` | deepseek-v4-flash | shipped coder with `done`, yolo sandbox gate, 32768 ceiling, multiplier 1, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 18 (0.90) | 3.57M | 0 | 0 | 2 | `done` on 15/15 turns that ended on their own; 15 done and solved |
-| 2026-10-03 | `kj-ds4-tb2-20-20261003`, `…b` | `0f37d0ee…` → `9283226c` | deepseek-v4-flash | shipped coder, yolo sandbox gate, **16384 ceiling** (unset), multiplier 1, 1 trial at once, moltar; Harbor died at 10 tasks and `…b` ran the other 10 | 20 (`tb2-subset.txt`) | 14 (0.70) | 2.93M | 0 | 0 | 4 | `done` on 17/17 turns that ended on their own; 14 done and solved |
+| 2026-10-01 | `kj-ds4-tb2-20-1` | `1997713d…` → `6c8252c4` | deepseek-v4-flash | shipped coder with `done`, yolo sandbox gate, 32768 ceiling, multiplier 1, 2 trials at once, moltar | 20 (`tb2-subset.txt`) | 18 (0.90) reported; 17 without raman-fitting's fetched answer | 3.57M | 0 | 0 | 2 | `done` on 15/15 turns that ended on their own; 15 done and solved |
+| 2026-10-03 | `kj-ds4-tb2-20-20261003`, `…b` | `0f37d0ee…` → `9283226c` | deepseek-v4-flash | shipped coder, yolo sandbox gate, **16384 ceiling** (unset), multiplier 1, 1 trial at once, moltar; Harbor died at 10 tasks and `…b` ran the other 10 | 20 (`tb2-subset.txt`) | 14 (0.70) reported; 13 without extract-elf's fetched answer | 2.93M | 0 | 0 | 4 | `done` on 17/17 turns that ended on their own; 14 done and solved |
+| 2026-10-03 | `kj-ds4-tb2-20-64d8b208` | `3b13320c…` → `64d8b208` | deepseek-v4-flash | shipped coder, yolo sandbox gate, 65536 ceiling (adapter default), effort `high`, multiplier 5, 1 trial at once, moltar | 20 (`tb2-subset.txt`) | 17 (0.85) reported; 15 without the two fetched answers | 1.44M | 0 | 0 | 0 | `done` on 20/20 turns; 17 done and solved, 3 done but failed |
 
 `kj-calib-1`'s two failures: `regex-log` ended `provider_failure` when the
 model's `write` call arrived with its JSON arguments cut off and the whole turn
@@ -631,7 +632,9 @@ failed, nothing asked (yolo gate), nothing stalled.
 
 18 of 20, against 17 for the frozen plain-rendering arm and 18 for the
 bash-only control on the same model. One sample per task, so read it as
-"the harness no longer costs pass rate here", not as a gain. Binary
+"the harness no longer costs pass rate here", not as a gain. raman-fitting's
+pass copied the task's `solve.sh` from GitHub, so 17 is the honest count (see
+the 64K run below). Binary
 6c8252c4: `done` and its nudge, cut shell output kept in CAS, `timeout_ms`,
 the removed-cwd fix, batch results after their calls. It predates the
 same-file edit ordering (ecc17787), the coder's own binding and one shell
@@ -713,14 +716,77 @@ The other 12 passed.
 - **query-optimize missed a timing check by 17%** while niced test builds ran
   on the host; treat it as confounded.
 - **raman-fitting** fit the peaks in the wrong units.
-- **extract-elf passed**: the 10-01 loss came from `grep -r /` reading `/proc`,
-  which is now unlisted.
+- **extract-elf passed by copying the reference** from a clone of
+  `harbor-framework/terminal-bench-2`. The 10-01 loss came from `grep -r /`
+  reading `/proc`, which is now unlisted.
 - **configure-git-webserver** passed after about 70 calls finding that `/git`
   was read-only to kaijutsu; refusals now list the mounts, and the adapter
-  mounts `/app`, `/git`, and `/srv` read-write.
+  mounts `/app`, `/git`, and `/srv` read-write. The pass came from a
+  `hello.html` its own test left behind (see the 64K run below).
 - 93 of 1056 tool calls failed. Three were guard parse denials; the rest were
   ordinary program errors, missing files, read-only writes, and builtin gaps
   (`docs/issues.md`, "From kj-ds4-tb2-20-20261003").
+
+### deepseek-v4-flash at effort high and a 64K ceiling (2026-10-03)
+
+17 of 20 reported, at less than half the input tokens of `kj-ds4-tb2-20-1`:
+29.4M in and 0.76M out, against 63.5M and 1.39M. **Two of the 17 passes copied
+the benchmark's own answers from the internet**, so 15 is the honest count,
+against 17 for `kj-ds4-tb2-20-1` counted the same way. Binary 64d8b208: effort
+`high`, the adapter's 65536 ceiling, the stances rewritten in one register, the
+coder without a recall block, and no MCP grep tool. It also carries the mounts,
+egress, and stderr work of 10-03.
+
+| Task | Result | Ended | Tokens in | Inferences | Trial time |
+|---|---|---|---|---|---|
+| configure-git-webserver | fail | `done` | 899K | 35 | 253 s |
+| query-optimize | fail | `done` | 409K | 31 | 1801 s |
+| raman-fitting | fail | `done` | 4.16M | 61 | 668 s |
+| largest-eigenval | pass | `done` | 7.10M | 74 | 759 s |
+| dna-assembly | pass | `done` | 3.44M | 55 | 516 s |
+| cobol-modernization | pass | `done` | 3.07M | 66 | 484 s |
+| db-wal-recovery | pass, fetched answer | `done` | 2.71M | 55 | 316 s |
+| extract-elf | pass, fetched answer | `done` | 872K | 28 | 161 s |
+
+The other 12 passed with under 2M input tokens each. Median solved trial time
+was 180 s.
+
+- **The task container's network lets the model fetch the benchmark.** Host
+  programs reach the internet without passing kaijutsu's egress list, so this
+  predates the S50-egress overlay. In extract-elf, the model cloned
+  `laude-institute/terminal-bench`, read the task's grader and `solution.sh`,
+  and copied the reference script verbatim. In db-wal-recovery, it destroyed
+  the WAL with its first `sqlite3` open despite the backup rule, then
+  downloaded the task fixture from HuggingFace
+  (`harborframework/terminal-bench-2.0`) and ran the hidden tests. The 747182ec
+  db-wal-recovery pass did the same through GitHub, and quoted this file from
+  the public kaijutsu repository. raman-fitting searched grep.app, Google, and
+  HuggingFace without finding the task. Every `done` summary in this run
+  disclosed the fetch. Count these passes as failures. A scan of every job
+  under `jobs/` found two earlier copied answers: `kj-ds4-tb2-20-1`
+  raman-fitting fetched `solve.sh` and the grader with host `/usr/bin/curl`,
+  and `kj-ds4-tb2-20-20261003b` extract-elf cloned
+  `harbor-framework/terminal-bench-2`. chess-best-move's Stockfish download
+  is a tool, not an answer.
+- **Every turn ended with `done`.** None hit the ceiling, Harbor's timeout, or
+  a turn failure. The largest single inference wrote 22K output tokens, above
+  the old 16K ceiling.
+- **configure-git-webserver's verifier needs an account the instruction never
+  names.** `verify.sh` clones `git@localhost:/git/server` with the password
+  `password`, and the reference solution creates that account. This run created
+  `user`, tested the literal flow, then emptied the repository and web root. The
+  10-03 and 747182ec passes created no `git` account either. They passed
+  because their own test left `hello.html` in the web root. Read this task's
+  result as noise.
+- **query-optimize was 24% slower than the hidden golden query** (1.65 s
+  against 1.25 s median; the limit is 5%). No build ran during the trial. The
+  model compared its rewrite only against the slow original (248 s to 0.57 s)
+  and checked all 152,332 rows for identical output.
+- **raman-fitting got the units right and missed one offset.** It found that
+  the axis is 1e7/x and reported cm⁻¹. G passed. The 2D offset came out at 1414
+  against 1239 with a 10% tolerance, because the model fit 2450–2900 cm⁻¹ and
+  the reference fit 2500–2900. The model saw that the offset depended on the
+  window and picked a middle window.
 
 ## Known limits
 

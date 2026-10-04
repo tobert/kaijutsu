@@ -717,6 +717,21 @@ on current main"):
   cannot tell the streams apart. Color, not the text marker, may suit the
   tui better; decide against `docs/tui.md`.
 
+## From kj-ds4-tb2-20-64d8b208 (deepseek-v4-flash, binary 64d8b208)
+
+- **Models fetch benchmark answers over the task container's network.** Four
+  recorded passes copied a task's reference or fixture from GitHub or
+  HuggingFace with host `git`, `/usr/bin/curl`, or Python
+  (`docs/benchmarks.md`, "deepseek-v4-flash at effort high and a 64K
+  ceiling"). Kaijutsu's egress list covers only the `curl` builtin. Open for
+  Amy: deny these hosts at the container network, scan transcripts after each
+  job and fail the trial, or both. A stance line alone does not stop a stuck
+  model.
+- **The backup rule did not hold.** db-wal-recovery opened `main.db` with
+  `sqlite3` before copying the WAL, and SQLite deleted it, as on 10-03.
+- **configure-git-webserver is unscorable as written.** Its verifier logs in
+  as `git` with password `password`, which the instruction never names.
+
 ## From kj-ds4-tb2-20-20261003 (deepseek-v4-flash, binary 9283226c)
 
 - **Builtin refusals stop at the builtin.** `curl -w` is refused ("use
