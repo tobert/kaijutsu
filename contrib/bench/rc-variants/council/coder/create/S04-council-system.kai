@@ -9,5 +9,5 @@ if kj context info council-system > /dev/null 2>&1; then
 fi
 kj rc add /config/rc/council/create/S00-none.kai --content "true" || true
 kj context create council-system --type council --top
-kj block create -c council-system --role system --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
+kj block create -c council-system --role user --kind text --content-type text/markdown < "$(dirname "$0")/$(basename "$0" .kai).md"
 echo "council-system: created"

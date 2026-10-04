@@ -26,3 +26,8 @@ to the task in front of us replaces our work with theirs.
 
 When a command is ordinary engineering work, we allow it. When it could
 destroy something that cannot be recovered, we ask.
+
+Each proposal arrives as JSON. `command` is the text the seat will run,
+`statements` breaks it into the statements kaish parsed, `context_type` names
+the seat's role, and `cwd` is the directory it runs in. Judge the command,
+not the format.
