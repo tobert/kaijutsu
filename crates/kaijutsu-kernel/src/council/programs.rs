@@ -442,6 +442,194 @@ pub(crate) fn programs_in(planned: &[PlannedStatement], cwd: &str) -> Vec<Progra
     programs
 }
 
+/// The most program text a decision reads: 16 KiB. A larger file is not
+/// judged.
+pub(crate) const PROGRAM_CAP: usize = 16 * 1024;
+
+/// A file the council judged, by the hash of the exact bytes it read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JudgedFile {
+    pub(crate) path: String,
+    /// `sha256:` and the hex digest of the file's bytes.
+    pub(crate) sha256: String,
+}
+
+/// A program with its text, or the reason the text could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadProgram {
+    pub(crate) run: ProgramRun,
+    pub(crate) text: Result<ProgramText, String>,
+}
+
+/// The text a program decision reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProgramText {
+    pub(crate) text: String,
+    /// The file the text was read from, when it was read from one.
+    pub(crate) file: Option<JudgedFile>,
+    /// The file the submission writes this text to before running it.
+    pub(crate) written: Option<String>,
+    /// Top-level python imports that name a file beside the program; the
+    /// decision does not show their text.
+    pub(crate) imports_not_shown: Vec<String>,
+}
+
+pub(crate) fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// Read `path` whole, refusing more than [`PROGRAM_CAP`] bytes.
+async fn read_capped<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, path: &str) -> Result<Vec<u8>, String> {
+    let at = Path::new(path);
+    let attr = vfs.getattr(at).await.map_err(|e| format!("{path} could not be read: {e}"))?;
+    if !attr.kind.is_file() {
+        return Err(format!("{path} is not a regular file"));
+    }
+    if attr.size as usize > PROGRAM_CAP {
+        return Err(format!("{path} is {} bytes, more than the {PROGRAM_CAP}-byte limit a decision reads", attr.size));
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = vfs
+            .read(at, bytes.len() as u64, (PROGRAM_CAP + 1 - bytes.len()) as u32)
+            .await
+            .map_err(|e| format!("{path} could not be read: {e}"))?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > PROGRAM_CAP {
+            return Err(format!("{path} is more than the {PROGRAM_CAP}-byte limit a decision reads"));
+        }
+    }
+    Ok(bytes)
+}
+
+/// The first dotted name of each top-level `import` and `from ... import`
+/// line, in order, without repeats. Relative imports are left out.
+fn top_level_imports(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let found: Vec<&str> = if let Some(rest) = line.strip_prefix("import ") {
+            rest.split(',').filter_map(|part| part.split_whitespace().next()).collect()
+        } else if let Some(rest) = line.strip_prefix("from ") {
+            rest.split_whitespace().next().into_iter().collect()
+        } else {
+            continue;
+        };
+        for dotted in found {
+            let name = dotted.split('.').next().unwrap_or("");
+            if !name.is_empty() && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The imports in `text` that resolve to a file or package in `dir`.
+async fn local_imports<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, dir: &str, text: &str) -> Vec<String> {
+    let mut local = Vec::new();
+    for name in top_level_imports(text) {
+        let module = resolve(dir, &format!("{name}.py"));
+        let package = resolve(dir, &format!("{name}/__init__.py"));
+        if vfs.exists(Path::new(&module)).await || vfs.exists(Path::new(&package)).await {
+            local.push(name);
+        }
+    }
+    local
+}
+
+fn parent_of(path: &str) -> String {
+    Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "/".into())
+}
+
+/// Read each program's text through `vfs`, the view the shell has. A path
+/// command without a `#!` line and a module with no file beside the cwd
+/// are not programs and are dropped. Non-UTF-8 text, a file over
+/// [`PROGRAM_CAP`], and a missing file are reasons, not text.
+pub(crate) async fn read_programs<V: crate::vfs::VfsOps + ?Sized>(
+    vfs: &V,
+    cwd: &str,
+    runs: Vec<ProgramRun>,
+) -> Vec<ReadProgram> {
+    let mut read = Vec::new();
+    for run in runs {
+        let (text, dir, file, written) = match &run.source {
+            ProgramSource::Unknown(why) => {
+                read.push(ReadProgram { text: Err(why.clone()), run });
+                continue;
+            }
+            ProgramSource::Text(text) => (Ok(text.clone()), cwd.to_string(), None, None),
+            ProgramSource::Written { path, text } => (Ok(text.clone()), parent_of(path), None, Some(path.clone())),
+            ProgramSource::File { path, shebang } => {
+                let bytes = match read_capped(vfs, path).await {
+                    Ok(bytes) => bytes,
+                    // A path command that cannot be read is a binary or
+                    // missing, and the shell decision covers it.
+                    Err(_) if *shebang => continue,
+                    Err(why) => {
+                        read.push(ReadProgram { text: Err(why), run });
+                        continue;
+                    }
+                };
+                if *shebang && !bytes.starts_with(b"#!") {
+                    continue;
+                }
+                let file = JudgedFile { path: path.clone(), sha256: sha256_of(&bytes) };
+                let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8 text"));
+                (text, parent_of(path), Some(file), None)
+            }
+            ProgramSource::Module { candidates, .. } => {
+                let mut found = None;
+                for candidate in candidates {
+                    if vfs.exists(Path::new(candidate)).await {
+                        found = Some(candidate.clone());
+                        break;
+                    }
+                }
+                let Some(path) = found else { continue };
+                match read_capped(vfs, &path).await {
+                    Ok(bytes) => {
+                        let file = JudgedFile { path: path.clone(), sha256: sha256_of(&bytes) };
+                        let text = String::from_utf8(bytes).map_err(|_| format!("{path} is not UTF-8 text"));
+                        (text, cwd.to_string(), Some(file), None)
+                    }
+                    Err(why) => (Err(why), cwd.to_string(), None, None),
+                }
+            }
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                read.push(ReadProgram { text: Err(why), run });
+                continue;
+            }
+        };
+        let imports_not_shown =
+            if run.language == Language::Python { local_imports(vfs, &dir, &text).await } else { Vec::new() };
+        read.push(ReadProgram { text: Ok(ProgramText { text, file, written, imports_not_shown }), run });
+    }
+    read
+}
+
+/// Check that every judged file still holds the bytes the council read.
+/// `Err` names the first file that changed or can no longer be read.
+pub(crate) async fn verify_judged<V: crate::vfs::VfsOps + ?Sized>(vfs: &V, judged: &[JudgedFile]) -> Result<(), String> {
+    for file in judged {
+        let now = read_capped(vfs, &file.path).await.map(|bytes| sha256_of(&bytes));
+        if now.as_deref() != Ok(file.sha256.as_str()) {
+            return Err(format!(
+                "the script changed after the council judged it; send the command again. Nothing was run. \
+                 ({} no longer holds the text the council read)",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +747,78 @@ mod tests {
         let summary: Vec<(usize, &str)> = found.iter().map(|p| (p.statement, p.command.as_str())).collect();
         assert_eq!(summary, vec![(0, "python3 a.py"), (1, "bash b.sh"), (1, "python3 -c 'print(1)'"), (2, "python3 a.py")]);
         assert_eq!(found[3].source, file("/work/a.py"), "running a script does not write it");
+    }
+
+    async fn vfs_with(files: &[(&str, &[u8])]) -> crate::vfs::MountTable {
+        use crate::vfs::VfsOps;
+        let vfs = crate::vfs::MountTable::new();
+        vfs.mount("/", crate::vfs::MemoryBackend::new()).await;
+        for (path, bytes) in files {
+            let mut dir = PathBuf::from("/");
+            for part in Path::new(path).parent().unwrap().components().skip(1) {
+                dir.push(part);
+                let _ = vfs.mkdir(&dir, 0o755).await;
+            }
+            vfs.write_all(Path::new(path), bytes).await.unwrap();
+        }
+        vfs
+    }
+
+    async fn read(vfs: &crate::vfs::MountTable, command: &str) -> Vec<ReadProgram> {
+        let planned = kaish_kernel::plan_program(command).unwrap();
+        read_programs(vfs, "/work", programs_in(&planned, "/work")).await
+    }
+
+    #[tokio::test]
+    async fn a_script_is_read_with_the_hash_of_its_bytes_and_its_local_imports_named() {
+        let script = b"import os, helper\nfrom pkg.sub import x\nimport json\n  import indented\n";
+        let vfs = vfs_with(&[
+            ("/work/fix.py", script),
+            ("/work/helper.py", b"X = 1\n"),
+            ("/work/pkg/__init__.py", b""),
+        ])
+        .await;
+        let found = read(&vfs, "python3 fix.py").await;
+        let text = found[0].text.as_ref().unwrap();
+        assert_eq!(text.text.as_bytes(), script);
+        assert_eq!(text.file, Some(JudgedFile { path: "/work/fix.py".into(), sha256: sha256_of(script) }));
+        assert_eq!(text.imports_not_shown, vec!["helper".to_string(), "pkg".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_large_missing_or_binary_file_is_a_reason_not_text() {
+        let big = vec![b'#'; PROGRAM_CAP + 1];
+        let vfs = vfs_with(&[("/work/big.py", &big), ("/work/bin.py", &[0xff, 0xfe, 0x00]), ("/work/edge.py", &big[..PROGRAM_CAP])]).await;
+        let reason = |found: Vec<ReadProgram>| found[0].text.clone().unwrap_err();
+        assert!(reason(read(&vfs, "python3 big.py").await).contains("16384-byte limit"));
+        assert!(reason(read(&vfs, "python3 bin.py").await).contains("not UTF-8"));
+        assert!(reason(read(&vfs, "python3 gone.py").await).contains("could not be read"));
+        assert!(read(&vfs, "python3 edge.py").await[0].text.is_ok(), "exactly 16 KiB is read");
+    }
+
+    #[tokio::test]
+    async fn a_path_command_is_a_program_only_with_a_shebang_and_a_module_only_beside_the_cwd() {
+        let vfs = vfs_with(&[
+            ("/work/run.sh", b"#!/bin/sh\nrm -rf /\n"),
+            ("/work/a.out", b"\x7fELF"),
+            ("/work/tool/__main__.py", b"print(1)\n"),
+        ])
+        .await;
+        let found = read(&vfs, "./run.sh; ./a.out; ./missing; python3 -m tool; python3 -m pytest").await;
+        let commands: Vec<&str> = found.iter().map(|p| p.run.command.as_str()).collect();
+        assert_eq!(commands, vec!["./run.sh", "python3 -m tool"], "{found:#?}");
+        assert_eq!(found[1].text.as_ref().unwrap().file.as_ref().unwrap().path, "/work/tool/__main__.py");
+    }
+
+    #[tokio::test]
+    async fn a_judged_file_that_changes_fails_verification() {
+        use crate::vfs::VfsOps;
+        let vfs = vfs_with(&[("/work/fix.py", b"print(1)\n")]).await;
+        let found = read(&vfs, "python3 fix.py").await;
+        let judged = vec![found[0].text.as_ref().unwrap().file.clone().unwrap()];
+        verify_judged(&vfs, &judged).await.unwrap();
+        vfs.write_all(Path::new("/work/fix.py"), b"print(2)\n").await.unwrap();
+        let refused = verify_judged(&vfs, &judged).await.unwrap_err();
+        assert!(refused.starts_with("the script changed after the council judged it; send the command again"), "{refused}");
     }
 }
