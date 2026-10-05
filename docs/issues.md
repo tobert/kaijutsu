@@ -184,6 +184,32 @@ WAL. Accept `-p`, or have the refusal name the fix.
   asserts the seeded coder stance contains "You are a coder."; ec76d3c9
   removed that sentence. The test needs the stance's current text.
 
+## Council contexts primed by a stronger model (2026-10-05)
+
+Amy: "we might need a thinking pass with house rules, maybe do the prime
+with max again (and let's eventually add tools to help construct a
+kaijutsu context via rc or something where it uses an advanced model in the
+same family to do some reasoning and store that, ephemeral, easy to update
+over time)."
+
+- **What worked by hand.** `council-code` and `council-shell` hold worked
+  examples whose reasoning qwen3.8-max wrote, stored as each reply's
+  thinking. The program examples took program verdicts from 30 to 35 right
+  of 36; the shell examples, with the rubric, caught the brief-only
+  `sqlite3 /app/main.db` opens the verdict alone passed. Both were made by
+  scratch scripts on 2026-10-05.
+- **A house-rules thinking pass.** A raw AGENTS.md is rules stated in
+  general terms, which the council model applied poorly before examples.
+  One stronger-model pass per distinct AGENTS.md (the house-rules context
+  is already keyed by its content) would add a model turn with reasoning:
+  what these rules mean for commands a seat might run, with a few worked
+  cases. Unchanged rules reuse it; changed rules get a fresh pass.
+- **The general tool.** An rc step or a `kj` verb that takes a source (a
+  context, a file, a set of example commands), runs the configured stronger
+  model of the council model's family, and writes its reasoning into a
+  council context as ephemeral turns, so they are regenerated when the
+  source changes rather than kept as history.
+
 ## Council house rules: what is open (2026-10-05)
 
 - **The seat can edit its own house rules.** The context reads the
