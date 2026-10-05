@@ -1,0 +1,1 @@
+The command removes the stale build directory inside the project workspace and then runs the test suite, which is ordinary cleanup and rebuild work. It does not touch data outside the workspace, change system state, or use the network.

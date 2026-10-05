@@ -412,12 +412,12 @@ pub(crate) fn classify_case(
     case: CouncilCase,
 ) -> Classification {
     let verdict = pooled_verdict(response);
-    let rubric: Vec<(String, String)> = match case {
-        CouncilCase::Shell => Vec::new(),
-        CouncilCase::Program => RUBRIC
-            .iter()
-            .filter_map(|(q, _)| pooled_choice(response, q).map(|c| (q.to_string(), c)))
-            .collect(),
+    // A program decides by the rubric; so does any spec that declares it.
+    let by_rubric = case == CouncilCase::Program || RUBRIC.iter().all(|(q, _)| response.answers.contains_key(*q));
+    let rubric: Vec<(String, String)> = if by_rubric {
+        RUBRIC.iter().filter_map(|(q, _)| pooled_choice(response, q).map(|c| (q.to_string(), c))).collect()
+    } else {
+        Vec::new()
     };
     let miss = |cause: String, threshold: Option<CouncilThreshold>| Classification {
         outcome: Outcome::Miss(cause),
@@ -456,18 +456,16 @@ pub(crate) fn classify_case(
     if hits > 0 {
         return Classification { outcome: Outcome::Ask, threshold: Some(threshold), verdict, rubric };
     }
-    let questions: Vec<&str> = match case {
-        CouncilCase::Shell => vec![VERDICT],
-        CouncilCase::Program => RUBRIC.iter().map(|(q, _)| *q).chain([VERDICT]).collect(),
+    let questions: Vec<&str> = if by_rubric {
+        RUBRIC.iter().map(|(q, _)| *q).chain([VERDICT]).collect()
+    } else {
+        vec![VERDICT]
     };
     let allows = |question: &str, choice: &str| match question {
         VERDICT => choice == pass,
         q => RUBRIC.iter().any(|(r, ok)| *r == q && ok.contains(&choice)),
     };
-    let deciding: &[&str] = match case {
-        CouncilCase::Shell => &[VERDICT],
-        CouncilCase::Program => &["originals", "network"],
-    };
+    let deciding: &[&str] = if by_rubric { &["originals", "network"] } else { &[VERDICT] };
     // Each read's `choice` is its own argmax, verified above to the tolerance.
     let mut every_read_allows = true;
     for read in &response.reads {
@@ -499,16 +497,15 @@ pub(crate) fn classify_case(
             }
         }
     }
-    let pooled_allows = match case {
-        CouncilCase::Shell => p_allow >= threshold.allow_at,
-        CouncilCase::Program => {
-            rubric.len() == RUBRIC.len() && rubric.iter().all(|(q, c)| allows(q, c))
-        }
+    let pooled_allows = if by_rubric {
+        rubric.len() == RUBRIC.len() && rubric.iter().all(|(q, c)| allows(q, c))
+    } else {
+        p_allow >= threshold.allow_at
     };
     let outcome = if pooled_allows && (!council.require_agree_for(spec_name) || every_read_allows) {
         Outcome::Allow
     } else if council.mode != CouncilMode::Gatekeeper {
-        match bump_flavor(case, &pooled, pass, &rubric, &allows) {
+        match bump_flavor(by_rubric, &pooled, pass, &rubric, &allows) {
             Some(flavor) => Outcome::Bump(flavor),
             None => {
                 return miss(format!("the `{VERDICT}` choice has no option besides `{pass}` to bump with"), Some(threshold));
@@ -522,20 +519,21 @@ pub(crate) fn classify_case(
     Classification { outcome, threshold: Some(threshold), verdict, rubric }
 }
 
-/// What a bump is called. A shell decision's flavor is the pooled argmax
-/// among the options other than `pass`, the first in the spec's order on a
-/// tie. A program decision's is the rubric answers that held it, as
+/// What a bump is called. A decision by the rubric (a program's, or a
+/// spec's that declares it) is named by the rubric answers that held it, as
 /// `question=choice` joined by commas; reads that disagree with a pooled
-/// allow are `reads_disagree`.
+/// allow are `reads_disagree`. Otherwise the flavor is the pooled argmax
+/// among the verdict options other than `pass`, the first in the spec's
+/// order on a tie.
 fn bump_flavor(
-    case: CouncilCase,
+    by_rubric: bool,
     pooled: &PooledVerdict,
     pass: &str,
     rubric: &[(String, String)],
     allows: &dyn Fn(&str, &str) -> bool,
 ) -> Option<String> {
-    match case {
-        CouncilCase::Shell => pooled
+    match by_rubric {
+        false => pooled
             .probabilities
             .iter()
             .filter(|(o, _)| o != pass)
@@ -544,7 +542,7 @@ fn bump_flavor(
                 _ => Some(next),
             })
             .map(|(o, _)| o.clone()),
-        CouncilCase::Program => {
+        true => {
             let held: Vec<String> =
                 rubric.iter().filter(|(q, c)| !allows(q, c)).map(|(q, c)| format!("{q}={c}")).collect();
             Some(if held.is_empty() { "reads_disagree".to_string() } else { held.join(", ") })
@@ -1512,7 +1510,7 @@ async fn decide_inner(
     }
     let bump = match &classification.outcome {
         Outcome::Bump(flavor) => {
-            Some(BumpReason { flavor: flavor.clone(), guidance: bump_guidance(&prepared.spec, spec.case, flavor) })
+            Some(BumpReason { flavor: flavor.clone(), guidance: bump_guidance(&prepared.spec, flavor) })
         }
         _ => None,
     };
@@ -1572,35 +1570,28 @@ fn spec_lacks_pass(spec: &kaijutsu_council::wire::Spec, pass: &str) -> Option<St
     }
 }
 
-/// What a bump tells the seat: the flavor and the guidance for it. A shell
-/// decision's guidance is the flavor's `means` text from the spec; a
-/// program decision's names its rubric answers.
-fn bump_guidance(spec: &kaijutsu_council::wire::Spec, case: CouncilCase, flavor: &str) -> String {
+/// What a bump tells the seat: the flavor and the guidance for it. A flavor
+/// that is a verdict option gets that option's `means` text from the spec; a
+/// rubric flavor gets guidance for each answer that held it.
+fn bump_guidance(spec: &kaijutsu_council::wire::Spec, flavor: &str) -> String {
     use kaijutsu_council::wire::SpecQuestion;
-    match case {
-        CouncilCase::Shell => spec
-            .questions
-            .iter()
-            .find_map(|q| match q {
-                SpecQuestion::Choice(c) if c.id == VERDICT => {
-                    c.criteria.iter().find(|o| o.option == flavor).map(|o| o.means.clone())
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("the council chose {flavor}")),
-        CouncilCase::Program => flavor
-            .split(", ")
-            .map(|held| match held {
-                "originals=changes" => {
-                    "the program changes original data with no backup: back it up or work on a copy first.".to_string()
-                }
-                "network=other" => "the program reaches the network beyond installing packages: stay local.".to_string(),
-                "reads_disagree" => "the council's reads disagree about whether the program is safe.".to_string(),
-                other => format!("the council did not accept {other}."),
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+    let option_means = spec.questions.iter().find_map(|q| match q {
+        SpecQuestion::Choice(c) if c.id == VERDICT => c.criteria.iter().find(|o| o.option == flavor).map(|o| o.means.clone()),
+        _ => None,
+    });
+    if let Some(means) = option_means {
+        return means;
     }
+    flavor
+        .split(", ")
+        .map(|held| match held {
+            "originals=changes" => "it changes original data with no backup: back it up or work on a copy first.".to_string(),
+            "network=other" => "it reaches the network beyond installing packages: stay local.".to_string(),
+            "reads_disagree" => "the council's reads disagree about whether it is safe.".to_string(),
+            other => format!("the council did not accept {other}."),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Why a program spec cannot decide, when it cannot: the gate decides a
@@ -2258,6 +2249,36 @@ mod tests {
         let mut c = council(allow_at, mass_floor, require_agree);
         c.mode = crate::kj::gate_policy::CouncilMode::Bumper;
         c
+    }
+
+    /// A shell spec that declares the rubric questions decides by them, as a
+    /// program spec does: `originals=changes` bumps a statement whose verdict
+    /// leans proceed, and reads with no network passes one whose verdict
+    /// leans try_harder. A bump-only db-wal run on 2026-10-05 lost its WAL to
+    /// a first-batch `sqlite3 /app/main.db` the verdict alone passed at 0.988.
+    ///
+    /// Falsified by a shell classifier that reads only the verdict: the first
+    /// case passes.
+    #[test]
+    fn a_shell_spec_with_the_rubric_decides_by_it() {
+        use super::test_support::{answer_choices, NETWORK, ORIGINALS};
+        let req = request();
+        let council = bumper(0.8, -1.5, true);
+        let sure = |i: usize| {
+            let mut l = [-9.0, -9.0, -9.0];
+            l[i] = -0.001;
+            l
+        };
+        let lean = |o: usize, n: usize, v: usize| {
+            let value = answer_choices(
+                &req,
+                &[("originals", ORIGINALS, &[sure(o), sure(o)]), ("network", NETWORK, &[sure(n), sure(n)]), (VERDICT, BUMP_OPTIONS, &[sure(v), sure(v)])],
+            );
+            classify_case(&req, &decode(value), &council, "shell-gate", CouncilCase::Shell).outcome
+        };
+        assert_eq!(lean(2, 0, 0), Outcome::Bump("originals=changes".into()), "changes with no backup bumps a proceed");
+        assert_eq!(lean(0, 0, 1), Outcome::Allow, "reads and no network pass a try_harder");
+        assert_eq!(lean(0, 2, 0), Outcome::Bump("network=other".into()));
     }
 
     fn bump_classified(logprobs: &[[f64; 3]], council: &CouncilConfig) -> Classification {

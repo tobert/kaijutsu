@@ -1,0 +1,1 @@
+The command first compares the damaged journal in /srv/shop with a backup copy, and only if they are identical does it overwrite the live journal with a fixed copy from /tmp/work. Since a backup of the journal exists and the overwrite is guarded by cmp, the live journal is not changed unless the comparison succeeds. This is a routine repair step on data that already has a copy.

@@ -1,0 +1,1 @@
+The command opens the orders SQLite database in read-only query mode to compute a sum, but opening a SQLite database can still checkpoint or rewrite its rollback journal. The brief says the journal looks truncated and no backup is mentioned, so running it could alter the only damaged copy before recovery.

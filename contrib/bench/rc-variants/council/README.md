@@ -18,3 +18,11 @@ the proposal, qwen3.8-max's thinking, and its one-sentence judgment, written
 on 2026-10-05 from these rules and the notes. The thinking reaches the
 council as each reply's `reasoning`. In a megakernel probe, examples like
 these took program verdicts from 30 to 35 right of 36.
+
+It also creates `council-shell` (S06), which only the shell decision reads:
+ten worked shell examples, each the seat's brief with a proposed statement,
+qwen3.8-max's thinking, and its judgment. Two generated examples were left
+out: a read-only search of host container storage (whether a seat should
+search the host at all is a house rule to decide, not to teach by example)
+and writing the task's own output file (judged unsafe, which would teach
+false bumps).

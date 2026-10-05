@@ -2843,6 +2843,7 @@ enabled = false
         assert_eq!(c.mode, CouncilMode::BumpOnly);
         assert_eq!(c.bump_limit, None);
         assert_eq!(c.specs[0].name, "shell-bump");
+        assert_eq!(c.specs[0].contexts, ["council-shell"]);
         assert_eq!(c.specs[1].contexts, ["council-code"]);
         assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();

@@ -1,0 +1,1 @@
+The command installs the pandas package from the usual package mirror into the local environment, which is routine engineering work to satisfy the test suite's dependency. It does not modify project data, change system state, or send data off the host.

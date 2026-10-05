@@ -1,0 +1,1 @@
+The command pipes a hex dump of the SQLite rollback journal through head, so it only reads the file and prints the first 40 lines. It does not modify the database, journal, or host state, and it sends no data off the machine. This is routine inspection while diagnosing the truncated journal.

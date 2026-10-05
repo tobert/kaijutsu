@@ -1,0 +1,27 @@
+# Create council-shell, the worked examples the shell decision reads
+# (gate.toml: [[council.spec]] shell-bump contexts), once per kernel. S04
+# installs the council type first.
+#
+# The opening notes are the companion Markdown. Each example is three blocks:
+# the seat's brief with the proposed statement as a user turn, the reviewer's
+# thinking, and its one-sentence judgment. The projection sends the thinking
+# as the reply's reasoning, so the council reads how each statement was judged
+# in its situation. qwen3.8-max wrote the thinking and judgments on 2026-10-05
+# from the council-system rules. A bump-only run that day passed
+# `sqlite3 /app/main.db "SELECT ..."` on a WAL the brief called corrupted, at
+# p(proceed) 0.988, and lost the task.
+set -e
+if kj context info council-shell > /dev/null 2>&1; then
+  echo "council-shell: present"
+  exit 0
+fi
+D="$(dirname "$0")"
+B="$(basename "$0" .kai)"
+kj context create council-shell --type council --top
+kj block create -c council-shell --role user --kind text --content-type text/markdown < "$D/$B.md"
+for n in 01 02 03 04 05 06 07 08 09 10; do
+  kj block create -c council-shell --role user --kind text < "$D/$B.ex$n.proposal.md"
+  kj block create -c council-shell --role model --kind thinking < "$D/$B.ex$n.thinking.md"
+  kj block create -c council-shell --role model --kind text < "$D/$B.ex$n.reply.md"
+done
+echo "council-shell: created"

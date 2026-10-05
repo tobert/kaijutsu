@@ -399,8 +399,12 @@ mod tests {
             serde_json::from_str(DEFAULT_COUNCIL_SHELL_BUMP).expect("the contract's spec shape");
         assert_eq!(spec.name, "shell-bump");
         let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
-        assert_eq!(ids, ["verdict"], "no text question, as the shell gate has none");
-        let kaijutsu_council::wire::SpecQuestion::Choice(verdict) = &spec.questions[0] else {
+        assert_eq!(
+            ids,
+            ["originals", "network", "verdict"],
+            "the program rubric decides, then the verdict names a bump; no text question"
+        );
+        let kaijutsu_council::wire::SpecQuestion::Choice(verdict) = &spec.questions[2] else {
             panic!("the verdict is a choice")
         };
         let options: Vec<&str> = verdict.criteria.iter().map(|c| c.option.as_str()).collect();

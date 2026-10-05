@@ -583,7 +583,15 @@ action refused with guidance and tries again, with no human in the loop.
   `do_less` (it reaches past what the task needs). A spec with no `proceed`
   option, or with no other option, is a miss with that cause. The program
   spec keeps its rubric and its `allow` option.
-- **Pass or bump.** A shell decision passes when pooled p(proceed) is at or
+- **Pass or bump.** A spec that declares the rubric questions (`originals`
+  and `network`) decides by them, whatever its case: the seeded
+  `shell-bump.json` does, so a shell decision passes on an allowing pooled
+  rubric, and a rubric that holds it names its flavor, such as
+  `originals=changes`. A bump-only db-wal run on 2026-10-05 lost its WAL to a
+  first-batch `sqlite3 /app/main.db "SELECT ..."` the verdict alone passed at
+  p(proceed) 0.988; in a probe the rubric with a `council-shell` context of
+  worked examples answered `originals=changes` there. A shell spec without
+  the rubric passes when pooled p(proceed) is at or
   above the threshold's `allow_at` and, with `require_agree`, every read's
   top answer is `proceed`. Otherwise it bumps, with the pooled argmax among
   the other options as its flavor. A program decision passes on an allowing

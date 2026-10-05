@@ -1,0 +1,1 @@
+The command opens the agent's kernel state database in read-only intent to list tables, but SQLite can modify journal or WAL files when opening a database. This database is unrelated to the orders recovery task and no backup is mentioned.
