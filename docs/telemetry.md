@@ -18,7 +18,8 @@ cargo run -p kaijutsu-app
 cargo run -p kaijutsu-mcp
 ```
 
-Without `OTEL_EXPORTER_OTLP_ENDPOINT` set, nothing is exported.
+Without `OTEL_EXPORTER_OTLP_ENDPOINT` or `KAIJUTSU_OTEL_FILE_DIR` set, nothing
+is exported.
 
 ## Environment Variables
 
@@ -29,7 +30,8 @@ Standard OTel env vars are respected:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint (enables export) |
 | `OTEL_TRACES_EXPORTER` | Exporter type (`otlp`, `none`) |
 | `OTEL_SERVICE_NAME` | Overrides the default service name |
-| `OTEL_SDK_DISABLED=true` | Force-disable even when endpoint is set |
+| `KAIJUTSU_OTEL_FILE_DIR` | Directory for OTLP JSON-lines files (enables export; see "File export") |
+| `OTEL_SDK_DISABLED=true` | Force-disable even when the endpoint or file directory is set |
 
 ## What Gets Traced
 
@@ -309,6 +311,52 @@ The fmt → stderr/journald logging is unchanged; OTLP logs are additive and
 respect the same `EnvFilter`. The bridge **excludes `opentelemetry*` targets**
 so the exporter's own internal logs can't feed back into the exporter and storm
 on a persistent export failure.
+
+## File export
+
+`KAIJUTSU_OTEL_FILE_DIR=<dir>` writes all three signals to files. It is for
+runs that cannot reach a collector, such as a benchmark container. The kernel
+creates `<dir>` if needed and appends to three files in it:
+
+| File | One line is |
+|------|-------------|
+| `traces.jsonl` | one `ExportTraceServiceRequest` |
+| `metrics.jsonl` | one `ExportMetricsServiceRequest` |
+| `logs.jsonl` | one `ExportLogsServiceRequest` |
+
+The switch works alone or beside `OTEL_EXPORTER_OTLP_ENDPOINT`; with both set,
+each signal goes to the collector and to the file. `OTEL_SDK_DISABLED=true`
+turns both off. A file-only setup starts no Tokio runtime.
+
+Each line is the OTLP/JSON encoding of the request: lowerCamelCase field names,
+trace and span ids as hex strings, enums as integers, and 64-bit integers
+(timestamps in nanoseconds, `asInt`, counts) as strings. The SDK-to-request
+conversion and the JSON mapping come from `opentelemetry-proto`. That crate
+writes some 64-bit fields as bare numbers, so `file_export.rs` converts every
+64-bit field to a string before writing.
+
+Writes use the same batch processors and periodic reader as the OTLP path:
+spans and logs are written when a batch fills or on the batch timer, and
+metrics on the reader's interval (60 s by default, from
+`OTEL_METRIC_EXPORT_INTERVAL`). Shutdown flushes all three. Each batch is one
+`write` of one whole line, so a killed process leaves complete lines. A metrics
+line holds the full cumulative state, so files grow by one copy of every live
+instrument per interval; lines are not rotated. A write failure prints one
+warning to stderr per file, drops that batch, and tries again with the next
+batch. It never blocks or panics the kernel.
+
+The collector's `otlpjsonfile` receiver reads these files, so a run's files can
+be replayed into a collector later:
+
+```yaml
+receivers:
+  otlpjsonfile:
+    include: ["/path/to/otel/*.jsonl"]
+    start_at: beginning
+```
+
+The Harbor adapter sets `KAIJUTSU_OTEL_FILE_DIR=/logs/agent/otel` by default;
+see `contrib/bench/harbor/README.md`.
 
 ## Per-Context Traces
 

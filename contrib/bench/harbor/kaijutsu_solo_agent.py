@@ -56,6 +56,11 @@ REQUEST_TIMEOUT_ENV = "KAIJUTSU_ACP_REQUEST_TIMEOUT"
 WORKSPACE_MOUNTS_ENV = "KAIJUTSU_ACP_WORKSPACE_MOUNTS"
 EGRESS_ALLOW_ENV = "KAIJUTSU_ACP_EGRESS_ALLOW"
 OTLP_ENDPOINT_ENV = "KAIJUTSU_ACP_OTLP_ENDPOINT"
+OTEL_FILE_ENV = "KAIJUTSU_ACP_OTEL_FILE"
+
+#: Where the kernel writes OTLP JSON lines inside the task container. Harbor
+#: copies /logs/agent/ out of each container, so the files travel with the job.
+OTEL_FILE_DIR = "/logs/agent/otel"
 
 #: The single owner of these defaults. Every other file defers to them.
 DEFAULT_BACKEND_KIND = "deepseek"
@@ -194,57 +199,87 @@ def _git(repo: Path, *args: str) -> str | None:
 _LOOPBACK_HOSTS = ("localhost", "::1", "0.0.0.0")
 
 
+def _otel_file_enabled(given: bool | str | None, env: str | None) -> bool:
+    """Whether the kernel writes OTLP files; on unless the option or variable says no."""
+    raw = given if given is not None else env
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text == "":
+        return True
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"otel_file {raw!r} is not a boolean (--ak otel_file=false or ${OTEL_FILE_ENV})."
+    )
+
+
 def _otel_env(
     endpoint: str | None,
     logs_dir: Path | None,
     commit: str | None,
     dirty: bool,
+    file_export: bool = False,
 ) -> dict[str, str]:
-    """The OTel environment the agent runs with; empty when `endpoint` is unset.
+    """The OTel environment the agent runs with.
+
+    `endpoint` turns on OTLP gRPC export and `file_export` turns on OTLP JSON
+    lines under `OTEL_FILE_DIR`; both may be on. Empty when neither is.
 
     The resource attributes name the Harbor job, trial and task, taken from
     the trial's agent log directory
     (`<jobs_dir>/<job>/<trial>/agent`, trial `<task>__<suffix>`), so a run's
-    traces can be found by those values.
+    traces can be found by those values. With an endpoint, a log directory
+    that does not match is an error. With only file export the attributes are
+    left out, since the files already sit in the trial's directory.
     """
-    if endpoint is None or not endpoint.strip():
+    has_endpoint = endpoint is not None and bool(endpoint.strip())
+    if not has_endpoint and not file_export:
         return {}
-    endpoint = endpoint.strip()
-    parsed = urlparse(endpoint)
-    host = parsed.hostname or ""
-    if parsed.scheme not in ("http", "https") or not host:
-        raise ValueError(
-            f"otlp_endpoint {endpoint!r} must be an http(s) URL "
-            f"(--ak otlp_endpoint=... or ${OTLP_ENDPOINT_ENV})"
-        )
-    if host in _LOOPBACK_HOSTS or host.startswith("127."):
-        raise ValueError(
-            f"otlp_endpoint {endpoint!r} names the container's own loopback. "
-            "Use an address the container can reach, such as "
-            "http://host.containers.internal:4317."
-        )
-    if logs_dir is None or logs_dir.name != "agent":
-        raise ValueError(
-            "otlp_endpoint is set, but the agent log directory "
-            f"{logs_dir!s} is not <job>/<trial>/agent, so the job and trial "
-            "names for the trace tags cannot be read from it."
-        )
-    trial = logs_dir.parent.name
-    job = logs_dir.parent.parent.name
-    task = trial.split("__")[0]
-    attributes = {
-        "harbor.job.name": job,
-        "harbor.trial.name": trial,
-        "harbor.task.name": task,
-    }
-    if commit:
-        attributes["kaijutsu.commit"] = commit + ("-dirty" if dirty else "")
-    return {
-        "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
-        "OTEL_RESOURCE_ATTRIBUTES": ",".join(
+    env: dict[str, str] = {}
+    if has_endpoint:
+        endpoint = endpoint.strip()
+        parsed = urlparse(endpoint)
+        host = parsed.hostname or ""
+        if parsed.scheme not in ("http", "https") or not host:
+            raise ValueError(
+                f"otlp_endpoint {endpoint!r} must be an http(s) URL "
+                f"(--ak otlp_endpoint=... or ${OTLP_ENDPOINT_ENV})"
+            )
+        if host in _LOOPBACK_HOSTS or host.startswith("127."):
+            raise ValueError(
+                f"otlp_endpoint {endpoint!r} names the container's own loopback. "
+                "Use an address the container can reach, such as "
+                "http://host.containers.internal:4317."
+            )
+        if logs_dir is None or logs_dir.name != "agent":
+            raise ValueError(
+                "otlp_endpoint is set, but the agent log directory "
+                f"{logs_dir!s} is not <job>/<trial>/agent, so the job and trial "
+                "names for the trace tags cannot be read from it."
+            )
+        env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+    if file_export:
+        env["KAIJUTSU_OTEL_FILE_DIR"] = OTEL_FILE_DIR
+    if logs_dir is not None and logs_dir.name == "agent":
+        trial = logs_dir.parent.name
+        job = logs_dir.parent.parent.name
+        task = trial.split("__")[0]
+        attributes = {
+            "harbor.job.name": job,
+            "harbor.trial.name": trial,
+            "harbor.task.name": task,
+        }
+        if commit:
+            attributes["kaijutsu.commit"] = commit + ("-dirty" if dirty else "")
+        env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(
             f"{k}={quote(v, safe='')}" for k, v in attributes.items()
-        ),
-    }
+        )
+    return env
 
 
 def _positive_int(name: str, given: int | str | None, env: str | None) -> int | None:
@@ -395,6 +430,16 @@ class KaijutsuSoloOptions(AcpOptions):
             f"kaijutsu.commit). Default: ${OTLP_ENDPOINT_ENV}, else no export."
         ),
     )
+    otel_file: bool | None = Field(
+        default=None,
+        description=(
+            "Write the kernel's traces, metrics, and logs as OTLP JSON lines "
+            f"to {OTEL_FILE_DIR}/{{traces,metrics,logs}}.jsonl in the task "
+            "container (sets KAIJUTSU_OTEL_FILE_DIR), so they travel with the "
+            "job's agent logs. Independent of otlp_endpoint. "
+            f"Default: ${OTEL_FILE_ENV}, else on. --ak otel_file=false turns it off."
+        ),
+    )
 
 
 class KaijutsuSoloAcp(AcpAgent):
@@ -423,6 +468,7 @@ class KaijutsuSoloAcp(AcpAgent):
         rc_overlay: str | None = None,
         egress_allow: str | None = None,
         otlp_endpoint: str | None = None,
+        otel_file: bool | str | None = None,
         base_url: str | None = None,
         api_key_env: str | None = None,
         no_key: bool | str | None = None,
@@ -596,6 +642,7 @@ class KaijutsuSoloAcp(AcpAgent):
             kwargs.get("logs_dir"),
             self._git_head,
             self._git_dirty,
+            file_export=_otel_file_enabled(otel_file, os.environ.get(OTEL_FILE_ENV)),
         )
 
         kwargs.setdefault("registry_entry", self._registry_entry_payload())

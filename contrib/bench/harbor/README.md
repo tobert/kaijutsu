@@ -89,6 +89,17 @@ directory's sorted relative paths and file bytes, so a job's provenance ties
 a run to the exact variant that produced it even though the variant's own
 files never leave the host in the trial's output.
 
+`KAIJUTSU_ACP_OTEL_FILE` (`--ak otel_file=`) is on unless set to `false`, `0`,
+`no`, or `off`. On, the adapter passes `KAIJUTSU_OTEL_FILE_DIR=/logs/agent/otel`
+to the kernel, which writes `traces.jsonl`, `metrics.jsonl`, and `logs.jsonl`
+there as OTLP JSON lines. Harbor copies `/logs/agent/` out of every container,
+so the files land in `<job>/<trial>/agent/otel/` with no collector reachable
+from the container. It is independent of `--ak otlp_endpoint=`: with both set,
+the kernel exports to each. When the trial's log directory is
+`<job>/<trial>/agent`, the same `harbor.*` and `kaijutsu.commit` resource
+attributes are set. `docs/telemetry.md`, "File export", has the format and how
+the collector's `otlpjsonfile` receiver replays the files.
+
 Requirements: bash >= 4.4 (the wrapper expands possibly-empty arrays under
 `set -u`) and Python >= 3.12 (Harbor's own floor — `requires-python = ">=3.12"`;
 the adapter imports Harbor and runs in its interpreter).

@@ -76,5 +76,45 @@ class TestOtelEnv(unittest.TestCase):
             agent._otel_env(ENDPOINT, None, COMMIT, False)
 
 
+class TestOtelFileExport(unittest.TestCase):
+    def test_file_export_sets_the_directory_under_the_agent_logs(self):
+        env = agent._otel_env(None, LOGS, COMMIT, False, file_export=True)
+        self.assertEqual(env["KAIJUTSU_OTEL_FILE_DIR"], "/logs/agent/otel")
+        self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT", env)
+        self.assertEqual(attrs(env)["harbor.task.name"], "build-pmars")
+
+    def test_file_export_off_leaves_the_environment_alone(self):
+        self.assertEqual(agent._otel_env(None, LOGS, COMMIT, False, file_export=False), {})
+        env = agent._otel_env(ENDPOINT, LOGS, COMMIT, False, file_export=False)
+        self.assertNotIn("KAIJUTSU_OTEL_FILE_DIR", env)
+        self.assertEqual(env["OTEL_EXPORTER_OTLP_ENDPOINT"], ENDPOINT)
+
+    def test_both_exports_can_run_together(self):
+        env = agent._otel_env(ENDPOINT, LOGS, COMMIT, False, file_export=True)
+        self.assertEqual(env["OTEL_EXPORTER_OTLP_ENDPOINT"], ENDPOINT)
+        self.assertEqual(env["KAIJUTSU_OTEL_FILE_DIR"], "/logs/agent/otel")
+
+    def test_file_only_without_a_trial_directory_omits_the_names(self):
+        env = agent._otel_env(None, None, COMMIT, False, file_export=True)
+        self.assertEqual(env, {"KAIJUTSU_OTEL_FILE_DIR": "/logs/agent/otel"})
+
+    def test_endpoint_still_requires_a_trial_directory_with_file_export(self):
+        with self.assertRaises(ValueError):
+            agent._otel_env(ENDPOINT, None, COMMIT, False, file_export=True)
+
+    def test_default_is_on_and_the_knob_turns_it_off(self):
+        self.assertTrue(agent._otel_file_enabled(None, None))
+        for off in (False, "false", "0", "no", "off", " False "):
+            self.assertFalse(agent._otel_file_enabled(off, None), off)
+        for on in (True, "true", "1", "yes", "on"):
+            self.assertTrue(agent._otel_file_enabled(on, None), on)
+        self.assertFalse(agent._otel_file_enabled(None, "0"))
+        self.assertTrue(agent._otel_file_enabled(True, "0"), "the option beats the variable")
+
+    def test_unrecognized_knob_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            agent._otel_file_enabled("maybe", None)
+
+
 if __name__ == "__main__":
     unittest.main()
