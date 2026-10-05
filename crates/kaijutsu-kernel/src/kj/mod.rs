@@ -732,7 +732,10 @@ impl KjDispatcher {
     /// (the rc lifecycle) holds it, and so does a caller with no joined
     /// context: house verbs such as `kj ledger` and `kj character` take no
     /// context so that a person at a bare shell can run them, and a seat that
-    /// is narrowed always has a context. A context with no loadout or an
+    /// is narrowed always has a context. A live root actor, a person, holds
+    /// it in any context: the narrowing is for a seat's model performer, and
+    /// the app, the tui, and the mcp bridge poll the ledger in whatever
+    /// context they are joined to. Otherwise a context with no loadout or an
     /// empty one is denied, as in [`Self::require_cap`]. A KernelDb read
     /// failure is an error, never a no.
     fn holds_house(&self, caller: &KjCaller) -> Result<bool, String> {
@@ -742,9 +745,12 @@ impl KjDispatcher {
         let Some(ctx) = caller.context_id else {
             return Ok(true);
         };
-        self.kernel_db()
-            .lock()
-            .get_context_binding(ctx)
+        let db = self.kernel_db();
+        let db = db.lock();
+        if db.get_character(caller.actor_id).map_err(|e| e.to_string())?.is_some_and(|c| c.is_live_root()) {
+            return Ok(true);
+        }
+        db.get_context_binding(ctx)
             .map(|b| b.is_some_and(|b| b.allows(&crate::mcp::Capability::House)))
             .map_err(|e| e.to_string())
     }
@@ -2299,6 +2305,43 @@ mod house_verb_tests {
             assert!(msg.contains(line.split_whitespace().next().unwrap()), "{line}: should name the verb: {msg}");
             assert!(!msg.contains("binding allow") && !msg.contains("house"), "{line}: must not say how to get it: {msg}");
         }
+    }
+
+    /// The worker narrowing applies to the seat's model performer, not to a
+    /// person: a live root character acting in a worker context keeps the
+    /// house verbs, since the app, the tui, and the mcp bridge poll the
+    /// ledger in whatever context they are joined to. A model character in
+    /// the same context is refused.
+    ///
+    /// Falsified by a check that reads only the context's loadout: the
+    /// person's `kj ledger list` is refused.
+    #[tokio::test]
+    async fn a_person_in_a_worker_seat_keeps_house_verbs() {
+        let d = test_dispatcher().await;
+        let worker = caller_bound(&d, "worker", &worker_binding());
+        let character = |name: &str, root: bool| {
+            let principal_id = PrincipalId::new();
+            d.kernel_db()
+                .lock()
+                .insert_character(&crate::kernel_db::CharacterRow {
+                    principal_id,
+                    name: name.to_string(),
+                    created_at: 0,
+                    retired_at: None,
+                    handoff_ctx: None,
+                    root_ctx: None,
+                    root,
+                })
+                .expect("insert character");
+            principal_id
+        };
+        let person = character("person", true);
+        let model = character("coder-model", false);
+        let argv: Vec<String> = ["ledger", "list"].iter().map(|v| v.to_string()).collect();
+        let as_person = d.dispatch(&argv, &worker.clone().with_actor(person, None)).await;
+        assert!(!as_person.message().contains(REFUSAL), "a person was refused: {}", as_person.message());
+        let as_model = d.dispatch(&argv, &worker.with_actor(model, None)).await;
+        assert!(as_model.message().contains(REFUSAL), "the model performer was not refused: {}", as_model.message());
     }
 
     #[tokio::test]

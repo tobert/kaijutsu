@@ -3684,9 +3684,9 @@ experiment" — treat `Editor` as provisional until that sweep.
   and point the worker at `kj wait --ask <id>`.
 - **Client ledger polling runs in the joined context.** The app, TUI, and MCP
   clients call `kj ledger list|show` through `execute_kj_quiet(ctx, ..)` in
-  whichever context they are joined to. Joined to a `coder` context, that is
-  refused. Run the bookkeeping in a house seat's context (the person's root
-  context).
+  whichever context they are joined to. A live root actor holds the house
+  verbs in any context, so a person joined to a `coder` context keeps it; an
+  mcp session whose actor is not a root character is still refused there.
 - **The musician tick and rc scripts bypass the capability gates.** rc runs
   as a privileged caller, so `kj drive` in `musician/tick/S10-drive.kai` is
   not checked against the musician's `drive` grant, and neither is `house`.
