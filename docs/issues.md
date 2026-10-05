@@ -255,6 +255,28 @@ pass/bump verdict, bumping when either the verdict is bump or the fix is not
 read, so the fix answer does not feed the verdict read; the fix menu in the
 spec layer is what changes the verdict.
 
+Built (bumper mode, `docs/council.md`, "Bumper mode"): the two modes, the
+bump record and limit, and the message template. Still open:
+
+- **Drift of the bump to the seat's banto.** A bump is a tool failure only;
+  it does not reach the seat's context as a drift, nor its banto.
+- **Ledger garbage collection.** Bump decisions have no ask and so do not
+  fill `kj ledger`, but they accumulate in `council_decisions`.
+- **`kj ledger` does not show bumps.** Bumps are `council_decisions` rows, and
+  `kj ledger` lists asks. Showing council decisions there needs its own design.
+- **Debiasing by reading both option orders.**
+- **The bump count never resets.** It counts every refused bump of a
+  submission in a seat context. A bump an hour ago counts after a pass in
+  between; whether a pass, a context fork, or time resets it is open.
+- **The shell bumper spec has no `fix` question.** The probes (60 graded
+  cases, 52 sorted) used one beside the verdict; `shell-bump.json` holds the
+  verdict alone.
+- **A bump reads as a denial to callers.** It rides `RefusalKind::Denied`,
+  whose doc says retrying gets the same answer. A `Bumped` refusal kind would
+  cost a wire change.
+- **Per-spec council contexts** are on main under `[[council.spec]]`; bumper
+  mode touches only the `[council]` table.
+
 ## What the first live council decisions on zorak showed (2026-10-04)
 
 A coder seat on tenchi's qwen3.8-27b (`council-smoke`) ran `ls -la`,

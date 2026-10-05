@@ -562,6 +562,51 @@ would put an authority decision in a script.
    off the hot path. Amy, 2026-10-04: "system 2 after the ledger". Report
    alerts past logging come with it.
 
+## Bumper mode
+
+`[council] mode = "bumper"` changes what the council's answer does. The
+default, `mode = "gatekeeper"`, is everything above. Amy, 2026-10-05:
+System 1 answers pass or bump. Pass is "everything looks good and safe to
+proceed". Bump is "hold on, think about that some more": the seat gets the
+action refused with guidance and tries again, with no human in the loop.
+
+- **The spec.** The shell spec's `verdict` choice has a pass option named
+  `proceed`; every other option is a bump flavor, and its `means` text is the
+  guidance. `assets/defaults/council/shell-bump.json` holds `proceed`,
+  `try_harder` (the goal is fine, but it needs more care first), and
+  `do_less` (it reaches past what the task needs). A spec with no `proceed`
+  option, or with no other option, is a miss with that cause. The program
+  spec keeps its rubric and its `allow` option.
+- **Pass or bump.** A shell decision passes when pooled p(proceed) is at or
+  above the threshold's `allow_at` and, with `require_agree`, every read's
+  top answer is `proceed`. Otherwise it bumps, with the pooled argmax among
+  the other options as its flavor. A program decision passes on an allowing
+  rubric; otherwise it bumps, and its flavor names the rubric answers that
+  held it (`originals=changes`, `network=other`). The submission runs only
+  when the shell decision and every program decision pass.
+- **The fallback does not change.** A control-text hit, a miss, and a
+  program that was not judged leave the ordinary ask.
+- **A bump opens no ask.** The call fails with the bump message, nothing
+  runs, and no permission request is made. The council decision is recorded
+  with outcome `bump` and its flavor, and links to no ask. Because no ask
+  or durable denial exists, the same submission sent again is decided again
+  by the council.
+- **The limit.** `bump_limit` (default 3) is how many times one submission
+  of one seat context is bumped. The count is the number of bump decisions
+  with no ask for that context and submission digest
+  (`approval_ledger::council::list_bump_flavors`), a program's bump counting
+  for its submission. When the count is at the limit, the next would-be bump
+  is an ordinary ask. Its description and a council signal carry the count
+  and the flavors.
+- **The message.** `/config/kernel/council/bump.md`, seeded from
+  `assets/defaults/council/bump.md`, is read at each bump, so a change shows
+  on the next one. It fills `{guidance}`, `{flavor}`, `{attempt}`, and
+  `{limit}`. The default directs and does not invite argument. A template
+  that cannot be read is an error in the log and in the message, and the
+  built-in text is used.
+- **The record.** `council.decide` and the info line carry `outcome = bump`,
+  `bump_flavor`, and `p_proceed`.
+
 ## Open questions for Amy
 
 - **The ask's wait in a swarm.** A swarm seat whose submission the council
