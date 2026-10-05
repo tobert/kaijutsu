@@ -99,7 +99,7 @@ decision. The client decides, from its own thresholds.
 | case | The `state` one decision reads: the thing being judged. |
 | read | One context's answers to one case, or the spec's alone when no context is named. |
 | decision | One case read after zero or more contexts, with the reads pooled. |
-| identity | The model, weights, tokenizer, rendering template, and engine build that produced a number. A threshold fitted under one identity does not carry to another. |
+| identity | The model, weights, tokenizer, rendering template, and engine that produced a number. A threshold fitted under one identity does not carry to another. |
 
 ## The snapshot stack
 
@@ -353,10 +353,15 @@ The body is `{"error": {"type", "message", "param"?, "head"?}}`.
 ## Identity and capabilities
 
 `GET /council/v1/identity` returns `model`, `aliases`, `weight_hash`,
-`tokenizer_hash`, `template`, `engine` (build commit and binary hash),
-`device`, `limits`, `capabilities`, and, with `describe`, `text_stop`: the
+`tokenizer_hash`, `template`, `engine`, `device`, `limits`, `capabilities`, and, with `describe`, `text_stop`: the
 rule that ends a `text` answer, so a client can tell why two servers'
 descriptions differ in length.
+
+`engine` names what computes the numbers: the engine binary and the server
+code that turns its output into answers, each by content hash. It never
+names a source commit, so a deploy that changes only plumbing or docs keeps
+the identity and the thresholds fitted under it. The megakernel writes
+`libmkengine:<binary sha256[:16]>+numbers:<sha256[:16] of its answer code>`.
 
 | Limit | Means |
 |---|---|

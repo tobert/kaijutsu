@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Council API
-  version: 0.2.3-draft
+  version: 0.2.4-draft
   summary: Typed decisions read after several held model contexts, a superset of the gateway Decisions API.
   description: |
     Proposed contract for the megakernel and lfm2d decision servers. The prose
@@ -900,7 +900,9 @@ components:
         template: {type: string}
         engine:
           type: string
-          description: Build commit and binary hash.
+          description: >-
+            What computes the numbers: the engine binary and the server's
+            answer code, each by content hash. Never a source commit.
         device: {type: string}
         text_stop:
           type: string
