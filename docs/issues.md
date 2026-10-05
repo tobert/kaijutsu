@@ -221,6 +221,36 @@ WAL. Accept `-p`, or have the refusal name the fix.
   100 ms while still connecting closes a connection empty. Let the mock
   ignore an empty connection.
 
+## Council bump protocol: pass or bump instead of allow or ask (2026-10-05)
+
+Amy proposed that System 1 answer pass or bump. Pass means everything looks
+good and safe to proceed. Bump means "hold on, think about that some more":
+the seat gets the action back with what we know and tries again, where today
+a deny would refuse it or an ask would wait on a human. Amy, 2026-10-05:
+
+- **Two gate modes, bumper and gatekeeper.** `kj/gate.rs` gains a bump
+  protocol beside today's allow/ask/report. Today a retry of the same
+  request replays its durable denial (`kj/gate.rs`, "this exact request was
+  already denied by its assigned reviewer"), so a seat that makes a backup
+  and sends the same `sqlite3` again is never judged again. A bump must not
+  close the request that way.
+- **A bump is a ledger entry plus a drift.** The action goes in the ledger;
+  the bump goes to the seat, or later to its banto, as a drift, so it gets
+  the existing context infrastructure. In a swarm a bump could send banto
+  to read the ledger and decide.
+- **The bump limit is a counter in the ledger.** How it is keyed (request
+  digest, seat, turn) and what happens at the limit are open.
+- **The bump message carries everything useful we have,** composed through
+  rc so we can tune it the way we tune prompts.
+- **The ledger needs garbage collection.** The ui gets slow on the long list
+  of old entries, and bumps will add more of them.
+
+Probes on the megakernel (`signoff.md`, 2026-10-05): a `fix` question plus a
+pass/bump verdict, bumping when either the verdict is bump or the fix is not
+"nothing", sorted 52 of 60 graded cases. Each question is a separate letter
+read, so the fix answer does not feed the verdict read; the fix menu in the
+spec layer is what changes the verdict.
+
 ## What the first live council decisions on zorak showed (2026-10-04)
 
 A coder seat on tenchi's qwen3.8-27b (`council-smoke`) ran `ls -la`,
