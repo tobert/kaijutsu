@@ -176,6 +176,17 @@ Decisions API. The body and answer are the same.
 - **`pin: true`** exempts the head and its spec layers from eviction;
   `pin: false` releases it; absent leaves it as it was. Pins past the
   server's budget are a `507`.
+- **`persist: false`** says the client will `PUT` the context again after a
+  restart or an eviction, so the server need not keep it beyond memory: a
+  server with `park` does not write it to disk. `persist: true` is today's
+  behavior and the default on a first `PUT`; absent on a later `PUT` leaves
+  it as it was. A snapshot is kept on disk while any context holding it is
+  `persist: true`; switching the last such holder to `false` drops the
+  parked files. After a restart, a decision or `GET` naming a
+  `persist: false` context is the ordinary `404` ("`PUT` it again").
+  `persist` is not part of identity, snapshot ids, or the numbers, and it is
+  independent of `pin` (pin exempts from eviction; persist outlives a
+  restart). Requires the `persist` capability.
 - **`dry_run: true`** reports `head`, `kept`, and `fed` and builds nothing:
   the cost of an update before paying for it. `head` is the snapshot id the
   build would have. Every `PUT` reply carries `dry_run`, `false` when it
@@ -266,7 +277,7 @@ Decisions API. The body and answer are the same.
   server ignored would turn a council decision into a plain one without
   saying so.
 - **Every capability a request needs must be declared.** A `warm`,
-  `dry_run`, or `text` question on a server without that capability is a
+  `dry_run`, `persist`, or `text` question on a server without that capability is a
   `400` naming it.
 
 ### Answers
@@ -380,6 +391,7 @@ the identity and the thresholds fitted under it. The megakernel writes
 | `park` | Snapshots and context records are kept on disk and outlive eviction and restarts. |
 | `warm` | `PUT` accepts `warm`. |
 | `dry_run` | `PUT` accepts `dry_run`. |
+| `persist` | `PUT` accepts `persist`, and the server may drop a `persist: false` context at a restart. |
 | `describe` | Specs may hold `text` questions. |
 | `leave_one_out` | Pooled answers carry `leave_one_out`. |
 

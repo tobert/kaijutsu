@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Council API
-  version: 0.2.4-draft
+  version: 0.2.5-draft
   summary: Typed decisions read after several held model contexts, a superset of the gateway Decisions API.
   description: |
     Proposed contract for the megakernel and lfm2d decision servers. The prose
@@ -321,6 +321,14 @@ components:
           type: boolean
           default: false
           description: Report head, kept and fed and build nothing. Requires the dry_run capability.
+        persist:
+          type: boolean
+          description: >-
+            false says the client will PUT the context again after a restart or
+            an eviction, so the server need not keep it beyond memory; true (the
+            default on a first PUT) may keep it across a restart; absent on a
+            later PUT leaves it as it was. Not part of identity. Requires the
+            persist capability.
     SnapshotInfo:
       type: object
       required: [id, tokens, layer]
@@ -356,6 +364,9 @@ components:
           minimum: 0
         pinned:
           type: boolean
+        persist:
+          type: boolean
+          description: The context's persist setting.
         snapshots:
           type: array
           items: {$ref: '#/components/schemas/SnapshotInfo'}
@@ -925,7 +936,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [park, warm, dry_run, describe, leave_one_out]
+            enum: [park, warm, dry_run, persist, describe, leave_one_out]
     Error:
       type: object
       required: [error]
