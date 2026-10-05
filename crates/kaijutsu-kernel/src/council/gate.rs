@@ -552,6 +552,49 @@ fn bump_flavor(
     }
 }
 
+/// The file a bump's message is rendered from, read at each bump.
+pub(crate) const BUMP_TEMPLATE_PATH: &str = "council/bump.md";
+
+/// Fill `template`: `{attempt}`, `{limit}`, `{flavor}`, then `{guidance}`
+/// last, so guidance text is never read as a placeholder.
+pub(crate) fn render_bump_template(template: &str, bump: &BumpReason, attempt: u64, limit: u64) -> String {
+    template
+        .replace("{attempt}", &attempt.to_string())
+        .replace("{limit}", &limit.to_string())
+        .replace("{flavor}", &bump.flavor)
+        .replace("{guidance}", &bump.guidance)
+}
+
+/// The message a bump refuses the call with, from
+/// `/config/kernel/council/bump.md` as it stands now. A template that is
+/// missing or unreadable is an error in the log and in the message, and the
+/// built-in text stands in.
+pub(crate) async fn bump_message(kernel: &crate::Kernel, bump: &BumpReason, attempt: u64, limit: u64) -> String {
+    use crate::vfs::VfsOps;
+    let path = kaijutsu_types::paths::config_path(BUMP_TEMPLATE_PATH);
+    let read = kernel
+        .vfs()
+        .read_all(std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| format!("not valid UTF-8: {e}")));
+    match read {
+        Ok(template) => render_bump_template(&template, bump, attempt, limit),
+        Err(why) => {
+            tracing::error!(
+                target: "kaijutsu::council",
+                path = %path,
+                error = %why,
+                "the bump template could not be read; the built-in text is used"
+            );
+            format!(
+                "{}\n(The bump template {path} could not be read: {why}. The built-in text is used.)",
+                render_bump_template(crate::config_seed::DEFAULT_COUNCIL_BUMP_MESSAGE, bump, attempt, limit).trim_end()
+            )
+        }
+    }
+}
+
 /// A council failure that produced no response, in plain words.
 pub(crate) fn failure_cause(error: &CouncilError, deadline_ms: u64) -> String {
     match error {
@@ -780,6 +823,11 @@ impl CouncilVerdict {
         self.bump
             .clone()
             .or_else(|| self.programs.iter().find_map(|p| p.decision.as_ref().ok().and_then(|d| d.bump.clone())))
+    }
+
+    /// `[council] bump_limit`, as this decision read it.
+    pub(crate) fn bump_limit(&self) -> u64 {
+        self.council.bump_limit
     }
 
     /// The digest of the submission this decision read, as its record
@@ -1427,15 +1475,10 @@ async fn decide_inner(
 }
 
 /// Why a spec cannot decide a gate ask, when it cannot: the gate acts on a
-/// [`VERDICT`] choice with an `allow` option, and a spec without one would
-/// only ever miss.
-fn spec_lacks_verdict(spec: &kaijutsu_council::wire::Spec) -> Option<String> {
-    spec_lacks_pass(spec, "allow")
-}
-
-/// [`spec_lacks_verdict`] for the pass option `pass` ([`pass_option`]). A
-/// bumper's `proceed` also needs another option: every other option is a
-/// bump flavor, and a spec with none could only pass or miss.
+/// [`VERDICT`] choice with a pass option (`pass`, from [`pass_option`]), and
+/// a spec without one would only ever miss. A bumper's `proceed` also needs
+/// another option: every other option is a bump flavor, and a spec with
+/// none could only pass or miss.
 fn spec_lacks_pass(spec: &kaijutsu_council::wire::Spec, pass: &str) -> Option<String> {
     use kaijutsu_council::wire::SpecQuestion;
     match spec.questions.iter().find(|q| q.id() == VERDICT) {
@@ -1972,9 +2015,9 @@ mod tests {
     fn a_spec_without_an_allow_verdict_cannot_decide() {
         let mut spec: kaijutsu_council::wire::Spec =
             serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
-        assert_eq!(spec_lacks_verdict(&spec), None);
+        assert_eq!(spec_lacks_pass(&spec, "allow"), None);
         spec.questions.retain(|q| q.id() != VERDICT);
-        assert!(spec_lacks_verdict(&spec).unwrap().contains("no `verdict` choice"));
+        assert!(spec_lacks_pass(&spec, "allow").unwrap().contains("no `verdict` choice"));
     }
 
     #[test]

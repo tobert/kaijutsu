@@ -605,6 +605,12 @@ pub(crate) async fn run_gate_recorded(
     council: Option<crate::council::gate::CouncilVerdict>,
     record: &(dyn Fn(&rusqlite::Connection, &str) -> crate::kernel_db::KernelDbResult<()> + Send + Sync),
 ) -> GateOutcome {
+    let mut council = council;
+    if let Some(verdict) = council.as_mut()
+        && let Some(refused) = refuse_bump(kernel, caller, verdict).await
+    {
+        return refused;
+    }
     let recorded = std::sync::OnceLock::new();
     let mut outcome = run_gate_once(kernel, caller, spec, ledger_flows, config, council.as_ref(), &recorded, record).await;
     let Some(mut council) = council else { return outcome };
@@ -638,6 +644,67 @@ pub(crate) async fn run_gate_recorded(
             ),
             judged: Vec::new(),
         },
+    }
+}
+
+/// Bumper mode: refuse a submission the council bumped, with no ask. The
+/// bump is recorded as an unlinked decision, so the same submission sent
+/// again is decided again; nothing here closes it the way a durable denial
+/// does. Returns the refusal, or `None` to go on: the verdict is no bump, or
+/// the submission has been bumped `bump_limit` times and asks, carrying the
+/// bumps' flavors (`CouncilVerdict::at_bump_limit`).
+async fn refuse_bump(
+    kernel: &Arc<crate::Kernel>,
+    caller: &KjCaller,
+    council: &mut crate::council::gate::CouncilVerdict,
+) -> Option<GateOutcome> {
+    let bump = council.submission_bump()?;
+    let context = caller.context_id?;
+    let limit = council.bump_limit();
+    let history = {
+        let db = kernel.kernel_db().lock();
+        approval_ledger::council::list_bump_flavors(
+            db.conn_for_ledger(), context.as_bytes(), council.submission_digest(),
+        )
+    };
+    let history = match history {
+        Ok(history) => history,
+        Err(e) => {
+            return Some(GateOutcome::unavailable_without_row(format!(
+                "the council could not count earlier bumps of this submission: {e} \
+                 (fail-closed — a ledger fault, not a decision)"
+            )));
+        }
+    };
+    if history.len() as u64 >= limit {
+        tracing::info!(bumps = history.len(), limit, "the submission reached its bump limit; it asks");
+        council.at_bump_limit(history);
+        return None;
+    }
+    let attempt = history.len() as u64 + 1;
+    let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
+    let written = {
+        let db = kernel.kernel_db().lock();
+        require_live_context_for_gate(&db, context)
+            .map_err(|e| e.to_string())
+            .and_then(|()| record_unlinked_council_decision(db.conn_for_ledger(), council).map_err(|e| e.to_string()))
+    };
+    match written {
+        Ok(decision_id) => {
+            tracing::info!(attempt, limit, flavor = %bump.flavor, "the council bumped the submission; nothing ran");
+            council.observe(kernel.clone(), decision_id);
+            Some(GateOutcome {
+                verdict: GateVerdict::Denied,
+                ask: None,
+                cwd: ShellCwd::Context,
+                reason: message,
+                judged: Vec::new(),
+            })
+        }
+        Err(e) => Some(GateOutcome::unavailable_without_row(format!(
+            "the council bumped this submission, and the bump could not be recorded: {e} \
+             (fail-closed — a ledger fault, not a decision)"
+        ))),
     }
 }
 

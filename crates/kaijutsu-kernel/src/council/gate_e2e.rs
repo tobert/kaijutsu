@@ -256,6 +256,10 @@ struct Setup {
     programs: bool,
     /// `[council] seat`.
     seat: bool,
+    /// Bumper mode with this `bump_limit`, reading the `shell-bump` spec.
+    bump_limit: Option<u64>,
+    /// The bump template file is left out of the config directory.
+    no_bump_template: bool,
 }
 
 impl Default for Setup {
@@ -269,6 +273,8 @@ impl Default for Setup {
             chain: false,
             programs: false,
             seat: false,
+            bump_limit: None,
+            no_bump_template: false,
         }
     }
 }
@@ -283,15 +289,16 @@ server = "{server}"
 contexts = {contexts}
 voices = {voices}
 seat = {seat}
+{mode}
 pool = {{ method = "loglinear", weights = "mass" }}
 deadline_ms = {deadline}
 
 [[council.spec]]
-name = "shell-gate"
+name = "{shell}"
 case = "shell"
 
 [[council.threshold]]
-spec = "shell-gate"
+spec = "{shell}"
 weight_hash = "w1"
 engine = "e1"
 tokenizer_hash = "t1"
@@ -307,6 +314,11 @@ enabled = {enabled}
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
         voices = setup.voices,
         seat = setup.seat,
+        mode = match setup.bump_limit {
+            Some(limit) => format!("mode = \"bumper\"\nbump_limit = {limit}"),
+            None => String::new(),
+        },
+        shell = if setup.bump_limit.is_some() { "shell-bump" } else { "shell-gate" },
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
         programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
@@ -359,6 +371,22 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     vfs.write_all(std::path::Path::new("/config/kernel/council/shell-gate.json"), spec_text().as_bytes())
         .await
         .unwrap();
+    vfs.write_all(
+        std::path::Path::new("/config/kernel/council/shell-bump.json"),
+        crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP.as_bytes(),
+    )
+    .await
+    .unwrap();
+    if setup.no_bump_template {
+        let _ = vfs.unlink(std::path::Path::new("/config/kernel/council/bump.md")).await;
+    } else {
+        vfs.write_all(
+            std::path::Path::new("/config/kernel/council/bump.md"),
+            crate::config_seed::DEFAULT_COUNCIL_BUMP_MESSAGE.as_bytes(),
+        )
+        .await
+        .unwrap();
+    }
     vfs.write_all(
         std::path::Path::new("/config/kernel/council/program-gate.json"),
         crate::config_seed::DEFAULT_COUNCIL_PROGRAM_GATE.as_bytes(),
@@ -2016,6 +2044,234 @@ async fn an_unread_program_is_listed_with_its_cause() {
         let programs = programs_field(&sent[0]);
         assert_eq!(programs[0]["outcome"], "unread", "{via:?}: {programs:?}");
         assert!(programs[0]["cause"].as_str().unwrap().contains("could not be read"), "{programs:?}");
+        rig.finish().await;
+    }
+}
+
+// ---- bumper mode ----
+
+const BUMP_OPTIONS: [&str; 3] = ["proceed", "try_harder", "do_less"];
+const PROCEED: [f64; 3] = [-0.001, -8.0, -9.0];
+const TRY_HARDER: [f64; 3] = [-4.0, -0.03, -5.0];
+const DO_LESS: [f64; 3] = [-6.0, -3.0, -0.04];
+
+/// Every read of a bumper shell decision puts these log probabilities on
+/// proceed, try_harder, do_less.
+fn bump_answer(request: &DecisionRequest, logprobs: [f64; 3]) -> serde_json::Value {
+    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    super::gate::test_support::answer_choices(request, &[("verdict", BUMP_OPTIONS, &vec![logprobs; n])])
+}
+
+impl Mock {
+    fn bumper_says(&self, logprobs: [f64; 3]) {
+        self.set(move |req| Reply::ok(bump_answer(req, logprobs)));
+    }
+}
+
+fn bumper(limit: u64) -> Setup {
+    Setup { bump_limit: Some(limit), ..Setup::default() }
+}
+
+fn refusal_text(via: Via, result: Result<(), McpError>) -> String {
+    match result {
+        Err(error) => {
+            assert!(!error.is_refusal(RefusalKind::Pending), "{via:?}: a bump opens no ask: {error:?}");
+            error.to_string()
+        }
+        Ok(()) => panic!("{via:?}: the submission must be bumped, and it ran"),
+    }
+}
+
+fn bump_flavors(rig: &Rig, digest: &str) -> Vec<String> {
+    let db = rig.d.kernel_db();
+    let db = db.lock();
+    approval_ledger::council::list_bump_flavors(db.conn_for_ledger(), &rig.context_bytes(), digest).unwrap()
+}
+
+fn digest_of(command: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", Sha256::digest(command.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// A bumper council that proceeds runs the submission like an allow does.
+#[tokio::test]
+async fn a_bumper_proceed_runs_the_submission() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.mock.bumper_says(PROCEED);
+        rig.submit("echo council-ran").await.unwrap_or_else(|e| panic!("{via:?}: the council proceeds: {e:?}"));
+        let ask = rig.only_ask();
+        assert_eq!(ask.status, ApprovalStatus::Allowed, "{via:?}");
+        assert_eq!(the_decision(&rig, &ask).decision.outcome, CouncilOutcome::Allow);
+        assert!(rig.asks().iter().all(|a| a.status != ApprovalStatus::Pending));
+        rig.finish().await;
+    }
+}
+
+/// A bump refuses with the rendered template and the flavor's guidance,
+/// runs nothing, opens no ask, and leaves a bump decision.
+///
+/// Falsified by treating a non-proceed answer as an ask: the submission is
+/// pending.
+#[tokio::test]
+async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        let text = refusal_text(via, rig.submit("touch /work/marker").await);
+        assert!(text.contains("Bumped by the council (attempt 1 of 3)"), "{via:?}: {text}");
+        assert!(text.contains("the goal is fine, but it needs more care first"), "{via:?}: {text}");
+        assert!(text.contains("Try harder, a different approach"), "{via:?}: {text}");
+        assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
+        let decisions = rig.decisions();
+        assert_eq!(decisions.len(), 1, "{via:?}");
+        assert_eq!(decisions[0].decision.outcome, CouncilOutcome::Bump);
+        assert_eq!(decisions[0].decision.bump_flavor.as_deref(), Some("try_harder"));
+        assert!(decisions[0].decision.request_id.is_none());
+        assert_eq!(bump_flavors(&rig, &digest_of("touch /work/marker")), ["try_harder"]);
+        rig.finish().await;
+    }
+}
+
+/// The same submission sent again after a bump is judged again, and runs
+/// when the council now proceeds.
+///
+/// Falsified by closing the request with a durable denial: the second send
+/// replays it and the mock is consulted once.
+#[tokio::test]
+async fn the_same_submission_sent_again_after_a_bump_is_judged_again() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        refusal_text(via, rig.submit("echo tables").await);
+        assert_eq!(rig.mock.decisions().len(), 1);
+        rig.mock.bumper_says(PROCEED);
+        rig.submit("echo tables").await.unwrap_or_else(|e| panic!("{via:?}: now it proceeds: {e:?}"));
+        assert_eq!(rig.mock.decisions().len(), 2, "{via:?}: the council judged it again");
+        rig.finish().await;
+    }
+}
+
+/// After `bump_limit` bumps the next would-be bump is an ordinary ask that
+/// carries the bumps' flavors.
+#[tokio::test]
+async fn at_the_bump_limit_the_submission_asks_with_its_history() {
+    for via in BOTH {
+        let rig = rig(via, bumper(2)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        refusal_text(via, rig.submit("touch /work/a").await);
+        rig.mock.bumper_says(DO_LESS);
+        let second = refusal_text(via, rig.submit("touch /work/a").await);
+        assert!(second.contains("attempt 2 of 2") && second.contains("reaches past what the task needs"), "{second}");
+        assert_pending(via, rig.submit("touch /work/a").await);
+        assert_eq!(rig.mock.decisions().len(), 3, "{via:?}");
+        let ask = rig.only_ask();
+        assert!(
+            ask.description.contains("bumped 2 times (try_harder; do_less)"),
+            "{via:?}: {}",
+            ask.description
+        );
+        let signals = rig.signals(&ask.request_id);
+        assert!(
+            signals.iter().any(|s| s.label.as_deref() == Some("bumped 2 times (try_harder; do_less)")),
+            "{via:?}: {signals:#?}"
+        );
+        // The ask's own decision links to the ask and does not count as a refused bump.
+        assert_eq!(bump_flavors(&rig, &digest_of("touch /work/a")).len(), 2);
+        rig.finish().await;
+    }
+}
+
+/// Bumper mode keeps the ordinary ask for a miss and a control-text hit.
+#[tokio::test]
+async fn a_miss_and_a_control_text_hit_are_ordinary_asks_in_bumper_mode() {
+    for via in BOTH {
+        let rig = rig(via, Setup { server: Some(dead_server()), ..bumper(3) }).await;
+        assert_pending(via, rig.submit("touch /work/a").await);
+        assert_eq!(rig.only_ask().status, ApprovalStatus::Pending);
+        rig.finish().await;
+
+        let rig = self::rig(via, bumper(3)).await;
+        rig.mock.set(|req| {
+            let mut body = bump_answer(req, PROCEED);
+            body["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+            Reply::ok(body)
+        });
+        assert_pending(via, rig.submit("touch /work/a").await);
+        assert_eq!(the_decision(&rig, &rig.only_ask()).decision.outcome, CouncilOutcome::Ask);
+        rig.finish().await;
+    }
+}
+
+/// A bumper spec with no `proceed` option is a miss naming it: the
+/// submission asks.
+#[tokio::test]
+async fn a_bumper_spec_without_proceed_is_refused_as_a_miss() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.write("/config/kernel/council/shell-bump.json", &spec_text()).await;
+        assert_pending(via, rig.submit("touch /work/a").await);
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
+        let cause = decision.decision.miss_cause.unwrap();
+        assert!(cause.contains("no `proceed` option"), "{via:?}: {cause}");
+        rig.finish().await;
+    }
+}
+
+/// A program the rubric flags bumps a submission whose shell decision
+/// proceeds, with the program's guidance, and counts as one bump.
+#[tokio::test]
+async fn a_flagged_program_bumps_with_its_rubric_guidance() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..bumper(3) }).await;
+        rig.write("/work/wipe.py", "import shutil\nshutil.rmtree('data')\n").await;
+        rig.mock.set(|req| {
+            if is_program(req) {
+                Reply::ok(super::gate::test_support::program_answer(req, LAST, FIRST, [-0.01, -5.0, -6.0]))
+            } else {
+                Reply::ok(bump_answer(req, PROCEED))
+            }
+        });
+        let text = refusal_text(via, rig.submit_gate("python3 /work/wipe.py").await);
+        assert!(text.contains("back it up or work on a copy first"), "{via:?}: {text}");
+        assert!(rig.asks().is_empty());
+        assert_eq!(bump_flavors(&rig, &digest_of("python3 /work/wipe.py")), ["originals=changes"]);
+        rig.finish().await;
+    }
+}
+
+/// The template is read at each bump, so a change shows on the next one; a
+/// missing template is an error in the message, with the built-in text.
+#[tokio::test]
+async fn the_bump_template_is_read_at_each_bump() {
+    for via in BOTH {
+        let rig = rig(via, bumper(5)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        refusal_text(via, rig.submit("touch /work/a").await);
+        rig.write("/config/kernel/council/bump.md", "HOLD {flavor} {attempt}/{limit}: {guidance}").await;
+        let text = refusal_text(via, rig.submit("touch /work/a").await);
+        assert!(text.contains("HOLD try_harder 2/5: the goal is fine"), "{via:?}: {text}");
+        rig.finish().await;
+
+        let rig = self::rig(via, Setup { no_bump_template: true, ..bumper(3) }).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        let text = refusal_text(via, rig.submit("touch /work/a").await);
+        assert!(text.contains("Bumped by the council (attempt 1 of 3)"), "{via:?}: {text}");
+        assert!(text.contains("could not be read"), "{via:?}: {text}");
+        rig.finish().await;
+    }
+}
+
+/// With no `mode`, the gate is a gatekeeper: the shell-gate spec, an ask
+/// for anything but allow.
+#[tokio::test]
+async fn without_a_mode_the_gate_is_a_gatekeeper() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        rig.mock.answers(&ASK);
+        assert_pending(via, rig.submit("touch /work/a").await);
+        assert_eq!(the_decision(&rig, &rig.only_ask()).decision.spec_name, "shell-gate");
         rig.finish().await;
     }
 }
