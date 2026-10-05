@@ -2789,6 +2789,22 @@ enabled = false
         assert!(c.seat, "the bench reads the seat context");
     }
 
+    /// The benchmark's bumper gate parses: bumper mode over the bump spec,
+    /// the program spec reading council-code, one identity for both.
+    #[test]
+    fn the_bench_bumper_gate_bumps_and_reads_council_code_for_programs() {
+        let cfg = config(include_str!("../../../../contrib/bench/gate-bump.toml"));
+        let c = cfg.council().expect("the bench file declares a council");
+        assert_eq!(c.mode, CouncilMode::Bumper);
+        assert_eq!(c.bump_limit, 3);
+        assert_eq!(c.specs[0].name, "shell-bump");
+        assert_eq!(c.specs[1].contexts, ["council-code"]);
+        let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();
+        assert!(c.threshold_for("program-gate", &shell.identity).is_some());
+        assert!(cfg.council_enabled_for(Some("coder")));
+        assert!(c.seat, "the bench reads the seat context");
+    }
+
     #[test]
     fn a_threshold_must_name_a_declared_spec() {
         let m = council_err(&council_with("spec = \"shell-gate\"", "spec = \"nope\""));
