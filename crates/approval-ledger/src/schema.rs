@@ -812,7 +812,9 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 -- set). The fixed-shape rules stay in SQL: a miss carries its cause and
 -- nothing else does, the threshold columns are all set or all NULL, and
 -- `agree` and `spread` are both set or both NULL. `control_text_hits` is
--- the count of `council_control_text` rows; `insert_council_decision`
+-- the count of `council_control_text` rows; `bump_flavor` names a bump's
+-- flavor and is set for a `bump` outcome only (the insert function holds
+-- that rule; a refused bump has no `request_id`); `insert_council_decision`
 -- writes both from the same list.
 CREATE TABLE IF NOT EXISTS council_decisions (
     decision_id       BLOB    NOT NULL PRIMARY KEY,
@@ -841,6 +843,7 @@ CREATE TABLE IF NOT EXISTS council_decisions (
     queue_ms          INTEGER NOT NULL,
     ms                INTEGER NOT NULL,
     seat_head         TEXT,
+    bump_flavor       TEXT,
     created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     CHECK ((outcome = 'miss') = (miss_cause IS NOT NULL)),
@@ -1038,7 +1041,7 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // list, so any column an old database is missing has to exist before
     // that copy runs or the SELECT names a column that is not there.
     add_columns_if_missing(conn, "approvals", APPROVALS_ADDED_COLUMNS)?;
-    add_columns_if_missing(conn, "council_decisions", &[("seat_head", "TEXT")])?;
+    add_columns_if_missing(conn, "council_decisions", &[("seat_head", "TEXT"), ("bump_flavor", "TEXT")])?;
     add_rc_runs_script_count_column_if_missing(conn)?;
     add_rc_runs_intended_outcome_column_if_missing(conn)?;
     add_rc_run_script_settlement_columns_if_missing(conn)?;
@@ -1620,6 +1623,26 @@ mod tests {
         let seat: Option<String> =
             conn.query_row("SELECT seat_head FROM council_decisions", [], |row| row.get(0)).unwrap();
         assert_eq!(seat, None);
+    }
+
+    /// A database whose `council_decisions` predates `bump_flavor` gains the
+    /// column, as NULL for the rows it holds.
+    #[test]
+    fn migrate_adds_bump_flavor_to_council_decisions_created_without_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        let ddl = DDL.replace("    bump_flavor       TEXT,\n", "");
+        assert_ne!(ddl, DDL, "the fixture removes bump_flavor from the shipped DDL");
+        conn.execute_batch(&ddl).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, control_text_hits, queue_ms, ms, bump_flavor)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'bump', 0, 0, 0, 'do_less');",
+        )
+        .unwrap();
     }
 
     /// The same regression as

@@ -58,7 +58,7 @@ use super::sync::{PrepareMiss, Prepared};
 use super::voices::{SkippedVoice, VoiceChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
-    CouncilCase, CouncilConfig, CouncilIdentity, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
+    CouncilCase, CouncilConfig, CouncilIdentity, CouncilMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
     CouncilThreshold, GateConfigLoad, Layers, PolicyVerdict,
 };
 use crate::kj::KjCaller;
@@ -66,6 +66,16 @@ use crate::kj::KjCaller;
 /// The spec question whose answer the gate acts on: a `choice` over
 /// `allow`, `ask` and `report`.
 pub(crate) const VERDICT: &str = "verdict";
+
+/// The option of [`VERDICT`] that lets a submission run: `allow` for a
+/// gatekeeper, and `proceed` for a bumper's shell spec. A program spec keeps
+/// its `allow` in both modes.
+pub(crate) fn pass_option(case: CouncilCase, mode: CouncilMode) -> &'static str {
+    match (case, mode) {
+        (CouncilCase::Shell, CouncilMode::Bumper) => "proceed",
+        _ => "allow",
+    }
+}
 
 /// The tool whose gate-policy ask the council may decide on the RPC paths.
 const SHELL_WRITE: &str = "shell_write";
@@ -294,6 +304,9 @@ pub(crate) enum Outcome {
     Allow,
     Ask,
     Report,
+    /// Bumper mode: refuse with guidance. The flavor is the non-pass option
+    /// the pool chose, or a program's failing rubric answers.
+    Bump(String),
     /// No usable answer; the cause in plain words.
     Miss(String),
 }
@@ -304,6 +317,7 @@ impl Outcome {
             Self::Allow => (CouncilOutcome::Allow, None),
             Self::Ask => (CouncilOutcome::Ask, None),
             Self::Report => (CouncilOutcome::Report, None),
+            Self::Bump(_) => (CouncilOutcome::Bump, None),
             Self::Miss(cause) => (CouncilOutcome::Miss, Some(cause.clone())),
         }
     }
@@ -434,8 +448,9 @@ pub(crate) fn classify_case(
     let Some(pooled) = verdict.clone() else {
         return miss(format!("the answer has no `{VERDICT}` choice"), Some(threshold));
     };
-    let Some(p_allow) = pooled.p("allow") else {
-        return miss(format!("the `{VERDICT}` choice has no `allow` option"), Some(threshold));
+    let pass = pass_option(case, council.mode);
+    let Some(p_allow) = pooled.p(pass) else {
+        return miss(format!("the `{VERDICT}` choice has no `{pass}` option"), Some(threshold));
     };
     let hits = response.signals.as_ref().map(|s| s.control_text.len()).unwrap_or(0);
     if hits > 0 {
@@ -446,7 +461,7 @@ pub(crate) fn classify_case(
         CouncilCase::Program => RUBRIC.iter().map(|(q, _)| *q).chain([VERDICT]).collect(),
     };
     let allows = |question: &str, choice: &str| match question {
-        VERDICT => choice == "allow",
+        VERDICT => choice == pass,
         q => RUBRIC.iter().any(|(r, ok)| *r == q && ok.contains(&choice)),
     };
     let deciding: &[&str] = match case {
@@ -492,12 +507,49 @@ pub(crate) fn classify_case(
     };
     let outcome = if pooled_allows && (!council.require_agree || every_read_allows) {
         Outcome::Allow
+    } else if council.mode == CouncilMode::Bumper {
+        match bump_flavor(case, &pooled, pass, &rubric, &allows) {
+            Some(flavor) => Outcome::Bump(flavor),
+            None => {
+                return miss(format!("the `{VERDICT}` choice has no option besides `{pass}` to bump with"), Some(threshold));
+            }
+        }
     } else if pooled.choice == "report" {
         Outcome::Report
     } else {
         Outcome::Ask
     };
     Classification { outcome, threshold: Some(threshold), verdict, rubric }
+}
+
+/// What a bump is called. A shell decision's flavor is the pooled argmax
+/// among the options other than `pass`, the first in the spec's order on a
+/// tie. A program decision's is the rubric answers that held it, as
+/// `question=choice` joined by commas; reads that disagree with a pooled
+/// allow are `reads_disagree`.
+fn bump_flavor(
+    case: CouncilCase,
+    pooled: &PooledVerdict,
+    pass: &str,
+    rubric: &[(String, String)],
+    allows: &dyn Fn(&str, &str) -> bool,
+) -> Option<String> {
+    match case {
+        CouncilCase::Shell => pooled
+            .probabilities
+            .iter()
+            .filter(|(o, _)| o != pass)
+            .fold(None::<&(String, f64)>, |best, next| match best {
+                Some(b) if b.1 >= next.1 => Some(b),
+                _ => Some(next),
+            })
+            .map(|(o, _)| o.clone()),
+        CouncilCase::Program => {
+            let held: Vec<String> =
+                rubric.iter().filter(|(q, c)| !allows(q, c)).map(|(q, c)| format!("{q}={c}")).collect();
+            Some(if held.is_empty() { "reads_disagree".to_string() } else { held.join(", ") })
+        }
+    }
 }
 
 /// A council failure that produced no response, in plain words.
@@ -642,6 +694,18 @@ pub(crate) struct CouncilVerdict {
     programs: Vec<ProgramVerdict>,
     /// A program decision's pooled rubric answers ([`RUBRIC`] order).
     rubric: Vec<(String, String)>,
+    /// For a bump: the flavor and its guidance.
+    bump: Option<BumpReason>,
+    /// The flavors of the bumps this submission already got, when it has
+    /// reached the bump limit and so asks.
+    bump_history: Vec<String>,
+}
+
+/// A decision's bump: what it is called and what it tells the seat.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BumpReason {
+    pub(crate) flavor: String,
+    pub(crate) guidance: String,
 }
 
 /// One program a submission runs, as the gate judged it.
@@ -701,6 +765,35 @@ impl CouncilVerdict {
         self.outcome == Outcome::Allow && self.programs.iter().all(ProgramVerdict::allows)
     }
 
+    /// The bump that refuses this submission, in bumper mode: the shell
+    /// decision's when it bumped, else the first program decision that did.
+    /// `None` unless every decision is a pass or a bump and at least one is
+    /// a bump: a miss, an ask, a program not judged, or no bump at all
+    /// leaves the submission to the ordinary ask or run.
+    pub(crate) fn submission_bump(&self) -> Option<BumpReason> {
+        let passes_or_bumps = |o: &Outcome| matches!(o, Outcome::Allow | Outcome::Bump(_));
+        if !passes_or_bumps(&self.outcome)
+            || !self.programs.iter().all(|p| p.decision.as_ref().is_ok_and(|d| passes_or_bumps(&d.outcome)))
+        {
+            return None;
+        }
+        self.bump
+            .clone()
+            .or_else(|| self.programs.iter().find_map(|p| p.decision.as_ref().ok().and_then(|d| d.bump.clone())))
+    }
+
+    /// The digest of the submission this decision read, as its record
+    /// stores it: what the ledger counts bumps by.
+    pub(crate) fn submission_digest(&self) -> &str {
+        &self.record.submission_digest
+    }
+
+    /// The submission has been bumped as often as the limit allows, so it
+    /// asks: its ask carries the flavors of the earlier bumps.
+    pub(crate) fn at_bump_limit(&mut self, history: Vec<String>) {
+        self.bump_history = history;
+    }
+
     /// The durable record, linked to the ask it led to when there is one.
     pub(crate) fn record_for(&self, request_id: Option<&str>) -> NewCouncilDecision {
         let mut record = self.record.clone();
@@ -748,6 +841,19 @@ impl CouncilVerdict {
     pub(crate) fn signals(&self) -> Vec<NewSignal> {
         let mut signals = vec![self.signal.clone()];
         signals.extend(self.programs.iter().filter_map(|p| p.decision.as_ref().ok()).map(|d| d.signal.clone()));
+        if !self.bump_history.is_empty() {
+            signals.push(NewSignal {
+                source_kind: SignalSourceKind::Council,
+                source_id: Some(self.spec.clone()),
+                model_id: None,
+                weight_hash: None,
+                stmt_seq: None,
+                cmd_seq: None,
+                label: Some(self.bump_history_text()),
+                score: None,
+                verdict: SignalVerdict::Escalate,
+            });
+        }
         signals
     }
 
@@ -765,7 +871,15 @@ impl CouncilVerdict {
                 Err(_) => format!("The submission is held because program {} was not judged.", held.name()),
             });
         }
+        if !self.bump_history.is_empty() {
+            lines.push(format!("The council bumped this submission before it asked: {}.", self.bump_history_text()));
+        }
         lines.join("\n")
+    }
+
+    /// The bumps a submission got before it asked, as the ask shows them.
+    fn bump_history_text(&self) -> String {
+        format!("bumped {} times ({})", self.bump_history.len(), self.bump_history.join("; "))
     }
 
     /// The files the program decisions read, by the hash of the bytes they
@@ -1031,7 +1145,11 @@ fn build_verdict(
     // record keeps whatever numbers the server sent.
     let p_allow = match classification.outcome {
         Outcome::Miss(_) => None,
-        _ => verdict.and_then(|v| v.p("allow")),
+        _ => verdict.and_then(|v| v.p(pass_option(spec.case, council.mode))),
+    };
+    let bump_flavor = match &classification.outcome {
+        Outcome::Bump(flavor) => Some(flavor.clone()),
+        _ => None,
     };
     let record = NewCouncilDecision {
         request_id: None,
@@ -1054,6 +1172,7 @@ fn build_verdict(
             Seen::Answered(p, _) | Seen::Prepared(p) => p.seat().map(|c| c.head.to_string()),
             Seen::Nothing => None,
         },
+        bump_flavor,
         reads,
         pooled,
         control_text,
@@ -1061,6 +1180,7 @@ fn build_verdict(
     let rubric = classification.rubric.iter().map(|(q, c)| format!("{q}={c}")).collect::<Vec<_>>().join(", ");
     let label = match &classification.outcome {
         Outcome::Miss(cause) => format!("miss: {cause}"),
+        Outcome::Bump(flavor) => format!("bump: {flavor}"),
         other => other_word(other).to_string(),
     };
     let signal = NewSignal {
@@ -1104,6 +1224,8 @@ fn build_verdict(
         decide_span: None,
         programs: Vec::new(),
         rubric: classification.rubric,
+        bump: None,
+        bump_history: Vec::new(),
     }
 }
 
@@ -1112,6 +1234,7 @@ fn other_word(outcome: &Outcome) -> &'static str {
         Outcome::Allow => "allow",
         Outcome::Ask => "ask",
         Outcome::Report => "report",
+        Outcome::Bump(_) => "bump",
         Outcome::Miss(_) => "miss",
     }
 }
@@ -1138,6 +1261,8 @@ pub(crate) async fn decide(
         council.p_allow = tracing::field::Empty,
         council.p_ask = tracing::field::Empty,
         council.p_report = tracing::field::Empty,
+        council.p_proceed = tracing::field::Empty,
+        council.bump_flavor = tracing::field::Empty,
         council.agree = tracing::field::Empty,
         council.spread = tracing::field::Empty,
         council.model = tracing::field::Empty,
@@ -1165,6 +1290,10 @@ pub(crate) async fn decide(
     if let Outcome::Miss(cause) = &verdict.outcome {
         span.record("council.miss_cause", cause.as_str());
     }
+    let bump_flavor = verdict.record.bump_flavor.as_deref().unwrap_or("");
+    if !bump_flavor.is_empty() {
+        span.record("council.bump_flavor", bump_flavor);
+    }
     let seat_head = verdict.record.seat_head.as_deref().unwrap_or("none");
     span.record("council.seat_head", seat_head);
     tracing::info!(
@@ -1172,6 +1301,7 @@ pub(crate) async fn decide(
         spec = %spec.name,
         outcome = other_word(&verdict.outcome),
         p_allow = verdict.p_allow,
+        bump_flavor,
         seat_head,
         context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
         "{}",
@@ -1217,7 +1347,8 @@ async fn decide_inner(
     span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
     span.record("council.model", prepared.identity.model.as_str());
     span.record("council.spec_id", prepared.spec_id.as_str());
-    if let Some(cause) = spec_lacks_verdict(&prepared.spec).or_else(|| match spec.case {
+    let pass = pass_option(spec.case, council.mode);
+    if let Some(cause) = spec_lacks_pass(&prepared.spec, pass).or_else(|| match spec.case {
         CouncilCase::Shell => None,
         CouncilCase::Program => spec_lacks_rubric(&prepared.spec),
     }) {
@@ -1248,7 +1379,12 @@ async fn decide_inner(
         span.record("council.queue_ms", ms);
     }
     if let Some(v) = &classification.verdict {
-        for (option, field) in [("allow", "council.p_allow"), ("ask", "council.p_ask"), ("report", "council.p_report")] {
+        for (option, field) in [
+            ("allow", "council.p_allow"),
+            ("ask", "council.p_ask"),
+            ("report", "council.p_report"),
+            ("proceed", "council.p_proceed"),
+        ] {
             if let Some(p) = v.p(option) {
                 span.record(field, p);
             }
@@ -1277,9 +1413,16 @@ async fn decide_inner(
             answers: serde_json::Value::Array(answers),
         });
     }
+    let bump = match &classification.outcome {
+        Outcome::Bump(flavor) => {
+            Some(BumpReason { flavor: flavor.clone(), guidance: bump_guidance(&prepared.spec, spec.case, flavor) })
+        }
+        _ => None,
+    };
     let mut verdict =
         build_verdict(caller, &case, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
     verdict.report = reported;
+    verdict.bump = bump;
     verdict
 }
 
@@ -1287,11 +1430,55 @@ async fn decide_inner(
 /// [`VERDICT`] choice with an `allow` option, and a spec without one would
 /// only ever miss.
 fn spec_lacks_verdict(spec: &kaijutsu_council::wire::Spec) -> Option<String> {
+    spec_lacks_pass(spec, "allow")
+}
+
+/// [`spec_lacks_verdict`] for the pass option `pass` ([`pass_option`]). A
+/// bumper's `proceed` also needs another option: every other option is a
+/// bump flavor, and a spec with none could only pass or miss.
+fn spec_lacks_pass(spec: &kaijutsu_council::wire::Spec, pass: &str) -> Option<String> {
     use kaijutsu_council::wire::SpecQuestion;
     match spec.questions.iter().find(|q| q.id() == VERDICT) {
-        Some(SpecQuestion::Choice(c)) if c.criteria.iter().any(|o| o.option == "allow") => None,
-        Some(_) => Some(format!("spec {} has no `allow` option on its `{VERDICT}` choice", spec.name)),
+        Some(SpecQuestion::Choice(c)) if c.criteria.iter().any(|o| o.option == pass) => {
+            if pass == "proceed" && c.criteria.len() < 2 {
+                Some(format!("spec {} has no option to bump with besides `proceed` on its `{VERDICT}` choice", spec.name))
+            } else {
+                None
+            }
+        }
+        Some(_) => Some(format!("spec {} has no `{pass}` option on its `{VERDICT}` choice", spec.name)),
         None => Some(format!("spec {} has no `{VERDICT}` choice", spec.name)),
+    }
+}
+
+/// What a bump tells the seat: the flavor and the guidance for it. A shell
+/// decision's guidance is the flavor's `means` text from the spec; a
+/// program decision's names its rubric answers.
+fn bump_guidance(spec: &kaijutsu_council::wire::Spec, case: CouncilCase, flavor: &str) -> String {
+    use kaijutsu_council::wire::SpecQuestion;
+    match case {
+        CouncilCase::Shell => spec
+            .questions
+            .iter()
+            .find_map(|q| match q {
+                SpecQuestion::Choice(c) if c.id == VERDICT => {
+                    c.criteria.iter().find(|o| o.option == flavor).map(|o| o.means.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("the council chose {flavor}")),
+        CouncilCase::Program => flavor
+            .split(", ")
+            .map(|held| match held {
+                "originals=changes" => {
+                    "the program changes original data with no backup: back it up or work on a copy first.".to_string()
+                }
+                "network=other" => "the program reaches the network beyond installing packages: stay local.".to_string(),
+                "reads_disagree" => "the council's reads disagree about whether the program is safe.".to_string(),
+                other => format!("the council did not accept {other}."),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -1604,6 +1791,8 @@ mod tests {
             voices: false,
             seat: false,
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
+            mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
+            bump_limit: crate::kj::gate_policy::DEFAULT_BUMP_LIMIT,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
@@ -1940,5 +2129,124 @@ mod tests {
             Outcome::Miss(cause) => assert!(cause.contains("`originals`"), "{cause}"),
             other => panic!("a rubric read below the floor is a miss, got {other:?}"),
         }
+    }
+
+    const BUMP_OPTIONS: [&str; 3] = ["proceed", "try_harder", "do_less"];
+
+    fn bumper(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
+        let mut c = council(allow_at, mass_floor, require_agree);
+        c.mode = crate::kj::gate_policy::CouncilMode::Bumper;
+        c
+    }
+
+    fn bump_classified(logprobs: &[[f64; 3]], council: &CouncilConfig) -> Classification {
+        let req = request();
+        let value = test_support::answer_choices(&req, &[(VERDICT, BUMP_OPTIONS, logprobs)]);
+        classify(&req, &decode(value), council, "shell-gate")
+    }
+
+    /// Two confident reads of proceed, of try_harder, of do_less.
+    const PROCEED: [[f64; 3]; 2] = [[-0.001, -8.0, -9.0], [-0.002, -7.5, -9.0]];
+    const TRY_HARDER: [[f64; 3]; 2] = [[-4.0, -0.03, -5.0], [-3.5, -0.04, -5.0]];
+    const DO_LESS: [[f64; 3]; 2] = [[-6.0, -3.0, -0.04], [-6.0, -2.5, -0.03]];
+
+    #[test]
+    fn a_confident_agreed_proceed_passes_in_bumper_mode() {
+        let c = bump_classified(&PROCEED, &bumper(0.98, -0.05, true));
+        assert_eq!(c.outcome, Outcome::Allow);
+        assert!(c.verdict.unwrap().p("proceed").unwrap() > 0.99);
+    }
+
+    #[test]
+    fn a_bump_names_the_flavor_the_pool_chose() {
+        let try_harder = bump_classified(&TRY_HARDER, &bumper(0.98, -2.0, true)).outcome;
+        assert_eq!(try_harder, Outcome::Bump("try_harder".into()));
+        let do_less = bump_classified(&DO_LESS, &bumper(0.98, -2.0, true)).outcome;
+        assert_eq!(do_less, Outcome::Bump("do_less".into()));
+    }
+
+    /// The flavor is the best bump option, not the pooled argmax: proceed
+    /// leads at 0.6 but is under the threshold, so the runner-up chooses.
+    #[test]
+    fn the_flavor_is_the_argmax_among_the_bump_options() {
+        let lean_proceed = [[-0.51, -2.3, -1.6], [-0.51, -2.3, -1.6]];
+        let c = bump_classified(&lean_proceed, &bumper(0.98, -0.2, false));
+        assert_eq!(c.verdict.as_ref().unwrap().choice, "proceed", "{c:?}");
+        assert_eq!(c.outcome, Outcome::Bump("do_less".into()), "{c:?}");
+    }
+
+    #[test]
+    fn disagreement_bumps_in_bumper_mode_when_agreement_is_required() {
+        let split = [[-0.01, -5.0, -9.0], [-1.0, -0.5, -9.0]];
+        assert_eq!(bump_classified(&split, &bumper(0.5, -2.0, false)).outcome, Outcome::Allow);
+        assert_eq!(bump_classified(&split, &bumper(0.5, -2.0, true)).outcome, Outcome::Bump("try_harder".into()));
+    }
+
+    /// Bumper mode never weakens the declared fallback: a control-text hit
+    /// asks, and a thin read is a miss.
+    #[test]
+    fn control_text_and_a_thin_read_keep_their_fallback_in_bumper_mode() {
+        let req = request();
+        let mut value = test_support::answer_choices(&req, &[(VERDICT, BUMP_OPTIONS, &PROCEED)]);
+        value["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+        let c = classify(&req, &decode(value), &bumper(0.98, -0.05, true), "shell-gate");
+        assert_eq!(c.outcome, Outcome::Ask);
+        let thin = [[-0.001, -8.0, -9.0], [-2.0, -9.0, -9.0]];
+        assert!(matches!(bump_classified(&thin, &bumper(0.5, -0.05, false)).outcome, Outcome::Miss(_)));
+    }
+
+    /// A gatekeeper spec answers `allow`, not `proceed`; read as a bumper's
+    /// it has no pass option, which is a miss with that cause.
+    #[test]
+    fn a_bumper_response_with_no_proceed_option_is_a_miss() {
+        let c = classified(&ALLOW, &bumper(0.98, -0.05, true));
+        match c.outcome {
+            Outcome::Miss(cause) => assert!(cause.contains("`proceed`"), "{cause}"),
+            other => panic!("expected a miss, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bumper_spec_needs_a_proceed_option_and_a_bump_option() {
+        use kaijutsu_council::wire::SpecQuestion;
+        let mut spec: kaijutsu_council::wire::Spec =
+            serde_json::from_str(crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP).unwrap();
+        assert_eq!(spec_lacks_pass(&spec, "proceed"), None);
+        let gate: kaijutsu_council::wire::Spec =
+            serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
+        let cause = spec_lacks_pass(&gate, "proceed").unwrap();
+        assert!(cause.contains("no `proceed` option") && cause.contains(VERDICT), "{cause}");
+        for q in &mut spec.questions {
+            if let SpecQuestion::Choice(c) = q
+                && c.id == VERDICT
+            {
+                c.criteria.retain(|o| o.option == "proceed");
+            }
+        }
+        let cause = spec_lacks_pass(&spec, "proceed").unwrap();
+        assert!(cause.contains("no option to bump with"), "{cause}");
+    }
+
+    /// A program decision in bumper mode keeps its rubric: an allow passes,
+    /// and anything else bumps with the rubric answers that held it.
+    #[test]
+    fn a_program_decision_bumps_with_its_rubric_in_bumper_mode() {
+        use super::test_support::program_answer;
+        let req = request();
+        let mut council = program_council();
+        council.mode = crate::kj::gate_policy::CouncilMode::Bumper;
+        let lean = |o: [f64; 3], n: [f64; 3], v: [f64; 3]| {
+            classify_case(&req, &decode(program_answer(&req, o, n, v)), &council, "program-gate", CouncilCase::Program)
+        };
+        const FIRST: [f64; 3] = [-0.2, -2.5, -3.0];
+        const LAST: [f64; 3] = [-3.0, -2.5, -0.2];
+        assert_eq!(lean(FIRST, FIRST, FIRST).outcome, Outcome::Allow);
+        assert_eq!(lean(LAST, FIRST, FIRST).outcome, Outcome::Bump("originals=changes".into()));
+        assert_eq!(lean(FIRST, LAST, FIRST).outcome, Outcome::Bump("network=other".into()));
+        assert_eq!(
+            lean(LAST, LAST, LAST).outcome,
+            Outcome::Bump("originals=changes, network=other".into()),
+            "a report argmax bumps too"
+        );
     }
 }

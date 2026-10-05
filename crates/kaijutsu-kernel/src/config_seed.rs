@@ -33,6 +33,18 @@ pub const DEFAULT_GATE_CONFIG: &str = include_str!("../../../assets/defaults/gat
 pub const DEFAULT_COUNCIL_SHELL_GATE: &str =
     include_str!("../../../assets/defaults/council/shell-gate.json");
 
+/// Embedded council spec for shell statements in bumper mode, seeded to
+/// `/config/kernel/council/shell-bump.json` (`docs/council.md`, "Bumper
+/// mode").
+pub const DEFAULT_COUNCIL_SHELL_BUMP: &str =
+    include_str!("../../../assets/defaults/council/shell-bump.json");
+
+/// Embedded text a bump tells the seat, seeded to
+/// `/config/kernel/council/bump.md`. The host file is the live body, read at
+/// each bump.
+pub const DEFAULT_COUNCIL_BUMP_MESSAGE: &str =
+    include_str!("../../../assets/defaults/council/bump.md");
+
 /// Embedded council spec for the programs a submission runs, seeded to
 /// `/config/kernel/council/program-gate.json` (`docs/council.md`, "Programs
 /// are cases of their own").
@@ -96,6 +108,8 @@ pub fn config_seed_files() -> Vec<(String, &'static str)> {
         (config_path("mcp.toml"), DEFAULT_MCP_CONFIG),
         (config_path("gate.toml"), DEFAULT_GATE_CONFIG),
         (config_path("council/shell-gate.json"), DEFAULT_COUNCIL_SHELL_GATE),
+        (config_path("council/shell-bump.json"), DEFAULT_COUNCIL_SHELL_BUMP),
+        (config_path("council/bump.md"), DEFAULT_COUNCIL_BUMP_MESSAGE),
         (config_path("council/program-gate.json"), DEFAULT_COUNCIL_PROGRAM_GATE),
         (config_path("council/direction-check.json"), DEFAULT_COUNCIL_DIRECTION_CHECK),
         (config_path("continuation.toml"), DEFAULT_CONTINUATION_CONFIG),
@@ -376,6 +390,37 @@ mod tests {
         assert_eq!(
             config_seed_body(&config_path("council/shell-gate.json")),
             Some(DEFAULT_COUNCIL_SHELL_GATE)
+        );
+    }
+
+    #[test]
+    fn council_shell_bump_spec_names_proceed_and_two_bump_flavors() {
+        let spec: kaijutsu_council::wire::Spec =
+            serde_json::from_str(DEFAULT_COUNCIL_SHELL_BUMP).expect("the contract's spec shape");
+        assert_eq!(spec.name, "shell-bump");
+        let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
+        assert_eq!(ids, ["verdict"], "no text question, as the shell gate has none");
+        let kaijutsu_council::wire::SpecQuestion::Choice(verdict) = &spec.questions[0] else {
+            panic!("the verdict is a choice")
+        };
+        let options: Vec<&str> = verdict.criteria.iter().map(|c| c.option.as_str()).collect();
+        assert_eq!(options, ["proceed", "try_harder", "do_less"]);
+        kaijutsu_council::canon::spec_id(&spec).expect("the spec canonicalizes");
+        assert_eq!(
+            config_seed_body(&config_path("council/shell-bump.json")),
+            Some(DEFAULT_COUNCIL_SHELL_BUMP)
+        );
+    }
+
+    #[test]
+    fn the_bump_message_template_directs_and_names_its_placeholders() {
+        for placeholder in ["{guidance}", "{attempt}", "{limit}"] {
+            assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains(placeholder), "the default lacks {placeholder}");
+        }
+        assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Try harder, a different approach"));
+        assert_eq!(
+            config_seed_body(&config_path("council/bump.md")),
+            Some(DEFAULT_COUNCIL_BUMP_MESSAGE)
         );
     }
 

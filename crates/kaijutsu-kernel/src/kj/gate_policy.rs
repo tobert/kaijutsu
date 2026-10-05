@@ -382,6 +382,16 @@ pub(crate) enum CouncilPoolWeights {
     Mass,
 }
 
+/// How the council's answer acts (`docs/council.md`, "Bumper mode").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CouncilMode {
+    /// Allow runs the submission; anything else opens an ask. The default.
+    Gatekeeper,
+    /// Proceed runs the submission; anything else refuses it with guidance
+    /// and no ask, until the bump limit.
+    Bumper,
+}
+
 /// The kind of case a council spec reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CouncilCase {
@@ -446,6 +456,11 @@ pub(crate) struct CouncilConfig {
     /// `[council] seat_tokens`: the seat context's budget for the brief and
     /// for the narration, each, estimated at four bytes a token.
     pub(crate) seat_tokens: u64,
+    /// `[council] mode`: gatekeeper (default) or bumper.
+    pub(crate) mode: CouncilMode,
+    /// `[council] bump_limit`: in bumper mode, the bumps one submission gets
+    /// before the next would-be bump is an ordinary ask.
+    pub(crate) bump_limit: u64,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
 }
@@ -477,6 +492,10 @@ struct CouncilToml {
     seat: bool,
     #[serde(default = "default_seat_tokens")]
     seat_tokens: i64,
+    #[serde(default = "default_mode")]
+    mode: String,
+    #[serde(default = "default_bump_limit")]
+    bump_limit: i64,
     #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
@@ -490,6 +509,17 @@ fn default_require_agree() -> bool {
 /// The seat context's default budget, in tokens, for the brief and for the
 /// narration each.
 pub(crate) const DEFAULT_SEAT_TOKENS: u64 = 2000;
+
+/// The bumps one submission gets by default before it asks.
+pub(crate) const DEFAULT_BUMP_LIMIT: u64 = 3;
+
+fn default_bump_limit() -> i64 {
+    DEFAULT_BUMP_LIMIT as i64
+}
+
+fn default_mode() -> String {
+    "gatekeeper".into()
+}
 
 fn default_seat_tokens() -> i64 {
     DEFAULT_SEAT_TOKENS as i64
@@ -685,6 +715,19 @@ impl GateConfig {
                 raw.seat_tokens
             )));
         }
+        let mode = match raw.mode.as_str() {
+            "gatekeeper" => CouncilMode::Gatekeeper,
+            "bumper" => CouncilMode::Bumper,
+            other => {
+                return Err(err(format!("[council] mode: `{other}` is not one of gatekeeper, bumper")))
+            }
+        };
+        if raw.bump_limit <= 0 {
+            return Err(err(format!(
+                "[council] bump_limit: {} must be an integer greater than 0",
+                raw.bump_limit
+            )));
+        }
         if raw.spec.is_empty() {
             return Err(err("[council]: declare at least one [[council.spec]]".into()));
         }
@@ -792,6 +835,8 @@ impl GateConfig {
             voices: raw.voices,
             seat: raw.seat,
             seat_tokens: raw.seat_tokens as u64,
+            mode,
+            bump_limit: raw.bump_limit as u64,
             specs,
             thresholds,
         })
@@ -2549,6 +2594,28 @@ enabled = false
         assert!(m.contains("seat_tokens"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = \"yes\""));
         assert!(m.contains("seat"), "{m}");
+    }
+
+    #[test]
+    fn the_council_mode_defaults_to_gatekeeper_and_parses_bumper() {
+        let c = config(COUNCIL_FULL);
+        assert_eq!(c.council().unwrap().mode, CouncilMode::Gatekeeper);
+        assert_eq!(c.council().unwrap().bump_limit, DEFAULT_BUMP_LIMIT);
+        let bumper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bumper\"\nbump_limit = 5"));
+        assert_eq!(bumper.council().unwrap().mode, CouncilMode::Bumper);
+        assert_eq!(bumper.council().unwrap().bump_limit, 5);
+        let gatekeeper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"gatekeeper\""));
+        assert_eq!(gatekeeper.council().unwrap().mode, CouncilMode::Gatekeeper);
+    }
+
+    #[test]
+    fn the_council_mode_and_bump_limit_reject_junk() {
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bouncer\""));
+        assert!(m.contains("mode") && m.contains("bouncer") && m.contains("gatekeeper, bumper"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nbump_limit = 0"));
+        assert!(m.contains("bump_limit"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nbump_limit = \"three\""));
+        assert!(m.contains("bump_limit"), "{m}");
     }
 
     #[test]

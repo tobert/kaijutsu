@@ -19,6 +19,8 @@ pub enum CouncilOutcome {
     Allow,
     Ask,
     Report,
+    /// Bumper mode: the council refused the action with guidance.
+    Bump,
     Miss,
 }
 
@@ -28,6 +30,7 @@ impl CouncilOutcome {
             Self::Allow => "allow",
             Self::Ask => "ask",
             Self::Report => "report",
+            Self::Bump => "bump",
             Self::Miss => "miss",
         }
     }
@@ -136,6 +139,10 @@ pub struct NewCouncilDecision {
     /// That read's row is the one whose context is `context_id`.
     #[serde(default)]
     pub seat_head: Option<String>,
+    /// A bump's flavor: the non-pass option the council chose. Set for a
+    /// `Bump` and for nothing else.
+    #[serde(default)]
+    pub bump_flavor: Option<String>,
     pub reads: Vec<CouncilRead>,
     pub pooled: Vec<CouncilPooled>,
     pub control_text: Vec<CouncilControlText>,
@@ -156,6 +163,14 @@ fn invalid(message: impl Into<String>) -> LedgerError {
 }
 
 fn check_outcome_and_cause(d: &NewCouncilDecision) -> Result<()> {
+    match (d.outcome, d.bump_flavor.as_deref()) {
+        (CouncilOutcome::Bump, None) => return Err(invalid("a bump must carry its flavor")),
+        (CouncilOutcome::Bump, Some("")) => return Err(invalid("a bump flavor must not be empty")),
+        (CouncilOutcome::Bump, Some(_)) | (_, None) => {}
+        (outcome, Some(_)) => {
+            return Err(invalid(format!("only a bump carries a flavor, this outcome is {}", outcome.as_str())));
+        }
+    }
     match (d.outcome, d.miss_cause.as_deref()) {
         (CouncilOutcome::Miss, None) => Err(invalid("a miss must carry its cause")),
         (CouncilOutcome::Miss, Some("")) => Err(invalid("a miss cause must not be empty")),
@@ -203,9 +218,9 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             decision_id, request_id, context_id, principal_id, submission_digest, spec_id, spec_name,
             server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
             allow_at, mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread,
-            control_text_hits, queue_ms, ms, created_at, seat_head
+            control_text_hits, queue_ms, ms, created_at, seat_head, bump_flavor
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                   ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             decision_id,
             d.request_id,
@@ -234,6 +249,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             d.ms,
             crate::time::now_millis(),
             d.seat_head,
+            d.bump_flavor,
         ],
     )?;
     for (read_idx, read) in d.reads.iter().enumerate() {
@@ -282,7 +298,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
 const DECISION_COLUMNS: &str = "decision_id, request_id, context_id, principal_id, submission_digest, spec_id, \
     spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights, allow_at, \
     mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread, control_text_hits, queue_ms, ms, \
-    created_at, seat_head";
+    created_at, seat_head, bump_flavor";
 
 /// Load one decision with its reads, pooled probabilities, and control-text
 /// hits. `None` when no decision has this id.
@@ -323,6 +339,30 @@ pub fn list_council_decisions_for_context(
         ),
         params![context_id, limit],
     )
+}
+
+/// The flavors of the bumps the council refused for this context's
+/// submission, oldest first; the count of bumps is the length. The
+/// submission's shell decision (its digest is the command's) is a refused
+/// bump when it bumped, or when one of its programs did: its flavor is the
+/// shell's own, else the first bumping program's. A refused bump has no ask:
+/// a bump at the limit becomes an ask, and its decision links to that ask,
+/// so it does not count again.
+pub fn list_bump_flavors(conn: &Connection, context_id: &[u8], submission_digest: &str) -> Result<Vec<String>> {
+    const PROGRAM_BUMP: &str = "SELECT pd.bump_flavor FROM council_programs p
+        JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+        WHERE p.decision_id = d.decision_id AND pd.outcome = 'bump' ORDER BY p.seq LIMIT 1";
+    let mut stmt = conn.prepare(&format!(
+        "SELECT CASE WHEN d.outcome = 'bump' THEN d.bump_flavor ELSE ({PROGRAM_BUMP}) END
+         FROM council_decisions d
+         WHERE d.context_id = ?1 AND d.submission_digest = ?2 AND d.request_id IS NULL
+           AND (d.outcome = 'bump' OR EXISTS ({PROGRAM_BUMP}))
+         ORDER BY d.created_at ASC, d.decision_id ASC"
+    ))?;
+    let flavors = stmt
+        .query_map(params![context_id, submission_digest], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(flavors)
 }
 
 fn list(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<CouncilDecision>> {
@@ -389,6 +429,7 @@ fn decode_decision(row: &Row<'_>) -> rusqlite::Result<DecisionHead> {
             queue_ms: row.get("queue_ms")?,
             ms: row.get("ms")?,
             seat_head: row.get("seat_head")?,
+            bump_flavor: row.get("bump_flavor")?,
             reads: Vec::new(),
             pooled: Vec::new(),
             control_text: Vec::new(),
@@ -623,6 +664,7 @@ mod tests {
             queue_ms: 3,
             ms: 41,
             seat_head: Some("snap:seat".into()),
+            bump_flavor: None,
             reads: vec![read(Some(&[1, 1]), "a"), read(None, "b")],
             pooled: vec![
                 CouncilPooled { question_id: "undo".into(), option: "yes".into(), probability: 0.8 },
@@ -772,6 +814,91 @@ mod tests {
         let id = insert_council_decision(&conn, &miss).unwrap();
         let loaded = load_council_decision(&conn, &id).unwrap().unwrap();
         assert_eq!(loaded.decision.miss_cause.as_deref(), Some("deadline"));
+    }
+
+    #[test]
+    fn a_bump_carries_its_flavor_and_only_a_bump_has_one() {
+        let conn = open_memory();
+        let mut bump = decision();
+        bump.outcome = CouncilOutcome::Bump;
+        bump.bump_flavor = None;
+        assert!(matches!(insert_council_decision(&conn, &bump), Err(LedgerError::InvalidCouncilDecision(_))));
+        bump.bump_flavor = Some(String::new());
+        assert!(matches!(insert_council_decision(&conn, &bump), Err(LedgerError::InvalidCouncilDecision(_))));
+
+        let mut flavored = decision();
+        flavored.bump_flavor = Some("try_harder".into());
+        assert!(matches!(insert_council_decision(&conn, &flavored), Err(LedgerError::InvalidCouncilDecision(_))));
+        assert_eq!(count(&conn, "council_decisions"), 0);
+
+        bump.bump_flavor = Some("try_harder".into());
+        let id = insert_council_decision(&conn, &bump).unwrap();
+        let loaded = load_council_decision(&conn, &id).unwrap().unwrap();
+        assert_eq!(loaded.decision.outcome, CouncilOutcome::Bump);
+        assert_eq!(loaded.decision.bump_flavor.as_deref(), Some("try_harder"));
+    }
+
+    /// A refused bump is a bump decision no ask links to. The count and the
+    /// history are per (context, submission digest), oldest first.
+    #[test]
+    fn bumps_are_counted_per_context_and_submission_without_asks() {
+        let conn = open_memory();
+        let bump = |context: &[u8], digest: &str, flavor: &str| {
+            let mut d = decision();
+            d.context_id = context.to_vec();
+            d.submission_digest = digest.into();
+            d.outcome = CouncilOutcome::Bump;
+            d.bump_flavor = Some(flavor.into());
+            insert_council_decision(&conn, &d).unwrap();
+        };
+        bump(ASKING_CONTEXT, "d1", "try_harder");
+        bump(ASKING_CONTEXT, "d1", "do_less");
+        bump(ASKING_CONTEXT, "d2", "try_harder");
+        bump(&[7, 7], "d1", "try_harder");
+        let mut allowed = decision();
+        allowed.submission_digest = "d1".into();
+        insert_council_decision(&conn, &allowed).unwrap();
+        // A bump that opened an ask at the limit is an ask's decision, not a refused bump.
+        let ask = crate::ask::create_ask(&conn, &minimal_ask()).unwrap();
+        let mut asked = decision();
+        asked.request_id = Some(ask);
+        asked.outcome = CouncilOutcome::Bump;
+        asked.bump_flavor = Some("do_less".into());
+        insert_council_decision(&conn, &asked).unwrap();
+
+        // A submission whose shell decision proceeded but whose program bumped
+        // is one refused bump; so is one where both bumped.
+        let program_bump = |digest: &str, shell_outcome: CouncilOutcome, shell_flavor: Option<&str>, flavor: &str| {
+            let mut program = decision();
+            program.submission_digest = "program-text".into();
+            program.outcome = CouncilOutcome::Bump;
+            program.bump_flavor = Some(flavor.into());
+            let program_id = insert_council_decision(&conn, &program).unwrap();
+            let mut shell = decision();
+            shell.submission_digest = digest.into();
+            shell.outcome = shell_outcome;
+            shell.bump_flavor = shell_flavor.map(str::to_owned);
+            let shell_id = insert_council_decision(&conn, &shell).unwrap();
+            insert_council_programs_within(&conn, &shell_id, &[CouncilProgram {
+                statement_idx: 0,
+                command: "python3 x.py".into(),
+                language: "python".into(),
+                path: None,
+                sha256: None,
+                imports_not_shown: vec![],
+                unread_cause: None,
+                program_decision_id: Some(program_id),
+            }])
+            .unwrap();
+        };
+        program_bump("d3", CouncilOutcome::Allow, None, "originals=changes");
+        program_bump("d3", CouncilOutcome::Bump, Some("do_less"), "network=other");
+        assert_eq!(list_bump_flavors(&conn, ASKING_CONTEXT, "d3").unwrap(), ["originals=changes", "do_less"]);
+
+        assert_eq!(list_bump_flavors(&conn, ASKING_CONTEXT, "d1").unwrap(), ["try_harder", "do_less"]);
+        assert_eq!(list_bump_flavors(&conn, ASKING_CONTEXT, "d2").unwrap(), ["try_harder"]);
+        assert_eq!(list_bump_flavors(&conn, &[7, 7], "d1").unwrap(), ["try_harder"]);
+        assert!(list_bump_flavors(&conn, ASKING_CONTEXT, "nothing").unwrap().is_empty());
     }
 
     #[test]

@@ -318,6 +318,7 @@ mod tests {
                 reads: vec![],
                 pooled: vec![],
                 seat_head: None,
+                bump_flavor: None,
                 control_text: vec![],
             },
         )
