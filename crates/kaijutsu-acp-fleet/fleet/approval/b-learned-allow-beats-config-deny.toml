@@ -9,12 +9,12 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
 text = "noted"
-tool_calls = [{ name = "done", input = { status = "done", summary = "recorded a run" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "recorded a run" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "echo ran >> runs.txt" } }]
 [[model]]
 text = "ran it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "recorded another run" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "recorded another run" } }]
 
 # The client answers "always allow", which remembers an exact-text rule, and
 # the held turn runs the command.

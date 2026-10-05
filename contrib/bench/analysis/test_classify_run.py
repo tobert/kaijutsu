@@ -690,6 +690,17 @@ class TestVerdictInAnalyzeRun(unittest.TestCase):
         self.assertEqual(report["verdict_reason"], "no network")
         self.assertEqual(report["verdict_source"], "done_tool")
 
+    def test_done_feedback_and_a_refusal_are_the_verdict(self):
+        events = [
+            tool_call("t1", kind="other", title="done",
+                      raw_input={"status": "refused", "feedback": "the units are never stated"}),
+            tool_call_update("t1", status="completed", text="refused: the units are never stated"),
+        ]
+        report = cr.analyze_run(events, base_summary())
+        self.assertEqual(report["verdict"], "refused")
+        self.assertEqual(report["verdict_reason"], "the units are never stated")
+        self.assertEqual(report["verdict_source"], "done_tool")
+
     def test_a_failed_done_call_is_no_verdict(self):
         events = [
             tool_call("t1", kind="other", title="done", raw_input={"status": "done", "summary": " "}),

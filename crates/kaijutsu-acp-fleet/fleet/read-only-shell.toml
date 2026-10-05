@@ -11,7 +11,7 @@ kj binding allow "facade:shell"
 tool_calls = [{ name = "shell", input = { command = "id" } }]
 [[model]]
 text = "use shell_write then"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "the read-only shell refuses id" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "the read-only shell refuses id" } }]
 
 [[prompt]]
 text = "who am I"

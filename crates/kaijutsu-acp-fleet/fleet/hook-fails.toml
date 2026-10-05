@@ -14,7 +14,7 @@ no-such-command-in-the-fleet
 tool_calls = [{ name = "shell_write", input = { command = "mkdir crashed" } }]
 [[model]]
 text = "refused"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir crashed was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir crashed was denied" } }]
 
 [[prompt]]
 text = "make the crashed directory"

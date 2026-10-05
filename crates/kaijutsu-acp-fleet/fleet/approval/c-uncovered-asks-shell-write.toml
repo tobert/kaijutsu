@@ -9,7 +9,7 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir uncovered" } }]
 [[model]]
 text = "left it alone"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir uncovered was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir uncovered was denied" } }]
 
 [[prompt]]
 text = "make the uncovered directory"

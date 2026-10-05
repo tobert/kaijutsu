@@ -25,19 +25,19 @@ exit 0
 tool_calls = [{ name = "shell_write", input = { command = "mkdir tier-allowed" } }]
 [[model]]
 text = "made it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the directory" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the directory" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "dd if=seed.txt of=copy.txt" } }]
 [[model]]
 text = "refused"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "dd is denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "dd is denied" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mv seed.txt moved.txt" } }]
 [[model]]
 text = "left it alone"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "the move was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "the move was denied" } }]
 
 [[prompt]]
 text = "make the directory"

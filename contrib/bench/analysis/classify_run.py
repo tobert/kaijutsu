@@ -572,8 +572,9 @@ def analyze_run(
     # --- the `done` tool --------------------------------------------------
     # A context offered `done` (builtin.turn) ends its task by calling it.
     # The last completed call wins over any verdict line; a failed call (an
-    # empty summary, say) is no verdict. `gave_up` reads as the line's
-    # "gave up" so the two sources compare.
+    # empty feedback, say) is no verdict. `gave_up` reads as the line's
+    # "gave up" so the two sources compare. The tool's text field is
+    # `feedback`; jobs from before 2026-10-05 call it `summary`.
     done_calls = [
         tool_states[tid] for tid in tools_by_recency
         if tool_states[tid].title == "done" and tool_states[tid].status == "completed"
@@ -582,8 +583,8 @@ def analyze_run(
     if done_calls:
         done_input = done_calls[-1].raw_input
         verdict = done_input["status"].replace("_", " ")
-        done_summary = done_input.get("summary")
-        verdict_reason = done_summary.strip() if isinstance(done_summary, str) and done_summary.strip() else None
+        done_feedback = done_input.get("feedback", done_input.get("summary"))
+        verdict_reason = done_feedback.strip() if isinstance(done_feedback, str) and done_feedback.strip() else None
         verdict_source = "done_tool"
 
     # --- gate-wait / asks_orphaned -----------------------------------

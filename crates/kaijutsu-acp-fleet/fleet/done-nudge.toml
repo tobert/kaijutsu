@@ -7,7 +7,7 @@ description = "A coder's text-only reply does not end its turn: the kernel's not
 text = "Next I'll run the tests."
 [[model]]
 text = "The tests pass."
-tool_calls = [{ name = "done", input = { status = "done", summary = "the tests pass" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "the tests pass" } }]
 
 # Harbor names a call of kind `other` by its title, so `done` reaches its
 # trajectory as `done` with the verdict as output.

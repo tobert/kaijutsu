@@ -10,7 +10,7 @@ events = [
 # went on; this one ends the task, since a coder's turn ends with `done`.
 [[model]]
 text = "The call was cut off at the output limit."
-tool_calls = [{ name = "done", input = { status = "gave_up", summary = "the file is too large to write in one call" } }]
+tool_calls = [{ name = "done", input = { status = "gave_up", feedback = "the file is too large to write in one call" } }]
 
 [[prompt]]
 text = "write a very large file"

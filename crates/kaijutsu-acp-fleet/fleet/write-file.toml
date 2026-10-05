@@ -7,7 +7,7 @@ tool_calls = [
 
 [[model]]
 text = "wrote it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "wrote notes/fleet.txt" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "wrote notes/fleet.txt" } }]
 
 [[prompt]]
 text = "write the file"

@@ -33,8 +33,11 @@ pub enum DoneStatus {
     /// The task needs something only someone else can give: an answer, an
     /// approval, or access.
     Blocked,
-    /// The task cannot be completed; the summary says why.
+    /// The task cannot be completed; the feedback says why.
     GaveUp,
+    /// The task as given is unsafe, or too ambiguous to do safely without
+    /// guessing; the feedback says what is missing.
+    Refused,
 }
 
 impl DoneStatus {
@@ -43,6 +46,7 @@ impl DoneStatus {
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::GaveUp => "gave_up",
+            Self::Refused => "refused",
         }
     }
 }
@@ -53,11 +57,12 @@ impl DoneStatus {
 pub struct DoneParams {
     /// `done` when the task is complete and checked, `blocked` when it needs
     /// something only someone else can give, `gave_up` when it cannot be
-    /// completed.
+    /// completed, `refused` when the task as given is unsafe or too
+    /// ambiguous to do safely without guessing.
     pub status: DoneStatus,
-    /// What happened, for whoever reads the result: what changed and how it
-    /// was checked, what is needed, or why it stopped.
-    pub summary: String,
+    /// "And remember, this is for posterity, so be honest. How do you
+    /// feel?" Free-form, about 50 to 400 words.
+    pub feedback: String,
 }
 
 pub struct BuiltinTurnServer {
@@ -92,9 +97,10 @@ impl McpServerLike for BuiltinTurnServer {
             name: crate::runtime::llm_stream::DONE_TOOL.to_string(),
             description: Some(
                 "End the task and report how it ended. Call it when the task is complete and \
-                 checked, when you are blocked on something only someone else can give, or when \
-                 you are giving up. The turn ends after this call; a reply without a tool call \
-                 does not end it."
+                 checked, when you are blocked on something only someone else can give, when \
+                 you are giving up, or when you refuse a task that is unsafe or too ambiguous to \
+                 do safely. The turn ends after this call; a reply without a tool call does not \
+                 end it."
                     .to_string(),
             ),
             input_schema: tool_input_schema::<DoneParams>(),
@@ -111,10 +117,10 @@ impl McpServerLike for BuiltinTurnServer {
             return Err(McpError::ToolNotFound { instance: self.instance_id.clone(), tool: params.tool });
         }
         let done: DoneParams = serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
-        if done.summary.trim().is_empty() {
-            return Ok(KernelToolResult::error_text("done: the summary is empty; say what happened"));
+        if done.feedback.trim().is_empty() {
+            return Ok(KernelToolResult::error_text("done: the feedback is empty; say what happened"));
         }
-        Ok(KernelToolResult::text(format!("{}: {}", done.status.as_str(), done.summary.trim())))
+        Ok(KernelToolResult::text(format!("{}: {}", done.status.as_str(), done.feedback.trim())))
     }
 
     fn notifications(&self) -> broadcast::Receiver<ServerNotification> {
@@ -131,24 +137,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn done_reports_its_status_and_summary() {
+    async fn done_reports_its_status_and_feedback() {
         let server = BuiltinTurnServer::new();
         let ctx = CallContext::test();
-        let result = server.call_tool(call(serde_json::json!({"status": "gave_up", "summary": "no network"})),
+        let result = server.call_tool(call(serde_json::json!({"status": "gave_up", "feedback": "no network"})),
             &ctx, CancellationToken::new()).await.unwrap();
         assert!(!result.is_error);
         assert!(matches!(result.content.as_slice(), [crate::mcp::ToolContent::Text(t)] if t == "gave_up: no network"),
             "{:?}", result.content);
     }
 
+    /// A seat refuses a task that is unsafe, or too ambiguous to do safely
+    /// without guessing, and says why in its feedback.
     #[tokio::test]
-    async fn done_refuses_an_unknown_status_and_an_empty_summary() {
+    async fn done_reports_a_refusal() {
         let server = BuiltinTurnServer::new();
         let ctx = CallContext::test();
-        assert!(server.call_tool(call(serde_json::json!({"status": "finished", "summary": "x"})),
+        let result = server.call_tool(call(serde_json::json!({"status": "refused", "feedback": "the units are never stated"})),
+            &ctx, CancellationToken::new()).await.unwrap();
+        assert!(matches!(result.content.as_slice(), [crate::mcp::ToolContent::Text(t)] if t == "refused: the units are never stated"),
+            "{:?}", result.content);
+    }
+
+    #[tokio::test]
+    async fn done_refuses_an_unknown_status_an_old_summary_and_empty_feedback() {
+        let server = BuiltinTurnServer::new();
+        let ctx = CallContext::test();
+        assert!(server.call_tool(call(serde_json::json!({"status": "finished", "feedback": "x"})),
             &ctx, CancellationToken::new()).await.is_err());
-        let empty = server.call_tool(call(serde_json::json!({"status": "done", "summary": "  "})),
+        assert!(server.call_tool(call(serde_json::json!({"status": "done", "summary": "x"})),
+            &ctx, CancellationToken::new()).await.is_err(), "the field is feedback now");
+        let empty = server.call_tool(call(serde_json::json!({"status": "done", "feedback": "  "})),
             &ctx, CancellationToken::new()).await.unwrap();
         assert!(empty.is_error);
+    }
+
+    /// The schema a model reads says the feedback is for posterity,
+    /// free-form, and gives its size.
+    #[tokio::test]
+    async fn the_schema_describes_feedback_and_refused() {
+        let server = BuiltinTurnServer::new();
+        let tools = server.list_tools(&CallContext::test()).await.unwrap();
+        let schema = serde_json::to_string(&tools[0].input_schema).unwrap();
+        assert!(schema.contains("\"feedback\"") && !schema.contains("\"summary\""), "{schema}");
+        assert!(schema.contains("posterity") && schema.contains("words"), "{schema}");
+        assert!(schema.contains("refused"), "{schema}");
     }
 }

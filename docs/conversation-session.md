@@ -118,9 +118,9 @@ on `builtin.turn`; `*` does not cover that instance
 The shipped coder does, in its own `rc/coder/create/S10-binding.kai`. Other types keep
 the ordinary ending: text with no tool call ends the turn.
 
-`done` takes a status (`done`, `blocked`, `gave_up`) and a summary, and its
-result reads `status: summary`. When a call in a batch succeeds and no other
-call in that batch failed, the turn ends after the batch settles; no further
+`done` takes a status (`done`, `blocked`, `gave_up`, `refused`) and a
+free-form `feedback`, and its result reads `status: feedback`. When a call
+in a batch succeeds and no other call in that batch failed, the turn ends after the batch settles; no further
 inference runs. A failed sibling keeps the turn going, so the model reads the
 failure before it can finish. Input that arrived
 meanwhile stays pending for the turn's end. A refused call (an empty

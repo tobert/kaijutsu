@@ -2,7 +2,7 @@ description = "A plain chat turn: the model's text reaches the client and the tu
 
 [[model]]
 text = "fleet mock speaking"
-tool_calls = [{ name = "done", input = { status = "done", summary = "said something" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "said something" } }]
 
 [[prompt]]
 text = "say something"

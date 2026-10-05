@@ -10,17 +10,17 @@ allow = ["jq"]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
 text = "noted"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir forbidden was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir forbidden was denied" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger forget \"$(kj ledger rules | jq -r '.[0]')\"" } }]
 [[model]]
 text = "tried to forget it"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "only the reviewer who made the rule can forget it" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "only the reviewer who made the rule can forget it" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]
 text = "still refused"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "a rule denies mkdir forbidden" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "a rule denies mkdir forbidden" } }]
 
 # The client answers "always deny", which remembers the rule.
 [[prompt]]

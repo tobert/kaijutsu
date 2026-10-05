@@ -186,7 +186,7 @@ fn tail_entry(b: &BlockSnapshot, max_bytes: usize) -> serde_json::Value {
 /// Returns the entries and how many admitted blocks were dropped off the front
 /// to honor the cap, so a caller can tell a short turn from a trimmed one.
 /// The verdict of the last successful `done` call after `since`: its status
-/// and summary, as the tool's result states them (`status: summary`).
+/// and feedback, as the tool's result states them (`status: feedback`).
 fn done_verdict(blocks: &[BlockSnapshot], since: Option<usize>) -> Option<(String, String)> {
     let start = since.map_or(0, |i| i + 1);
     let after = blocks.get(start..).unwrap_or_default();
@@ -198,8 +198,8 @@ fn done_verdict(blocks: &[BlockSnapshot], since: Option<usize>) -> Option<(Strin
         if call.tool_name.as_deref() != Some(crate::runtime::llm_stream::DONE_TOOL) {
             return None;
         }
-        let (status, summary) = result.content.split_once(": ")?;
-        Some((status.to_string(), summary.to_string()))
+        let (status, feedback) = result.content.split_once(": ")?;
+        Some((status.to_string(), feedback.to_string()))
     })
 }
 
@@ -496,8 +496,8 @@ impl KjDispatcher {
                 elapsed_ms as f64 / 1000.0
             ),
         }];
-        if let Some((status, summary)) = &verdict {
-            lines.push(format!("done: {status} — {summary}"));
+        if let Some((status, feedback)) = &verdict {
+            lines.push(format!("done: {status} — {feedback}"));
         }
         for entry in &tail {
             let kind = entry["kind"].as_str().unwrap_or("?");
@@ -523,7 +523,7 @@ impl KjDispatcher {
                 "detail": detail,
                 "output_block_id": output_block_id,
                 "resolved_by": resolved_by,
-                "done": verdict.map(|(status, summary)| serde_json::json!({"status": status, "summary": summary})),
+                "done": verdict.map(|(status, feedback)| serde_json::json!({"status": status, "feedback": feedback})),
                 "cursor": cursor,
                 "blocks": tail,
                 "omitted": omitted,
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn the_verdict_is_the_last_successful_done_after_the_seed() {
         let [old_call, old_result] = done_pair(1, "gave_up: earlier task", false);
-        let [bad_call, bad_result] = done_pair(2, "done: the summary is empty", true);
+        let [bad_call, bad_result] = done_pair(2, "done: the feedback is empty", true);
         let [call, result] = done_pair(3, "blocked: needs the deploy key", false);
         let blocks = vec![old_call, old_result, user("next task"), bad_call, bad_result, call, result, model("waiting")];
         assert_eq!(done_verdict(&blocks, Some(2)), Some(("blocked".into(), "needs the deploy key".into())));

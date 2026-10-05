@@ -10,7 +10,7 @@ uncovered = "allow"
 tool_calls = [{ name = "shell_write", input = { command = "echo started; sleep 30; echo never", timeout_ms = 500 } }]
 [[model]]
 text = "it timed out"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "the command timed out after 500 ms" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "the command timed out after 500 ms" } }]
 
 [[prompt]]
 text = "run the slow command"

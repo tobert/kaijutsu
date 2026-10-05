@@ -13,12 +13,12 @@ tool_calls = [
 ]
 [[model]]
 text = "one refused, one ran"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the late directory once" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the late directory once" } }]
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir late" } }]
 [[model]]
 text = "the rule refused it"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "a rule denies mkdir late" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "a rule denies mkdir late" } }]
 
 # Both requests are held until both have arrived. The first is answered
 # "always deny", which remembers a deny rule; only once the bridge has

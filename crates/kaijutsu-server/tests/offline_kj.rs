@@ -224,7 +224,7 @@ fn drive_offline_fails_a_gated_call_instead_of_holding() {
          {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}],
         // A coder ends its task with `done`.
         ["TextStart", {"TextDelta": "understood"}, "TextEnd",
-         {"ToolUse": {"id": "offline-done", "name": "done", "input": {"status": "blocked", "summary": "the call needs an approval"}}},
+         {"ToolUse": {"id": "offline-done", "name": "done", "input": {"status": "blocked", "feedback": "the call needs an approval"}}},
          {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}]
     ]).to_string()).unwrap();
 

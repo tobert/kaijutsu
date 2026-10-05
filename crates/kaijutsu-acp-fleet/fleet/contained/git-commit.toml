@@ -12,7 +12,7 @@ tool_calls = [{ name = "shell_write", input = { command = "git add hello.txt" } 
 tool_calls = [{ name = "shell_write", input = { command = "git commit -q -m 'fleet: first commit'" } }]
 [[model]]
 text = "committed"
-tool_calls = [{ name = "done", input = { status = "done", summary = "committed hello.txt" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "committed hello.txt" } }]
 
 [[prompt]]
 text = "put hello.txt under git and commit it"

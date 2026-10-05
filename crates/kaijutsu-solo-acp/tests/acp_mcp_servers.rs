@@ -66,7 +66,7 @@ fn done(id: &str, reply: &str) -> Value {
         "TextStart",
         {"TextDelta": reply},
         "TextEnd",
-        {"ToolUse": {"id": id, "name": "done", "input": {"status": "done", "summary": reply}}},
+        {"ToolUse": {"id": id, "name": "done", "input": {"status": "done", "feedback": reply}}},
         {"Done": {"stop_reason": "tool_use", "input_tokens": 1, "output_tokens": 1, "extra": null}}
     ])
 }

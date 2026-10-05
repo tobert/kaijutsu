@@ -17,7 +17,7 @@ exit 0
 tool_calls = [{ name = "shell_write", input = { command = "mkdir benign" } }]
 [[model]]
 text = "made it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the benign directory" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the benign directory" } }]
 
 [[prompt]]
 text = "make the benign directory"

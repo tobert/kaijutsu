@@ -11,14 +11,14 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir granted" } }]
 [[model]]
 text = "granted exists now"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the granted directory" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the granted directory" } }]
 
 # Prompt 2: the same shape, answered deny.
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir refused" } }]
 [[model]]
 text = "refused was not made"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir refused was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir refused was denied" } }]
 
 # The `kj` call is the ACP bridge recording the client's answer.
 [[prompt]]

@@ -8,7 +8,7 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir made" } }]
 [[model]]
 text = "ran once"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the made directory" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the made directory" } }]
 
 [[prompt]]
 text = "make the made directory"

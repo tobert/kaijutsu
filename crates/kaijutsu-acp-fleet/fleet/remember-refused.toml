@@ -11,7 +11,7 @@ tool_calls = [{ name = "shell_write", input = { command = "export GREETING=hello
 tool_calls = [{ name = "shell_write", input = { command = "echo $GREETING > greeting.txt" } }]
 [[model]]
 text = "wrote the greeting"
-tool_calls = [{ name = "done", input = { status = "done", summary = "wrote greeting.txt" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "wrote greeting.txt" } }]
 
 [[prompt]]
 text = "write the greeting"

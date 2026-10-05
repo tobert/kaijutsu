@@ -21,13 +21,13 @@ kj binding allow "facade:shell"
 tool_calls = [{ name = "shell", input = { command = "cat seed.txt" } }]
 [[model]]
 text = "refused"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "cat is denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "cat is denied" } }]
 
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "kj ledger list --history --status denied" } }]
 [[model]]
 text = "listed"
-tool_calls = [{ name = "done", input = { status = "done", summary = "listed the denied asks" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "listed the denied asks" } }]
 
 [[prompt]]
 text = "read the seed"

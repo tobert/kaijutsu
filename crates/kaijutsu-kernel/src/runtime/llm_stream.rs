@@ -4179,7 +4179,7 @@ mod publish_tests {
     fn done_call(id: &str) -> Vec<crate::llm::StreamEvent> {
         vec![
             crate::llm::StreamEvent::ToolUse { id: id.into(), name: "done".into(),
-                input: serde_json::json!({"status": "done", "summary": "fixed the build"}) },
+                input: serde_json::json!({"status": "done", "feedback": "fixed the build"}) },
             crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(10), output_tokens: Some(5), extra: None },
         ]
     }
@@ -4241,7 +4241,7 @@ mod publish_tests {
             let batch = vec![
                 crate::llm::StreamEvent::ToolUse { id: "c1".into(), name: "missing_tool".into(), input: serde_json::json!({}) },
                 crate::llm::StreamEvent::ToolUse { id: "c2".into(), name: "done".into(),
-                    input: serde_json::json!({"status": "done", "summary": "all good"}) },
+                    input: serde_json::json!({"status": "done", "feedback": "all good"}) },
                 crate::llm::StreamEvent::Done { stop_reason: Some("tool_use".into()), input_tokens: Some(1), output_tokens: Some(1), extra: None },
             ];
             let (reason, blocks) = turn_offering_done("done-beside-failure",

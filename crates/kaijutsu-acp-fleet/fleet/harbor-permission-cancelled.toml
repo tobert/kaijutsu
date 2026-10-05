@@ -10,7 +10,7 @@ gate = """
 tool_calls = [{ name = "shell_write", input = { command = "mkdir cancelled" } }]
 [[model]]
 text = "the command was refused"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir cancelled was refused" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir cancelled was refused" } }]
 
 # The `kj` call is the ACP bridge recording the denial.
 [[prompt]]

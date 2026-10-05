@@ -19,7 +19,7 @@ exit 3
 tool_calls = [{ name = "shell", input = { command = "mkdir escaped" } }]
 [[model]]
 text = "after the approval"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "the read-only shell refuses mkdir" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "the read-only shell refuses mkdir" } }]
 
 [[prompt]]
 text = "make the escaped directory"

@@ -56,7 +56,7 @@ exit 3
 tool_calls = [{ name = "shell_write", input = { command = "mkdir doomed" } }]
 [[model]]
 text = "left it alone"
-tool_calls = [{ name = "done", input = { status = "blocked", summary = "mkdir doomed was denied" } }]
+tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir doomed was denied" } }]
 
 [[prompt]]
 text = "make the doomed directory"
@@ -82,7 +82,7 @@ tool_calls = [{ name = "shell_write", input = { command = "git init -q" } }]
 # ... write, git add, git commit ...
 [[model]]
 text = "committed"
-tool_calls = [{ name = "done", input = { status = "done", summary = "committed hello.txt" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "committed hello.txt" } }]
 
 [[prompt]]
 text = "put hello.txt under git and commit it"
@@ -134,7 +134,7 @@ exhausted mock script shows up this way.
 ```toml
 [[model]]
 text = "made it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "made the directory" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "made the directory" } }]
 
 [[prompt]]
 text = "make the directory"
@@ -294,7 +294,7 @@ kaijutsu-mcp (path D) have no ACP entry.
 tool_calls = [{ name = "shell_write", input = { command = "while ! [[ -f release ]]; do sleep 0.05; done; echo finished > finished.txt" } }]
 [[model]]
 text = "a fresh turn after the cancel"
-tool_calls = [{ name = "done", input = { status = "done", summary = "still here" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "still here" } }]
 
 [[prompt]]
 text = "wait for the release file"

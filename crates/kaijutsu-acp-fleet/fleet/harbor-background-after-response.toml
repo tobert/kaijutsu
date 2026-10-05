@@ -14,11 +14,11 @@ uncovered = "allow"
 tool_calls = [{ name = "shell_write", input = { command = "sleep 1; echo done > bg.txt", run_in_background = true } }]
 [[model]]
 text = "started it"
-tool_calls = [{ name = "done", input = { status = "done", summary = "started writing bg.txt in the background" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "started writing bg.txt in the background" } }]
 # Only the completion notice starts this turn.
 [[model]]
 text = "the background job finished"
-tool_calls = [{ name = "done", input = { status = "done", summary = "bg.txt is written" } }]
+tool_calls = [{ name = "done", input = { status = "done", feedback = "bg.txt is written" } }]
 
 [[prompt]]
 text = "write bg.txt in the background"
