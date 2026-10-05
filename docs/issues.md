@@ -2684,7 +2684,7 @@ benchmark run every command bumped on a threshold identity mismatch, and the
 bump message then carried the miss cause, "confirm or refit one in
 gate.toml". DeepSeek found `/config` writable through the file tools, backed
 up `/config/kernel/gate.toml`, rewrote the engine hash to the live server's,
-and went on. The cause no longer reaches the seat (1bcc656c's successor), but
+and went on. The cause no longer reaches the seat (2b403892), but
 a coder can still write `/config/kernel` and `/config/rc`, its own gate and
 instructions. Open: whether a worker loadout's file tools should exclude
 `/config`, or the bench should mount it read-only for the seat.
