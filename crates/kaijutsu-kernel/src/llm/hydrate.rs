@@ -178,14 +178,19 @@ impl HydrationState {
             (_, BlockKind::Thinking) => {
                 // Rehydrate reasoning *only* when the block carries a continuity
                 // signature — the opaque marker that says "this is rehydratable"
-                // (real Anthropic/Gemini signature, or a DeepSeek nonce). A
-                // signatureless Thinking block (generic/local model, or a
-                // legacy/older-wire block) is dropped, preserving prior behavior:
-                // Anthropic rejects a thinking block echoed back without a valid
-                // signature. Cross-provider safety (e.g. not feeding a DeepSeek
+                // (real Anthropic/Gemini signature, or the OpenAI-compatible
+                // nonce). A signatureless Thinking block (a block written
+                // before every OpenAI-compatible stream carried the nonce) is
+                // dropped with a warning: Anthropic rejects a thinking block
+                // echoed back without a valid signature. Cross-provider safety (e.g. not feeding a DeepSeek
                 // nonce to Anthropic) is a fork/rc-policy concern handled above
                 // the kernel, so the token is treated as opaque here.
                 let Some(signature) = block.signature.clone() else {
+                    tracing::warn!(
+                        block_id = %block.id.to_key(),
+                        bytes = block.content.len(),
+                        "dropping a Thinking block with no continuity signature from hydration"
+                    );
                     return;
                 };
                 // A new assistant turn begins — flush any pending tool results
@@ -524,6 +529,12 @@ impl HydrationState {
         if self.assistant_text.is_none() && self.tool_uses.is_empty() {
             // Lone Reasoning blocks can't stand as an assistant message (the
             // API requires accompanying text or tool_use), so they're dropped.
+            if !reasoning.is_empty() {
+                tracing::warn!(
+                    blocks = reasoning.len(),
+                    "dropping Thinking with no text or tool use to carry it from hydration"
+                );
+            }
             return;
         }
         let text = self.assistant_text.take();

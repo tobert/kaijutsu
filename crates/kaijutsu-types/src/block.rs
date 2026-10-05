@@ -1724,13 +1724,13 @@ pub struct BlockSnapshot {
     /// provider-agnostic marker that says "this reasoning is rehydratable."
     /// Carries the verbatim Anthropic `signature` (or Gemini `thoughtSignature`)
     /// that the API requires when echoing thinking back during a tool-use cycle;
-    /// carries a sentinel nonce for providers (e.g. DeepSeek V4) that round-trip
-    /// reasoning as plain text but want it included on rehydration. `None` means
-    /// "not rehydratable" — the hydrator drops the block (the default for
-    /// generic/local OpenAI-compatible models and legacy/older-wire blocks).
-    /// The token is opaque to the hydrator: cross-provider safety (e.g. not
-    /// feeding a DeepSeek nonce to Anthropic) is a fork/rc-policy concern, not a
-    /// kernel one. See `llm::hydrate`.
+    /// carries a sentinel nonce for every OpenAI-compatible provider (DeepSeek,
+    /// vLLM, llama.cpp, Alibaba), which round-trips reasoning as plain text.
+    /// `None` means "not rehydratable": the hydrator drops the block with a
+    /// warning (blocks written before OpenAI-compatible streams carried the
+    /// nonce). The token is opaque to the hydrator: cross-provider safety (e.g.
+    /// not feeding an OpenAI-compatible nonce to Anthropic) is a fork/rc-policy
+    /// concern, not a kernel one. See `llm::hydrate`.
     #[serde(default)]
     pub signature: Option<String>,
     /// Structured output data for richer formatting (tables, trees).

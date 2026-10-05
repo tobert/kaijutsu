@@ -224,7 +224,7 @@ impl Client {
 
         let response = self.error_for_status(response).await?;
 
-        Ok(Stream::from_response(response, self.reasoning_required))
+        Ok(Stream::from_response(response))
     }
 
     /// Map an OpenAI-compatible 4xx/5xx response body into [`LlmError`].
@@ -294,13 +294,13 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn from_response(response: reqwest::Response, reasoning_required: bool) -> Self {
+    fn from_response(response: reqwest::Response) -> Self {
         use eventsource_stream::Eventsource;
         let bytes: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>> =
             response.bytes_stream().boxed();
         Self {
             inner: Some(bytes.eventsource()),
-            state: StateMachine::new(reasoning_required),
+            state: StateMachine::new(),
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
@@ -320,7 +320,7 @@ impl Stream {
             .boxed();
         Self {
             inner: Some(bytes.eventsource()),
-            state: StateMachine::new(false),
+            state: StateMachine::new(),
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
