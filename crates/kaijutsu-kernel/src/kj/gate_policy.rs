@@ -415,6 +415,9 @@ pub(crate) struct CouncilSpec {
     /// contexts`, such as a code context for program decisions. Empty by
     /// default.
     pub(crate) contexts: Vec<String>,
+    /// This spec's own `require_agree`, overriding `[council]
+    /// require_agree` when set.
+    pub(crate) require_agree: Option<bool>,
 }
 
 /// What produced a number: a threshold fitted under one identity does not
@@ -470,6 +473,12 @@ pub(crate) struct CouncilConfig {
 }
 
 impl CouncilConfig {
+    /// Whether a decision on the spec named `spec_name` needs every read to
+    /// agree: the spec's own `require_agree`, else `[council]`'s.
+    pub(crate) fn require_agree_for(&self, spec_name: &str) -> bool {
+        self.specs.iter().find(|s| s.name == spec_name).and_then(|s| s.require_agree).unwrap_or(self.require_agree)
+    }
+
     /// The threshold for `spec` under `identity`, or `None` when none was
     /// fitted for that identity.
     pub(crate) fn threshold_for(
@@ -540,6 +549,8 @@ struct CouncilSpecToml {
     case: String,
     #[serde(default)]
     contexts: Vec<String>,
+    #[serde(default)]
+    require_agree: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -784,7 +795,7 @@ impl GateConfig {
                     return Err(err(format!("[[council.spec]] {} contexts: `{label}` is listed twice", s.name)));
                 }
             }
-            specs.push(CouncilSpec { name: s.name.clone(), case, contexts: s.contexts.clone() });
+            specs.push(CouncilSpec { name: s.name.clone(), case, contexts: s.contexts.clone(), require_agree: s.require_agree });
         }
         let mut thresholds: Vec<CouncilThreshold> = Vec::new();
         for t in &raw.threshold {
@@ -2577,7 +2588,7 @@ enabled = false
         assert!(c.require_agree, "require_agree defaults to true");
         assert_eq!(
             c.specs,
-            [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }]
+            [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }]
         );
         assert_eq!(c.thresholds.len(), 2);
         assert_eq!(c.thresholds[0].allow_at, 0.98);
@@ -2639,6 +2650,17 @@ enabled = false
         assert!(m.contains("bump_limit") && m.contains("bump-only"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bouncer\""));
         assert!(m.contains("bump-only"), "the error lists every mode: {m}");
+    }
+
+    #[test]
+    fn a_spec_may_set_its_own_require_agree() {
+        let cfg = config(&council_with("case = \"shell\"", "case = \"shell\"\nrequire_agree = false"));
+        let c = cfg.council().unwrap();
+        assert_eq!(c.specs[0].require_agree, Some(false));
+        assert!(!c.require_agree_for("shell-gate"));
+        let plain = config(COUNCIL_FULL);
+        assert_eq!(plain.council().unwrap().specs[0].require_agree, None);
+        assert!(plain.council().unwrap().require_agree_for("shell-gate"));
     }
 
     #[test]
@@ -2791,8 +2813,8 @@ enabled = false
         assert_eq!(
             c.specs,
             vec![
-                CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() },
-                CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new() },
+                CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None },
+                CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new(), require_agree: None },
             ]
         );
         assert_eq!(c.threshold_for("program-gate", &identity("wh1")).unwrap().mass_floor, -1.5);
@@ -2822,6 +2844,7 @@ enabled = false
         assert_eq!(c.bump_limit, None);
         assert_eq!(c.specs[0].name, "shell-bump");
         assert_eq!(c.specs[1].contexts, ["council-code"]);
+        assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();
         assert!(c.threshold_for("program-gate", &shell.identity).is_some());
         assert!(cfg.council_enabled_for(Some("coder")));

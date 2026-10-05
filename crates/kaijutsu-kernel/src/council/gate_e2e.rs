@@ -2214,6 +2214,41 @@ async fn a_miss_and_a_control_text_hit_are_ordinary_asks_in_bumper_mode() {
     }
 }
 
+/// A decision that does not pass logs each context's own answers at info,
+/// so a run's log says which context dissented; an allow does not.
+///
+/// Falsified by an outcome line with the pooled answer alone: the `reads`
+/// field is missing.
+#[tokio::test]
+async fn a_decision_that_does_not_pass_logs_each_contexts_answers() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let seen = Arc::new(Seen::default());
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Capture(seen.clone())));
+    tracing::callsite::rebuild_interest_cache();
+    let rig = rig(Via::Tool, bumper(3)).await;
+    rig.mock.set(|req| {
+        Reply::ok(super::gate::test_support::answer_choices(req, &[("verdict", BUMP_OPTIONS, &vec![PROCEED, TRY_HARDER])]))
+    });
+    let _ = rig.submit("touch /work/a").await;
+    rig.mock.bumper_says(PROCEED);
+    rig.submit("touch /work/b").await.expect("a pass runs");
+    let events = seen.events.lock().unwrap();
+    let outcomes: Vec<(String, Option<String>)> = events
+        .iter()
+        .filter(|(_, f)| field(f, "outcome").is_some() && field(f, "spec").is_some())
+        .map(|(_, f)| (field(f, "outcome").unwrap().to_string(), field(f, "reads").map(str::to_string)))
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    let (bump, reads) = &outcomes[0];
+    assert_eq!(bump, "bump", "{outcomes:?}");
+    let reads = reads.as_deref().unwrap_or_default();
+    assert!(reads.contains("voice: verdict=proceed") && reads.contains("system-rules: verdict=try_harder"), "{reads}");
+    assert_eq!(outcomes[1].0, "allow");
+    assert!(outcomes[1].1.as_deref().unwrap_or_default().is_empty(), "an allow logs no reads: {outcomes:?}");
+    drop(events);
+    rig.finish().await;
+}
+
 fn bump_only() -> Setup {
     Setup { bump_only: true, ..Setup::default() }
 }

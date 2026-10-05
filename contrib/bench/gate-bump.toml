@@ -67,6 +67,11 @@ case = "program"
 # Program notes and worked examples with their reasoning, created by the
 # council rc variant's S05-council-code.
 contexts = ["council-code"]
+# A program passes on its pooled rubric; one dissenting read no longer bumps
+# it. On 2026-10-05 a read-only `python3 /tmp/make_json.py` was bumped with
+# a pooled `changes_backed_up` because one context disagreed. Amy: "we can
+# relax a bit." The shell spec still needs every read to agree.
+require_agree = false
 
 [[council.threshold]]
 spec = "program-gate"

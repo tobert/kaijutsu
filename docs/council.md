@@ -490,6 +490,12 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 enabled = true
 ```
 
+A spec's `require_agree` overrides `[council] require_agree` for its own
+decisions; the bump-only bench turns it off for programs. A decision that
+answers and does not allow logs each context's own answers at info, in its
+outcome line's `reads` field (`label: question=choice ...`, reads joined by
+`; `), so a run's log names the context that dissented.
+
 A spec's `contexts` are read by that spec's decisions alone, after
 `[council] contexts` and before the voting voices. A label already in
 `[council] contexts`, or listed twice, fails the parse. A code context with

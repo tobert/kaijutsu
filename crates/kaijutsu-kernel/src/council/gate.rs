@@ -505,7 +505,7 @@ pub(crate) fn classify_case(
             rubric.len() == RUBRIC.len() && rubric.iter().all(|(q, c)| allows(q, c))
         }
     };
-    let outcome = if pooled_allows && (!council.require_agree || every_read_allows) {
+    let outcome = if pooled_allows && (!council.require_agree_for(spec_name) || every_read_allows) {
         Outcome::Allow
     } else if council.mode != CouncilMode::Gatekeeper {
         match bump_flavor(case, &pooled, pass, &rubric, &allows) {
@@ -716,6 +716,10 @@ pub(crate) struct CouncilVerdict {
     pub(crate) outcome: Outcome,
     /// The pooled p(allow), when the council answered.
     pub(crate) p_allow: Option<f64>,
+    /// Each context's own answers, for a decision that answered and did not
+    /// allow: `label: question=choice ...`, reads joined by `; `. Empty
+    /// otherwise.
+    pub(crate) reads: String,
     record: NewCouncilDecision,
     signal: NewSignal,
     note: String,
@@ -1229,7 +1233,7 @@ fn build_verdict(
     let threshold = classification.threshold.as_ref().map(|t| RecordedThreshold {
         allow_at: t.allow_at,
         mass_floor: t.mass_floor,
-        require_agree: council.require_agree,
+        require_agree: council.require_agree_for(&spec.name),
     });
     let verdict = classification.verdict.as_ref();
     // A miss is never an answer, so its signal carries no probability; the
@@ -1316,6 +1320,7 @@ fn build_verdict(
         programs: Vec::new(),
         rubric: classification.rubric,
         bump: None,
+        reads: String::new(),
         bump_history: Vec::new(),
     }
 }
@@ -1394,6 +1399,7 @@ pub(crate) async fn decide(
         p_allow = verdict.p_allow,
         bump_flavor,
         seat_head,
+        reads = %verdict.reads,
         context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
         "{}",
         verdict.note
@@ -1510,11 +1516,40 @@ async fn decide_inner(
         }
         _ => None,
     };
+    let reads = if classification.outcome == Outcome::Allow { String::new() } else { reads_note(&prepared, &response) };
     let mut verdict =
         build_verdict(caller, &case, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
     verdict.report = reported;
     verdict.bump = bump;
+    verdict.reads = reads;
     verdict
+}
+
+/// Each read's own choice answers in spec order, named by the context's
+/// label: which context dissented from a decision that did not allow.
+fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
+    response
+        .reads
+        .iter()
+        .map(|read| {
+            let label = read
+                .context
+                .as_deref()
+                .and_then(|id| prepared.contexts.iter().find(|c| c.context_id.to_string() == id).map(|c| c.label.clone()))
+                .unwrap_or_else(|| read.context.clone().unwrap_or_else(|| "spec".into()));
+            let answers: Vec<String> = prepared
+                .spec
+                .questions
+                .iter()
+                .filter_map(|q| match read.answers.get(q.id()) {
+                    Some(ReadAnswer::Choice(c)) => Some(format!("{}={}", q.id(), c.choice)),
+                    _ => None,
+                })
+                .collect();
+            format!("{label}: {}", answers.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Why a spec cannot decide a gate ask, when it cannot: the gate acts on a
@@ -1879,7 +1914,7 @@ mod tests {
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
-            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
+            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
                 identity: CouncilIdentity {
@@ -2180,7 +2215,7 @@ mod tests {
 
     fn program_council() -> CouncilConfig {
         let mut c = council(0.98, -1.5, true);
-        c.specs.push(CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new() });
+        c.specs.push(CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new(), require_agree: None });
         let mut t = c.thresholds[0].clone();
         t.spec = "program-gate".into();
         c.thresholds.push(t);
@@ -2315,6 +2350,31 @@ mod tests {
 
     /// A program decision in bumper mode keeps its rubric: an allow passes,
     /// and anything else bumps with the rubric answers that held it.
+    /// A spec's own `require_agree` overrides `[council] require_agree`:
+    /// with it off, one dissenting read no longer holds a program the pooled
+    /// rubric allows.
+    ///
+    /// Falsified by a classifier that reads only `[council]`: the program
+    /// asks with the override off.
+    #[test]
+    fn a_spec_may_turn_off_require_agree() {
+        use super::test_support::{answer_choices, NETWORK, OPTIONS, ORIGINALS};
+        let req = request();
+        let sure = [-0.001, -9.0, -9.0];
+        let dissent = [-1.2, -1.5, -0.7];
+        let answer = answer_choices(
+            &req,
+            &[("originals", ORIGINALS, &[sure, dissent]), ("network", NETWORK, &[sure, sure]), (VERDICT, OPTIONS, &[sure, sure])],
+        );
+        let strict = program_council();
+        let held = classify_case(&req, &decode(answer.clone()), &strict, "program-gate", CouncilCase::Program);
+        assert_ne!(held.outcome, Outcome::Allow, "require_agree holds a dissent: {held:?}");
+        let mut relaxed = program_council();
+        relaxed.specs.iter_mut().find(|s| s.name == "program-gate").unwrap().require_agree = Some(false);
+        let allowed = classify_case(&req, &decode(answer), &relaxed, "program-gate", CouncilCase::Program);
+        assert_eq!(allowed.outcome, Outcome::Allow, "{allowed:?}");
+    }
+
     #[test]
     fn a_program_decision_bumps_with_its_rubric_in_bumper_mode() {
         use super::test_support::program_answer;

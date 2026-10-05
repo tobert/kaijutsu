@@ -630,7 +630,7 @@ mod tests {
         let voice = live_context(&kernel, "voice");
         append_dialogue(&kernel, voice, &["never rm -rf the repo", "understood"]);
         let mock = serve().await;
-        let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() };
+        let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None };
         let council = CouncilConfig {
             server: mock.base.clone(),
             contexts: vec!["voice".into()],
