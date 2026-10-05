@@ -13,6 +13,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, ShouldSample, SpanLimits};
+use crate::file_export::{FileLogExporter, FileMetricExporter, FileSpanExporter};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::filter_fn;
 
@@ -61,57 +62,69 @@ where
         + Sync
         + 'static,
 {
+    let env = |name: &str| std::env::var(name).ok();
+    let want_otlp = crate::otlp_requested(&env);
+    let file_dir = crate::file_dir_requested(&env);
+
     // Tonic needs a Tokio runtime for channel setup and ongoing gRPC exports.
     // The server already has one, but the Bevy app doesn't when main() starts.
     // Create a dedicated runtime, leak it (lives for the process), and enter it
-    // so that BatchSpanProcessor's tokio::spawn calls succeed.
-    let (span_exporter, metric_exporter, log_exporter, runtime_ref, enter_guard) =
+    // so that BatchSpanProcessor's tokio::spawn calls succeed. File export needs
+    // no runtime, so a file-only setup creates none.
+    let (otlp, runtime_ref, enter_guard) = if !want_otlp {
+        (None, None, None)
+    } else {
         match tokio::runtime::Handle::try_current() {
-            Ok(_handle) => {
-                let (span, metric, log) = build_exporters();
-                (span, metric, log, None, None)
-            }
+            Ok(_handle) => (Some(build_exporters()), None, None),
             Err(_) => {
                 let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
                     tokio::runtime::Runtime::new().expect("failed to create OTel tokio runtime"),
                 ));
                 let guard = rt.enter();
-                let (span, metric, log) = rt.block_on(async { build_exporters() });
-                (span, metric, log, Some(rt), Some(guard))
+                let exporters = rt.block_on(async { build_exporters() });
+                (Some(exporters), Some(rt), Some(guard))
             }
-        };
+        }
+    };
 
     let resource = Resource::builder()
         .with_service_name(service_name.to_string())
         .build();
 
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(span_exporter)
+    // Each `with_batch_exporter` / `with_periodic_exporter` adds its own
+    // processor, so network and file export run side by side when both are on.
+    let mut tracer_builder = SdkTracerProvider::builder()
         .with_sampler(KaijutsuSampler)
         .with_resource(resource.clone())
-        .with_span_limits(SpanLimits::default())
-        .build();
-
-    global::set_tracer_provider(provider.clone());
-
+        .with_span_limits(SpanLimits::default());
     // Metrics export through the global meter provider on a periodic reader.
     // Unlike traces, metrics need no tracing-subscriber layer — instruments
     // record straight to the global provider (see `crate::metrics`).
-    let meter_provider = SdkMeterProvider::builder()
-        .with_periodic_exporter(metric_exporter)
-        .with_resource(resource.clone())
-        .build();
+    let mut meter_builder = SdkMeterProvider::builder().with_resource(resource.clone());
+    let mut logger_builder = SdkLoggerProvider::builder().with_resource(resource);
 
+    if let Some((span_exporter, metric_exporter, log_exporter)) = otlp {
+        tracer_builder = tracer_builder.with_batch_exporter(span_exporter);
+        meter_builder = meter_builder.with_periodic_exporter(metric_exporter);
+        logger_builder = logger_builder.with_batch_exporter(log_exporter);
+    }
+    if let Some(dir) = &file_dir {
+        tracer_builder = tracer_builder.with_batch_exporter(FileSpanExporter::new(dir));
+        meter_builder = meter_builder.with_periodic_exporter(FileMetricExporter::new(dir));
+        logger_builder = logger_builder.with_batch_exporter(FileLogExporter::new(dir));
+    }
+
+    let provider = tracer_builder.build();
+    global::set_tracer_provider(provider.clone());
+
+    let meter_provider = meter_builder.build();
     global::set_meter_provider(meter_provider.clone());
 
     // Logs bridge: existing `tracing` events become OTLP log records, stamped
     // with the active trace/span id for correlation. Exclude `opentelemetry*`
     // targets so the exporter's own internal logs can't feed back into the
     // exporter and storm on a persistent export failure.
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_batch_exporter(log_exporter)
-        .with_resource(resource)
-        .build();
+    let logger_provider = logger_builder.build();
 
     let logs_layer = OpenTelemetryTracingBridge::new(&logger_provider)
         .with_filter(filter_fn(|meta| !meta.target().starts_with("opentelemetry")));

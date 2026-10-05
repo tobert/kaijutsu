@@ -220,6 +220,7 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace", "metrics", "logs"] }
 opentelemetry-appender-tracing = "0.31"
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
 tracing-opentelemetry = "0.32"
 
 # Testing
