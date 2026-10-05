@@ -842,7 +842,7 @@ CREATE TABLE IF NOT EXISTS council_decisions (
     control_text_hits INTEGER NOT NULL,
     queue_ms          INTEGER NOT NULL,
     ms                INTEGER NOT NULL,
-    seat_head         TEXT,
+    house_rules_head  TEXT,
     bump_flavor       TEXT,
     created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
@@ -959,7 +959,7 @@ CREATE TABLE IF NOT EXISTS council_programs (
 -- (`council-<character>`) under its own spec, made after the gate decided
 -- (`docs/council.md`, "Council contexts are kaijutsu contexts"). It hangs
 -- off the decision it observed and never changes that decision's rows.
--- `seat_context_id` is NULL when the label resolved to no live context;
+-- `voice_context_id` is NULL when the label resolved to no live context;
 -- `spec_id` and the identity columns are empty strings when the server never
 -- reported them, as in `council_decisions`. `outcome` follows the
 -- growable-value-set rule in `DDL`'s doc comment
@@ -969,8 +969,8 @@ CREATE TABLE IF NOT EXISTS council_programs (
 CREATE TABLE IF NOT EXISTS council_observations (
     observation_id  BLOB    NOT NULL PRIMARY KEY,
     decision_id     BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
-    seat_label      TEXT    NOT NULL,
-    seat_context_id BLOB,
+    voice_label     TEXT    NOT NULL,
+    voice_context_id BLOB,
     spec_name       TEXT    NOT NULL,
     spec_id         TEXT    NOT NULL,
     server_model    TEXT    NOT NULL,
@@ -1041,7 +1041,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // list, so any column an old database is missing has to exist before
     // that copy runs or the SELECT names a column that is not there.
     add_columns_if_missing(conn, "approvals", APPROVALS_ADDED_COLUMNS)?;
-    add_columns_if_missing(conn, "council_decisions", &[("seat_head", "TEXT"), ("bump_flavor", "TEXT")])?;
+    rename_columns_if_present(
+        conn,
+        &[
+            ("council_decisions", "seat_head", "house_rules_head"),
+            ("council_observations", "seat_label", "voice_label"),
+            ("council_observations", "seat_context_id", "voice_context_id"),
+        ],
+    )?;
+    add_columns_if_missing(conn, "council_decisions", &[("house_rules_head", "TEXT"), ("bump_flavor", "TEXT")])?;
     add_rc_runs_script_count_column_if_missing(conn)?;
     add_rc_runs_intended_outcome_column_if_missing(conn)?;
     add_rc_run_script_settlement_columns_if_missing(conn)?;
@@ -1083,6 +1091,23 @@ const APPROVALS_ADDED_COLUMNS: &[(&str, &str)] = &[
     ("pair_owner", "TEXT"),
     ("continuation_epoch", "INTEGER"),
 ];
+
+/// Renames each `(table, old, new)` column whose old name is still there and
+/// whose new name is not, with `ALTER TABLE ... RENAME COLUMN`. SQLite
+/// rewrites the indexes, triggers, and views that name the column, and the
+/// rows keep their values.
+fn rename_columns_if_present(conn: &Connection, renames: &[(&str, &str, &str)]) -> SqliteResult<()> {
+    for (table, old, new) in renames {
+        let existing: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<String>>>()?;
+        if existing.iter().any(|name| name == old) && !existing.iter().any(|name| name == new) {
+            conn.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {old} TO {new}"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Adds each of `columns` (name, type) that `table` lacks, with
 /// `ALTER TABLE ... ADD COLUMN`. Existing rows read the new column as NULL.
@@ -1601,14 +1626,14 @@ mod tests {
         assert_eq!(pending_index, 1, "the pending-projection index must follow the column upgrade");
     }
 
-    /// A database whose `council_decisions` predates `seat_head` gains the
-    /// column, as NULL for the rows it holds, and a second `migrate` is a
+    /// A database whose `council_decisions` predates `house_rules_head` gains
+    /// the column, as NULL for the rows it holds, and a second `migrate` is a
     /// no-op.
     #[test]
-    fn migrate_adds_seat_head_to_council_decisions_created_without_it() {
+    fn migrate_adds_house_rules_head_to_council_decisions_created_without_it() {
         let conn = Connection::open_in_memory().unwrap();
-        let ddl = DDL.replace("    seat_head         TEXT,\n", "");
-        assert_ne!(ddl, DDL, "the fixture removes seat_head from the shipped DDL");
+        let ddl = DDL.replace("    house_rules_head  TEXT,\n", "");
+        assert_ne!(ddl, DDL, "the fixture removes house_rules_head from the shipped DDL");
         conn.execute_batch(&ddl).unwrap();
         conn.execute_batch(
             "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
@@ -1620,9 +1645,60 @@ mod tests {
         .unwrap();
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
-        let seat: Option<String> =
-            conn.query_row("SELECT seat_head FROM council_decisions", [], |row| row.get(0)).unwrap();
-        assert_eq!(seat, None);
+        let head: Option<String> =
+            conn.query_row("SELECT house_rules_head FROM council_decisions", [], |row| row.get(0)).unwrap();
+        assert_eq!(head, None);
+    }
+
+    /// A database built when the column was `seat_head` and the observation
+    /// columns were `seat_label` and `seat_context_id` keeps its rows under
+    /// the new names: `house_rules_head`, `voice_label`, `voice_context_id`.
+    /// A second `migrate` is a no-op.
+    ///
+    /// Falsified by a migration that only adds the new columns: the old
+    /// values read back as NULL, or the old `NOT NULL` column rejects the
+    /// insert after the migration.
+    #[test]
+    fn migrate_renames_the_seat_columns_and_keeps_their_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old = DDL
+            .replace("house_rules_head  TEXT", "seat_head         TEXT")
+            .replace("voice_label     TEXT", "seat_label      TEXT")
+            .replace("voice_context_id BLOB", "seat_context_id BLOB");
+        for column in ["    seat_head         TEXT,", "    seat_label      TEXT    NOT NULL,", "    seat_context_id BLOB,"] {
+            assert!(old.contains(column), "the fixture gives the old shape `{column}`");
+        }
+        conn.execute_batch(&old).unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms, seat_head)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'miss', 'down', 0, 0, 0, 'snap:old');
+             INSERT INTO council_observations (observation_id, decision_id, seat_label, seat_context_id, spec_name,
+                spec_id, server_model, weight_hash, tokenizer_hash, template, engine, outcome, miss_cause,
+                queue_ms, ms)
+             VALUES (X'0A', X'01', 'council-banto', X'0B', 'direction-check', '', '', '', '', '', '', 'miss',
+                'late', 0, 0);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let head: Option<String> =
+            conn.query_row("SELECT house_rules_head FROM council_decisions", [], |row| row.get(0)).unwrap();
+        assert_eq!(head.as_deref(), Some("snap:old"));
+        let (label, ctx): (String, Option<Vec<u8>>) = conn
+            .query_row("SELECT voice_label, voice_context_id FROM council_observations", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((label.as_str(), ctx), ("council-banto", Some(vec![0x0B])));
+        for gone in [("council_decisions", "seat_head"), ("council_observations", "seat_label"), ("council_observations", "seat_context_id")] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = '{}'", gone.0, gone.1), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{} still has {}", gone.0, gone.1);
+        }
     }
 
     /// A database whose `council_decisions` predates `bump_flavor` gains the

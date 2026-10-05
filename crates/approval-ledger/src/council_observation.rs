@@ -46,10 +46,10 @@ pub struct NewCouncilObservation {
     /// The council decision observed.
     pub decision_id: Vec<u8>,
     /// The voice context's label, `council-<character>`.
-    pub seat_label: String,
+    pub voice_label: String,
     /// The voice context's id; `None` when the label resolved to no live
     /// context by the time it was read.
-    pub seat_context_id: Option<Vec<u8>>,
+    pub voice_context_id: Option<Vec<u8>>,
     pub spec_name: String,
     /// Empty when the spec was never prepared.
     pub spec_id: String,
@@ -128,15 +128,15 @@ pub fn insert_council_observation(conn: &Connection, o: &NewCouncilObservation) 
     let observation_id = uuid::Uuid::now_v7().as_bytes().to_vec();
     tx.execute(
         "INSERT INTO council_observations (
-            observation_id, decision_id, seat_label, seat_context_id, spec_name, spec_id, server_model,
+            observation_id, decision_id, voice_label, voice_context_id, spec_name, spec_id, server_model,
             weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause, snapshot,
             expected_head, queue_ms, ms, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             observation_id,
             o.decision_id,
-            o.seat_label,
-            o.seat_context_id,
+            o.voice_label,
+            o.voice_context_id,
             o.spec_name,
             o.spec_id,
             o.server.model,
@@ -172,7 +172,7 @@ pub fn insert_council_observation(conn: &Connection, o: &NewCouncilObservation) 
     Ok(observation_id)
 }
 
-const OBSERVATION_COLUMNS: &str = "observation_id, decision_id, seat_label, seat_context_id, spec_name, spec_id, \
+const OBSERVATION_COLUMNS: &str = "observation_id, decision_id, voice_label, voice_context_id, spec_name, spec_id, \
     server_model, weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause, snapshot, \
     expected_head, queue_ms, ms, created_at";
 
@@ -187,8 +187,8 @@ fn decode(row: &Row<'_>) -> rusqlite::Result<CouncilObservation> {
         created_at: row.get("created_at")?,
         observation: NewCouncilObservation {
             decision_id: row.get("decision_id")?,
-            seat_label: row.get("seat_label")?,
-            seat_context_id: row.get("seat_context_id")?,
+            voice_label: row.get("voice_label")?,
+            voice_context_id: row.get("voice_context_id")?,
             spec_name: row.get("spec_name")?,
             spec_id: row.get("spec_id")?,
             server: CouncilServer {
@@ -317,7 +317,7 @@ mod tests {
                 ms: 1,
                 reads: vec![],
                 pooled: vec![],
-                seat_head: None,
+                house_rules_head: None,
                 bump_flavor: None,
                 control_text: vec![],
             },
@@ -328,8 +328,8 @@ mod tests {
     fn answered(decision_id: &[u8]) -> NewCouncilObservation {
         NewCouncilObservation {
             decision_id: decision_id.to_vec(),
-            seat_label: "council-banto".into(),
-            seat_context_id: Some(vec![4, 4]),
+            voice_label: "council-banto".into(),
+            voice_context_id: Some(vec![4, 4]),
             spec_name: "direction-check".into(),
             spec_id: "sha256:b".into(),
             server: server(),
@@ -382,7 +382,7 @@ mod tests {
         miss.outcome = CouncilObservationOutcome::Miss;
         miss.choice = None;
         miss.miss_cause = Some("council context \"council-banto\" names no live context".into());
-        miss.seat_context_id = None;
+        miss.voice_context_id = None;
         miss.spec_id = String::new();
         miss.server = CouncilServer {
             model: String::new(),
@@ -417,7 +417,7 @@ mod tests {
 
         let raw = |outcome: &str, choice: &str, cause: &str| {
             format!(
-                "INSERT INTO council_observations (observation_id, decision_id, seat_label, spec_name, spec_id,
+                "INSERT INTO council_observations (observation_id, decision_id, voice_label, spec_name, spec_id,
                     server_model, weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause,
                     queue_ms, ms)
                  VALUES (randomblob(16), X'{}', 'council-banto', 'direction-check', '', '', '', '', '', '',
