@@ -45,7 +45,7 @@ use approval_ledger::council::{
 };
 use approval_ledger::types::{AskVerdict, NewSignal, Origin, SignalSourceKind, SignalVerdict};
 use kaijutsu_council::wire::{
-    ContextRef, DecisionIdentity, DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer,
+    ContextRef, DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer,
     ReadAnswer,
 };
 use kaijutsu_council::{CouncilError, Json};
@@ -58,7 +58,7 @@ use super::sync::{PrepareMiss, Prepared};
 use super::voices::{SkippedVoice, VoiceChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
-    CouncilCase, CouncilConfig, CouncilIdentity, CouncilMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
+    CouncilCase, CouncilConfig, CouncilMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
     CouncilThreshold, GateConfigLoad, Layers, PolicyVerdict,
 };
 use crate::kj::KjCaller;
@@ -360,15 +360,6 @@ pub(crate) struct Classification {
 pub(crate) const RUBRIC: [(&str, &[&str]); 2] =
     [("originals", &["reads", "changes_backed_up"]), ("network", &["none", "packages"])];
 
-fn identity_of(identity: &DecisionIdentity) -> CouncilIdentity {
-    CouncilIdentity {
-        weight_hash: identity.weight_hash.clone(),
-        engine: identity.engine.clone(),
-        tokenizer_hash: identity.tokenizer_hash.clone(),
-        template: identity.template.clone(),
-    }
-}
-
 fn pooled_verdict(response: &DecisionResponse) -> Option<PooledVerdict> {
     match response.answers.get(VERDICT)? {
         PooledAnswer::Choice(c) => Some(PooledVerdict {
@@ -433,16 +424,8 @@ pub(crate) fn classify_case(
     {
         return miss(format!("the server read spec {read}, not the spec asked for, {asked}"), None);
     }
-    let identity = identity_of(&response.identity);
-    let Some(threshold) = council.threshold_for(spec_name, &identity) else {
-        return miss(
-            format!(
-                "no threshold for spec {spec_name} under the server's identity (weight_hash {}, \
-                 engine {}, tokenizer_hash {}, template {}); confirm or refit one in gate.toml",
-                identity.weight_hash, identity.engine, identity.tokenizer_hash, identity.template
-            ),
-            None,
-        );
+    let Some(threshold) = council.threshold_for(spec_name) else {
+        return miss(format!("no threshold for spec {spec_name}; declare one in gate.toml"), None);
     };
     let threshold = threshold.clone();
     let Some(pooled) = verdict.clone() else {
@@ -1908,12 +1891,6 @@ mod tests {
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
-                identity: CouncilIdentity {
-                    weight_hash: "w1".into(),
-                    engine: "e1".into(),
-                    tokenizer_hash: "t1".into(),
-                    template: "mk-letters-1:0123456789abcdef".into(),
-                },
                 allow_at,
                 mass_floor,
             }],
@@ -2031,18 +2008,20 @@ mod tests {
         }
     }
 
+    /// A threshold names its spec alone: another server identity still
+    /// decides, and a spec with no threshold is a miss naming it.
     #[test]
-    fn an_identity_with_no_threshold_is_a_miss_naming_it() {
+    fn a_threshold_follows_its_spec_not_the_server_identity() {
         let req = request();
         let mut value = answer(&req, &ALLOW);
         value["identity"]["weight_hash"] = serde_json::json!("w2");
-        match classify(&req, &decode(value), &council(0.98, -0.05, true), "shell-gate").outcome {
-            Outcome::Miss(cause) => assert!(cause.contains("no threshold") && cause.contains("w2"), "{cause}"),
-            other => panic!("an unknown identity is a miss, got {other:?}"),
+        value["identity"]["engine"] = serde_json::json!("e2");
+        let moved = classify(&req, &decode(value), &council(0.98, -0.05, true), "shell-gate");
+        assert_eq!(moved.outcome, Outcome::Allow, "a new engine is not a miss: {moved:?}");
+        match classify(&req, &decode(answer(&req, &ALLOW)), &council(0.98, -0.05, true), "program").outcome {
+            Outcome::Miss(cause) => assert!(cause.contains("no threshold for spec program"), "{cause}"),
+            other => panic!("a spec with no threshold is a miss, got {other:?}"),
         }
-        // A threshold fitted for another spec does not carry either.
-        let other_spec = classify(&req, &decode(answer(&req, &ALLOW)), &council(0.98, -0.05, true), "program");
-        assert!(matches!(other_spec.outcome, Outcome::Miss(_)), "{other_spec:?}");
     }
 
     #[test]

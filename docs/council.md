@@ -423,24 +423,28 @@ does, so the council reads the file too (`council/programs.rs`).
   again; if any differs, the command is rejected and nothing runs: "the
   script changed after the council judged it; send the command again."
 
-## Thresholds and identity
+## Thresholds
 
-- **A threshold belongs to a (server identity, spec) pair.** Contexts steer
-  the probabilities across a stable threshold; that is what tuning by chat
-  does. Refitting on every context change would take the gate out of
-  enforcement each time Amy tunes it. We record the context heads with every
-  decision, so the effect of a change is measured, not assumed.
-- **An identity with no threshold is a miss.** The config pins the identity
-  each threshold was set for. When the server's `weight_hash`, `engine`,
-  `tokenizer_hash`, or `template` differs, every decision is a miss with that
-  cause until the threshold is confirmed or refit for the new identity. A
-  server update never silently applies an old threshold.
-- **The starting threshold is a guess.** We have no fitted data. `allow_at =
-  0.98` with a mass floor is where we start; the recorded decisions are what
-  we fit the next one from.
+- **A threshold belongs to its spec.** Each `[[council.threshold]]` names
+  one spec and gives its `allow_at` and `mass_floor`; a second threshold for
+  one spec fails the parse. The council server's identity (`weight_hash`,
+  `engine`, `tokenizer_hash`, `template`) is recorded with every decision
+  and on its span, but does not select a threshold. Amy, 2026-10-05: "let's
+  drop this pinning business against mk, we're not that precise for this."
+  Pinning made every decision a miss each time the megakernel moved its
+  engine, three times in one day. A threshold that still names the identity
+  fields fails the parse with a message saying to delete them.
+- **Contexts steer the probabilities across a stable threshold.** That is
+  what tuning by chat does. We record the context heads and the server
+  identity with every decision, so the effect of a change is measured, not
+  assumed, and a refit can read which server produced each number.
+- **The starting threshold is a guess.** `allow_at = 0.98` with a mass
+  floor is where we start; the recorded decisions are what we fit the next
+  one from.
 - **An allow needs every read to agree.** `require_agree` defaults to true:
   the pooled answer allows only when every context's top answer is allow.
-  Amy, 2026-10-04: "require agree yes".
+  Amy, 2026-10-04: "require agree yes". A spec's own `require_agree`
+  overrides it.
 - **The gate never narrows options.** Narrowing changes the distribution, so
   the gate always reads the spec's full option set.
 
@@ -472,10 +476,6 @@ contexts = ["council-code"]    # read by this spec's decisions only, after [coun
 
 [[council.threshold]]
 spec = "shell-gate"
-weight_hash = "…"
-engine = "…"
-tokenizer_hash = "…"
-template = "mk-letters-1:…"
 allow_at = 0.98                # pooled p(allow)
 mass_floor = -0.05             # each read's verdict mass, a log probability
 

@@ -302,10 +302,6 @@ case = "shell"
 
 [[council.threshold]]
 spec = "{shell}"
-weight_hash = "w1"
-engine = "e1"
-tokenizer_hash = "t1"
-template = "mk-letters-1:0123456789abcdef"
 allow_at = 0.98
 mass_floor = -0.05
 
@@ -337,10 +333,6 @@ case = "program"
 
 [[council.threshold]]
 spec = "program-gate"
-weight_hash = "w1"
-engine = "e1"
-tokenizer_hash = "t1"
-template = "mk-letters-1:0123456789abcdef"
 allow_at = 0.98
 mass_floor = -1.5
 "#;
@@ -810,7 +802,7 @@ fn dead_server() -> String {
 /// recompute, and an identity with no threshold.
 #[tokio::test]
 async fn a_council_miss_asks_and_records_its_cause() {
-    let cases: [(&str, Setup, Option<fn(&Mock)>, &str); 4] = [
+    let cases: [(&str, Setup, Option<fn(&Mock)>, &str); 3] = [
         ("down", Setup { server: Some(dead_server()), ..Setup::default() }, None, "identity failed"),
         (
             "slow",
@@ -823,12 +815,6 @@ async fn a_council_miss_asks_and_records_its_cause() {
             Setup::default(),
             Some(|m: &Mock| m.edited(&ALLOW, |v| v["answers"]["verdict"]["probabilities"]["allow"] = serde_json::json!(0.9999))),
             "do not recompute",
-        ),
-        (
-            "identity",
-            Setup::default(),
-            Some(|m: &Mock| m.edited(&ALLOW, |v| v["identity"]["weight_hash"] = serde_json::json!("w2"))),
-            "no threshold for spec shell-gate",
         ),
     ];
     for (name, setup, arrange, cause) in cases {

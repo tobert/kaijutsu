@@ -420,21 +420,11 @@ pub(crate) struct CouncilSpec {
     pub(crate) require_agree: Option<bool>,
 }
 
-/// What produced a number: a threshold fitted under one identity does not
-/// carry to another.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CouncilIdentity {
-    pub(crate) weight_hash: String,
-    pub(crate) engine: String,
-    pub(crate) tokenizer_hash: String,
-    pub(crate) template: String,
-}
-
-/// The cut a spec's pooled answer must clear under one identity.
+/// The cut a spec's pooled answer must clear. The council server's identity
+/// is recorded with each decision but does not select a threshold.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CouncilThreshold {
     pub(crate) spec: String,
-    pub(crate) identity: CouncilIdentity,
     /// Pooled p(allow) at or above which the council may allow.
     pub(crate) allow_at: f64,
     /// Each read's verdict mass, a log probability, at or above which the
@@ -479,14 +469,9 @@ impl CouncilConfig {
         self.specs.iter().find(|s| s.name == spec_name).and_then(|s| s.require_agree).unwrap_or(self.require_agree)
     }
 
-    /// The threshold for `spec` under `identity`, or `None` when none was
-    /// fitted for that identity.
-    pub(crate) fn threshold_for(
-        &self,
-        spec: &str,
-        identity: &CouncilIdentity,
-    ) -> Option<&CouncilThreshold> {
-        self.thresholds.iter().find(|t| t.spec == spec && t.identity == *identity)
+    /// The threshold for `spec`, or `None` when gate.toml declares none.
+    pub(crate) fn threshold_for(&self, spec: &str) -> Option<&CouncilThreshold> {
+        self.thresholds.iter().find(|t| t.spec == spec)
     }
 }
 
@@ -562,12 +547,17 @@ struct CouncilSpecToml {
 #[serde(deny_unknown_fields)]
 struct CouncilThresholdToml {
     spec: String,
-    weight_hash: String,
-    engine: String,
-    tokenizer_hash: String,
-    template: String,
     allow_at: f64,
     mass_floor: f64,
+    // Read only to refuse with a message that says to delete them.
+    #[serde(default)]
+    weight_hash: Option<toml::Value>,
+    #[serde(default)]
+    engine: Option<toml::Value>,
+    #[serde(default)]
+    tokenizer_hash: Option<toml::Value>,
+    #[serde(default)]
+    template: Option<toml::Value>,
 }
 
 /// `[context_type.<type>.council]`.
@@ -823,8 +813,11 @@ impl GateConfig {
                 ("tokenizer_hash", &t.tokenizer_hash),
                 ("template", &t.template),
             ] {
-                if value.trim().is_empty() {
-                    return Err(err(format!("{at} {field}: must be a non-empty string")));
+                if value.is_some() {
+                    return Err(err(format!(
+                        "{at} {field}: a threshold no longer names the council server's identity; \
+                         delete weight_hash, engine, tokenizer_hash and template"
+                    )));
                 }
             }
             if !(t.allow_at.is_finite() && t.allow_at > 0.0 && t.allow_at <= 1.0) {
@@ -839,21 +832,11 @@ impl GateConfig {
                     t.mass_floor
                 )));
             }
-            let identity = CouncilIdentity {
-                weight_hash: t.weight_hash.clone(),
-                engine: t.engine.clone(),
-                tokenizer_hash: t.tokenizer_hash.clone(),
-                template: t.template.clone(),
-            };
-            if thresholds.iter().any(|p| p.spec == t.spec && p.identity == identity) {
-                return Err(err(format!(
-                    "{at}: a second threshold repeats the same weight_hash, engine, \
-                     tokenizer_hash and template; one threshold per identity"
-                )));
+            if thresholds.iter().any(|p| p.spec == t.spec) {
+                return Err(err(format!("{at}: a second threshold for the spec; one threshold per spec")));
             }
             thresholds.push(CouncilThreshold {
                 spec: t.spec.clone(),
-                identity,
                 allow_at: t.allow_at,
                 mass_floor: t.mass_floor,
             });
@@ -2542,21 +2525,8 @@ case = "shell"
 
 [[council.threshold]]
 spec = "shell-gate"
-weight_hash = "wh1"
-engine = "mk-1"
-tokenizer_hash = "tk1"
-template = "mk-letters-1:abc"
 allow_at = 0.98
 mass_floor = -0.05
-
-[[council.threshold]]
-spec = "shell-gate"
-weight_hash = "wh2"
-engine = "mk-1"
-tokenizer_hash = "tk1"
-template = "mk-letters-1:abc"
-allow_at = 0.9
-mass_floor = -0.1
 
 [context_type.coder.council]
 enabled = true
@@ -2564,15 +2534,6 @@ enabled = true
 [context_type.toolie.council]
 enabled = false
 "#;
-
-    fn identity(weight_hash: &str) -> CouncilIdentity {
-        CouncilIdentity {
-            weight_hash: weight_hash.into(),
-            engine: "mk-1".into(),
-            tokenizer_hash: "tk1".into(),
-            template: "mk-letters-1:abc".into(),
-        }
-    }
 
     fn council_err(text: &str) -> String {
         let GateConfigError::Parse(m) = GateConfig::parse(text).unwrap_err() else {
@@ -2601,7 +2562,7 @@ enabled = false
             c.specs,
             [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }]
         );
-        assert_eq!(c.thresholds.len(), 2);
+        assert_eq!(c.thresholds.len(), 1);
         assert_eq!(c.thresholds[0].allow_at, 0.98);
         assert_eq!(c.thresholds[0].mass_floor, -0.05);
     }
@@ -2825,7 +2786,6 @@ enabled = false
         let text = COUNCIL_FULL.replacen(
             "[[council.threshold]]",
             "[[council.spec]]\nname = \"program-gate\"\ncase = \"program\"\n\n[[council.threshold]]\nspec = \"program-gate\"\n\
-             weight_hash = \"wh1\"\nengine = \"mk-1\"\ntokenizer_hash = \"tk1\"\ntemplate = \"mk-letters-1:abc\"\n\
              allow_at = 0.98\nmass_floor = -1.5\n\n[[council.threshold]]",
             1,
         );
@@ -2838,25 +2798,24 @@ enabled = false
                 CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new(), require_agree: None },
             ]
         );
-        assert_eq!(c.threshold_for("program-gate", &identity("wh1")).unwrap().mass_floor, -1.5);
+        assert_eq!(c.threshold_for("program-gate").unwrap().mass_floor, -1.5);
     }
 
     /// The benchmark's council gate parses and judges programs under its own
-    /// spec, with a threshold for the same server identity as the shell's.
+    /// spec, with a threshold of its own.
     #[test]
     fn the_bench_council_gate_declares_both_cases() {
         let cfg = config(include_str!("../../../../contrib/bench/gate-council.toml"));
         let c = cfg.council().expect("the bench file declares a council");
         let cases: Vec<CouncilCase> = c.specs.iter().map(|s| s.case).collect();
         assert_eq!(cases, vec![CouncilCase::Shell, CouncilCase::Program]);
-        let shell = c.thresholds.iter().find(|t| t.spec == "shell-gate").unwrap();
-        assert!(c.threshold_for("program-gate", &shell.identity).is_some());
+        assert!(c.threshold_for("shell-gate").is_some() && c.threshold_for("program-gate").is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
         assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
     }
 
     /// The benchmark's bump gate parses: bump-only mode over the bump spec,
-    /// the program spec reading council-code, one identity for both.
+    /// the program spec reading council-code, a threshold for each.
     #[test]
     fn the_bench_bump_only_gate_bumps_and_reads_council_code_for_programs() {
         let cfg = config(include_str!("../../../../contrib/bench/gate-bump.toml"));
@@ -2867,8 +2826,7 @@ enabled = false
         assert_eq!(c.specs[0].contexts, ["council-shell"]);
         assert_eq!(c.specs[1].contexts, ["council-code"]);
         assert!(c.require_agree_for("shell-bump") && !c.require_agree_for("program-gate"));
-        let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();
-        assert!(c.threshold_for("program-gate", &shell.identity).is_some());
+        assert!(c.threshold_for("shell-bump").is_some() && c.threshold_for("program-gate").is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
         assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
         for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
@@ -2881,19 +2839,6 @@ enabled = false
     fn a_threshold_must_name_a_declared_spec() {
         let m = council_err(&council_with("spec = \"shell-gate\"", "spec = \"nope\""));
         assert!(m.contains("[[council.threshold]] spec") && m.contains("nope"), "{m}");
-    }
-
-    #[test]
-    fn threshold_identity_fields_must_be_nonempty() {
-        for field in ["weight_hash", "engine", "tokenizer_hash", "template"] {
-            let from = format!("{field} = ");
-            let line = COUNCIL_FULL
-                .lines()
-                .find(|l| l.starts_with(&from))
-                .unwrap_or_else(|| panic!("fixture lacks {field}"));
-            let m = council_err(&council_with(line, &format!("{field} = \"\"")));
-            assert!(m.contains(field) && m.contains("non-empty"), "{field}: {m}");
-        }
     }
 
     #[test]
@@ -2912,23 +2857,37 @@ enabled = false
         config(&council_with("mass_floor = -0.05", "mass_floor = 0"));
     }
 
+    /// A threshold names its spec alone: the council server's identity is
+    /// recorded with each decision but no longer selects a threshold. Amy,
+    /// 2026-10-05: "let's drop this pinning business against mk, we're not
+    /// that precise for this."
     #[test]
-    fn two_thresholds_for_one_spec_and_identity_are_an_error() {
-        let m = council_err(&council_with("weight_hash = \"wh2\"", "weight_hash = \"wh1\""));
-        assert!(m.contains("one threshold per identity") && m.contains("shell-gate"), "{m}");
+    fn thresholds_are_found_by_spec_alone() {
+        let cfg = config(COUNCIL_FULL);
+        let c = cfg.council().unwrap();
+        assert_eq!(c.threshold_for("shell-gate").unwrap().allow_at, 0.98);
+        assert!(c.threshold_for("other-spec").is_none());
     }
 
     #[test]
-    fn thresholds_are_found_by_spec_and_identity() {
-        let cfg = config(COUNCIL_FULL);
-        let c = cfg.council().unwrap();
-        assert_eq!(c.threshold_for("shell-gate", &identity("wh1")).unwrap().allow_at, 0.98);
-        assert_eq!(c.threshold_for("shell-gate", &identity("wh2")).unwrap().allow_at, 0.9);
-        assert!(c.threshold_for("shell-gate", &identity("other")).is_none());
-        assert!(c.threshold_for("other-spec", &identity("wh1")).is_none());
-        let mut shifted = identity("wh1");
-        shifted.template = "mk-letters-2:abc".into();
-        assert!(c.threshold_for("shell-gate", &shifted).is_none(), "every identity field counts");
+    fn two_thresholds_for_one_spec_are_an_error() {
+        let second = COUNCIL_FULL.replacen(
+            "[context_type.coder.council]",
+            "[[council.threshold]]\nspec = \"shell-gate\"\nallow_at = 0.9\nmass_floor = -0.1\n\n[context_type.coder.council]",
+            1,
+        );
+        let m = council_err(&second);
+        assert!(m.contains("shell-gate") && m.contains("one threshold per spec"), "{m}");
+    }
+
+    /// The old identity lines fail the parse with a message that says to
+    /// delete them, rather than an unknown-field error.
+    #[test]
+    fn the_old_identity_fields_fail_naming_what_to_delete() {
+        for field in ["weight_hash", "engine", "tokenizer_hash", "template"] {
+            let m = council_err(&council_with("allow_at = 0.98", &format!("{field} = \"x\"\nallow_at = 0.98")));
+            assert!(m.contains(field) && m.contains("delete"), "{field}: {m}");
+        }
     }
 
     #[test]
