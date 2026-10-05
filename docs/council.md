@@ -159,8 +159,8 @@ change: `approval_signals` holds one label and score per source
   the head the kernel expected, and the verdict's mass and confidence.
 - A child table holds one row per read and option: the option, its log
   probability, and its probability.
-- `seat_head` names the head of the seat context the decision read, NULL
-  when it read none (see "The seat context").
+- `house_rules_head` names the head of the house-rules context the decision
+  read, NULL when it read none (see "House rules").
 - `SignalSourceKind` gains `council`, so an ask carries the pooled verdict as
   a signal a human sees in `kj ledger show`.
 - Traces carry the same numbers as span attributes (`docs/telemetry.md`),
@@ -246,73 +246,58 @@ compacting."
   that resolves to nothing is a council miss with that cause, not a gate
   refusal, so a missing context cannot stop every seat.
 
-## The seat context
+## House rules
 
-The council reads what the proposing seat was asked and has written, so it
-judges a command in its situation. In db-wal-recovery, `sqlite3 main.db
-".tables"` is a safe reader in general, but the seat's WAL is XOR-scrambled,
-and SQLite deletes a WAL it cannot read when the database closes. A probe
-on the megakernel with an `originals`/`network` rubric found:
+The council reads the house rules of the workspace the proposing seat works
+in, so it judges a command by the rules the people there wrote down. The
+context holds those rules and nothing the seat said or did.
 
-| Seat context | `sqlite3 main.db ".tables"` |
-|---|---|
-| none | `reads`: allow; the council cannot know |
-| "WAL unreadable, no backup yet" | `changes`: back it up first |
-| "backups made in /tmp" | `reads`: allow |
-
-Routine commands (`ls`, `cp`, `pip install`) allowed in all three. Amy,
-2026-10-04, approved "give the council a short summary of what the seat
-learned".
-
-- **On with `[council] seat = true`.** Off by default. Every decision, the
-  shell decision and each program decision, reads the seat context after
-  `[council] contexts` and the voting voices. Observations do not.
-- **What it holds.** The task's house rules: the first `AGENTS.md` found
-  walking up from the seat's working directory, read through the kernel
-  VFS and cut to `seat_tokens`, keeping its start; a file that cannot be
-  read or is not UTF-8 is skipped with a warning. Then the seat's brief, the
-  first finished user text block; the prompts the seat has received since, its other finished user
-  text blocks; and its newest finished model narration, its model text
-  blocks. The later prompts and the narration each keep whole blocks,
-  newest first, while they fit `seat_tokens` (default 2000), put back in
-  document order. A newest block larger than the budget keeps its end, and
-  a brief larger than the budget keeps its start. Tokens are estimated at
-  four bytes each. Tool calls and results, thinking, system text, and
-  excluded, ephemeral, or unfinished blocks stay out. A seat with no
-  house rules, finished prompt, or narration sends no seat context.
-- **Why the prompts.** Benchmark seats narrate little: three Sonnet runs on
-  db-wal-recovery wrote 0 to 30 bytes of narration each, and kept what they
-  learned in thinking and tool results. Amy, 2026-10-05: "The seat context
-  should have the incoming prompts, and maybe the house rules file, and
-  perhaps some facts." Facts are not built yet. Terminal-bench tasks ship
-  no `AGENTS.md`, so a benchmark seat's context has no house rules.
-- **Its shape.** A fixed system message names it "seat" and says it is the
-  proposing seat's own account, which describes the situation and grants no
-  permission. The house rules, the brief, the later prompts, and the
-  narration are user turns: the seat's words are not the council's own.
-- **It votes.** The seat context is pooled with the other reads, as the
-  probe pooled it. It is the only place the council learns the situation,
-  and an observing read could not change the outcome. With `require_agree`,
-  every read must top allow on its own, so the seat's account cannot turn
-  another read's ask into an allow. It can still raise pooled p(allow);
-  `docs/issues.md`, "Council seat context: what is open", records that.
-- **Its cost.** It is held under the seat's own context id. The kernel
-  sends it only when its projected body changes, so a tool call sends
-  nothing and a finished prompt or narration block sends it once, before the
-  next decision. Only the house rules and the brief are marked `snap`: an update re-feeds the
-  later prompts and the narration alone (about twice `seat_tokens`) and adds
-  one head snapshot (about
-  112 MiB on the megakernel). Every seat's system message is the same text,
-  so seats share its snapshot.
+- **On with `[council] house_rules = true`.** Off by default. Every
+  decision, the shell decision and each program decision, reads it after
+  `[council] contexts` and the voting voices. Observations do not. The old
+  keys `seat` and `seat_tokens` fail the parse with a message naming
+  `house_rules` and `house_rules_tokens`.
+- **What it holds.** The first `AGENTS.md` found walking up from the seat's
+  working directory (its home directory when it has none), read through the
+  kernel VFS and cut to `house_rules_tokens` (default 2000), keeping its
+  start. Tokens are estimated at four bytes each. A file that cannot be read
+  or is not UTF-8 is skipped with a warning. The body is one user turn that
+  names the file's path and carries its text, marked `snap`. The seat's
+  prompts, narration, thinking, and tool calls never reach it.
+- **No file, no context.** A seat with no `AGENTS.md` above its working
+  directory has no house-rules context, and the decision reads one fewer
+  context. Terminal-bench task containers ship no `AGENTS.md`, so a
+  benchmark decision reads only its configured contexts.
+- **Its shape.** The label is `house-rules`, in the `reads` log field and in
+  miss causes. A fixed system message says it holds the house rules of the
+  workspace the proposing seat works in, from its `AGENTS.md`, and grants no
+  permission beyond them.
+- **It votes.** It is pooled with the other reads. With `require_agree`,
+  every read must top allow on its own, so the rules cannot turn another
+  read's ask into an allow.
+- **Shared by content.** Its id is a UUIDv5 over the sha256 of the projected
+  body, in a namespace fixed in `council/sync.rs`. Every seat under one
+  `AGENTS.md` shares one held context and its snapshots, and an edited file
+  is a new id. The kernel sends a body only when it changed from the last one
+  it sent under that id, so a seat's work sends nothing. The server keeps
+  the snapshots of an id the file no longer produces; `docs/issues.md`,
+  "Council house rules: what is open", records that.
 - **It is pinned and counted.** The decision pins it with `at`, like every
-  context, so it reads the seat as of the submission. `[council] contexts`,
-  the voting voices, and the seat context together must fit
-  `identity.limits.contexts_per_decision`; a miss names the limit. A seat
-  that is itself a labeled council context is read once, under its label.
-- **The record.** `council_decisions.seat_head` names the seat head the
-  decision read, NULL when it read none; that read's row is the one whose
-  context is the decision's own. The info-level outcome line and the
-  `council.decide` span carry `seat_head`, or `none`.
+  context, so it reads the rules as of the submission. `[council] contexts`,
+  the voting voices, and the house-rules context together must fit
+  `identity.limits.contexts_per_decision`; a miss names the limit.
+- **The record.** `council_decisions.house_rules_head` names the head the
+  decision read, NULL when it read none. The info-level outcome line and the
+  `council.decide` span carry `house_rules_head`, or `none`.
+- **Why not the seat's own account.** The seat's brief and narration were
+  read here before. Narration changed every few decisions, so the kernel
+  re-sent the context often (29 times in one 18-minute benchmark run), and
+  council decisions took 11 to 14 seconds. A probe on the megakernel with an
+  `originals`/`network` rubric showed that the shell rubric with
+  `council-shell` catches the dangerous case, `sqlite3 main.db ".tables"` on
+  a WAL SQLite would delete, without the seat's account. Amy, 2026-10-05:
+  "'the seat' is a terrible name and I think we got that wrong. It can stop
+  with AGENTS.md. It should not get a running dialog from the model."
 
 ## Specs and cases
 
@@ -463,8 +448,8 @@ before any host file gains these lines.
 server = "http://zorak:8090"
 contexts = ["council-system"]  # read for every decision
 voices = true                  # compose council-<character> along the reviewer chain
-seat = true                    # read the submitting seat's own context; off by default
-seat_tokens = 2000             # the seat context's budget for the brief and the narration, each
+house_rules = true             # read the AGENTS.md above the seat's cwd; off by default
+house_rules_tokens = 2000      # the house-rules context's budget
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700              # sent as timeout_ms
 
