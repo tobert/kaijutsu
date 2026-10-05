@@ -585,7 +585,8 @@ action refused with guidance and tries again, with no human in the loop.
   held it (`originals=changes`, `network=other`). The submission runs only
   when the shell decision and every program decision pass.
 - **The fallback does not change.** A control-text hit, a miss, and a
-  program that was not judged leave the ordinary ask.
+  program that was not judged leave the ordinary ask (except in bump-only
+  mode, below).
 - **A bump opens no ask.** The call fails with the bump message, nothing
   runs, and no permission request is made. The council decision is recorded
   with outcome `bump` and its flavor, and links to no ask. Because no ask
@@ -606,6 +607,26 @@ action refused with guidance and tries again, with no human in the loop.
   built-in text is used.
 - **The record.** `council.decide` and the info line carry `outcome = bump`,
   `bump_flavor`, and `p_proceed`.
+
+### Bump-only
+
+`[council] mode = "bump-only"` is bumper mode with no ask at all. The
+benchmarks run it while the ask side is tuned. Amy, 2026-10-05: "I was
+intending to run the benchmarks with bump only, we have a lot of tuning to
+do on the more ask/deny side."
+
+- **Every decision that does not pass bumps, saying why.** The shell
+  decision is read first, then each program decision. A miss bumps with
+  flavor `unjudged` ("the council could not judge it (the miss's short
+  cause): try a smaller, plainer step."). A control-text hit, the only ask a
+  bumper mode can produce, bumps with flavor `control_text`. A program the
+  council could not read bumps with flavor `unread` and names the program.
+- **There is no limit.** The message counts `attempt N of ∞`, and the
+  default template tells the seat not to send the same command again
+  unchanged and to try something else. Amy: "even an accidental bump can be
+  worked around, and it still forces the thinking and intent we want." A
+  `bump_limit` with `bump-only` fails the parse. A miss is recorded with
+  outcome `miss`, so it does not raise the attempt count.
 
 ## Open questions for Amy
 

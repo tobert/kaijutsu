@@ -371,7 +371,7 @@ mod tests {
             seat: false,
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
-            bump_limit: crate::kj::gate_policy::DEFAULT_BUMP_LIMIT,
+            bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
             thresholds: vec![],
         };

@@ -1,11 +1,11 @@
-# Council gate policy in bumper mode: a benchmark container where System 1
-# passes or bumps (docs/council.md, "Bumper mode").
+# Council gate policy in bump-only mode: a benchmark container where System 1
+# passes or bumps and never asks (docs/council.md, "Bumper mode").
 #
-# A pass runs the submission. A bump refuses it with guidance and opens no
-# ask, so the seat tries again and the council judges the next try afresh;
-# after bump_limit bumps of one submission the next is an ordinary ask. A
-# miss or a control-text hit is an ordinary ask too. Run Harbor with
-# `--ak permission_mode=deny` so those asks are refusals the model sees.
+# A pass runs the submission. Anything else bumps: the submission is refused
+# with guidance and no ask, the seat tries again, and the council judges the
+# next try afresh. A miss, a control-text hit, and a program the council
+# could not read bump too, each saying why. There is no bump limit. Amy,
+# 2026-10-05: the benchmarks run bump-only while the ask side is tuned.
 #
 # The council reads `council-system` for every decision and, for program
 # decisions, `council-code` (both from the `council` rc variant). The
@@ -17,14 +17,16 @@
 uncovered = "ask"
 
 [council]
-mode = "bumper"
-bump_limit = 3
+mode = "bump-only"
 server = "http://zorak:8090"
 contexts = ["council-system"]
 pool = { method = "loglinear", weights = "mass" }
 # Exploration values from the Sonnet benchmark runs: a 3000 ms deadline
 # missed when a shell and a program decision run together.
-deadline_ms = 10000
+# In bump-only mode a miss bumps the seat, so a slow council costs the seat a
+# try. A DeepSeek run on 2026-10-05 missed 4 of 15 program decisions at
+# 10000 ms with council-code and the seat context read.
+deadline_ms = 20000
 require_agree = true
 voices = false
 # Each decision also reads the seat's own context: its brief and its newest
@@ -73,7 +75,9 @@ engine = "9fa181c94e60d6a443b20f0266892d614c1033b3:e48a8e4be1e67ac1ca756ceee08fa
 tokenizer_hash = "518665209619906d18852264fb032d302f6171425e4faa84aec9ac7d4b96cac6"
 template = "mk-letters-2:0b697183e7a5b7cb"
 allow_at = 0.98
-mass_floor = -1.5
+# Two program reads on 2026-10-05 put -1.53 and -1.79 on `originals`;
+# in bump-only mode a low-mass miss bumps the seat.
+mass_floor = -2.5
 
 [context_type.coder.council]
 enabled = true

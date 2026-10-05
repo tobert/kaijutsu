@@ -72,7 +72,7 @@ pub(crate) const VERDICT: &str = "verdict";
 /// its `allow` in both modes.
 pub(crate) fn pass_option(case: CouncilCase, mode: CouncilMode) -> &'static str {
     match (case, mode) {
-        (CouncilCase::Shell, CouncilMode::Bumper) => "proceed",
+        (CouncilCase::Shell, CouncilMode::Bumper | CouncilMode::BumpOnly) => "proceed",
         _ => "allow",
     }
 }
@@ -507,7 +507,7 @@ pub(crate) fn classify_case(
     };
     let outcome = if pooled_allows && (!council.require_agree || every_read_allows) {
         Outcome::Allow
-    } else if council.mode == CouncilMode::Bumper {
+    } else if council.mode != CouncilMode::Gatekeeper {
         match bump_flavor(case, &pooled, pass, &rubric, &allows) {
             Some(flavor) => Outcome::Bump(flavor),
             None => {
@@ -557,10 +557,10 @@ pub(crate) const BUMP_TEMPLATE_PATH: &str = "council/bump.md";
 
 /// Fill `template`: `{attempt}`, `{limit}`, `{flavor}`, then `{guidance}`
 /// last, so guidance text is never read as a placeholder.
-pub(crate) fn render_bump_template(template: &str, bump: &BumpReason, attempt: u64, limit: u64) -> String {
+pub(crate) fn render_bump_template(template: &str, bump: &BumpReason, attempt: u64, limit: Option<u64>) -> String {
     template
         .replace("{attempt}", &attempt.to_string())
-        .replace("{limit}", &limit.to_string())
+        .replace("{limit}", &limit.map_or_else(|| "∞".to_string(), |l| l.to_string()))
         .replace("{flavor}", &bump.flavor)
         .replace("{guidance}", &bump.guidance)
 }
@@ -569,7 +569,7 @@ pub(crate) fn render_bump_template(template: &str, bump: &BumpReason, attempt: u
 /// `/config/kernel/council/bump.md` as it stands now. A template that is
 /// missing or unreadable is an error in the log and in the message, and the
 /// built-in text stands in.
-pub(crate) async fn bump_message(kernel: &crate::Kernel, bump: &BumpReason, attempt: u64, limit: u64) -> String {
+pub(crate) async fn bump_message(kernel: &crate::Kernel, bump: &BumpReason, attempt: u64, limit: Option<u64>) -> String {
     use crate::vfs::VfsOps;
     let path = kaijutsu_types::paths::config_path(BUMP_TEMPLATE_PATH);
     let read = kernel
@@ -814,6 +814,9 @@ impl CouncilVerdict {
     /// a bump: a miss, an ask, a program not judged, or no bump at all
     /// leaves the submission to the ordinary ask or run.
     pub(crate) fn submission_bump(&self) -> Option<BumpReason> {
+        if self.council.mode == CouncilMode::BumpOnly {
+            return self.first_unpassed();
+        }
         let passes_or_bumps = |o: &Outcome| matches!(o, Outcome::Allow | Outcome::Bump(_));
         if !passes_or_bumps(&self.outcome)
             || !self.programs.iter().all(|p| p.decision.as_ref().is_ok_and(|d| passes_or_bumps(&d.outcome)))
@@ -825,8 +828,45 @@ impl CouncilVerdict {
             .or_else(|| self.programs.iter().find_map(|p| p.decision.as_ref().ok().and_then(|d| d.bump.clone())))
     }
 
-    /// `[council] bump_limit`, as this decision read it.
-    pub(crate) fn bump_limit(&self) -> u64 {
+    /// Bump-only mode: the first decision that did not pass, the shell
+    /// decision first, as a bump that says why. In a bumper mode an ask can
+    /// only come from a control-text hit.
+    fn first_unpassed(&self) -> Option<BumpReason> {
+        fn unpassed(outcome: &Outcome, bump: Option<&BumpReason>) -> Option<BumpReason> {
+            match outcome {
+                Outcome::Allow => None,
+                Outcome::Bump(_) => bump.cloned(),
+                Outcome::Miss(cause) => Some(BumpReason {
+                    flavor: "unjudged".into(),
+                    guidance: format!(
+                        "the council could not judge it ({}): try a smaller, plainer step.",
+                        cause.split(": ").next().unwrap_or(cause)
+                    ),
+                }),
+                Outcome::Ask | Outcome::Report => Some(BumpReason {
+                    flavor: "control_text".into(),
+                    guidance: "it spells a model's control token: write the command plainly.".into(),
+                }),
+            }
+        }
+        if let Some(reason) = unpassed(&self.outcome, self.bump.as_ref()) {
+            return Some(reason);
+        }
+        self.programs.iter().find_map(|p| match &p.decision {
+            Ok(decision) => unpassed(&decision.outcome, decision.bump.as_ref()),
+            Err(why) => Some(BumpReason {
+                flavor: "unread".into(),
+                guidance: format!(
+                    "the council could not read the program {} runs ({why}): run a file the command names, or show the program's text in the command.",
+                    p.name()
+                ),
+            }),
+        })
+    }
+
+    /// `[council] bump_limit`, as this decision read it; `None` in
+    /// bump-only mode, which has no limit.
+    pub(crate) fn bump_limit(&self) -> Option<u64> {
         self.council.bump_limit
     }
 
@@ -1835,7 +1875,7 @@ mod tests {
             seat: false,
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
-            bump_limit: crate::kj::gate_policy::DEFAULT_BUMP_LIMIT,
+            bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),

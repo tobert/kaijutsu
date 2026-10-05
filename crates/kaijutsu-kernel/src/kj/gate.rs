@@ -676,8 +676,8 @@ async fn refuse_bump(
             )));
         }
     };
-    if history.len() as u64 >= limit {
-        tracing::info!(bumps = history.len(), limit, "the submission reached its bump limit; it asks");
+    if limit.is_some_and(|limit| history.len() as u64 >= limit) {
+        tracing::info!(bumps = history.len(), limit = ?limit, "the submission reached its bump limit; it asks");
         council.at_bump_limit(history);
         return None;
     }
@@ -691,7 +691,7 @@ async fn refuse_bump(
     };
     match written {
         Ok(decision_id) => {
-            tracing::info!(attempt, limit, flavor = %bump.flavor, "the council bumped the submission; nothing ran");
+            tracing::info!(attempt, limit = ?limit, flavor = %bump.flavor, "the council bumped the submission; nothing ran");
             council.observe(kernel.clone(), decision_id);
             Some(GateOutcome {
                 verdict: GateVerdict::Denied,

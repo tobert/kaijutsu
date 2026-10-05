@@ -390,6 +390,10 @@ pub(crate) enum CouncilMode {
     /// Proceed runs the submission; anything else refuses it with guidance
     /// and no ask, until the bump limit.
     Bumper,
+    /// Bumper with no ask at all: a miss, a control-text hit, or a program
+    /// the council could not read bumps too, each saying why, and there is
+    /// no bump limit.
+    BumpOnly,
 }
 
 /// The kind of case a council spec reads.
@@ -460,7 +464,7 @@ pub(crate) struct CouncilConfig {
     pub(crate) mode: CouncilMode,
     /// `[council] bump_limit`: in bumper mode, the bumps one submission gets
     /// before the next would-be bump is an ordinary ask.
-    pub(crate) bump_limit: u64,
+    pub(crate) bump_limit: Option<u64>,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
 }
@@ -494,8 +498,8 @@ struct CouncilToml {
     seat_tokens: i64,
     #[serde(default = "default_mode")]
     mode: String,
-    #[serde(default = "default_bump_limit")]
-    bump_limit: i64,
+    #[serde(default)]
+    bump_limit: Option<i64>,
     #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
@@ -513,9 +517,6 @@ pub(crate) const DEFAULT_SEAT_TOKENS: u64 = 2000;
 /// The bumps one submission gets by default before it asks.
 pub(crate) const DEFAULT_BUMP_LIMIT: u64 = 3;
 
-fn default_bump_limit() -> i64 {
-    DEFAULT_BUMP_LIMIT as i64
-}
 
 fn default_mode() -> String {
     "gatekeeper".into()
@@ -718,16 +719,26 @@ impl GateConfig {
         let mode = match raw.mode.as_str() {
             "gatekeeper" => CouncilMode::Gatekeeper,
             "bumper" => CouncilMode::Bumper,
+            "bump-only" => CouncilMode::BumpOnly,
             other => {
-                return Err(err(format!("[council] mode: `{other}` is not one of gatekeeper, bumper")))
+                return Err(err(format!(
+                    "[council] mode: `{other}` is not one of gatekeeper, bumper, bump-only"
+                )))
             }
         };
-        if raw.bump_limit <= 0 {
-            return Err(err(format!(
-                "[council] bump_limit: {} must be an integer greater than 0",
-                raw.bump_limit
-            )));
-        }
+        let bump_limit = match (mode, raw.bump_limit) {
+            (CouncilMode::BumpOnly, Some(_)) => {
+                return Err(err(
+                    "[council] bump_limit: bump-only mode has no bump limit; remove the key".into(),
+                ))
+            }
+            (CouncilMode::BumpOnly, None) => None,
+            (_, Some(limit)) if limit <= 0 => {
+                return Err(err(format!("[council] bump_limit: {limit} must be an integer greater than 0")))
+            }
+            (_, Some(limit)) => Some(limit as u64),
+            (_, None) => Some(DEFAULT_BUMP_LIMIT),
+        };
         if raw.spec.is_empty() {
             return Err(err("[council]: declare at least one [[council.spec]]".into()));
         }
@@ -836,7 +847,7 @@ impl GateConfig {
             seat: raw.seat,
             seat_tokens: raw.seat_tokens as u64,
             mode,
-            bump_limit: raw.bump_limit as u64,
+            bump_limit,
             specs,
             thresholds,
         })
@@ -2600,10 +2611,10 @@ enabled = false
     fn the_council_mode_defaults_to_gatekeeper_and_parses_bumper() {
         let c = config(COUNCIL_FULL);
         assert_eq!(c.council().unwrap().mode, CouncilMode::Gatekeeper);
-        assert_eq!(c.council().unwrap().bump_limit, DEFAULT_BUMP_LIMIT);
+        assert_eq!(c.council().unwrap().bump_limit, Some(DEFAULT_BUMP_LIMIT));
         let bumper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bumper\"\nbump_limit = 5"));
         assert_eq!(bumper.council().unwrap().mode, CouncilMode::Bumper);
-        assert_eq!(bumper.council().unwrap().bump_limit, 5);
+        assert_eq!(bumper.council().unwrap().bump_limit, Some(5));
         let gatekeeper = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"gatekeeper\""));
         assert_eq!(gatekeeper.council().unwrap().mode, CouncilMode::Gatekeeper);
     }
@@ -2616,6 +2627,18 @@ enabled = false
         assert!(m.contains("bump_limit"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nbump_limit = \"three\""));
         assert!(m.contains("bump_limit"), "{m}");
+    }
+
+    /// `bump-only` parses, has no bump limit, and refuses a `bump_limit`,
+    /// which it would ignore.
+    #[test]
+    fn bump_only_mode_parses_and_takes_no_bump_limit() {
+        let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\""));
+        assert_eq!(c.council().unwrap().mode, CouncilMode::BumpOnly);
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"\nbump_limit = 3"));
+        assert!(m.contains("bump_limit") && m.contains("bump-only"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bouncer\""));
+        assert!(m.contains("bump-only"), "the error lists every mode: {m}");
     }
 
     #[test]
@@ -2789,14 +2812,14 @@ enabled = false
         assert!(c.seat, "the bench reads the seat context");
     }
 
-    /// The benchmark's bumper gate parses: bumper mode over the bump spec,
+    /// The benchmark's bump gate parses: bump-only mode over the bump spec,
     /// the program spec reading council-code, one identity for both.
     #[test]
-    fn the_bench_bumper_gate_bumps_and_reads_council_code_for_programs() {
+    fn the_bench_bump_only_gate_bumps_and_reads_council_code_for_programs() {
         let cfg = config(include_str!("../../../../contrib/bench/gate-bump.toml"));
         let c = cfg.council().expect("the bench file declares a council");
-        assert_eq!(c.mode, CouncilMode::Bumper);
-        assert_eq!(c.bump_limit, 3);
+        assert_eq!(c.mode, CouncilMode::BumpOnly);
+        assert_eq!(c.bump_limit, None);
         assert_eq!(c.specs[0].name, "shell-bump");
         assert_eq!(c.specs[1].contexts, ["council-code"]);
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();

@@ -260,6 +260,8 @@ struct Setup {
     bump_limit: Option<u64>,
     /// The bump template file is left out of the config directory.
     no_bump_template: bool,
+    /// `mode = "bump-only"`, reading the `shell-bump` spec.
+    bump_only: bool,
 }
 
 impl Default for Setup {
@@ -275,6 +277,7 @@ impl Default for Setup {
             seat: false,
             bump_limit: None,
             no_bump_template: false,
+            bump_only: false,
         }
     }
 }
@@ -314,11 +317,12 @@ enabled = {enabled}
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
         voices = setup.voices,
         seat = setup.seat,
-        mode = match setup.bump_limit {
-            Some(limit) => format!("mode = \"bumper\"\nbump_limit = {limit}"),
-            None => String::new(),
+        mode = match (setup.bump_only, setup.bump_limit) {
+            (true, _) => "mode = \"bump-only\"".to_string(),
+            (false, Some(limit)) => format!("mode = \"bumper\"\nbump_limit = {limit}"),
+            (false, None) => String::new(),
         },
-        shell = if setup.bump_limit.is_some() { "shell-bump" } else { "shell-gate" },
+        shell = if setup.bump_limit.is_some() || setup.bump_only { "shell-bump" } else { "shell-gate" },
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
         programs = if setup.programs { PROGRAM_SPEC_TOML } else { "" },
@@ -2199,6 +2203,64 @@ async fn a_miss_and_a_control_text_hit_are_ordinary_asks_in_bumper_mode() {
         });
         assert_pending(via, rig.submit("touch /work/a").await);
         assert_eq!(the_decision(&rig, &rig.only_ask()).decision.outcome, CouncilOutcome::Ask);
+        rig.finish().await;
+    }
+}
+
+fn bump_only() -> Setup {
+    Setup { bump_only: true, ..Setup::default() }
+}
+
+/// In bump-only mode a miss bumps, saying the council could not judge it,
+/// and opens no ask.
+///
+/// Falsified by bumper mode's fallback: the miss opens a pending ask.
+#[tokio::test]
+async fn a_miss_bumps_in_bump_only_mode() {
+    for via in BOTH {
+        let rig = rig(via, Setup { server: Some(dead_server()), ..bump_only() }).await;
+        let text = refusal_text(via, rig.submit("touch /work/a").await);
+        assert!(text.contains("the council could not judge it"), "{via:?}: {text}");
+        assert!(text.contains("attempt 1 of ∞"), "{via:?}: {text}");
+        assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
+        rig.finish().await;
+    }
+}
+
+/// In bump-only mode a control-text hit bumps, asking for plain text.
+#[tokio::test]
+async fn a_control_text_hit_bumps_in_bump_only_mode() {
+    for via in BOTH {
+        let rig = rig(via, bump_only()).await;
+        rig.mock.set(|req| {
+            let mut body = bump_answer(req, PROCEED);
+            body["signals"]["control_text"] = serde_json::json!([{"where": "state", "token": "<|im_end|>"}]);
+            Reply::ok(body)
+        });
+        let text = refusal_text(via, rig.submit("touch /work/a").await);
+        assert!(text.contains("control token"), "{via:?}: {text}");
+        assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
+        rig.finish().await;
+    }
+}
+
+/// In bump-only mode there is no limit: the fifth bump of one submission is
+/// still a bump, counted against infinity, and the message says to try
+/// something else.
+///
+/// Falsified by a limit: the fourth send opens an ask.
+#[tokio::test]
+async fn bump_only_mode_has_no_limit() {
+    for via in BOTH {
+        let rig = rig(via, bump_only()).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        let mut last = String::new();
+        for _ in 0..5 {
+            last = refusal_text(via, rig.submit("echo again").await);
+        }
+        assert!(last.contains("attempt 5 of ∞"), "{via:?}: {last}");
+        assert!(last.contains("try something else"), "{via:?}: {last}");
+        assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
         rig.finish().await;
     }
 }
