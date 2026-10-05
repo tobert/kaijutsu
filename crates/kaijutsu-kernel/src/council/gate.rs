@@ -836,12 +836,15 @@ impl CouncilVerdict {
             match outcome {
                 Outcome::Allow => None,
                 Outcome::Bump(_) => bump.cloned(),
+                // The cause stays in the record and the log: it names the
+                // gate's own machinery, which is not the seat's work.
                 Outcome::Miss(cause) => Some(BumpReason {
                     flavor: "unjudged".into(),
-                    guidance: format!(
-                        "the council could not judge it ({}): try a smaller, plainer step.",
-                        cause.split(": ").next().unwrap_or(cause)
-                    ),
+                    guidance: if cause.contains("deadline") {
+                        "the council could not judge it in time: try a smaller, plainer step.".into()
+                    } else {
+                        "the council could not judge it: try a smaller, plainer step.".into()
+                    },
                 }),
                 Outcome::Ask | Outcome::Report => Some(BumpReason {
                     flavor: "control_text".into(),

@@ -2220,8 +2220,11 @@ async fn a_miss_bumps_in_bump_only_mode() {
     for via in BOTH {
         let rig = rig(via, Setup { server: Some(dead_server()), ..bump_only() }).await;
         let text = refusal_text(via, rig.submit("touch /work/a").await);
-        assert!(text.contains("the council could not judge it"), "{via:?}: {text}");
+        assert!(text.contains("the council could not judge it: try a smaller, plainer step."), "{via:?}: {text}");
         assert!(text.contains("attempt 1 of ∞"), "{via:?}: {text}");
+        // The miss's cause names the gate's own machinery; a DeepSeek seat
+        // that read "refit one in gate.toml" in a bump rewrote its gate.
+        assert!(!text.contains("server") && !text.contains("gate.toml"), "{via:?}: the cause stays internal: {text}");
         assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
         rig.finish().await;
     }

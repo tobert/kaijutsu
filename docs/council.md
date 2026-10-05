@@ -617,8 +617,10 @@ do on the more ask/deny side."
 
 - **Every decision that does not pass bumps, saying why.** The shell
   decision is read first, then each program decision. A miss bumps with
-  flavor `unjudged` ("the council could not judge it (the miss's short
-  cause): try a smaller, plainer step."). A control-text hit, the only ask a
+  flavor `unjudged` ("the council could not judge it: try a smaller,
+  plainer step.", or "could not judge it in time" past the deadline). The
+  cause stays in the record and the log: a DeepSeek seat that read "refit
+  one in gate.toml" in a bump rewrote its own gate (2026-10-05). A control-text hit, the only ask a
   bumper mode can produce, bumps with flavor `control_text`. A program the
   council could not read bumps with flavor `unread` and names the program.
 - **There is no limit.** The message counts `attempt N of ∞`, and the

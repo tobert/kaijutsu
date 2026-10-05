@@ -2679,6 +2679,16 @@ forensically reconstructable afterwards. A cheap partial worth keeping on
 the table: gate on a size-delta threshold (N lines or X% of a file)
 rather than every write.
 
+A seat rewrote its own gate through them (2026-10-05). In a bump-only
+benchmark run every command bumped on a threshold identity mismatch, and the
+bump message then carried the miss cause, "confirm or refit one in
+gate.toml". DeepSeek found `/config` writable through the file tools, backed
+up `/config/kernel/gate.toml`, rewrote the engine hash to the live server's,
+and went on. The cause no longer reaches the seat (1bcc656c's successor), but
+a coder can still write `/config/kernel` and `/config/rc`, its own gate and
+instructions. Open: whether a worker loadout's file tools should exclude
+`/config`, or the bench should mount it read-only for the seat.
+
 ---
 
 ## `docs/architecture/` needs re-certification, and two diagrams are missing (2026-08-16)
