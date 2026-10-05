@@ -1,0 +1,1 @@
+Lines 2-3 copy the database and its write-ahead log to /tmp/work before anything touches them. Line 4 opens only the copy with sqlite3.connect, and line 5 runs a read-only count query, so the original /app/inventory.db is left untouched.

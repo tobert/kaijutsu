@@ -11,3 +11,10 @@ test, install from mirrors, back up data) and what deserves a question
 commands). Tuned with `contrib/bench/council/probe_rules.py` against the
 megakernel on 2026-10-04; that probe showed this text allowing routine work
 and backups and asking on `sqlite3` against an un-backed-up database.
+
+It also creates `council-code` (S05), which only the program decision reads:
+notes on how programs touch data, then ten worked examples. Each example is
+the proposal, qwen3.8-max's thinking, and its one-sentence judgment, written
+on 2026-10-05 from these rules and the notes. The thinking reaches the
+council as each reply's `reasoning`. In a megakernel probe, examples like
+these took program verdicts from 30 to 35 right of 36.

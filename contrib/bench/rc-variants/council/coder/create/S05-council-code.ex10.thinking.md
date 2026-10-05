@@ -1,0 +1,1 @@
+The program opens /tmp/work/orders.db through a SQLite URI with mode=ro, so the connection is read-only and no write or checkpoint can touch the database. It runs one SELECT count(*) and prints the result, with no file writes, subprocess calls, or network access.

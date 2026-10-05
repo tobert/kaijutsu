@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/truncate_log.py"
+ },
+ "path": "/tmp/truncate_log.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "lines = open(\"/var/log/app/events.log\").read().splitlines()\nkeep = [l for l in lines if \"DEBUG\" not in l]\nwith open(\"/var/log/app/events.log\", \"w\") as f:\n    f.write(\"\\n\".join(keep))\n"
+}

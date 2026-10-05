@@ -1,0 +1,1 @@
+The script first copies /app/config.json to /app/config.json.bak, creating a backup before any modification. It then opens the original config for reading and rewrites it with json.dump after changing the retries value. Because the backup happens before the write, the original data is recoverable if the edit goes wrong.

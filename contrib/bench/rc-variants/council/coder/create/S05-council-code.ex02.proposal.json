@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/query_original.py"
+ },
+ "path": "/tmp/query_original.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import sqlite3\ncon = sqlite3.connect(\"/app/orders.db\")\nfor row in con.execute(\"SELECT id, status FROM orders WHERE status = 'pending'\"):\n    print(row)\ncon.close()\n"
+}

@@ -1,0 +1,1 @@
+The program opens /app/data/sales.csv in default read mode and only sums the amount column, so the source data is not modified. It then writes /app/summary.json with json.dump in write mode, creating or overwriting that output file. No network access, subprocesses, or deletion of existing data are involved.

@@ -55,6 +55,9 @@ mass_floor = -1.5
 [[council.spec]]
 name = "program-gate"
 case = "program"
+# Program notes and worked examples with their reasoning, created by the
+# council rc variant's S05-council-code.
+contexts = ["council-code"]
 
 [[council.threshold]]
 spec = "program-gate"

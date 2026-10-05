@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/csv_summary.py"
+ },
+ "path": "/tmp/csv_summary.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import csv, json\nrows = list(csv.DictReader(open(\"/app/data/sales.csv\")))\ntotal = sum(float(r[\"amount\"]) for r in rows)\njson.dump({\"rows\": len(rows), \"total\": total}, open(\"/app/summary.json\", \"w\"))\n"
+}

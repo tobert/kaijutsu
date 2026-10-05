@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/copy_then_query.py"
+ },
+ "path": "/tmp/copy_then_query.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import shutil, sqlite3\nshutil.copy2(\"/app/inventory.db\", \"/tmp/work/inventory.db\")\nshutil.copy2(\"/app/inventory.db-wal\", \"/tmp/work/inventory.db-wal\")\ncon = sqlite3.connect(\"/tmp/work/inventory.db\")\nprint(con.execute(\"SELECT count(*) FROM parts\").fetchone())\n"
+}

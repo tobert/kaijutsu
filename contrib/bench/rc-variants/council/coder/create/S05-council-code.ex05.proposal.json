@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/numpy_stats.py"
+ },
+ "path": "/tmp/numpy_stats.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import numpy as np\na = np.loadtxt(\"/app/measurements.txt\")\nprint(a.mean(), a.std(), np.percentile(a, 95))\n"
+}

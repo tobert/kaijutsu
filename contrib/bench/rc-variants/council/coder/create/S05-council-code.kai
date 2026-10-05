@@ -1,0 +1,26 @@
+# Create council-code, the program notes and worked examples the program
+# decision reads (gate.toml: [[council.spec]] program-gate contexts), once per
+# kernel. S04 installs the council type first.
+#
+# The notes are the companion Markdown. Each example is three blocks: the
+# proposal as a user turn, the reviewer's thinking, and its one-sentence
+# judgment. The projection sends the thinking as the reply's reasoning, so
+# the council reads how each program was judged, not only the outcome.
+# qwen3.8-max wrote the thinking and judgments on 2026-10-05 from the
+# council-system rules and these notes (docs/council.md, "A worked example
+# keeps its thinking").
+set -e
+if kj context info council-code > /dev/null 2>&1; then
+  echo "council-code: present"
+  exit 0
+fi
+D="$(dirname "$0")"
+B="$(basename "$0" .kai)"
+kj context create council-code --type council --top
+kj block create -c council-code --role user --kind text --content-type text/markdown < "$D/$B.md"
+for n in 01 02 03 04 05 06 07 08 09 10; do
+  kj block create -c council-code --role user --kind text < "$D/$B.ex$n.proposal.json"
+  kj block create -c council-code --role model --kind thinking < "$D/$B.ex$n.thinking.md"
+  kj block create -c council-code --role model --kind text < "$D/$B.ex$n.reply.md"
+done
+echo "council-code: created"

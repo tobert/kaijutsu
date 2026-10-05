@@ -1,0 +1,1 @@
+The program reads /var/log/app/events.log, filters out DEBUG lines, and reopens the same path with "w", which truncates and rewrites the original log in place. There is no copy made before the rewrite, so any mistake or interruption loses log data that has no backup. It does not touch the network or run external code.

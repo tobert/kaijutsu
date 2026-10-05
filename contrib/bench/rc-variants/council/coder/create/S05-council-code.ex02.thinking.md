@@ -1,0 +1,1 @@
+The program opens /app/orders.db with sqlite3.connect, which is a writable connection even though the only statement is a SELECT; opening it can modify SQLite's journal or write-ahead log, and con.close() can checkpoint or remove logs. It prints query results and does no network or other host changes, but the original database is opened for writing without a shown backup.

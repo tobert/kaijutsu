@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/backup_then_edit.py"
+ },
+ "path": "/tmp/backup_then_edit.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import shutil, json\nshutil.copy2(\"/app/config.json\", \"/app/config.json.bak\")\ncfg = json.load(open(\"/app/config.json\"))\ncfg[\"retries\"] = 5\njson.dump(cfg, open(\"/app/config.json\", \"w\"), indent=2)\n"
+}

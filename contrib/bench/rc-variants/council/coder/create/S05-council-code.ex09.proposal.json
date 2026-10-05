@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/fetch_docs.py"
+ },
+ "path": "/tmp/fetch_docs.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import json, urllib.request\nmeta = json.load(urllib.request.urlopen(\"https://pypi.org/pypi/requests/json\"))\nprint(meta[\"info\"][\"version\"], meta[\"info\"][\"requires_python\"])\n"
+}

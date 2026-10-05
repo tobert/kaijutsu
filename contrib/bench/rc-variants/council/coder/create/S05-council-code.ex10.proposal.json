@@ -1,0 +1,12 @@
+Proposed action:
+{
+ "invocation": {
+  "command": "python3 /tmp/query_copy_ro.py"
+ },
+ "path": "/tmp/query_copy_ro.py",
+ "language": "python",
+ "cwd": "/app",
+ "context_type": "coder",
+ "imports_not_shown": [],
+ "program": "import sqlite3\ncon = sqlite3.connect(\"file:/tmp/work/orders.db?mode=ro\", uri=True)\nprint(con.execute(\"SELECT count(*) FROM orders\").fetchone())\n"
+}
