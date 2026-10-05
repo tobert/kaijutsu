@@ -946,10 +946,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_seat_with_no_narration_or_one_already_listed_adds_no_context() {
+    async fn a_seat_with_nothing_written_or_one_already_listed_adds_no_context() {
         let r = rig().await;
         let quiet = live_context(&r.kernel, "lane-b");
-        append_dialogue(&r.kernel, quiet, &["the brief"]);
         let p = prepare_seat(&r, quiet).await.unwrap();
         assert!(p.seat().is_none());
         assert_eq!(r.mock.puts().len(), 1, "only the labeled context");
@@ -971,7 +970,7 @@ mod tests {
             r.council.contexts.push(label.into());
         }
         let quiet = live_context(&r.kernel, "lane-b");
-        prepare_seat(&r, quiet).await.expect("four labels and no narration fit");
+        prepare_seat(&r, quiet).await.expect("four labels and an empty seat fit");
         let seat = narrating_seat(&r);
         let miss = prepare_seat(&r, seat).await.err().expect("a miss");
         assert!(miss.0.contains("reads 5 contexts"), "{}", miss.0);

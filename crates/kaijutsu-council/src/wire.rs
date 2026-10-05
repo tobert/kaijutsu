@@ -107,6 +107,11 @@ pub struct Turn {
     /// Keep a snapshot boundary at the end of this turn. Left out when false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub snap: bool,
+    /// The model's own thinking on an assistant turn, which the server renders
+    /// as that turn's thinking region. Left out when absent; any other role
+    /// carrying it is a `400`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// The body of `PUT /council/v1/contexts/{id}`: the whole context.
@@ -812,8 +817,8 @@ mod tests {
         let put = ContextPut {
             system: "s".into(),
             turns: vec![
-                Turn { role: Role::User, content: "a".into(), snap: false },
-                Turn { role: Role::Assistant, content: "b".into(), snap: true },
+                Turn { role: Role::User, content: "a".into(), snap: false, reasoning: None },
+                Turn { role: Role::Assistant, content: "b".into(), snap: true, reasoning: None },
             ],
             pin: None,
             warm: None,
@@ -829,6 +834,15 @@ mod tests {
         assert_eq!(v["pin"], json!(false));
         assert_eq!(v["dry_run"], json!(true));
         assert!(v.get("warm").is_none());
+    }
+
+    #[test]
+    fn an_assistant_turn_carries_its_reasoning() {
+        let turn = Turn { role: Role::Assistant, content: "hold".into(), snap: false, reasoning: Some("it opens the original".into()) };
+        assert_eq!(
+            serde_json::to_value(&turn).unwrap(),
+            json!({"role": "assistant", "content": "hold", "reasoning": "it opens the original"})
+        );
     }
 
     #[test]

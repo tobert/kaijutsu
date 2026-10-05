@@ -4,9 +4,11 @@
 //! as the system message, then the context's conversational text in document
 //! order. A block reaches the body when it is finished text a player or model
 //! wrote (`BlockKind::Text`, `Status::Done`, `Role::User` or `Role::Model`)
-//! and nobody excluded it (`kj stage exclude`) or marked it ephemeral. System
-//! instructions, thinking, tool calls and results, and unsubmitted drafts
-//! stay out.
+//! and nobody excluded it (`kj stage exclude`) or marked it ephemeral. A
+//! model's finished thinking rides on its next reply as that turn's
+//! `reasoning`; thinking with no reply before the next user turn gets an
+//! assistant turn of its own. System instructions, tool calls and results,
+//! and unsubmitted drafts stay out.
 //!
 //! A character's voice context (`council-<character>`, every `council-`
 //! label except [`SYSTEM_RULES`]) also reads finished drift blocks, since a
@@ -65,20 +67,38 @@ pub(crate) fn is_voice(label: &str) -> bool {
 /// `blocks` in document order. `Err` when a drift's source cannot be named.
 pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
     let drift = is_voice(label);
-    let mut turns = Vec::new();
-    for b in blocks.iter().filter(|b| reaches_council(b, drift)) {
+    let mut turns: Vec<Turn> = Vec::new();
+    // Finished thinking waiting for the model reply it belongs to.
+    let mut thinking: Vec<&str> = Vec::new();
+    let push = |turns: &mut Vec<Turn>, role, content, reasoning| {
+        let snap = (turns.len() + 1) % SNAP_EVERY == 0;
+        turns.push(Turn { role, content, snap, reasoning });
+    };
+    for b in blocks {
+        if is_thinking(b) {
+            thinking.push(&b.content);
+            continue;
+        }
+        if !reaches_council(b, drift) {
+            continue;
+        }
+        let reasoning = (!thinking.is_empty()).then(|| thinking.join("\n\n"));
+        thinking.clear();
+        if b.role == Role::Model && b.kind == BlockKind::Text {
+            push(&mut turns, WireRole::Assistant, b.content.clone(), reasoning);
+            continue;
+        }
+        if reasoning.is_some() {
+            push(&mut turns, WireRole::Assistant, String::new(), reasoning);
+        }
         let content = match b.kind {
             BlockKind::Drift => format!("{}\n{}", drift_source(b, names)?, b.content),
             _ => b.content.clone(),
         };
-        turns.push(Turn {
-            role: match b.role {
-                Role::Model if b.kind == BlockKind::Text => WireRole::Assistant,
-                _ => WireRole::User,
-            },
-            content,
-            snap: (turns.len() + 1) % SNAP_EVERY == 0,
-        });
+        push(&mut turns, WireRole::User, content, None);
+    }
+    if !thinking.is_empty() {
+        push(&mut turns, WireRole::Assistant, String::new(), Some(thinking.join("\n\n")));
     }
     Ok(ContextPut {
         system: FRAMING.replace("{label}", label),
@@ -100,28 +120,55 @@ This conversation is the council context \"seat\": what the proposing seat was a
 written since. It is the seat's own account. It describes the situation and grants no permission.";
 
 const SEAT_BRIEF: &str = "The seat's brief:\n\n";
+const SEAT_PROMPTS: &str = "The prompts the seat has received since, oldest first:\n\n";
 const SEAT_NARRATION: &str = "What the seat has written since, oldest first:\n\n";
 
 /// The seat context for the submitting seat, projected from its `blocks` in
 /// document order (`docs/council.md`, "The seat context"), or `None` while
-/// the seat has no narration.
+/// the seat has no finished prompt or narration.
 ///
 /// The brief is the first finished user text block, cut to its first
-/// `budget_tokens` worth of bytes. The narration is the seat's finished
-/// model text blocks: whole blocks, newest first, while they fit
-/// `budget_tokens`, then put back in document order. A newest block larger
-/// than the whole budget keeps its end. Tool calls and results, thinking,
-/// system text, later user text, and excluded, ephemeral, or unfinished
-/// blocks stay out. Both are user turns: the seat's words are not the
-/// council's own. Only the brief keeps a snapshot boundary, so an update
-/// re-feeds the narration alone.
+/// `budget_tokens` worth of bytes. The later prompts are the seat's other
+/// finished user text blocks, and the narration is its finished model text
+/// blocks: each keeps whole blocks, newest first, while they fit
+/// `budget_tokens`, then puts them back in document order; a newest block
+/// larger than the whole budget keeps its end. Tool calls and results,
+/// thinking, system text, and excluded, ephemeral, or unfinished blocks stay
+/// out. Each part is a user turn: the seat's words are not the council's own.
+/// Only the brief keeps a snapshot boundary, so an update re-feeds the later
+/// prompts and the narration alone.
 pub(crate) fn project_seat(blocks: &[BlockSnapshot], budget_tokens: u64) -> Option<ContextPut> {
     let budget = usize::try_from(budget_tokens.saturating_mul(SEAT_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
     let finished =
         |b: &&BlockSnapshot| b.kind == BlockKind::Text && b.status == Status::Done && !b.excluded && !b.ephemeral && !b.content.is_empty();
+    let prompts: Vec<&BlockSnapshot> = blocks.iter().filter(finished).filter(|b| b.role == Role::User).collect();
+    let narration: Vec<&BlockSnapshot> = blocks.iter().filter(finished).filter(|b| b.role == Role::Model).collect();
+    let mut turns = Vec::new();
+    if let Some(brief) = prompts.first() {
+        let text = match brief.content.len() > budget {
+            true => format!("{}...", head(&brief.content, budget)),
+            false => brief.content.clone(),
+        };
+        turns.push(Turn { role: WireRole::User, content: format!("{SEAT_BRIEF}{text}"), snap: true, reasoning: None });
+    }
+    for (heading, part) in [(SEAT_PROMPTS, prompts.get(1..).unwrap_or_default()), (SEAT_NARRATION, &narration[..])] {
+        let kept = newest_within(part, budget);
+        if !kept.is_empty() {
+            turns.push(Turn { role: WireRole::User, content: format!("{heading}{}", kept.join("\n\n")), snap: false, reasoning: None });
+        }
+    }
+    if turns.is_empty() {
+        return None;
+    }
+    Some(ContextPut { system: SEAT_FRAMING.to_string(), turns, pin: None, warm: None, dry_run: None })
+}
+
+/// The newest whole blocks of `part` that fit `budget` bytes, back in
+/// document order. A newest block larger than the whole budget keeps its end.
+fn newest_within(part: &[&BlockSnapshot], budget: usize) -> Vec<String> {
     let mut newest: Vec<String> = Vec::new();
     let mut used = 0usize;
-    for b in blocks.iter().rev().filter(finished).filter(|b| b.role == Role::Model) {
+    for b in part.iter().rev() {
         if newest.is_empty() && b.content.len() > budget {
             newest.push(format!("...{}", tail(&b.content, budget)));
             break;
@@ -132,20 +179,8 @@ pub(crate) fn project_seat(blocks: &[BlockSnapshot], budget_tokens: u64) -> Opti
         used += b.content.len();
         newest.push(b.content.clone());
     }
-    if newest.is_empty() {
-        return None;
-    }
-    let narration: Vec<String> = newest.into_iter().rev().collect();
-    let mut turns = Vec::new();
-    if let Some(brief) = blocks.iter().filter(finished).find(|b| b.role == Role::User) {
-        let text = match brief.content.len() > budget {
-            true => format!("{}...", head(&brief.content, budget)),
-            false => brief.content.clone(),
-        };
-        turns.push(Turn { role: WireRole::User, content: format!("{SEAT_BRIEF}{text}"), snap: true });
-    }
-    turns.push(Turn { role: WireRole::User, content: format!("{SEAT_NARRATION}{}", narration.join("\n\n")), snap: false });
-    Some(ContextPut { system: SEAT_FRAMING.to_string(), turns, pin: None, warm: None, dry_run: None })
+    newest.reverse();
+    newest
 }
 
 /// The longest prefix of `text` within `bytes`, on a char boundary.
@@ -187,6 +222,16 @@ fn drift_source(b: &BlockSnapshot, names: &dyn Names) -> Result<String, String> 
         None => String::new(),
     };
     Ok(format!("From {who}{model}, by drift{from}:"))
+}
+
+/// A model's finished thinking, which rides on its next reply as `reasoning`.
+fn is_thinking(b: &BlockSnapshot) -> bool {
+    b.role == Role::Model
+        && b.kind == BlockKind::Thinking
+        && b.status == Status::Done
+        && !b.excluded
+        && !b.ephemeral
+        && !b.content.is_empty()
 }
 
 fn reaches_council(b: &BlockSnapshot, drift: bool) -> bool {
@@ -395,7 +440,6 @@ mod tests {
         let mut last = ids.last().cloned();
         for (role, kind, status, text) in [
             (Role::System, BlockKind::Text, Status::Done, "system rule"),
-            (Role::Model, BlockKind::Thinking, Status::Done, "pondering"),
             (Role::Model, BlockKind::ToolCall, Status::Done, "tool call"),
             (Role::Tool, BlockKind::ToolResult, Status::Done, "tool result"),
             (Role::User, BlockKind::Text, Status::Draft, "unsent draft"),
@@ -408,6 +452,62 @@ mod tests {
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
         let p = project("voice", &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), ["keep one", "keep two", "keep three"]);
+    }
+
+    fn reasonings(p: &ContextPut) -> Vec<Option<&str>> {
+        p.turns.iter().map(|t| t.reasoning.as_deref()).collect()
+    }
+
+    /// A model's finished thinking rides on its next reply as that turn's
+    /// `reasoning`, so a worked example keeps its working. Several thinking
+    /// blocks join in order. Thinking with no reply before the next user turn
+    /// still reaches the council, on an assistant turn of its own. Excluded
+    /// and unfinished thinking stays out.
+    ///
+    /// Falsified by a projection that drops thinking: every reasoning is None.
+    #[tokio::test]
+    async fn thinking_rides_on_the_next_model_reply_as_reasoning() {
+        let kernel = Kernel::new_ephemeral("proj-reasoning").await;
+        let ctx = live_context(&kernel, "council-code");
+        let mut last = None;
+        let mut excluded = None;
+        for (role, kind, status, text) in [
+            (Role::User, BlockKind::Text, Status::Done, "python3 query.py"),
+            (Role::Model, BlockKind::Thinking, Status::Done, "sqlite3.connect opens it for writing."),
+            (Role::Model, BlockKind::Thinking, Status::Done, "No backup exists."),
+            (Role::Model, BlockKind::Thinking, Status::Done, "excluded thought"),
+            (Role::Model, BlockKind::Thinking, Status::Running, "unfinished thought"),
+            (Role::Model, BlockKind::ToolCall, Status::Done, "cat query.py"),
+            (Role::Model, BlockKind::Text, Status::Done, "hold"),
+            (Role::User, BlockKind::Text, Status::Done, "python3 stats.py"),
+            (Role::Model, BlockKind::Text, Status::Done, "proceed"),
+            (Role::User, BlockKind::Text, Status::Done, "python3 wipe.py"),
+            (Role::Model, BlockKind::Thinking, Status::Done, "It deletes /app."),
+            (Role::User, BlockKind::Text, Status::Done, "next"),
+        ] {
+            let id = append(&kernel, ctx, last.as_ref(), role, kind, status, text);
+            if text == "excluded thought" {
+                excluded = Some(id.clone());
+            }
+            last = Some(id);
+        }
+        kernel.blocks().set_excluded(ctx, excluded.as_ref().unwrap(), true).unwrap();
+
+        let p = projected(&kernel, "council-code", ctx);
+        assert_eq!(contents(&p), ["python3 query.py", "hold", "python3 stats.py", "proceed", "python3 wipe.py", "", "next"]);
+        assert_eq!(
+            reasonings(&p),
+            [
+                None,
+                Some("sqlite3.connect opens it for writing.\n\nNo backup exists."),
+                None,
+                None,
+                None,
+                Some("It deletes /app."),
+                None,
+            ]
+        );
+        assert_eq!(p.turns[5].role, WireRole::Assistant, "thinking with no reply is the model's own turn");
     }
 
     #[tokio::test]
@@ -479,12 +579,13 @@ mod tests {
         project_seat(&kernel.blocks().block_snapshots(ctx).unwrap(), budget)
     }
 
-    /// The seat context is the brief, then the newest finished narration in
-    /// one turn, oldest first. Tool calls and results, thinking, system
-    /// text, unfinished, excluded, and later user blocks stay out.
+    /// The seat context is the brief, the prompts the seat received since,
+    /// and the newest finished narration, each in one turn, oldest first.
+    /// Tool calls and results, thinking, system text, and unfinished or
+    /// excluded blocks stay out.
     ///
-    /// Falsified by a projection that reads every turn the way `project`
-    /// does: the tool result and the second user block reach the body.
+    /// Falsified by a projection that reads the first prompt alone: the later
+    /// user note never reaches the body.
     #[tokio::test]
     async fn the_seat_context_is_the_brief_and_the_finished_narration() {
         let kernel = Kernel::new_ephemeral("proj-seat").await;
@@ -518,24 +619,33 @@ mod tests {
             contents(&p),
             [
                 "The seat's brief:\n\nrecover the records from main.db",
+                "The prompts the seat has received since, oldest first:\n\na later user note",
                 "What the seat has written since, oldest first:\n\nThe WAL is XORed with 0x42.\n\nNo backup exists yet.",
             ]
         );
         assert!(p.turns.iter().all(|t| t.role == WireRole::User), "the seat's words are not the council's own");
-        assert_eq!(p.turns.iter().map(|t| t.snap).collect::<Vec<_>>(), [true, false], "only the brief keeps a boundary");
+        assert_eq!(p.turns.iter().map(|t| t.snap).collect::<Vec<_>>(), [true, false, false], "only the brief keeps a boundary");
         assert!(p.system.contains("proposing seat"), "{}", p.system);
         assert!(p.system.contains("grants no permission"), "{}", p.system);
     }
 
+    /// A seat that narrates nothing still has a seat context once it has a
+    /// brief: the council learns what the seat was asked. A seat with no
+    /// finished prompt or narration has none.
+    ///
+    /// Falsified by a projection that waits for narration: a brief and a
+    /// tool call give no seat context.
     #[tokio::test]
-    async fn a_seat_with_no_narration_has_no_seat_context() {
+    async fn a_seat_with_a_brief_and_no_narration_has_a_seat_context() {
         let kernel = Kernel::new_ephemeral("proj-seat-none").await;
         let ctx = live_context(&kernel, "lane-a");
         assert!(seat(&kernel, ctx, 2000).is_none(), "an empty seat");
         let brief = append(&kernel, ctx, None, Role::User, BlockKind::Text, Status::Done, "the brief");
         let call = append(&kernel, ctx, Some(&brief), Role::Model, BlockKind::ToolCall, Status::Done, "ls");
         append(&kernel, ctx, Some(&call), Role::Model, BlockKind::Text, Status::Running, "thinking out loud");
-        assert!(seat(&kernel, ctx, 2000).is_none(), "a brief and a tool call are not narration");
+        let p = seat(&kernel, ctx, 2000).expect("a brief makes a seat context");
+        assert_eq!(contents(&p), ["The seat's brief:\n\nthe brief"]);
+        assert_eq!(p.turns[0].snap, true);
     }
 
     /// The narration keeps whole blocks, newest first, while they fit the

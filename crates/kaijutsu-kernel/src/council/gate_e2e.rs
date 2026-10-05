@@ -1789,7 +1789,7 @@ async fn a_script_changed_after_the_council_judged_it_does_not_run() {
 /// With `[council] seat` on, the shell decision and each program decision
 /// read the submitting seat's own context after the configured contexts,
 /// under the seat's context id and pinned at the head the kernel prepared.
-/// A seat with no narration yet reads no seat context. Each decision
+/// A seat with nothing written yet reads no seat context. Each decision
 /// records the seat head it read, and its info log line says whether it
 /// read one.
 ///

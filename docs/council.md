@@ -217,12 +217,20 @@ compacting."
 - **Voices count against the server's limit.** The system context plus the
   voting voices must fit `identity.limits.contexts_per_decision` (8 on the
   megakernel); a longer chain is a miss naming the limit, not a silent cut.
+- **A worked example keeps its thinking.** A model's finished thinking rides
+  on its next reply as that turn's `reasoning` (council API 0.2.2), so a
+  council context can hold examples the way a stronger model reasoned them.
+  The council answers with an empty thinking region, so these examples are
+  how it learns the reasoning. A probe on the megakernel (2026-10-05) put
+  eight programs judged by qwen3.8-max, with its reasoning, in a code
+  context: the program verdicts went from 30 to 35 right of 36.
 - **Tuning is chat.** Amy switches to a council context and talks to it.
   `kj stage exclude` removes a block from what the council reads, the same
   way it shapes a fork. No special UI.
 - **A change reaches the server as a whole-context `PUT`.** The kernel
   projects the context (its framing as the system message, its blocks as
-  turns, excluded blocks left out) and sends it with `If-Match` on the head
+  turns, excluded blocks left out, and a model's thinking as its reply's
+  `reasoning`) and sends it with `If-Match` on the head
   it last saw and `warm` naming the gate's specs. The server feeds only what
   changed, then rebuilds the spec layer, so the next decision starts from a
   held snapshot.
@@ -260,17 +268,24 @@ learned".
   shell decision and each program decision, reads the seat context after
   `[council] contexts` and the voting voices. Observations do not.
 - **What it holds.** The seat's brief, the first finished user text
-  block, and its newest finished model narration: whole model text blocks,
+  block; the prompts the seat has received since, its other finished user
+  text blocks; and its newest finished model narration, its model text
+  blocks. The later prompts and the narration each keep whole blocks,
   newest first, while they fit `seat_tokens` (default 2000), put back in
   document order. A newest block larger than the budget keeps its end, and
   a brief larger than the budget keeps its start. Tokens are estimated at
-  four bytes each. Tool calls and results, thinking, system text, later
-  user text, and excluded, ephemeral, or unfinished blocks stay out. A seat
-  with no narration yet sends no seat context.
+  four bytes each. Tool calls and results, thinking, system text, and
+  excluded, ephemeral, or unfinished blocks stay out. A seat with no
+  finished prompt or narration sends no seat context.
+- **Why the prompts.** Benchmark seats narrate little: three Sonnet runs on
+  db-wal-recovery wrote 0 to 30 bytes of narration each, and kept what they
+  learned in thinking and tool results. Amy, 2026-10-05: "The seat context
+  should have the incoming prompts, and maybe the house rules file, and
+  perhaps some facts." The house rules and facts are not built yet.
 - **Its shape.** A fixed system message names it "seat" and says it is the
   proposing seat's own account, which describes the situation and grants no
-  permission. The brief and the narration are two user turns: the seat's
-  words are not the council's own.
+  permission. The brief, the later prompts, and the narration are user
+  turns: the seat's words are not the council's own.
 - **It votes.** The seat context is pooled with the other reads, as the
   probe pooled it. It is the only place the council learns the situation,
   and an observing read could not change the outcome. With `require_agree`,
@@ -279,9 +294,10 @@ learned".
   `docs/issues.md`, "Council seat context: what is open", records that.
 - **Its cost.** It is held under the seat's own context id. The kernel
   sends it only when its projected body changes, so a tool call sends
-  nothing and a finished narration block sends it once, before the next
-  decision. Only the brief turn is marked `snap`: an update re-feeds the
-  narration alone (about `seat_tokens`) and adds one head snapshot (about
+  nothing and a finished prompt or narration block sends it once, before the
+  next decision. Only the brief turn is marked `snap`: an update re-feeds the
+  later prompts and the narration alone (about twice `seat_tokens`) and adds
+  one head snapshot (about
   112 MiB on the megakernel). Every seat's system message is the same text,
   so seats share its snapshot.
 - **It is pinned and counted.** The decision pins it with `at`, like every

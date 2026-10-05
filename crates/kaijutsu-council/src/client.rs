@@ -415,7 +415,7 @@ mod tests {
     fn put_body() -> ContextPut {
         ContextPut {
             system: "rules".into(),
-            turns: vec![Turn { role: Role::User, content: "hi".into(), snap: true }],
+            turns: vec![Turn { role: Role::User, content: "hi".into(), snap: true, reasoning: None }],
             pin: None,
             warm: None,
             dry_run: None,
