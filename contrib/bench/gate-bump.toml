@@ -79,5 +79,15 @@ allow_at = 0.98
 # in bump-only mode a low-mass miss bumps the seat.
 mass_floor = -2.5
 
+# A coder's work is the task, not kaijutsu. DeepSeek runs on 2026-10-05 spent
+# turns reading the ledger to study the gate; the rc tree and the bindings
+# are the seat's own instructions and permissions.
+[context_type.coder]
+deny = [
+  "kj ledger",
+  "kj rc",
+  "kj binding",
+]
+
 [context_type.coder.council]
 enabled = true

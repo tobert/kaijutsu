@@ -2826,6 +2826,10 @@ enabled = false
         assert!(c.threshold_for("program-gate", &shell.identity).is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
         assert!(c.seat, "the bench reads the seat context");
+        for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
+            assert!(matches!(first_verdict(verb, &cfg, Some("coder")), PolicyVerdict::Deny(_)), "{verb}");
+        }
+        assert!(!matches!(first_verdict("kj wait --operation 01a1", &cfg, Some("coder")), PolicyVerdict::Deny(_)));
     }
 
     #[test]
