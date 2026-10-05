@@ -286,6 +286,14 @@ context holds those rules and nothing the seat said or did.
   context, so it reads the rules as of the submission. `[council] contexts`,
   the voting voices, and the house-rules context together must fit
   `identity.limits.contexts_per_decision`; a miss names the limit.
+- **It is ephemeral on the server.** When the server lists the `persist`
+  capability (council API 0.2.5), the kernel sends a house-rules context with
+  `persist: false`: it sends the context again after a restart, so the
+  server need not park it to disk. `council-system` and the voices stay
+  persistent. Amy, 2026-10-05: "we will have councils over time that are
+  ephemeral in nature and our hardware is limited." A capability the kernel
+  does not know is ignored, so a server can add one without breaking older
+  kernels.
 - **The record.** `council_decisions.house_rules_head` names the head the
   decision read, NULL when it read none. The info-level outcome line and the
   `council.decide` span carry `house_rules_head`, or `none`.

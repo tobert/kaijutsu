@@ -106,6 +106,7 @@ pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) 
         pin: None,
         warm: None,
         dry_run: None,
+        persist: None,
     })
 }
 
@@ -147,6 +148,7 @@ pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64
         pin: None,
         warm: None,
         dry_run: None,
+        persist: None,
     })
 }
 

@@ -386,6 +386,9 @@ the identity and the thresholds fitted under it. The megakernel writes
 | `pin_bytes` | The pin budget. |
 | `snapshot_bytes` | What one held snapshot costs, so a client can budget `warm` and `snap`. |
 
+A client ignores a capability it does not know, so a server can add one
+without breaking clients built before it.
+
 | Capability | Means |
 |---|---|
 | `park` | Snapshots and context records are kept on disk and outlive eviction and restarts. |

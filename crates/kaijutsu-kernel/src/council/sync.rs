@@ -249,11 +249,11 @@ impl CouncilSync {
             })?;
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
-            let head = self.hold(&client, server, &identity, &spec_id, label, context_id, body).await?;
+            let head = self.hold(&client, server, &identity, &spec_id, label, context_id, body, true).await?;
             contexts.push(PreparedContext { label: label.clone(), context_id, head, house_rules: false });
         }
         if let Some((context_id, body)) = house {
-            let head = self.hold(&client, server, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body).await?;
+            let head = self.hold(&client, server, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
             contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, head, house_rules: true });
         }
 
@@ -262,7 +262,10 @@ impl CouncilSync {
     }
 
     /// Makes the server hold `body` as `context_id` and returns its head.
-    /// Sends nothing when the server already holds this body.
+    /// Sends nothing when the server already holds this body. A context that
+    /// is not `persistent` is sent with `persist: false` when the server
+    /// lists the capability: the kernel sends it again after a restart, so
+    /// the server need not keep it on disk.
     #[allow(clippy::too_many_arguments)]
     async fn hold(
         &self,
@@ -273,6 +276,7 @@ impl CouncilSync {
         label: &str,
         context_id: ContextId,
         body: kaijutsu_council::wire::ContextPut,
+        persistent: bool,
     ) -> Result<SnapshotId, PrepareMiss> {
         let hash = body_hash(&body)?;
         let key = (server.to_string(), context_id);
@@ -283,6 +287,9 @@ impl CouncilSync {
         let mut body = body;
         if identity.capabilities.contains(&Capability::Warm) {
             body.warm = Some(vec![spec_id.clone()]);
+        }
+        if !persistent && identity.capabilities.contains(&Capability::Persist) {
+            body.persist = Some(false);
         }
         let id = context_id.to_string();
         let mut if_match = held.as_ref().map(|h| h.head.clone());
@@ -1027,6 +1034,34 @@ mod tests {
         let again = prepare_seat(&r, seat).await.unwrap();
         assert_eq!(r.mock.puts().len(), 2, "narration and prompts send nothing");
         assert_eq!(again.house_rules().unwrap().head, p.house_rules().unwrap().head);
+    }
+
+    /// A house-rules context is ephemeral: it is sent with `persist: false`
+    /// when the server lists the `persist` capability, so the server need not
+    /// park it; a labeled context never carries `persist`, and a server
+    /// without the capability never sees the field.
+    ///
+    /// Falsified by a sync that leaves `persist` off: the house-rules body
+    /// has no `persist`.
+    #[tokio::test]
+    async fn house_rules_are_sent_with_persist_false_when_the_server_can_drop_them() {
+        let mut r = rig().await;
+        r.council.house_rules = true;
+        r.mock.force("GET", reply(200, identity_with(json!(["leave_one_out", "persist"]))));
+        write_rules(&r, "Back up data before changing it.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo"));
+        prepare_seat(&r, seat).await.expect("prepared");
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 2);
+        assert!(puts[0].1.get("persist").is_none(), "a labeled context stays persistent: {}", puts[0].1);
+        assert_eq!(puts[1].1["persist"], json!(false), "{}", puts[1].1);
+
+        let mut plain = rig().await;
+        plain.council.house_rules = true;
+        write_rules(&plain, "Back up data before changing it.").await;
+        let seat = seat_in(&plain, "lane-a", Some("/work/repo"));
+        prepare_seat(&plain, seat).await.expect("prepared");
+        assert!(plain.mock.puts()[1].1.get("persist").is_none(), "no capability, no field");
     }
 
     /// The held id comes from the body, so every seat under one `AGENTS.md`

@@ -419,6 +419,7 @@ mod tests {
             pin: None,
             warm: None,
             dry_run: None,
+            persist: None,
         }
     }
 

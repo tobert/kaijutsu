@@ -125,6 +125,11 @@ pub struct ContextPut {
     pub warm: Option<Vec<SpecId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
+    /// `false` says the client will `PUT` this context again after a restart
+    /// or an eviction, so the server need not keep it beyond memory. Absent
+    /// keeps the server's setting. Requires the `persist` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<bool>,
 }
 
 /// Which layer of the stack a snapshot ends.
@@ -162,6 +167,8 @@ pub struct ContextState {
     pub tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist: Option<bool>,
     pub snapshots: Vec<SnapshotInfo>,
 }
 
@@ -623,8 +630,15 @@ pub enum Capability {
     Park,
     Warm,
     DryRun,
+    /// `PUT` accepts `persist`, and the server may drop a `persist: false`
+    /// context at a restart.
+    Persist,
     Describe,
     LeaveOneOut,
+    /// A capability this client does not know. A server may add capabilities;
+    /// a client built before one keeps working and never uses it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A server's limits.
@@ -823,6 +837,7 @@ mod tests {
             pin: None,
             warm: None,
             dry_run: None,
+            persist: None,
         };
         assert_eq!(
             serde_json::to_value(&put).unwrap(),
@@ -834,6 +849,25 @@ mod tests {
         assert_eq!(v["pin"], json!(false));
         assert_eq!(v["dry_run"], json!(true));
         assert!(v.get("warm").is_none());
+    }
+
+    #[test]
+    fn a_context_put_carries_persist_and_the_capability_is_named_persist() {
+        let put = ContextPut { system: "s".into(), turns: vec![], pin: None, warm: None, dry_run: None, persist: Some(false) };
+        assert_eq!(serde_json::to_value(&put).unwrap()["persist"], json!(false));
+        let none = ContextPut { persist: None, ..put };
+        assert!(serde_json::to_value(&none).unwrap().get("persist").is_none());
+        let caps: Vec<Capability> = serde_json::from_value(json!(["warm", "persist"])).unwrap();
+        assert_eq!(caps, [Capability::Warm, Capability::Persist]);
+    }
+
+    /// A capability this client does not know is kept as `Unknown`, so a
+    /// server that adds one does not fail every client built before it.
+    /// Falsified by a closed enum: the identity does not decode.
+    #[test]
+    fn an_unknown_capability_does_not_fail_the_identity() {
+        let caps: Vec<Capability> = serde_json::from_value(json!(["warm", "time_travel"])).unwrap();
+        assert_eq!(caps, [Capability::Warm, Capability::Unknown]);
     }
 
     #[test]
@@ -907,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_decodes_and_rejects_an_unknown_capability() {
+    fn identity_decodes_and_keeps_an_unknown_capability_as_unknown() {
         let ok = json!({"model": "m", "weight_hash": "w", "tokenizer_hash": "t", "template": "x", "engine": "e",
                         "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 8,
                                    "choice_options": 255, "default_timeout_ms": 1000},
@@ -916,7 +950,8 @@ mod tests {
         assert_eq!(id.capabilities, [Capability::Park, Capability::DryRun, Capability::LeaveOneOut]);
         let mut bad = ok.clone();
         bad["capabilities"] = json!(["teleport"]);
-        assert!(serde_json::from_value::<ServerIdentity>(bad).is_err());
+        let newer: ServerIdentity = serde_json::from_value(bad).unwrap();
+        assert_eq!(newer.capabilities, [Capability::Unknown], "a newer server's capability is not an error");
         let mut missing = ok;
         missing["limits"].as_object_mut().unwrap().remove("state_bytes");
         assert!(serde_json::from_value::<ServerIdentity>(missing).is_err());
