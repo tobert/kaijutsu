@@ -564,6 +564,8 @@ mod tests {
         binding.grant(crate::mcp::Capability::AllInstances);
         binding.grant(crate::mcp::Capability::AllFacades);
         binding.grant(crate::mcp::Capability::Operator);
+        // `house` lets the call reach the verb's own `drive` check.
+        binding.grant(crate::mcp::Capability::House);
         d.kernel_db().lock().upsert_context_binding(ctx, &binding).unwrap();
 
         let c = caller_with_context(ctx);

@@ -3661,12 +3661,42 @@ Still unaddressed: `Capability` (`kaijutsu-kernel/src/mcp/binding.rs:133`)
 still mixes `Instance`/`Tool{instance,tool}`/`Facade` (granular), `Admin`/
 `AllInstances`/`AllFacades` (broad), and bare-word verb authorities
 (`Drive`/`Fork`/`Drift`/`Transport`/`Operator`/`ConfigWrite`/`Exec`/
-`Editor`) — three different shapes, grown ad-hoc as gaps were found. Amy:
+`Editor`/`System`/`House`) — three different shapes, grown ad-hoc as gaps were found. Amy:
 "Director should only get `shell` as long as it has `kj`" — director's
 broad facade/exec grants (`assets/defaults/rc/director/create/S10-binding.kai`)
 are worth revisiting once `kj` itself can reach what a shell used to be
 for. "We'll do a cap redesign sweep soon so it's a good time to
 experiment" — treat `Editor` as provisional until that sweep.
+
+## Worker loadout: what still points at house verbs (2026-10-05)
+
+`house` hides the administration verbs from worker seats (`docs/instrument-design.md`,
+"Many hands, one trust boundary"). These surfaces were left as they are:
+
+- **The `kj` tool schema lists every verb.** `KjBuiltin::schema` reflects the
+  whole clap tree, and one schema serves every context, so a worker's shell
+  still shows `ledger`, `rc`, and the rest in schema-driven help. Filtering
+  needs a schema per context loadout.
+- **Held-ask text names `kj ledger`.** `PENDING_REASON_EXECUTES`,
+  `PENDING_REASON_RETRY` (`kj/gate.rs`) and the pending-ask remedy in
+  `mcp/error.rs` tell the reader which `kj ledger` command the reviewer runs.
+  A worker reads them too and cannot run them. Say "wait for the reviewer"
+  and point the worker at `kj wait --ask <id>`.
+- **Client ledger polling runs in the joined context.** The app, TUI, and MCP
+  clients call `kj ledger list|show` through `execute_kj_quiet(ctx, ..)` in
+  whichever context they are joined to. Joined to a `coder` context, that is
+  refused. Run the bookkeeping in a house seat's context (the person's root
+  context).
+- **The musician tick and rc scripts bypass the capability gates.** rc runs
+  as a privileged caller, so `kj drive` in `musician/tick/S10-drive.kai` is
+  not checked against the musician's `drive` grant, and neither is `house`.
+  The `drive` comment in `musician/create/S10-binding.kai` claims otherwise.
+- **A shell with no joined context may run house verbs.** `kj ledger`,
+  `kj character`, `kj roster`, and the others take no context so a person at a
+  bare shell can run them, and there is no loadout to narrow. A context whose
+  loadout is missing or empty is refused them, as `require_cap` refuses.
+- **`synth` is classified as a worker verb** (`house.rs`); it was in neither
+  list the assignment gave.
 
 ## Shell settlement follow-ups
 

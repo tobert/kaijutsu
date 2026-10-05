@@ -37,6 +37,7 @@ pub mod gate;
 pub mod handoff;
 pub mod hook;
 pub mod hook_gate;
+pub(crate) mod house;
 pub mod interrupt;
 pub mod kaish;
 pub mod mcp;
@@ -460,7 +461,7 @@ impl KjDispatcher {
     )]
     pub async fn dispatch(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
-            return KjResult::Err(self.help());
+            return KjResult::Err(self.help_for(caller));
         }
 
         // Footgun guard: a trailing bare `help` (e.g. `kj context create help`)
@@ -474,7 +475,15 @@ impl KjDispatcher {
 
         // Commands that don't strictly require an active context
         if cmd == "help" || cmd == "--help" || cmd == "-h" {
-            return KjResult::ok_ephemeral(self.help(), ContentType::Markdown);
+            return KjResult::ok_ephemeral(self.help_for(caller), ContentType::Markdown);
+        }
+
+        // House verbs are refused here, before any handler (or the
+        // destructive-verb latch) runs.
+        if house::is_house_verb(cmd) {
+            if let Err(refusal) = self.require_house(caller, cmd) {
+                return refusal;
+            }
         }
 
         // Verb class: kj/effect.rs. A Destroy verb latches here,
@@ -702,13 +711,58 @@ impl KjDispatcher {
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,
-                self.help()
+                self.help_for(caller)
             )),
         }
     }
 
-    fn help(&self) -> String {
-        include_str!("../../docs/help/kj.md").to_string()
+    /// The `kj help` text for `caller`: the house verbs appear only for a
+    /// caller that holds the `house` capability.
+    fn help_for(&self, caller: &KjCaller) -> String {
+        let full = include_str!("../../docs/help/kj.md");
+        match self.holds_house(caller) {
+            Ok(true) => full.to_string(),
+            // A loadout that cannot be read shows the narrow help, the same
+            // as a loadout without the grant.
+            Ok(false) | Err(_) => house::without_house_verbs(full),
+        }
+    }
+
+    /// Whether `caller` holds the `house` capability. A privileged caller
+    /// (the rc lifecycle) holds it, and so does a caller with no joined
+    /// context: house verbs such as `kj ledger` and `kj character` take no
+    /// context so that a person at a bare shell can run them, and a seat that
+    /// is narrowed always has a context. A context with no loadout or an
+    /// empty one is denied, as in [`Self::require_cap`]. A KernelDb read
+    /// failure is an error, never a no.
+    fn holds_house(&self, caller: &KjCaller) -> Result<bool, String> {
+        if caller.privileged {
+            return Ok(true);
+        }
+        let Some(ctx) = caller.context_id else {
+            return Ok(true);
+        };
+        self.kernel_db()
+            .lock()
+            .get_context_binding(ctx)
+            .map(|b| b.is_some_and(|b| b.allows(&crate::mcp::Capability::House)))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Refuse a house verb to a seat without the `house` capability. The
+    /// message says the verb is outside this seat's work and does not say
+    /// how to widen the loadout: a worker is not meant to go looking.
+    fn require_house(&self, caller: &KjCaller, verb: &str) -> Result<(), KjResult> {
+        match self.holds_house(caller) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(KjResult::Err(format!(
+                "kj {verb}: not part of this seat's work. `kj help` lists the commands this seat uses."
+            ))),
+            Err(e) => Err(KjResult::Err(format!(
+                "kj {verb}: authorization unavailable: {e}. The loadout could not be read, \
+                 so the verb is refused."
+            ))),
+        }
     }
 
     // Accessors for subcommand modules
@@ -1648,6 +1702,7 @@ pub(crate) mod test_helpers {
             binding.grant(crate::mcp::Capability::Transport);
             binding.grant(crate::mcp::Capability::Operator);
             binding.grant(crate::mcp::Capability::ConfigWrite);
+            binding.grant(crate::mcp::Capability::House);
             db.upsert_context_binding(id, &binding).unwrap();
         }
 
@@ -2155,5 +2210,183 @@ mod destroy_latches_at_dispatch_tests {
             failed.len(),
             failed.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod house_verb_tests {
+    //! House verbs need the `house` capability (`kj/house.rs`). A worker
+    //! seat is refused them before the handler runs and does not see them in
+    //! `kj help`.
+
+    use super::test_helpers::*;
+    use super::*;
+    use crate::mcp::{Capability, ContextToolBinding};
+
+    const REFUSAL: &str = "not part of this seat's work";
+
+    /// The loadout shape `coder` ships: tools and the worker authorities,
+    /// no `house`, no `operator`.
+    fn worker_binding() -> ContextToolBinding {
+        let mut b = ContextToolBinding::new();
+        b.grant(Capability::Facade("shell_write".into()));
+        b.grant(Capability::Instance(crate::mcp::InstanceId::new("builtin.file")));
+        b.grant(Capability::Drift);
+        b.grant(Capability::Fork);
+        b.grant(Capability::Exec);
+        b.grant(Capability::Editor);
+        b
+    }
+
+    fn caller_bound(d: &KjDispatcher, label: &str, binding: &ContextToolBinding) -> KjCaller {
+        let ctx = register_context(d, Some(label), None, PrincipalId::new());
+        d.kernel_db().lock().upsert_context_binding(ctx, binding).unwrap();
+        caller_with_context(ctx)
+    }
+
+    fn house_binding() -> ContextToolBinding {
+        let mut b = worker_binding();
+        b.grant(Capability::House);
+        b.grant(Capability::Operator);
+        b
+    }
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn every_top_level_verb_is_classified_exactly_once() {
+        let mut missing = Vec::new();
+        let mut doubled = Vec::new();
+        for sub in kj_command().get_subcommands() {
+            let name = sub.get_name();
+            let house = house::HOUSE_VERBS.contains(&name);
+            let worker = house::WORKER_VERBS.contains(&name);
+            if !house && !worker {
+                missing.push(name.to_string());
+            }
+            if house && worker {
+                doubled.push(name.to_string());
+            }
+        }
+        assert!(missing.is_empty(), "verbs in neither house::HOUSE_VERBS nor house::WORKER_VERBS: {missing:?}");
+        assert!(doubled.is_empty(), "verbs in both lists: {doubled:?}");
+    }
+
+    #[test]
+    fn every_listed_verb_is_a_real_verb() {
+        let cmd = kj_command();
+        let real: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+        for v in house::HOUSE_VERBS.iter().chain(house::WORKER_VERBS) {
+            // `help` is answered before routing, so it has no clap subcommand.
+            assert!(*v == "help" || real.contains(v), "{v} is listed but is not a kj verb");
+        }
+        for (alias, verb) in house::VERB_ALIASES {
+            assert!(real.contains(verb), "alias {alias} names {verb}, which is not a kj verb");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_seat_is_refused_house_verbs() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "worker", &worker_binding());
+        for line in ["ledger list", "rc list", "binding list", "ledger --help", "cast list", "ledger help"] {
+            let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
+            assert!(matches!(result, KjResult::Err(_)), "{line}: expected a refusal, got {result:?}");
+            let msg = result.message().to_string();
+            assert!(msg.contains(REFUSAL), "{line}: {msg}");
+            assert!(msg.contains(line.split_whitespace().next().unwrap()), "{line}: should name the verb: {msg}");
+            assert!(!msg.contains("binding allow") && !msg.contains("house"), "{line}: must not say how to get it: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_seat_keeps_worker_verbs() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "worker", &worker_binding());
+        for line in ["wait", "block list", "drift queue", "context list", "stage status", "models", "model", "search foo"] {
+            let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
+            assert!(!result.message().contains(REFUSAL), "{line} was refused as a house verb: {}", result.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn house_seat_runs_house_verbs() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "house", &house_binding());
+        for line in ["ledger list", "rc list", "binding show"] {
+            let result = d.dispatch(&line.split_whitespace().map(String::from).collect::<Vec<_>>(), &caller).await;
+            assert!(!result.message().contains(REFUSAL), "{line} was refused: {}", result.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn privileged_caller_bypasses_the_house_gate() {
+        let d = test_dispatcher().await;
+        let caller = test_caller();
+        let result = d.dispatch(&[s("ledger"), s("list")], &caller).await;
+        assert!(!result.message().contains(REFUSAL), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn a_caller_with_no_joined_context_may_run_house_verbs() {
+        let d = test_dispatcher().await;
+        let mut caller = caller_with_context(ContextId::new());
+        caller.context_id = None;
+        let result = d.dispatch(&[s("ledger"), s("list")], &caller).await;
+        assert!(!result.message().contains(REFUSAL), "{}", result.message());
+    }
+
+    #[tokio::test]
+    async fn unbound_context_is_refused_house_verbs() {
+        let d = test_dispatcher().await;
+        let ctx = register_context(&d, Some("unbound"), None, PrincipalId::new());
+        d.kernel_db().lock().delete_context_binding(ctx).unwrap();
+        let result = d.dispatch(&[s("ledger"), s("list")], &caller_with_context(ctx)).await;
+        assert!(result.message().contains(REFUSAL), "{}", result.message());
+    }
+
+    fn verbs_listed(help: &str) -> Vec<String> {
+        let mut in_commands = false;
+        let mut out = Vec::new();
+        for line in help.lines() {
+            if line.starts_with("## Commands") {
+                in_commands = true;
+            } else if in_commands && line.starts_with("```") && !out.is_empty() {
+                break;
+            } else if in_commands && !line.starts_with("```") && !line.starts_with(' ') && !line.is_empty() {
+                out.push(line.split_whitespace().next().unwrap().to_string());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn help_leaves_house_verbs_out_for_a_worker_seat() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "worker", &worker_binding());
+        for argv in [vec!["help"], vec!["--help"], vec!["-h"], vec![]] {
+            let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+            let result = d.dispatch(&argv, &caller).await;
+            let listed = verbs_listed(result.message());
+            assert!(!listed.is_empty(), "{argv:?}: no verbs parsed from help:\n{}", result.message());
+            for hidden in house::HOUSE_VERBS.iter().chain(&["ledger", "rc", "binding"]) {
+                assert!(!listed.iter().any(|v| v == hidden), "{argv:?}: help still lists {hidden}");
+            }
+            for kept in ["block", "drift", "fork", "wait", "context"] {
+                assert!(listed.iter().any(|v| v == kept), "{argv:?}: help lost worker verb {kept}: {listed:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn help_lists_house_verbs_for_a_house_seat() {
+        let d = test_dispatcher().await;
+        let caller = caller_bound(&d, "house", &house_binding());
+        let listed = verbs_listed(d.dispatch(&[s("help")], &caller).await.message());
+        for verb in house::HOUSE_VERBS.iter().chain(&["ledger", "rc", "binding"]) {
+            assert!(listed.iter().any(|v| v == verb), "house help lacks {verb}: {listed:?}");
+        }
     }
 }

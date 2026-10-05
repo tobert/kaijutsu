@@ -911,10 +911,10 @@ async fn run_gate_once(
             Ok(Some((request_id, _, row, true))) => {
                 return GateOutcome::unavailable_without_row(if row.exec_source.is_some() {
                     format!("Approval {request_id} runs its command once, in the approval worker. \
-                             No new command ran. Inspect it with kj ledger show {request_id}.")
+                             No new command ran. Read its status with kj wait --ask {request_id}.")
                 } else {
                     format!("Approval {request_id} belongs to its original invocation. No new command ran. \
-                             Inspect it with kj ledger show {request_id}.")
+                             Read its status with kj wait --ask {request_id}.")
                 });
             }
             Ok(Some((request_id, status, row, false))) => {

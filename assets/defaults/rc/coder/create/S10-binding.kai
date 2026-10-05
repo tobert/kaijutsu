@@ -14,11 +14,13 @@ kj binding allow "builtin.turn"
 kj binding allow "facade:edit_input"
 kj binding allow "facade:submit_input"
 kj binding allow "facade:commit_capture"
-# kj verb authorities, as the shared broad loadout grants them.
-kj binding allow "drive"
+# kj verb authorities a coder works with: fork a context, push and merge
+# drift, run host commands, and save through the editor.
 kj binding allow "fork"
 kj binding allow "drift"
-kj binding allow "transport"
-kj binding allow "operator"
 kj binding allow "exec"
 kj binding allow "editor"
+# Deliberately NOT granted: house (the kj administration verbs: ledger, rc,
+# binding, cast, config, and the rest), operator, transport, drive, system.
+# A coder works on the task; the kernel's own running is not its work, and
+# every verb it can see costs a turn it may spend studying instead.

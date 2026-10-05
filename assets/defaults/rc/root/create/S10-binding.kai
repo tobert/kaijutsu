@@ -24,6 +24,8 @@ kj binding allow "drift"
 kj binding allow "transport"
 # See and stop the running kernel.
 kj binding allow "system"
+# The kj administration verbs (ledger, rc, binding, cast, config, ...).
+kj binding allow "house"
 # Host subprocesses from the context shell.
 kj binding allow "exec"
 # The kernel-owned editor's write path.

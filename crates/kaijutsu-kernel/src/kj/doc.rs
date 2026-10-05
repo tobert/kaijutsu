@@ -757,7 +757,9 @@ mod tests {
             .create_document(child, DocKind::Conversation, None)
             .expect("create_document");
 
-        let c = caller_with_context(child);
+        // This context was inserted without a loadout; the test is about the
+        // listing, so the caller stands in for the control plane.
+        let c = crate::kj::KjCaller { privileged: true, ..caller_with_context(child) };
         let result = d.dispatch(&[s("doc"), s("list")], &c).await;
         assert!(result.is_ok(), "list failed: {}", result.message());
         let message = result.message();

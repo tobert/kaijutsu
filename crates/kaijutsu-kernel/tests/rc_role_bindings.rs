@@ -563,3 +563,61 @@ async fn the_toolie_stance_examples_run_in_its_read_only_shell_body() {
             "{write}: the refusal must say {says:?}: {envelope}");
     }
 }
+
+/// The `house` capability (the kj administration verbs) is a house seat's
+/// grant and not a worker's. Each context type's real rc `create` lifecycle
+/// assigns its loadout, so a grant that is mislexed or missing shows here.
+#[test]
+fn only_house_seats_hold_the_house_capability() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(only_house_seats_hold_the_house_capability_body());
+    });
+}
+
+async fn only_house_seats_hold_the_house_capability_body() {
+    let h = harness().await;
+    let root = ensure_root(&h, "amy").await;
+    let mut seats = vec![("root", root)];
+    for ty in ["default", "mcp", "director", "coder", "toolie", "musician"] {
+        let ctx = create_typed(&h, &format!("seat-{ty}"), ty).await;
+        seats.push((ty, ctx));
+    }
+    for (ty, ctx) in seats {
+        let binding = h.kernel.broker().binding(&ctx).await
+            .unwrap_or_else(|| panic!("{ty} rc must seed a binding"));
+        let house = !matches!(ty, "coder" | "toolie" | "musician");
+        assert_eq!(binding.allows(&Capability::House), house, "{ty}: house");
+    }
+}
+
+/// A coder keeps the work authorities (drift, fork, exec, editor) and drops
+/// the ones that run the instrument: the kj verbs for context lifecycle,
+/// the beat, and self-driving belong to a house seat.
+#[test]
+fn coder_loadout_is_a_worker_loadout() {
+    run_on_rc_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(coder_loadout_is_a_worker_loadout_body());
+    });
+}
+
+async fn coder_loadout_is_a_worker_loadout_body() {
+    let h = harness().await;
+    let ctx = create_typed(&h, "coder-seat", "coder").await;
+    let binding = h.kernel.broker().binding(&ctx).await.expect("coder rc must seed a binding");
+    for cap in [Capability::Drift, Capability::Fork, Capability::Exec, Capability::Editor,
+                Capability::Facade("shell_write".into())] {
+        assert!(binding.allows(&cap), "coder should allow {cap:?}");
+    }
+    for cap in [Capability::House, Capability::Operator, Capability::Transport,
+                Capability::Drive, Capability::System, Capability::ConfigWrite, Capability::Admin] {
+        assert!(!binding.allows(&cap), "coder must not allow {cap:?}");
+    }
+}

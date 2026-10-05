@@ -2795,6 +2795,7 @@ impl KernelDb {
         // authority (`docs/approval-identity.md`).
         conn.execute_batch("DROP TABLE IF EXISTS approval_identity_config")?;
         Self::remove_retired_classifier(conn)?;
+        Self::migrate_house_capability(conn)?;
         Ok(())
     }
 
@@ -3323,6 +3324,46 @@ impl KernelDb {
         let cleared = conn.execute("UPDATE contexts SET fork_kind = NULL WHERE fork_kind = 'subtree'", [])?;
         if cleared > 0 {
             info!(cleared, "cleared retired 'subtree' fork_kind from stored contexts");
+        }
+        Ok(())
+    }
+
+    const HOUSE_MIGRATION: &'static str = "grant-house-capability-v1";
+
+    /// Grant `house` once to every binding that existed before the
+    /// capability did, so an upgraded kernel keeps the administration verbs
+    /// on its contexts. Worker types (coder, toolie, musician) are the seats
+    /// the capability narrows, so they do not get it; a binding that grants
+    /// nothing stays empty, because `house` alone would make it look usable.
+    ///
+    /// Recorded in `kernel_migrations`: a seat that later drops `house` must
+    /// not get it back on the next open. A fresh database records the marker
+    /// with nothing to grant.
+    fn migrate_house_capability(conn: &Connection) -> KernelDbResult<()> {
+        let done: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kernel_migrations WHERE name = ?1)",
+            [Self::HOUSE_MIGRATION], |row| row.get(0),
+        )?;
+        if done {
+            return Ok(());
+        }
+        let tx = conn.unchecked_transaction()?;
+        let granted = tx.execute(
+            "INSERT OR IGNORE INTO context_binding_authorities (context_id, authority)
+             SELECT b.context_id, 'house'
+             FROM context_bindings b JOIN contexts c ON c.context_id = b.context_id
+             WHERE c.context_type NOT IN ('coder', 'toolie', 'musician')
+               AND (b.all_instances OR b.all_facades OR b.binding_admin
+                    OR EXISTS (SELECT 1 FROM context_binding_instances WHERE context_id = b.context_id)
+                    OR EXISTS (SELECT 1 FROM context_binding_tools WHERE context_id = b.context_id)
+                    OR EXISTS (SELECT 1 FROM context_binding_facades WHERE context_id = b.context_id)
+                    OR EXISTS (SELECT 1 FROM context_binding_authorities WHERE context_id = b.context_id))",
+            [],
+        )?;
+        tx.execute("INSERT INTO kernel_migrations (name) VALUES (?1)", [Self::HOUSE_MIGRATION])?;
+        tx.commit()?;
+        if granted > 0 {
+            info!(granted, "granted the house capability to existing non-worker bindings");
         }
         Ok(())
     }
@@ -9356,6 +9397,65 @@ mod tests {
             !is_duplicate_column_error(&other),
             "a no-such-table failure must not be misclassified as duplicate-column: {other}"
         );
+    }
+
+    /// Contexts created before the `house` capability existed keep the kj
+    /// administration verbs: the migration grants `house` to every existing
+    /// non-empty binding except the worker types', once.
+    #[test]
+    fn house_capability_migrates_onto_pre_existing_bindings_once() {
+        use crate::mcp::{Capability, ContextToolBinding};
+        let mut db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let mut ids = std::collections::BTreeMap::new();
+        for ty in ["default", "mcp", "director", "coder", "toolie", "musician", "empty", "unbound"] {
+            let mut row = make_context_row(Some(ty));
+            row.context_type = if matches!(ty, "empty" | "unbound") { "default" } else { ty }.to_string();
+            insert_context_with_doc(&db, &row, ws_id);
+            let mut b = ContextToolBinding::new();
+            match ty {
+                "empty" => {}
+                "unbound" => {
+                    ids.insert(ty, row.context_id);
+                    continue;
+                }
+                _ => {
+                    b.grant(Capability::Facade("shell".into()));
+                    b.grant(Capability::Operator);
+                }
+            }
+            db.upsert_context_binding(row.context_id, &b).unwrap();
+            ids.insert(ty, row.context_id);
+        }
+        // The shape of a database from before this migration: no marker.
+        db.conn.execute("DELETE FROM kernel_migrations WHERE name = ?1", [KernelDb::HOUSE_MIGRATION]).unwrap();
+        fn holds(db: &KernelDb, id: ContextId) -> bool {
+            db.get_context_binding(id).unwrap().is_some_and(|b| b.allows(&Capability::House))
+        }
+        assert!(!holds(&db, ids["default"]), "fixture: old binding has no house");
+
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        for ty in ["default", "mcp", "director"] {
+            assert!(holds(&db, ids[ty]), "{ty} binding should gain house");
+        }
+        for ty in ["coder", "toolie", "musician"] {
+            assert!(!holds(&db, ids[ty]), "{ty} binding must not gain house");
+        }
+        // A context that grants nothing stays empty: house must not turn
+        // "no usable loadout" into a usable one.
+        assert!(db.get_context_binding(ids["empty"]).unwrap().unwrap().is_empty());
+        assert!(db.get_context_binding(ids["unbound"]).unwrap().is_none());
+        // The grant is additive.
+        let kept = db.get_context_binding(ids["default"]).unwrap().unwrap();
+        assert!(kept.allows(&Capability::Operator) && kept.allows(&Capability::Facade("shell".into())));
+
+        // One-time: a seat that later drops house is not given it back.
+        let mut narrowed = db.get_context_binding(ids["default"]).unwrap().unwrap();
+        narrowed.revoke_cap(&Capability::House);
+        db.upsert_context_binding(ids["default"], &narrowed).unwrap();
+        KernelDb::apply_additive_migrations(&db.conn).unwrap();
+        assert!(!holds(&db, ids["default"]), "the migration must run once");
+        assert!(holds(&db, ids["mcp"]), "a second run changes nothing else");
     }
 
     /// `context_usage.cache_ttl_secs` must land on a DB created before the

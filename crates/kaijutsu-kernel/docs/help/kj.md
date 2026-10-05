@@ -62,7 +62,7 @@ backend         list, show, set, remove, model set|remove, default show|set, res
                 an env-var name or a file path.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
                 (cap tokens incl. config-write, drive, fork, drift, transport,
-                operator, exec, editor, system, admin, or <instance>[:<tool>],
+                operator, exec, editor, system, house, admin, or <instance>[:<tool>],
                 facade:<name>, *, facade:*)
 block           list, inspect, count, read, render, cat, original, reproject,
                 append, history, diff, status, create, edit (insert|delete|replace) —

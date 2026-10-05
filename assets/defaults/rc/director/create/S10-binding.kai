@@ -33,6 +33,10 @@ kj binding allow "operator"
 # and a director is the seat that coordinates, so it holds it. A coder or
 # musician does not, and drifts the question instead (docs/system-verbs.md).
 kj binding allow "system"
+# house: the kj administration verbs (ledger, rc, binding, cast, config, ...).
+# A director runs the house; worker seats (coder, toolie, musician) do not
+# hold it and do not see these verbs in `kj help`.
+kj binding allow "house"
 # Host subprocess exec from the context shell — the director's operational
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.

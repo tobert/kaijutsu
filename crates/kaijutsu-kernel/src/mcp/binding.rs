@@ -224,6 +224,17 @@ pub enum Capability {
     /// its own: kaijutsu's own agents must never bring a seppuku'd kernel
     /// back. See `docs/system-verbs.md`.
     System,
+    /// The kaijutsu administration verbs: `kj ledger`, `rc`, `binding`,
+    /// `cast`, `backend`, `config`, `transport`, and the rest of the table
+    /// in `kj/house.rs`. A worker seat (coder, toolie, musician) does not
+    /// need them, so its loadout omits this grant and the verbs are
+    /// refused and left out of `kj help`.
+    ///
+    /// A focus rule, not a security boundary: every player shares one trust
+    /// boundary (`docs/instrument-design.md`, "Many hands, one trust
+    /// boundary"). It is additional to a verb's own capability (`operator`,
+    /// `drive`, ...), never a replacement, and `*` does not imply it.
+    House,
 }
 
 impl Capability {
@@ -243,6 +254,7 @@ impl Capability {
             Capability::Exec => "exec",
             Capability::Editor => "editor",
             Capability::System => "system",
+            Capability::House => "house",
             _ => return None,
         })
     }
@@ -260,6 +272,7 @@ impl Capability {
             "exec" => Capability::Exec,
             "editor" => Capability::Editor,
             "system" => Capability::System,
+            "house" => Capability::House,
             _ => return None,
         })
     }
@@ -398,7 +411,8 @@ impl ContextToolBinding {
             | Capability::ConfigWrite
             | Capability::Exec
             | Capability::Editor
-            | Capability::System => {
+            | Capability::System
+            | Capability::House => {
                 cap.authority_name().is_some_and(|n| self.authorities.contains(n))
             }
         }
@@ -440,7 +454,8 @@ impl ContextToolBinding {
             | Capability::ConfigWrite
             | Capability::Exec
             | Capability::Editor
-            | Capability::System) => {
+            | Capability::System
+            | Capability::House) => {
                 if let Some(n) = c.authority_name() {
                     self.authorities.insert(n.to_string());
                 }
@@ -492,7 +507,8 @@ impl ContextToolBinding {
             | Capability::ConfigWrite
             | Capability::Exec
             | Capability::Editor
-            | Capability::System => {
+            | Capability::System
+            | Capability::House => {
                 if let Some(n) = cap.authority_name() {
                     self.authorities.remove(n);
                 }

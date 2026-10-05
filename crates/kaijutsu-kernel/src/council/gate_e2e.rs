@@ -890,7 +890,14 @@ async fn a_retry_of_a_held_or_open_ask_is_never_council_allowed() {
         rig.answer_pending(true);
         rig.mock.answers(&ALLOW);
         match rig.submit("touch held.txt").await {
-            Err(error) => assert!(error.to_string().contains("approval worker"), "{via:?}: {error}"),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("approval worker"), "{via:?}: {error}");
+                // The seat that is told this is a worker seat: it reads the
+                // ask with a verb it holds, never with a house verb.
+                assert!(text.contains("kj wait --ask "), "{via:?}: {error}");
+                assert!(!text.contains("kj ledger show"), "{via:?}: {error}");
+            }
             Ok(()) => panic!("{via:?}: a retry ran beside the approval worker"),
         }
         assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: the council is not asked about a held answer's retry");
