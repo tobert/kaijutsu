@@ -47,7 +47,7 @@ contexts = ["council-shell"]
 [[council.threshold]]
 spec = "shell-bump"
 weight_hash = "0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"
-engine = "libmkengine:e48a8e4be1e67ac1+numbers:1c7a6cfc4c2ffe18"
+engine = "libmkengine:3de1b0df354b624f+numbers:1c7a6cfc4c2ffe18"
 tokenizer_hash = "518665209619906d18852264fb032d302f6171425e4faa84aec9ac7d4b96cac6"
 template = "mk-letters-2:0b697183e7a5b7cb"
 # Not used while shell-bump declares the rubric: the rubric answers decide.
@@ -81,7 +81,7 @@ require_agree = false
 [[council.threshold]]
 spec = "program-gate"
 weight_hash = "0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"
-engine = "libmkengine:e48a8e4be1e67ac1+numbers:1c7a6cfc4c2ffe18"
+engine = "libmkengine:3de1b0df354b624f+numbers:1c7a6cfc4c2ffe18"
 tokenizer_hash = "518665209619906d18852264fb032d302f6171425e4faa84aec9ac7d4b96cac6"
 template = "mk-letters-2:0b697183e7a5b7cb"
 allow_at = 0.98
