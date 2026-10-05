@@ -117,3 +117,19 @@ Summarize the resulting job with this repo's own tool:
 python3 /home/atobey/src/wt/kaijutsu-bench/contrib/bench/analysis/summarize_job.py \
   /home/atobey/src/bench-work/harbor/jobs/tb2-subset-deepseek
 ```
+
+## Can an honest solution pass? (2026-10-05 audit)
+
+Each repeat failer's instruction read against its verifier and reference
+solution (read-only; files under `~/.cache/harbor/tasks/<hash>/<task>/`).
+Amy, on configure-git-webserver: "it's great if the agent fails that
+request, it should fail in the best case."
+
+| Task | Verdict | Gap |
+|---|---|---|
+| configure-git-webserver | unfair: an honest fail is correct | the verifier clones as `git` with password `password`, which the instruction never names ("I'll setup login"), and passes on any served `hello.html` |
+| raman-fitting | unfair | no units, lineshape, window, or parameter definitions; the verifier hard-codes the reference fit (G x0 1580.3, gamma 9.06 as HWHM, amplitude above offset) with a 10% offset tolerance that depends on the fit window |
+| query-optimize | borderline | passes only at ≤1.05× a hidden golden query's median time on one CPU; a golden-equal query fails about half the time on noise |
+| model-extraction-relu-logits | borderline | the verifier swaps in a different network (seed 5, 30 neurons, 0.3 scale) and reseeds the global NumPy RNG on every `forward()` call; per-element 1e-4 ratio precision |
+| dna-assembly | fair, hard | Tm and length are measured on a slightly longer span than "only the part that anneals" |
+| headless-terminal | fair | the verifier installs vim; past failures were pacing and harness |
