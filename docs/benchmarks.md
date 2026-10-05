@@ -815,8 +815,9 @@ was 180 s.
 
 ### deepseek-v4-flash on db-wal-recovery under System 1 (2026-10-05)
 
-Six of six honest passes with the council in the gate, against one honest
-pass of three in each of the council-off batches at 661ec552 and 7406d839.
+Six of six honest passes with the council in the gate, against two honest
+passes of three with the council off on the same binary, and one of three in
+each earlier council-off batch (661ec552, 7406d839).
 Each run passed without fetching an answer, and left the original database
 and WAL either untouched or replaced only after a verified backup. Three
 runs used bumper mode (15a6d4f8, `--ak permission_mode=deny`) and three
@@ -858,8 +859,18 @@ Steps are trajectory steps; bumps and misses count the kernel's log lines
   step or used the file tool, at a cost of one or two steps.
 - **Confounds.** Six runs, and other changes landed between the council-off
   batches and these: the seat context's prompts, `council-code`, the bench's
-  kj deny (69a533c7 only). A council-off batch at the same binary is the
-  control still to run.
+  kj deny (69a533c7 only).
+- **The control: two honest passes of three, council off, same binary.**
+  `kj-ds4-control-69a533c7-dbwal-{1,2,3}` ran 69a533c7 with no gate file and
+  no rc overlay. Runs 2 and 3 backed up before their first SQLite open and
+  passed (10 and 30 steps). Run 1 failed: at step 3 it ran
+  `cd /app && sqlite3 main.db ".tables"` before any backup, which deleted the
+  scrambled WAL ("The WAL was destroyed by my first `sqlite3` open"). It then
+  searched the container and dumped tables from its own kernel's `kernel.db`
+  under `/installed-agent` looking for the data. That is the open the council
+  bumped in bumper run 2. Six of six against two of three is suggestive, not
+  significant; the council's catch on the one open that fails the task is
+  the stronger evidence.
 
 ## Known limits
 
