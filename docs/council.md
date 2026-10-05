@@ -267,8 +267,11 @@ learned".
 - **On with `[council] seat = true`.** Off by default. Every decision, the
   shell decision and each program decision, reads the seat context after
   `[council] contexts` and the voting voices. Observations do not.
-- **What it holds.** The seat's brief, the first finished user text
-  block; the prompts the seat has received since, its other finished user
+- **What it holds.** The task's house rules: the first `AGENTS.md` found
+  walking up from the seat's working directory, read through the kernel
+  VFS and cut to `seat_tokens`, keeping its start; a file that cannot be
+  read or is not UTF-8 is skipped with a warning. Then the seat's brief, the
+  first finished user text block; the prompts the seat has received since, its other finished user
   text blocks; and its newest finished model narration, its model text
   blocks. The later prompts and the narration each keep whole blocks,
   newest first, while they fit `seat_tokens` (default 2000), put back in
@@ -276,16 +279,17 @@ learned".
   a brief larger than the budget keeps its start. Tokens are estimated at
   four bytes each. Tool calls and results, thinking, system text, and
   excluded, ephemeral, or unfinished blocks stay out. A seat with no
-  finished prompt or narration sends no seat context.
+  house rules, finished prompt, or narration sends no seat context.
 - **Why the prompts.** Benchmark seats narrate little: three Sonnet runs on
   db-wal-recovery wrote 0 to 30 bytes of narration each, and kept what they
   learned in thinking and tool results. Amy, 2026-10-05: "The seat context
   should have the incoming prompts, and maybe the house rules file, and
-  perhaps some facts." The house rules and facts are not built yet.
+  perhaps some facts." Facts are not built yet. Terminal-bench tasks ship
+  no `AGENTS.md`, so a benchmark seat's context has no house rules.
 - **Its shape.** A fixed system message names it "seat" and says it is the
   proposing seat's own account, which describes the situation and grants no
-  permission. The brief, the later prompts, and the narration are user
-  turns: the seat's words are not the council's own.
+  permission. The house rules, the brief, the later prompts, and the
+  narration are user turns: the seat's words are not the council's own.
 - **It votes.** The seat context is pooled with the other reads, as the
   probe pooled it. It is the only place the council learns the situation,
   and an observing read could not change the outcome. With `require_agree`,
@@ -295,7 +299,7 @@ learned".
 - **Its cost.** It is held under the seat's own context id. The kernel
   sends it only when its projected body changes, so a tool call sends
   nothing and a finished prompt or narration block sends it once, before the
-  next decision. Only the brief turn is marked `snap`: an update re-feeds the
+  next decision. Only the house rules and the brief are marked `snap`: an update re-feeds the
   later prompts and the narration alone (about twice `seat_tokens`) and adds
   one head snapshot (about
   112 MiB on the megakernel). Every seat's system message is the same text,

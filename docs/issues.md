@@ -241,7 +241,11 @@ a deny would refuse it or an ask would wait on a human. Amy, 2026-10-05:
 - **The bump limit is a counter in the ledger.** How it is keyed (request
   digest, seat, turn) and what happens at the limit are open.
 - **The bump message carries everything useful we have,** composed through
-  rc so we can tune it the way we tune prompts.
+  rc so we can tune it the way we tune prompts. It directs and does not
+  invite an argument. Amy: "Try harder, a different approach, or look for
+  more ways to verify safety before mutations." A bump that arrives as a
+  drift stays out of the seat context, which reads only finished user and
+  model text; the seat's own reply to it does reach the council.
 - **The ledger needs garbage collection.** The ui gets slow on the long list
   of old entries, and bumps will add more of them.
 

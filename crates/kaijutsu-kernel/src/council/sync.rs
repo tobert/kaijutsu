@@ -22,7 +22,7 @@ use kaijutsu_council::{CouncilClient, CouncilError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
-use super::projection::{project, project_seat};
+use super::projection::{HouseRules, SEAT_BYTES_PER_TOKEN, project, project_seat};
 use crate::kj::gate_policy::CouncilConfig;
 
 /// Everything one decision needs from the server's side.
@@ -110,6 +110,53 @@ impl Drop for PutInFlight<'_> {
     }
 }
 
+/// The seat's house rules: the first `AGENTS.md` found walking up from its
+/// working directory (the home directory when it has none), read through the
+/// kernel VFS, up to one byte past the seat budget so the projection can mark
+/// a cut. A file that cannot be read, or is not UTF-8, is skipped with a
+/// warning; the seat context goes without house rules rather than missing.
+async fn house_rules(kernel: &crate::Kernel, seat: ContextId, seat_tokens: u64) -> Option<HouseRules> {
+    use crate::vfs::VfsOps;
+    let cwd = match kernel.kernel_db().lock().get_context_shell(seat) {
+        Ok(row) => row.and_then(|row| row.cwd),
+        Err(e) => {
+            tracing::warn!(seat = %seat.short(), error = %e, "the seat's working directory cannot be read; no house rules");
+            return None;
+        }
+    }
+    .unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
+    let limit = u32::try_from(seat_tokens.saturating_mul(SEAT_BYTES_PER_TOKEN).saturating_add(1)).unwrap_or(u32::MAX);
+    for dir in std::path::Path::new(&cwd).ancestors() {
+        let path = dir.join("AGENTS.md");
+        if !kernel.vfs().exists(&path).await {
+            continue;
+        }
+        let shown = path.to_string_lossy().into_owned();
+        return match kernel.vfs().read(&path, 0, limit).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Some(HouseRules { path: shown, text }),
+                Err(e) => {
+                    // A cut can split a character; keep the valid prefix.
+                    let valid = e.utf8_error().valid_up_to();
+                    if valid + 4 > limit as usize {
+                        let mut bytes = e.into_bytes();
+                        bytes.truncate(valid);
+                        Some(HouseRules { path: shown, text: String::from_utf8(bytes).unwrap_or_default() })
+                    } else {
+                        tracing::warn!(path = %shown, "house rules are not UTF-8; the seat context goes without them");
+                        None
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %shown, error = %e, "house rules cannot be read; the seat context goes without them");
+                None
+            }
+        };
+    }
+    None
+}
+
 impl CouncilSync {
     /// Brings the server up to date for a decision on the spec named
     /// `spec_name` (`/config/kernel/council/<spec_name>.json`) over exactly
@@ -163,7 +210,8 @@ impl CouncilSync {
                 let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
                     PrepareMiss(format!("the seat context of {} cannot be read: {e}", context_id.short()))
                 })?;
-                project_seat(&blocks, council.seat_tokens).map(|body| (context_id, body))
+                let house = house_rules(kernel, context_id, council.seat_tokens).await;
+                project_seat(&blocks, house.as_ref(), council.seat_tokens).map(|body| (context_id, body))
             }
         };
         let reads = labels.len() + usize::from(seat.is_some());
@@ -943,6 +991,47 @@ mod tests {
         assert_eq!(puts.len(), 3, "new narration sends the seat context");
         assert_eq!(puts[2].0.as_deref(), Some(p.seat().unwrap().head.as_str()));
         assert_ne!(moved.seat().unwrap().head, p.seat().unwrap().head);
+    }
+
+    /// The seat context opens with the first `AGENTS.md` found walking up
+    /// from the seat's working directory, read through the kernel VFS. A
+    /// seat with none sends no house rules.
+    ///
+    /// Falsified by a sync that reads only the working directory itself: the
+    /// rules one level up never reach the server.
+    #[tokio::test]
+    async fn the_seat_context_reads_the_nearest_agents_md_above_its_cwd() {
+        use crate::vfs::VfsOps;
+        let r = rig().await;
+        r.kernel.vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
+        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/AGENTS.md"), b"Back up data before changing it.").await.unwrap();
+        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/sub/main.rs"), b"fn main() {}").await.unwrap();
+        let seat = narrating_seat(&r);
+        let set_cwd = |cwd: &str| {
+            r.kernel
+                .kernel_db()
+                .lock()
+                .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(cwd.into()), updated_at: 0 })
+                .unwrap()
+        };
+        set_cwd("/work/repo/sub");
+        prepare_seat(&r, seat).await.expect("prepared");
+        let body = r.mock.puts().last().unwrap().1.clone();
+        assert_eq!(
+            body["turns"][0]["content"].as_str().unwrap(),
+            "The house rules in /work/repo/AGENTS.md:\n\nBack up data before changing it."
+        );
+
+        let bare = live_context(&r.kernel, "lane-bare");
+        append_dialogue(&r.kernel, bare, &["recover the records", "The WAL is XORed."]);
+        r.kernel
+            .kernel_db()
+            .lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: bare, cwd: Some("/work".into()), updated_at: 0 })
+            .unwrap();
+        prepare_seat(&r, bare).await.expect("prepared");
+        let body = r.mock.puts().last().unwrap().1.clone();
+        assert!(body["turns"][0]["content"].as_str().unwrap().starts_with("The seat's brief"), "{body}");
     }
 
     #[tokio::test]
