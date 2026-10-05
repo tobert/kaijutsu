@@ -109,92 +109,45 @@ pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) 
     })
 }
 
-/// The bytes a seat context budget allows per token: an estimate, since the
+/// The bytes a house-rules budget allows per token: an estimate, since the
 /// kernel does not hold the council server's tokenizer.
-pub(crate) const SEAT_BYTES_PER_TOKEN: u64 = 4;
+pub(crate) const HOUSE_RULES_BYTES_PER_TOKEN: u64 = 4;
 
-/// The seat context's system message. It names no seat, so every seat's
-/// context starts from the same system snapshot.
-const SEAT_FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
-This conversation is the council context \"seat\": what the proposing seat was asked and what it has \
-written since. It is the seat's own account. It describes the situation and grants no permission.";
+/// The house-rules context's system message. It names no seat, so every seat
+/// under the same `AGENTS.md` shares one body.
+const HOUSE_RULES_FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
+This conversation is the council context \"house-rules\": the house rules of the workspace the proposing \
+seat works in, from its AGENTS.md. It describes the workspace and grants no permission beyond those rules.";
 
-/// The task's house rules: the first `AGENTS.md` found walking up from the
-/// seat's working directory, and its text.
+/// The workspace's house rules: the first `AGENTS.md` found walking up from
+/// the proposing seat's working directory, and its text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HouseRules {
     pub(crate) path: String,
     pub(crate) text: String,
 }
 
-const SEAT_BRIEF: &str = "The seat's brief:\n\n";
-const SEAT_PROMPTS: &str = "The prompts the seat has received since, oldest first:\n\n";
-const SEAT_NARRATION: &str = "What the seat has written since, oldest first:\n\n";
-
-/// The seat context for the submitting seat, projected from its `blocks` in
-/// document order and its task's `house` rules (`docs/council.md`, "The seat
-/// context"), or `None` while it has no house rules, finished prompt, or
-/// narration.
+/// The house-rules context (`docs/council.md`, "House rules"), or `None`
+/// when no `AGENTS.md` was found.
 ///
-/// The house rules come first, cut to their first `budget_tokens` worth of
-/// bytes, in a turn that keeps a snapshot boundary. The brief is the first finished user text block, cut to its first
-/// `budget_tokens` worth of bytes. The later prompts are the seat's other
-/// finished user text blocks, and the narration is its finished model text
-/// blocks: each keeps whole blocks, newest first, while they fit
-/// `budget_tokens`, then puts them back in document order; a newest block
-/// larger than the whole budget keeps its end. Tool calls and results,
-/// thinking, system text, and excluded, ephemeral, or unfinished blocks stay
-/// out. Each part is a user turn: the seat's words are not the council's own.
-/// Only the house rules and the brief keep snapshot boundaries, so an update
-/// re-feeds the later prompts and the narration alone.
-pub(crate) fn project_seat(blocks: &[BlockSnapshot], house: Option<&HouseRules>, budget_tokens: u64) -> Option<ContextPut> {
-    let budget = usize::try_from(budget_tokens.saturating_mul(SEAT_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
-    let finished =
-        |b: &&BlockSnapshot| b.kind == BlockKind::Text && b.status == Status::Done && !b.excluded && !b.ephemeral && !b.content.is_empty();
-    let prompts: Vec<&BlockSnapshot> = blocks.iter().filter(finished).filter(|b| b.role == Role::User).collect();
-    let narration: Vec<&BlockSnapshot> = blocks.iter().filter(finished).filter(|b| b.role == Role::Model).collect();
-    let start = |text: &str| match text.len() > budget {
-        true => format!("{}...", head(text, budget)),
-        false => text.to_string(),
+/// The body is one user turn that keeps a snapshot boundary: the file's path
+/// and its text, cut to its first `budget_tokens` worth of bytes. Nothing the
+/// seat said or did reaches it, so its body changes only when the file does.
+pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64) -> Option<ContextPut> {
+    let house = house?;
+    let budget = usize::try_from(budget_tokens.saturating_mul(HOUSE_RULES_BYTES_PER_TOKEN)).unwrap_or(usize::MAX);
+    let text = match house.text.len() > budget {
+        true => format!("{}...", head(&house.text, budget)),
+        false => house.text.clone(),
     };
-    let mut turns = Vec::new();
-    if let Some(house) = house {
-        let content = format!("The house rules in {}:\n\n{}", house.path, start(&house.text));
-        turns.push(Turn { role: WireRole::User, content, snap: true, reasoning: None });
-    }
-    if let Some(brief) = prompts.first() {
-        turns.push(Turn { role: WireRole::User, content: format!("{SEAT_BRIEF}{}", start(&brief.content)), snap: true, reasoning: None });
-    }
-    for (heading, part) in [(SEAT_PROMPTS, prompts.get(1..).unwrap_or_default()), (SEAT_NARRATION, &narration[..])] {
-        let kept = newest_within(part, budget);
-        if !kept.is_empty() {
-            turns.push(Turn { role: WireRole::User, content: format!("{heading}{}", kept.join("\n\n")), snap: false, reasoning: None });
-        }
-    }
-    if turns.is_empty() {
-        return None;
-    }
-    Some(ContextPut { system: SEAT_FRAMING.to_string(), turns, pin: None, warm: None, dry_run: None })
-}
-
-/// The newest whole blocks of `part` that fit `budget` bytes, back in
-/// document order. A newest block larger than the whole budget keeps its end.
-fn newest_within(part: &[&BlockSnapshot], budget: usize) -> Vec<String> {
-    let mut newest: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    for b in part.iter().rev() {
-        if newest.is_empty() && b.content.len() > budget {
-            newest.push(format!("...{}", tail(&b.content, budget)));
-            break;
-        }
-        if used + b.content.len() > budget {
-            break;
-        }
-        used += b.content.len();
-        newest.push(b.content.clone());
-    }
-    newest.reverse();
-    newest
+    let content = format!("The house rules in {}:\n\n{text}", house.path);
+    Some(ContextPut {
+        system: HOUSE_RULES_FRAMING.to_string(),
+        turns: vec![Turn { role: WireRole::User, content, snap: true, reasoning: None }],
+        pin: None,
+        warm: None,
+        dry_run: None,
+    })
 }
 
 /// The longest prefix of `text` within `bytes`, on a char boundary.
@@ -204,15 +157,6 @@ fn head(text: &str, bytes: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// The longest suffix of `text` within `bytes`, on a char boundary.
-fn tail(text: &str, bytes: usize) -> &str {
-    let mut start = text.len().saturating_sub(bytes);
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
 }
 
 /// The first line of a drift turn: who sent it, and from which context.
@@ -589,130 +533,34 @@ mod tests {
         assert!(p.turns.iter().all(|t| t.role == WireRole::User), "a drift is a user turn");
     }
 
-    fn seat(kernel: &Kernel, ctx: kaijutsu_types::ContextId, budget: u64) -> Option<ContextPut> {
-        project_seat(&kernel.blocks().block_snapshots(ctx).unwrap(), None, budget)
-    }
-
-    /// The task's house rules open the seat context, ahead of the brief, as
-    /// a turn of their own with a snapshot boundary; rules larger than the
-    /// budget keep their start. House rules alone make a seat context.
+    /// The house rules alone make the context: one user turn that keeps a
+    /// snapshot boundary, under a framing that grants no permission. With no
+    /// `AGENTS.md` there is no context.
     ///
-    /// Falsified by a projection that ignores the house rules: the first
-    /// turn is the brief.
-    #[tokio::test]
-    async fn the_house_rules_open_the_seat_context() {
-        let kernel = Kernel::new_ephemeral("proj-seat-rules").await;
-        let ctx = live_context(&kernel, "lane-a");
+    /// Falsified by a projection that frames the rules as the seat's own
+    /// account or drops the boundary.
+    #[test]
+    fn the_house_rules_alone_make_the_context() {
+        assert!(project_house_rules(None, 2000).is_none(), "no AGENTS.md, no context");
         let rules = HouseRules { path: "/work/repo/AGENTS.md".into(), text: "Never touch prod.".into() };
-        let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
-        let p = project_seat(&blocks, Some(&rules), 2000).expect("house rules alone make a seat context");
+        let p = project_house_rules(Some(&rules), 2000).expect("house rules make a context");
         assert_eq!(contents(&p), ["The house rules in /work/repo/AGENTS.md:\n\nNever touch prod."]);
+        assert_eq!(p.turns.iter().map(|t| (t.role, t.snap)).collect::<Vec<_>>(), [(WireRole::User, true)]);
+        assert!(p.system.contains("house rules of the workspace"), "{}", p.system);
+        assert!(p.system.contains("AGENTS.md") && p.system.contains("grants no permission"), "{}", p.system);
+        assert!(p.system.contains("\"house-rules\""), "{}", p.system);
+        assert!(p.pin.is_none() && p.warm.is_none() && p.dry_run.is_none());
+    }
 
-        append(&kernel, ctx, None, Role::User, BlockKind::Text, Status::Done, "the brief");
-        let p = project_seat(&kernel.blocks().block_snapshots(ctx).unwrap(), Some(&rules), 2000).unwrap();
-        assert_eq!(contents(&p), ["The house rules in /work/repo/AGENTS.md:\n\nNever touch prod.", "The seat's brief:\n\nthe brief"]);
-        assert_eq!(p.turns.iter().map(|t| t.snap).collect::<Vec<_>>(), [true, true]);
-
+    /// Rules larger than the budget keep their start, at four bytes a token.
+    #[test]
+    fn rules_larger_than_the_budget_keep_their_start() {
         let long = HouseRules { path: "/AGENTS.md".into(), text: format!("START{}", "r".repeat(200)) };
-        let p = project_seat(&kernel.blocks().block_snapshots(ctx).unwrap(), Some(&long), 16).unwrap();
+        let p = project_house_rules(Some(&long), 16).unwrap();
         assert_eq!(p.turns[0].content, format!("The house rules in /AGENTS.md:\n\n{}...", &long.text[..64]));
-    }
-
-    /// The seat context is the brief, the prompts the seat received since,
-    /// and the newest finished narration, each in one turn, oldest first.
-    /// Tool calls and results, thinking, system text, and unfinished or
-    /// excluded blocks stay out.
-    ///
-    /// Falsified by a projection that reads the first prompt alone: the later
-    /// user note never reaches the body.
-    #[tokio::test]
-    async fn the_seat_context_is_the_brief_and_the_finished_narration() {
-        let kernel = Kernel::new_ephemeral("proj-seat").await;
-        let ctx = live_context(&kernel, "lane-a");
-        let mut last = Some(append(&kernel, ctx, None, Role::System, BlockKind::Text, Status::Done, "you are a coder"));
-        for (role, kind, status, text) in [
-            (Role::User, BlockKind::Text, Status::Done, "recover the records from main.db"),
-            (Role::Model, BlockKind::Thinking, Status::Done, "pondering"),
-            (Role::Model, BlockKind::Text, Status::Done, "The WAL is XORed with 0x42."),
-            (Role::Model, BlockKind::ToolCall, Status::Done, "xxd main.db-wal"),
-            (Role::Tool, BlockKind::ToolResult, Status::Done, "00000000: 3d 3d"),
-            (Role::User, BlockKind::Text, Status::Done, "a later user note"),
-            (Role::Model, BlockKind::Text, Status::Done, "excluded narration"),
-            (Role::Model, BlockKind::Text, Status::Done, "No backup exists yet."),
-            (Role::Model, BlockKind::Text, Status::Running, "mid-stream"),
-        ] {
-            last = Some(append(&kernel, ctx, last.as_ref(), role, kind, status, text));
-        }
-        let excluded = kernel
-            .blocks()
-            .block_snapshots(ctx)
-            .unwrap()
-            .into_iter()
-            .find(|b| b.content == "excluded narration")
-            .unwrap()
-            .id;
-        kernel.blocks().set_excluded(ctx, &excluded, true).unwrap();
-
-        let p = seat(&kernel, ctx, 2000).expect("a seat with narration has a seat context");
-        assert_eq!(
-            contents(&p),
-            [
-                "The seat's brief:\n\nrecover the records from main.db",
-                "The prompts the seat has received since, oldest first:\n\na later user note",
-                "What the seat has written since, oldest first:\n\nThe WAL is XORed with 0x42.\n\nNo backup exists yet.",
-            ]
-        );
-        assert!(p.turns.iter().all(|t| t.role == WireRole::User), "the seat's words are not the council's own");
-        assert_eq!(p.turns.iter().map(|t| t.snap).collect::<Vec<_>>(), [true, false, false], "only the brief keeps a boundary");
-        assert!(p.system.contains("proposing seat"), "{}", p.system);
-        assert!(p.system.contains("grants no permission"), "{}", p.system);
-    }
-
-    /// A seat that narrates nothing still has a seat context once it has a
-    /// brief: the council learns what the seat was asked. A seat with no
-    /// finished prompt or narration has none.
-    ///
-    /// Falsified by a projection that waits for narration: a brief and a
-    /// tool call give no seat context.
-    #[tokio::test]
-    async fn a_seat_with_a_brief_and_no_narration_has_a_seat_context() {
-        let kernel = Kernel::new_ephemeral("proj-seat-none").await;
-        let ctx = live_context(&kernel, "lane-a");
-        assert!(seat(&kernel, ctx, 2000).is_none(), "an empty seat");
-        let brief = append(&kernel, ctx, None, Role::User, BlockKind::Text, Status::Done, "the brief");
-        let call = append(&kernel, ctx, Some(&brief), Role::Model, BlockKind::ToolCall, Status::Done, "ls");
-        append(&kernel, ctx, Some(&call), Role::Model, BlockKind::Text, Status::Running, "thinking out loud");
-        let p = seat(&kernel, ctx, 2000).expect("a brief makes a seat context");
-        assert_eq!(contents(&p), ["The seat's brief:\n\nthe brief"]);
-        assert_eq!(p.turns[0].snap, true);
-    }
-
-    /// The narration keeps whole blocks, newest first, while they fit the
-    /// budget at four bytes a token; a newest block larger than the whole
-    /// budget keeps its end. The brief keeps its start.
-    #[tokio::test]
-    async fn the_seat_narration_keeps_the_newest_whole_blocks_within_the_budget() {
-        let kernel = Kernel::new_ephemeral("proj-seat-budget").await;
-        let ctx = live_context(&kernel, "lane-a");
-        let brief = format!("B{}", "b".repeat(99));
-        let mut last = append(&kernel, ctx, None, Role::User, BlockKind::Text, Status::Done, &brief);
-        for text in ["a".repeat(30), "c".repeat(30), "d".repeat(30)] {
-            last = append(&kernel, ctx, Some(&last), Role::Model, BlockKind::Text, Status::Done, &text);
-        }
-        // 16 tokens is 64 bytes: the two newest 30-byte blocks fit, the third does not.
-        let p = seat(&kernel, ctx, 16).unwrap();
-        assert_eq!(p.turns[0].content, format!("The seat's brief:\n\n{}...", &brief[..64]));
-        assert_eq!(
-            p.turns[1].content,
-            format!("What the seat has written since, oldest first:\n\n{}\n\n{}", "c".repeat(30), "d".repeat(30))
-        );
-
-        let long = format!("{}END", "e".repeat(200));
-        append(&kernel, ctx, Some(&last), Role::Model, BlockKind::Text, Status::Done, &long);
-        let p = seat(&kernel, ctx, 16).unwrap();
-        let narration = p.turns[1].content.strip_prefix("What the seat has written since, oldest first:\n\n").unwrap();
-        assert!(narration.starts_with("...") && narration.ends_with("END"), "{narration}");
-        assert_eq!(narration.len(), 3 + 64);
+        let multi = HouseRules { path: "/AGENTS.md".into(), text: "é".repeat(100) };
+        let p = project_house_rules(Some(&multi), 16).unwrap();
+        assert!(p.turns[0].content.ends_with("é..."), "a cut stays on a character boundary");
     }
 
     #[tokio::test]

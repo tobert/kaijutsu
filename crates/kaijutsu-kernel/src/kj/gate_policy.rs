@@ -456,13 +456,13 @@ pub(crate) struct CouncilConfig {
     /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
     /// contexts"). Off by default.
     pub(crate) voices: bool,
-    /// `[council] seat`: each decision also reads the submitting seat's own
-    /// context, its brief and newest narration (`docs/council.md`, "The
-    /// seat context"). Off by default.
-    pub(crate) seat: bool,
-    /// `[council] seat_tokens`: the seat context's budget for the brief and
-    /// for the narration, each, estimated at four bytes a token.
-    pub(crate) seat_tokens: u64,
+    /// `[council] house_rules`: each decision also reads the house rules of
+    /// the proposing seat's workspace, from its `AGENTS.md` when one is
+    /// found (`docs/council.md`, "House rules"). Off by default.
+    pub(crate) house_rules: bool,
+    /// `[council] house_rules_tokens`: the budget for the house rules,
+    /// estimated at four bytes a token.
+    pub(crate) house_rules_tokens: u64,
     /// `[council] mode`: gatekeeper (default) or bumper.
     pub(crate) mode: CouncilMode,
     /// `[council] bump_limit`: in bumper mode, the bumps one submission gets
@@ -502,9 +502,15 @@ struct CouncilToml {
     #[serde(default)]
     voices: bool,
     #[serde(default)]
-    seat: bool,
-    #[serde(default = "default_seat_tokens")]
-    seat_tokens: i64,
+    house_rules: bool,
+    #[serde(default = "default_house_rules_tokens")]
+    house_rules_tokens: i64,
+    /// Keys the seat context used. Parsed only to refuse them with the new
+    /// names.
+    #[serde(default)]
+    seat: Option<toml::Value>,
+    #[serde(default)]
+    seat_tokens: Option<toml::Value>,
     #[serde(default = "default_mode")]
     mode: String,
     #[serde(default)]
@@ -519,9 +525,8 @@ fn default_require_agree() -> bool {
     true
 }
 
-/// The seat context's default budget, in tokens, for the brief and for the
-/// narration each.
-pub(crate) const DEFAULT_SEAT_TOKENS: u64 = 2000;
+/// The house-rules context's default budget, in tokens.
+pub(crate) const DEFAULT_HOUSE_RULES_TOKENS: u64 = 2000;
 
 /// The bumps one submission gets by default before it asks.
 pub(crate) const DEFAULT_BUMP_LIMIT: u64 = 3;
@@ -531,8 +536,8 @@ fn default_mode() -> String {
     "gatekeeper".into()
 }
 
-fn default_seat_tokens() -> i64 {
-    DEFAULT_SEAT_TOKENS as i64
+fn default_house_rules_tokens() -> i64 {
+    DEFAULT_HOUSE_RULES_TOKENS as i64
 }
 
 #[derive(Deserialize)]
@@ -721,10 +726,16 @@ impl GateConfig {
                 raw.deadline_ms
             )));
         }
-        if raw.seat_tokens <= 0 {
+        if raw.seat.is_some() {
+            return Err(err("[council] seat: the seat context is gone; the key is now `house_rules`".into()));
+        }
+        if raw.seat_tokens.is_some() {
+            return Err(err("[council] seat_tokens: the seat context is gone; the key is now `house_rules_tokens`".into()));
+        }
+        if raw.house_rules_tokens <= 0 {
             return Err(err(format!(
-                "[council] seat_tokens: {} must be an integer greater than 0",
-                raw.seat_tokens
+                "[council] house_rules_tokens: {} must be an integer greater than 0",
+                raw.house_rules_tokens
             )));
         }
         let mode = match raw.mode.as_str() {
@@ -855,8 +866,8 @@ impl GateConfig {
             deadline_ms: raw.deadline_ms as u64,
             require_agree: raw.require_agree,
             voices: raw.voices,
-            seat: raw.seat,
-            seat_tokens: raw.seat_tokens as u64,
+            house_rules: raw.house_rules,
+            house_rules_tokens: raw.house_rules_tokens as u64,
             mode,
             bump_limit,
             specs,
@@ -2605,17 +2616,27 @@ enabled = false
     }
 
     #[test]
-    fn the_seat_context_is_off_unless_the_council_turns_it_on() {
+    fn the_house_rules_context_is_off_unless_the_council_turns_it_on() {
         let c = config(COUNCIL_FULL);
-        assert!(!c.council().unwrap().seat, "the seat context defaults to off");
-        assert_eq!(c.council().unwrap().seat_tokens, DEFAULT_SEAT_TOKENS);
-        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = true\nseat_tokens = 500"));
-        assert!(on.council().unwrap().seat);
-        assert_eq!(on.council().unwrap().seat_tokens, 500);
-        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat_tokens = 0"));
-        assert!(m.contains("seat_tokens"), "{m}");
-        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = \"yes\""));
-        assert!(m.contains("seat"), "{m}");
+        assert!(!c.council().unwrap().house_rules, "the house-rules context defaults to off");
+        assert_eq!(c.council().unwrap().house_rules_tokens, DEFAULT_HOUSE_RULES_TOKENS);
+        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nhouse_rules = true\nhouse_rules_tokens = 500"));
+        assert!(on.council().unwrap().house_rules);
+        assert_eq!(on.council().unwrap().house_rules_tokens, 500);
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nhouse_rules_tokens = 0"));
+        assert!(m.contains("house_rules_tokens"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nhouse_rules = \"yes\""));
+        assert!(m.contains("house_rules"), "{m}");
+    }
+
+    /// A gate.toml written for the seat context fails to parse, and the
+    /// message names the key that replaces each old one.
+    #[test]
+    fn the_old_seat_keys_fail_and_name_their_replacements() {
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat = true"));
+        assert!(m.contains("[council] seat") && m.contains("house_rules"), "{m}");
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat_tokens = 500"));
+        assert!(m.contains("[council] seat_tokens") && m.contains("house_rules_tokens"), "{m}");
     }
 
     #[test]
@@ -2831,7 +2852,7 @@ enabled = false
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-gate").unwrap();
         assert!(c.threshold_for("program-gate", &shell.identity).is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
-        assert!(c.seat, "the bench reads the seat context");
+        assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
     }
 
     /// The benchmark's bump gate parses: bump-only mode over the bump spec,
@@ -2849,7 +2870,7 @@ enabled = false
         let shell = c.thresholds.iter().find(|t| t.spec == "shell-bump").unwrap();
         assert!(c.threshold_for("program-gate", &shell.identity).is_some());
         assert!(cfg.council_enabled_for(Some("coder")));
-        assert!(c.seat, "the bench reads the seat context");
+        assert!(c.house_rules, "the bench reads the house rules, and finds none in a task container");
         for verb in ["kj ledger show 01a1", "kj ledger list --history", "kj rc list", "kj binding list"] {
             assert!(matches!(first_verdict(verb, &cfg, Some("coder")), PolicyVerdict::Deny(_)), "{verb}");
         }

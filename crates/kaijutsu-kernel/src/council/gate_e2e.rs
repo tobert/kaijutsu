@@ -254,8 +254,8 @@ struct Setup {
     /// `gate.toml` declares the program spec, `program-gate`, with a
     /// threshold for the test server.
     programs: bool,
-    /// `[council] seat`.
-    seat: bool,
+    /// `[council] house_rules`.
+    house_rules: bool,
     /// Bumper mode with this `bump_limit`, reading the `shell-bump` spec.
     bump_limit: Option<u64>,
     /// The bump template file is left out of the config directory.
@@ -274,7 +274,7 @@ impl Default for Setup {
             voices: false,
             chain: false,
             programs: false,
-            seat: false,
+            house_rules: false,
             bump_limit: None,
             no_bump_template: false,
             bump_only: false,
@@ -291,7 +291,7 @@ fn gate_toml(server: &str, setup: &Setup) -> String {
 server = "{server}"
 contexts = {contexts}
 voices = {voices}
-seat = {seat}
+house_rules = {house_rules}
 {mode}
 pool = {{ method = "loglinear", weights = "mass" }}
 deadline_ms = {deadline}
@@ -316,7 +316,7 @@ enabled = {enabled}
         global = setup.global,
         contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
         voices = setup.voices,
-        seat = setup.seat,
+        house_rules = setup.house_rules,
         mode = match (setup.bump_only, setup.bump_limit) {
             (true, _) => "mode = \"bump-only\"".to_string(),
             (false, Some(limit)) => format!("mode = \"bumper\"\nbump_limit = {limit}"),
@@ -1195,7 +1195,7 @@ async fn voices_compose_amy_into_the_decision_and_banto_observes_it() {
         let rows = rig.observations(&decision.decision_id, 1).await;
         assert_eq!(rows.len(), 1, "{via:?}: {rows:#?}");
         let o = &rows[0].observation;
-        assert_eq!(o.seat_label, "council-banto");
+        assert_eq!(o.voice_label, "council-banto");
         assert_eq!(o.spec_name, "direction-check");
         assert_eq!(o.outcome, CouncilObservationOutcome::Answered, "{via:?}: {o:?}");
         assert_eq!(o.choice.as_deref(), Some("strays"));
@@ -1860,30 +1860,41 @@ async fn a_spec_reads_its_own_contexts_and_no_other_spec_does() {
     }
 }
 
-/// With `[council] seat` on, the shell decision and each program decision
-/// read the submitting seat's own context after the configured contexts,
-/// under the seat's context id and pinned at the head the kernel prepared.
-/// A seat with nothing written yet reads no seat context. Each decision
-/// records the seat head it read, and its info log line says whether it
-/// read one.
+/// With `[council] house_rules` on, a seat whose working directory has an
+/// `AGENTS.md` above it makes the shell decision and each program decision
+/// read `house-rules` after the configured contexts, under an id derived
+/// from the file's text (not the seat's context id) and pinned at the head
+/// the kernel prepared. With no `AGENTS.md` the decision reads no extra
+/// context, as in a task container. Each decision records the head it read,
+/// and its info log line and read note say whether it read one.
 ///
-/// Falsified by a gate that leaves the seat out of the program decision:
-/// its request reads two contexts.
+/// Falsified by a gate that leaves the house rules out of the program
+/// decision: its request reads two contexts.
 #[tokio::test]
-async fn the_seat_context_joins_the_shell_and_program_decisions() {
+async fn the_house_rules_context_joins_the_shell_and_program_decisions() {
     use tracing_subscriber::layer::SubscriberExt;
     for via in BOTH {
         let seen = Arc::new(Seen::default());
         let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Capture(seen.clone())));
         tracing::callsite::rebuild_interest_cache();
-        let rig = rig(via, Setup { seat: true, programs: true, ..Setup::default() }).await;
+        let rig = rig(via, Setup { house_rules: true, programs: true, ..Setup::default() }).await;
+        rig.d
+            .kernel_db()
+            .lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: rig.ctx.context_id,
+                cwd: Some("/work".into()),
+                updated_at: 0,
+            })
+            .unwrap();
         rig.mock.set(allow_each);
-        rig.submit("echo before-any-narration").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
+        rig.submit("echo no-agents-md").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
         let first = rig.mock.decisions();
-        assert_eq!(Rig::read_ids(&first[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+        assert_eq!(Rig::read_ids(&first[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}: no AGENTS.md, no extra read");
 
         append_dialogue(rig.d.kernel(), rig.ctx.context_id, &["recover the records", "The WAL is XORed; no backup yet."]);
+        rig.write("/work/AGENTS.md", "Back up data before changing it.\n").await;
         rig.write("/work/fix.py", "print('fixed')\n").await;
         rig.mock.set(|req| {
             if is_program(req) {
@@ -1896,28 +1907,30 @@ async fn the_seat_context_joins_the_shell_and_program_decisions() {
         let sent: Vec<_> = rig.mock.decisions().into_iter().skip(first.len()).collect();
         assert_eq!(sent.len(), 2, "{via:?}: a shell and a program decision");
         let seat = rig.ctx.context_id.to_string();
+        let held = Rig::read_ids(&sent[0])[2].clone();
+        assert_ne!(held, seat, "{via:?}: the id comes from the text, not the seat");
         for request in &sent {
             assert_eq!(
                 Rig::read_ids(request),
-                [rig.context_of("voice"), rig.context_of("system-rules"), seat.clone()],
+                [rig.context_of("voice"), rig.context_of("system-rules"), held.clone()],
                 "{via:?}: program={}",
                 is_program(request)
             );
-            let at = request.contexts.as_ref().unwrap()[2].at.as_ref().expect("the seat is pinned");
+            let at = request.contexts.as_ref().unwrap()[2].at.as_ref().expect("the house rules are pinned");
             assert_eq!(at, sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap(), "{via:?}: one head for both");
         }
         let head = sent[0].contexts.as_ref().unwrap()[2].at.as_ref().unwrap().to_string();
         let decisions = rig.decisions();
-        let heads: Vec<Option<&str>> = decisions.iter().map(|d| d.decision.seat_head.as_deref()).collect();
+        let heads: Vec<Option<&str>> = decisions.iter().map(|d| d.decision.house_rules_head.as_deref()).collect();
         assert_eq!(heads.len(), 3, "{via:?}: {heads:?}");
         assert_eq!(heads.iter().filter(|h| **h == Some(head.as_str())).count(), 2, "{via:?}: {heads:?}");
-        assert_eq!(heads.iter().filter(|h| h.is_none()).count(), 1, "{via:?}: the first read no seat: {heads:?}");
+        assert_eq!(heads.iter().filter(|h| h.is_none()).count(), 1, "{via:?}: the first read no house rules: {heads:?}");
 
         let events = seen.events.lock().unwrap();
         let logged: Vec<&str> = events
             .iter()
             .filter(|(_, f)| field(f, "outcome").is_some() && field(f, "spec").is_some())
-            .filter_map(|(_, f)| field(f, "seat_head"))
+            .filter_map(|(_, f)| field(f, "house_rules_head"))
             .collect();
         assert_eq!(logged.iter().filter(|h| **h == head).count(), 2, "{via:?}: {logged:?}");
         assert_eq!(logged.iter().filter(|h| **h == "none").count(), 1, "{via:?}: {logged:?}");
@@ -2245,6 +2258,44 @@ async fn a_decision_that_does_not_pass_logs_each_contexts_answers() {
     assert!(reads.contains("voice: verdict=proceed") && reads.contains("system-rules: verdict=try_harder"), "{reads}");
     assert_eq!(outcomes[1].0, "allow");
     assert!(outcomes[1].1.as_deref().unwrap_or_default().is_empty(), "an allow logs no reads: {outcomes:?}");
+    drop(events);
+    rig.finish().await;
+}
+
+/// The house-rules context is named `house-rules` in the log line that says
+/// which context dissented.
+///
+/// Falsified by a label other than `house-rules`: the `reads` field names
+/// the old label or the context's id.
+#[tokio::test]
+async fn a_dissenting_house_rules_context_is_named_house_rules_in_the_log() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let seen = Arc::new(Seen::default());
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Capture(seen.clone())));
+    tracing::callsite::rebuild_interest_cache();
+    let rig = rig(Via::Tool, Setup { house_rules: true, ..bumper(3) }).await;
+    rig.d
+        .kernel_db()
+        .lock()
+        .upsert_context_shell(&crate::kernel_db::ContextShellRow {
+            context_id: rig.ctx.context_id,
+            cwd: Some("/work".into()),
+            updated_at: 0,
+        })
+        .unwrap();
+    rig.write("/work/AGENTS.md", "Never touch prod.\n").await;
+    rig.mock.set(|req| {
+        Reply::ok(super::gate::test_support::answer_choices(req, &[("verdict", BUMP_OPTIONS, &vec![PROCEED, PROCEED, TRY_HARDER])]))
+    });
+    let _ = rig.submit("touch /work/a").await;
+    let events = seen.events.lock().unwrap();
+    let reads: Vec<&str> = events
+        .iter()
+        .filter(|(_, f)| field(f, "outcome").is_some() && field(f, "spec").is_some())
+        .filter_map(|(_, f)| field(f, "reads"))
+        .collect();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].contains("house-rules: verdict=try_harder"), "{}", reads[0]);
     drop(events);
     rig.finish().await;
 }

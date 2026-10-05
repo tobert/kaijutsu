@@ -22,7 +22,7 @@ use kaijutsu_council::{CouncilClient, CouncilError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
-use super::projection::{HouseRules, SEAT_BYTES_PER_TOKEN, project, project_seat};
+use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules};
 use crate::kj::gate_policy::CouncilConfig;
 
 /// Everything one decision needs from the server's side.
@@ -34,15 +34,15 @@ pub(crate) struct Prepared {
     pub(crate) identity: ServerIdentity,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
-    /// In the order the labels were given, then the seat context when one
-    /// is read.
+    /// In the order the labels were given, then the house-rules context when
+    /// one is read.
     pub(crate) contexts: Vec<PreparedContext>,
 }
 
 impl Prepared {
-    /// The seat context this decision reads, when it reads one.
-    pub(crate) fn seat(&self) -> Option<&PreparedContext> {
-        self.contexts.iter().find(|c| c.seat)
+    /// The house-rules context this decision reads, when it reads one.
+    pub(crate) fn house_rules(&self) -> Option<&PreparedContext> {
+        self.contexts.iter().find(|c| c.house_rules)
     }
 }
 
@@ -52,13 +52,24 @@ pub(crate) struct PreparedContext {
     pub(crate) context_id: ContextId,
     /// The head the server reported for the body this kernel sent.
     pub(crate) head: SnapshotId,
-    /// The submitting seat's own context (`docs/council.md`, "The seat
-    /// context"), not a labeled council context.
-    pub(crate) seat: bool,
+    /// The house-rules context (`docs/council.md`, "House rules"), not a
+    /// labeled council context. Its id comes from its body.
+    pub(crate) house_rules: bool,
 }
 
-/// The label a seat context goes by in reports and miss causes.
-pub(crate) const SEAT_LABEL: &str = "seat";
+/// The label the house-rules context goes by in reports and miss causes.
+pub(crate) const HOUSE_RULES_LABEL: &str = "house-rules";
+
+/// The namespace of house-rules context ids, which are UUIDv5 over the
+/// sha256 of the projected body.
+const HOUSE_RULES_NAMESPACE: uuid::Uuid = uuid::uuid!("5c1f0b0e-9a47-4d3b-8e62-7f1a2b3c4d5e");
+
+/// The id the council server holds a house-rules body under: UUIDv5 of the
+/// body's sha256 in [`HOUSE_RULES_NAMESPACE`]. The same body is the same id
+/// for every seat, and a changed body is a new id.
+fn house_rules_id(body: &kaijutsu_council::wire::ContextPut) -> Result<ContextId, PrepareMiss> {
+    Ok(ContextId::from(uuid::Uuid::new_v5(&HOUSE_RULES_NAMESPACE, &body_hash(body)?)))
+}
 
 /// Why the council cannot be asked right now, in plain words; the gate
 /// records it as a miss cause.
@@ -112,10 +123,10 @@ impl Drop for PutInFlight<'_> {
 
 /// The seat's house rules: the first `AGENTS.md` found walking up from its
 /// working directory (the home directory when it has none), read through the
-/// kernel VFS, up to one byte past the seat budget so the projection can mark
-/// a cut. A file that cannot be read, or is not UTF-8, is skipped with a
-/// warning; the seat context goes without house rules rather than missing.
-async fn house_rules(kernel: &crate::Kernel, seat: ContextId, seat_tokens: u64) -> Option<HouseRules> {
+/// kernel VFS, up to one byte past the budget so the projection can mark a
+/// cut. A file that cannot be read, or is not UTF-8, is skipped with a
+/// warning; the decision reads no house-rules context rather than missing.
+async fn house_rules(kernel: &crate::Kernel, seat: ContextId, house_rules_tokens: u64) -> Option<HouseRules> {
     use crate::vfs::VfsOps;
     let cwd = match kernel.kernel_db().lock().get_context_shell(seat) {
         Ok(row) => row.and_then(|row| row.cwd),
@@ -125,7 +136,7 @@ async fn house_rules(kernel: &crate::Kernel, seat: ContextId, seat_tokens: u64) 
         }
     }
     .unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
-    let limit = u32::try_from(seat_tokens.saturating_mul(SEAT_BYTES_PER_TOKEN).saturating_add(1)).unwrap_or(u32::MAX);
+    let limit = u32::try_from(house_rules_tokens.saturating_mul(HOUSE_RULES_BYTES_PER_TOKEN).saturating_add(1)).unwrap_or(u32::MAX);
     for dir in std::path::Path::new(&cwd).ancestors() {
         let path = dir.join("AGENTS.md");
         if !kernel.vfs().exists(&path).await {
@@ -143,13 +154,13 @@ async fn house_rules(kernel: &crate::Kernel, seat: ContextId, seat_tokens: u64) 
                         bytes.truncate(valid);
                         Some(HouseRules { path: shown, text: String::from_utf8(bytes).unwrap_or_default() })
                     } else {
-                        tracing::warn!(path = %shown, "house rules are not UTF-8; the seat context goes without them");
+                        tracing::warn!(path = %shown, "house rules are not UTF-8; the decision reads none");
                         None
                     }
                 }
             },
             Err(e) => {
-                tracing::warn!(path = %shown, error = %e, "house rules cannot be read; the seat context goes without them");
+                tracing::warn!(path = %shown, error = %e, "house rules cannot be read; the decision reads none");
                 None
             }
         };
@@ -164,14 +175,15 @@ impl CouncilSync {
     /// followed by its voting voices ([`super::voices::VoiceChain::decision_labels`]);
     /// an observation passes the one voice it reads.
     ///
-    /// `seat` names the submitting seat's context when `[council] seat` is
-    /// on. Its projection ([`project_seat`]) is held under the seat's own
-    /// context id and read after the labels. A seat with no narration yet,
-    /// or one that is itself among the labels, adds no context.
+    /// `seat` names the proposing seat's context when `[council] house_rules`
+    /// is on. Its working directory finds the house rules, whose projection
+    /// ([`project_house_rules`]) is held under an id derived from its body and
+    /// read after the labels. A seat with no `AGENTS.md` above its working
+    /// directory adds no context.
     ///
     /// A miss, before any context is sent: a spec holding a `text` question
     /// when the server lacks the `describe` capability, a label listed twice,
-    /// and more contexts, the seat's included, than the server's
+    /// and more contexts, the house rules included, than the server's
     /// `contexts_per_decision`.
     pub(crate) async fn prepare_labels(
         &self,
@@ -204,21 +216,21 @@ impl CouncilSync {
                 i + 1
             )));
         }
-        let seat = match seat {
+        let house = match seat {
             None => None,
             Some(context_id) => {
-                let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
-                    PrepareMiss(format!("the seat context of {} cannot be read: {e}", context_id.short()))
-                })?;
-                let house = house_rules(kernel, context_id, council.seat_tokens).await;
-                project_seat(&blocks, house.as_ref(), council.seat_tokens).map(|body| (context_id, body))
+                let rules = house_rules(kernel, context_id, council.house_rules_tokens).await;
+                match project_house_rules(rules.as_ref(), council.house_rules_tokens) {
+                    Some(body) => Some((house_rules_id(&body)?, body)),
+                    None => None,
+                }
             }
         };
-        let reads = labels.len() + usize::from(seat.is_some());
+        let reads = labels.len() + usize::from(house.is_some());
         if reads as u64 > identity.limits.contexts_per_decision {
             let mut named = labels.to_vec();
-            if seat.is_some() {
-                named.push("the seat context".to_string());
+            if house.is_some() {
+                named.push("the house-rules context".to_string());
             }
             return Err(PrepareMiss(format!(
                 "a decision on spec {spec_name} reads {reads} contexts ({}), and council server {server} \
@@ -238,13 +250,11 @@ impl CouncilSync {
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
             let head = self.hold(&client, server, &identity, &spec_id, label, context_id, body).await?;
-            contexts.push(PreparedContext { label: label.clone(), context_id, head, seat: false });
+            contexts.push(PreparedContext { label: label.clone(), context_id, head, house_rules: false });
         }
-        if let Some((context_id, body)) = seat
-            && !contexts.iter().any(|c| c.context_id == context_id)
-        {
-            let head = self.hold(&client, server, &identity, &spec_id, SEAT_LABEL, context_id, body).await?;
-            contexts.push(PreparedContext { label: SEAT_LABEL.to_string(), context_id, head, seat: true });
+        if let Some((context_id, body)) = house {
+            let head = self.hold(&client, server, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body).await?;
+            contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, head, house_rules: true });
         }
 
         let spec = spec_body;
@@ -639,8 +649,8 @@ mod tests {
             deadline_ms: 5000,
             require_agree: false,
             voices: false,
-            seat: false,
-            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
+            house_rules: false,
+            house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             specs: vec![spec.clone()],
@@ -939,11 +949,28 @@ mod tests {
         assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
     }
 
-    /// A seat with a brief and narration, labeled `lane-a`.
-    fn narrating_seat(r: &Rig) -> ContextId {
-        let seat = live_context(&r.kernel, "lane-a");
+    /// A seat with a brief and narration, labeled `label`, working in `cwd`.
+    fn seat_in(r: &Rig, label: &str, cwd: Option<&str>) -> ContextId {
+        let seat = live_context(&r.kernel, label);
         append_dialogue(&r.kernel, seat, &["recover the records", "The WAL is XORed."]);
+        if let Some(cwd) = cwd {
+            r.kernel
+                .kernel_db()
+                .lock()
+                .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(cwd.into()), updated_at: 0 })
+                .unwrap();
+        }
         seat
+    }
+
+    /// Mounts `/work` and writes the repo's `AGENTS.md`.
+    async fn write_rules(r: &Rig, text: &str) {
+        use crate::vfs::VfsOps;
+        if !r.kernel.vfs().exists(std::path::Path::new("/work")).await {
+            r.kernel.vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
+        }
+        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/AGENTS.md"), text.as_bytes()).await.unwrap();
+        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/sub/main.rs"), b"fn main() {}").await.unwrap();
     }
 
     fn append_to(r: &Rig, ctx: ContextId, role: kaijutsu_types::Role, kind: kaijutsu_types::BlockKind, text: &str) {
@@ -963,109 +990,107 @@ mod tests {
         r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat)).await
     }
 
-    /// The seat context is held under the seat's own id, read after the
-    /// labels, and sent again only when its narration changes: a tool call
-    /// and its result send nothing, a finished narration block sends it
-    /// with the last head in `If-Match`.
+    /// The house-rules context is the first `AGENTS.md` found walking up
+    /// from the seat's working directory, read through the kernel VFS, and
+    /// read after the labels. Nothing the seat said or did reaches it: a
+    /// brief, narration, a tool call, and later narration leave the body
+    /// and the server's copy as they were.
     ///
-    /// Falsified by a sync that hashes every block of the seat: the tool
-    /// call sends a `PUT`.
+    /// Falsified by a sync that reads only the working directory itself (the
+    /// rules one level up never arrive), or one that projects the seat's
+    /// blocks (the narration changes the body and sends a `PUT`).
     #[tokio::test]
-    async fn the_seat_context_is_held_under_the_seat_id_and_sent_when_its_narration_changes() {
-        let r = rig().await;
-        let seat = narrating_seat(&r);
+    async fn the_house_rules_come_from_the_nearest_agents_md_and_ignore_the_seat() {
+        let mut r = rig().await;
+        r.council.house_rules = true;
+        write_rules(&r, "Back up data before changing it.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo/sub"));
         let p = prepare_seat(&r, seat).await.expect("prepared");
-        assert_eq!(p.contexts.iter().map(|c| (c.label.as_str(), c.seat)).collect::<Vec<_>>(), [("voice", false), ("seat", true)]);
-        assert_eq!(p.seat().unwrap().context_id, seat);
+        assert_eq!(
+            p.contexts.iter().map(|c| (c.label.as_str(), c.house_rules)).collect::<Vec<_>>(),
+            [("voice", false), ("house-rules", true)]
+        );
         let puts = r.mock.puts();
         assert_eq!(puts.len(), 2);
-        assert!(puts[1].1["system"].as_str().unwrap().contains("proposing seat"), "{}", puts[1].1);
-
-        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::ToolCall, "xxd main.db-wal");
-        append_to(&r, seat, kaijutsu_types::Role::Tool, kaijutsu_types::BlockKind::ToolResult, "00000000: 3d");
-        let again = prepare_seat(&r, seat).await.unwrap();
-        assert_eq!(r.mock.puts().len(), 2, "a tool call is not narration");
-        assert_eq!(again.seat().unwrap().head, p.seat().unwrap().head);
-
-        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "No backup exists yet.");
-        let moved = prepare_seat(&r, seat).await.unwrap();
-        let puts = r.mock.puts();
-        assert_eq!(puts.len(), 3, "new narration sends the seat context");
-        assert_eq!(puts[2].0.as_deref(), Some(p.seat().unwrap().head.as_str()));
-        assert_ne!(moved.seat().unwrap().head, p.seat().unwrap().head);
-    }
-
-    /// The seat context opens with the first `AGENTS.md` found walking up
-    /// from the seat's working directory, read through the kernel VFS. A
-    /// seat with none sends no house rules.
-    ///
-    /// Falsified by a sync that reads only the working directory itself: the
-    /// rules one level up never reach the server.
-    #[tokio::test]
-    async fn the_seat_context_reads_the_nearest_agents_md_above_its_cwd() {
-        use crate::vfs::VfsOps;
-        let r = rig().await;
-        r.kernel.vfs().mount("/work", crate::vfs::MemoryBackend::new()).await;
-        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/AGENTS.md"), b"Back up data before changing it.").await.unwrap();
-        r.kernel.vfs().write_all(std::path::Path::new("/work/repo/sub/main.rs"), b"fn main() {}").await.unwrap();
-        let seat = narrating_seat(&r);
-        let set_cwd = |cwd: &str| {
-            r.kernel
-                .kernel_db()
-                .lock()
-                .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: seat, cwd: Some(cwd.into()), updated_at: 0 })
-                .unwrap()
-        };
-        set_cwd("/work/repo/sub");
-        prepare_seat(&r, seat).await.expect("prepared");
-        let body = r.mock.puts().last().unwrap().1.clone();
+        let body = &puts[1].1;
+        assert!(body["system"].as_str().unwrap().contains("house rules of the workspace"), "{body}");
+        assert_eq!(body["turns"].as_array().unwrap().len(), 1, "{body}");
         assert_eq!(
             body["turns"][0]["content"].as_str().unwrap(),
             "The house rules in /work/repo/AGENTS.md:\n\nBack up data before changing it."
         );
+        assert!(!body.to_string().contains("WAL"), "the seat's narration stays out: {body}");
 
-        let bare = live_context(&r.kernel, "lane-bare");
-        append_dialogue(&r.kernel, bare, &["recover the records", "The WAL is XORed."]);
-        r.kernel
-            .kernel_db()
-            .lock()
-            .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: bare, cwd: Some("/work".into()), updated_at: 0 })
-            .unwrap();
-        prepare_seat(&r, bare).await.expect("prepared");
-        let body = r.mock.puts().last().unwrap().1.clone();
-        assert!(body["turns"][0]["content"].as_str().unwrap().starts_with("The seat's brief"), "{body}");
+        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::ToolCall, "xxd main.db-wal");
+        append_to(&r, seat, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "No backup exists yet.");
+        append_to(&r, seat, kaijutsu_types::Role::User, kaijutsu_types::BlockKind::Text, "a later prompt");
+        let again = prepare_seat(&r, seat).await.unwrap();
+        assert_eq!(r.mock.puts().len(), 2, "narration and prompts send nothing");
+        assert_eq!(again.house_rules().unwrap().head, p.house_rules().unwrap().head);
     }
 
+    /// The held id comes from the body, so every seat under one `AGENTS.md`
+    /// shares one held context, and an edited file is a new id.
+    ///
+    /// Falsified by an id derived from the seat's context id: the two seats
+    /// hold two contexts and the second prepare sends another `PUT`.
     #[tokio::test]
-    async fn a_seat_with_nothing_written_or_one_already_listed_adds_no_context() {
-        let r = rig().await;
-        let quiet = live_context(&r.kernel, "lane-b");
-        let p = prepare_seat(&r, quiet).await.unwrap();
-        assert!(p.seat().is_none());
-        assert_eq!(r.mock.puts().len(), 1, "only the labeled context");
-
-        // A seat that is itself a council context is read once, as its label.
-        append_to(&r, r.voice, kaijutsu_types::Role::Model, kaijutsu_types::BlockKind::Text, "noted");
-        let p = prepare_seat(&r, r.voice).await.unwrap();
-        assert_eq!(p.contexts.len(), 1);
-        assert!(p.seat().is_none());
-    }
-
-    /// The labels and the seat context together must fit the server's
-    /// `contexts_per_decision`; a miss names the limit and the seat.
-    #[tokio::test]
-    async fn the_seat_context_counts_against_contexts_per_decision() {
+    async fn seats_under_one_agents_md_share_one_held_context_and_an_edit_is_a_new_id() {
         let mut r = rig().await;
+        r.council.house_rules = true;
+        write_rules(&r, "Back up data before changing it.").await;
+        let one = seat_in(&r, "lane-a", Some("/work/repo/sub"));
+        let two = seat_in(&r, "lane-b", Some("/work/repo"));
+        let p1 = prepare_seat(&r, one).await.unwrap();
+        let p2 = prepare_seat(&r, two).await.unwrap();
+        let (h1, h2) = (p1.house_rules().unwrap(), p2.house_rules().unwrap());
+        assert_eq!(h1.context_id, h2.context_id, "one body, one id");
+        assert_ne!(h1.context_id, one);
+        assert_ne!(h1.context_id, two);
+        assert_eq!(r.mock.puts().len(), 2, "the voice, and the rules once");
+
+        write_rules(&r, "Back up data. Never push.").await;
+        let p3 = prepare_seat(&r, one).await.unwrap();
+        let h3 = p3.house_rules().unwrap();
+        assert_ne!(h3.context_id, h1.context_id, "an edited file is a new id");
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 3);
+        assert_eq!(puts[2].0, None, "a new id has no head to match");
+    }
+
+    /// With no `AGENTS.md` above the working directory, or no working
+    /// directory under a mounted tree that holds one, there is no
+    /// house-rules context.
+    #[tokio::test]
+    async fn no_agents_md_means_no_house_rules_context() {
+        let mut r = rig().await;
+        r.council.house_rules = true;
+        r.kernel.vfs().mount("/bare", crate::vfs::MemoryBackend::new()).await;
+        let seat = seat_in(&r, "lane-a", Some("/bare"));
+        let p = prepare_seat(&r, seat).await.unwrap();
+        assert!(p.house_rules().is_none());
+        assert_eq!(p.contexts.len(), 1);
+        assert_eq!(r.mock.puts().len(), 1, "only the labeled context");
+    }
+
+    /// The labels and the house-rules context together must fit the
+    /// server's `contexts_per_decision`; a miss names the limit and the
+    /// context.
+    #[tokio::test]
+    async fn the_house_rules_context_counts_against_contexts_per_decision() {
+        let mut r = rig().await;
+        r.council.house_rules = true;
         for label in ["rules-a", "rules-b", "rules-c"] {
             live_context(&r.kernel, label);
             r.council.contexts.push(label.into());
         }
-        let quiet = live_context(&r.kernel, "lane-b");
-        prepare_seat(&r, quiet).await.expect("four labels and an empty seat fit");
-        let seat = narrating_seat(&r);
+        let bare = seat_in(&r, "lane-b", Some("/nowhere"));
+        prepare_seat(&r, bare).await.expect("four labels and no house rules fit");
+        write_rules(&r, "Back up data.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo"));
         let miss = prepare_seat(&r, seat).await.err().expect("a miss");
         assert!(miss.0.contains("reads 5 contexts"), "{}", miss.0);
-        assert!(miss.0.contains("the seat context") && miss.0.contains("contexts_per_decision"), "{}", miss.0);
+        assert!(miss.0.contains("house-rules") && miss.0.contains("contexts_per_decision"), "{}", miss.0);
     }
 
     #[tokio::test]

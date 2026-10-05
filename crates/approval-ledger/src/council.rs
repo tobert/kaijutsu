@@ -136,7 +136,7 @@ pub struct NewCouncilDecision {
     pub ms: i64,
     /// The head of the house-rules context the decision read
     /// (`docs/council.md`, "House rules"); `None` when it read none.
-    /// That read's row is the one whose context is `context_id`.
+    /// The read's row carries that context's id, derived from its text.
     #[serde(default)]
     pub house_rules_head: Option<String>,
     /// A bump's flavor: the non-pass option the council chose. Set for a

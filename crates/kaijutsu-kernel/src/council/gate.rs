@@ -663,7 +663,7 @@ fn forget_after(kernel: &crate::Kernel, error: &CouncilError, prepared: &Prepare
 }
 
 /// Prepare the server for a decision on `spec_name` over `labels` and, when
-/// given, the seat context of `seat`, stopping at `deadline`. Every failure
+/// given, the house rules of the workspace `seat` works in, stopping at `deadline`. Every failure
 /// is a miss cause.
 pub(crate) async fn prepare_within(
     kernel: &crate::Kernel,
@@ -1261,8 +1261,8 @@ fn build_verdict(
         agreement: verdict.map(|v| CouncilAgreement { agree: v.agree, spread: v.spread }),
         queue_ms,
         ms: elapsed.as_millis() as i64,
-        seat_head: match &seen {
-            Seen::Answered(p, _) | Seen::Prepared(p) => p.seat().map(|c| c.head.to_string()),
+        house_rules_head: match &seen {
+            Seen::Answered(p, _) | Seen::Prepared(p) => p.house_rules().map(|c| c.head.to_string()),
             Seen::Nothing => None,
         },
         bump_flavor,
@@ -1335,8 +1335,8 @@ fn other_word(outcome: &Outcome) -> &'static str {
 
 /// Ask the council once about `submission` and return its verdict. Every
 /// failure is a verdict too: a miss with its cause, including a reviewer
-/// chain that could not be walked (`chain`). With `[council] seat` on, the
-/// decision also reads the caller's seat context. Runs with no database
+/// chain that could not be walked (`chain`). With `[council] house_rules` on, the
+/// decision also reads the house rules of the caller's workspace. Runs with no database
 /// lock held; `deadline_ms` bounds preparing the server and the decision
 /// call together.
 pub(crate) async fn decide(
@@ -1366,7 +1366,7 @@ pub(crate) async fn decide(
         council.template = tracing::field::Empty,
         council.spec_id = tracing::field::Empty,
         council.report_stop = tracing::field::Empty,
-        council.seat_head = tracing::field::Empty,
+        council.house_rules_head = tracing::field::Empty,
         council.deadline_ms = council.deadline_ms,
         council.prepare_ms = tracing::field::Empty,
         council.ms = tracing::field::Empty,
@@ -1388,15 +1388,15 @@ pub(crate) async fn decide(
     if !bump_flavor.is_empty() {
         span.record("council.bump_flavor", bump_flavor);
     }
-    let seat_head = verdict.record.seat_head.as_deref().unwrap_or("none");
-    span.record("council.seat_head", seat_head);
+    let house_rules_head = verdict.record.house_rules_head.as_deref().unwrap_or("none");
+    span.record("council.house_rules_head", house_rules_head);
     tracing::info!(
         target: "kaijutsu::council",
         spec = %spec.name,
         outcome = other_word(&verdict.outcome),
         p_allow = verdict.p_allow,
         bump_flavor,
-        seat_head,
+        house_rules_head,
         reads = %verdict.reads,
         context_id = %caller.context_id.map(|c| c.to_string()).unwrap_or_default(),
         "{}",
@@ -1431,7 +1431,7 @@ async fn decide_inner(
     };
     let labels = chain.decision_labels(council, spec);
     let carried = Carried { chain, state };
-    let seat = caller.context_id.filter(|_| council.seat);
+    let seat = caller.context_id.filter(|_| council.house_rules);
     let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline).await {
         Ok(prepared) => prepared,
         Err(cause) => {
@@ -1901,8 +1901,8 @@ mod tests {
             deadline_ms: 700,
             require_agree,
             voices: false,
-            seat: false,
-            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
+            house_rules: false,
+            house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
@@ -2118,7 +2118,7 @@ mod tests {
                     label: format!("c{i}"),
                     context_id: *id,
                     head: kaijutsu_council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
-                    seat: false,
+                    house_rules: false,
                 })
                 .collect(),
         }

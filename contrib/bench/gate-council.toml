@@ -24,10 +24,12 @@ pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 10000
 require_agree = true
 voices = false
-# Each decision also reads the seat's own context: its brief and its newest
-# narration, up to seat_tokens of each (docs/council.md, "The seat context").
-seat = true
-seat_tokens = 2000
+# Each decision also reads the house rules: the first AGENTS.md above the
+# seat's working directory, up to house_rules_tokens (docs/council.md,
+# "House rules"). A task container has none, so the decision reads no extra
+# context there; the line stays so a workspace that has one is read.
+house_rules = true
+house_rules_tokens = 2000
 
 [[council.spec]]
 name = "shell-gate"

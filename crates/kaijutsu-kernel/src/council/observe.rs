@@ -141,8 +141,8 @@ async fn observe_one(
     let started = Instant::now();
     let mut row = NewCouncilObservation {
         decision_id: decision_id.to_vec(),
-        seat_label: label.to_string(),
-        seat_context_id: None,
+        voice_label: label.to_string(),
+        voice_context_id: None,
         spec_name: DIRECTION_CHECK.to_string(),
         spec_id: String::new(),
         server: empty_server(),
@@ -167,9 +167,9 @@ async fn observe_one(
         Ok(prepared) => prepared,
         Err(cause) => return miss(row, cause, started.elapsed()),
     };
-    let seat = &prepared.contexts[0];
-    row.seat_context_id = Some(seat.context_id.as_bytes().to_vec());
-    row.expected_head = Some(seat.head.to_string());
+    let voice = &prepared.contexts[0];
+    row.voice_context_id = Some(voice.context_id.as_bytes().to_vec());
+    row.expected_head = Some(voice.head.to_string());
     row.spec_id = prepared.spec_id.to_string();
     row.server = CouncilServer {
         model: prepared.identity.model.clone(),
@@ -235,13 +235,13 @@ fn read_answer(
     {
         return Err(format!("the server read spec {read}, not the spec asked for, {asked}"));
     }
-    let seat = prepared.contexts[0].context_id.to_string();
+    let voice = prepared.contexts[0].context_id.to_string();
     let [read] = response.reads.as_slice() else {
         return Err(format!("the answer has {} reads, not the one voice asked for", response.reads.len()));
     };
-    if read.context.as_deref() != Some(seat.as_str()) {
+    if read.context.as_deref() != Some(voice.as_str()) {
         return Err(format!(
-            "the answer read {}, not the voice asked for, {seat}",
+            "the answer read {}, not the voice asked for, {voice}",
             read.context.as_deref().unwrap_or("the spec alone")
         ));
     }
@@ -368,8 +368,8 @@ mod tests {
             deadline_ms: 5000,
             require_agree: true,
             voices: false,
-            seat: false,
-            seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
+            house_rules: false,
+            house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
@@ -402,7 +402,7 @@ mod tests {
                 ms: 3,
                 reads: vec![],
                 pooled: vec![],
-                seat_head: None,
+                house_rules_head: None,
                 bump_flavor: None,
                 control_text: vec![],
             },
@@ -452,8 +452,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let o = &rows[0].observation;
         assert_eq!(rows[0].observation_id, id);
-        assert_eq!(o.seat_label, "council-banto");
-        assert_eq!(o.seat_context_id.as_deref(), Some(r.banto.as_bytes().as_slice()));
+        assert_eq!(o.voice_label, "council-banto");
+        assert_eq!(o.voice_context_id.as_deref(), Some(r.banto.as_bytes().as_slice()));
         assert_eq!(o.choice.as_deref(), Some("strays"));
         assert_eq!(o.server.weight_hash, "w1");
         assert_eq!(o.questions.len(), 1);
@@ -497,7 +497,7 @@ mod tests {
         let observed = r.observe(&["council-ghost"]).await;
         let Seen::Miss(cause) = &observed[0].seen else { panic!("a miss") };
         assert!(cause.contains("council-ghost"), "{cause}");
-        assert_eq!(r.recorded()[0].observation.seat_context_id, None);
+        assert_eq!(r.recorded()[0].observation.voice_context_id, None);
         assert!(r.mock.bodies("/council/v1/decisions").is_empty());
     }
 
