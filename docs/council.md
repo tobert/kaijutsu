@@ -475,6 +475,7 @@ case = "shell"
 [[council.spec]]
 name = "program-gate"          # /config/kernel/council/program-gate.json
 case = "program"
+contexts = ["council-code"]    # read by this spec's decisions only, after [council] contexts
 
 [[council.threshold]]
 spec = "shell-gate"
@@ -488,6 +489,12 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 [context_type.coder.council]
 enabled = true
 ```
+
+A spec's `contexts` are read by that spec's decisions alone, after
+`[council] contexts` and before the voting voices. A label already in
+`[council] contexts`, or listed twice, fails the parse. A code context with
+worked examples belongs to the program spec; the shell decision does not
+need it.
 
 The council's settings live only here. One `deadline_ms` bounds the whole
 decision, preparing the contexts and spec included: the kernel sends it as

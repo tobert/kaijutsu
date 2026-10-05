@@ -370,7 +370,7 @@ mod tests {
             voices: false,
             seat: false,
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
-            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
+            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
             thresholds: vec![],
         };
         let decision = insert_council_decision(

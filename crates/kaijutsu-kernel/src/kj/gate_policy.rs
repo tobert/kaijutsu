@@ -397,6 +397,10 @@ pub(crate) enum CouncilCase {
 pub(crate) struct CouncilSpec {
     pub(crate) name: String,
     pub(crate) case: CouncilCase,
+    /// Council contexts this spec's decisions read after `[council]
+    /// contexts`, such as a code context for program decisions. Empty by
+    /// default.
+    pub(crate) contexts: Vec<String>,
 }
 
 /// What produced a number: a threshold fitted under one identity does not
@@ -503,6 +507,8 @@ struct CouncilPoolToml {
 struct CouncilSpecToml {
     name: String,
     case: String,
+    #[serde(default)]
+    contexts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -712,7 +718,19 @@ impl GateConfig {
                     s.name, s.case
                 )));
             }
-            specs.push(CouncilSpec { name: s.name.clone(), case });
+            for (i, label) in s.contexts.iter().enumerate() {
+                if raw.contexts.contains(label) {
+                    return Err(err(format!(
+                        "[[council.spec]] {} contexts: `{label}` is already in [council] contexts, \
+                         which every decision reads",
+                        s.name
+                    )));
+                }
+                if s.contexts[..i].contains(label) {
+                    return Err(err(format!("[[council.spec]] {} contexts: `{label}` is listed twice", s.name)));
+                }
+            }
+            specs.push(CouncilSpec { name: s.name.clone(), case, contexts: s.contexts.clone() });
         }
         let mut thresholds: Vec<CouncilThreshold> = Vec::new();
         for t in &raw.threshold {
@@ -2503,7 +2521,7 @@ enabled = false
         assert!(c.require_agree, "require_agree defaults to true");
         assert_eq!(
             c.specs,
-            [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }]
+            [CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }]
         );
         assert_eq!(c.thresholds.len(), 2);
         assert_eq!(c.thresholds[0].allow_at, 0.98);
@@ -2624,6 +2642,22 @@ enabled = false
         }
     }
 
+    /// A spec may name contexts of its own, read after `[council] contexts`
+    /// for its decisions only. One already in `[council] contexts`, or
+    /// listed twice, is a parse error rather than a decision-time miss.
+    #[test]
+    fn a_spec_names_contexts_of_its_own() {
+        let cfg = config(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"council-code\"]"));
+        let council = cfg.council().unwrap();
+        assert_eq!(council.specs[0].contexts, ["council-code"]);
+        let plain = config(COUNCIL_FULL);
+        assert!(plain.council().unwrap().specs[0].contexts.is_empty());
+        let m = council_err(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"voice\"]"));
+        assert!(m.contains("[[council.spec]] shell-gate contexts") && m.contains("voice"), "{m}");
+        let m = council_err(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"a\", \"a\"]"));
+        assert!(m.contains("[[council.spec]] shell-gate contexts") && m.contains("twice"), "{m}");
+    }
+
     #[test]
     fn council_needs_a_spec_with_a_safe_unique_name_and_a_known_case() {
         let no_spec = COUNCIL_FULL
@@ -2667,8 +2701,8 @@ enabled = false
         assert_eq!(
             c.specs,
             vec![
-                CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell },
-                CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program },
+                CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() },
+                CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new() },
             ]
         );
         assert_eq!(c.threshold_for("program-gate", &identity("wh1")).unwrap().mass_floor, -1.5);

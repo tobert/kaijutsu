@@ -1786,6 +1786,41 @@ async fn a_script_changed_after_the_council_judged_it_does_not_run() {
     rig.finish().await;
 }
 
+/// A spec's own contexts are read by its decisions alone, after `[council]
+/// contexts`: the program spec names `code`, so the program decision reads
+/// it and the shell decision does not.
+///
+/// Falsified by a gate that reads only `[council] contexts`: the program
+/// decision reads two contexts.
+#[tokio::test]
+async fn a_spec_reads_its_own_contexts_and_no_other_spec_does() {
+    use crate::vfs::VfsOps;
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, ..Setup::default() }).await;
+        live_context(rig.d.kernel(), "code");
+        let toml = gate_toml(&rig.mock.base, &Setup { programs: true, ..Setup::default() })
+            .replace("case = \"program\"", "case = \"program\"\ncontexts = [\"code\"]");
+        rig.d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
+        rig.write("/work/fix.py", "print('fixed')\n").await;
+        rig.mock.set(|req| {
+            if is_program(req) {
+                Reply::ok(super::gate::test_support::program_answer(req, FIRST, FIRST, [-0.01, -5.0, -6.0]))
+            } else {
+                allow_each(req)
+            }
+        });
+        rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
+        let sent = rig.mock.decisions();
+        assert_eq!(sent.len(), 2, "{via:?}: a shell and a program decision");
+        let (voice, rules, code) = (rig.context_of("voice"), rig.context_of("system-rules"), rig.context_of("code"));
+        for request in &sent {
+            let want = if is_program(request) { vec![voice.clone(), rules.clone(), code.clone()] } else { vec![voice.clone(), rules.clone()] };
+            assert_eq!(Rig::read_ids(request), want, "{via:?}: program={}", is_program(request));
+        }
+        rig.finish().await;
+    }
+}
+
 /// With `[council] seat` on, the shell decision and each program decision
 /// read the submitting seat's own context after the configured contexts,
 /// under the seat's context id and pinned at the head the kernel prepared.

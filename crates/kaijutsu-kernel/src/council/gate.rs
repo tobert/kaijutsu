@@ -1204,7 +1204,7 @@ async fn decide_inner(
             return build_verdict(caller, &case, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
-    let labels = chain.decision_labels(council);
+    let labels = chain.decision_labels(council, spec);
     let carried = Carried { chain, state };
     let seat = caller.context_id.filter(|_| council.seat);
     let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline).await {
@@ -1604,7 +1604,7 @@ mod tests {
             voices: false,
             seat: false,
             seat_tokens: crate::kj::gate_policy::DEFAULT_SEAT_TOKENS,
-            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell }],
+            specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new() }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),
                 identity: CouncilIdentity {
@@ -1905,7 +1905,7 @@ mod tests {
 
     fn program_council() -> CouncilConfig {
         let mut c = council(0.98, -1.5, true);
-        c.specs.push(CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program });
+        c.specs.push(CouncilSpec { name: "program-gate".into(), case: CouncilCase::Program, contexts: Vec::new() });
         let mut t = c.thresholds[0].clone();
         t.spec = "program-gate".into();
         c.thresholds.push(t);

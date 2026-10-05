@@ -20,7 +20,7 @@ use kaijutsu_types::{ContextId, PrincipalId};
 
 use super::projection::{SYSTEM_RULES, VOICE_PREFIX};
 use crate::kernel_db::KernelDb;
-use crate::kj::gate_policy::CouncilConfig;
+use crate::kj::gate_policy::{CouncilConfig, CouncilSpec};
 
 /// A character on the chain with no `council-<character>` context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,10 +50,11 @@ pub(crate) struct VoiceChain {
 }
 
 impl VoiceChain {
-    /// The labels a gate decision reads: `[council] contexts`, then each
-    /// voting voice that list does not already hold.
-    pub(crate) fn decision_labels(&self, council: &CouncilConfig) -> Vec<String> {
+    /// The labels a gate decision on `spec` reads: `[council] contexts`, the
+    /// spec's own contexts, then each voting voice those do not already hold.
+    pub(crate) fn decision_labels(&self, council: &CouncilConfig, spec: &CouncilSpec) -> Vec<String> {
         let mut labels = council.contexts.clone();
+        labels.extend(spec.contexts.iter().cloned());
         for voice in &self.voting {
             if !labels.contains(voice) {
                 labels.push(voice.clone());
@@ -194,7 +195,15 @@ case = "shell"
         assert_eq!(chain.observing, ["council-banto"]);
         assert!(chain.skipped.is_empty());
         let council = config(VOICES_ON);
-        assert_eq!(chain.decision_labels(council.council().unwrap()), ["council-system", "council-amy"]);
+        let council = council.council().unwrap();
+        assert_eq!(chain.decision_labels(council, &council.specs[0]), ["council-system", "council-amy"]);
+        let coded = config(&VOICES_ON.replace("case = \"shell\"", "case = \"shell\"\ncontexts = [\"council-code\"]"));
+        let coded = coded.council().unwrap();
+        assert_eq!(
+            chain.decision_labels(coded, &coded.specs[0]),
+            ["council-system", "council-code", "council-amy"],
+            "a spec's own contexts come after [council] contexts and before the voices"
+        );
     }
 
     #[tokio::test]
@@ -255,7 +264,8 @@ case = "shell"
         let listed = VOICES_ON.replace(r#"contexts = ["council-system"]"#, r#"contexts = ["council-system", "council-amy"]"#);
         let chain = f.chain(&listed, f.lane, f.coder).unwrap();
         let council = config(&listed);
-        assert_eq!(chain.decision_labels(council.council().unwrap()), ["council-system", "council-amy"]);
+        let council = council.council().unwrap();
+        assert_eq!(chain.decision_labels(council, &council.specs[0]), ["council-system", "council-amy"]);
     }
 
     #[tokio::test]
