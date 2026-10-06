@@ -77,7 +77,7 @@ file the backend row names. It never belongs in this file.
 | `--no-cwd-mount` | Do not mount the directory the agent was launched in. |
 | `--unlist <path>` | Leave a path out of its parent's directory listing, so a walk from above (`find /`, `grep -r PATTERN /`, `ls /`) never reaches it; naming it still does (`docs/mounts.md`, "Unlisted paths"). Repeatable. Must be absolute and not `/`; it need not exist. The Harbor adapter unlists `/logs` and `/installed-agent`. |
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
-| `--max-tokens <N>` | The output token ceiling written into this kernel's model defaults. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the factory ceiling, 16384. |
+| `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (DeepSeek's factory rows carry 65536 at effort `high`), else the kernel defaults' 16384. |
 | `--rc-overlay <dir>` | An rc variant to install over the seeded `/config/rc` tree, for A/B instruction sets (`contrib/bench/rc-variants/*/README.md`). The directory mirrors the rc tree's layout and holds only the files that differ; every regular file under it (a top-level `README.md` is skipped) replaces the file at the same relative path, unlinked first so a seeded symlink into `lib/` is replaced rather than written through. Refuses, before anything is replaced, if the directory is missing or empty, contains a symlink or another non-regular file, or names a file whose seeded parent directory does not exist. Idempotent: re-applying the same overlay against a persistent `--state-dir` is safe. |
 
 Zero flags works when exactly one of `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
@@ -158,8 +158,9 @@ Each step fails loudly, with what it was doing:
    provider and model. The factory row is left alone unless `--base-url`,
    `--api-key-env`, or `--no-key` says something different; a row written
    without `--api-key-env` or `--no-key` keeps the provider's key file. The
-   two timeouts change only their own columns of the factory row. `--max-tokens` overrides the factory output-token
-   ceiling in this same defaults row; left out, the factory ceiling stands.
+   two timeouts change only their own columns of the factory row. `--max-tokens` sets the
+   chosen model's own output budget, which outranks the defaults row; left out, the
+   model's factory budget stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews
    and `solo-coder` performs.

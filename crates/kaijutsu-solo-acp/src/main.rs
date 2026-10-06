@@ -136,11 +136,11 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     gate_config: Option<PathBuf>,
 
-    /// Output token ceiling for every turn, written into this kernel's model
-    /// defaults. Must be greater than zero — zero and negative values are
-    /// refused. A value the provider rejects as above its own per-model
-    /// ceiling is refused by the provider, not by this flag. Default: the
-    /// factory ceiling, 16384.
+    /// Output token budget for every turn, reasoning included, written onto
+    /// the chosen model's row. Must be greater than zero — zero and negative
+    /// values are refused. A value the provider rejects as above its own
+    /// per-model ceiling is refused by the provider, not by this flag.
+    /// Default: the model's own budget (65536 for DeepSeek), else 16384.
     #[arg(long, value_name = "N")]
     max_tokens: Option<NonZeroU64>,
 

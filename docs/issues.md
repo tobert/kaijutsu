@@ -347,6 +347,23 @@ response has no `queue_ms`, although `docs/council-api.md` lists it, so a
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
 
+## Model tunables: follow-ups from the kaibo review (2026-10-06)
+
+- **Two writers store an unresolved model string.** `kj cast slot set`
+  stores `--model` verbatim, and RPC `configure_llm`
+  (`kaijutsu-server/src/rpc.rs`) persists the raw provider and model. An
+  alias or a `provider/model` form there becomes the wire model and the
+  tunables key, so the model row is skipped and the floor applies. `kj
+  context set` and `kj fork` resolve through `resolve_model_choice`; these
+  two should too.
+- **`kj model` can show a knob the wire drops.** Claude drops temperature
+  and top_p whenever thinking is on, and `effort` rides only the adaptive
+  tier; codex-app maps only model and effort. `kj model` prints the
+  resolved values regardless.
+- **`unknown_kind_in_the_table_is_fatal` cannot fail for its name**
+  (`llm/db_config.rs`): it never puts an unparseable kind in the table, so
+  `load_backends` skipping one would stay green.
+
 ## acp_fleet's forget-a-human-rule scenario predates the worker loadout (2026-10-06)
 
 `cargo test -p kaijutsu-solo-acp --features test-mock --test acp_fleet`

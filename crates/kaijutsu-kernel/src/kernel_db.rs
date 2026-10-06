@@ -8770,6 +8770,49 @@ mod tests {
         assert!(KernelDb::open(&path).unwrap().unpublished_approval_pairs().unwrap().is_empty());
     }
 
+    /// A database whose `backend_models` predates the tunable columns opens,
+    /// keeps its rows with every tunable unset, and stores tunables after.
+    #[test]
+    fn backend_models_gain_tunables_on_existing_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kernel.db");
+        let backend_id = BackendId::new();
+        {
+            let db = KernelDb::open(&path).unwrap();
+            db.conn.execute_batch(
+                "DROP TABLE backend_models;
+                 CREATE TABLE backend_models (
+                     backend_id BLOB NOT NULL REFERENCES backends(backend_id) ON DELETE CASCADE,
+                     model_id TEXT NOT NULL,
+                     context_window INTEGER CHECK (context_window IS NULL OR context_window > 0),
+                     extra TEXT,
+                     PRIMARY KEY (backend_id, model_id));",
+            ).unwrap();
+            db.conn.execute(
+                "INSERT INTO backends (backend_id, name, kind, key_optional, created_at, created_by)
+                 VALUES (?1, 'old', 'openai', 1, 0, ?2)",
+                params![blob_param(backend_id.as_bytes()), blob_param(PrincipalId::system().as_bytes())],
+            ).unwrap();
+            db.conn.execute(
+                "INSERT INTO backend_models (backend_id, model_id, context_window) VALUES (?1, 'm', 1000)",
+                params![blob_param(backend_id.as_bytes())],
+            ).unwrap();
+        }
+        let db = KernelDb::open(&path).unwrap();
+        let rows = db.list_backend_models(backend_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].context_window, Some(1000));
+        assert_eq!(rows[0].tunables, ModelTunablesRow::default());
+        let mut row = rows[0].clone();
+        row.tunables.max_tokens = Some(65536);
+        row.tunables.effort = Some("high".into());
+        db.set_backend_model(&row).unwrap();
+        assert_eq!(db.list_backend_models(backend_id).unwrap()[0].tunables.max_tokens, Some(65536));
+        assert!(db.conn.execute(
+            "UPDATE backend_models SET max_tokens = 0 WHERE model_id = 'm'", [],
+        ).is_err(), "the migrated column carries its CHECK");
+    }
+
     /// The builtin-model shape carries no service endpoint and the kernel
     /// ships no default one, so the rebuild leaves the table empty: the
     /// semantic index stays off until an operator writes an endpoint.

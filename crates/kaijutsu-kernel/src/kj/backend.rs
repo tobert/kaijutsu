@@ -20,7 +20,7 @@
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{BackendId, ContentType};
 
-use crate::kernel_db::{BackendModelRow, BackendRow, LlmDefaultsRow};
+use crate::kernel_db::{BackendModelRow, BackendRow, LlmDefaultsRow, ModelTunablesRow};
 use crate::llm::BackendKind;
 
 use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
@@ -96,8 +96,10 @@ enum BackendCommand {
     /// Show or set the kernel-wide LLM defaults (`llm_defaults`).
     #[command(subcommand)]
     Default(BackendDefaultCommand),
-    /// Restore the factory backends, model windows, aliases, and defaults to
-    /// their embedded definitions. Operator-added backends are left alone.
+    /// Restore the factory backends, their model rows (windows and tunables),
+    /// and the defaults to their embedded definitions, overwriting edits to
+    /// them. Operator-added backends and models, aliases, and casts are left
+    /// alone.
     Reseed,
 }
 
@@ -118,25 +120,8 @@ enum BackendModelCommand {
         /// Sparse provider-specific JSON
         #[arg(long)]
         extra: Option<String>,
-        /// Maximum RESPONSE tokens for this model, reasoning included (not the
-        /// context window)
-        #[arg(long = "max-tokens")]
-        max_tokens: Option<u64>,
-        /// Sampling temperature, 0.0..=2.0
-        #[arg(long)]
-        temperature: Option<f64>,
-        /// Nucleus sampling, (0.0, 1.0]
-        #[arg(long = "top-p")]
-        top_p: Option<f64>,
-        /// This provider's effort ladder token (e.g. low, high, max)
-        #[arg(long)]
-        effort: Option<String>,
-        /// Extended-thinking token budget
-        #[arg(long = "thinking-budget")]
-        thinking_budget: Option<u64>,
-        /// Extended-thinking style token
-        #[arg(long = "thinking-style")]
-        thinking_style: Option<String>,
+        #[command(flatten)]
+        tunables: TunableFlags,
     },
     /// Drop one model's metadata row.
     #[command(alias = "rm")]
@@ -160,25 +145,86 @@ enum BackendDefaultCommand {
         /// Default model id
         #[arg(long)]
         model: Option<String>,
-        /// Maximum RESPONSE tokens (not the context window)
-        #[arg(long = "max-tokens")]
-        max_tokens: Option<u64>,
-        /// Sampling temperature, 0.0..=2.0
-        #[arg(long)]
-        temperature: Option<f64>,
-        /// Nucleus sampling, (0.0, 1.0]
-        #[arg(long = "top-p")]
-        top_p: Option<f64>,
-        /// Provider effort ladder token (e.g. low, high, max)
-        #[arg(long)]
-        effort: Option<String>,
-        /// Extended-thinking token budget
-        #[arg(long = "thinking-budget")]
-        thinking_budget: Option<u64>,
-        /// Extended-thinking style token
-        #[arg(long = "thinking-style")]
-        thinking_style: Option<String>,
+        #[command(flatten)]
+        tunables: TunableFlags,
     },
+}
+
+/// The tunables a model row or the defaults carry, as flags. Only the flags
+/// you pass change; `--clear` returns a field to the next level down.
+#[derive(clap::Args, Debug)]
+struct TunableFlags {
+    /// Maximum RESPONSE tokens, reasoning included (not the context window)
+    #[arg(long = "max-tokens")]
+    max_tokens: Option<u64>,
+    /// Sampling temperature, 0.0..=2.0
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// Nucleus sampling, (0.0, 1.0]
+    #[arg(long = "top-p")]
+    top_p: Option<f64>,
+    /// The provider's effort ladder token (e.g. low, high, max)
+    #[arg(long)]
+    effort: Option<String>,
+    /// Extended-thinking token budget
+    #[arg(long = "thinking-budget")]
+    thinking_budget: Option<u64>,
+    /// Extended-thinking style token
+    #[arg(long = "thinking-style")]
+    thinking_style: Option<String>,
+    /// Unset a tunable so the next level answers: max-tokens, temperature,
+    /// top-p, effort, thinking-budget, or thinking-style. Repeat for more
+    #[arg(long = "clear", value_name = "FIELD")]
+    clear: Vec<String>,
+}
+
+const TUNABLE_FIELDS: &str = "max-tokens, temperature, top-p, effort, thinking-budget, thinking-style";
+
+impl TunableFlags {
+    /// Apply the given flags onto `t`: set what was passed, clear what
+    /// `--clear` names. Refuses an unknown field, an empty token, and a field
+    /// both set and cleared.
+    fn apply(self, t: &mut ModelTunablesRow) -> Result<(), String> {
+        for (name, value) in [("effort", &self.effort), ("thinking-style", &self.thinking_style)] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(format!("--{name} must not be empty; use --clear {name} to unset it"));
+            }
+        }
+        let set = |field: &str| match field {
+            "max-tokens" => self.max_tokens.is_some(),
+            "temperature" => self.temperature.is_some(),
+            "top-p" => self.top_p.is_some(),
+            "effort" => self.effort.is_some(),
+            "thinking-budget" => self.thinking_budget.is_some(),
+            "thinking-style" => self.thinking_style.is_some(),
+            _ => false,
+        };
+        for field in &self.clear {
+            if !TUNABLE_FIELDS.split(", ").any(|f| f == field) {
+                return Err(format!("--clear {field}: not a tunable; choose from {TUNABLE_FIELDS}"));
+            }
+            if set(field) {
+                return Err(format!("--{field} and --clear {field} together; pass one"));
+            }
+        }
+        if let Some(v) = self.max_tokens { t.max_tokens = Some(v as i64); }
+        if self.temperature.is_some() { t.temperature = self.temperature; }
+        if self.top_p.is_some() { t.top_p = self.top_p; }
+        if self.effort.is_some() { t.effort = self.effort; }
+        if let Some(v) = self.thinking_budget { t.thinking_budget = Some(v as i64); }
+        if self.thinking_style.is_some() { t.thinking_style = self.thinking_style; }
+        for field in &self.clear {
+            match field.as_str() {
+                "max-tokens" => t.max_tokens = None,
+                "temperature" => t.temperature = None,
+                "top-p" => t.top_p = None,
+                "effort" => t.effort = None,
+                "thinking-budget" => t.thinking_budget = None,
+                _ => t.thinking_style = None,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One model row for a person: its window, then each tunable it sets. An
@@ -268,22 +314,8 @@ impl KjDispatcher {
             BackendCommand::Default(BackendDefaultCommand::Set {
                 backend,
                 model,
-                max_tokens,
-                temperature,
-                top_p,
-                effort,
-                thinking_budget,
-                thinking_style,
-            }) => self.backend_default_set(
-                backend,
-                model,
-                max_tokens,
-                temperature,
-                top_p,
-                effort,
-                thinking_budget,
-                thinking_style,
-            ),
+                tunables,
+            }) => self.backend_default_set(backend, model, tunables),
             BackendCommand::Reseed => self.backend_reseed(caller),
         };
 
@@ -519,12 +551,7 @@ impl KjDispatcher {
                 model,
                 context_window,
                 extra,
-                max_tokens,
-                temperature,
-                top_p,
-                effort,
-                thinking_budget,
-                thinking_style,
+                tunables,
             } => {
                 let b = match db.get_backend_by_name(&backend) {
                     Ok(Some(b)) => b,
@@ -555,13 +582,9 @@ impl KjDispatcher {
                 });
                 if let Some(w) = context_window { row.context_window = Some(w as i64); }
                 if extra.is_some() { row.extra = extra; }
-                let t = &mut row.tunables;
-                if let Some(v) = max_tokens { t.max_tokens = Some(v as i64); }
-                if temperature.is_some() { t.temperature = temperature; }
-                if top_p.is_some() { t.top_p = top_p; }
-                if effort.is_some() { t.effort = effort; }
-                if let Some(v) = thinking_budget { t.thinking_budget = Some(v as i64); }
-                if thinking_style.is_some() { t.thinking_style = thinking_style; }
+                if let Err(e) = tunables.apply(&mut row.tunables) {
+                    return KjResult::Err(format!("kj backend model set: {e}"));
+                }
                 match db.set_backend_model(&row) {
                     Ok(()) => KjResult::ok(format!("set {backend}/{model}: {}", model_summary(&row))),
                     Err(e) => KjResult::Err(format!("kj backend model set: {e}")),
@@ -634,12 +657,7 @@ impl KjDispatcher {
         &self,
         backend: Option<String>,
         model: Option<String>,
-        max_tokens: Option<u64>,
-        temperature: Option<f64>,
-        top_p: Option<f64>,
-        effort: Option<String>,
-        thinking_budget: Option<u64>,
-        thinking_style: Option<String>,
+        flags: TunableFlags,
     ) -> KjResult {
         let db = self.kernel_db().lock();
         let current = match db.get_llm_defaults() {
@@ -666,17 +684,26 @@ impl KjDispatcher {
             }
             Err(e) => return KjResult::Err(format!("kj backend default set: {e}")),
         };
+        let mut t = ModelTunablesRow {
+            max_tokens: current.max_tokens,
+            temperature: current.temperature,
+            top_p: current.top_p,
+            effort: current.effort,
+            thinking_budget: current.thinking_budget,
+            thinking_style: current.thinking_style,
+        };
+        if let Err(e) = flags.apply(&mut t) {
+            return KjResult::Err(format!("kj backend default set: {e}"));
+        }
         let next = LlmDefaultsRow {
             default_backend: backend.unwrap_or(current.default_backend),
             default_model: model.unwrap_or(current.default_model),
-            max_tokens: max_tokens.map(|v| v as i64).or(current.max_tokens),
-            temperature: temperature.or(current.temperature),
-            top_p: top_p.or(current.top_p),
-            effort: effort.or(current.effort),
-            thinking_budget: thinking_budget
-                .map(|v| v as i64)
-                .or(current.thinking_budget),
-            thinking_style: thinking_style.or(current.thinking_style),
+            max_tokens: t.max_tokens,
+            temperature: t.temperature,
+            top_p: t.top_p,
+            effort: t.effort,
+            thinking_budget: t.thinking_budget,
+            thinking_style: t.thinking_style,
         };
         match db.set_llm_defaults(&next) {
             Ok(()) => KjResult::ok(format!(
@@ -691,8 +718,7 @@ impl KjDispatcher {
         let mut db = self.kernel_db().lock();
         match crate::seed_backends::reseed_factory_backends(&mut db, caller.principal_id) {
             Ok(n) => KjResult::ok(format!(
-                "restored {n} factory backend(s), their model windows, the factory \
-                 aliases, and the defaults"
+                "restored {n} factory backend(s), their model rows, and the defaults"
             )),
             Err(e) => KjResult::Err(format!("kj backend reseed: {e}")),
         }
@@ -997,6 +1023,43 @@ mod tests {
                 assert_eq!(v["models"][0]["effort"], "high");
             }
             other => panic!("show returns its record: {other:?}"),
+        }
+    }
+
+    /// A set tunable can be cleared back to "take the next level" with
+    /// `--clear`, on a model row and on the defaults; an empty string is
+    /// refused rather than stored and sent to the provider.
+    #[tokio::test]
+    async fn clear_returns_a_tunable_to_the_next_level() {
+        let d = seeded().await;
+        let c = test_caller();
+        let run = |args: &[&str]| argv(args);
+        let ok = |r: &KjResult| assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+        ok(&d.dispatch(&run(&["backend", "default", "set", "--effort", "max", "--max-tokens", "16384"]), &c).await);
+        ok(&d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--context-window", "400000",
+            "--max-tokens", "65536", "--effort", "high"]), &c).await);
+
+        ok(&d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--clear", "max-tokens"]), &c).await);
+        ok(&d.dispatch(&run(&["backend", "default", "set", "--clear", "effort"]), &c).await);
+        let registry = d.kernel().llm().read().await;
+        assert_eq!(registry.default_tunables().effort, None, "the defaults' effort is cleared");
+        let t = registry.model_tunables("gpt", "gpt-5.6-terra");
+        assert_eq!(t.max_tokens, Some(16384), "a cleared model value takes the defaults'");
+        assert_eq!(t.effort.as_deref(), Some("high"), "other fields stay");
+        assert_eq!(registry.context_window_for("gpt", "gpt-5.6-terra"), Some(400_000));
+        drop(registry);
+
+        match d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--clear", "colour"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("colour") && m.contains("effort"), "names the field and the choices: {m}"),
+            other => panic!("an unknown field is refused: {other:?}"),
+        }
+        match d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--effort", ""]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("effort"), "{m}"),
+            other => panic!("an empty effort is refused, not sent: {other:?}"),
+        }
+        match d.dispatch(&run(&["backend", "model", "set", "gpt", "gpt-5.6-terra", "--effort", "low", "--clear", "effort"]), &c).await {
+            KjResult::Err(m) => assert!(m.contains("effort"), "{m}"),
+            other => panic!("setting and clearing one field is refused: {other:?}"),
         }
     }
 

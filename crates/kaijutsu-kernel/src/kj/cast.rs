@@ -11,8 +11,8 @@
 //!
 //! The kernel ships **no factory casts** — an ensemble is an operator/agent
 //! decision, and shipping one would be the kernel guessing at who plays which
-//! seat. Nothing on the turn path selects a cast yet; that wiring is Track B,
-//! which consumes `LlmRegistry::resolved_slot`.
+//! seat. The turn path selects a context's cast seat through
+//! `model_resolution::resolve_context_model`.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{CastId, ContentType};
@@ -404,32 +404,38 @@ impl KjDispatcher {
                 }) {
                     Ok(()) => {
                         let mut msg = format!("set {cast}/{role} → {backend}/{model}");
-                        // Write-time inverted-budget check (gemini review):
-                        // request-build time already refuses an inverted
-                        // thinking_budget/max_tokens pair loudly — that stays
-                        // exactly as-is. This just says so earlier, at write
-                        // time, against the SAME llm_defaults-cascade floor
-                        // (`SlotTunables::over`) the turn path resolves
-                        // through, so the operator doesn't have to wait for
-                        // a live request to fail to learn the slot is
-                        // already broken. Warn, not error — the write lands
-                        // either way (an operator raising max_tokens on
-                        // `llm_defaults` right after can make it valid, and
-                        // refusing the write would make that two-step
-                        // impossible to perform in either order).
+                        // Write-time inverted-budget check: request-build
+                        // time already refuses an inverted
+                        // thinking_budget/max_tokens pair loudly. This says so
+                        // at write time against the same cascade the turn
+                        // resolves (slot, then the model's row, then
+                        // llm_defaults), so the operator need not wait for a
+                        // live request to fail. Warn, not error — the write
+                        // lands either way, since raising max_tokens on the
+                        // model row or the defaults right after can make it
+                        // valid.
                         if let Some(tb) = thinking_budget {
+                            let row_max_tokens = db
+                                .list_backend_models(b.backend_id)
+                                .ok()
+                                .and_then(|rows| rows.into_iter().find(|r| r.model_id == model))
+                                .and_then(|r| r.tunables.max_tokens)
+                                .and_then(|v| u64::try_from(v).ok());
                             let floor_max_tokens = db
                                 .get_llm_defaults()
                                 .ok()
                                 .flatten()
                                 .and_then(|d| d.max_tokens)
                                 .and_then(|v| u64::try_from(v).ok());
-                            let effective_max_tokens =
-                                max_tokens.or(floor_max_tokens).unwrap_or(64_000);
+                            let effective_max_tokens = max_tokens
+                                .or(row_max_tokens)
+                                .or(floor_max_tokens)
+                                .unwrap_or(64_000);
                             if tb >= effective_max_tokens {
                                 msg.push_str(&format!(
                                     " — WARN: thinking_budget ({tb}) >= effective max_tokens \
-                                     ({effective_max_tokens}) after the llm_defaults cascade; \
+                                     ({effective_max_tokens}) after the slot, model, and \
+                                     defaults cascade; \
                                      requests on this slot will fail at build time until one is \
                                      raised or the other lowered"
                                 ));
@@ -659,6 +665,30 @@ mod tests {
             }
             other => panic!("the write must still land: {other:?}"),
         }
+    }
+
+    /// The check walks the same cascade the turn does: a model row's
+    /// `max_tokens` sits between the slot and the floor, so a budget that
+    /// fits the row is not flagged, and one that overflows a small row is.
+    #[tokio::test]
+    async fn slot_set_checks_the_budget_against_the_model_row() {
+        let d = seeded().await;
+        let c = test_caller();
+        d.dispatch(&argv(&["cast", "create", "house"]), &c).await;
+        let slot = |budget: &'static str| argv(&[
+            "cast", "slot", "set", "house", "coder", "--backend", "anthropic", "--model",
+            "claude-opus-5", "--thinking-budget", budget,
+        ]);
+        let r = d.dispatch(&argv(&["backend", "model", "set", "anthropic", "claude-opus-5", "--max-tokens", "65536"]), &c).await;
+        assert!(r.is_ok(), "{}", r.message());
+        let fits = d.dispatch(&slot("20000"), &c).await;
+        assert!(fits.is_ok() && !fits.message().contains("WARN"), "the row's 65536 holds 20000: {}", fits.message());
+
+        let r = d.dispatch(&argv(&["backend", "model", "set", "anthropic", "claude-opus-5", "--max-tokens", "8192"]), &c).await;
+        assert!(r.is_ok(), "{}", r.message());
+        let overflows = d.dispatch(&slot("12000"), &c).await;
+        assert!(overflows.message().contains("WARN") && overflows.message().contains("8192"),
+            "the row's 8192 cannot hold 12000: {}", overflows.message());
     }
 
     /// Same check, but against an explicit per-slot `--max-tokens` override

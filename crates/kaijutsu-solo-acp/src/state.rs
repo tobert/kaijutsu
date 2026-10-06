@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{bail, Context, Result};
 use russh::keys::{PrivateKey, ssh_key};
 
-use kaijutsu_kernel::kernel_db::{BackendRow, CharacterRow, KernelDb};
+use kaijutsu_kernel::kernel_db::{BackendModelRow, BackendRow, CharacterRow, KernelDb};
 use kaijutsu_kernel::seed_backends;
 use kaijutsu_server::AuthDb;
 use kaijutsu_types::{BackendId, PrincipalId};
@@ -224,10 +224,11 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
 ///   other kernel ships.
 /// - `choice.idle_timeout_secs` and `request_timeout_secs`, when given, land
 ///   on the backend row, written or factory.
-/// - `max_tokens`, when given, overrides the factory output-token ceiling
-///   (`kaijutsu_kernel::seed_backends::FACTORY_MAX_TOKENS`) in the written
-///   defaults row. Left `None`, the factory ceiling from
-///   `ensure_factory_backends` stands.
+/// - `max_tokens`, when given, is the output budget of every turn: it lands
+///   on the chosen model's own `backend_models` row, which outranks the
+///   defaults, keeping the row's window and other tunables. Left `None`, the
+///   model's factory budget stands (DeepSeek's rows carry 65536), or the
+///   defaults' 16384 for a model with no budget of its own.
 pub fn prepare_rows(
     state: &SoloState,
     root_character: &str,
@@ -294,11 +295,30 @@ pub fn prepare_rows(
         .context("the factory floor wrote no model defaults")?;
     defaults.default_backend = choice.backend.clone();
     defaults.default_model = choice.model.clone();
-    if let Some(max_tokens) = max_tokens {
-        defaults.max_tokens = Some(max_tokens);
-    }
     db.set_llm_defaults(&defaults)
         .context("point the model defaults at the chosen provider")?;
+
+    if let Some(max_tokens) = max_tokens {
+        let backend = db
+            .get_backend_by_name(&choice.backend)
+            .with_context(|| format!("read the {} backend row", choice.backend))?
+            .with_context(|| format!("no {} backend row to set a budget on", choice.backend))?;
+        let mut row = db
+            .list_backend_models(backend.backend_id)
+            .with_context(|| format!("read the {} model rows", choice.backend))?
+            .into_iter()
+            .find(|r| r.model_id == choice.model)
+            .unwrap_or_else(|| BackendModelRow {
+                backend_id: backend.backend_id,
+                model_id: choice.model.clone(),
+                context_window: None,
+                extra: None,
+                tunables: Default::default(),
+            });
+        row.tunables.max_tokens = Some(max_tokens);
+        db.set_backend_model(&row)
+            .with_context(|| format!("set the output budget of {}/{}", choice.backend, choice.model))?;
+    }
 
     if db
         .get_character_by_name(performer)
@@ -534,36 +554,40 @@ mod tests {
         (parent, state)
     }
 
+    /// The chosen model's row, as the turn path reads it.
+    fn chosen_row(state: &SoloState) -> kaijutsu_kernel::kernel_db::BackendModelRow {
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let choice = factory_choice();
+        let backend = db.get_backend_by_name(&choice.backend).unwrap().expect("the backend row");
+        db.list_backend_models(backend.backend_id).unwrap().into_iter()
+            .find(|r| r.model_id == choice.model).expect("the chosen model's row")
+    }
+
+    /// `--max-tokens` limits every turn, so it lands on the chosen model's own
+    /// row, which outranks the defaults; the row keeps its window and its
+    /// other tunables.
     #[test]
-    fn a_max_tokens_override_lands_in_the_defaults_row() {
+    fn a_max_tokens_override_lands_on_the_chosen_models_row() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
         prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), Some(4096))
             .expect("prepare rows with an override");
 
-        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
-        let defaults = db
-            .get_llm_defaults()
-            .expect("read the model defaults")
-            .expect("prepare_rows wrote a defaults row");
-        assert_eq!(defaults.max_tokens, Some(4096));
+        let row = chosen_row(&state);
+        assert_eq!(row.tunables.max_tokens, Some(4096));
+        assert_eq!(row.tunables.effort.as_deref(), Some("high"), "the factory effort stays");
+        assert_eq!(row.context_window, Some(1_000_000), "the window stays");
     }
 
     #[test]
-    fn without_an_override_the_factory_ceiling_stands() {
+    fn without_an_override_the_models_factory_budget_stands() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
         prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), None)
             .expect("prepare rows with no override");
-
-        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
-        let defaults = db
-            .get_llm_defaults()
-            .expect("read the model defaults")
-            .expect("prepare_rows wrote a defaults row");
-        // `seed_backends::FACTORY_MAX_TOKENS` is private to that module; this
-        // is docs/solo-acp.md's documented default, kept in sync by hand.
-        assert_eq!(defaults.max_tokens, Some(16384));
+        // DeepSeek's factory rows carry 65536 at effort high
+        // (`seed_backends::DEEPSEEK_TUNING`), documented in docs/solo-acp.md.
+        assert_eq!(chosen_row(&state).tunables.max_tokens, Some(65536));
     }
 
     #[test]

@@ -1277,8 +1277,8 @@ impl LlmRegistry {
     /// to 64000 when unset.
     ///
     /// Set generously — the API enforces per-model ceilings. This is the
-    /// global floor; a cast slot's own `max_tokens` overrides it, which Track
-    /// B consumes via [`Self::resolved_slot`].
+    /// floor; a model row's or a cast slot's own `max_tokens` overrides it
+    /// (see [`Self::model_tunables`]).
     pub fn max_output_tokens(&self) -> u64 {
         self.default_tunables.max_tokens.unwrap_or(64000)
     }
@@ -1328,12 +1328,9 @@ impl LlmRegistry {
             .collect();
     }
 
-    /// One cast's seat for a role, with the `llm_defaults` cascade already
-    /// applied. Cast labels are case-insensitive (matching the UNIQUE
-    /// collation); roles are exact.
-    ///
-    /// Nothing on the turn path reads this yet — **Track B** wires cast
-    /// selection into context creation and the request builder.
+    /// One cast's seat for a role, with its model row and the `llm_defaults`
+    /// floor already applied. Cast labels are case-insensitive (matching the
+    /// UNIQUE collation); roles are exact.
     pub fn resolved_slot(&self, cast: &str, role: &str) -> Option<&ResolvedSlot> {
         self.cast_slots.get(&(cast.to_lowercase(), role.to_string()))
     }
