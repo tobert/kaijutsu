@@ -80,7 +80,7 @@ enum BlockCommand {
         #[arg(long, value_name = "N")]
         tail: Option<usize>,
     },
-    /// Inspect a single block's metadata.
+    /// Inspect a single block's metadata, including whether it is excluded.
     Inspect {
         /// Block id: context_hex_principal_hex_seq (or legacy : form)
         block_id: String,
@@ -644,6 +644,8 @@ impl KjDispatcher {
             "status": snap.status.as_str(),
             "parent_id": snap.parent_id.map(|id| id.to_key()),
             "content_length": snap.content.len(),
+            "excluded": snap.excluded,
+            "ephemeral": snap.ephemeral,
             "tool_name": snap.tool_name,
             "tool_call_id": snap.tool_call_id.map(|id| id.to_key()),
             "is_error": snap.is_error,
@@ -658,7 +660,7 @@ impl KjDispatcher {
             .map(|i| i.to_key())
             .unwrap_or_else(|| "-".into());
         let mut out = format!(
-            "id:        {}\nctx:       {}\nctx_count: {}\nrole:      {}\nkind:      {}\nstatus:    {}\nparent:    {}\ncontent:   {} chars\n",
+            "id:        {}\nctx:       {}\nctx_count: {}\nrole:      {}\nkind:      {}\nstatus:    {}\nparent:    {}\ncontent:   {} chars\nexcluded:  {}\n",
             id_str,
             ctx_id.to_hex(),
             block_count,
@@ -667,7 +669,11 @@ impl KjDispatcher {
             snap.status.as_str(),
             parent,
             snap.content.len(),
+            snap.excluded,
         );
+        if snap.ephemeral {
+            out.push_str("ephemeral: true\n");
+        }
         if let Some(tool_name) = &snap.tool_name {
             out.push_str(&format!("tool:      {tool_name}\n"));
         }
@@ -2592,6 +2598,35 @@ mod tests {
             "got: {}",
             result.message()
         );
+    }
+
+    /// Whether a block is excluded decides what a fork, a turn, and a council
+    /// read; inspect states it either way, and names ephemeral blocks.
+    #[tokio::test]
+    async fn block_inspect_states_whether_the_block_is_excluded() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context_with_doc(&d, Some("c"), principal);
+        let c = caller_with_context(ctx);
+        let id = d.blocks
+            .insert_tool_call(ctx, None, None, "kj cas ls", serde_json::json!({}), None)
+            .expect("insert_tool_call");
+        let short = super::short_key(&id);
+        let data = |r: &crate::kj::KjResult| match r {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => v.clone(),
+            other => panic!("inspect returns its record: {}", other.message()),
+        };
+
+        let shown = d.dispatch(&[s("block"), s("inspect"), s(&short)], &c).await;
+        assert!(shown.message().contains("excluded:  false\n"), "got: {}", shown.message());
+        assert!(!shown.message().contains("ephemeral:"), "got: {}", shown.message());
+        assert_eq!(data(&shown)["excluded"], false);
+
+        d.blocks.set_excluded(ctx, &id, true).unwrap();
+        let excluded = d.dispatch(&[s("block"), s("inspect"), s(&short)], &c).await;
+        assert!(excluded.message().contains("excluded:  true\n"), "got: {}", excluded.message());
+        assert_eq!(data(&excluded)["excluded"], true);
+        assert_eq!(data(&excluded)["ephemeral"], false);
     }
 
     /// `tool_call_id`/`exit_code`/`is_error`/`summary` used to ride only the
