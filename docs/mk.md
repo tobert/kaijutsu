@@ -82,17 +82,10 @@ Observed in the megakernel source (`service/generate.py`, `gpu.py`, `http.py`,
 Not in the service, and so not assumed: stop sequences, grammar-constrained
 decoding, logit bias, tool-call ids, and a `tool_call_id` on tool messages.
 
-Unknown, to measure before relying on it:
-
-- How often a Qwen3.8 tool call fails to parse in a real agent loop.
-- Whether resending the full `messages` each turn keeps the held prefix, or
-  re-prefills from the first turn that the template re-renders differently
-  (the template trims earlier turns' reasoning).
-- How many of the 32768 tokens the seat's system prompt and tool schemas
-  take before the first user word.
-- Whether a resent call with several arguments keeps the held prefix. The
-  kernel keeps argument member order (`serde_json` with `preserve_order`,
-  declared by `kaijutsu-kernel`), so the call should re-render as written.
+Measured on zorak on 2026-10-06 (see "Probe results"): resending the whole
+history keeps the held prefix, and small tool calls parse reliably.
+Still unknown: how many of the window's tokens the seat's system prompt and
+tool schemas take before the first user word.
 
 ## Crate: `kaijutsu-mk`
 
@@ -174,9 +167,9 @@ Rules:
   history whose result count differs from its call count.
 - The adapter sends `reasoning_content` back and lets the template decide
   what to keep. It does not trim history itself.
-- The first version resends `messages` every turn. Using `done.context` with
-  `POST /mk/v1/contexts` is an optimization to add only after we measure that
-  resending re-prefills.
+- The provider resends `messages` every turn. The probes showed that this
+  keeps the held prefix, so `done.context` and `POST /mk/v1/contexts` are
+  not used.
 
 ### Calls that did not parse
 
@@ -353,20 +346,45 @@ Kernel tests deny host subprocess execution; none of these needs it.
    413) is `InvalidRequest`, timeouts and connection failures are
    `NetworkError`, and the rest are `ApiError`; mid-stream failures are
    error events.
-4. Run the live probes. Decide the resend-versus-context question and the
-   tool-call reliability question from the numbers.
+4. Done: the live probes (`llm/mk/probes.rs`, ignored by default). Resend
+   stays; tool calls are reliable enough for a seat. See "Probe results".
 5. Add the cast, rc, and seat, and decide liveness.
+
+## Probe results
+
+Run on zorak on 2026-10-06 under the heavy lock, megakernel build ef88dcf,
+temperature 0, five tools (`ls`, `read_file`, `write_file`, `grep`, `run`)
+and canned results. Commands are in `llm/mk/probes.rs`.
+
+- Thinking on (effort `low`), a tool call then its result: the second
+  inference kept 663 tokens, exactly the first inference's prompt (608) plus
+  its reply (55). Signed reasoning replays as the template rendered it.
+- A call with two arguments (`write_file` with `path` and `content`): the
+  next inference kept 643 = 595 + 48. Argument order survives replay.
+- Ten inferences of one task, thinking off: inside a tool loop, every
+  inference kept the whole previous prompt and reply, feeding 33 to 61 new
+  tokens. After a plain answer and a new user message, the next inference
+  kept 959 of 1221 and fed 281: the template drops earlier turns' empty
+  thinking once a new user turn starts, so the last reply is fed again. Ten
+  inferences sent 10128 prompt tokens and fed 1227.
+- Twenty small tool tasks, thinking off, including quotes, `<`, `>`, `&`,
+  JSON content, and a shebang: 21 parsed calls, 0 unparsed, 0 tasks with no
+  call.
+- Decode ran at 16 to 18 tokens per second. Prefill time varied widely (191
+  to 2666 ms for under 62 fed tokens; 1.2 to 3.5 s for a 580-token first
+  turn), which is queueing behind other GPU work, not prefill cost.
 
 ## Open questions
 
 - Should the provider keep `done.context` ids in the conversation, so a
-  restart or a fork reuses a held prefix? Held contexts survive a service
-  restart, but only for the same weights and engine identity.
+  restart or a fork reuses a held prefix? The probes make this unnecessary
+  for an ordinary turn; it may matter after a service restart, when held
+  contexts survive only for the same weights and engine identity.
 - How does the seat's window interact with `kj fork` filters when 32768 tokens
   is the whole budget?
 - Does a Qwen `tool` role with several results at once match what the
-  kernel's grouped `ToolResult` blocks mean? The service renders them as the
-  template defines; a live probe should confirm the call order.
+  kernel's grouped `ToolResult` blocks mean? The probes made one call per
+  inference except once; a probe with several calls should confirm the order.
 - Which liveness signal does the in-flight strip get during the `tool` phase?
 
 Related: `docs/council.md`, `docs/council-api.md`, `docs/prompts.md`,

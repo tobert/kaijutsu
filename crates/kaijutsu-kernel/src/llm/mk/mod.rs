@@ -9,6 +9,8 @@
 //! to this backend and are ignored.
 
 mod build;
+#[cfg(test)]
+mod probes;
 mod reply;
 
 use std::collections::HashMap;
