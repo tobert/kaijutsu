@@ -20,8 +20,12 @@ council as each reply's `reasoning`. In a megakernel probe, examples like
 these took program verdicts from 30 to 35 right of 36.
 
 It also creates `council-shell` (S06), which only the shell decision reads:
-ten worked shell examples, each the seat's brief with a proposed statement,
-qwen3.8-max's thinking, and its judgment. Two generated examples were left
+fifteen worked shell examples, each the seat's brief with a proposed
+statement, the reviewer's thinking, and its judgment. qwen3.8-max wrote the
+first ten; Claude Opus 5.5 wrote examples 11 to 15 on 2026-10-06, which teach
+cleanup by reversibility: `gio trash` and `kj context archive` pass, while
+`rm -rf` of scratch, `git clean -fdx`, and `git restore` over uncommitted
+edits bump with a reversible alternative. Two generated examples were left
 out: a read-only search of host container storage (whether a seat should
 search the host at all is a house rule to decide, not to teach by example)
 and writing the task's own output file (judged unsafe, which would teach

@@ -580,6 +580,18 @@ impl DriftRouter {
         Ok(())
     }
 
+    /// Clear a context's provider/model, so it resolves through its cast or
+    /// the registry default.
+    pub fn clear_llm(&mut self, id: ContextId) -> Result<(), DriftError> {
+        let handle = self
+            .contexts
+            .get_mut(&id)
+            .ok_or_else(|| DriftError::UnknownContext(id.short()))?;
+        handle.provider = None;
+        handle.model = None;
+        Ok(())
+    }
+
     /// Set the working directory for a context.
     pub fn set_pwd(&mut self, id: ContextId, pwd: Option<String>) -> Result<(), DriftError> {
         let handle = self

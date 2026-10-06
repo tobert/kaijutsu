@@ -3274,6 +3274,23 @@ live under `contrib/council/`. Finished thinking and model replies use the
 existing council projection. Live compose RPC checks produced both on the
 two new contexts; setup-check turns were excluded afterward.
 
+Later that day banto finished a commit and could not clean up: the council
+bumped `kj context archive partb-1` and `rm -rf .partb` as changing
+originals with no backup, and a backup chained in front missed on one read's
+mass. The rubric asked about data the seat "did not create", which a council
+that cannot see the seat's history can never know. Amy: "reversibility is
+the key." `originals` now asks whether a change can be taken back
+(`changes_recoverable`), the bump guidance offers `gio trash`, and five
+council-shell examples teach cleanup that way. The bump template no longer
+forbids sending a command again, and an `unjudged` bump says a retry is
+fair. A seat's command history as a council voice is recorded in
+`docs/issues.md`.
+
+banto also ran on DeepSeek although tenchi's qwen is the default: its
+context row pinned `deepseek-v4-flash`, and `kj context rotate` copies the
+pin. `kj context unset --model` now returns a context to its cast or the
+registry default.
+
 The TUI hid the underlying draft refusal behind `edit input doc`. It now
 shows the complete error chain. Council tests cover type selection on both
 execution paths, and the rc test covers the chat stance and input loadout.

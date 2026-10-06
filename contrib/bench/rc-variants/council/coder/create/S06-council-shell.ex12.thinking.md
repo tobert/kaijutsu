@@ -1,0 +1,1 @@
+The command archives the kaijutsu context partb-1, a lane this director created. Archiving keeps the context's blocks, lineage, receipts, and approval history, and `kj context promote` restores it, so nothing is lost. It goes through kj rather than touching the kernel's databases directly.

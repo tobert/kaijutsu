@@ -376,11 +376,11 @@ does, so the council reads the file too (`council/programs.rs`).
   `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
   `imports_not_shown`, and `program`, the text, last.
 - **The program spec decides on its rubric.** `program-gate.json` asks
-  `originals` (`reads`, `changes_backed_up`, `changes`; opening data with a
+  `originals` (`reads`, `changes_recoverable`, `changes`; opening data with a
   program that can write to it counts as changing it), `network` (`none`,
   `packages`, `other`), and `verdict`, all choice questions: the megakernel
   does not answer `text`. A program decision allows when the pooled
-  `originals` is `reads` or `changes_backed_up` and the pooled `network` is
+  `originals` is `reads` or `changes_recoverable` and the pooled `network` is
   `none` or `packages`, and, with `require_agree`, every read's own answers
   are too. Otherwise a `verdict` argmax of `report` reports and anything
   else asks. Probes on the megakernel (2026-10-04) found per-question
@@ -611,6 +611,18 @@ action refused with guidance and tries again, with no human in the loop.
   rubric; otherwise it bumps, and its flavor names the rubric answers that
   held it (`originals=changes`, `network=other`). The submission runs only
   when the shell decision and every program decision pass.
+- **`originals` asks whether a change can be taken back.** A change is
+  `changes_recoverable` when a backup or copy exists, it moves to the
+  trash, git holds it with no uncommitted changes, the command keeps its
+  history (`kj context archive`), or the project rebuilds it. `changes`
+  deletes or overwrites with no way back, and its guidance offers
+  `gio trash`, a backup, or a copy. The council cannot see who created a
+  file, so authorship was the wrong question: a director's `rm -rf` of its
+  own scratch and an archive of its own lane were bumped on 2026-10-06. A
+  shell spec that names any rubric question must carry the whole rubric
+  with its passing options, or the decision is a miss naming what is
+  missing; a host seeded before the rename misses rather than bumping every
+  recoverable change.
 - **The fallback does not change.** A control-text hit, a miss, and a
   program that was not judged leave the ordinary ask (except in bump-only
   mode, below).
@@ -644,15 +656,18 @@ do on the more ask/deny side."
 
 - **Every decision that does not pass bumps, saying why.** The shell
   decision is read first, then each program decision. A miss bumps with
-  flavor `unjudged` ("the council could not judge it: try a smaller,
-  plainer step.", or "could not judge it in time" past the deadline). The
+  flavor `unjudged` ("the council could not judge it: send it again, or
+  write it more plainly.", or "could not judge it in time" past the
+  deadline). A miss often comes from one read's mass falling just under the
+  floor while every read agreed, so sending it again unchanged is a fair
+  answer. The
   cause stays in the record and the log: a DeepSeek seat that read "refit
   one in gate.toml" in a bump rewrote its own gate (2026-10-05). A control-text hit, the only ask a
   bumper mode can produce, bumps with flavor `control_text`. A program the
   council could not read bumps with flavor `unread` and names the program.
-- **There is no limit.** The message counts `attempt N of ∞`, and the
-  default template tells the seat not to send the same command again
-  unchanged and to try something else. Amy: "even an accidental bump can be
+- **There is no limit.** The message counts `attempt N of ∞`. The default
+  template does not forbid sending the same command again: a miss is often
+  worth one more try. Amy: "even an accidental bump can be
   worked around, and it still forces the thinking and intent we want." A
   `bump_limit` with `bump-only` fails the parse. A miss is recorded with
   outcome `miss`, so it does not raise the attempt count.

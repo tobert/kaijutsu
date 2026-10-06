@@ -166,7 +166,8 @@ enum ContextCommand {
         #[command(flatten)]
         config: ContextConfigArgs,
     },
-    /// Remove an env var from a context, or clear its assigned cast.
+    /// Remove an env var from a context, or clear its assigned cast or
+    /// model.
     Unset {
         /// Context to update. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -178,6 +179,11 @@ enum ContextCommand {
         /// default at resolution time)
         #[arg(long)]
         cast: bool,
+        /// Clear the context's own model, set by `create -m` or `set -m`
+        /// and copied by `rotate`. The context then resolves its model
+        /// through its cast or the registry default; `kj model` shows which
+        #[arg(long)]
+        model: bool,
     },
     /// Show fork lineage from a context up to root (default: current).
     Log {
@@ -723,8 +729,8 @@ impl KjDispatcher {
             ContextCommand::Set { context, character, reviewer, clear_reviewer, director, egress_allow, egress_deny, config } => {
                 self.context_set(context.as_deref(), character.as_deref(), reviewer.as_deref(), clear_reviewer, director.as_deref(), &egress_allow, &egress_deny, config.into(), caller).await
             }
-            ContextCommand::Unset { context, env, cast } => {
-                self.context_unset(context.as_deref(), env.as_deref(), cast, caller)
+            ContextCommand::Unset { context, env, cast, model } => {
+                self.context_unset(context.as_deref(), env.as_deref(), cast, model, caller)
             }
             ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
             ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
@@ -2102,6 +2108,7 @@ impl KjDispatcher {
         target_arg: Option<&str>,
         env_key: Option<&str>,
         clear_cast: bool,
+        clear_model: bool,
         caller: &KjCaller,
     ) -> KjResult {
         let db = self.kernel_db().lock();
@@ -2121,8 +2128,27 @@ impl KjDispatcher {
                 Ok(()) => KjResult::ok("cleared cast".to_string()),
                 Err(e) => KjResult::Err(format!("kj context unset: {e}")),
             }
+        } else if clear_model {
+            let had = match db.get_context(target_id) {
+                Ok(Some(row)) => row.provider.is_some() || row.model.is_some(),
+                Ok(None) => return KjResult::Err(format!("kj context unset: context {} not found", target_id.short())),
+                Err(e) => return KjResult::Err(format!("kj context unset: {e}")),
+            };
+            if let Err(e) = db.update_model(target_id, None, None) {
+                return KjResult::Err(format!("kj context unset: {e}"));
+            }
+            drop(db);
+            // The turn path reads the live handle, so it must agree with the row.
+            if let Err(e) = self.drift_router().write().clear_llm(target_id) {
+                return KjResult::Err(format!("kj context unset: {e}"));
+            }
+            if had {
+                KjResult::ok("cleared model; `kj model` shows what it resolves to now".to_string())
+            } else {
+                KjResult::ok("no model was set".to_string())
+            }
         } else {
-            KjResult::Err("kj context unset: requires --env KEY or --cast".to_string())
+            KjResult::Err("kj context unset: requires --env KEY, --cast, or --model".to_string())
         }
     }
 
@@ -4393,6 +4419,44 @@ mod tests {
         let handle = router.get(ctx).unwrap();
         assert_eq!(handle.provider.as_deref(), Some("mock"));
         assert_eq!(handle.model.as_deref(), Some("test-model"));
+    }
+
+    /// `unset --model` clears a pinned model from the row and the live
+    /// handle, so the context resolves through its cast or the registry
+    /// default again. Rotation copies a pin, so one set long ago outlives a
+    /// change of default without this.
+    ///
+    /// Falsified by an unset that clears only the row: the turn path reads
+    /// the handle and keeps the pin.
+    #[tokio::test]
+    async fn context_unset_model_returns_to_the_default() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let ctx = register_context(&d, Some("pinned"), None, principal);
+        {
+            use crate::llm::{MockClient, Provider};
+            use std::sync::Arc;
+            let mock = Arc::new(Provider::Mock(MockClient::new("mock")));
+            d.kernel().llm().write().await.register("mock", mock);
+        }
+        let c = caller_with_context(ctx);
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--model"), s("mock/pinned-model")], &c).await;
+        assert!(set.is_ok(), "set failed: {}", set.message());
+
+        let result = d.dispatch(&[s("context"), s("unset"), s("."), s("--model")], &c).await;
+        assert!(result.is_ok(), "unset failed: {}", result.message());
+        assert!(result.message().contains("cleared model"), "msg: {}", result.message());
+        {
+            let router = d.drift_router().read();
+            let handle = router.get(ctx).unwrap();
+            assert_eq!((handle.provider.as_deref(), handle.model.as_deref()), (None, None));
+        }
+        let row = d.kernel_db().lock().get_context(ctx).unwrap().unwrap();
+        assert_eq!((row.provider.as_deref(), row.model.as_deref()), (None, None));
+
+        let again = d.dispatch(&[s("context"), s("unset"), s("."), s("--model")], &c).await;
+        assert!(again.is_ok(), "a second unset is a no-op: {}", again.message());
+        assert!(again.message().contains("no model was set"), "msg: {}", again.message());
     }
 
     /// `--env` validates its key at write time, after `--model` has already

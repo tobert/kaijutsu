@@ -1,0 +1,1 @@
+The command moves the scratch directory /src/app/.partb to the trash instead of deleting it. The brief names it as a working copy made for this task, and the trash keeps it, so `gio trash --restore` or the file manager can bring it back. Nothing outside the workspace changes and nothing uses the network.

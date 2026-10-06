@@ -300,6 +300,43 @@ bump record and limit, and the message template. Still open:
 - **Per-spec council contexts** are on main under `[[council.spec]]`; bumper
   mode touches only the `[council]` table.
 
+## Council: a shadow voice holding the seat's command history (2026-10-06)
+
+The council judges each command alone. It cannot tell that `.partb` is
+scratch the seat made an hour ago, so a cleanup of the seat's own work looks
+like destroying an original. Amy, 2026-10-06: "we may need to carefully wire
+a council that accumulates command history so it can be contextual, that was
+the idea for the shadow context on say a coder, each command, not the
+model's full output, would go into the council member. maybe tool calls
+too. not the results. so it's small and makes up the workstream of things
+the model under observation has tried."
+
+- **What it holds.** Each submitted command, and maybe each tool call, of
+  the observed seat, in order. No results, no narration, no thinking. House
+  rules dropped the seat's narration because it changed every few decisions
+  and forced re-sends (29 in 18 minutes); an append-only command list only
+  extends, so a held snapshot stays useful.
+- **Open.** Whether it votes or only observes; whether bumped and denied
+  commands go in, marked as such; how it is keyed (seat context, fork
+  tree); its snapshot cadence against `snapshot_bytes`; and how much
+  history it keeps before compaction.
+
+## Council bump-only has no way to hand an action to Amy (2026-10-06)
+
+In bump-only mode every decision that does not pass bumps, so a command the
+rules say "needs Amy" can only be bumped again. On 2026-10-06 banto stopped
+after four bumps and reported, which was the right move, but the system
+offered it no ask. Whether bump-only should open an ask for a `report`
+verdict, or after N bumps of one goal, is open.
+
+## Council mass floor misses a decision every read agreed on (2026-10-06)
+
+`kj db backup … && kj context archive partb-1 --confirm` missed on moltar:
+every read answered `originals=changes_backed_up`, and one read's verdict
+mass was −2.58 against the director's floor of −2.5. The floor exists to
+catch reads that answer off the menu; whether it should apply to the
+verdict when the rubric decides, or sit lower for the director, is open.
+
 ## What the first live council decisions on zorak showed (2026-10-04)
 
 A coder seat on tenchi's qwen3.8-27b (`council-smoke`) ran `ls -la`,

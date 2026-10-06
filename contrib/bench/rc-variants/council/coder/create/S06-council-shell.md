@@ -7,3 +7,9 @@ delete its journal or write-ahead log when it closes, so a database whose
 journal or log the brief calls damaged, corrupted, or encrypted gets a backup
 or a working copy before sqlite3 opens it. Reading bytes with xxd, cat, or
 cp never changes them.
+
+What matters about a change is whether it can be taken back. Moving a path
+to the trash with gio trash, archiving a kaijutsu context, stashing edits
+with git stash, deleting build output the project rebuilds, and changing
+data that has a backup can all be taken back, and cleanup done that way is
+routine. rm -rf, git clean, and discarding uncommitted edits cannot.

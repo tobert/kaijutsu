@@ -358,7 +358,7 @@ pub(crate) struct Classification {
 /// question's allowing choices (`docs/council.md`, "Programs are cases of
 /// their own").
 pub(crate) const RUBRIC: [(&str, &[&str]); 2] =
-    [("originals", &["reads", "changes_backed_up"]), ("network", &["none", "packages"])];
+    [("originals", &["reads", "changes_recoverable"]), ("network", &["none", "packages"])];
 
 fn pooled_verdict(response: &DecisionResponse) -> Option<PooledVerdict> {
     match response.answers.get(VERDICT)? {
@@ -830,9 +830,9 @@ impl CouncilVerdict {
                 Outcome::Miss(cause) => Some(BumpReason {
                     flavor: "unjudged".into(),
                     guidance: if cause.contains("deadline") {
-                        "the council could not judge it in time: try a smaller, plainer step.".into()
+                        "the council could not judge it in time: send it again, or write it more plainly.".into()
                     } else {
-                        "the council could not judge it: try a smaller, plainer step.".into()
+                        "the council could not judge it: send it again, or write it more plainly.".into()
                     },
                 }),
                 Outcome::Ask | Outcome::Report => Some(BumpReason {
@@ -1430,9 +1430,12 @@ async fn decide_inner(
     span.record("council.model", prepared.identity.model.as_str());
     span.record("council.spec_id", prepared.spec_id.as_str());
     let pass = pass_option(spec.case, council.mode);
+    // A shell spec that names any rubric question decides by the rubric, so
+    // it must carry all of it.
+    let declares_rubric = prepared.spec.questions.iter().any(|q| RUBRIC.iter().any(|(id, _)| q.id() == *id));
     if let Some(cause) = spec_lacks_pass(&prepared.spec, pass).or_else(|| match spec.case {
-        CouncilCase::Shell => None,
-        CouncilCase::Program => spec_lacks_rubric(&prepared.spec),
+        CouncilCase::Shell if !declares_rubric => None,
+        CouncilCase::Shell | CouncilCase::Program => spec_lacks_rubric(&prepared.spec),
     }) {
         return build_verdict(caller, &case, council, spec, Seen::Prepared(&prepared), missed(cause), started.elapsed(), carried);
     }
@@ -1572,7 +1575,7 @@ fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> Strin
     flavor
         .split(", ")
         .map(|held| match held {
-            "originals=changes" => "it changes original data with no backup: back it up or work on a copy first.".to_string(),
+            "originals=changes" => "it deletes or changes data with no way back: move it to the trash with `gio trash`, back it up, or work on a copy.".to_string(),
             "network=other" => "it reaches the network beyond installing packages: stay local.".to_string(),
             "reads_disagree" => "the council's reads disagree about whether it is safe.".to_string(),
             other => format!("the council did not accept {other}."),
@@ -1583,7 +1586,7 @@ fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> Strin
 
 /// Why a program spec cannot decide, when it cannot: the gate decides a
 /// program from the [`RUBRIC`] choices.
-fn spec_lacks_rubric(spec: &kaijutsu_mk::council::wire::Spec) -> Option<String> {
+pub(crate) fn spec_lacks_rubric(spec: &kaijutsu_mk::council::wire::Spec) -> Option<String> {
     use kaijutsu_mk::council::wire::SpecQuestion;
     RUBRIC.iter().find_map(|(id, ok)| match spec.questions.iter().find(|q| q.id() == *id) {
         Some(SpecQuestion::Choice(c)) if ok.iter().all(|o| c.criteria.iter().any(|k| k.option == *o)) => None,
@@ -1776,7 +1779,7 @@ pub(crate) mod test_support {
     }
 
     /// The program rubric's options, in the spec's order.
-    pub(crate) const ORIGINALS: [&str; 3] = ["reads", "changes_backed_up", "changes"];
+    pub(crate) const ORIGINALS: [&str; 3] = ["reads", "changes_recoverable", "changes"];
     pub(crate) const NETWORK: [&str; 3] = ["none", "packages", "other"];
 
     /// A program decision's answer: every read puts the given log
@@ -2259,7 +2262,8 @@ mod tests {
             );
             classify_case(&req, &decode(value), &council, "shell-gate", CouncilCase::Shell).outcome
         };
-        assert_eq!(lean(2, 0, 0), Outcome::Bump("originals=changes".into()), "changes with no backup bumps a proceed");
+        assert_eq!(lean(2, 0, 0), Outcome::Bump("originals=changes".into()), "a change with no way back bumps a proceed");
+        assert_eq!(lean(1, 0, 0), Outcome::Allow, "a recoverable change passes");
         assert_eq!(lean(0, 0, 1), Outcome::Allow, "reads and no network pass a try_harder");
         assert_eq!(lean(0, 2, 0), Outcome::Bump("network=other".into()));
     }

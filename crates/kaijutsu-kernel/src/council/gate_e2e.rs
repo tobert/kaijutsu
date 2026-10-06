@@ -2320,7 +2320,7 @@ async fn a_miss_bumps_in_bump_only_mode() {
     for via in BOTH {
         let rig = rig(via, Setup { server: Some(dead_server()), ..bump_only() }).await;
         let text = refusal_text(via, rig.submit("touch /work/a").await);
-        assert!(text.contains("the council could not judge it: try a smaller, plainer step."), "{via:?}: {text}");
+        assert!(text.contains("the council could not judge it: send it again, or write it more plainly."), "{via:?}: {text}");
         assert!(text.contains("attempt 1 of ∞"), "{via:?}: {text}");
         // The miss's cause names the gate's own machinery; a DeepSeek seat
         // that read "refit one in gate.toml" in a bump rewrote its gate.
@@ -2348,8 +2348,8 @@ async fn a_control_text_hit_bumps_in_bump_only_mode() {
 }
 
 /// In bump-only mode there is no limit: the fifth bump of one submission is
-/// still a bump, counted against infinity, and the message says to try
-/// something else.
+/// still a bump, counted against infinity, and the message does not forbid
+/// sending it again: a miss is often worth one more try unchanged.
 ///
 /// Falsified by a limit: the fourth send opens an ask.
 #[tokio::test]
@@ -2362,7 +2362,7 @@ async fn bump_only_mode_has_no_limit() {
             last = refusal_text(via, rig.submit("echo again").await);
         }
         assert!(last.contains("attempt 5 of ∞"), "{via:?}: {last}");
-        assert!(last.contains("try something else"), "{via:?}: {last}");
+        assert!(!last.contains("unchanged"), "{via:?}: {last}");
         assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
         rig.finish().await;
     }
@@ -2384,6 +2384,29 @@ async fn a_bumper_spec_without_proceed_is_refused_as_a_miss() {
     }
 }
 
+/// A shell spec that names one rubric question must carry the whole rubric
+/// with its passing options; a spec seeded before `changes_backed_up`
+/// became `changes_recoverable` is a miss that names the missing option,
+/// not a bump on every change.
+///
+/// Falsified by a shell case that skips the rubric check: the stale spec
+/// decides, and a recoverable change bumps as `originals=changes_backed_up`.
+#[tokio::test]
+async fn a_shell_spec_with_a_stale_rubric_is_a_miss() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        let stale = crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP.replace("changes_recoverable", "changes_backed_up");
+        assert_ne!(stale, crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP, "the seed names changes_recoverable");
+        rig.write("/config/kernel/council/shell-bump.json", &stale).await;
+        assert_pending(via, rig.submit("touch /work/a").await);
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
+        let cause = decision.decision.miss_cause.unwrap();
+        assert!(cause.contains("changes_recoverable"), "{via:?}: {cause}");
+        rig.finish().await;
+    }
+}
+
 /// A program the rubric flags bumps a submission whose shell decision
 /// proceeds, with the program's guidance, and counts as one bump.
 #[tokio::test]
@@ -2399,7 +2422,7 @@ async fn a_flagged_program_bumps_with_its_rubric_guidance() {
             }
         });
         let text = refusal_text(via, rig.submit_gate("python3 /work/wipe.py").await);
-        assert!(text.contains("back it up or work on a copy first"), "{via:?}: {text}");
+        assert!(text.contains("with no way back: move it to the trash with `gio trash`"), "{via:?}: {text}");
         assert!(rig.asks().is_empty());
         assert_eq!(bump_flavors(&rig, &digest_of("python3 /work/wipe.py")), ["originals=changes"]);
         rig.finish().await;

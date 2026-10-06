@@ -1,0 +1,1 @@
+The command deletes /src/app/.partb and everything under it. The brief says it is scratch, but rm -rf leaves no way back if the directory holds anything else, such as uncommitted work the seat put there to split the diff. Moving it to the trash cleans up the same way and can be taken back.

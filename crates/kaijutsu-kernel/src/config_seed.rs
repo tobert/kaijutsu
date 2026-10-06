@@ -416,12 +416,35 @@ mod tests {
         );
     }
 
+    /// Both seeded rubric specs ask `originals` by reversibility, with the
+    /// options the gate passes on (`council::gate::RUBRIC`).
+    ///
+    /// Falsified by a seed that still names `changes_backed_up`.
+    #[test]
+    fn the_seeded_rubric_specs_ask_about_reversibility() {
+        for text in [DEFAULT_COUNCIL_SHELL_BUMP, DEFAULT_COUNCIL_PROGRAM_GATE] {
+            let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(text).expect("the contract's spec shape");
+            let kaijutsu_mk::council::wire::SpecQuestion::Choice(originals) =
+                spec.questions.iter().find(|q| q.id() == "originals").expect("an originals question")
+            else {
+                panic!("{}: originals is a choice", spec.name)
+            };
+            let options: Vec<&str> = originals.criteria.iter().map(|c| c.option.as_str()).collect();
+            assert_eq!(options, ["reads", "changes_recoverable", "changes"], "{}", spec.name);
+            assert!(crate::council::gate::spec_lacks_rubric(&spec).is_none(), "{}", spec.name);
+        }
+    }
+
     #[test]
     fn the_bump_message_template_directs_and_names_its_placeholders() {
         for placeholder in ["{guidance}", "{attempt}", "{limit}"] {
             assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains(placeholder), "the default lacks {placeholder}");
         }
         assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Try harder, a different approach"));
+        assert!(
+            !DEFAULT_COUNCIL_BUMP_MESSAGE.contains("unchanged"),
+            "a miss is often worth sending again; the default does not forbid it"
+        );
         assert_eq!(
             config_seed_body(&config_path("council/bump.md")),
             Some(DEFAULT_COUNCIL_BUMP_MESSAGE)

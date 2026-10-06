@@ -1,0 +1,1 @@
+The command deletes every untracked and every ignored file in the repository. That reaches past stale build output: it also removes files git does not hold at all, such as a local .env, test data, notes, or new source files not yet added, and none of them can be recovered. The build output alone can be removed by its own directory or by the build tool's clean command.
