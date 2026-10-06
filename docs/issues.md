@@ -357,6 +357,27 @@ the interrupt state live would hard-cancel a turn on its own successful
 delivery. Disarm the guard on delivery. Found in the kaibo review of the
 timing work.
 
+## Reading a seat writes into its log (2026-10-06)
+
+`kjc -c <context> kj ...` authors its call and result as blocks in the
+context named, and `kj context show` takes no argument, so reading banto's
+metadata from outside put a user tool call and its result into banto's next
+turn. Amy: "expected, but will need some UX work for both of us." A read
+from outside a seat should name its target without becoming the seat's
+history, for people and for agents. Meanwhile, read from `verify` with `-c`
+flags (`kj block list -c banto`).
+
+## Council setup on an existing host takes hand steps (2026-10-06)
+
+Turning the council on for moltar took a copy of the missing specs into
+`/config/kernel/council/` (docs/operating.md says to) and the bench's
+`council` rc variant run by hand. Its scripts find their Markdown through
+`$0`, which `source` does not set, so `council-system` came out empty on
+the first try and the script still reported nothing wrong. The variant
+lives under `coder/create`, but the contexts it creates serve every type
+whose council is enabled. A seed step for council specs and contexts would
+replace both.
+
 ## `blocks repair-order` does not converge on one conversation (2026-10-04)
 
 On zorak's deploy, the first `--apply` fixed 1099 conversations' worth of
