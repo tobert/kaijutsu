@@ -616,7 +616,9 @@ action refused with guidance and tries again, with no human in the loop.
   trash, git holds it with no uncommitted changes, the command keeps its
   history (`kj context archive`), or the project rebuilds it. `changes`
   deletes or overwrites with no way back, and its guidance offers
-  `gio trash`, a backup, or a copy. The council cannot see who created a
+  `gio trash`, a backup, or a copy. `gio trash` works from a seat's shell
+  on moltar under the home directory and refuses tmpfs mounts such as
+  `/tmp` (checked 2026-10-06). The council cannot see who created a
   file, so authorship was the wrong question: a director's `rm -rf` of its
   own scratch and an archive of its own lane were bumped on 2026-10-06. A
   shell spec that names any rubric question must carry the whole rubric
