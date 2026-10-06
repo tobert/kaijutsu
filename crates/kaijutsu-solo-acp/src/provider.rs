@@ -53,7 +53,7 @@ impl BackendKind {
                 kind: "deepseek",
                 api_key_env: Some("DEEPSEEK_API_KEY"),
                 api_key_file: Some("~/.deepseek-key"),
-                default_model: Some("deepseek-v4-flash"),
+                default_model: Some("deepseek-flash"),
             },
             Self::Openai => Factory {
                 backend: "gpt",
@@ -304,7 +304,7 @@ mod tests {
         let host = FakeHost::default().with_var("DEEPSEEK_API_KEY", "sk-x");
         let choice = resolve(&ModelFlags::default(), &host).expect("one key resolves");
         assert_eq!(choice.backend, "deepseek");
-        assert_eq!(choice.model, "deepseek-v4-flash");
+        assert_eq!(choice.model, "deepseek-flash");
         assert!(!choice.write_backend_row, "the factory row already says this");
     }
 

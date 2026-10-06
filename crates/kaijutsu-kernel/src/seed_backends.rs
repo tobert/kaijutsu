@@ -125,7 +125,7 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
         api_key_file: Some("~/.deepseek-key"),
         key_optional: false,
         models: &[
-            ("deepseek-v4-flash", Some(1_000_000)),
+            ("deepseek-flash", Some(1_000_000)),
             ("deepseek-v4-pro", Some(1_000_000)),
         ],
         tuning: Some(DEEPSEEK_TUNING),
@@ -157,7 +157,9 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
 
 /// The kernel-wide default: the affordable lane.
 const FACTORY_DEFAULT_BACKEND: &str = "deepseek";
-const FACTORY_DEFAULT_MODEL: &str = "deepseek-v4-flash";
+/// DeepSeek's undated flash id tracks each new flash generation; the dated
+/// `deepseek-v4-flash` was retired (kaibo moved on 2026-09-10).
+const FACTORY_DEFAULT_MODEL: &str = "deepseek-flash";
 /// The floor's output budget, for a model whose row sets none. Models with a
 /// measured budget carry their own (`DEEPSEEK_TUNING`).
 const FACTORY_MAX_TOKENS: i64 = 16384;

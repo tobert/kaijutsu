@@ -3121,8 +3121,9 @@ impl KernelDb {
     /// - anything else that has a `provider` or `model` set (`lemonade`,
     ///   `local`, a typo, garbage, or a model with no provider at all) is not
     ///   a name we can resolve any more, so it is reassigned to the kernel's
-    ///   affordable default: `deepseek` / `deepseek-v4-flash` (Amy: "mostly we
-    ///   can toss them to deepseek v4 flash for now").
+    ///   affordable default: `deepseek` / `deepseek-flash` (Amy: "mostly we
+    ///   can toss them to deepseek v4 flash for now"; the undated id tracks
+    ///   each flash generation).
     /// - a row with BOTH columns NULL is left untouched — that already means
     ///   "fall through to the registry default", and remapping it would turn
     ///   an implicit default into an explicit pin nobody asked for.
@@ -3134,7 +3135,7 @@ impl KernelDb {
     fn migrate_context_model_rollover(conn: &Connection) -> KernelDbResult<()> {
         const KEEP: [&str; 4] = ["anthropic", "deepseek", "ollama", "gpt"];
         const FALLBACK_PROVIDER: &str = "deepseek";
-        const FALLBACK_MODEL: &str = "deepseek-v4-flash";
+        const FALLBACK_MODEL: &str = "deepseek-flash";
 
         let rows: Vec<(Vec<u8>, Option<String>, Option<String>)> = {
             let mut stmt = conn.prepare("SELECT context_id, provider, model FROM contexts")?;
@@ -9682,7 +9683,7 @@ mod tests {
         ] {
             let row = db.get_context(id).unwrap().unwrap();
             assert_eq!(row.provider.as_deref(), Some("deepseek"));
-            assert_eq!(row.model.as_deref(), Some("deepseek-v4-flash"));
+            assert_eq!(row.model.as_deref(), Some("deepseek-flash"));
         }
     }
 

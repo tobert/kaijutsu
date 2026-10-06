@@ -509,7 +509,7 @@ mod tests {
         ModelChoice {
             backend: "deepseek".to_string(),
             kind: "deepseek".to_string(),
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
             base_url: None,
             api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
             api_key_file: Some("~/.deepseek-key".to_string()),

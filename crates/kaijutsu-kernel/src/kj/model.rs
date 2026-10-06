@@ -789,7 +789,7 @@ mod tests {
         let parent =
             crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
         let c = crate::kj::test_helpers::caller_with_context(parent);
-        let r = d.dispatch(&[s("context"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-v4-flash")], &c).await;
+        let r = d.dispatch(&[s("context"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-flash")], &c).await;
         assert!(r.is_ok(), "context create failed: {}", r.message());
 
         let result = d.dispatch(&[s("model"), s("--context"), s("plain")], &c).await;

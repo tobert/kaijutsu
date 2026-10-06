@@ -22,7 +22,7 @@ for f in amy banto; do
   if kj context info "council-$f" > /dev/null 2>&1; then
     echo "council-$f: present"
   else
-    kj context create "council-$f" --top --type council --as council -m deepseek/deepseek-v4-flash
+    kj context create "council-$f" --top --type council --as council -m deepseek/deepseek-flash
     kj context set "council-$f" --reviewer amy
     kj block create -c "council-$f" --role user --kind text --content-type text/markdown < "$data/$f.md"
     echo "council-$f: created"

@@ -363,7 +363,7 @@ mod tests {
         let db = seeded_db();
         let registry = build_llm_registry(&db).unwrap();
         assert_eq!(registry.default_provider_name(), Some("deepseek"));
-        assert_eq!(registry.default_model(), Some("deepseek-v4-flash"));
+        assert_eq!(registry.default_model(), Some("deepseek-flash"));
         assert_eq!(registry.max_output_tokens(), 16384);
         let t = registry.default_tunables();
         // The floor reaches every backend, so it carries no effort token; the
@@ -373,7 +373,7 @@ mod tests {
         // registry — the seed being right buys nothing if the registry drops
         // it.
         assert_eq!(t.effort, None);
-        let model = registry.model_tunables("deepseek", "deepseek-v4-flash");
+        let model = registry.model_tunables("deepseek", "deepseek-flash");
         assert_eq!(model.effort.as_deref(), Some("high"));
         assert_eq!(model.max_tokens, Some(65536));
         // Knobs we haven't decided on stay NULL — "provider default" is a

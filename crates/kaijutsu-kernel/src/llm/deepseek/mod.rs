@@ -11,8 +11,8 @@
 //! - **`reasoning_required`** — DeepSeek V4 thinks by default and *requires*
 //!   the chain-of-thought echoed back on any assistant turn that performed
 //!   tool calls (else HTTP 400). See [`crate::llm::openai::build`].
-//! - **Model list** — the two tool-capable models (`deepseek-v4-flash`,
-//!   `deepseek-v4-pro`). The pure reasoning model can't call tools, so it
+//! - **Model list** — the two tool-capable models (`deepseek-flash`, the
+//!   undated id that tracks each flash generation, and `deepseek-v4-pro`). The pure reasoning model can't call tools, so it
 //!   belongs in a forked, tool-less context rather than the agentic loop.
 
 use super::openai;
@@ -48,7 +48,7 @@ impl Client {
 
     /// Tool-capable models surfaced by this provider.
     pub fn available_models(&self) -> Vec<&'static str> {
-        vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+        vec!["deepseek-flash", "deepseek-v4-pro"]
     }
 
     /// One-shot prompt with optional system preamble (non-streaming).

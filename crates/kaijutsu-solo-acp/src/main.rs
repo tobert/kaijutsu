@@ -6,7 +6,7 @@
 //! kaijutsu-solo-acp
 //!
 //! # naming the provider and the model
-//! kaijutsu-solo-acp --backend-kind deepseek --model deepseek-v4-flash
+//! kaijutsu-solo-acp --backend-kind deepseek --model deepseek-flash
 //! ```
 //!
 //! An ACP client launches this as a subprocess and speaks JSON-RPC 2.0 on its
@@ -69,7 +69,7 @@ struct Cli {
     base_url: Option<String>,
 
     /// Model id for every turn. Default: the provider's shipped model —
-    /// `deepseek-v4-flash` or `claude-sonnet-5-5`. The `openai` provider ships
+    /// `deepseek-flash` or `claude-sonnet-5-5`. The `openai` provider ships
     /// none, so it needs this flag.
     #[arg(long)]
     model: Option<String>,

@@ -347,6 +347,16 @@ response has no `queue_ms`, although `docs/council-api.md` lists it, so a
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
 
+## acp_fleet's forget-a-human-rule scenario predates the worker loadout (2026-10-06)
+
+`cargo test -p kaijutsu-solo-acp --features test-mock --test acp_fleet`
+fails `f-model-cannot-forget-human-rule`: the scenario expects a coder's
+`kj ledger forget` to reach "ask the reviewer who made it", but since
+13fff761 a coder has no `kj ledger` at all ("not part of this seat's
+work"). The property holds more strongly; the scenario should expect the
+house refusal, or move to a seat that holds the house capability. Which
+it should test is a choice to make, not a typo to fix.
+
 ## Two tui terminal_fit tests fail on moltar (2026-10-06)
 
 `ctrl_a_r_rotates_the_seat_and_follows_its_successor` (the client never
