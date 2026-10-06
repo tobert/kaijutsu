@@ -1,9 +1,9 @@
 [package]
-name = "kaijutsu-council"
+name = "kaijutsu-mk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Council API wire types, spec ids, answer and pool math, and an HTTP client"
+description = "Megakernel client: council API wire types, spec ids, answer and pool math, and the HTTP transport"
 
 [lints]
 workspace = true

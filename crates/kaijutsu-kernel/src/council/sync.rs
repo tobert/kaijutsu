@@ -16,9 +16,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use kaijutsu_council::canon;
-use kaijutsu_council::wire::{Capability, ServerIdentity, SnapshotId, Spec, SpecId, SpecQuestion};
-use kaijutsu_council::{CouncilClient, CouncilError};
+use kaijutsu_mk::council::canon;
+use kaijutsu_mk::council::wire::{Capability, ServerIdentity, SnapshotId, Spec, SpecId, SpecQuestion};
+use kaijutsu_mk::{MkClient, MkError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
@@ -30,7 +30,7 @@ pub(crate) struct Prepared {
     /// Addresses `CouncilConfig.server`. Its timeout, `deadline_ms`, bounds
     /// each call `prepare_labels` makes; a decision passes the time its
     /// deadline leaves.
-    pub(crate) client: CouncilClient,
+    pub(crate) client: MkClient,
     pub(crate) identity: ServerIdentity,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
@@ -67,7 +67,7 @@ const HOUSE_RULES_NAMESPACE: uuid::Uuid = uuid::uuid!("5c1f0b0e-9a47-4d3b-8e62-7
 /// The id the council server holds a house-rules body under: UUIDv5 of the
 /// body's sha256 in [`HOUSE_RULES_NAMESPACE`]. The same body is the same id
 /// for every seat, and a changed body is a new id.
-fn house_rules_id(body: &kaijutsu_council::wire::ContextPut) -> Result<ContextId, PrepareMiss> {
+fn house_rules_id(body: &kaijutsu_mk::council::wire::ContextPut) -> Result<ContextId, PrepareMiss> {
     Ok(ContextId::from(uuid::Uuid::new_v5(&HOUSE_RULES_NAMESPACE, &body_hash(body)?)))
 }
 
@@ -195,7 +195,7 @@ impl CouncilSync {
     ) -> Result<Prepared, PrepareMiss> {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
-        let client = CouncilClient::new(server, Duration::from_millis(council.deadline_ms))
+        let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
             .map_err(|e| self.failed(server, "client", e))?;
 
         let identity = self.identity(&client, server).await?;
@@ -269,13 +269,13 @@ impl CouncilSync {
     #[allow(clippy::too_many_arguments)]
     async fn hold(
         &self,
-        client: &CouncilClient,
+        client: &MkClient,
         server: &str,
         identity: &ServerIdentity,
         spec_id: &SpecId,
         label: &str,
         context_id: ContextId,
-        body: kaijutsu_council::wire::ContextPut,
+        body: kaijutsu_mk::council::wire::ContextPut,
         persistent: bool,
     ) -> Result<SnapshotId, PrepareMiss> {
         let hash = body_hash(&body)?;
@@ -333,7 +333,7 @@ impl CouncilSync {
         self.state.lock().specs.retain(|(_, id)| id != spec_id);
     }
 
-    async fn identity(&self, client: &CouncilClient, server: &str) -> Result<ServerIdentity, PrepareMiss> {
+    async fn identity(&self, client: &MkClient, server: &str) -> Result<ServerIdentity, PrepareMiss> {
         if let Some(i) = self.state.lock().identities.get(server) {
             return Ok(i.clone());
         }
@@ -344,7 +344,7 @@ impl CouncilSync {
 
     async fn ensure_spec(
         &self,
-        client: &CouncilClient,
+        client: &MkClient,
         server: &str,
         spec: &Spec,
         spec_id: &SpecId,
@@ -363,7 +363,7 @@ impl CouncilSync {
 
     /// A call to `server` failed: forget its identity and posted specs, so
     /// the next `prepare_labels` asks again, and name the failure.
-    fn failed(&self, server: &str, what: &str, e: CouncilError) -> PrepareMiss {
+    fn failed(&self, server: &str, what: &str, e: MkError) -> PrepareMiss {
         let mut state = self.state.lock();
         state.identities.remove(server);
         state.specs.retain(|(s, _)| s != server);
@@ -371,7 +371,7 @@ impl CouncilSync {
     }
 }
 
-fn body_hash(body: &kaijutsu_council::wire::ContextPut) -> Result<[u8; 32], PrepareMiss> {
+fn body_hash(body: &kaijutsu_mk::council::wire::ContextPut) -> Result<[u8; 32], PrepareMiss> {
     let bytes = serde_json::to_vec(body)
         .map_err(|e| PrepareMiss(format!("council context body does not serialize: {e}")))?;
     Ok(Sha256::digest(&bytes).into())
@@ -409,8 +409,8 @@ pub(super) mod mock {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use kaijutsu_council::canon;
-    use kaijutsu_council::wire::Spec;
+    use kaijutsu_mk::council::canon;
+    use kaijutsu_mk::council::wire::Spec;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -624,7 +624,7 @@ mod tests {
     /// `describe` capability.
     const SPEC: &str = crate::config_seed::DEFAULT_COUNCIL_SHELL_GATE;
     /// The contract's example spec, which holds the `text` question `effect`.
-    const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-council/tests/fixtures/spec.json");
+    const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json");
 
     struct Rig {
         kernel: Kernel,

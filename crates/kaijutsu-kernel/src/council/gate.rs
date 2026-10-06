@@ -44,11 +44,11 @@ use approval_ledger::council::{
     CouncilQuestion, CouncilRead, CouncilServer, CouncilThreshold as RecordedThreshold, NewCouncilDecision,
 };
 use approval_ledger::types::{AskVerdict, NewSignal, Origin, SignalSourceKind, SignalVerdict};
-use kaijutsu_council::wire::{
+use kaijutsu_mk::council::wire::{
     ContextRef, DecisionRequest, DecisionResponse, Pool, PoolMethod, PoolWeights, PooledAnswer,
     ReadAnswer,
 };
-use kaijutsu_council::{CouncilError, Json};
+use kaijutsu_mk::{Json, MkError};
 use kaijutsu_types::ContextId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -416,7 +416,7 @@ pub(crate) fn classify_case(
         verdict: verdict.clone(),
         rubric: rubric.clone(),
     };
-    if let Err(mismatch) = kaijutsu_council::math::verify(response, request) {
+    if let Err(mismatch) = kaijutsu_mk::council::math::verify(response, request) {
         return miss(format!("the answer's numbers do not recompute ({mismatch})"), None);
     }
     if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
@@ -577,19 +577,19 @@ pub(crate) async fn bump_message(kernel: &crate::Kernel, bump: &BumpReason, atte
 }
 
 /// A council failure that produced no response, in plain words.
-pub(crate) fn failure_cause(error: &CouncilError, deadline_ms: u64) -> String {
+pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
     match error {
-        CouncilError::Timeout => format!("no answer within the {deadline_ms} ms deadline"),
-        CouncilError::Status { status, error: Some(detail), .. } => {
+        MkError::Timeout => format!("no answer within the {deadline_ms} ms deadline"),
+        MkError::Status { status, error: Some(detail), .. } => {
             format!("the council server answered {status} ({:?}: {})", detail.r#type, detail.message)
         }
-        CouncilError::Status { status, body, .. } => {
+        MkError::Status { status, body, .. } => {
             format!("the council server answered {status}: {}", body.chars().take(200).collect::<String>())
         }
-        CouncilError::Transport(e) => format!("the council server could not be reached: {e}"),
-        CouncilError::Decode { what, message, .. } => format!("the answer is outside the schema ({what}): {message}"),
-        CouncilError::Request(e) => format!("the kernel built a request the contract refuses: {e}"),
-        CouncilError::SpecIdMismatch { computed, server } => {
+        MkError::Transport(e) => format!("the council server could not be reached: {e}"),
+        MkError::Decode { what, message, .. } => format!("the answer is outside the schema ({what}): {message}"),
+        MkError::Request(e) => format!("the kernel built a request the contract refuses: {e}"),
+        MkError::SpecIdMismatch { computed, server } => {
             format!("the server holds the spec as {server}, not {computed}")
         }
     }
@@ -611,12 +611,12 @@ struct Resend {
 /// names, or, when it names neither, every prepared context, and the spec
 /// too after a 404. The server forgot what it held, and sending either
 /// again is idempotent. A 409 is about a context's snapshot, never the spec.
-fn to_resend(error: &CouncilError, prepared: &Prepared) -> Resend {
+fn to_resend(error: &MkError, prepared: &Prepared) -> Resend {
     let status = error.status();
     let Some(404 | 409) = status else { return Resend::default() };
     let text = match error {
-        CouncilError::Status { error: Some(d), body, .. } => format!("{} {} {body}", d.message, d.param.as_deref().unwrap_or("")),
-        CouncilError::Status { body, .. } => body.clone(),
+        MkError::Status { error: Some(d), body, .. } => format!("{} {} {body}", d.message, d.param.as_deref().unwrap_or("")),
+        MkError::Status { body, .. } => body.clone(),
         _ => String::new(),
     };
     let named: Vec<ContextId> = prepared
@@ -635,7 +635,7 @@ fn to_resend(error: &CouncilError, prepared: &Prepared) -> Resend {
 
 /// Forget what a decision's failure says the server no longer holds, so the
 /// next prepare sends it again.
-fn forget_after(kernel: &crate::Kernel, error: &CouncilError, prepared: &Prepared) {
+fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared) {
     let resend = to_resend(error, prepared);
     for context in resend.contexts {
         kernel.council_sync().invalidate(context);
@@ -680,7 +680,7 @@ pub(crate) async fn ask_within(
     let answer =
         tokio::time::timeout_at(deadline, prepared.client.decide_traced(request, left, traceparent.as_deref())).await;
     match answer {
-        Err(_) | Ok(Err(CouncilError::Timeout)) => Err(deadline_cause(council.deadline_ms, "the decision")),
+        Err(_) | Ok(Err(MkError::Timeout)) => Err(deadline_cause(council.deadline_ms, "the decision")),
         Ok(Err(error)) => {
             forget_after(kernel, &error, prepared);
             Err(failure_cause(&error, council.deadline_ms))
@@ -1538,8 +1538,8 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
 /// a spec without one would only ever miss. A bumper's `proceed` also needs
 /// another option: every other option is a bump flavor, and a spec with
 /// none could only pass or miss.
-fn spec_lacks_pass(spec: &kaijutsu_council::wire::Spec, pass: &str) -> Option<String> {
-    use kaijutsu_council::wire::SpecQuestion;
+fn spec_lacks_pass(spec: &kaijutsu_mk::council::wire::Spec, pass: &str) -> Option<String> {
+    use kaijutsu_mk::council::wire::SpecQuestion;
     match spec.questions.iter().find(|q| q.id() == VERDICT) {
         Some(SpecQuestion::Choice(c)) if c.criteria.iter().any(|o| o.option == pass) => {
             if pass == "proceed" && c.criteria.len() < 2 {
@@ -1556,8 +1556,8 @@ fn spec_lacks_pass(spec: &kaijutsu_council::wire::Spec, pass: &str) -> Option<St
 /// What a bump tells the seat: the flavor and the guidance for it. A flavor
 /// that is a verdict option gets that option's `means` text from the spec; a
 /// rubric flavor gets guidance for each answer that held it.
-fn bump_guidance(spec: &kaijutsu_council::wire::Spec, flavor: &str) -> String {
-    use kaijutsu_council::wire::SpecQuestion;
+fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> String {
+    use kaijutsu_mk::council::wire::SpecQuestion;
     let option_means = spec.questions.iter().find_map(|q| match q {
         SpecQuestion::Choice(c) if c.id == VERDICT => c.criteria.iter().find(|o| o.option == flavor).map(|o| o.means.clone()),
         _ => None,
@@ -1579,8 +1579,8 @@ fn bump_guidance(spec: &kaijutsu_council::wire::Spec, flavor: &str) -> String {
 
 /// Why a program spec cannot decide, when it cannot: the gate decides a
 /// program from the [`RUBRIC`] choices.
-fn spec_lacks_rubric(spec: &kaijutsu_council::wire::Spec) -> Option<String> {
-    use kaijutsu_council::wire::SpecQuestion;
+fn spec_lacks_rubric(spec: &kaijutsu_mk::council::wire::Spec) -> Option<String> {
+    use kaijutsu_mk::council::wire::SpecQuestion;
     RUBRIC.iter().find_map(|(id, ok)| match spec.questions.iter().find(|q| q.id() == *id) {
         Some(SpecQuestion::Choice(c)) if ok.iter().all(|o| c.criteria.iter().any(|k| k.option == *o)) => None,
         Some(_) => Some(format!("spec {} has no `{id}` choice with the options {}", spec.name, ok.join(", "))),
@@ -1753,8 +1753,8 @@ const MAX_PROGRAMS: usize = 8;
 pub(crate) mod test_support {
     //! verify()-consistent decision responses for tests.
 
-    use kaijutsu_council::math::{self, Row, WeightSpec};
-    use kaijutsu_council::wire::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
+    use kaijutsu_mk::council::math::{self, Row, WeightSpec};
+    use kaijutsu_mk::council::wire::{DecisionRequest, DecisionResponse, PoolMethod, PoolWeights};
 
     pub(crate) const OPTIONS: [&str; 3] = ["allow", "ask", "report"];
 
@@ -1871,8 +1871,8 @@ mod tests {
     const CTX_A: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11";
     const CTX_B: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12";
 
-    fn spec_id() -> kaijutsu_council::wire::SpecId {
-        kaijutsu_council::wire::SpecId::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
+    fn spec_id() -> kaijutsu_mk::council::wire::SpecId {
+        kaijutsu_mk::council::wire::SpecId::parse(format!("sha256:{}", "a".repeat(64))).unwrap()
     }
 
     fn council(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     fn request() -> DecisionRequest {
-        let snap = |c: char| kaijutsu_council::wire::SnapshotId::parse(format!("snap:{}", c.to_string().repeat(64))).unwrap();
+        let snap = |c: char| kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", c.to_string().repeat(64))).unwrap();
         DecisionRequest {
             spec_id: Some(spec_id()),
             contexts: Some(vec![
@@ -1923,7 +1923,7 @@ mod tests {
     #[test]
     fn the_test_answers_verify() {
         let req = request();
-        kaijutsu_council::math::verify(&decode(answer(&req, &ALLOW)), &req).expect("consistent");
+        kaijutsu_mk::council::math::verify(&decode(answer(&req, &ALLOW)), &req).expect("consistent");
     }
 
     #[test]
@@ -2061,8 +2061,8 @@ mod tests {
 
     #[test]
     fn a_spec_without_an_allow_verdict_cannot_decide() {
-        let mut spec: kaijutsu_council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
+        let mut spec: kaijutsu_mk::council::wire::Spec =
+            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
         assert_eq!(spec_lacks_pass(&spec, "allow"), None);
         spec.questions.retain(|q| q.id() != VERDICT);
         assert!(spec_lacks_pass(&spec, "allow").unwrap().contains("no `verdict` choice"));
@@ -2070,25 +2070,25 @@ mod tests {
 
     #[test]
     fn failures_read_as_plain_causes() {
-        assert_eq!(failure_cause(&CouncilError::Timeout, 700), "no answer within the 700 ms deadline");
-        let status = CouncilError::Status { status: 503, error: None, retry_after: None, body: "busy".into() };
+        assert_eq!(failure_cause(&MkError::Timeout, 700), "no answer within the 700 ms deadline");
+        let status = MkError::Status { status: 503, error: None, retry_after: None, body: "busy".into() };
         assert!(failure_cause(&status, 700).contains("503"));
-        let transport = CouncilError::Transport("connection refused".into());
+        let transport = MkError::Transport("connection refused".into());
         assert!(failure_cause(&transport, 700).contains("could not be reached"));
     }
 
     fn prepared(contexts: &[ContextId]) -> Prepared {
-        let identity: kaijutsu_council::wire::ServerIdentity = serde_json::from_value(serde_json::json!({
+        let identity: kaijutsu_mk::council::wire::ServerIdentity = serde_json::from_value(serde_json::json!({
             "model": "m", "weight_hash": "w1", "tokenizer_hash": "t1", "template": "x", "engine": "e1",
             "limits": {"context_tokens": 1, "state_bytes": 1, "contexts_per_decision": 8,
                        "choice_options": 8, "default_timeout_ms": 1000},
             "capabilities": []})).unwrap();
-        let spec: kaijutsu_council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
+        let spec: kaijutsu_mk::council::wire::Spec =
+            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
         Prepared {
-            client: kaijutsu_council::CouncilClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
+            client: kaijutsu_mk::MkClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
             identity,
-            spec_id: kaijutsu_council::canon::spec_id(&spec).unwrap(),
+            spec_id: kaijutsu_mk::council::canon::spec_id(&spec).unwrap(),
             spec,
             contexts: contexts
                 .iter()
@@ -2096,7 +2096,7 @@ mod tests {
                 .map(|(i, id)| super::super::sync::PreparedContext {
                     label: format!("c{i}"),
                     context_id: *id,
-                    head: kaijutsu_council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
+                    head: kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })
                 .collect(),
@@ -2143,10 +2143,10 @@ mod tests {
     fn a_404_naming_a_context_resends_it_and_a_409_naming_none_resends_every_context() {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
-        let named = CouncilError::Status {
+        let named = MkError::Status {
             status: 404,
-            error: Some(kaijutsu_council::wire::ErrorDetail {
-                r#type: kaijutsu_council::wire::ErrorType::NotFound,
+            error: Some(kaijutsu_mk::council::wire::ErrorDetail {
+                r#type: kaijutsu_mk::council::wire::ErrorType::NotFound,
                 message: format!("unknown context {}", ids[1]),
                 param: None,
                 head: None,
@@ -2155,9 +2155,9 @@ mod tests {
             body: String::new(),
         };
         assert_eq!(to_resend(&named, &p), Resend { contexts: vec![ids[1]], spec: false });
-        let bare = CouncilError::Status { status: 409, error: None, retry_after: None, body: String::new() };
+        let bare = MkError::Status { status: 409, error: None, retry_after: None, body: String::new() };
         assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: false });
-        let busy = CouncilError::Status { status: 503, error: None, retry_after: None, body: String::new() };
+        let busy = MkError::Status { status: 503, error: None, retry_after: None, body: String::new() };
         assert_eq!(to_resend(&busy, &p), Resend::default());
     }
 
@@ -2167,10 +2167,10 @@ mod tests {
     fn a_404_naming_the_spec_resends_only_the_spec() {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
-        let spec = CouncilError::Status {
+        let spec = MkError::Status {
             status: 404,
-            error: Some(kaijutsu_council::wire::ErrorDetail {
-                r#type: kaijutsu_council::wire::ErrorType::NotFound,
+            error: Some(kaijutsu_mk::council::wire::ErrorDetail {
+                r#type: kaijutsu_mk::council::wire::ErrorType::NotFound,
                 message: format!("unknown spec {}", p.spec_id.as_str()),
                 param: None,
                 head: None,
@@ -2179,7 +2179,7 @@ mod tests {
             body: String::new(),
         };
         assert_eq!(to_resend(&spec, &p), Resend { contexts: vec![], spec: true });
-        let bare = CouncilError::Status { status: 404, error: None, retry_after: None, body: String::new() };
+        let bare = MkError::Status { status: 404, error: None, retry_after: None, body: String::new() };
         assert_eq!(to_resend(&bare, &p), Resend { contexts: ids.to_vec(), spec: true });
     }
 
@@ -2329,12 +2329,12 @@ mod tests {
 
     #[test]
     fn a_bumper_spec_needs_a_proceed_option_and_a_bump_option() {
-        use kaijutsu_council::wire::SpecQuestion;
-        let mut spec: kaijutsu_council::wire::Spec =
+        use kaijutsu_mk::council::wire::SpecQuestion;
+        let mut spec: kaijutsu_mk::council::wire::Spec =
             serde_json::from_str(crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP).unwrap();
         assert_eq!(spec_lacks_pass(&spec, "proceed"), None);
-        let gate: kaijutsu_council::wire::Spec =
-            serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
+        let gate: kaijutsu_mk::council::wire::Spec =
+            serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
         let cause = spec_lacks_pass(&gate, "proceed").unwrap();
         assert!(cause.contains("no `proceed` option") && cause.contains(VERDICT), "{cause}");
         for q in &mut spec.questions {

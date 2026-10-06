@@ -14,7 +14,7 @@ use approval_ledger::council_observation::{
     CouncilObservation, CouncilObservationOutcome, list_council_observations_for_decision, list_council_voice_skips,
 };
 use approval_ledger::types::{ApprovalRow, ApprovalStatus, SignalRow, SignalSourceKind, SignalVerdict};
-use kaijutsu_council::wire::DecisionRequest;
+use kaijutsu_mk::council::wire::DecisionRequest;
 use kaijutsu_types::{PrincipalId, RefusalKind, SessionId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -33,9 +33,9 @@ use crate::mcp::{
 /// The docs' shell spec without its `text` question, as the shipped default
 /// holds it while the server does not declare `describe`.
 fn spec_text() -> String {
-    let mut spec: kaijutsu_council::wire::Spec =
-        serde_json::from_str(include_str!("../../../kaijutsu-council/tests/fixtures/spec.json")).unwrap();
-    spec.questions.retain(|q| !matches!(q, kaijutsu_council::wire::SpecQuestion::Text(_)));
+    let mut spec: kaijutsu_mk::council::wire::Spec =
+        serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
+    spec.questions.retain(|q| !matches!(q, kaijutsu_mk::council::wire::SpecQuestion::Text(_)));
     serde_json::to_string(&spec).unwrap()
 }
 
@@ -186,8 +186,8 @@ async fn serve() -> Mock {
                 let reply = match (method.as_str(), path.as_str()) {
                     ("GET", "/council/v1/identity") => Reply { status: 200, body: server_identity(), delay: Duration::ZERO },
                     ("POST", "/council/v1/specs") => {
-                        let spec: kaijutsu_council::wire::Spec = serde_json::from_str(&body).unwrap();
-                        let id = kaijutsu_council::canon::spec_id(&spec).unwrap();
+                        let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
+                        let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
                         Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "mk-letters-1:0123456789abcdef"}))
                     }
                     ("PUT", p) if p.starts_with("/council/v1/contexts/") => {

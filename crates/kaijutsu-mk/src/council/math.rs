@@ -9,7 +9,7 @@ use std::fmt;
 
 use indexmap::IndexMap;
 
-use crate::wire::{
+use crate::council::wire::{
     DecisionRequest, DecisionResponse, PoolMethod, PoolWeights, PooledAnswer, ReadAnswer,
 };
 
@@ -527,8 +527,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const REQUEST: &str = include_str!("../tests/fixtures/decision_request.json");
-    const RESPONSE: &str = include_str!("../tests/fixtures/decision_response.json");
+    const REQUEST: &str = include_str!("../../tests/fixtures/decision_request.json");
+    const RESPONSE: &str = include_str!("../../tests/fixtures/decision_response.json");
     // Vectors below come from the megakernel's service/council.py answer() and
     // pooled() on the same float32 letter logits.
     const R1: [f64; 3] = [-4.0, -0.25, -3.5];
@@ -791,7 +791,7 @@ mod tests {
         *one.pool.normalized.get_mut("verdict").unwrap() = vec![1.0];
         one.answers.insert(
             "verdict".into(),
-            PooledAnswer::Choice(crate::wire::PooledChoice {
+            PooledAnswer::Choice(crate::council::wire::PooledChoice {
                 choice: c.choice,
                 probabilities: c.probabilities,
                 confidence: c.confidence,
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn verify_checks_noul_answers() {
-        use crate::wire::{PooledNoul, ReadNoul};
+        use crate::council::wire::{PooledNoul, ReadNoul};
         let (mut resp, mut req) = fixture();
         let lp = [[-0.25, -1.75], [-2.5, -0.5]];
         let rs: Vec<Row> = lp.iter().map(|l| Row::from_logprobs(l).unwrap()).collect();
@@ -834,7 +834,7 @@ mod tests {
         }));
         resp.pool.normalized.clear();
         resp.pool.normalized.insert("risky".into(), p.weights.clone());
-        req.pool = Some(crate::wire::Pool { method: Some(PoolMethod::Loglinear), weights: Some(PoolWeights::Mass), values: None });
+        req.pool = Some(crate::council::wire::Pool { method: Some(PoolMethod::Loglinear), weights: Some(PoolWeights::Mass), values: None });
         verify(&resp, &req).unwrap();
         let PooledAnswer::Noul(n) = resp.answers.get_mut("risky").unwrap() else { panic!() };
         n.noul += 0.01;

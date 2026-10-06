@@ -6640,20 +6640,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kaijutsu-council"
-version = "0.1.0"
-dependencies = [
- "hex",
- "indexmap 2.14.0",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "kaijutsu-diff"
 version = "0.1.0"
 dependencies = [
@@ -6748,12 +6734,12 @@ dependencies = [
  "kaijutsu-ansi",
  "kaijutsu-audio",
  "kaijutsu-cas",
- "kaijutsu-council",
  "kaijutsu-diff",
  "kaijutsu-editor",
  "kaijutsu-hyoushigi",
  "kaijutsu-index",
  "kaijutsu-kernel",
+ "kaijutsu-mk",
  "kaijutsu-telemetry",
  "kaijutsu-types",
  "kaish-glob",
@@ -6815,6 +6801,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "whoami",
+]
+
+[[package]]
+name = "kaijutsu-mk"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "indexmap 2.14.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

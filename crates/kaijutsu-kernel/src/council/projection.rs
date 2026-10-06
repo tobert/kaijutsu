@@ -16,7 +16,7 @@
 //! whose first line names the sender and the context it came from. Drift
 //! stays out of every other council context.
 
-use kaijutsu_council::wire::{ContextPut, Role as WireRole, Turn};
+use kaijutsu_mk::council::wire::{ContextPut, Role as WireRole, Turn};
 use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Status};
 
 /// A turn carries `snap` when its 1-based position is a multiple of this.

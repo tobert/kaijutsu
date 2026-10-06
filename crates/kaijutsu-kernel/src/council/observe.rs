@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use approval_ledger::council::{CouncilQuestion, CouncilServer};
 use approval_ledger::council_observation::{CouncilObservationOutcome, NewCouncilObservation, insert_council_observation};
-use kaijutsu_council::Json;
-use kaijutsu_council::wire::{DecisionResponse, ReadAnswer, SpecQuestion};
+use kaijutsu_mk::Json;
+use kaijutsu_mk::council::wire::{DecisionResponse, ReadAnswer, SpecQuestion};
 
 use super::sync::Prepared;
 use crate::kj::gate_policy::CouncilConfig;
@@ -225,10 +225,10 @@ fn spec_lacks_follows(prepared: &Prepared) -> Option<String> {
 /// answered, and its top option for [`FOLLOWS`].
 fn read_answer(
     prepared: &Prepared,
-    request: &kaijutsu_council::wire::DecisionRequest,
+    request: &kaijutsu_mk::council::wire::DecisionRequest,
     response: &DecisionResponse,
 ) -> Result<(Option<String>, Vec<CouncilQuestion>, String), String> {
-    kaijutsu_council::math::verify(response, request)
+    kaijutsu_mk::council::math::verify(response, request)
         .map_err(|mismatch| format!("the answer's numbers do not recompute ({mismatch})"))?;
     if let (Some(read), Some(asked)) = (&response.identity.spec_id, &request.spec_id)
         && read != asked
@@ -257,8 +257,8 @@ fn read_answer(
 pub(crate) mod test_support {
     //! verify()-consistent `direction-check` answers for tests.
 
-    use kaijutsu_council::math::{self, Row, WeightSpec};
-    use kaijutsu_council::wire::{DecisionRequest, PoolMethod, PoolWeights};
+    use kaijutsu_mk::council::math::{self, Row, WeightSpec};
+    use kaijutsu_mk::council::wire::{DecisionRequest, PoolMethod, PoolWeights};
 
     pub(crate) const OPTIONS: [&str; 3] = ["follows", "strays", "unclear"];
 
@@ -316,7 +316,7 @@ mod tests {
 
     use approval_ledger::council::{CouncilOutcome, NewCouncilDecision, insert_council_decision, load_council_decision};
     use approval_ledger::council_observation::list_council_observations_for_decision;
-    use kaijutsu_council::wire::DecisionRequest;
+    use kaijutsu_mk::council::wire::DecisionRequest;
 
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::super::sync::mock::{Mock, reply, serve};

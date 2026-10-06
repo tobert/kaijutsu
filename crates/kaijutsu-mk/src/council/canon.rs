@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::wire::{Spec, SpecId};
+use crate::council::wire::{Spec, SpecId};
 
 /// Why a value has no canonical form here.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn the_docs_hold_a_spec_once_example_has_the_megakernel_id() {
         // Pinned from service/council.py spec_id() on the same JSON.
-        let spec: Spec = serde_json::from_str(crate::wire::tests_support::DOC_SPEC).unwrap();
+        let spec: Spec = serde_json::from_str(crate::council::wire::tests_support::DOC_SPEC).unwrap();
         assert_eq!(
             spec_id(&spec).unwrap().as_str(),
             "sha256:5114ff063b887c710333afd4fe35238c55946ac2a63fb76d6c9004b56a1503ea"
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn the_megakernel_canonical_text_of_the_example_spec() {
-        let spec: Spec = serde_json::from_str(crate::wire::tests_support::DOC_SPEC).unwrap();
+        let spec: Spec = serde_json::from_str(crate::council::wire::tests_support::DOC_SPEC).unwrap();
         let value = serde_json::to_value(&spec).unwrap();
         assert_eq!(
             canonical_json(&value).unwrap(),
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_spec_with_a_float_in_its_instructions_has_no_id() {
-        let mut spec: Spec = serde_json::from_str(crate::wire::tests_support::DOC_SPEC).unwrap();
+        let mut spec: Spec = serde_json::from_str(crate::council::wire::tests_support::DOC_SPEC).unwrap();
         spec.questions[1].set_instructions(serde_json::from_str(r#"{"weight":0.5}"#).unwrap());
         assert!(matches!(spec_id(&spec), Err(CanonError::Number(_))));
     }

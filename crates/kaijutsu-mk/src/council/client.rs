@@ -1,123 +1,19 @@
-//! An async HTTP client for the council API.
-//!
-//! Every failure is a typed [`CouncilError`]. The client never retries and
-//! never turns a failure into a default answer; a caller that wants to retry
-//! reads `retry_after` and decides.
+//! The `/council/v1` calls (`docs/council-api.md`).
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderName, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
-use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
+use reqwest::Method;
 
-use crate::canon;
-use crate::wire::{
-    ContextPut, ContextPutResult, ContextState, DecisionRequest, DecisionResponse, ErrorBody,
-    ErrorDetail, HeldSpec, InvalidRequest, ServerIdentity, SnapshotId, Spec, SpecId,
+use crate::client::{to_body, MkClient, MkError};
+use crate::council::canon;
+use crate::council::wire::{
+    ContextPut, ContextPutResult, ContextState, DecisionRequest, DecisionResponse, HeldSpec,
+    ServerIdentity, SnapshotId, Spec, SpecId,
 };
 
-/// Longest slice of a response body kept in an error.
-const BODY_EXCERPT: usize = 512;
-
-/// Why a call failed.
-#[derive(Debug, thiserror::Error)]
-pub enum CouncilError {
-    /// The server answered with an error status. `error` is the decoded body
-    /// when it matched the contract (it carries `head` for 409 and 412);
-    /// `body` is the start of the raw text either way.
-    #[error("council server answered {status}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default())]
-    Status {
-        status: u16,
-        error: Option<ErrorDetail>,
-        /// The `Retry-After` header, when it held whole seconds.
-        retry_after: Option<Duration>,
-        body: String,
-    },
-    /// The call took longer than the client's timeout.
-    #[error("council call timed out")]
-    Timeout,
-    /// The request did not reach the server or the reply did not arrive whole.
-    #[error("council transport failed: {0}")]
-    Transport(String),
-    /// The server answered success with a body outside the schema, or with a
-    /// success status the contract does not give for the call.
-    #[error("council reply outside the schema ({what}): {message}")]
-    Decode {
-        what: &'static str,
-        message: String,
-        body: String,
-    },
-    /// The client refused to send a request the contract forbids.
-    #[error("{0}")]
-    Request(String),
-    /// The server held a spec under a different id than the canonical one.
-    #[error("spec id disagrees: computed {computed}, server says {server}")]
-    SpecIdMismatch { computed: SpecId, server: SpecId },
-}
-
-impl CouncilError {
-    /// For a 409 or 412, the context's current head.
-    pub fn head(&self) -> Option<&SnapshotId> {
-        match self {
-            CouncilError::Status { error: Some(e), .. } => e.head.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// The HTTP status, when the server answered with one.
-    pub fn status(&self) -> Option<u16> {
-        match self {
-            CouncilError::Status { status, .. } => Some(*status),
-            _ => None,
-        }
-    }
-}
-
-impl From<InvalidRequest> for CouncilError {
-    fn from(e: InvalidRequest) -> Self {
-        CouncilError::Request(e.to_string())
-    }
-}
-
-fn excerpt(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    text.chars().take(BODY_EXCERPT).collect()
-}
-
-/// A client for one council server.
-#[derive(Clone, Debug)]
-pub struct CouncilClient {
-    http: reqwest::Client,
-    base: String,
-    timeout: Duration,
-    traceparent: Option<String>,
-}
-
-impl CouncilClient {
-    /// A client for the server at `base_url` (such as `http://localhost:8090`).
-    /// `timeout` bounds each call except `decide`, which takes its own. The
-    /// client ignores proxy environment variables: a council server is addressed directly.
-    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, CouncilError> {
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| CouncilError::Transport(e.to_string()))?;
-        Ok(CouncilClient {
-            http,
-            base: base_url.into().trim_end_matches('/').to_string(),
-            timeout,
-            traceparent: None,
-        })
-    }
-
-    /// Sends this W3C `traceparent` header on every call.
-    pub fn with_traceparent(mut self, traceparent: impl Into<String>) -> Self {
-        self.traceparent = Some(traceparent.into());
-        self
-    }
-
+impl MkClient {
     /// `GET /council/v1/identity`.
-    pub async fn identity(&self) -> Result<ServerIdentity, CouncilError> {
+    pub async fn identity(&self) -> Result<ServerIdentity, MkError> {
         self.json(Method::GET, "/council/v1/identity", None, &[], self.timeout, 200, "identity")
             .await
     }
@@ -128,7 +24,7 @@ impl CouncilClient {
         id: &str,
         body: &ContextPut,
         if_match: Option<&SnapshotId>,
-    ) -> Result<ContextPutResult, CouncilError> {
+    ) -> Result<ContextPutResult, MkError> {
         let path = context_path(id)?;
         let bytes = to_body(body)?;
         let mut headers = Vec::new();
@@ -140,32 +36,32 @@ impl CouncilClient {
     }
 
     /// `GET /council/v1/contexts/{id}`.
-    pub async fn get_context(&self, id: &str) -> Result<ContextState, CouncilError> {
+    pub async fn get_context(&self, id: &str) -> Result<ContextState, MkError> {
         let path = context_path(id)?;
         self.json(Method::GET, &path, None, &[], self.timeout, 200, "context state").await
     }
 
     /// `DELETE /council/v1/contexts/{id}`.
-    pub async fn delete_context(&self, id: &str) -> Result<(), CouncilError> {
+    pub async fn delete_context(&self, id: &str) -> Result<(), MkError> {
         let path = context_path(id)?;
         self.call(Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
     }
 
-    /// `POST /council/v1/specs`. Fails with [`CouncilError::SpecIdMismatch`]
+    /// `POST /council/v1/specs`. Fails with [`MkError::SpecIdMismatch`]
     /// when the server's id is not the spec's canonical id.
-    pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, CouncilError> {
-        let computed = canon::spec_id(spec).map_err(|e| CouncilError::Request(e.to_string()))?;
+    pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, MkError> {
+        let computed = canon::spec_id(spec).map_err(|e| MkError::Request(e.to_string()))?;
         let held: HeldSpec = self
             .json(Method::POST, "/council/v1/specs", Some(to_body(spec)?), &[], self.timeout, 200, "held spec")
             .await?;
         if held.spec_id != computed {
-            return Err(CouncilError::SpecIdMismatch { computed, server: held.spec_id });
+            return Err(MkError::SpecIdMismatch { computed, server: held.spec_id });
         }
         Ok(held)
     }
 
     /// `GET /council/v1/specs/{spec_id}`.
-    pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, CouncilError> {
+    pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, MkError> {
         let path = format!("/council/v1/specs/{id}");
         self.json(Method::GET, &path, None, &[], self.timeout, 200, "held spec").await
     }
@@ -177,7 +73,7 @@ impl CouncilClient {
         &self,
         request: &DecisionRequest,
         timeout: Duration,
-    ) -> Result<DecisionResponse, CouncilError> {
+    ) -> Result<DecisionResponse, MkError> {
         self.decide_traced(request, timeout, None).await
     }
 
@@ -188,7 +84,7 @@ impl CouncilClient {
         request: &DecisionRequest,
         timeout: Duration,
         traceparent: Option<&str>,
-    ) -> Result<DecisionResponse, CouncilError> {
+    ) -> Result<DecisionResponse, MkError> {
         request.validate()?;
         let mut headers = Vec::new();
         if let Some(tp) = traceparent {
@@ -197,98 +93,11 @@ impl CouncilClient {
         self.json(Method::POST, "/council/v1/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
             .await
     }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn json<T: DeserializeOwned>(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Vec<u8>>,
-        headers: &[(&'static str, String)],
-        timeout: Duration,
-        expect: u16,
-        what: &'static str,
-    ) -> Result<T, CouncilError> {
-        let bytes = self.call(method, path, body, headers, timeout, expect).await?;
-        serde_json::from_slice(&bytes).map_err(|e| CouncilError::Decode {
-            what,
-            message: e.to_string(),
-            body: excerpt(&bytes),
-        })
-    }
-
-    async fn call(
-        &self,
-        method: Method,
-        path: &str,
-        body: Option<Vec<u8>>,
-        headers: &[(&'static str, String)],
-        timeout: Duration,
-        expect: u16,
-    ) -> Result<Vec<u8>, CouncilError> {
-        let mut req = self.http.request(method, format!("{}{}", self.base, path)).timeout(timeout);
-        for (name, value) in headers {
-            req = req.header(HeaderName::from_static(name), header_value(name, value)?);
-        }
-        if let Some(tp) = &self.traceparent
-            && !headers.iter().any(|(n, _)| *n == "traceparent")
-        {
-            req = req.header(HeaderName::from_static("traceparent"), header_value("traceparent", tp)?);
-        }
-        if let Some(body) = body {
-            req = req.header(CONTENT_TYPE, "application/json").body(body);
-        }
-        let resp = req.send().await.map_err(map_reqwest)?;
-        let status = resp.status();
-        let retry_after = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
-        let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
-        if status.as_u16() == expect {
-            return Ok(bytes);
-        }
-        if status.is_success() {
-            return Err(CouncilError::Decode {
-                what: "status",
-                message: format!("expected {expect}, got {status}"),
-                body: excerpt(&bytes),
-            });
-        }
-        Err(status_error(status, retry_after, &bytes))
-    }
 }
 
-fn status_error(status: StatusCode, retry_after: Option<Duration>, bytes: &[u8]) -> CouncilError {
-    CouncilError::Status {
-        status: status.as_u16(),
-        error: serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error),
-        retry_after,
-        body: excerpt(bytes),
-    }
-}
-
-fn map_reqwest(e: reqwest::Error) -> CouncilError {
-    if e.is_timeout() {
-        CouncilError::Timeout
-    } else {
-        CouncilError::Transport(e.to_string())
-    }
-}
-
-fn header_value(name: &str, value: &str) -> Result<HeaderValue, CouncilError> {
-    HeaderValue::from_str(value).map_err(|_| CouncilError::Request(format!("{name} header value is not valid")))
-}
-
-fn to_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CouncilError> {
-    serde_json::to_vec(value).map_err(|e| CouncilError::Request(format!("request does not serialize: {e}")))
-}
-
-fn context_path(id: &str) -> Result<String, CouncilError> {
+fn context_path(id: &str) -> Result<String, MkError> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-        return Err(CouncilError::Request(format!("context id {id:?} is not a UUID")));
+        return Err(MkError::Request(format!("context id {id:?} is not a UUID")));
     }
     Ok(format!("/council/v1/contexts/{id}"))
 }
@@ -302,12 +111,12 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::council::wire::{ContextRef, ErrorType, Role, Turn};
     use crate::json::Json;
-    use crate::wire::{ContextRef, ErrorType, Role, Turn};
 
-    const SPEC: &str = include_str!("../tests/fixtures/spec.json");
-    const REQUEST: &str = include_str!("../tests/fixtures/decision_request.json");
-    const RESPONSE: &str = include_str!("../tests/fixtures/decision_response.json");
+    const SPEC: &str = include_str!("../../tests/fixtures/spec.json");
+    const REQUEST: &str = include_str!("../../tests/fixtures/decision_request.json");
+    const RESPONSE: &str = include_str!("../../tests/fixtures/decision_response.json");
     const DOC_SPEC_ID: &str = "sha256:5114ff063b887c710333afd4fe35238c55946ac2a63fb76d6c9004b56a1503ea";
     const CTX: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b11";
 
@@ -400,8 +209,8 @@ mod tests {
         (base, seen)
     }
 
-    fn client(base: &str) -> CouncilClient {
-        CouncilClient::new(base, Duration::from_secs(5)).unwrap()
+    fn client(base: &str) -> MkClient {
+        MkClient::new(base, Duration::from_secs(5)).unwrap()
     }
 
     fn error_body(kind: &str, extra: serde_json::Value) -> String {
@@ -478,7 +287,7 @@ mod tests {
         let err = client(&base).put_context(CTX, &put_body(), None).await.unwrap_err();
         assert_eq!(err.status(), Some(412));
         assert_eq!(err.head().unwrap().as_str(), snap('b'));
-        let CouncilError::Status { error: Some(e), .. } = &err else { panic!("{err:?}") };
+        let MkError::Status { error: Some(e), .. } = &err else { panic!("{err:?}") };
         assert_eq!(e.r#type, ErrorType::HeadMismatch);
     }
 
@@ -499,7 +308,7 @@ mod tests {
             let (base, _) = serve(vec![reply(status, body)]).await;
             let err = client(&base).decide(&decision_request(), Duration::from_secs(5)).await.unwrap_err();
             assert_eq!(err.status(), Some(status), "{err:?}");
-            let CouncilError::Status { error: Some(e), .. } = &err else { panic!("{err:?}") };
+            let MkError::Status { error: Some(e), .. } = &err else { panic!("{err:?}") };
             assert_eq!(e.param.as_deref(), Some("state_bytes"));
             assert_eq!(err.head().unwrap().as_str(), snap('c'));
         }
@@ -512,11 +321,11 @@ mod tests {
             r.headers.push(("Retry-After", "7".into()));
             let (base, _) = serve(vec![r]).await;
             let err = client(&base).get_context(CTX).await.unwrap_err();
-            let CouncilError::Status { retry_after, .. } = err else { panic!() };
+            let MkError::Status { retry_after, .. } = err else { panic!() };
             assert_eq!(retry_after, Some(Duration::from_secs(7)));
         }
         let (base, _) = serve(vec![reply(503, error_body("unavailable", json!({})))]).await;
-        let CouncilError::Status { retry_after, .. } = client(&base).get_context(CTX).await.unwrap_err() else { panic!() };
+        let MkError::Status { retry_after, .. } = client(&base).get_context(CTX).await.unwrap_err() else { panic!() };
         assert_eq!(retry_after, None);
     }
 
@@ -524,7 +333,7 @@ mod tests {
     async fn an_error_status_with_a_foreign_body_keeps_the_text() {
         let (base, _) = serve(vec![reply(502, "<html>bad gateway</html>")]).await;
         let err = client(&base).get_context(CTX).await.unwrap_err();
-        let CouncilError::Status { status, error, body, .. } = err else { panic!() };
+        let MkError::Status { status, error, body, .. } = err else { panic!() };
         assert_eq!(status, 502);
         assert!(error.is_none());
         assert!(body.contains("bad gateway"));
@@ -538,7 +347,7 @@ mod tests {
         assert_eq!(c.get_context(CTX).await.unwrap().tokens, 10);
         assert_eq!(seen.lock().unwrap()[0].method, "GET");
         let err = c.get_context(CTX).await.unwrap_err();
-        assert!(matches!(err, CouncilError::Decode { what: "context state", .. }), "{err:?}");
+        assert!(matches!(err, MkError::Decode { what: "context state", .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -548,7 +357,7 @@ mod tests {
         c.delete_context(CTX).await.unwrap();
         assert_eq!(seen.lock().unwrap()[0].method, "DELETE");
         assert_eq!(c.delete_context(CTX).await.unwrap_err().status(), Some(404));
-        assert!(matches!(c.delete_context(CTX).await.unwrap_err(), CouncilError::Decode { what: "status", .. }));
+        assert!(matches!(c.delete_context(CTX).await.unwrap_err(), MkError::Decode { what: "status", .. }));
     }
 
     #[tokio::test]
@@ -565,7 +374,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(SPEC).unwrap()
         );
         let err = c.post_spec(&spec).await.unwrap_err();
-        assert!(matches!(err, CouncilError::SpecIdMismatch { .. }), "{err:?}");
+        assert!(matches!(err, MkError::SpecIdMismatch { .. }), "{err:?}");
     }
 
     #[tokio::test]
@@ -574,7 +383,7 @@ mod tests {
         spec.questions[1].set_instructions(serde_json::from_str(r#"{"w":0.5}"#).unwrap());
         let (base, seen) = serve(vec![]).await;
         let err = client(&base).post_spec(&spec).await.unwrap_err();
-        assert!(matches!(err, CouncilError::Request(_)), "{err:?}");
+        assert!(matches!(err, MkError::Request(_)), "{err:?}");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -592,7 +401,7 @@ mod tests {
         let req = decision_request();
         let resp = client(&base).decide(&req, Duration::from_secs(5)).await.unwrap();
         assert_eq!(resp.model, "qwen3.8-flash-next");
-        crate::math::verify(&resp, &req).unwrap();
+        crate::council::math::verify(&resp, &req).unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!((seen[0].method.as_str(), seen[0].path.as_str()), ("POST", "/council/v1/decisions"));
         assert_eq!(
@@ -622,11 +431,11 @@ mod tests {
         req.contexts = Some(vec![ContextRef { id: "a".into(), at: None }, ContextRef { id: "a".into(), at: None }]);
         req.pool = None;
         let err = client(&base).decide(&req, Duration::from_secs(5)).await.unwrap_err();
-        assert!(matches!(err, CouncilError::Request(_)), "{err:?}");
+        assert!(matches!(err, MkError::Request(_)), "{err:?}");
         let mut neither = decision_request();
         neither.spec_id = None;
         neither.state = Json::from("s");
-        assert!(matches!(client(&base).decide(&neither, Duration::from_secs(5)).await, Err(CouncilError::Request(_))));
+        assert!(matches!(client(&base).decide(&neither, Duration::from_secs(5)).await, Err(MkError::Request(_))));
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -638,7 +447,7 @@ mod tests {
         let c = client(&base);
         for _ in 0..2 {
             let err = c.decide(&decision_request(), Duration::from_secs(5)).await.unwrap_err();
-            assert!(matches!(err, CouncilError::Decode { what: "decision", .. }), "{err:?}");
+            assert!(matches!(err, MkError::Decode { what: "decision", .. }), "{err:?}");
         }
     }
 
@@ -648,7 +457,7 @@ mod tests {
         slow.delay = Duration::from_millis(800);
         let (base, _) = serve(vec![slow]).await;
         let err = client(&base).decide(&decision_request(), Duration::from_millis(100)).await.unwrap_err();
-        assert!(matches!(err, CouncilError::Timeout), "{err:?}");
+        assert!(matches!(err, MkError::Timeout), "{err:?}");
     }
 
     #[tokio::test]
@@ -657,7 +466,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let err = client(&base).identity().await.unwrap_err();
-        assert!(matches!(err, CouncilError::Transport(_)), "{err:?}");
+        assert!(matches!(err, MkError::Transport(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -665,7 +474,7 @@ mod tests {
         let (base, seen) = serve(vec![]).await;
         for id in ["", "../x", "a/b", "a b", "a?b"] {
             let err = client(&base).get_context(id).await.unwrap_err();
-            assert!(matches!(err, CouncilError::Request(_)), "{id:?}");
+            assert!(matches!(err, MkError::Request(_)), "{id:?}");
         }
         assert!(seen.lock().unwrap().is_empty());
     }

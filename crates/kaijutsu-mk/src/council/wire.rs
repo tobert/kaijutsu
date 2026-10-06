@@ -264,7 +264,7 @@ impl SpecQuestion {
 }
 
 /// A held question set. Its id is the hash of its canonical JSON
-/// ([`crate::canon::spec_id`]).
+/// ([`crate::council::canon::spec_id`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spec {
     pub name: String,
@@ -716,7 +716,7 @@ pub struct ErrorBody {
 #[cfg(test)]
 pub(crate) mod tests_support {
     /// The spec of the docs' "Hold a spec once" example.
-    pub const DOC_SPEC: &str = include_str!("../tests/fixtures/spec.json");
+    pub const DOC_SPEC: &str = include_str!("../../tests/fixtures/spec.json");
 }
 
 #[cfg(test)]
@@ -724,8 +724,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const REQUEST: &str = include_str!("../tests/fixtures/decision_request.json");
-    const RESPONSE: &str = include_str!("../tests/fixtures/decision_response.json");
+    const REQUEST: &str = include_str!("../../tests/fixtures/decision_request.json");
+    const RESPONSE: &str = include_str!("../../tests/fixtures/decision_response.json");
 
     fn snap(c: char) -> String {
         format!("snap:{}", c.to_string().repeat(64))

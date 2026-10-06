@@ -355,13 +355,13 @@ mod tests {
     /// rubric the gate decides a program from.
     #[test]
     fn council_program_gate_spec_holds_the_rubric_and_the_verdict() {
-        let spec: kaijutsu_council::wire::Spec =
+        let spec: kaijutsu_mk::council::wire::Spec =
             serde_json::from_str(DEFAULT_COUNCIL_PROGRAM_GATE).expect("a council spec");
         assert_eq!(spec.name, "program-gate");
         let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
         assert_eq!(ids, ["originals", "network", "verdict"]);
-        assert!(spec.questions.iter().all(|q| matches!(q, kaijutsu_council::wire::SpecQuestion::Choice(_))));
-        kaijutsu_council::canon::spec_id(&spec).expect("the spec canonicalizes");
+        assert!(spec.questions.iter().all(|q| matches!(q, kaijutsu_mk::council::wire::SpecQuestion::Choice(_))));
+        kaijutsu_mk::council::canon::spec_id(&spec).expect("the spec canonicalizes");
     }
 
     #[test]
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn council_shell_bump_spec_names_proceed_and_two_bump_flavors() {
-        let spec: kaijutsu_council::wire::Spec =
+        let spec: kaijutsu_mk::council::wire::Spec =
             serde_json::from_str(DEFAULT_COUNCIL_SHELL_BUMP).expect("the contract's spec shape");
         assert_eq!(spec.name, "shell-bump");
         let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
@@ -404,12 +404,12 @@ mod tests {
             ["originals", "network", "verdict"],
             "the program rubric decides, then the verdict names a bump; no text question"
         );
-        let kaijutsu_council::wire::SpecQuestion::Choice(verdict) = &spec.questions[2] else {
+        let kaijutsu_mk::council::wire::SpecQuestion::Choice(verdict) = &spec.questions[2] else {
             panic!("the verdict is a choice")
         };
         let options: Vec<&str> = verdict.criteria.iter().map(|c| c.option.as_str()).collect();
         assert_eq!(options, ["proceed", "try_harder", "do_less"]);
-        kaijutsu_council::canon::spec_id(&spec).expect("the spec canonicalizes");
+        kaijutsu_mk::council::canon::spec_id(&spec).expect("the spec canonicalizes");
         assert_eq!(
             config_seed_body(&config_path("council/shell-bump.json")),
             Some(DEFAULT_COUNCIL_SHELL_BUMP)
@@ -442,9 +442,9 @@ mod tests {
         let options: Vec<&str> = criteria.iter().map(|c| c["option"].as_str().unwrap()).collect();
         assert_eq!(options, ["follows", "strays", "unclear"]);
         assert!(criteria.iter().all(|c| c["means"].as_str().is_some_and(|m| !m.is_empty())));
-        let spec: kaijutsu_council::wire::Spec =
+        let spec: kaijutsu_mk::council::wire::Spec =
             serde_json::from_str(DEFAULT_COUNCIL_DIRECTION_CHECK).expect("the contract's spec shape");
-        kaijutsu_council::canon::spec_id(&spec).expect("a spec id");
+        kaijutsu_mk::council::canon::spec_id(&spec).expect("a spec id");
         assert_eq!(
             config_seed_body(&config_path("council/direction-check.json")),
             Some(DEFAULT_COUNCIL_DIRECTION_CHECK)
