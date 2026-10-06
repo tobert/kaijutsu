@@ -1678,9 +1678,13 @@ async fn mirror_ops(bridge: &KernelBridge, app: &mut App, ctx: ContextId, ops: &
             // The draft is the kernel's copy; a failed edit means the two have
             // diverged, and saying so beats typing into a line that is no
             // longer going anywhere.
-            Err(e) => app.note(format!("draft edit failed: {e}")),
+            Err(e) => app.note(draft_edit_failure(&e)),
         }
     }
+}
+
+fn draft_edit_failure(error: &anyhow::Error) -> String {
+    format!("draft edit failed: {error:#}")
 }
 
 /// One keystroke on the compose surface: mirror what the vi engine did onto
@@ -2875,6 +2879,14 @@ mod tests {
         ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
     };
     use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+
+    #[test]
+    fn a_draft_edit_failure_names_the_underlying_refusal() {
+        let error = anyhow::anyhow!("context has no binding: edit_input is denied").context("edit input doc");
+        let note = draft_edit_failure(&error);
+        assert!(note.contains("edit input doc"));
+        assert!(note.contains("context has no binding: edit_input is denied"), "{note}");
+    }
 
     #[test]
     fn over_a_full_screen_surface_the_prefix_moves_seats_and_feeds_vim() {

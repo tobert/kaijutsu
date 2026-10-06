@@ -471,7 +471,7 @@ mod tests {
         assert!(seed_body("/config/rc/mcp/create/S00-stance.md").is_none());
         assert!(seed_body("/config/rc/mcp/create/S00-stance.kai").is_none());
 
-        for context_type in ["coder", "default", "director"] {
+        for context_type in ["coder", "default", "director", "council"] {
             let path = format!("/config/rc/{context_type}/create/S00-stance.md");
             let stance = seed_body(&path).unwrap_or_else(|| panic!("missing {path}"));
             let stance = stance.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -494,6 +494,7 @@ mod tests {
             "/config/rc/coder/create/S00-stance.md",
             "/config/rc/default/create/S00-stance.md",
             "/config/rc/director/create/S00-stance.md",
+            "/config/rc/council/create/S00-stance.md",
             "/config/rc/director/create/S00-stance.kai",
             "/config/rc/assistant/create/S00-stance.kai",
             "/config/rc/director/create/S06-kj-help.md",

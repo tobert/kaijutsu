@@ -481,7 +481,26 @@ mass_floor = -0.05             # each read's verdict mass, a log probability
 
 [context_type.coder.council]
 enabled = true
+
+[context_type.director.council]
+enabled = true
+contexts = ["council-amy", "council-banto"]
 ```
+
+A context type's `contexts` replaces `[council] contexts` for that type.
+Omitting it keeps the shared list. The replacement must hold at least one
+distinct, non-empty label and cannot repeat a spec's own context. Specs,
+thresholds, worked examples, voices, and house rules keep their shared
+settings. Explicitly listing `council-banto` makes it a voting read; this
+does not enable reviewer-chain voices or their observations.
+
+To chat with a council context, give it `facade:edit_input` and
+`facade:submit_input`, a live model performer with a distinct reviewer,
+and a model. Its system instruction can ask it to think about submitted
+guidance and acknowledge it briefly. The council server supplies decisions;
+the context's regular model supplies these chat replies. Finished thinking
+and replies reach the next council decision through the same projection
+as its user guidance. A context with no binding denies compose input.
 
 A spec's `require_agree` overrides `[council] require_agree` for its own
 decisions; the bump-only bench turns it off for programs. A decision that

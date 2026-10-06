@@ -1619,7 +1619,6 @@ pub(crate) async fn consult(
         return Ok(None);
     }
     let Ok(config) = config else { return Ok(None) };
-    let Some(council) = config.council() else { return Ok(None) };
     let (Some(context_id), Some(command)) = (caller.context_id, spec.exec_source.as_deref()) else {
         return Ok(None);
     };
@@ -1669,6 +1668,7 @@ pub(crate) async fn consult(
             .and_then(|row| row.cwd);
         (context_type, cwd)
     };
+    let Some(council) = config.council_for(context_type.as_deref()) else { return Ok(None) };
     let Some(shell) = shell_spec(council) else { return Ok(None) };
     let chain = super::voices::voice_chain(&kernel.kernel_db().lock(), council, context_id, caller.actor_id);
     let submission = Submission {

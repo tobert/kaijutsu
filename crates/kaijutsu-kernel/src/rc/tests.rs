@@ -3004,6 +3004,29 @@ esac
         });
     }
 
+    #[test]
+    fn council_chat_has_input_facades_and_its_own_stance() {
+        crate::on_rc_thread(|| async {
+            let d = std::sync::Arc::new(test_dispatcher_rc().await);
+            d.set_self_arc();
+            let caller = console_caller(&d);
+            let args: Vec<String> = ["context", "create", "council-chat", "--type", "council"].map(String::from).to_vec();
+            let r = d.dispatch(&args, &caller).await;
+            assert!(r.is_ok(), "create failed: {}", r.message());
+            let ctx = lookup_context_id(&d, "council-chat");
+            let binding = d.kernel().broker().binding(&ctx).await.expect("council rc binds input");
+            assert_eq!(binding.allowed_facades, ["edit_input", "submit_input", "commit_capture"]);
+            assert!(binding.allowed_instances.is_empty());
+            assert!(binding.allowed_tools.is_empty());
+            assert!(!binding.all_instances && !binding.all_facades);
+            let blocks = d.block_store().block_snapshots(ctx).unwrap();
+            let instructions: Vec<_> = blocks.iter().filter(|b| b.role == kaijutsu_types::Role::System && b.kind == kaijutsu_types::BlockKind::Text).collect();
+            assert_eq!(instructions.len(), 1);
+            assert!(instructions[0].content.contains("acknowledge"));
+            assert!(instructions[0].content.contains("Amy is accountable"));
+        });
+    }
+
     /// A coder starts clean: no fleet or memory recall digest. That script
     /// read one person's notes from paths fixed in its source and put their
     /// index into every coder context (Amy, 2026-10-03: "want coder clean").

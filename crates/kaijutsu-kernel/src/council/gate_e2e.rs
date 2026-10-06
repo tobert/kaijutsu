@@ -1270,6 +1270,27 @@ async fn with_voices_off_the_decision_reads_the_configured_contexts() {
     }
 }
 
+#[tokio::test]
+async fn a_context_type_reads_its_own_council_without_changing_other_types() {
+    use crate::vfs::VfsOps;
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        live_context(rig.d.kernel(), "council-amy");
+        live_context(rig.d.kernel(), "council-banto");
+        let toml = format!("{}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n", gate_toml(&rig.mock.base, &Setup::default()));
+        rig.d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/gate.toml"), toml.as_bytes()).await.unwrap();
+        rig.mock.set(allow_each);
+        rig.submit("echo inherited").await.unwrap();
+        rig.d.kernel().kernel_db().lock().update_context_type(rig.ctx.context_id, "director").unwrap();
+        rig.submit("echo director").await.unwrap();
+        let sent = rig.mock.decisions();
+        assert_eq!(sent.len(), 2, "{via:?}");
+        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+        assert_eq!(Rig::read_ids(&sent[1]), [rig.context_of("council-amy"), rig.context_of("council-banto")], "{via:?}");
+        rig.finish().await;
+    }
+}
+
 /// A decision's 404 naming the spec is a miss, and the next decision posts
 /// the spec again before it asks. The contexts the server still holds are
 /// not sent again.

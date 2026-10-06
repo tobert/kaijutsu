@@ -94,6 +94,13 @@ system prompt is the only one its model reads; `register_session` returns no
 instruction text. Guidance for that agent belongs in the MCP server's
 instructions or the `shell` tool description.
 
+The council type is a chat context for council guidance. Its own stance asks
+the model to think about submitted guidance and acknowledge it in one or two
+sentences. Its loadout grants compose input, capture, and editor access, with
+no model tools. Assign a live performer, a distinct reviewer, and a model
+before chatting. Finished thinking and replies become council guidance;
+see `docs/council.md`, "Council contexts are kaijutsu contexts".
+
 The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.

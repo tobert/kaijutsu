@@ -3880,3 +3880,21 @@ holds `lib/create/S00-base.{kai,md}`, the `S00-base` links under `coder`,
 there would run both the old base and the old tiered `S00-stance.kai`. When we
 next deploy zorak, delete those files by hand, then run
 `kaijutsu-server rc reseed --force`. Delete this entry once that is done.
+
+## Client ledger reads inherit worker policy (2026-10-06)
+
+The TUI's quiet pending-ask poll runs `kj ledger list` in the displayed
+context (`kaijutsu-client/src/ledger.rs`). A coder context intentionally
+denies `kj ledger`, so Amy sees `cannot refresh pending asks: denied by the
+gate policy: context_type config (coder) denies kj ledger`. Client ledger
+reads and human decisions need their review context without widening the
+coder's model loadout or removing its static deny. The same shared helper
+serves other clients; correct the common path and verify over RPC.
+
+## Live council exclusions require staging (2026-10-06)
+
+`kj stage include|exclude` currently refuses a live context, while the prompt
+and council docs describe exclusions as the way to tune live guidance.
+The client's `setBlockExcluded` RPC works on live contexts. Align the `kj`
+curation behavior with the documented rule and test both live and staging
+contexts before changing the docs or adding another command.

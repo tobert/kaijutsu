@@ -3255,3 +3255,27 @@ per-kernel counter stamps output spans, so merged stdout and stderr can follow
 write order.
 
 Credits: Claude Opus 5.5; DeepSeek flash via kaibo for reviews and studies.
+
+## Council guidance becomes chat (October 6)
+
+Amy separated the director council from coder's: `council-amy` starts with
+her home `AGENTS.md`, and `council-banto` starts with the director stance.
+Each context keeps evolving through chat. A context type can now replace
+the shared council context list without changing the specs, thresholds, or
+other types. Explicitly naming Banto's context makes it a voting read; the
+reviewer-chain observation policy stays separate.
+
+The hand-seeded council contexts had no binding, so the TUI refused compose
+input. They now have input permissions and a council performer, reviewed by
+Amy, using DeepSeek flash. The shipped `council` lifecycle owns a small
+loadout and an acknowledgment stance: think about the person's guidance,
+then acknowledge it briefly. Source snapshots and a one-time seed script
+live under `contrib/council/`. Finished thinking and model replies use the
+existing council projection. Live compose RPC checks produced both on the
+two new contexts; setup-check turns were excluded afterward.
+
+The TUI hid the underlying draft refusal behind `edit input doc`. It now
+shows the complete error chain. Council tests cover type selection on both
+execution paths, and the rc test covers the chat stance and input loadout.
+
+Credits: Codex.

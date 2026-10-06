@@ -364,8 +364,8 @@ pub(crate) struct GateConfig {
     global: TierTable,
     context_types: BTreeMap<String, TierTable>,
     council: Option<CouncilConfig>,
-    /// Context types whose `[context_type.<type>.council]` says `enabled = true`.
-    council_enabled: std::collections::BTreeSet<String>,
+    /// Enabled councils by context type, with any context override applied.
+    council_by_type: BTreeMap<String, CouncilConfig>,
 }
 
 /// How the kernel pools the council's per-context reads.
@@ -565,6 +565,8 @@ struct CouncilThresholdToml {
 #[serde(deny_unknown_fields)]
 struct CouncilSwitchToml {
     enabled: bool,
+    #[serde(default)]
+    contexts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -640,7 +642,7 @@ impl GateConfig {
             global: Self::table_from(&raw.global, "[global]")?,
             context_types: BTreeMap::new(),
             council: None,
-            council_enabled: Default::default(),
+            council_by_type: BTreeMap::new(),
         };
         if raw.global.council.is_some() {
             return Err(GateConfigError::Parse(
@@ -649,22 +651,48 @@ impl GateConfig {
                     .into(),
             ));
         }
+        if let Some(council) = &raw.council {
+            config.council = Some(Self::council_from(council)?);
+        }
         for (context_type, tier) in &raw.context_type {
             let section = format!("[context_type.{context_type}]");
             config
                 .context_types
                 .insert(context_type.clone(), Self::table_from(tier, &section)?);
-            if tier.council.as_ref().is_some_and(|c| c.enabled) {
-                config.council_enabled.insert(context_type.clone());
+            if let Some(switch) = &tier.council {
+                let section = format!("[context_type.{context_type}.council]");
+                let Some(mut council) = config.council.clone() else {
+                    if switch.enabled || switch.contexts.is_some() {
+                        return Err(GateConfigError::Parse(format!(
+                            "{section}: the file has no [council] section to enable or override"
+                        )));
+                    }
+                    continue;
+                };
+                if let Some(contexts) = &switch.contexts {
+                    if contexts.is_empty() {
+                        return Err(GateConfigError::Parse(format!("{section} contexts: at least one label is required")));
+                    }
+                    for (i, label) in contexts.iter().enumerate() {
+                        let why = if label.trim().is_empty() {
+                            Some("labels must be non-empty".to_string())
+                        } else if contexts[..i].contains(label) {
+                            Some(format!("`{label}` is listed twice"))
+                        } else if let Some(spec) = council.specs.iter().find(|s| s.contexts.contains(label)) {
+                            Some(format!("`{label}` is already in spec {} contexts", spec.name))
+                        } else {
+                            None
+                        };
+                        if let Some(why) = why {
+                            return Err(GateConfigError::Parse(format!("{section} contexts: {why}")));
+                        }
+                    }
+                    council.contexts = contexts.clone();
+                }
+                if switch.enabled {
+                    config.council_by_type.insert(context_type.clone(), council);
+                }
             }
-        }
-        if let Some(council) = &raw.council {
-            config.council = Some(Self::council_from(council)?);
-        } else if let Some(name) = config.council_enabled.iter().next() {
-            return Err(GateConfigError::Parse(format!(
-                "[context_type.{name}.council] enabled = true: the file has no [council] section \
-                 to enable"
-            )));
         }
         Ok(config)
     }
@@ -859,16 +887,21 @@ impl GateConfig {
     }
 
     /// The council's settings, when the file declares `[council]`.
+    #[cfg(test)]
     pub(crate) fn council(&self) -> Option<&CouncilConfig> {
         self.council.as_ref()
+    }
+
+    /// The enabled council for a context type, with its context override.
+    pub(crate) fn council_for(&self, context_type: Option<&str>) -> Option<&CouncilConfig> {
+        context_type.and_then(|t| self.council_by_type.get(t))
     }
 
     /// Whether the council reads for a caller of `context_type`: the file
     /// declares `[council]` and the type's own section enables it. Off for
     /// every other type, and for a caller with no type.
     pub(crate) fn council_enabled_for(&self, context_type: Option<&str>) -> bool {
-        self.council.is_some()
-            && context_type.is_some_and(|t| self.council_enabled.contains(t))
+        self.council_for(context_type).is_some()
     }
 
     fn table_from(tier: &TierToml, section: &str) -> Result<TierTable, GateConfigError> {
@@ -2669,6 +2702,28 @@ enabled = false
         assert!(!cfg.council_enabled_for(Some("toolie")), "enabled = false");
         assert!(!cfg.council_enabled_for(Some("director")), "unmentioned type");
         assert!(!cfg.council_enabled_for(None), "no context type");
+    }
+
+    #[test]
+    fn a_context_type_can_replace_the_council_contexts() {
+        let cfg = config(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = true\ncontexts = [\"council-amy\", \"council-banto\"]\n"));
+        let director = cfg.council_for(Some("director")).unwrap();
+        assert_eq!(director.contexts, ["council-amy", "council-banto"]);
+        let coder = cfg.council_for(Some("coder")).unwrap();
+        assert_eq!(coder.contexts, ["voice", "system-rules"]);
+        assert_eq!(director.specs, coder.specs);
+        assert_eq!(director.thresholds, coder.thresholds);
+        assert!(cfg.council_for(Some("toolie")).is_none());
+        assert!(cfg.council_for(None).is_none());
+    }
+
+    #[test]
+    fn a_context_type_council_rejects_empty_duplicate_and_spec_contexts() {
+        for contexts in ["[]", "[\"\"]", "[\"a\", \"a\"]", "[\"examples\"]"] {
+            let base = council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"examples\"]");
+            let m = council_err(&format!("{base}\n[context_type.director.council]\nenabled = true\ncontexts = {contexts}\n"));
+            assert!(m.contains("context_type.director.council"), "{m}");
+        }
     }
 
     #[test]

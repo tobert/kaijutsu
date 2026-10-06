@@ -1,0 +1,13 @@
+# Run once from Amy's Kaijutsu shell after rc reseed.
+# Existing labels refuse creation; never overwrite their conversation.
+set -e
+data="$(dirname "$0")/director"
+
+kj character create council
+kj context create council-amy --top --type council --as council -m deepseek/deepseek-v4-flash
+kj context set council-amy --reviewer amy
+kj block create -c council-amy --role user --kind text --content-type text/markdown < "$data/amy.md"
+
+kj context create council-banto --top --type council --as council -m deepseek/deepseek-v4-flash
+kj context set council-banto --reviewer amy
+kj block create -c council-banto --role user --kind text --content-type text/markdown < "$data/banto.md"

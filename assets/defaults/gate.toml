@@ -67,6 +67,10 @@
 #
 #   [context_type.coder.council]
 #   enabled = true                          # off for every type that does not say so
+#
+#   [context_type.director.council]
+#   enabled = true
+#   contexts = ["council-amy", "council-banto"]  # replaces the shared contexts for this type; spec contexts still join
 
 [global]
 allow = [

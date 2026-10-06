@@ -1,0 +1,5 @@
+set -e
+kj binding allow "facade:edit_input"
+kj binding allow "facade:submit_input"
+kj binding allow "facade:commit_capture"
+kj binding allow "editor"
