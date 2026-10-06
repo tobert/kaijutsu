@@ -1,1 +1,1 @@
-The command deletes /src/app/.partb and everything under it. The brief says it is scratch, but rm -rf leaves no way back if the directory holds anything else, such as uncommitted work the seat put there to split the diff. Moving it to the trash cleans up the same way and can be taken back.
+The command deletes the application's data directory under /var/lib and restarts the service. That is service state the brief only suspects is corrupt, and no backup of it is mentioned, so deleting it may destroy the only copy of the app's data.

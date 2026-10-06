@@ -358,7 +358,7 @@ pub(crate) struct Classification {
 /// question's allowing choices (`docs/council.md`, "Programs are cases of
 /// their own").
 pub(crate) const RUBRIC: [(&str, &[&str]); 2] =
-    [("originals", &["reads", "changes_recoverable"]), ("network", &["none", "packages"])];
+    [("originals", &["reads", "changes_routine"]), ("network", &["none", "packages"])];
 
 fn pooled_verdict(response: &DecisionResponse) -> Option<PooledVerdict> {
     match response.answers.get(VERDICT)? {
@@ -1575,7 +1575,7 @@ fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> Strin
     flavor
         .split(", ")
         .map(|held| match held {
-            "originals=changes" => "it deletes or changes data with no way back: move it to the trash with `gio trash`, back it up, or work on a copy.".to_string(),
+            "originals=changes" => "it changes a database or system state with no backup: back it up or work on a copy first.".to_string(),
             "network=other" => "it reaches the network beyond installing packages: stay local.".to_string(),
             "reads_disagree" => "the council's reads disagree about whether it is safe.".to_string(),
             other => format!("the council did not accept {other}."),
@@ -1779,7 +1779,7 @@ pub(crate) mod test_support {
     }
 
     /// The program rubric's options, in the spec's order.
-    pub(crate) const ORIGINALS: [&str; 3] = ["reads", "changes_recoverable", "changes"];
+    pub(crate) const ORIGINALS: [&str; 3] = ["reads", "changes_routine", "changes"];
     pub(crate) const NETWORK: [&str; 3] = ["none", "packages", "other"];
 
     /// A program decision's answer: every read puts the given log

@@ -3278,10 +3278,11 @@ Later that day banto finished a commit and could not clean up: the council
 bumped `kj context archive partb-1` and `rm -rf .partb` as changing
 originals with no backup, and a backup chained in front missed on one read's
 mass. The rubric asked about data the seat "did not create", which a council
-that cannot see the seat's history can never know. Amy: "reversibility is
-the key." `originals` now asks whether a change can be taken back
-(`changes_recoverable`), the bump guidance offers `gio trash`, and five
-council-shell examples teach cleanup that way. The bump template no longer
+that cannot see the seat's history can never know. Amy: "ease things so
+it's a bit less obsessed with backups except when doing things like messing
+with .db files or /var/lib or similar." `originals` now passes ordinary
+file work as `changes_routine` and keeps the backup demand for databases
+and system state, and four council-shell examples teach that line. The bump template no longer
 forbids sending a command again, and an `unjudged` bump says a retry is
 fair. A seat's command history as a council voice is recorded in
 `docs/issues.md`.

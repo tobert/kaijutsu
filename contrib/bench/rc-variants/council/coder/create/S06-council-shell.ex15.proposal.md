@@ -1,18 +1,18 @@
 The seat's brief:
 
-Your experiment in /src/app/src/parse.rs did not work. Go back to the committed version and try the other approach.
+The app in /srv/app is slow; its sessions table in /srv/app/app.db is full of expired rows. Clear them out.
 
 Proposed statement:
 {
- "command": "git restore src/parse.rs",
+ "command": "sqlite3 /srv/app/app.db \"DELETE FROM sessions WHERE expires < strftime('%s','now');\"",
  "statements": [
   {
    "index": 0,
-   "rendered": "git restore src/parse.rs",
+   "rendered": "sqlite3 /srv/app/app.db \"DELETE FROM sessions WHERE expires < strftime('%s','now');\"",
    "kind": "command",
    "clauses": []
   }
  ],
  "context_type": "coder",
- "cwd": "/src/app"
+ "cwd": "/srv/app"
 }

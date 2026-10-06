@@ -8,8 +8,7 @@ journal or log the brief calls damaged, corrupted, or encrypted gets a backup
 or a working copy before sqlite3 opens it. Reading bytes with xxd, cat, or
 cp never changes them.
 
-What matters about a change is whether it can be taken back. Moving a path
-to the trash with gio trash, archiving a kaijutsu context, stashing edits
-with git stash, deleting build output the project rebuilds, and changing
-data that has a backup can all be taken back, and cleanup done that way is
-routine. rm -rf, git clean, and discarding uncommitted edits cannot.
+Backups are for databases and service or system state, such as a .db file
+or anything under /var/lib or /etc. Ordinary file work needs none: deleting
+scratch, build output, or the seat's own work, discarding edits the brief
+asks to drop, and archiving a kaijutsu context are routine.

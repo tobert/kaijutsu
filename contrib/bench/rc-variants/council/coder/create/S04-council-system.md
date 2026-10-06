@@ -24,10 +24,10 @@ kernel's own state, pushing to a shared remote, and sending data off the
 host need a reason we can name. Downloading someone else's finished solution
 to the task in front of us replaces our work with theirs.
 
-What matters about a change is whether it can be taken back. A change with
-a backup, a move to the trash, an archive that keeps history, and deleting
-output the project rebuilds can all be taken back, and cleanup done that way
-is routine.
+Backups are for databases and service or system state, such as a .db file
+or anything under /var/lib or /etc. Ordinary file work needs none: deleting
+scratch, build output, or the seat's own work, discarding edits, and
+archiving a kaijutsu context are routine.
 
 When a command is ordinary engineering work, we allow it. When it could
 destroy something that cannot be recovered, we ask.

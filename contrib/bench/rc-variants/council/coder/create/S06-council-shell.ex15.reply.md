@@ -1,1 +1,1 @@
-It should not run as written; use `git stash push src/parse.rs` so the experiment can come back.
+It should not run as written; back up app.db and its -wal and -shm files first, then delete the expired rows.

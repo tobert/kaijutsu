@@ -376,11 +376,11 @@ does, so the council reads the file too (`council/programs.rs`).
   `language` (`python`, `shell`, or `shebang`), `context_type`, `cwd`,
   `imports_not_shown`, and `program`, the text, last.
 - **The program spec decides on its rubric.** `program-gate.json` asks
-  `originals` (`reads`, `changes_recoverable`, `changes`; opening data with a
+  `originals` (`reads`, `changes_routine`, `changes`; opening data with a
   program that can write to it counts as changing it), `network` (`none`,
   `packages`, `other`), and `verdict`, all choice questions: the megakernel
   does not answer `text`. A program decision allows when the pooled
-  `originals` is `reads` or `changes_recoverable` and the pooled `network` is
+  `originals` is `reads` or `changes_routine` and the pooled `network` is
   `none` or `packages`, and, with `require_agree`, every read's own answers
   are too. Otherwise a `verdict` argmax of `report` reports and anything
   else asks. Probes on the megakernel (2026-10-04) found per-question
@@ -611,20 +611,20 @@ action refused with guidance and tries again, with no human in the loop.
   rubric; otherwise it bumps, and its flavor names the rubric answers that
   held it (`originals=changes`, `network=other`). The submission runs only
   when the shell decision and every program decision pass.
-- **`originals` asks whether a change can be taken back.** A change is
-  `changes_recoverable` when a backup or copy exists, it moves to the
-  trash, git holds it with no uncommitted changes, the command keeps its
-  history (`kj context archive`), or the project rebuilds it. `changes`
-  deletes or overwrites with no way back, and its guidance offers
-  `gio trash`, a backup, or a copy. `gio trash` works from a seat's shell
-  on moltar under the home directory and refuses tmpfs mounts such as
-  `/tmp` (checked 2026-10-06). The council cannot see who created a
-  file, so authorship was the wrong question: a director's `rm -rf` of its
-  own scratch and an archive of its own lane were bumped on 2026-10-06. A
-  shell spec that names any rubric question must carry the whole rubric
-  with its passing options, or the decision is a miss naming what is
-  missing; a host seeded before the rename misses rather than bumping every
-  recoverable change.
+- **`originals` saves backups for databases and system state.** A change
+  is `changes_routine` when it touches ordinary files (source, scratch,
+  build output, the seat's own work), when a backup exists, or when the
+  command keeps history (`kj context archive`). `changes` touches a
+  database, service, or system state, such as a `.db` file or anything
+  under `/var/lib` or `/etc`, with no backup. The rubric used to ask about
+  data the seat "did not create", which the council cannot see: a
+  director's `rm -rf` of its own scratch and an archive of its own lane
+  were bumped on 2026-10-06. Amy: "ease things so it's a bit less obsessed
+  with backups except when doing things like messing with .db files or
+  /var/lib or similar." A shell spec that names any rubric question must
+  carry the whole rubric with its passing options, or the decision is a
+  miss naming what is missing; a host seeded before the rename misses
+  rather than bumping every routine change.
 - **The fallback does not change.** A control-text hit, a miss, and a
   program that was not judged leave the ordinary ask (except in bump-only
   mode, below).

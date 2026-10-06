@@ -2386,7 +2386,7 @@ async fn a_bumper_spec_without_proceed_is_refused_as_a_miss() {
 
 /// A shell spec that names one rubric question must carry the whole rubric
 /// with its passing options; a spec seeded before `changes_backed_up`
-/// became `changes_recoverable` is a miss that names the missing option,
+/// became `changes_routine` is a miss that names the missing option,
 /// not a bump on every change.
 ///
 /// Falsified by a shell case that skips the rubric check: the stale spec
@@ -2395,14 +2395,14 @@ async fn a_bumper_spec_without_proceed_is_refused_as_a_miss() {
 async fn a_shell_spec_with_a_stale_rubric_is_a_miss() {
     for via in BOTH {
         let rig = rig(via, bumper(3)).await;
-        let stale = crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP.replace("changes_recoverable", "changes_backed_up");
-        assert_ne!(stale, crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP, "the seed names changes_recoverable");
+        let stale = crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP.replace("changes_routine", "changes_backed_up");
+        assert_ne!(stale, crate::config_seed::DEFAULT_COUNCIL_SHELL_BUMP, "the seed names changes_routine");
         rig.write("/config/kernel/council/shell-bump.json", &stale).await;
         assert_pending(via, rig.submit("touch /work/a").await);
         let decision = the_decision(&rig, &rig.only_ask());
         assert_eq!(decision.decision.outcome, CouncilOutcome::Miss);
         let cause = decision.decision.miss_cause.unwrap();
-        assert!(cause.contains("changes_recoverable"), "{via:?}: {cause}");
+        assert!(cause.contains("changes_routine"), "{via:?}: {cause}");
         rig.finish().await;
     }
 }
@@ -2422,7 +2422,8 @@ async fn a_flagged_program_bumps_with_its_rubric_guidance() {
             }
         });
         let text = refusal_text(via, rig.submit_gate("python3 /work/wipe.py").await);
-        assert!(text.contains("with no way back: move it to the trash with `gio trash`"), "{via:?}: {text}");
+        assert!(text.contains("a database or system state with no backup"), "{via:?}: {text}");
+        assert!(!text.contains("trash"), "{via:?}: {text}");
         assert!(rig.asks().is_empty());
         assert_eq!(bump_flavors(&rig, &digest_of("python3 /work/wipe.py")), ["originals=changes"]);
         rig.finish().await;

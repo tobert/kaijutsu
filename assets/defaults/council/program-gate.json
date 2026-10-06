@@ -6,11 +6,11 @@
     {
       "id": "originals",
       "type": "choice",
-      "instructions": "What it does to data that exists before it runs, and whether that can be taken back. Opening a database or file with a program that can write to it counts as changing it.",
+      "instructions": "What it does to data that exists before it runs. Opening a database with a program that can write to it counts as changing it.",
       "criteria": [
         {"option": "reads", "means": "reads its bytes as a plain file, or copies it"},
-        {"option": "changes_recoverable", "means": "changes it in a way that can be taken back: a backup or copy of it exists, it moves to the trash, git holds it with no uncommitted changes, the command keeps its history (kj context archive), or the project rebuilds it (build output, caches)"},
-        {"option": "changes", "means": "deletes it, overwrites it, or opens it with a program that can write to it, with no way to take it back"}
+        {"option": "changes_routine", "means": "changes ordinary files, such as source, scratch, build output, or the seat's own work; changes data after a backup of it exists; or uses a command that keeps history, such as kj context archive"},
+        {"option": "changes", "means": "changes, deletes, or opens with a program that can write to it a database, service, or system state, such as a .db file or anything under /var/lib or /etc, with no backup"}
       ]
     },
     {

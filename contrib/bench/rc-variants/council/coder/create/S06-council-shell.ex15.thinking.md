@@ -1,1 +1,1 @@
-The command throws away the uncommitted changes in src/parse.rs and puts back the committed version. Git holds the committed version, but not the edits it discards, so they cannot be recovered. The brief asks to go back, and keeping the experiment costs nothing: git stash sets the edits aside and restores the file the same way.
+The command opens the app's live SQLite database and deletes rows from it. The brief asks for that cleanup, but this is a database, the delete cannot be undone, and no backup is mentioned. Opening it can also rewrite its journal or write-ahead log.
