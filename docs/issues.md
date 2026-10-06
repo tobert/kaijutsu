@@ -1048,12 +1048,11 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   policy does not cover; `runtime/llm_stream.rs` deliberately does not retry
   mid-stream to avoid duplicate kernel blocks. Bring partial-block handling to
   the design before changing it.
-- **The factory output ceiling is small for DeepSeek's reasoning.**
-  `max_tokens` 16384 counts reasoning too; at effort `max` it truncated a
-  `write` on `regex-log` and, on 2026-10-03, ended three turns that reasoned
-  past it. The factory effort is now `high`, and the benchmark adapter passes
-  65536 on DeepSeek. Every other caller of the factory 16384 is unchanged;
-  a per-model ceiling would remove the single number.
+- **The bench adapter duplicates DeepSeek's output budget.**
+  `contrib/bench/harbor/kaijutsu_solo_agent.py` passes 65536 on DeepSeek
+  when `KAIJUTSU_ACP_MAX_TOKENS` is unset. DeepSeek's factory model rows now
+  carry `max_tokens` 65536 at effort `high` (`seed_backends::DEEPSEEK_TUNING`),
+  so the adapter's copy can go once a run confirms the kernel sends 65536.
 - **Harbor puts the provider key in process arguments.** `run-harbor.sh`
   passes `--ae DEEPSEEK_API_KEY=…`, and Harbor's `docker-compose exec -e
   DEEPSEEK_API_KEY=sk-…` shows the key to anyone running `ps` on the host

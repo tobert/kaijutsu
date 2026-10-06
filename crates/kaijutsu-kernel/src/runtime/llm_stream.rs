@@ -17,7 +17,7 @@ use kaijutsu_types::{BlockKind, ContentType, Role, Status, summarize_thinking};
 use crate::flows::{TurnFlow, TurnOrigin, TurnStopReason};
 use crate::kernel_db::KernelDb;
 use crate::llm::stream::{
-    BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_slot_tunables,
+    BuildOpts, CacheTarget, InlineToolResult, StreamEvent, apply_tunables,
     longest_cache_ttl_secs,
 };
 use crate::llm::SlotTunables;
@@ -591,7 +591,7 @@ pub(super) async fn spawn_admitted_turn(
             }
         }
     };
-    let provider_resolution: Result<(Arc<Provider>, String, u64, Option<SlotTunables>, StreamTimeouts), String> = {
+    let provider_resolution: Result<(Arc<Provider>, String, u64, SlotTunables, StreamTimeouts), String> = {
         let registry = kernel_arc.llm().read().await;
         let max_tokens = registry.max_output_tokens();
 
@@ -618,7 +618,8 @@ pub(super) async fn spawn_admitted_turn(
                         kernel_arc.timeouts(),
                         registry.backend_config(&resolved.backend),
                     );
-                    Ok((p, resolved.model, max_tokens, resolved.tunables, timeouts))
+                    let tunables = resolved.tunables_in(&registry);
+                    Ok((p, resolved.model, max_tokens, tunables, timeouts))
                 }
                 // A resolved backend must be registered; falling back would
                 // send the pinned model name to a different provider.
@@ -631,7 +632,7 @@ pub(super) async fn spawn_admitted_turn(
             None => Err("No LLM backend configured (see `kj backend list`)".to_string()),
         }
     };
-    let (provider, model_name, max_output_tokens, slot_tunables, stream_timeouts) = match provider_resolution {
+    let (provider, model_name, max_output_tokens, tunables, stream_timeouts) = match provider_resolution {
         Ok(v) => v,
         Err(detail) => {
             tracing::error!("LLM resolution failed for context {context_id}: {detail}");
@@ -727,7 +728,7 @@ pub(super) async fn spawn_admitted_turn(
         let run = process_llm_stream(
             provider, documents, context_id, model_name, kernel_arc, kernel_db,
             tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts,
-            slot_tunables, conversation_cache, user_principal_id,
+            tunables, conversation_cache, user_principal_id,
             Some(TurnSpanIdentity { performer, reviewer, director, review_source: review.source }),
             tool_ctx, interrupt, turn_lease, origin,
             continuation_epoch,
@@ -2159,8 +2160,8 @@ async fn process_llm_stream(
     stream_timeouts: StreamTimeouts,
     // The context's resolved cast-seat tunables (`resolve_context_model`),
     // already cascaded onto `llm_defaults`; `None` when no cast seat answered
-    // (the floor then applies at the `apply_slot_tunables` seam below).
-    slot_tunables: Option<SlotTunables>,
+    // (the floor then applies at the `apply_tunables` seam below).
+    tunables: SlotTunables,
     conversation_cache: Arc<ConversationCache>,
     // The requester authors the TurnFlow outcome event; provider blocks
     // use the performing character carried by tool_ctx.
@@ -2199,7 +2200,7 @@ async fn process_llm_stream(
         kernel.turns().open_ingress(context_id, turn_id, turn_lease.interrupt());
         let outcome = std::panic::AssertUnwindSafe(run_llm_stream(
             provider, documents.clone(), context_id, model_name, kernel.clone(), kernel_db.clone(),
-            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, slot_tunables,
+            tools, after_block_id, system_prompt, max_output_tokens, stream_timeouts, tunables,
             conversation_cache, user_principal_id, span_identity, tool_ctx, interrupt, origin,
             continuation_epoch, &mut *mailbox, &turn_lease,
         )).catch_unwind().await;
@@ -2297,8 +2298,8 @@ async fn run_llm_stream(
     stream_timeouts: StreamTimeouts,
     // The context's resolved cast-seat tunables (`resolve_context_model`),
     // already cascaded onto `llm_defaults`; `None` when no cast seat answered
-    // (the floor then applies at the `apply_slot_tunables` seam below).
-    slot_tunables: Option<SlotTunables>,
+    // (the floor then applies at the `apply_tunables` seam below).
+    tunables: SlotTunables,
     conversation_cache: Arc<ConversationCache>,
     // The requester authors the TurnFlow outcome event; provider blocks
     // use the performing character carried by tool_ctx.
@@ -2538,25 +2539,15 @@ async fn run_llm_stream(
             }
         };
 
-        // Overlay the LLM tunables cascade (max_tokens/temperature/top_p/
-        // effort/thinking_budget/thinking_style) onto the request:
-        // `slot_tunables` is the context's resolved cast seat (already
-        // cascaded onto `llm_defaults` by `resolve_context_model`); when no
-        // seat answered, `floor` (the bare `llm_defaults` row) applies, so a
-        // kernel with no casts configured still gets its defaults on every
-        // request.
-        let default_tunables = {
-            let registry = kernel.llm().read().await;
-            registry.default_tunables().clone()
-        };
-        let build_opts = apply_slot_tunables(
+        // The tunables were resolved with the model: cast slot, then the
+        // model's row, then the `llm_defaults` floor.
+        let build_opts = apply_tunables(
             BuildOpts::new(&model_name)
                 .with_system(&system_prompt)
                 .with_max_tokens(max_output_tokens)
                 .with_tools(tools.clone())
                 .with_cache_breakpoints(cache_breakpoints),
-            slot_tunables.as_ref(),
-            &default_tunables,
+            &tunables,
         );
 
         // `retry_disposition` decides which startup failures keep the
@@ -3617,7 +3608,7 @@ mod publish_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             None,
@@ -5062,7 +5053,7 @@ mod publish_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             None,
@@ -6020,7 +6011,7 @@ mod usage_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             Some(TurnSpanIdentity {
@@ -6623,7 +6614,7 @@ mod error_child_anchor_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             None,
@@ -6826,7 +6817,7 @@ mod authorship_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             None,
@@ -6970,7 +6961,7 @@ mod gate_resume_cache_eviction_tests {
             "system".to_string(),
             1024,
             StreamTimeouts::from_policy(kernel.timeouts()),
-            None,
+            SlotTunables::default(),
             conversation_cache,
             player,
             None,

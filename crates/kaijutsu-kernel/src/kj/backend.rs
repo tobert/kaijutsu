@@ -103,7 +103,9 @@ enum BackendCommand {
 
 #[derive(Subcommand, Debug)]
 enum BackendModelCommand {
-    /// Pin (or re-pin) one model's metadata on a backend.
+    /// Pin one model's metadata and tunables on a backend. Only the flags you
+    /// pass change. The tunables apply between a cast slot and the kernel
+    /// defaults (`kj backend default show`), field by field.
     Set {
         /// Backend name
         backend: String,
@@ -116,6 +118,25 @@ enum BackendModelCommand {
         /// Sparse provider-specific JSON
         #[arg(long)]
         extra: Option<String>,
+        /// Maximum RESPONSE tokens for this model, reasoning included (not the
+        /// context window)
+        #[arg(long = "max-tokens")]
+        max_tokens: Option<u64>,
+        /// Sampling temperature, 0.0..=2.0
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Nucleus sampling, (0.0, 1.0]
+        #[arg(long = "top-p")]
+        top_p: Option<f64>,
+        /// This provider's effort ladder token (e.g. low, high, max)
+        #[arg(long)]
+        effort: Option<String>,
+        /// Extended-thinking token budget
+        #[arg(long = "thinking-budget")]
+        thinking_budget: Option<u64>,
+        /// Extended-thinking style token
+        #[arg(long = "thinking-style")]
+        thinking_style: Option<String>,
     },
     /// Drop one model's metadata row.
     #[command(alias = "rm")]
@@ -158,6 +179,22 @@ enum BackendDefaultCommand {
         #[arg(long = "thinking-style")]
         thinking_style: Option<String>,
     },
+}
+
+/// One model row for a person: its window, then each tunable it sets. An
+/// unset tunable takes the kernel defaults and is not listed.
+fn model_summary(m: &BackendModelRow) -> String {
+    let mut parts = vec![m.context_window
+        .map(|w| format!("{w} ctx"))
+        .unwrap_or_else(|| "unknown ctx".to_string())];
+    let t = &m.tunables;
+    if let Some(v) = t.max_tokens { parts.push(format!("max_tokens={v}")); }
+    if let Some(v) = &t.effort { parts.push(format!("effort={v}")); }
+    if let Some(v) = t.temperature { parts.push(format!("temperature={v}")); }
+    if let Some(v) = t.top_p { parts.push(format!("top_p={v}")); }
+    if let Some(v) = t.thinking_budget { parts.push(format!("thinking_budget={v}")); }
+    if let Some(v) = &t.thinking_style { parts.push(format!("thinking_style={v}")); }
+    parts.join("  ")
 }
 
 impl KjDispatcher {
@@ -386,11 +423,7 @@ impl KjDispatcher {
         } else {
             lines.push("Models:".to_string());
             for m in &models {
-                let w = m
-                    .context_window
-                    .map(|w| format!("{w} ctx"))
-                    .unwrap_or_else(|| "unknown ctx".to_string());
-                lines.push(format!("  {:<24} {w}", m.model_id));
+                lines.push(format!("  {:<24} {}", m.model_id, model_summary(m)));
             }
         }
 
@@ -407,6 +440,12 @@ impl KjDispatcher {
                 "model": m.model_id,
                 "context_window": m.context_window,
                 "extra": m.extra,
+                "max_tokens": m.tunables.max_tokens,
+                "temperature": m.tunables.temperature,
+                "top_p": m.tunables.top_p,
+                "effort": m.tunables.effort,
+                "thinking_budget": m.tunables.thinking_budget,
+                "thinking_style": m.tunables.thinking_style,
             })).collect::<Vec<_>>(),
         });
         KjResult::ok_with_data(lines.join("\n"), data)
@@ -480,6 +519,12 @@ impl KjDispatcher {
                 model,
                 context_window,
                 extra,
+                max_tokens,
+                temperature,
+                top_p,
+                effort,
+                thinking_budget,
+                thinking_style,
             } => {
                 let b = match db.get_backend_by_name(&backend) {
                     Ok(Some(b)) => b,
@@ -497,18 +542,28 @@ impl KjDispatcher {
                         "kj backend model set: --extra must be valid JSON".to_string(),
                     );
                 }
-                match db.set_backend_model(&BackendModelRow {
+                let existing = match db.list_backend_models(b.backend_id) {
+                    Ok(rows) => rows.into_iter().find(|r| r.model_id == model),
+                    Err(e) => return KjResult::Err(format!("kj backend model set: {e}")),
+                };
+                let mut row = existing.unwrap_or_else(|| BackendModelRow {
                     backend_id: b.backend_id,
                     model_id: model.clone(),
-                    context_window: context_window.map(|w| w as i64),
-                    extra,
-                }) {
-                    Ok(()) => KjResult::ok(format!(
-                        "set {backend}/{model} ({})",
-                        context_window
-                            .map(|w| format!("{w} ctx"))
-                            .unwrap_or_else(|| "context window unknown".to_string())
-                    )),
+                    context_window: None,
+                    extra: None,
+                    tunables: Default::default(),
+                });
+                if let Some(w) = context_window { row.context_window = Some(w as i64); }
+                if extra.is_some() { row.extra = extra; }
+                let t = &mut row.tunables;
+                if let Some(v) = max_tokens { t.max_tokens = Some(v as i64); }
+                if temperature.is_some() { t.temperature = temperature; }
+                if top_p.is_some() { t.top_p = top_p; }
+                if effort.is_some() { t.effort = effort; }
+                if let Some(v) = thinking_budget { t.thinking_budget = Some(v as i64); }
+                if thinking_style.is_some() { t.thinking_style = thinking_style; }
+                match db.set_backend_model(&row) {
+                    Ok(()) => KjResult::ok(format!("set {backend}/{model}: {}", model_summary(&row))),
                     Err(e) => KjResult::Err(format!("kj backend model set: {e}")),
                 }
             }
@@ -905,6 +960,44 @@ mod tests {
             d.kernel().llm().read().await.context_window_for("gpt", "gpt-5.6-terra"),
             Some(400_000)
         );
+    }
+
+    /// A model's tunables are set on its row; only the flags given change, so
+    /// setting an output budget keeps the pinned window. The registry and
+    /// `kj backend show` both see them.
+    #[tokio::test]
+    async fn model_set_tunes_a_model_without_clearing_its_window() {
+        let d = seeded().await;
+        let c = test_caller();
+        let set = |args: &'static [&'static str]| {
+            let mut v = vec!["backend", "model", "set", "gpt", "gpt-5.6-terra"];
+            v.extend_from_slice(args);
+            argv(&v)
+        };
+        let r = d.dispatch(&set(&["--context-window", "400000"]), &c).await;
+        assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+        let r = d.dispatch(&set(&["--max-tokens", "65536", "--effort", "high", "--temperature", "1.0"]), &c).await;
+        assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+
+        let registry = d.kernel().llm().read().await;
+        assert_eq!(registry.context_window_for("gpt", "gpt-5.6-terra"), Some(400_000), "the window stays");
+        let t = registry.model_tunables("gpt", "gpt-5.6-terra");
+        assert_eq!(t.max_tokens, Some(65536));
+        assert_eq!(t.effort.as_deref(), Some("high"));
+        assert_eq!(t.temperature, Some(1.0));
+        drop(registry);
+
+        let shown = d.dispatch(&argv(&["backend", "show", "gpt"]), &c).await;
+        let message = shown.message();
+        assert!(message.contains("gpt-5.6-terra") && message.contains("max_tokens=65536")
+            && message.contains("effort=high"), "{message}");
+        match shown {
+            KjResult::Ok { data: Some(v), .. } => {
+                assert_eq!(v["models"][0]["max_tokens"], 65536);
+                assert_eq!(v["models"][0]["effort"], "high");
+            }
+            other => panic!("show returns its record: {other:?}"),
+        }
     }
 
     #[tokio::test]

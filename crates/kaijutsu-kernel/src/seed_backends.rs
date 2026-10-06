@@ -24,9 +24,10 @@
 //!   flag) rather than a property of the model id. Unknown ≠ guessed: a
 //!   fabricated denominator makes a "% of context used" gauge confidently
 //!   wrong, which is worse than the gauge saying "unknown".
-//! - **No tunables we haven't decided on.** `max_tokens` is real (16384, sized
-//!   for V4 reasoning tokens counting against the output budget); temperature
-//!   / top_p / effort / thinking_* stay NULL, meaning "provider default".
+//! - **No tunables we haven't decided on.** The floor's `max_tokens` (16384)
+//!   is for models nobody has measured; temperature / top_p / effort /
+//!   thinking_* stay NULL there, meaning "provider default". DeepSeek's model
+//!   rows carry their own measured values (`DEEPSEEK_TUNING`).
 //! - **No embedding service.** `embedding_config` is operator data; with no
 //!   row the semantic index stays off and boot says so (`docs/synthesis.md`).
 //!
@@ -39,7 +40,7 @@
 use kaijutsu_types::{BackendId, PrincipalId};
 
 use crate::kernel_db::{
-    BackendModelRow, BackendRow, KernelDb, KernelDbResult, LlmDefaultsRow,
+    BackendModelRow, ModelTunablesRow, BackendRow, KernelDb, KernelDbResult, LlmDefaultsRow,
 };
 
 /// A factory backend definition.
@@ -53,7 +54,38 @@ struct FactoryBackend {
     /// `(model_id, context_window)` — `None` means "we do not know", and that
     /// is the honest answer we ship rather than a number we made up.
     models: &'static [(&'static str, Option<u64>)],
+    /// Tunables every model row of this backend ships with, or `None` to
+    /// leave its models on the floor.
+    tuning: Option<FactoryTuning>,
 }
+
+/// The tunables a factory backend's model rows carry.
+#[derive(Clone, Copy)]
+struct FactoryTuning {
+    max_tokens: i64,
+    effort: &'static str,
+}
+
+impl FactoryTuning {
+    fn row(self) -> ModelTunablesRow {
+        ModelTunablesRow {
+            max_tokens: Some(self.max_tokens),
+            effort: Some(self.effort.to_string()),
+            ..Default::default()
+        }
+    }
+}
+
+/// DeepSeek V4 at effort `high` with a 64K output budget, the API's default
+/// `max_tokens` at a thinking effort below `max` (128K at `max`; the ceiling
+/// is 393216, probed 2026-10-06). Reasoning tokens count against it.
+///
+/// `high`, not `max` (Amy, 2026-10-03: "using max will waste a lot of money
+/// and time"; high "can be the default for most things"). In a benchmark run
+/// at `max`, three tasks reasoned past a 16K output ceiling four times each
+/// without a tool call. A role that needs `max` asks for it with a cast
+/// slot, and should raise `max_tokens` to 131072 with it.
+const DEEPSEEK_TUNING: FactoryTuning = FactoryTuning { max_tokens: 65536, effort: "high" };
 
 /// Context windows read live from Anthropic's `GET /v1/models/{id}`
 /// (`max_input_tokens`) on 2026-08-02 and from api-docs.deepseek.com on
@@ -83,6 +115,7 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
             ("claude-fable-5", Some(1_000_000)),
             ("claude-fable-5-1", Some(1_000_000)),
         ],
+        tuning: None,
     },
     FactoryBackend {
         name: "deepseek",
@@ -95,6 +128,7 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
             ("deepseek-v4-flash", Some(1_000_000)),
             ("deepseek-v4-pro", Some(1_000_000)),
         ],
+        tuning: Some(DEEPSEEK_TUNING),
     },
     FactoryBackend {
         name: "gpt",
@@ -105,6 +139,7 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
         key_optional: false,
         // No windows: we have no verified number for the gpt-5.6 family.
         models: &[],
+        tuning: None,
     },
     FactoryBackend {
         name: "ollama",
@@ -116,27 +151,16 @@ const FACTORY_BACKENDS: &[FactoryBackend] = &[
         key_optional: true,
         // No windows: `num_ctx` is a runtime setting, not a model property.
         models: &[],
+        tuning: None,
     },
 ];
 
 /// The kernel-wide default: the affordable lane.
 const FACTORY_DEFAULT_BACKEND: &str = "deepseek";
 const FACTORY_DEFAULT_MODEL: &str = "deepseek-v4-flash";
-/// V4 models think by default and reasoning tokens count toward the output
-/// budget (max 64K), so leave headroom above a plain-answer ceiling.
+/// The floor's output budget, for a model whose row sets none. Models with a
+/// measured budget carry their own (`DEEPSEEK_TUNING`).
 const FACTORY_MAX_TOKENS: i64 = 16384;
-/// Factory effort-ladder token. DeepSeek's ladder is
-/// `none|minimal|low|medium|high|xhigh|max` (probed against the live API
-/// 2026-08-15 — an unknown token 400s with the full variant list, so this is
-/// measured, not assumed).
-///
-/// `high`, not `max` (Amy, 2026-10-03: "using max will waste a lot of money
-/// and time"; high "can be the default for most things"). In a benchmark run
-/// at `max`, three tasks reasoned past a 16K output ceiling four times each
-/// without a tool call, and one solved task spent 27.8M input tokens over
-/// 159 inferences at a 64K ceiling. A role that needs more reasoning asks
-/// for it per context or per cast.
-const FACTORY_EFFORT: &str = "high";
 
 /// Endpoints earlier kernels seeded into `embedding_config`. The kernel ships
 /// no embedding endpoint now, so a row still holding one of these was never
@@ -189,6 +213,7 @@ pub fn ensure_factory_backends(db: &mut KernelDb, created_by: PrincipalId) -> Ke
                 model_id: (*model_id).to_string(),
                 context_window: window.map(|w| w as i64),
                 extra: None,
+                tunables: fb.tuning.map(FactoryTuning::row).unwrap_or_default(),
             })?;
         }
     }
@@ -224,6 +249,7 @@ pub fn reseed_factory_backends(
                 model_id: (*model_id).to_string(),
                 context_window: window.map(|w| w as i64),
                 extra: None,
+                tunables: fb.tuning.map(FactoryTuning::row).unwrap_or_default(),
             })?;
         }
     }
@@ -239,8 +265,9 @@ fn factory_defaults() -> LlmDefaultsRow {
         // Undecided knobs stay NULL — "provider default" is a real answer.
         temperature: None,
         top_p: None,
-        // Decided, not undecided: see FACTORY_EFFORT.
-        effort: Some(FACTORY_EFFORT.to_string()),
+        // The floor reaches every backend, so it carries no provider's effort
+        // token; DeepSeek's lives on its model rows (DEEPSEEK_TUNING).
+        effort: None,
         thinking_budget: None,
         thinking_style: None,
     }
@@ -270,24 +297,33 @@ fn insert_factory_backend(
 mod tests {
     use super::*;
 
-    /// The factory floor ships `effort=high`, and that is a decision rather
-    /// than an oversight (see `FACTORY_EFFORT`). Pinned so a future "tidy up
-    /// the NULL knobs" pass cannot quietly drop it back to provider-default,
-    /// which would look like no change at all.
+    /// DeepSeek's models ship `effort=high` with a 64K output budget, the
+    /// provider's own default at that effort (see `DEEPSEEK_TUNING`). The
+    /// floor carries no provider's effort token: it reaches every backend, so
+    /// a DeepSeek ladder token there would be sent to Anthropic and vLLM too.
+    /// Pinned so a tidy-up cannot move either back.
     #[test]
-    fn the_factory_floor_asks_for_high_reasoning() {
+    fn deepseek_models_ask_for_high_reasoning_and_the_floor_stays_neutral() {
         let d = factory_defaults();
         assert_eq!(d.default_backend, "deepseek");
-        assert_eq!(d.default_model, "deepseek-v4-flash");
-        assert_eq!(
-            d.effort.as_deref(),
-            Some("high"),
-            "the floor must ask for high reasoning — see FACTORY_EFFORT"
-        );
-        // Deliberately still unset: these have no decided answer, and
-        // "provider default" is a real one.
+        assert_eq!(d.effort, None, "the floor carries no provider's effort token");
+        assert_eq!(d.max_tokens, Some(16384), "the floor for unmeasured models");
         assert_eq!(d.temperature, None);
         assert_eq!(d.top_p, None);
+
+        let mut db = KernelDb::temporary().unwrap();
+        ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
+        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
+        let rows = db.list_backend_models(deepseek.backend_id).unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            assert_eq!(row.tunables.effort.as_deref(), Some("high"), "{}", row.model_id);
+            assert_eq!(row.tunables.max_tokens, Some(65536), "{}", row.model_id);
+        }
+        let anthropic = db.get_backend_by_name("anthropic").unwrap().unwrap();
+        assert!(db.list_backend_models(anthropic.backend_id).unwrap().iter()
+            .all(|r| r.tunables == crate::kernel_db::ModelTunablesRow::default()),
+            "unmeasured models take the floor");
     }
 
     #[test]
@@ -398,6 +434,7 @@ mod tests {
             model_id: "claude-opus-5".into(),
             context_window: Some(123_456),
             extra: None,
+            tunables: Default::default(),
         })
         .unwrap();
 

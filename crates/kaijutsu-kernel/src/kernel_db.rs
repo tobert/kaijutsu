@@ -1202,6 +1202,14 @@ CREATE TABLE IF NOT EXISTS backend_models (
     model_id       TEXT NOT NULL,
     context_window INTEGER CHECK (context_window IS NULL OR context_window > 0),
     extra          TEXT,
+    -- This model's own tunables on this backend, between a cast slot and the
+    -- llm_defaults floor. NULL falls through to the floor.
+    max_tokens      INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0),
+    temperature     REAL    CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0)),
+    top_p           REAL    CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0)),
+    effort          TEXT,
+    thinking_budget INTEGER CHECK (thinking_budget IS NULL OR thinking_budget > 0),
+    thinking_style  TEXT,
     PRIMARY KEY (backend_id, model_id)
 );
 
@@ -2731,6 +2739,14 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
+            "ALTER TABLE backend_models ADD COLUMN temperature REAL \
+                 CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
+            "ALTER TABLE backend_models ADD COLUMN top_p REAL CHECK (top_p IS NULL OR (top_p > 0.0 AND top_p <= 1.0))",
+            "ALTER TABLE backend_models ADD COLUMN effort TEXT",
+            "ALTER TABLE backend_models ADD COLUMN thinking_budget INTEGER \
+                 CHECK (thinking_budget IS NULL OR thinking_budget > 0)",
+            "ALTER TABLE backend_models ADD COLUMN thinking_style TEXT",
         ];
         for sql in alters {
             match conn.execute(sql, []) {
@@ -7284,7 +7300,7 @@ pub struct BackendRow {
 }
 
 /// Per-model metadata for one backend (a `backend_models` row).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendModelRow {
     pub backend_id: BackendId,
     pub model_id: String,
@@ -7293,6 +7309,20 @@ pub struct BackendModelRow {
     pub context_window: Option<i64>,
     /// Sparse provider-specific JSON.
     pub extra: Option<String>,
+    /// This model's own tunables on this backend.
+    pub tunables: ModelTunablesRow,
+}
+
+/// A model's tunables on its backend. They apply between a cast slot and the
+/// `llm_defaults` floor, field by field; `None` falls through to the floor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelTunablesRow {
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub effort: Option<String>,
+    pub thinking_budget: Option<i64>,
+    pub thinking_style: Option<String>,
 }
 
 /// The singleton `llm_defaults` row.
@@ -7604,17 +7634,32 @@ impl KernelDb {
                  and a zero denominator makes every usage gauge garbage"
             )));
         }
+        let t = &row.tunables;
+        validate_tunables(t.max_tokens, t.temperature, t.top_p, t.thinking_budget)?;
         self.conn.execute(
-            "INSERT INTO backend_models (backend_id, model_id, context_window, extra)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO backend_models (backend_id, model_id, context_window, extra,
+                 max_tokens, temperature, top_p, effort, thinking_budget, thinking_style)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(backend_id, model_id) DO UPDATE SET
                  context_window = excluded.context_window,
-                 extra = excluded.extra",
+                 extra = excluded.extra,
+                 max_tokens = excluded.max_tokens,
+                 temperature = excluded.temperature,
+                 top_p = excluded.top_p,
+                 effort = excluded.effort,
+                 thinking_budget = excluded.thinking_budget,
+                 thinking_style = excluded.thinking_style",
             params![
                 blob_param(row.backend_id.as_bytes()),
                 row.model_id,
                 row.context_window,
                 row.extra,
+                t.max_tokens,
+                t.temperature,
+                t.top_p,
+                t.effort,
+                t.thinking_budget,
+                t.thinking_style,
             ],
         )?;
         Ok(())
@@ -7639,8 +7684,9 @@ impl KernelDb {
         backend_id: BackendId,
     ) -> KernelDbResult<Vec<BackendModelRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT model_id, context_window, extra FROM backend_models
-             WHERE backend_id = ?1 ORDER BY model_id",
+            "SELECT model_id, context_window, extra, max_tokens, temperature, top_p,
+                    effort, thinking_budget, thinking_style
+             FROM backend_models WHERE backend_id = ?1 ORDER BY model_id",
         )?;
         let rows = stmt.query_map(params![blob_param(backend_id.as_bytes())], |row| {
             Ok(BackendModelRow {
@@ -7648,6 +7694,14 @@ impl KernelDb {
                 model_id: row.get(0)?,
                 context_window: row.get(1)?,
                 extra: row.get(2)?,
+                tunables: ModelTunablesRow {
+                    max_tokens: row.get(3)?,
+                    temperature: row.get(4)?,
+                    top_p: row.get(5)?,
+                    effort: row.get(6)?,
+                    thinking_budget: row.get(7)?,
+                    thinking_style: row.get(8)?,
+                },
             })
         })?;
         Ok(rows.collect::<SqliteResult<Vec<_>>>()?)

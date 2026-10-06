@@ -286,36 +286,20 @@ impl BuildOpts {
     }
 }
 
-/// Apply a cast's resolved tunables onto a `BuildOpts` in progress — the ONE
-/// seam through which [`SlotTunables`] reach a provider request. `slot` is
-/// the tunables of the caller's resolved cast seat for this context's role
-/// (`resolve_context_model`'s `tunables`, ultimately
-/// [`crate::llm::LlmRegistry::resolved_slot`] — already cascaded onto
-/// `llm_defaults`); `None` when the context has no cast seat (no cast
-/// assigned, or its cast has no slot for this context_type). When `slot` is
-/// `None`, `floor` (the bare `llm_defaults` row,
-/// [`crate::llm::LlmRegistry::default_tunables`]) supplies the tunables
-/// directly, so a kernel with no casts configured at all still gets its
-/// `llm_defaults`.
+/// Put a turn's resolved tunables on its request. They are already
+/// cascaded: a cast slot over the model's `backend_models` row over the
+/// `llm_defaults` floor (`LlmRegistry::model_tunables`, and the cast-slot
+/// resolution in `db_config`).
 ///
-/// `max_tokens` carries different precedence than the other knobs: a
-/// tunable-supplied value overrides whatever `opts.max_tokens` already held,
-/// but when neither `slot` nor `floor` sets it, `opts.max_tokens` is left
-/// exactly as the caller built it — never reset to a hardcoded number — so a
-/// provider's own clamp-on-zero fallback (`ChatRequest::clamp_max_tokens` for
-/// DeepSeek/generic OpenAI) still applies when nothing upstream configured
-/// anything. Every other field is set unconditionally from the resolved
-/// tunables (including back to `None` — a slot/floor `None` is the honest
+/// `max_tokens` carries different precedence than the other knobs: a set
+/// value overrides whatever `opts.max_tokens` already held, but an unset one
+/// leaves `opts.max_tokens` exactly as the caller built it — never reset to a
+/// hardcoded number — so a provider's own clamp-on-zero fallback
+/// (`ChatRequest::clamp_max_tokens` for DeepSeek/generic OpenAI) still applies
+/// when nothing upstream configured anything. Every other field is set
+/// unconditionally (including back to `None` — an unset tunable is the honest
 /// "provider default" answer, not "leave whatever was there").
-///
-/// Grep `apply_slot_tunables` to find every call site — this is Track D's
-/// seam for wiring a context's cast slot through.
-pub fn apply_slot_tunables(
-    mut opts: BuildOpts,
-    slot: Option<&SlotTunables>,
-    floor: &SlotTunables,
-) -> BuildOpts {
-    let tunables = slot.unwrap_or(floor);
+pub fn apply_tunables(mut opts: BuildOpts, tunables: &SlotTunables) -> BuildOpts {
     if let Some(max_tokens) = tunables.max_tokens {
         opts.max_tokens = max_tokens;
     }
@@ -603,11 +587,11 @@ mod tests {
         assert_eq!(opts.thinking_style.as_deref(), Some("budget"));
     }
 
-    mod apply_slot_tunables_tests {
+    mod apply_tunables_tests {
         use super::*;
-        use crate::llm::config::{ResolvedSlot, SlotTunables};
+        use crate::llm::config::SlotTunables;
 
-        fn floor(max_tokens: Option<u64>) -> SlotTunables {
+        fn tunables(max_tokens: Option<u64>) -> SlotTunables {
             SlotTunables {
                 max_tokens,
                 temperature: Some(0.5),
@@ -619,9 +603,8 @@ mod tests {
         }
 
         #[test]
-        fn no_slot_uses_floor_directly() {
-            let floor = floor(Some(8000));
-            let opts = apply_slot_tunables(BuildOpts::new("m"), None, &floor);
+        fn every_tunable_reaches_the_request() {
+            let opts = apply_tunables(BuildOpts::new("m"), &tunables(Some(8000)));
             assert_eq!(opts.max_tokens, 8000);
             assert_eq!(opts.temperature, Some(0.5));
             assert_eq!(opts.top_p, Some(0.8));
@@ -631,38 +614,17 @@ mod tests {
         }
 
         #[test]
-        fn slot_tunables_win_over_floor() {
-            let floor = floor(Some(8000));
-            let slot = ResolvedSlot {
-                role: "coder".into(),
-                backend: "anthropic".into(),
-                model: "claude-x".into(),
-                tunables: SlotTunables {
-                    max_tokens: Some(4000),
-                    temperature: Some(0.9),
-                    top_p: None,
-                    effort: None,
-                    thinking_budget: None,
-                    thinking_style: None,
-                },
-                loadout: None,
-                extra: None,
-            };
-            let opts = apply_slot_tunables(BuildOpts::new("m"), Some(&slot.tunables), &floor);
-            assert_eq!(opts.max_tokens, 4000, "slot's own max_tokens wins over floor");
-            assert_eq!(opts.temperature, Some(0.9), "slot's own temperature wins over floor");
-            assert_eq!(
-                opts.top_p, None,
-                "slot leaves top_p None, which is the honest resolved answer \
-                 (the ResolvedSlot cascade already merged floor values in — \
-                 this helper does not re-cascade)"
+        fn an_unset_tunable_is_the_provider_default() {
+            let opts = apply_tunables(
+                BuildOpts::new("m").with_effort("high"),
+                &SlotTunables::default(),
             );
+            assert_eq!(opts.effort, None, "an unset effort clears what was there");
         }
 
         #[test]
         fn unset_max_tokens_leaves_opts_value_untouched() {
-            let floor = floor(None); // no configured max_tokens anywhere
-            let opts = apply_slot_tunables(BuildOpts::new("m").with_max_tokens(12345), None, &floor);
+            let opts = apply_tunables(BuildOpts::new("m").with_max_tokens(12345), &tunables(None));
             assert_eq!(
                 opts.max_tokens, 12345,
                 "no configured max_tokens anywhere must not reset an already-set value"
@@ -671,8 +633,7 @@ mod tests {
 
         #[test]
         fn set_max_tokens_overrides_existing_opts_value() {
-            let floor = floor(Some(999));
-            let opts = apply_slot_tunables(BuildOpts::new("m").with_max_tokens(12345), None, &floor);
+            let opts = apply_tunables(BuildOpts::new("m").with_max_tokens(12345), &tunables(Some(999)));
             assert_eq!(opts.max_tokens, 999, "an explicitly configured max_tokens wins");
         }
     }

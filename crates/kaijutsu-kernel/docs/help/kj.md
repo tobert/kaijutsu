@@ -149,7 +149,7 @@ midi            list, show, send note|cc|pc|sysex, identify, panic — device
                 device (the kernel never touches hardware — a sink resolves
                 the port); identify asks a device what it is and records the
                 answer at /run/midi/<device>
-model           Show a context's effective model (--context <ref>)
+model           Show a context's effective model and its tunables (--context <ref>)
 models          List configured providers, their models, and --model aliases
 play            Play a sample now (a host path, or --cas <hash> for an object
                 already in the CAS), or commit it as a clip cell onto a track

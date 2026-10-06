@@ -136,7 +136,7 @@ pub fn unknown_backend_kind_message(name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Per-model metadata for one backend, keyed by model id.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ModelInfo {
     /// Total context window (input + output) in tokens, if known.
     ///
@@ -154,6 +154,11 @@ pub struct ModelInfo {
     /// registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<String>,
+
+    /// This model's own tunables on this backend. They apply between a cast
+    /// slot and the `llm_defaults` floor; an unset field takes the floor.
+    #[serde(default)]
+    pub tunables: SlotTunables,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +167,7 @@ pub struct ModelInfo {
 
 /// One configured LLM endpoint, resolved from a `backends` row plus its
 /// `backend_models` rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendConfig {
     /// Free-form unique handle — the name you type at `--model <name>/<model>`
     /// and the key this backend occupies in the registry.
@@ -259,6 +264,11 @@ impl BackendConfig {
         self.models.get(model)?.context_window
     }
 
+    /// This model's own tunables, or `None` when the backend has no row for it.
+    pub fn model_tunables(&self, model: &str) -> Option<&SlotTunables> {
+        self.models.get(model).map(|m| &m.tunables)
+    }
+
     /// Resolve the API key, trying sources in order (first hit wins):
     ///
     /// 1. `api_key_file` — trimmed file contents (`~` expanded). A configured
@@ -342,22 +352,18 @@ pub struct ModelAlias {
     pub model: String,
 }
 
-/// The knobs a cast slot may override and `llm_defaults` supplies a floor for.
+/// The request knobs a turn resolves field by field: a cast slot, then the
+/// model's `backend_models` row, then the `llm_defaults` floor
+/// (`LlmRegistry::model_tunables`; cast slots resolve in `db_config`).
 ///
 /// `None` at every level means "provider default", which is a real answer, not
 /// a missing one — we do not invent numbers we have not decided on.
 ///
-/// Track A stored and resolved these; **Track B** plumbed them into provider
-/// requests — `stream::apply_slot_tunables` is the one seam that copies a
-/// resolved `SlotTunables` onto a `BuildOpts` in progress, and each
-/// provider's `build()` interprets the per-wire mapping from there (Claude:
+/// `stream::apply_tunables` copies the resolved values onto a `BuildOpts`,
+/// and each provider's `build()` maps them to its wire (Claude:
 /// `thinking_style`/`thinking_budget`/`effort` → `thinking`, with
 /// temperature/top_p dropped whenever thinking ends up on; DeepSeek/OpenAI:
-/// `effort` → `reasoning_effort` or a structural disable). **Track D's
-/// stitch** closed the loop: `kaijutsu-server/src/llm_stream.rs` resolves the
-/// context's cast seat via `model_resolution::resolve_context_model` and
-/// passes its tunables through `apply_slot_tunables`; a context with no cast
-/// seat gets the bare `llm_defaults` floor.
+/// `effort` → `reasoning_effort` or a structural disable).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SlotTunables {
     /// Maximum RESPONSE tokens. Not the context window — a different number.
@@ -430,6 +436,7 @@ mod tests {
             ModelInfo {
                 context_window: Some(1_000_000),
                 extra: None,
+                tunables: Default::default(),
             },
         );
         assert_eq!(config.context_window("claude-opus-4-8"), Some(1_000_000));

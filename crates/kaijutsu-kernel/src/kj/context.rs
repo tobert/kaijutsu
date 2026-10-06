@@ -5837,6 +5837,7 @@ mod tests {
                 ModelInfo {
                     context_window: Some(100_000),
                     extra: None,
+                    tunables: Default::default(),
                 },
             );
             let mut registry = d.kernel().llm().write().await;

@@ -40,12 +40,21 @@ pub struct ResolvedContextModel {
     /// Backend NAME (e.g. `anthropic`, `deepseek`, `gpt`).
     pub backend: String,
     pub model: String,
-    /// Slot tunables with the `llm_defaults` floor already applied — `Some`
-    /// only when [`ModelSource::CastSlot`] answered; neither a per-context
-    /// override nor the bare registry default carries slot-level tunables
-    /// today.
+    /// A cast seat's tunables, already resolved over its model's row and the
+    /// `llm_defaults` floor — `Some` only when [`ModelSource::CastSlot`]
+    /// answered. Use [`Self::tunables_in`] for what a turn runs.
     pub tunables: Option<SlotTunables>,
     pub source: ModelSource,
+}
+
+impl ResolvedContextModel {
+    /// The tunables a turn on this model runs: the cast seat's when one
+    /// answered, otherwise the model's own row over the `llm_defaults` floor.
+    pub fn tunables_in(&self, registry: &crate::llm::LlmRegistry) -> SlotTunables {
+        self.tunables
+            .clone()
+            .unwrap_or_else(|| registry.model_tunables(&self.backend, &self.model))
+    }
 }
 
 /// Resolve the effective model for a context.

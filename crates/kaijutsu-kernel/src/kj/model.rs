@@ -42,7 +42,7 @@ pub(crate) struct ModelsArgs {}
 #[derive(Parser, Debug)]
 #[command(
     name = "model",
-    about = "Report the effective model for a context",
+    about = "Report the effective model for a context and the tunables a turn on it runs",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -234,6 +234,7 @@ impl KjDispatcher {
             cast_label.as_deref(),
             &registry,
         );
+        let tunables = resolved.as_ref().map(|r| r.tunables_in(&registry));
         let (provider, model, source) = match resolved {
             Some(r) => {
                 let source = match &r.source {
@@ -272,7 +273,7 @@ impl KjDispatcher {
             None => "unknown".to_string(),
         };
 
-        let message = match source.as_str() {
+        let mut message = match source.as_str() {
             "context" => format!("{}: {display} [context: {window_display}]", ctx_id.short()),
             "default" => format!(
                 "{}: {display} (registry default) [context: {window_display}]",
@@ -283,6 +284,20 @@ impl KjDispatcher {
                 ctx_id.short()
             ),
         };
+        // The tunables the turn would run, so a truncation is explained here
+        // rather than discovered mid-turn.
+        if let Some(t) = &tunables {
+            let mut knobs = Vec::new();
+            if let Some(v) = t.max_tokens { knobs.push(format!("max_tokens={v}")); }
+            if let Some(v) = &t.effort { knobs.push(format!("effort={v}")); }
+            if let Some(v) = t.temperature { knobs.push(format!("temperature={v}")); }
+            if let Some(v) = t.top_p { knobs.push(format!("top_p={v}")); }
+            if let Some(v) = t.thinking_budget { knobs.push(format!("thinking_budget={v}")); }
+            if let Some(v) = &t.thinking_style { knobs.push(format!("thinking_style={v}")); }
+            if !knobs.is_empty() {
+                message.push_str(&format!(" {}", knobs.join(" ")));
+            }
+        }
 
         KjResult::ok_ephemeral_with_data(
             message,
@@ -293,6 +308,7 @@ impl KjDispatcher {
                 "model": model,
                 "source": source,
                 "context_window": context_window,
+                "tunables": tunables,
             }),
         )
     }
@@ -364,6 +380,7 @@ mod tests {
                 crate::llm::ModelInfo {
                     context_window: Some(1_000_000),
                     extra: None,
+                    tunables: Default::default(),
                 },
             );
             c
@@ -740,6 +757,7 @@ mod tests {
             "reports the cast slot's model, not the registry default: {msg}"
         );
         assert!(msg.contains("via cast band"), "names the cast as the source: {msg}");
+        assert!(msg.contains("max_tokens=65536") && msg.contains("effort=high"), "{msg}");
         let data = match result {
             crate::kj::KjResult::Ok { data: Some(v), .. } => v,
             other => panic!("expected data, got {other:?}"),
@@ -750,5 +768,37 @@ mod tests {
         // The floor pins deepseek-v4-pro's window, so the gauge input rides
         // along instead of "unknown".
         assert_eq!(data["context_window"], 1_000_000);
+        // The slot sets no tunables, so the model's own row answers.
+        assert_eq!(data["tunables"]["max_tokens"], 65536);
+        assert_eq!(data["tunables"]["effort"], "high");
+    }
+
+    /// A context with no cast seat runs its model's own tunables, the same
+    /// resolution the turn path uses: here the floor's 16384 would truncate
+    /// DeepSeek's reasoning, and the model row's 65536 must win.
+    #[tokio::test]
+    async fn model_reports_the_model_row_tunables_without_a_cast() {
+        let d = test_dispatcher().await;
+        {
+            let mut db = d.kernel_db().lock();
+            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
+                .unwrap();
+        }
+        d.reload_llm_registry().await.unwrap();
+        let principal = PrincipalId::new();
+        let parent =
+            crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
+        let c = crate::kj::test_helpers::caller_with_context(parent);
+        let r = d.dispatch(&[s("context"), s("create"), s("plain"), s("-m"), s("deepseek/deepseek-v4-flash")], &c).await;
+        assert!(r.is_ok(), "context create failed: {}", r.message());
+
+        let result = d.dispatch(&[s("model"), s("--context"), s("plain")], &c).await;
+        let data = match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => v,
+            other => panic!("expected data, got {other:?}"),
+        };
+        assert_eq!(data["source"], "context");
+        assert_eq!(data["tunables"]["max_tokens"], 65536, "the model row wins over the 16384 floor");
+        assert_eq!(data["tunables"]["effort"], "high");
     }
 }

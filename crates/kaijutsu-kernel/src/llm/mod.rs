@@ -49,7 +49,7 @@ pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
     BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
-    InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_slot_tunables,
+    InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
 pub use system_prompt::{CharacterIdentity, SituationalContext, build_system_prompt, extract_system_prompt_sections, read_system_prompt_sections};
@@ -1288,6 +1288,16 @@ impl LlmRegistry {
         &self.default_tunables
     }
 
+    /// A model's tunables on a backend: its `backend_models` row over the
+    /// `llm_defaults` floor, field by field. A model or backend with no row
+    /// gets the floor. A cast slot overlays this in turn.
+    pub fn model_tunables(&self, backend: &str, model: &str) -> SlotTunables {
+        match self.backends.get(backend).and_then(|b| b.model_tunables(model)) {
+            Some(own) => own.over(&self.default_tunables),
+            None => self.default_tunables.clone(),
+        }
+    }
+
     /// Get a backend's config by name.
     pub fn backend_config(&self, name: &str) -> Option<&BackendConfig> {
         self.backends.get(name)
@@ -2059,6 +2069,7 @@ mod tests {
             config::ModelInfo {
                 context_window: Some(1_000_000),
                 extra: None,
+                tunables: Default::default(),
             },
         );
         registry.set_backends(vec![anthropic]);
@@ -2120,6 +2131,7 @@ mod tests {
                 config::ModelInfo {
                     context_window: Some(1_000_000),
                     extra: None,
+                    tunables: Default::default(),
                 },
             );
             registry.set_backends(vec![cfg]);

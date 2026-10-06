@@ -64,6 +64,14 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
                     // into a nonsense u64.
                     context_window: m.context_window.and_then(|w| u64::try_from(w).ok()),
                     extra: m.extra,
+                    tunables: SlotTunables {
+                        max_tokens: m.tunables.max_tokens.and_then(|v| u64::try_from(v).ok()),
+                        temperature: m.tunables.temperature,
+                        top_p: m.tunables.top_p,
+                        effort: m.tunables.effort,
+                        thinking_budget: m.tunables.thinking_budget.and_then(|v| u64::try_from(v).ok()),
+                        thinking_style: m.tunables.thinking_style,
+                    },
                 },
             );
         }
@@ -181,7 +189,7 @@ pub fn build_llm_registry(db: &KernelDb) -> LlmResult<LlmRegistry> {
     registry.set_model_aliases(aliases);
 
     // ── casts ───────────────────────────────────────────────────────────
-    let floor = registry.default_tunables().clone();
+    // A slot's unset fields take its model's row, then the floor.
     let mut slots: Vec<(String, ResolvedSlot)> = Vec::new();
     for cast in db
         .list_casts()
@@ -205,13 +213,14 @@ pub fn build_llm_registry(db: &KernelDb) -> LlmResult<LlmRegistry> {
                 thinking_budget: slot.thinking_budget.and_then(|v| u64::try_from(v).ok()),
                 thinking_style: slot.thinking_style.clone(),
             };
+            let tunables = own.over(&registry.model_tunables(backend, &slot.model));
             slots.push((
                 cast.label.clone(),
                 ResolvedSlot {
                     role: slot.role,
                     backend: backend.clone(),
                     model: slot.model,
-                    tunables: own.over(&floor),
+                    tunables,
                     loadout: slot.loadout,
                     extra: slot.extra,
                 },
@@ -248,7 +257,7 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel_db::{BackendModelRow, EmbeddingConfigRow, LlmDefaultsRow, ModelAliasRow};
+    use crate::kernel_db::{BackendModelRow, EmbeddingConfigRow, LlmDefaultsRow, ModelAliasRow, ModelTunablesRow};
     use crate::seed_backends::{ensure_factory_backends, reseed_factory_backends};
     use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
@@ -357,12 +366,16 @@ mod tests {
         assert_eq!(registry.default_model(), Some("deepseek-v4-flash"));
         assert_eq!(registry.max_output_tokens(), 16384);
         let t = registry.default_tunables();
-        // Effort IS decided: the factory floor asks for high reasoning (see
-        // `seed_backends::FACTORY_EFFORT`). Asserted here as well as at the
+        // The floor reaches every backend, so it carries no effort token; the
+        // default model's own row asks for high reasoning with a 64K budget
+        // (`seed_backends::DEEPSEEK_TUNING`). Asserted here as well as at the
         // seed, because this is the path that carries it into a live
         // registry — the seed being right buys nothing if the registry drops
         // it.
-        assert_eq!(t.effort.as_deref(), Some("high"));
+        assert_eq!(t.effort, None);
+        let model = registry.model_tunables("deepseek", "deepseek-v4-flash");
+        assert_eq!(model.effort.as_deref(), Some("high"));
+        assert_eq!(model.max_tokens, Some(65536));
         // Knobs we haven't decided on stay NULL — "provider default" is a
         // real answer, not a gap to fill with an invented number.
         assert_eq!(t.temperature, None);
@@ -474,6 +487,65 @@ mod tests {
         assert!(registry.resolved_slot("house", "musician").is_none());
     }
 
+    /// Tunables belong to a model on its provider: a model row's values sit
+    /// between a cast slot and the `llm_defaults` floor, field by field, and a
+    /// model with no row of its own gets the floor.
+    #[test]
+    fn a_model_row_supplies_tunables_between_a_cast_slot_and_the_floor() {
+        let db = seeded_db();
+        db.set_llm_defaults(&LlmDefaultsRow {
+            default_backend: "deepseek".into(),
+            default_model: "deepseek-flash".into(),
+            max_tokens: Some(16384),
+            temperature: Some(0.5),
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+        })
+        .unwrap();
+        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
+        db.set_backend_model(&BackendModelRow {
+            backend_id: deepseek.backend_id,
+            model_id: "deepseek-flash".into(),
+            context_window: Some(1_000_000),
+            extra: None,
+            tunables: ModelTunablesRow {
+                max_tokens: Some(65536),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        let cast_id = CastId::new();
+        db.insert_cast(&crate::kernel_db::CastRow {
+            cast_id, label: "deep".into(), description: None, created_at: 0,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+        db.set_cast_slot(&crate::kernel_db::CastSlotRow {
+            cast_id, role: "coder".into(), backend_id: deepseek.backend_id,
+            model: "deepseek-flash".into(), max_tokens: None, temperature: None,
+            top_p: None, effort: Some("max".into()), thinking_budget: None,
+            thinking_style: None, loadout: None, extra: None,
+        })
+        .unwrap();
+
+        let registry = build_llm_registry(&db).unwrap();
+        let model = registry.model_tunables("deepseek", "deepseek-flash");
+        assert_eq!(model.max_tokens, Some(65536), "the model row wins over the floor");
+        assert_eq!(model.effort.as_deref(), Some("high"));
+        assert_eq!(model.temperature, Some(0.5), "an unset model field takes the floor");
+        assert_eq!(registry.model_tunables("deepseek", "deepseek-unlisted"), *registry.default_tunables(),
+            "a model without a row gets the floor");
+        assert_eq!(registry.model_tunables("nonesuch", "m"), *registry.default_tunables());
+
+        let slot = registry.resolved_slot("deep", "coder").unwrap();
+        assert_eq!(slot.tunables.effort.as_deref(), Some("max"), "the slot wins");
+        assert_eq!(slot.tunables.max_tokens, Some(65536), "an unset slot field takes the model row");
+        assert_eq!(slot.tunables.temperature, Some(0.5), "then the floor");
+    }
+
     #[test]
     fn no_factory_casts_are_seeded() {
         // Casts are operator/agent-configured; the floor ships none.
@@ -547,6 +619,7 @@ mod tests {
             model_id: "gpt-5.6-terra".into(),
             context_window: Some(400_000),
             extra: None,
+            tunables: Default::default(),
         })
         .unwrap();
         assert_eq!(
