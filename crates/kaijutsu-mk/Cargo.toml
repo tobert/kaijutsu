@@ -8,6 +8,10 @@ description = "Megakernel client: council API wire types, spec ids, answer and p
 [lints]
 workspace = true
 
+[features]
+# The scripted HTTP server the crate's tests use, for callers' tests.
+test-util = []
+
 [dependencies]
 hex = "0.4"
 indexmap = { workspace = true, features = ["serde"] }

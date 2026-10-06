@@ -57,6 +57,9 @@ pub enum BackendKind {
     /// an external process owner.
     #[serde(rename = "codex-app")]
     CodexApp,
+    /// The megakernel service's `/mk/v1` API (`llm/mk/`, `docs/mk.md`). No
+    /// key; `base_url` is the service address.
+    Mk,
     /// Canned-response client for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock,
@@ -65,7 +68,7 @@ pub enum BackendKind {
 /// Every kind an operator may write, in the order they're listed in errors.
 /// `mock` is deliberately absent even when the feature is on: it is not a
 /// thing to configure, only a thing a test harness seeds.
-pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "codex-app"];
+pub const SUPPORTED_BACKEND_KINDS: &[&str] = &["anthropic", "deepseek", "openai", "codex-app", "mk"];
 
 impl BackendKind {
     /// The canonical lowercase token — what lands in the `kind` column.
@@ -75,6 +78,7 @@ impl BackendKind {
             Self::DeepSeek => "deepseek",
             Self::OpenAi => "openai",
             Self::CodexApp => "codex-app",
+            Self::Mk => "mk",
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => "mock",
         }
@@ -89,6 +93,7 @@ impl BackendKind {
             "deepseek" => Ok(Self::DeepSeek),
             "openai" => Ok(Self::OpenAi),
             "codex-app" => Ok(Self::CodexApp),
+            "mk" => Ok(Self::Mk),
             #[cfg(any(test, feature = "test-mock"))]
             "mock" => Ok(Self::Mock),
             other => Err(unknown_backend_kind_message(other)),
@@ -102,7 +107,7 @@ impl BackendKind {
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::DeepSeek => Some("DEEPSEEK_API_KEY"),
             Self::OpenAi => Some("OPENAI_API_KEY"),
-            Self::CodexApp => None,
+            Self::CodexApp | Self::Mk => None,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock => None,
         }
@@ -110,15 +115,15 @@ impl BackendKind {
 
     /// Does this kind require a `base_url`?
     ///
-    /// `openai` means "some OpenAI-compatible server" and `codex-app` means a
-    /// reachable Codex app-server daemon; both need the endpoint in
-    /// `base_url`. Anthropic
-    /// which server is exactly the information `base_url` carries. Anthropic
-    /// accepts one as a gateway override; DeepSeek's endpoint is fixed, so a
-    /// `base_url` there is accepted-and-ignored rather than silently changing
-    /// where a key goes.
+    /// `openai` means "some OpenAI-compatible server", `codex-app` means a
+    /// reachable Codex app-server daemon, and `mk` means a megakernel
+    /// service. Each needs the endpoint in `base_url`, because which server
+    /// is exactly the information `base_url` carries. Anthropic accepts one
+    /// as a gateway override; DeepSeek's endpoint is fixed, so a `base_url`
+    /// there is accepted-and-ignored rather than silently changing where a
+    /// key goes.
     pub fn requires_base_url(&self) -> bool {
-        matches!(self, Self::OpenAi | Self::CodexApp)
+        matches!(self, Self::OpenAi | Self::CodexApp | Self::Mk)
     }
 }
 

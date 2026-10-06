@@ -2,8 +2,7 @@
 //!
 //! A **backend** is one configured endpoint: a free-form unique `name` (the
 //! handle you type) plus a closed `kind` (`anthropic` | `deepseek` | `openai` |
-//! `codex-app`)
-//! that picks which client speaks for it. That split is the point of this
+//! `codex-app` | `mk`) that picks which client speaks for it. That split is the point of this
 //! renovation — the demolished `models.toml` made the `[providers.<name>]`
 //! table name BE the provider type, so two Anthropic gateways were
 //! inexpressible and a local server had to be called `ollama`/`lemonade`/
@@ -55,12 +54,13 @@ enum BackendCommand {
     Set {
         /// Backend name — free-form, unique (e.g. anthropic, gpt, zorak)
         name: String,
-        /// Wire dialect: anthropic | deepseek | openai | codex-app
+        /// Wire dialect: anthropic | deepseek | openai | codex-app | mk
         #[arg(long)]
         kind: String,
         /// Endpoint URL. REQUIRED for --kind openai (it says WHICH
         /// OpenAI-compatible server); optional gateway override for
-        /// anthropic; unnecessary for deepseek; required for codex-app.
+        /// anthropic; unnecessary for deepseek; required for codex-app and for
+        /// mk (the megakernel service address, such as http://zorak:8090).
         #[arg(long = "base-url")]
         base_url: Option<String>,
         /// Environment variable NAME holding the API key (never the key)

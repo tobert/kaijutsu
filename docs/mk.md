@@ -1,8 +1,8 @@
 # mk: the megakernel suite
 
 Design. Built: the `kaijutsu-mk` crate with `MkClient`, the council calls,
-and the `generate` and `model` modules (steps 1 and 2 of "Order of work").
-The provider and the seat are not built. The megakernel is the Qwen
+and the `generate` and `model` modules, and the `mk` provider (steps 1 to 3
+of "Order of work"). The live probes and the seat are not done. The megakernel is the Qwen
 inference service in `~/src/megakernel-qwen38-flashnext-strixhalo`; its wire is
 `/mk/v1` (`service/openapi.json`) plus `/council/v1`
 (`service/council-openapi.json`). Facts below were read at megakernel
@@ -90,11 +90,9 @@ Unknown, to measure before relying on it:
   (the template trims earlier turns' reasoning).
 - How many of the 32768 tokens the seat's system prompt and tool schemas
   take before the first user word.
-- Whether a resent tool call matches what the model wrote. The crate keeps
-  argument member order (`Json`), but the kernel stores a call's input as a
-  `serde_json::Value`, which sorts keys. A call written as `{path, all}`
-  goes back as `{all, path}`, so the re-rendered history differs from the
-  generated tokens and the held prefix may end there.
+- Whether a resent call with several arguments keeps the held prefix. The
+  kernel keeps argument member order (`serde_json` with `preserve_order`,
+  declared by `kaijutsu-kernel`), so the call should re-render as written.
 
 ## Crate: `kaijutsu-mk`
 
@@ -195,15 +193,11 @@ start, because the first version resends the whole history. With held
 contexts, the held prefix already has the model's exact tokens and nothing is
 re-rendered.
 
-Two changes this needs:
-
-- The runtime's error text says the arguments "were not valid JSON" and were
-  "most likely cut off at the output limit." That is wrong for a Qwen XML
-  parse failure. The text must name the parser's own `error` and give the
-  output-limit advice only when the turn stopped at `length`.
-- The service may return `name: null`. The runtime and the replay need a
-  non-empty name, so the adapter uses a fixed placeholder and the error text
-  says the tool name did not parse.
+The runtime's error result says the arguments did not parse, names the
+parser's own `error`, and gives the output-limit advice as a condition, since
+the runtime does not know the finish when it answers the call. When the
+service returns `name: null`, the adapter names the call `unnamed_tool_call`
+and its error says the tool name did not parse.
 
 ### Response mapping
 
@@ -216,6 +210,20 @@ Two changes this needs:
 | `done.tool_calls` with `raw` and `error` | `ToolUseInvalid { id, name, arguments: raw, error }` |
 | `done.finish` | `Done { stop_reason, input_tokens, output_tokens, extra }` |
 | `error` event | `Error`, from the crate's mid-stream error variant |
+
+Thinking ends with the signature `mk-reasoning`, an opaque sentinel like the
+OpenAI-compatible path's, so the runtime and hydration replay it as
+`reasoning_content` instead of dropping it as unsigned.
+
+Thinking and answer text stream as deltas. Token pieces carry the template's
+markers, so the adapter splits them as the service does (text before
+`</think>` is thinking; with tools, text from `<tool_call>` on is tool text,
+and a marker split across pieces is still a marker) and trims each phase as
+Python's `str.strip()` does. At `done` it compares what it streamed with
+`done.reasoning_content` and `done.content`; a difference is an error event,
+because the stored block would not match the reply the service holds.
+
+Call ids are `mk-<first 16 hex of done.context>-<index>`.
 
 `stop_reason` is `tool_calls` when any call came back, `stop` for a plain end,
 and `length` for a length end. `input_tokens` is `usage.prompt`,
@@ -231,7 +239,11 @@ reply.
 
 A tool call is written in the `tool` phase and arrives only in `done`. At 16
 to 19 tokens per second, a call that writes 1500 tokens of a file is about 90
-seconds with no event. The in-flight strip must show that the turn is alive.
+seconds with no event. A long prefill before the first token is silent too.
+This is more than a display problem: the runtime cancels a stream that sends
+no event for its idle timeout (120 seconds by default) and fails the turn.
+Until a liveness event exists, an `mk` backend sets a longer idle timeout
+(`kj backend set ... --idle-timeout`), and the in-flight strip shows nothing.
 `StreamEvent` has no event for this today. The design choice (a progress event
 carrying the token count, or the tool-phase text as it arrives) is open; it
 must not invent a `ToolUse` before `done`.
@@ -239,8 +251,9 @@ must not invent a `ToolUse` before `done`.
 ### Window and admission
 
 - The window is the service's `max_context` from `GET /mk/v1/model`, read
-  when the provider is built. A model row's `context_window` larger than that
-  is a construction error. No kernel path enforces `context_window` today; it
+  once per client on its first turn, or the model row's `context_window`
+  when that is smaller. A row larger than the service is an error on the
+  turn, naming the fix. No kernel path enforces `context_window` today; it
   is shown by `kj backend` and context info, so the provider enforces the
   window itself.
 - Before each call, the adapter renders the request with `POST /mk/v1/render`
@@ -281,6 +294,8 @@ A maintenance seat on `mk` needs:
 - A tool loadout narrowed to maintenance work, small enough that its schemas
   leave room in the window. Capabilities are ergonomic here, not a security
   boundary.
+- `--idle-timeout` and `--request-timeout` on the backend long enough for a
+  silent tool phase and a slow reply (see "Liveness").
 - The council gate in bumper mode, so the seat can act without a human and the
   gate can still say "think again" (`docs/council.md`, "Bumper mode").
 
@@ -332,8 +347,12 @@ Kernel tests deny host subprocess execution; none of these needs it.
    and a model reply recorded from zorak; `contrib/mk/refresh-openapi.sh`
    refreshes the vendored OpenAPI file. A live replay test (ignored by
    default) passed on zorak.
-3. Add `llm/mk/` and `BackendKind::Mk` against the scripted fake, with
-   render-based admission and the unparsed-call text fix.
+3. Done: `llm/mk/` and `BackendKind::Mk` (`kj backend set --kind mk
+   --base-url ...`), tested against kaijutsu-mk's scripted server (its
+   `test-util` feature). Errors: a request the service refuses (400, 404,
+   413) is `InvalidRequest`, timeouts and connection failures are
+   `NetworkError`, and the rest are `ApiError`; mid-stream failures are
+   error events.
 4. Run the live probes. Decide the resend-versus-context question and the
    tool-call reliability question from the numbers.
 5. Add the cast, rc, and seat, and decide liveness.

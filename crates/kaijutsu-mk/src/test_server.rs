@@ -1,5 +1,5 @@
-//! A scripted HTTP/1.1 server on 127.0.0.1 for the crate's tests. It needs no
-//! dependency beyond tokio.
+//! A scripted HTTP/1.1 server on 127.0.0.1 for tests, here and in callers
+//! (the `test-util` feature). It needs no dependency beyond tokio.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,22 +9,22 @@ use tokio::net::TcpListener;
 
 /// One scripted reply, served on its own connection.
 #[derive(Clone)]
-pub(crate) struct Reply {
-    pub(crate) status: u16,
-    pub(crate) content_type: &'static str,
-    pub(crate) headers: Vec<(&'static str, String)>,
-    pub(crate) body: String,
+pub struct Reply {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: String,
     /// Waited before the status line.
-    pub(crate) delay: Duration,
+    pub delay: Duration,
     /// When set, the first half of the body is written, then this is waited
     /// before the rest.
-    pub(crate) stall: Option<Duration>,
+    pub stall: Option<Duration>,
     /// When false, the body has no `content-length` and ends when the
     /// connection closes, as a stream does.
-    pub(crate) length: bool,
+    pub length: bool,
 }
 
-pub(crate) fn reply(status: u16, body: impl Into<String>) -> Reply {
+pub fn reply(status: u16, body: impl Into<String>) -> Reply {
     Reply {
         status,
         content_type: "application/json",
@@ -37,26 +37,26 @@ pub(crate) fn reply(status: u16, body: impl Into<String>) -> Reply {
 }
 
 /// A close-delimited `text/event-stream` reply.
-pub(crate) fn sse(body: impl Into<String>) -> Reply {
+pub fn sse(body: impl Into<String>) -> Reply {
     Reply { content_type: "text/event-stream", length: false, ..reply(200, body) }
 }
 
 #[derive(Debug)]
-pub(crate) struct Captured {
-    pub(crate) method: String,
-    pub(crate) path: String,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: String,
+pub struct Captured {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
 }
 
 impl Captured {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
     }
 }
 
 /// Serves `replies` in order, one connection each, and records each request.
-pub(crate) async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Captured>>>) {
+pub async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Captured>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));

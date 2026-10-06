@@ -402,8 +402,8 @@ impl Usage {
 /// Typed provider-specific usage extension.
 ///
 /// Rides on [`StreamEvent::Done`] (which is serde-serialized over the
-/// wire), so each variant must round-trip — they're all plain `u64`
-/// counts, so that's free.
+/// wire), so each variant must round-trip; they hold integers and strings
+/// only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageExtra {
     Claude(ClaudeUsageExtra),
@@ -411,6 +411,8 @@ pub enum UsageExtra {
     /// lemonade/llama.cpp server, Ollama, OpenAI itself). DeepSeek populates
     /// the cache split + reasoning tokens; leaner servers leave them zero.
     OpenAiCompat(OpenAiCompatUsageExtra),
+    /// The megakernel (`llm/mk/`).
+    Mk(MkUsageExtra),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +433,25 @@ pub struct OpenAiCompatUsageExtra {
     pub prompt_cache_hit_tokens: u64,
     pub prompt_cache_miss_tokens: u64,
     pub reasoning_tokens: u64,
+}
+
+/// Usage extras for the megakernel. `kept` prompt tokens came from a held
+/// prefix and `fed` were prefilled for this call; both are inside
+/// `input_tokens`. The times are whole milliseconds: `prefill_ms` and
+/// `decode_ms` as the service measured them, `first_token_ms` and `wall_ms`
+/// as the provider saw them, queueing behind other GPU work included. `seed`
+/// replays the reply under the same weights (`model`, `weight_hash`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MkUsageExtra {
+    pub kept: u64,
+    pub fed: u64,
+    pub prefill_ms: u64,
+    pub decode_ms: u64,
+    pub first_token_ms: u64,
+    pub wall_ms: u64,
+    pub seed: u64,
+    pub model: String,
+    pub weight_hash: String,
 }
 
 /// Common finish reasons plus a typed provider escape hatch.

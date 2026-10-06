@@ -35,6 +35,7 @@ pub mod deepseek;
 pub(crate) mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
+pub mod mk;
 pub mod openai;
 pub(crate) mod splice;
 pub mod stream;
@@ -48,7 +49,7 @@ pub use config::{
 pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, OpenAiCompatUsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, MkUsageExtra, OpenAiCompatUsageExtra,
     InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
@@ -548,6 +549,8 @@ pub enum Provider {
     /// Experimental Codex app-server daemon, reached over a configured
     /// `ws://`/`wss://` endpoint. The provider never launches Codex itself.
     CodexApp(CodexAppClient),
+    /// The megakernel service (see `llm/mk/`).
+    Mk(mk::Client),
     /// Mock provider for tests.
     #[cfg(any(test, feature = "test-mock"))]
     Mock(MockClient),
@@ -897,6 +900,26 @@ impl Provider {
                     timeout: resolve_request_timeout(config),
                 }))
             }
+            // No key: the service is for the tailnet.
+            BackendKind::Mk => {
+                let base_url = config.base_url.as_deref().ok_or_else(|| {
+                    LlmError::InvalidRequest(format!(
+                        "backend '{}' has kind 'mk', which requires --base-url (the megakernel service address)",
+                        config.name
+                    ))
+                })?;
+                let windows = config
+                    .models
+                    .iter()
+                    .filter_map(|(model, info)| info.context_window.map(|w| (model.clone(), w)))
+                    .collect();
+                Ok(Self::Mk(mk::Client::new(
+                    config.name.clone(),
+                    base_url,
+                    resolve_request_timeout(config),
+                    windows,
+                )?))
+            }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => {
                 let mock = MockClient::new(format!(
@@ -943,6 +966,7 @@ impl Provider {
             Self::DeepSeek(_) => "deepseek",
             Self::OpenAi(c) => c.provider_name(),
             Self::CodexApp(c) => &c.name,
+            Self::Mk(c) => c.provider_name(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => "mock",
         }
@@ -970,6 +994,7 @@ impl Provider {
             Self::DeepSeek(client) => client.prompt(model, system, prompt).await,
             Self::OpenAi(client) => client.prompt(model, system, prompt).await,
             Self::CodexApp(client) => client.prompt(model, system, prompt).await,
+            Self::Mk(client) => client.prompt(model, system, prompt).await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if !mock.delay.is_zero() {
@@ -1013,6 +1038,7 @@ impl Provider {
                 Ok(ProviderStream::OpenAi(stream))
             }
             Self::CodexApp(client) => client.stream(opts, messages).await,
+            Self::Mk(client) => Ok(ProviderStream::Mk(client.stream(opts, messages).await?)),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
@@ -1088,7 +1114,7 @@ impl Provider {
             Self::Claude(c) => c.available_models(),
             Self::DeepSeek(c) => c.available_models(),
             Self::OpenAi(c) => c.available_models(),
-            Self::CodexApp(_) => Vec::new(),
+            Self::CodexApp(_) | Self::Mk(_) => Vec::new(),
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(_) => vec!["mock-model"],
         }
@@ -1107,6 +1133,8 @@ pub enum ProviderStream {
     OpenAi(openai::Stream),
     /// Codex app-server's translated event stream.
     Codex(CodexStream),
+    /// The megakernel's token stream.
+    Mk(mk::Stream),
     /// Replays a pre-built event queue. Lets tests drive a real streaming
     /// turn (e.g. the autonomous fork-and-act path) without a live provider.
     #[cfg(any(test, feature = "test-mock"))]
@@ -1132,6 +1160,7 @@ impl ProviderStream {
             Self::Claude(s) => s.next_event().await,
             Self::OpenAi(s) => s.next_event().await,
             Self::Codex(s) => s.client.next_event().await,
+            Self::Mk(s) => s.next_event().await,
             #[cfg(any(test, feature = "test-mock"))]
             Self::Mock(state) => {
                 if !state.event_delay.is_zero() { tokio::time::sleep(state.event_delay).await; }
@@ -1163,7 +1192,7 @@ impl ProviderStream {
                 .respond_inline_tool(id, result)
                 .await
                 .map_err(|error| error.to_string()),
-            Self::Claude(_) | Self::OpenAi(_) => Err(format!(
+            Self::Claude(_) | Self::OpenAi(_) | Self::Mk(_) => Err(format!(
                 "provider does not support inline tool response for callback {id}"
             )),
             #[cfg(any(test, feature = "test-mock"))]
@@ -1178,6 +1207,7 @@ impl ProviderStream {
         match self {
             Self::Claude(s) => s.cancel(),
             Self::OpenAi(s) => s.cancel(),
+            Self::Mk(s) => s.cancel(),
             // Phase 0 has no synchronous interrupt hook in ProviderStream;
             // dropping the stream closes the daemon connection at turn end.
             Self::Codex(_) => {}

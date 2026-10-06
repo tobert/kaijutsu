@@ -15,8 +15,8 @@ pub mod council;
 pub mod generate;
 pub mod json;
 pub mod model;
-#[cfg(test)]
-mod test_server;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_server;
 
 pub use client::{MkClient, MkError, ServiceError};
 pub use json::Json;

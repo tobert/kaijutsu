@@ -198,6 +198,7 @@ fn warn_if_near_context_window(
 /// `cache_read`/`cache_write` and a reader adds them to `tokens_in`.
 /// OpenAI-compatible providers (DeepSeek) count the hit inside `tokens_in`, so
 /// theirs are logged as `cache_hit`/`cache_miss`, which a reader must not add.
+/// The megakernel's `kept` (held prefix) and `fed` are inside `tokens_in` too.
 fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
     use crate::llm::UsageExtra;
     match extra {
@@ -208,6 +209,10 @@ fn usage_log_suffix(extra: &Option<crate::llm::UsageExtra>) -> String {
         Some(UsageExtra::OpenAiCompat(d)) => format!(
             ", cache_hit={}, cache_miss={}",
             d.prompt_cache_hit_tokens, d.prompt_cache_miss_tokens
+        ),
+        Some(UsageExtra::Mk(m)) => format!(
+            ", kept={}, fed={}, first_token_ms={}, wall_ms={}, seed={}",
+            m.kept, m.fed, m.first_token_ms, m.wall_ms, m.seed
         ),
         None => String::new(),
     }
@@ -2826,10 +2831,10 @@ async fn run_llm_stream(
                     // result: failing the turn tells the model nothing, and it
                     // ends the work with the call still unanswered.
                     let detail = format!(
-                        "This call did not run: its arguments were not valid JSON. They stop \
-                         after {} bytes ({error}), most likely cut off at the output limit. \
-                         Make the call again in smaller pieces — write a large file in several \
-                         appends rather than one call.",
+                        "This call did not run: its arguments did not parse ({error}; {} bytes \
+                         arrived). A call cut off at the output limit looks like this: make it \
+                         again in smaller pieces — write a large file in several appends rather \
+                         than one call.",
                         arguments.len(),
                     );
                     tracing::warn!(
@@ -2922,6 +2927,8 @@ async fn run_llm_stream(
                             c.cache_creation_input_tokens,
                             0,
                         ),
+                        // A held prefix is the megakernel's cache hit.
+                        Some(UsageExtra::Mk(m)) => (m.kept, 0, 0),
                         None => (0, 0, 0),
                     };
 
@@ -4829,7 +4836,7 @@ mod publish_tests {
                     .expect("the call is answered");
                 assert!(result.is_error, "the model must see this as an error");
                 assert!(
-                    result.content.contains("not valid JSON")
+                    result.content.contains("did not parse")
                         && result.content.contains("47 bytes")
                         && result.content.contains("line 1 column 7174"),
                     "{}",
