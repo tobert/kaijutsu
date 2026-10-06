@@ -5,7 +5,8 @@ The director reads `council-amy` and `council-banto` in place of the shared
 house rules still join each decision. Coder keeps its shared council.
 
 `amy.md` is Amy's `/home/atobey/AGENTS.md` as loaded on October 6, 2026.
-`banto.md` is the shipped director stance as loaded that day. These are
+`banto.md` is the shipped director stance as loaded that day. Each opens
+with one line telling the council what the text is. These are
 starting guidance; chat, edits, and exclusions in Kaijutsu evolve it.
 Editing these seed files does not rewrite live contexts.
 

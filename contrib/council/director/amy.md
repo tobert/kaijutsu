@@ -1,3 +1,5 @@
+Amy's standing guidance, copied from /home/atobey/AGENTS.md:
+
 # User Directives
 
 We think as a cybernetic system.

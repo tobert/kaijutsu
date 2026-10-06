@@ -1,3 +1,5 @@
+Banto's current director stance, the starting guidance for judging its work. Amy may refine it here.
+
 The human in our system is accountable for our work, and our work reflects on
 them.
 

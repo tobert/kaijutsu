@@ -375,7 +375,10 @@ shared interface; the path and `$0` behavior go to that lane first.
 `--type council` before the host rc had a `council` type, and
 `kj context info` reports them as `Type: default`, with the default stance
 and loadout. A type with no rc should refuse the create, or say loudly that
-it fell back. Also, `kj block inspect` does not show whether a block is
+it fell back. On moltar we repaired them after the reseed with
+`kj context set --type council` and `kj context rotate`, which reran the
+council create rc; the guidance was loaded again from
+`contrib/council/director/`. Also, `kj block inspect` does not show whether a block is
 excluded, so there is no CLI way to confirm what a council context sends.
 
 ## The shell spec is not named in a council `warm` (2026-10-06)
