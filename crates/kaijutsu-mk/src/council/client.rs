@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use reqwest::Method;
 
-use crate::client::{to_body, MkClient, MkError};
+use crate::client::{to_body, Family, MkClient, MkError};
 use crate::council::canon;
 use crate::council::wire::{
     ContextPut, ContextPutResult, ContextState, DecisionRequest, DecisionResponse, HeldSpec,
@@ -14,7 +14,7 @@ use crate::council::wire::{
 impl MkClient {
     /// `GET /council/v1/identity`.
     pub async fn identity(&self) -> Result<ServerIdentity, MkError> {
-        self.json(Method::GET, "/council/v1/identity", None, &[], self.timeout, 200, "identity")
+        self.json(Family::Council, Method::GET, "/council/v1/identity", None, &[], self.timeout, 200, "identity")
             .await
     }
 
@@ -31,20 +31,20 @@ impl MkClient {
         if let Some(head) = if_match {
             headers.push(("if-match", head.as_str().to_string()));
         }
-        self.json(Method::PUT, &path, Some(bytes), &headers, self.timeout, 200, "context put result")
+        self.json(Family::Council, Method::PUT, &path, Some(bytes), &headers, self.timeout, 200, "context put result")
             .await
     }
 
     /// `GET /council/v1/contexts/{id}`.
     pub async fn get_context(&self, id: &str) -> Result<ContextState, MkError> {
         let path = context_path(id)?;
-        self.json(Method::GET, &path, None, &[], self.timeout, 200, "context state").await
+        self.json(Family::Council, Method::GET, &path, None, &[], self.timeout, 200, "context state").await
     }
 
     /// `DELETE /council/v1/contexts/{id}`.
     pub async fn delete_context(&self, id: &str) -> Result<(), MkError> {
         let path = context_path(id)?;
-        self.call(Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
+        self.call(Family::Council, Method::DELETE, &path, None, &[], self.timeout, 204).await.map(|_| ())
     }
 
     /// `POST /council/v1/specs`. Fails with [`MkError::SpecIdMismatch`]
@@ -52,7 +52,7 @@ impl MkClient {
     pub async fn post_spec(&self, spec: &Spec) -> Result<HeldSpec, MkError> {
         let computed = canon::spec_id(spec).map_err(|e| MkError::Request(e.to_string()))?;
         let held: HeldSpec = self
-            .json(Method::POST, "/council/v1/specs", Some(to_body(spec)?), &[], self.timeout, 200, "held spec")
+            .json(Family::Council, Method::POST, "/council/v1/specs", Some(to_body(spec)?), &[], self.timeout, 200, "held spec")
             .await?;
         if held.spec_id != computed {
             return Err(MkError::SpecIdMismatch { computed, server: held.spec_id });
@@ -63,7 +63,7 @@ impl MkClient {
     /// `GET /council/v1/specs/{spec_id}`.
     pub async fn get_spec(&self, id: &SpecId) -> Result<HeldSpec, MkError> {
         let path = format!("/council/v1/specs/{id}");
-        self.json(Method::GET, &path, None, &[], self.timeout, 200, "held spec").await
+        self.json(Family::Council, Method::GET, &path, None, &[], self.timeout, 200, "held spec").await
     }
 
     /// `POST /council/v1/decisions`. The request is checked against the rules a
@@ -90,7 +90,7 @@ impl MkClient {
         if let Some(tp) = traceparent {
             headers.push(("traceparent", tp.to_string()));
         }
-        self.json(Method::POST, "/council/v1/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
+        self.json(Family::Council, Method::POST, "/council/v1/decisions", Some(to_body(request)?), &headers, timeout, 200, "decision")
             .await
     }
 }
@@ -104,15 +104,13 @@ fn context_path(id: &str) -> Result<String, MkError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
     use crate::council::wire::{ContextRef, ErrorType, Role, Turn};
     use crate::json::Json;
+    use crate::test_server::{reply, serve};
 
     const SPEC: &str = include_str!("../../tests/fixtures/spec.json");
     const REQUEST: &str = include_str!("../../tests/fixtures/decision_request.json");
@@ -122,91 +120,6 @@ mod tests {
 
     fn snap(c: char) -> String {
         format!("snap:{}", c.to_string().repeat(64))
-    }
-
-    #[derive(Clone)]
-    struct Reply {
-        status: u16,
-        headers: Vec<(&'static str, String)>,
-        body: String,
-        delay: Duration,
-    }
-
-    fn reply(status: u16, body: impl Into<String>) -> Reply {
-        Reply { status, headers: vec![], body: body.into(), delay: Duration::ZERO }
-    }
-
-    #[derive(Debug)]
-    struct Captured {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-        body: String,
-    }
-
-    impl Captured {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
-        }
-    }
-
-    /// A one-connection-per-reply HTTP/1.1 server on 127.0.0.1. It needs no
-    /// dependency beyond tokio, which the crate's tests already use.
-    async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Captured>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
-        tokio::spawn(async move {
-            for r in replies {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                let (head_end, content_length) = loop {
-                    let n = sock.read(&mut chunk).await.unwrap();
-                    assert!(n > 0, "client closed before sending a request");
-                    buf.extend_from_slice(&chunk[..n]);
-                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .map(|v| v.trim().parse::<usize>().unwrap())
-                            .unwrap_or(0);
-                        break (i + 4, len);
-                    }
-                };
-                while buf.len() < head_end + content_length {
-                    let n = sock.read(&mut chunk).await.unwrap();
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-                let mut lines = head.lines();
-                let mut first = lines.next().unwrap().split(' ');
-                let method = first.next().unwrap().to_string();
-                let path = first.next().unwrap().to_string();
-                let headers = lines
-                    .filter_map(|l| l.split_once(':'))
-                    .map(|(n, v)| (n.trim().to_lowercase(), v.trim().to_string()))
-                    .collect();
-                log.lock().unwrap().push(Captured {
-                    method,
-                    path,
-                    headers,
-                    body: String::from_utf8_lossy(&buf[head_end..]).to_string(),
-                });
-                tokio::time::sleep(r.delay).await;
-                let mut out = format!("HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n", r.status, r.body.len());
-                for (n, v) in &r.headers {
-                    out.push_str(&format!("{n}: {v}\r\n"));
-                }
-                out.push_str("\r\n");
-                out.push_str(&r.body);
-                let _ = sock.write_all(out.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        });
-        (base, seen)
     }
 
     fn client(base: &str) -> MkClient {

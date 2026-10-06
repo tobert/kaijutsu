@@ -12,6 +12,7 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::council::wire::{ErrorBody, ErrorDetail, InvalidRequest, SnapshotId, SpecId};
+use crate::json::Json;
 
 /// Longest slice of a response body kept in an error.
 const BODY_EXCERPT: usize = 512;
@@ -19,9 +20,9 @@ const BODY_EXCERPT: usize = 512;
 /// Why a call failed.
 #[derive(Debug, thiserror::Error)]
 pub enum MkError {
-    /// The server answered with an error status. `error` is the decoded body
-    /// when it matched the council contract (it carries `head` for 409 and
-    /// 412); `body` is the start of the raw text either way.
+    /// A `/council/v1` route answered with an error status. `error` is the
+    /// decoded body when it matched the council contract (it carries `head`
+    /// for 409 and 412); `body` is the start of the raw text either way.
     #[error("megakernel answered {status}{}", .error.as_ref().map(|e| format!(": {:?}: {}", e.r#type, e.message)).unwrap_or_default())]
     Status {
         status: u16,
@@ -30,6 +31,24 @@ pub enum MkError {
         retry_after: Option<Duration>,
         body: String,
     },
+    /// A `/mk/v1` route answered with an error status. `error` is the decoded
+    /// body when it matched the service's error schema; `body` is the start of
+    /// the raw text either way.
+    #[error("megakernel answered {status}{}", .error.as_ref().map(|e| format!(": {}: {}", e.r#type, e.message)).unwrap_or_default())]
+    Service {
+        status: u16,
+        error: Option<ServiceError>,
+        /// The `Retry-After` header, when it held whole seconds.
+        retry_after: Option<Duration>,
+        body: String,
+    },
+    /// The server failed after a stream began and said so in an `error` event.
+    /// A 503 of type `pass_timeout_error` dropped only this request.
+    #[error("megakernel failed mid-stream ({}): {}: {}", .0.code, .0.r#type, .0.message)]
+    Stream(ServiceError),
+    /// The stream ended before its `done` event. What arrived is not a reply.
+    #[error("megakernel stream ended before its done event: {0}")]
+    Truncated(String),
     /// The call took longer than the client's timeout.
     #[error("megakernel call timed out")]
     Timeout,
@@ -64,7 +83,8 @@ impl MkError {
     /// The HTTP status, when the server answered with one.
     pub fn status(&self) -> Option<u16> {
         match self {
-            MkError::Status { status, .. } => Some(*status),
+            MkError::Status { status, .. } | MkError::Service { status, .. } => Some(*status),
+            MkError::Stream(e) => Some(e.code),
             _ => None,
         }
     }
@@ -76,7 +96,28 @@ impl From<InvalidRequest> for MkError {
     }
 }
 
-fn excerpt(body: &[u8]) -> String {
+/// The inside of a `/mk/v1` error body, `{"error": {...}}`. `type` is the
+/// service's own name for the failure, such as `pass_timeout_error`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct ServiceError {
+    pub code: u16,
+    pub message: String,
+    pub r#type: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ServiceErrorBody {
+    pub(crate) error: ServiceError,
+}
+
+/// Which error schema a route's failures follow.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Family {
+    Council,
+    Mk,
+}
+
+pub(crate) fn excerpt(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     text.chars().take(BODY_EXCERPT).collect()
 }
@@ -113,9 +154,11 @@ impl MkClient {
         self
     }
 
+    /// A call whose success is one JSON body.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn json<T: DeserializeOwned>(
         &self,
+        family: Family,
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
@@ -124,16 +167,15 @@ impl MkClient {
         expect: u16,
         what: &'static str,
     ) -> Result<T, MkError> {
-        let bytes = self.call(method, path, body, headers, timeout, expect).await?;
-        serde_json::from_slice(&bytes).map_err(|e| MkError::Decode {
-            what,
-            message: e.to_string(),
-            body: excerpt(&bytes),
-        })
+        let bytes = self.call(family, method, path, body, headers, timeout, expect).await?;
+        decode(&bytes, what)
     }
 
+    /// A call whose whole reply is read within `timeout`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn call(
         &self,
+        family: Family,
         method: Method,
         path: &str,
         body: Option<Vec<u8>>,
@@ -141,7 +183,36 @@ impl MkClient {
         timeout: Duration,
         expect: u16,
     ) -> Result<Vec<u8>, MkError> {
-        let mut req = self.http.request(method, format!("{}{}", self.base, path)).timeout(timeout);
+        let resp = self.send(family, method, path, body, headers, Some(timeout)).await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
+        if status.as_u16() == expect {
+            return Ok(bytes);
+        }
+        Err(MkError::Decode {
+            what: "status",
+            message: format!("expected {expect}, got {status}"),
+            body: excerpt(&bytes),
+        })
+    }
+
+    /// Sends a request and returns the response once its status is a
+    /// success. An error status reads the body and becomes the family's error.
+    /// With `timeout` of `None`, nothing bounds the call: a stream bounds each
+    /// read itself.
+    pub(crate) async fn send(
+        &self,
+        family: Family,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&'static str, String)],
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, MkError> {
+        let mut req = self.http.request(method, format!("{}{}", self.base, path));
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
         for (name, value) in headers {
             req = req.header(HeaderName::from_static(name), header_value(name, value)?);
         }
@@ -155,6 +226,9 @@ impl MkClient {
         }
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
         let retry_after = resp
             .headers()
             .get(RETRY_AFTER)
@@ -162,30 +236,46 @@ impl MkClient {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
         let bytes = resp.bytes().await.map_err(map_reqwest)?.to_vec();
-        if status.as_u16() == expect {
-            return Ok(bytes);
-        }
-        if status.is_success() {
-            return Err(MkError::Decode {
-                what: "status",
-                message: format!("expected {expect}, got {status}"),
-                body: excerpt(&bytes),
-            });
-        }
-        Err(status_error(status, retry_after, &bytes))
+        Err(status_error(family, status, retry_after, &bytes))
     }
 }
 
-fn status_error(status: StatusCode, retry_after: Option<Duration>, bytes: &[u8]) -> MkError {
-    MkError::Status {
-        status: status.as_u16(),
-        error: serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error),
-        retry_after,
+/// Decodes a success body. Unknown fields are ignored; a missing field or a
+/// wrong type is a decode error.
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8], what: &'static str) -> Result<T, MkError> {
+    serde_json::from_slice(bytes).map_err(|e| MkError::Decode {
+        what,
+        message: e.to_string(),
         body: excerpt(bytes),
+    })
+}
+
+/// Fails unless `value` is a JSON object, as tool-call arguments must be.
+pub(crate) fn require_object(value: &Json, what: &'static str) -> Result<(), MkError> {
+    match value {
+        Json::Object(_) => Ok(()),
+        _ => Err(MkError::Decode { what, message: "arguments are not an object".into(), body: String::new() }),
     }
 }
 
-fn map_reqwest(e: reqwest::Error) -> MkError {
+fn status_error(family: Family, status: StatusCode, retry_after: Option<Duration>, bytes: &[u8]) -> MkError {
+    match family {
+        Family::Council => MkError::Status {
+            status: status.as_u16(),
+            error: serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error),
+            retry_after,
+            body: excerpt(bytes),
+        },
+        Family::Mk => MkError::Service {
+            status: status.as_u16(),
+            error: serde_json::from_slice::<ServiceErrorBody>(bytes).ok().map(|b| b.error),
+            retry_after,
+            body: excerpt(bytes),
+        },
+    }
+}
+
+pub(crate) fn map_reqwest(e: reqwest::Error) -> MkError {
     if e.is_timeout() {
         MkError::Timeout
     } else {

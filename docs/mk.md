@@ -1,7 +1,8 @@
 # mk: the megakernel suite
 
-Design. Built: the `kaijutsu-mk` crate with `MkClient` and the council
-calls (step 1 of "Order of work"). The rest is not built. The megakernel is the Qwen
+Design. Built: the `kaijutsu-mk` crate with `MkClient`, the council calls,
+and the `generate` and `model` modules (steps 1 and 2 of "Order of work").
+The provider and the seat are not built. The megakernel is the Qwen
 inference service in `~/src/megakernel-qwen38-flashnext-strixhalo`; its wire is
 `/mk/v1` (`service/openapi.json`) plus `/council/v1`
 (`service/council-openapi.json`). Facts below were read at megakernel
@@ -50,6 +51,12 @@ Observed in the megakernel source (`service/generate.py`, `gpu.py`, `http.py`,
   Qwen3-Coder XML, parsed against the request's tool schemas.
 - A call that does not parse comes back as `{name|null, raw, error}`. It is
   never repaired and never dropped.
+- Token pieces include the template's markers: `</think>` arrives as the
+  last `think` token, `<tool_call>` and the XML around a call arrive as
+  `tool` tokens, and the answer begins with the template's blank line.
+  `done.reasoning_content` and `done.content` carry the text without them.
+- A reply that made tool calls finishes with `finish: stop`; only
+  `done.tool_calls` says that calls came back.
 - Streaming is SSE: `token` events (`id`, `piece`, `phase`, `p`, `h`, `n`,
   `tps`), then one `done` event (`context`, `reasoning_content`, `content`,
   `tool_calls`, `finish` of `stop|length|cancelled`, `seed`, `usage` of
@@ -83,6 +90,11 @@ Unknown, to measure before relying on it:
   (the template trims earlier turns' reasoning).
 - How many of the 32768 tokens the seat's system prompt and tool schemas
   take before the first user word.
+- Whether a resent tool call matches what the model wrote. The crate keeps
+  argument member order (`Json`), but the kernel stores a call's input as a
+  `serde_json::Value`, which sorts keys. A call written as `{path, all}`
+  goes back as `{all, path}`, so the re-rendered history differs from the
+  generated tokens and the held prefix may end there.
 
 ## Crate: `kaijutsu-mk`
 
@@ -99,8 +111,8 @@ Layout, smallest first:
 |---|---|---|
 | `council` | `wire`, `canon`, `math`, the `/council/v1` calls | exists |
 | `client` | `MkClient`: base URL, timeout, `traceparent`, request send, status-to-error mapping; `MkError` | exists |
-| `generate` | `GenerateRequest`, `Message`, `Tool`, `Sample`, `TokenEvent`, `Done`, an SSE decoder, `generate` and `generate_stream` calls | new |
-| `model` | `GET /mk/v1/model` and `POST /mk/v1/render` | new |
+| `generate` | `GenerateRequest`, `Message`, `Tool`, `Sample`, `TokenEvent`, `Done`, an SSE decoder, `generate` and `generate_stream` calls | exists |
+| `model` | `GET /mk/v1/model` and `POST /mk/v1/render` | exists |
 | `contexts` | `POST /mk/v1/contexts`, `GET`, `DELETE` | new, only when a caller needs it |
 | `reads` | `POST /mk/v1/reads` | new, only when a caller needs it |
 | `status` | `GET /mk/v1/status` SSE | new, only when a caller needs it |
@@ -282,9 +294,11 @@ Each test below can fail for a named reason.
 - **Schema conformance.** Build requests with the crate's types and validate
   them against `service/openapi.json`. Validate recorded responses the same
   way. Mutation check: rename a field in a fixture and watch validation fail.
-  The OpenAPI files are copied into the crate's fixtures with their source
-  commit named in a sidecar file, and a script refreshes them. This is the
-  sensor for server drift, since the running decoder tolerates new fields.
+  The OpenAPI file is copied into the crate's fixtures with its source
+  commit named in `mk-openapi.source`, and `contrib/mk/refresh-openapi.sh`
+  refreshes it. This is the sensor for server drift, since the running
+  decoder tolerates new fields. Renaming a serialized field and sending
+  `content: null` both turn it red.
 - **Stream decoder.** Scripted SSE for a thinking-then-answer reply, a
   tool-call reply, an invalid tool call, a length stop, a cancel, an `error`
   event, a stream cut short, and an unknown event. The last three must error.
@@ -310,10 +324,14 @@ Kernel tests deny host subprocess execution; none of these needs it.
 1. Done: rename the crate and the kernel's paths; `CouncilClient` became
    `MkClient` and `CouncilError` became `MkError`. The crate's 70 tests and
    the kernel's council tests pass unchanged.
-2. Add `generate` and `model` types, the SSE decoder, and the conformance
-   test, with no provider yet. `MkError::Status` decodes only the council
-   error body today; the `/mk/v1` body (`code`, `message`, and a free-text
-   `type`) needs its own decoded form.
+2. Done: `generate` and `model` types, the SSE decoder, and the
+   conformance test. `/mk/v1` error statuses are `MkError::Service`, an
+   `error` event is `MkError::Stream`, and a stream without `done` is
+   `MkError::Truncated`. `generate_stream` bounds each read with an idle
+   timeout and nothing bounds the whole reply. Fixtures are three streams
+   and a model reply recorded from zorak; `contrib/mk/refresh-openapi.sh`
+   refreshes the vendored OpenAPI file. A live replay test (ignored by
+   default) passed on zorak.
 3. Add `llm/mk/` and `BackendKind::Mk` against the scripted fake, with
    render-based admission and the unparsed-call text fix.
 4. Run the live probes. Decide the resend-versus-context question and the

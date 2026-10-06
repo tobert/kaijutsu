@@ -1,0 +1,78 @@
+event: token
+data: {"id":248058,"piece":"<tool_call>","phase":"tool","p":0.9999204316968396,"h":0.0012403195332441378,"n":1,"tps":0.0}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.9999992604750909,"h":1.55639574126644e-05,"n":2,"tps":13.667201006850476}
+
+event: token
+data: {"id":27,"piece":"<","phase":"tool","p":0.9999999741496699,"h":5.206587267570593e-07,"n":3,"tps":15.164532867506171}
+
+event: token
+data: {"id":1628,"piece":"function","phase":"tool","p":0.9999999871424791,"h":2.5441541375528595e-07,"n":4,"tps":15.754943813376938}
+
+event: token
+data: {"id":28,"piece":"=","phase":"tool","p":0.9999959658613011,"h":6.732758372006652e-05,"n":5,"tps":16.061565838036493}
+
+event: token
+data: {"id":4577,"piece":"ls","phase":"tool","p":0.9999953130972244,"h":7.08432968206963e-05,"n":6,"tps":16.26729015476874}
+
+event: token
+data: {"id":29,"piece":">","phase":"tool","p":0.9999981421422366,"h":3.4526164088539544e-05,"n":7,"tps":15.78101160929222}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.999995548469684,"h":6.415826045275019e-05,"n":8,"tps":14.706259273002363}
+
+event: token
+data: {"id":27,"piece":"<","phase":"tool","p":0.9999974775465713,"h":3.517588253391551e-05,"n":9,"tps":14.918101866146143}
+
+event: token
+data: {"id":15704,"piece":"parameter","phase":"tool","p":0.9999999905216538,"h":2.002317096289859e-07,"n":10,"tps":15.125544208986703}
+
+event: token
+data: {"id":79114,"piece":"=path","phase":"tool","p":0.9996632228490698,"h":0.0031292295770528945,"n":11,"tps":15.501927244317281}
+
+event: token
+data: {"id":29,"piece":">","phase":"tool","p":0.9999999945608038,"h":1.2154135560984038e-07,"n":12,"tps":15.314645083343452}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.9999992724002034,"h":1.1425185922782315e-05,"n":13,"tps":15.662498732388528}
+
+event: token
+data: {"id":55101,"piece":"/tmp","phase":"tool","p":0.999989669542717,"h":0.00016518023876570468,"n":14,"tps":15.745088507906752}
+
+event: token
+data: {"id":53306,"piece":"/demo","phase":"tool","p":0.9998888608883634,"h":0.0013900464042078192,"n":15,"tps":15.82299958428469}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.999906505654775,"h":0.001353961354058958,"n":16,"tps":15.885926137761988}
+
+event: token
+data: {"id":510,"piece":"</","phase":"tool","p":0.9999995994068495,"h":8.823906120582586e-06,"n":17,"tps":15.938678246189122}
+
+event: token
+data: {"id":15704,"piece":"parameter","phase":"tool","p":0.9999999349200899,"h":1.2092182063282862e-06,"n":18,"tps":15.988504601816096}
+
+event: token
+data: {"id":29,"piece":">","phase":"tool","p":0.999993092981779,"h":0.00011787772025575858,"n":19,"tps":16.034443921984778}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.9999998115336357,"h":3.176810083867658e-06,"n":20,"tps":16.138085600297106}
+
+event: token
+data: {"id":510,"piece":"</","phase":"tool","p":0.6201547962808296,"h":0.6653005753318547,"n":21,"tps":16.180982948532108}
+
+event: token
+data: {"id":1628,"piece":"function","phase":"tool","p":0.9999996840217528,"h":5.286076573144776e-06,"n":22,"tps":16.22685850509091}
+
+event: token
+data: {"id":29,"piece":">","phase":"tool","p":0.9999892565195491,"h":0.0002382948193710184,"n":23,"tps":16.260413742852602}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"tool","p":0.9999999931811929,"h":1.5149895828096057e-07,"n":24,"tps":16.298531014613154}
+
+event: token
+data: {"id":248059,"piece":"</tool_call>","phase":"tool","p":0.9999999997887543,"h":5.515574106715595e-09,"n":25,"tps":16.326310118481032}
+
+event: done
+data: {"context":"393a878c2ec3bb1de44453dc95cbbbc08000c50b0d1b9515d22a90bbd4870344","reasoning_content":"","content":"","tool_calls":[{"name":"ls","arguments":{"path":"/tmp/demo"}}],"finish":"stop","seed":7,"usage":{"prompt":290,"kept":0,"fed":290,"completion":25},"ms":{"prefill":694.085757015273,"decode":1527.8666679514572},"model":{"id":"Qwen3.8-Flash-Next-UD-IQ4_XS","weight_hash":"0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"}}
+

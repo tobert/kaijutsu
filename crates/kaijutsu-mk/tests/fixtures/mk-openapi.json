@@ -1,0 +1,352 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "megakernel /mk/v1",
+    "version": "1.0.0",
+    "summary": "Qwen3.8-Flash-Next (UD-IQ4_XS) on one HIP megakernel: System 1 reads, System 2 generation, held contexts.",
+    "description": "Bespoke API (DESIGN.md \"Service\", \"The API suite, settled 2026-09-28\"). Tailnet only, no auth. Every request body is validated against this document: a field outside the schema is a 400, never ignored. Context ids are the lowercase hex sha256 of the context's token ids as little-endian u32s, so the same tokens name the same state however they were built. One engine runs one pass at a time; a read preempts generation between two decode steps.",
+    "license": {"name": "MIT", "identifier": "MIT"}
+  },
+  "servers": [{"url": "http://127.0.0.1:8090"}],
+  "paths": {
+    "/mk/v1/openapi.json": {
+      "get": {"operationId": "openapi", "summary": "This document.",
+        "responses": {"200": {"description": "The OpenAPI document.", "content": {"application/json": {"schema": {"type": "object"}}}}}}
+    },
+    "/mk/v1/health": {
+      "get": {"operationId": "health", "summary": "Liveness: 200 while the process serves HTTP, with how it got its weights; 503 after an unexpected failure stopped the server.",
+        "responses": {
+          "200": {"description": "Serving.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Health"}}}},
+          "503": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/model": {
+      "get": {"operationId": "model", "summary": "What a client pins a vector space or a calibration to.",
+        "responses": {"200": {"description": "The model and build identity.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Model"}}}}}}
+    },
+    "/mk/v1/status": {
+      "get": {"operationId": "status", "summary": "Server-sent events: a `status` snapshot on connect, then one `pass` event per engine pass.",
+        "responses": {"200": {"description": "An event stream (event names: status, pass).", "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/StatusEvents"}}}}}}
+    },
+    "/mk/v1/render": {
+      "post": {"operationId": "render", "summary": "The chat template's text and tokens for messages. Every string in messages and tools is content: special-token text in it encodes as plain text, so the template's own markers are the only control tokens (the same tokens /contexts and /generate build from these messages). A Unicode noncharacter anywhere is 400 (they escape special-token text inside the service).",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenderRequest"}}}},
+        "responses": {
+          "200": {"description": "Rendered.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RenderResponse"}}}},
+          "400": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/tokenize": {
+      "post": {"operationId": "tokenize", "summary": "Text to token ids. Raw text is the client's own structure: special-token text (the chat markers in a rendered prompt) tokenizes as its single id, as in a prompt or a suffix. So /tokenize of a /render text differs from its tokens where content held such text. A Unicode noncharacter is 400.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TokenizeRequest"}}}},
+        "responses": {
+          "200": {"description": "Tokens.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TokenizeResponse"}}}},
+          "400": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/detokenize": {
+      "post": {"operationId": "detokenize", "summary": "Token ids to text (invalid UTF-8 replaced).",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DetokenizeRequest"}}}},
+        "responses": {
+          "200": {"description": "Text.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DetokenizeResponse"}}}},
+          "400": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/contexts": {
+      "post": {"operationId": "contextCreate", "summary": "Hold a context: tokenize the whole input, extend the longest held prefix, keep the result. POSTing the same input again finds the same id. `pin: true` exempts it from eviction, `pin: false` releases a pin, no `pin` leaves it as it was.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ContextRequest"}}}},
+        "responses": {
+          "200": {"description": "Held.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ContextCreated"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Unavailable"},
+          "507": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/contexts/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"$ref": "#/components/schemas/ContextId"}}],
+      "get": {"operationId": "contextGet", "summary": "A held context.",
+        "responses": {
+          "200": {"description": "Held.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ContextInfo"}}}},
+          "404": {"$ref": "#/components/responses/Error"}}},
+      "delete": {"operationId": "contextDelete", "summary": "Drop a held context (pinned or not).",
+        "responses": {
+          "200": {"description": "Dropped.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ContextDeleted"}}}},
+          "404": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/reads": {
+      "post": {"operationId": "reads", "summary": "System 1: for each suffix, the next token's distribution over single-token letters after (context text + suffix). The context is never changed. With `contexts`, each suffix is read against each context and the distributions are pooled.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadsRequest"}}}},
+        "responses": {
+          "200": {"description": "With `context`: a ReadsResponse, one result per suffix in order. With `contexts`: a ReadsMultiResponse, one result per suffix per context, and one pooled entry per suffix.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadsReply"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Unavailable"}}}
+    },
+    "/mk/v1/generate": {
+      "post": {"operationId": "generate", "summary": "System 2: sample a reply. Streamed as server-sent events (`token` per token, then `done`), or the `done` object alone. Closing the stream cancels at the next step.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenerateRequest"}}}},
+        "responses": {
+          "200": {"description": "The reply.", "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Done"}},
+            "text/event-stream": {"schema": {"$ref": "#/components/schemas/GenerateEvents"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Unavailable"},
+          "507": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/embeddings": {
+      "post": {"operationId": "embeddings", "summary": "The last token's final hidden state per input. Flash-Next was never trained as an embedder: retrieval quality is unmeasured.",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EmbeddingsRequest"}}}},
+        "responses": {
+          "200": {"description": "One vector per input, in order.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EmbeddingsResponse"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Unavailable"}}}
+    },
+    "/mk/v1/traces": {
+      "get": {"operationId": "traceList", "summary": "The traces on disk, newest first (DESIGN.md \"Service\", traces).",
+        "responses": {"200": {"description": "Listed.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TraceList"}}}}}}
+    },
+    "/mk/v1/traces/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get": {"operationId": "traceGet", "summary": "A trace's manifest: what was traced, and its arrays.",
+        "responses": {"200": {"description": "The manifest.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TraceManifest"}}}},
+          "404": {"$ref": "#/components/responses/Error"}}}
+    },
+    "/mk/v1/traces/{id}/arrays/{name}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}},
+        {"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get": {"operationId": "traceArray", "summary": "One array of a trace as JSON. Past the service's cap (a full trace's residuals) it is 413: read the .npy from the trace's dir.",
+        "responses": {"200": {"description": "The array.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TraceArray"}}}},
+          "404": {"$ref": "#/components/responses/Error"},
+          "413": {"$ref": "#/components/responses/Error"}}}
+    }
+  },
+  "components": {
+    "responses": {
+      "Error": {"description": "An error.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Unavailable": {"description": "The engine can't run this request now. Type `pass_timeout_error`: a pass stopped on a spin-timeout (a grid barrier waited out its 1 s bound, as when another tenant time-slices the GPU); this request was dropped and its working contexts freed (a context being built is never held), held contexts are unchanged, the canary replayed clean and the server keeps serving: retry. A streamed generation that hits one ends with an `error` event of code 503 and the same type. Other types: the server is shutting down or the engine is closed.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+    },
+    "schemas": {
+      "Error": {"type": "object", "additionalProperties": false, "required": ["error"],
+        "properties": {"error": {"type": "object", "additionalProperties": false, "required": ["code", "message", "type"],
+          "properties": {"code": {"type": "integer"}, "message": {"type": "string"}, "type": {"type": "string"}}}}},
+      "Health": {"type": "object", "additionalProperties": false, "required": ["status", "weights"],
+        "properties": {"status": {"const": "ok"}, "weights": {"enum": ["attached", "loaded"], "description": "how this process got its weights: attached to the arena systemd kept across a restart, or loaded from the GGUF"}}},
+      "ContextId": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+      "Identity": {"type": "object", "additionalProperties": false, "required": ["id", "weight_hash"],
+        "properties": {"id": {"type": "string"}, "weight_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+      "Model": {"type": "object", "additionalProperties": false,
+        "required": ["id", "weight_hash", "hidden_size", "vocab_size", "max_context", "build", "device"],
+        "properties": {
+          "id": {"type": "string"},
+          "weight_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 over each shard's GGUF header and tensor-info bytes and its size: names the file set, not a digest of every weight byte."},
+          "hidden_size": {"type": "integer"},
+          "vocab_size": {"type": "integer"},
+          "max_context": {"type": "integer"},
+          "build": {"type": "object", "additionalProperties": false, "required": ["commit", "engine_sha256"],
+            "properties": {"commit": {"type": "string"}, "dirty": {"type": "boolean"}, "engine_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+          "device": {"type": "object", "additionalProperties": false, "required": ["name", "arch"],
+            "properties": {"name": {"type": "string"}, "arch": {"type": "string"}}}}},
+      "PassKind": {"enum": ["read", "prefill", "decode", "embed", "copy"]},
+      "StatusEvents": {"description": "SSE. `event: status` data StatusSnapshot (on connect); `event: pass` data PassEvent (after each engine pass).",
+        "oneOf": [{"$ref": "#/components/schemas/StatusSnapshot"}, {"$ref": "#/components/schemas/PassEvent"}]},
+      "Queue": {"type": "object", "additionalProperties": false, "required": ["reads", "other"],
+        "properties": {"reads": {"type": "integer", "minimum": 0}, "other": {"type": "integer", "minimum": 0}}},
+      "StatusSnapshot": {"type": "object", "additionalProperties": false, "required": ["queue", "contexts", "generating"],
+        "properties": {
+          "queue": {"$ref": "#/components/schemas/Queue"},
+          "generating": {"type": "integer", "minimum": 0, "description": "generations in flight"},
+          "contexts": {"type": "object", "additionalProperties": false, "required": ["held", "pinned", "bytes", "pinned_bytes", "budget_bytes"],
+            "properties": {"held": {"type": "integer"}, "pinned": {"type": "integer"}, "bytes": {"type": "integer"},
+              "pinned_bytes": {"type": "integer"}, "budget_bytes": {"type": "integer"}}}}},
+      "PassEvent": {"type": "object", "additionalProperties": false, "required": ["kind", "t", "ms", "queue"],
+        "properties": {"kind": {"$ref": "#/components/schemas/PassKind"}, "t": {"type": "integer", "minimum": 0},
+          "ms": {"type": "number"}, "queue": {"$ref": "#/components/schemas/Queue"}}},
+      "Message": {"type": "object", "additionalProperties": false, "required": ["role"],
+        "properties": {
+          "role": {"enum": ["system", "user", "assistant", "tool"]},
+          "content": {"type": "string"},
+          "reasoning_content": {"type": "string"},
+          "tool_calls": {"type": "array", "items": {"$ref": "#/components/schemas/ToolCallIn"}}}},
+      "ToolCallIn": {"type": "object", "additionalProperties": false, "required": ["name", "arguments"],
+        "properties": {"name": {"type": "string", "minLength": 1}, "arguments": {"type": "object"}}},
+      "Tool": {"type": "object", "additionalProperties": false, "required": ["type", "function"],
+        "properties": {"type": {"const": "function"},
+          "function": {"type": "object", "additionalProperties": false, "required": ["name"],
+            "properties": {"name": {"type": "string", "minLength": 1}, "description": {"type": "string"},
+              "parameters": {"type": "object", "description": "A JSON Schema for the arguments."}}}}},
+      "Messages": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/Message"}},
+      "Tools": {"type": "array", "items": {"$ref": "#/components/schemas/Tool"}},
+      "TokenIds": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+      "ReasoningEffort": {"enum": ["xhigh", "medium", "low"], "description": "The chat template's own reasoning_effort variable, for requests that render messages. Absent: the template's default (xhigh), byte for byte what a request without the field renders. With thinking on, xhigh and low write a \"Reasoning effort is set to ...\" line at the top of the system turn and medium writes none (so medium's system turn equals the thinking-off render's while the generation prompt still opens <think>). Refused (400) where nothing is rendered: from.context, from.prompt, from.tokens, and contexts from tokens or a prompt."},
+      "RenderRequest": {"type": "object", "additionalProperties": false, "required": ["messages"],
+        "properties": {"messages": {"$ref": "#/components/schemas/Messages"}, "tools": {"$ref": "#/components/schemas/Tools"},
+          "thinking": {"type": "boolean", "default": true},
+          "reasoning_effort": {"$ref": "#/components/schemas/ReasoningEffort"},
+          "generation_prompt": {"type": "boolean", "default": true, "description": "end at the start of the next assistant turn (inside an open <think> when thinking)"}}},
+      "RenderResponse": {"type": "object", "additionalProperties": false, "required": ["text", "tokens", "n_tokens"],
+        "properties": {"text": {"type": "string", "description": "the rendered text for reading; sent back as a prompt, content's special-token text would parse as control tokens: send messages instead"}, "tokens": {"type": "array", "items": {"type": "integer"}}, "n_tokens": {"type": "integer"}}},
+      "TokenizeRequest": {"type": "object", "additionalProperties": false, "required": ["text"],
+        "properties": {"text": {"type": "string"}, "pieces": {"type": "boolean", "default": false}}},
+      "TokenizeResponse": {"type": "object", "additionalProperties": false, "required": ["tokens", "n_tokens"],
+        "properties": {"tokens": {"type": "array", "items": {"type": "integer"}}, "n_tokens": {"type": "integer"},
+          "pieces": {"type": "array", "items": {"type": "string"}, "description": "each token's text (invalid UTF-8 replaced), when asked"}}},
+      "DetokenizeRequest": {"type": "object", "additionalProperties": false, "required": ["tokens"],
+        "properties": {"tokens": {"type": "array", "items": {"type": "integer", "minimum": 0}}}},
+      "DetokenizeResponse": {"type": "object", "additionalProperties": false, "required": ["text"],
+        "properties": {"text": {"type": "string"}}},
+      "ContextRequest": {"type": "object", "additionalProperties": false,
+        "oneOf": [{"required": ["prompt"]}, {"required": ["messages"]}, {"required": ["tokens"]}],
+        "properties": {
+          "prompt": {"type": "string", "minLength": 1},
+          "messages": {"$ref": "#/components/schemas/Messages"},
+          "tools": {"$ref": "#/components/schemas/Tools"},
+          "thinking": {"type": "boolean", "default": true},
+          "reasoning_effort": {"$ref": "#/components/schemas/ReasoningEffort"},
+          "generation_prompt": {"type": "boolean", "default": false, "description": "with messages: end the context at the start of the next assistant turn"},
+          "tokens": {"$ref": "#/components/schemas/TokenIds"},
+          "pin": {"type": "boolean"},
+          "trace": {"$ref": "#/components/schemas/TraceLevel"}}},
+      "ContextCreated": {"type": "object", "additionalProperties": false, "required": ["id", "n_tokens", "kept", "fed", "ms", "pinned", "bytes"],
+        "properties": {"id": {"$ref": "#/components/schemas/ContextId"}, "n_tokens": {"type": "integer"},
+          "kept": {"type": "integer", "description": "tokens reused from the longest held prefix"},
+          "fed": {"type": "integer", "description": "tokens run through the engine"},
+          "ms": {"type": "number"}, "pinned": {"type": "boolean"}, "bytes": {"type": "integer"},
+          "trace": {"oneOf": [{"$ref": "#/components/schemas/TraceId"}, {"type": "null"}], "description": "present when the request asked for a trace: the trace of the tokens this build fed, or null when it fed none"}}},
+      "ContextInfo": {"type": "object", "additionalProperties": false, "required": ["id", "n_tokens", "pinned", "bytes"],
+        "properties": {"id": {"$ref": "#/components/schemas/ContextId"}, "n_tokens": {"type": "integer"},
+          "pinned": {"type": "boolean"}, "bytes": {"type": "integer"}}},
+      "ContextDeleted": {"type": "object", "additionalProperties": false, "required": ["id", "deleted"],
+        "properties": {"id": {"$ref": "#/components/schemas/ContextId"}, "deleted": {"const": true}}},
+      "ReadsRequest": {"type": "object", "additionalProperties": false, "required": ["suffixes", "letters"],
+        "description": "Exactly one of `context` (one context: a ReadsResponse) or `contexts` (1 to 8 distinct contexts, each suffix read against each and pooled: a ReadsMultiResponse). `pool` goes only with `contexts`; `trace` only with `context`.",
+        "oneOf": [{"required": ["context"], "not": {"required": ["contexts"]}}, {"required": ["contexts"], "not": {"required": ["context"]}}],
+        "properties": {
+          "context": {"$ref": "#/components/schemas/ContextId"},
+          "contexts": {"type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": {"$ref": "#/components/schemas/ContextId"},
+            "description": "1 to 8 distinct context ids. Each suffix is tokenized against each context's own text and read on a fork of it. The reads run suffix by suffix, in request order; within one suffix every context is a segment of shared passes (at most 256 tokens each) in one GPU job."},
+          "pool": {"$ref": "#/components/schemas/PoolSettings"},
+          "suffixes": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string", "minLength": 1}},
+          "letters": {"type": "array", "minItems": 1, "maxItems": 26, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "top": {"type": "integer", "minimum": 0, "maximum": 20, "default": 5},
+          "trace": {"$ref": "#/components/schemas/TraceLevel"}}},
+      "PoolSettings": {"type": "object", "additionalProperties": false,
+        "description": "How a suffix's reads across contexts are pooled. Omitted: linear, uniform.",
+        "properties": {
+          "method": {"enum": ["linear", "loglinear"], "default": "linear", "description": "linear: the weighted mean of the contexts' letter probabilities (\"some context supports A\"). loglinear: the weighted mean of their log-probabilities, renormalized (\"the contexts agree on A\"; sharper)."},
+          "weights": {"oneOf": [{"enum": ["uniform", "mass"]}, {"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "number", "minimum": 0}}], "default": "uniform",
+            "description": "uniform: 1/N. mass: each context's letter mass for that suffix. Or one weight per context, each finite and >= 0 with a sum > 0. Always normalized to sum to 1."}}},
+      "TopToken": {"type": "object", "additionalProperties": false, "required": ["id", "piece", "logprob"],
+        "properties": {"id": {"type": "integer"}, "piece": {"type": "string"}, "logprob": {"type": "number"}}},
+      "ReadResult": {"type": "object", "additionalProperties": false, "required": ["probs", "logits", "mass", "top", "n_suffix", "ms"],
+        "properties": {
+          "probs": {"type": "array", "items": {"type": "number"}, "description": "softmax over the letters' logits, in the request's letter order"},
+          "logits": {"type": "array", "items": {"type": "number"}, "description": "the letters' raw logits (f32 values as JSON numbers)"},
+          "mass": {"type": "number", "description": "the letters' total probability under the full-vocabulary softmax"},
+          "top": {"type": "array", "items": {"$ref": "#/components/schemas/TopToken"}, "description": "the top tokens by raw logit, ties by id"},
+          "n_suffix": {"type": "integer"},
+          "ms": {"type": "number", "description": "wall time of the read. With `contexts`, the wall time of the whole GPU job for this suffix (every context's read of it runs together), so it is the same for every context at that suffix"},
+          "trace": {"$ref": "#/components/schemas/TraceId", "description": "present when the request asked for a trace"}}},
+      "ReadsResponse": {"type": "object", "additionalProperties": false, "required": ["context", "results", "model"],
+        "properties": {"context": {"$ref": "#/components/schemas/ContextId"},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/ReadResult"}},
+          "model": {"$ref": "#/components/schemas/Identity"}}},
+      "Pooled": {"type": "object", "additionalProperties": false, "required": ["probs", "argmax", "agree", "spread"],
+        "description": "One suffix pooled over the contexts. Not calibrated, even if each context's probs were.",
+        "properties": {
+          "probs": {"type": "array", "items": {"type": "number"}, "description": "the pooled distribution over the letters, in the request's letter order, summing to 1"},
+          "argmax": {"type": "string", "description": "the letter with the largest pooled probability (ties: the earliest letter)"},
+          "agree": {"type": "boolean", "description": "every context's own most probable letter is the same (ties: the earliest letter)"},
+          "spread": {"type": "number", "description": "the largest, over letters, of (highest minus lowest probability any context gave that letter): 0 when the contexts say the same thing"}}},
+      "ReadsMultiResponse": {"type": "object", "additionalProperties": false, "required": ["contexts", "results", "pooled", "pool", "model"],
+        "properties": {
+          "contexts": {"type": "array", "items": {"$ref": "#/components/schemas/ContextId"}, "description": "the request's context ids, in request order"},
+          "results": {"type": "array", "items": {"type": "array", "items": {"$ref": "#/components/schemas/ReadResult"}},
+            "description": "per context (request order), one ReadResult per suffix (request order): exactly what a single-context read of that context and suffix gives"},
+          "pooled": {"type": "array", "items": {"$ref": "#/components/schemas/Pooled"}, "description": "one per suffix, in order"},
+          "pool": {"$ref": "#/components/schemas/PoolSettings", "description": "the method and weights used, defaults filled in (given weights as sent, as numbers; \"mass\" stays \"mass\": it is per suffix)"},
+          "model": {"$ref": "#/components/schemas/Identity"}}},
+      "ReadsReply": {"oneOf": [{"$ref": "#/components/schemas/ReadsResponse"}, {"$ref": "#/components/schemas/ReadsMultiResponse"}]},
+      "Sample": {"type": "object", "additionalProperties": false,
+        "properties": {
+          "temperature": {"type": "number", "minimum": 0, "description": "0 is greedy (bit-reproducible, no draw)"},
+          "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+          "top_k": {"type": "integer", "minimum": 0, "description": "0 is off"},
+          "min_p": {"type": "number", "minimum": 0, "exclusiveMaximum": 1},
+          "seed": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615, "description": "missing or null draws a fresh seed; every response reports the seed used"}}},
+      "From": {"oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["context"], "properties": {"context": {"$ref": "#/components/schemas/ContextId"}}},
+        {"type": "object", "additionalProperties": false, "required": ["messages"], "properties": {"messages": {"$ref": "#/components/schemas/Messages"}, "tools": {"$ref": "#/components/schemas/Tools"}}},
+        {"type": "object", "additionalProperties": false, "required": ["prompt"], "properties": {"prompt": {"type": "string", "minLength": 1}}},
+        {"type": "object", "additionalProperties": false, "required": ["tokens"], "properties": {"tokens": {"$ref": "#/components/schemas/TokenIds"}}}]},
+      "GenerateRequest": {"type": "object", "additionalProperties": false, "required": ["from"],
+        "properties": {
+          "from": {"$ref": "#/components/schemas/From"},
+          "thinking": {"type": "boolean", "default": true, "description": "rendered by the template when `from` is messages; otherwise it says whether the prompt ends inside an open <think>"},
+          "reasoning_effort": {"$ref": "#/components/schemas/ReasoningEffort"},
+          "prefill": {"type": "string", "minLength": 1, "description": "Text the reply starts with, appended after the starting point and before the first generated token, so the model continues from it: with from.messages after the generation prompt (with thinking on, inside the open <think>), with from.context after the held context's tokens. Refused (400) with from.tokens and from.prompt (append it there yourself). It is content, encoded like message content with special tokens off: a \"</think>\" or \"<|im_end|>\" in it is plain text, never a control token, and (the model never having seen an end of thinking) ends no phase in the reply split. The text and prefill are tokenized together and the starting tokens must be a prefix of that result; a prefill whose first characters merge with the text's last token (a newline after the template's trailing newline) is a 400 naming the seam. The prefill counts in usage.prompt and is held in the context. done.reasoning_content and done.content cover the whole reply, prefill included. It is never sent as a `token` event: SSE `token` events are model-generated tokens only (n counts those)."},
+          "sample": {"$ref": "#/components/schemas/Sample"},
+          "max_tokens": {"type": "integer", "minimum": 1, "maximum": 32768, "default": 4096},
+          "stream": {"type": "boolean", "default": false}}},
+      "Phase": {"enum": ["think", "answer", "tool"]},
+      "TokenEvent": {"type": "object", "additionalProperties": false, "required": ["id", "piece", "phase", "p", "h", "n", "tps"],
+        "properties": {
+          "id": {"type": "integer"},
+          "piece": {"type": "string", "description": "the text this token completes (a UTF-8 character split across tokens arrives with its last byte)"},
+          "phase": {"$ref": "#/components/schemas/Phase"},
+          "p": {"type": "number", "description": "the model's own probability for this token (untempered full-vocabulary softmax)"},
+          "h": {"type": "number", "description": "entropy in nats of that distribution"},
+          "n": {"type": "integer", "description": "tokens generated so far, this one included"},
+          "tps": {"type": "number", "description": "decode tokens per second so far"}}},
+      "ToolCall": {"type": "object", "additionalProperties": false, "required": ["name"],
+        "properties": {
+          "name": {"type": ["string", "null"]},
+          "arguments": {"type": "object", "description": "parsed; present when the call parsed"},
+          "raw": {"type": "string", "description": "the call's exact text; present when it did not parse"},
+          "error": {"type": "string", "description": "why it did not parse"}},
+        "oneOf": [{"required": ["arguments"]}, {"required": ["raw", "error"]}]},
+      "Done": {"type": "object", "additionalProperties": false,
+        "required": ["context", "reasoning_content", "content", "tool_calls", "finish", "seed", "usage", "ms", "model"],
+        "properties": {
+          "context": {"$ref": "#/components/schemas/ContextId", "description": "the held prompt + reply, so the next turn extends it"},
+          "reasoning_content": {"type": "string"},
+          "content": {"type": "string"},
+          "tool_calls": {"type": "array", "items": {"$ref": "#/components/schemas/ToolCall"}},
+          "finish": {"enum": ["stop", "length", "cancelled"]},
+          "seed": {"type": "integer", "minimum": 0},
+          "usage": {"type": "object", "additionalProperties": false, "required": ["prompt", "kept", "fed", "completion"],
+            "properties": {"prompt": {"type": "integer"}, "kept": {"type": "integer"}, "fed": {"type": "integer"}, "completion": {"type": "integer"}}},
+          "ms": {"type": "object", "additionalProperties": false, "required": ["prefill", "decode"],
+            "properties": {"prefill": {"type": "number"}, "decode": {"type": "number"}}},
+          "model": {"$ref": "#/components/schemas/Identity"}}},
+      "GenerateEvents": {"description": "SSE. `event: token` data TokenEvent per generated token, then `event: done` data Done; `event: error` data Error if the server fails mid-stream (it then stops).",
+        "oneOf": [{"$ref": "#/components/schemas/TokenEvent"}, {"$ref": "#/components/schemas/Done"}, {"$ref": "#/components/schemas/Error"}]},
+      "EmbeddingsRequest": {"type": "object", "additionalProperties": false, "required": ["inputs"],
+        "properties": {"inputs": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1}}}},
+      "EmbeddingsResponse": {"type": "object", "additionalProperties": false, "required": ["vectors", "model", "dims"],
+        "properties": {"vectors": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}},
+          "model": {"$ref": "#/components/schemas/Identity"}, "dims": {"type": "integer"}}},
+      "TraceLevel": {"enum": ["summary", "full"], "description": "Run this request's passes on the unfused path with the engine's layer and route taps (the same bits as untraced) and keep a trace (DESIGN.md \"Service\", traces): summary = per layer and token update, norm, turn, the 4 streams' norms and spread, the routes, and for a read the letter lens at its last token; full adds every layer's residual (f16)."},
+      "TraceId": {"type": "string", "pattern": "^\\d{8}T\\d{6}-[0-9a-f]{8}$"},
+      "TraceInfo": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "level", "created", "bytes", "n_tokens", "preview"],
+        "properties": {"id": {"$ref": "#/components/schemas/TraceId"}, "kind": {"enum": ["read", "prefill"]},
+          "level": {"$ref": "#/components/schemas/TraceLevel"}, "created": {"type": "string"}, "bytes": {"type": "integer"},
+          "n_tokens": {"type": "integer"}, "preview": {"type": "string", "description": "the traced text's first 60 characters"}}},
+      "TraceList": {"type": "object", "additionalProperties": false, "required": ["traces"],
+        "properties": {"traces": {"type": "array", "items": {"$ref": "#/components/schemas/TraceInfo"}, "description": "newest first"}}},
+      "TraceArraySpec": {"type": "object", "additionalProperties": false, "required": ["dtype", "shape", "file"],
+        "properties": {"dtype": {"type": "string"}, "shape": {"type": "array", "items": {"type": "integer"}}, "file": {"type": "string"}}},
+      "TraceManifest": {"type": "object", "required": ["id", "kind", "level", "created", "created_ns", "bytes", "arrays", "tokens", "pieces", "context", "n_prefix", "model", "dir"],
+        "properties": {"id": {"$ref": "#/components/schemas/TraceId"}, "kind": {"enum": ["read", "prefill"]},
+          "level": {"$ref": "#/components/schemas/TraceLevel"}, "created": {"type": "string"}, "created_ns": {"type": "integer"},
+          "bytes": {"type": "integer"}, "arrays": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/TraceArraySpec"}},
+          "tokens": {"type": "array", "items": {"type": "integer"}, "description": "the tokens the traced passes fed"},
+          "pieces": {"type": "array", "items": {"type": "string"}},
+          "context": {"$ref": "#/components/schemas/ContextId", "description": "a read: the held context it read from; a prefill: the context it built"},
+          "n_prefix": {"type": "integer", "description": "the tokens before the traced ones"},
+          "model": {"$ref": "#/components/schemas/Identity"}, "dir": {"type": "string", "description": "the trace's directory on the service's disk"},
+          "letters": {"type": "array", "items": {"type": "string"}}, "letter_ids": {"type": "array", "items": {"type": "integer"}},
+          "logits": {"type": "array", "items": {"type": "number"}, "description": "a read: the letters' logits it answered"}},
+        "description": "Fields beyond these may appear (diagnostics such as ms and path)."},
+      "TraceArray": {"type": "object", "additionalProperties": false, "required": ["name", "dtype", "shape", "data"],
+        "properties": {"name": {"type": "string"}, "dtype": {"type": "string"}, "shape": {"type": "array", "items": {"type": "integer"}},
+          "data": {"type": "array", "items": {"type": "number"}, "description": "row-major, flat"}}}
+    }
+  }
+}

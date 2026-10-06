@@ -1,0 +1,30 @@
+event: token
+data: {"id":760,"piece":"The","phase":"answer","p":0.819261892278844,"h":0.6934053762847503,"n":1,"tps":0.0}
+
+event: token
+data: {"id":12515,"piece":" sky","phase":"answer","p":0.9993158012401213,"h":0.007009757975039454,"n":2,"tps":16.28348344882673}
+
+event: token
+data: {"id":369,"piece":" is","phase":"answer","p":0.9418725697965341,"h":0.2646516469623969,"n":3,"tps":16.51900766542311}
+
+event: token
+data: {"id":6105,"piece":" blue","phase":"answer","p":0.9036863454795063,"h":0.3341125075989493,"n":4,"tps":16.534398285528066}
+
+event: token
+data: {"id":383,"piece":" on","phase":"answer","p":0.7869906550408194,"h":0.5227902424495939,"n":5,"tps":16.61068333941025}
+
+event: token
+data: {"id":264,"piece":" a","phase":"answer","p":0.9999686076075489,"h":0.00043209888018426896,"n":6,"tps":16.61312070493504}
+
+event: token
+data: {"id":2708,"piece":" clear","phase":"answer","p":0.9999954346285782,"h":7.654293170290046e-05,"n":7,"tps":16.68230554694492}
+
+event: token
+data: {"id":1834,"piece":" day","phase":"answer","p":0.9999880744675198,"h":0.00018992492362653705,"n":8,"tps":16.869756607877378}
+
+event: token
+data: {"id":13,"piece":".","phase":"answer","p":0.9967214593412577,"h":0.022872080547744943,"n":9,"tps":16.844526092952737}
+
+event: done
+data: {"context":"896b73b83d2473f7c9fa3503b7903c05fe8d461688c765fe19dd3e47d4a4493c","reasoning_content":"","content":"The sky is blue on a clear day.","tool_calls":[],"finish":"stop","seed":7,"usage":{"prompt":33,"kept":0,"fed":33,"completion":9},"ms":{"prefill":154.2364249471575,"decode":548.8231187919155},"model":{"id":"Qwen3.8-Flash-Next-UD-IQ4_XS","weight_hash":"0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"}}
+

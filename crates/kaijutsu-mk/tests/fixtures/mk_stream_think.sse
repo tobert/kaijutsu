@@ -1,0 +1,135 @@
+event: token
+data: {"id":760,"piece":"The","phase":"think","p":0.9945146588389824,"h":0.03582540779491433,"n":1,"tps":0.0}
+
+event: token
+data: {"id":1156,"piece":" user","phase":"think","p":0.9999489501362748,"h":0.0007256380329979927,"n":2,"tps":14.871732360767956}
+
+event: token
+data: {"id":369,"piece":" is","phase":"think","p":0.3914968680759486,"h":1.1960811715087516,"n":3,"tps":16.13306110723358}
+
+event: token
+data: {"id":9859,"piece":" asking","phase":"think","p":0.9990318147073896,"h":0.0092354366202659,"n":4,"tps":16.426208688361786}
+
+event: token
+data: {"id":264,"piece":" a","phase":"think","p":0.6149424992499766,"h":0.8534300226038214,"n":5,"tps":16.77303833410055}
+
+event: token
+data: {"id":4145,"piece":" simple","phase":"think","p":0.9997033181505169,"h":0.0031066795903444033,"n":6,"tps":16.821780471096286}
+
+event: token
+data: {"id":33633,"piece":" arithmetic","phase":"think","p":0.7661269941660441,"h":0.6239662081134236,"n":7,"tps":16.85685095199305}
+
+event: token
+data: {"id":3296,"piece":" question","phase":"think","p":0.9770142038672719,"h":0.11338658156484084,"n":8,"tps":16.886806084940925}
+
+event: token
+data: {"id":25,"piece":":","phase":"think","p":0.9176526894745606,"h":0.32618736101044415,"n":9,"tps":16.906225162988232}
+
+event: token
+data: {"id":220,"piece":" ","phase":"think","p":0.999612885467746,"h":0.00373517953516261,"n":10,"tps":16.94548602955886}
+
+event: token
+data: {"id":16,"piece":"1","phase":"think","p":0.9999726485371386,"h":0.00035862011798695005,"n":11,"tps":16.999007923021466}
+
+event: token
+data: {"id":22,"piece":"7","phase":"think","p":0.9999930451886101,"h":0.0001059084456291126,"n":12,"tps":17.000920581939894}
+
+event: token
+data: {"id":478,"piece":" +","phase":"think","p":0.9999876291913091,"h":0.00019468190024197774,"n":13,"tps":17.022764723706608}
+
+event: token
+data: {"id":220,"piece":" ","phase":"think","p":0.9999974135703013,"h":5.076788841197858e-05,"n":14,"tps":17.31324286109154}
+
+event: token
+data: {"id":17,"piece":"2","phase":"think","p":0.9999725437222557,"h":0.00036091135033680877,"n":15,"tps":17.34553162368562}
+
+event: token
+data: {"id":20,"piece":"5","phase":"think","p":0.9999975076331962,"h":3.977582508406393e-05,"n":16,"tps":17.3387937377087}
+
+event: token
+data: {"id":13,"piece":".","phase":"think","p":0.8522138932410749,"h":0.5010617207698732,"n":17,"tps":17.364829949567373}
+
+event: token
+data: {"id":6558,"piece":" Let","phase":"think","p":0.5681626901976407,"h":1.0453163475953289,"n":18,"tps":17.164450525698577}
+
+event: token
+data: {"id":728,"piece":" me","phase":"think","p":0.999999383692921,"h":1.091130456787798e-05,"n":19,"tps":17.167134531121356}
+
+event: token
+data: {"id":10724,"piece":" calculate","phase":"think","p":0.9848335791168822,"h":0.08400748028959414,"n":20,"tps":17.18957391441086}
+
+event: token
+data: {"id":25,"piece":":","phase":"think","p":0.9946089043741677,"h":0.03721221621211267,"n":21,"tps":17.18330765665196}
+
+event: token
+data: {"id":220,"piece":" ","phase":"think","p":0.9999945774822068,"h":7.843508851455296e-05,"n":22,"tps":17.203591877129615}
+
+event: token
+data: {"id":16,"piece":"1","phase":"think","p":0.9999900211701213,"h":0.00013186111852218145,"n":23,"tps":17.20096156914409}
+
+event: token
+data: {"id":22,"piece":"7","phase":"think","p":0.9999979834859059,"h":3.305554437607811e-05,"n":24,"tps":17.224230163323735}
+
+event: token
+data: {"id":478,"piece":" +","phase":"think","p":0.9999991280079993,"h":1.5131427776103202e-05,"n":25,"tps":17.257670738706917}
+
+event: token
+data: {"id":220,"piece":" ","phase":"think","p":0.9999998637087616,"h":3.058740044620876e-06,"n":26,"tps":17.275361103002187}
+
+event: token
+data: {"id":17,"piece":"2","phase":"think","p":0.9999931715708037,"h":0.00011045731934497633,"n":27,"tps":17.33630674180007}
+
+event: token
+data: {"id":20,"piece":"5","phase":"think","p":0.9999872545575831,"h":0.0001874698668278287,"n":28,"tps":17.349896732580447}
+
+event: token
+data: {"id":283,"piece":" =","phase":"think","p":0.9999982344586985,"h":3.165355157625415e-05,"n":29,"tps":17.345549395434478}
+
+event: token
+data: {"id":220,"piece":" ","phase":"think","p":0.9999995679492825,"h":8.624929022484648e-06,"n":30,"tps":17.2121675088855}
+
+event: token
+data: {"id":19,"piece":"4","phase":"think","p":0.9999864005157946,"h":0.00019238406215315055,"n":31,"tps":17.209282860032296}
+
+event: token
+data: {"id":17,"piece":"2","phase":"think","p":0.9999883355473974,"h":0.00017152257165606324,"n":32,"tps":17.206499640199365}
+
+event: token
+data: {"id":13,"piece":".","phase":"think","p":0.9999774304692843,"h":0.0003191114658125577,"n":33,"tps":17.202773821505335}
+
+event: token
+data: {"id":2302,"piece":" They","phase":"think","p":0.9824644491229848,"h":0.10161610103940129,"n":34,"tps":17.199377389131666}
+
+event: token
+data: {"id":1318,"piece":" want","phase":"think","p":0.9987927858636395,"h":0.010242640029366857,"n":35,"tps":17.23779850837349}
+
+event: token
+data: {"id":279,"piece":" the","phase":"think","p":0.4656877281258308,"h":1.0634943503181045,"n":36,"tps":17.24093191372759}
+
+event: token
+data: {"id":1324,"piece":" number","phase":"think","p":0.99585041762178,"h":0.02707631707109931,"n":37,"tps":17.24296145200851}
+
+event: token
+data: {"id":1132,"piece":" only","phase":"think","p":0.999996206067875,"h":5.9263541417661665e-05,"n":38,"tps":17.237745166839105}
+
+event: token
+data: {"id":13,"piece":".","phase":"think","p":0.987439700167273,"h":0.07898904984048348,"n":39,"tps":17.23652682975226}
+
+event: token
+data: {"id":198,"piece":"\n","phase":"think","p":0.9999974682697951,"h":4.05180854362024e-05,"n":40,"tps":17.241252630421666}
+
+event: token
+data: {"id":248069,"piece":"</think>","phase":"think","p":0.9999989956398587,"h":1.8665826065432975e-05,"n":41,"tps":17.13392011980941}
+
+event: token
+data: {"id":271,"piece":"\n\n","phase":"answer","p":0.9999945021115624,"h":8.006503273787524e-05,"n":42,"tps":17.132188116565818}
+
+event: token
+data: {"id":19,"piece":"4","phase":"answer","p":0.9999941694753667,"h":9.747106388030834e-05,"n":43,"tps":17.12982795138143}
+
+event: token
+data: {"id":17,"piece":"2","phase":"answer","p":0.9999917996248249,"h":0.00011526421738299703,"n":44,"tps":17.1283255965254}
+
+event: done
+data: {"context":"553ef5b58d49c0442497eeb3766e7d5f7b0bde03bc668abb0932ca9a1a78fe91","reasoning_content":"The user is asking a simple arithmetic question: 17 + 25. Let me calculate: 17 + 25 = 42. They want the number only.","content":"42","tool_calls":[],"finish":"stop","seed":7,"usage":{"prompt":56,"kept":0,"fed":56,"completion":44},"ms":{"prefill":194.48199099861085,"decode":2568.477798020467},"model":{"id":"Qwen3.8-Flash-Next-UD-IQ4_XS","weight_hash":"0e25ef0d3240134fc2ba763e69a4d5e273bbd5bdf7a8d3386834f90bf2f59c37"}}
+
