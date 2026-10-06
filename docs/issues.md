@@ -347,6 +347,17 @@ response has no `queue_ms`, although `docs/council-api.md` lists it, so a
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
 
+## Two tui terminal_fit tests fail on moltar (2026-10-06)
+
+`ctrl_a_r_rotates_the_seat_and_follows_its_successor` (the client never
+shows `rotated` within 20 s) and
+`the_prefix_leaves_the_editor_parked_and_the_way_back_restores_it` fail
+in `crates/kaijutsu-tui/tests/terminal_fit.rs` at 606a98d0, b7055fcb, and
+d650b685 alike, so no change made that day caused them. The rotate dump
+shows the coder rc's orient step listing the real `/home/atobey` and its
+dotfiles, so host state reaches the test kernel; that is a likely
+contributing factor, not a confirmed cause. The other 43 tests pass.
+
 ## Running a kaish script file from a context shell (2026-10-06)
 
 Found while checking `contrib/council/seed-director.kai` on moltar through
