@@ -9,10 +9,18 @@ house rules still join each decision. Coder keeps its shared council.
 starting guidance; chat, edits, and exclusions in Kaijutsu evolve it.
 Editing these seed files does not rewrite live contexts.
 
-After deploying and reseeding rc, run `../seed-director.kai` once from Amy's
-Kaijutsu shell. It creates the two chat contexts, assigns a council performer
-reviewed by Amy, and loads these files as user guidance. Existing contexts
-must be inspected and edited instead of reseeded, so their chat is retained.
+After deploying and reseeding rc, run the seed from Amy's Kaijutsu shell:
+
+```sh
+cd ~/src/kaijutsu/contrib/council && source seed-director.kai
+```
+
+It creates the two chat contexts, assigns a council performer reviewed by
+Amy, and loads these files as user guidance. `source` leaves `$0` empty, so
+the files resolve from the working directory, and the script stops with an
+error anywhere else. A context that already exists is skipped, never
+reseeded, so its chat is retained; edit it in Kaijutsu instead. Running a
+script by its path in a context shell does nothing, so do not run it that way.
 
 Add this to the director's existing council section in `gate.toml`:
 

@@ -240,8 +240,9 @@ compacting."
   112 MiB of recurrent state). The projection marks `snap` at boundaries we
   expect to keep, such as every few guidance blocks and each handoff, and
   reads the cost of a `PUT` with `dry_run` before choosing more.
-- **After a restart, the kernel sends every council context again.** The
-  `PUT` is idempotent; a server with `park` answers it from disk.
+- **After a restart, the next decision sends each context it reads again.**
+  Nothing is sent at boot. The `PUT` is idempotent; a server with `park`
+  answers it from disk.
 - **A context's id is resolved from its label at decision time.** A label
   that resolves to nothing is a council miss with that cause, not a gate
   refusal, so a missing context cannot stop every seat.
@@ -548,7 +549,7 @@ It holds Amy's words and the house rules, so it stays there.
 | | Kernel port | rc pre_call hook |
 |---|---|---|
 | Allow | the gate auto-allows with a durable row | a hook's exit 0 only proceeds; on the RPC paths `ask_tier_ask` opens the ask anyway, and nothing lets a hook lower one |
-| Context sync | the kernel watches the council contexts' change feeds | a second mechanism outside the kernel |
+| Context sync | before each decision the kernel reads the council contexts and sends a changed one | a second mechanism outside the kernel |
 | Records | decision rows, traces, and the report event are kernel facts | a hook writes `kj ledger signal add` rows |
 | Egress | the kernel's own client | every seat's hook needs the server in its egress list |
 
@@ -564,8 +565,8 @@ would put an authority decision in a script.
 1. **The contract.** These docs, the OpenAPI file, and a conformance suite
    both servers run. The megakernel serves `/council/v1/`.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
-   tables, one spec, the system-rules context and Amy's voice sent at boot and on
-   config change, traces, the report event, and a report interrupting an
+   tables, one spec, the system-rules context and Amy's voice sent before a
+   decision that reads them, traces, the report event, and a report interrupting an
    autonomous seat's turn. Deployed on zorak against
    the megakernel, with coder seats moved back to `uncovered = "ask"`.
 3. **Live contexts.** Change-feed sync with `warm`, so tuning by chat lands

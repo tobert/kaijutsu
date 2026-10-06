@@ -13,7 +13,7 @@
 //!   `context_type`. Without this seed, fresh kernels miss all cache
 //!   breakpoints until the user installs them by hand.
 //! - `/config/rc/<type>/**` — the worked examples of real context_types
-//!   (coder, mcp, toolie, director, musician). Most ship an `S00-stance`
+//!   (coder, mcp, toolie, director, musician, council). Most ship an `S00-stance`
 //!   `.kai` script that authors instructions, reading `.md` data when needed, so the
 //!   kernel-side contract is self-contained (independent of any per-client
 //!   CLAUDE.md), a binding loadout, and the cache recipe.

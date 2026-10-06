@@ -1,13 +1,30 @@
-# Run once from Amy's Kaijutsu shell after rc reseed.
-# Existing labels refuse creation; never overwrite their conversation.
+# Run from Amy's Kaijutsu shell after rc reseed:
+#
+#   cd ~/src/kaijutsu/contrib/council && source seed-director.kai
+#
+# The guidance files are found through $0, which `source` leaves empty, so
+# they resolve from the working directory; elsewhere the script stops with
+# an error. A context that already exists is skipped and its conversation is
+# never touched, so a partial run is finished by running the script again.
 set -e
 data="$(dirname "$0")/director"
+for f in amy banto; do
+  if ! test -f "$data/$f.md"; then
+    echo "seed-director: $data/$f.md not found; cd to contrib/council first" >&2
+    exit 1
+  fi
+done
 
-kj character create council
-kj context create council-amy --top --type council --as council -m deepseek/deepseek-v4-flash
-kj context set council-amy --reviewer amy
-kj block create -c council-amy --role user --kind text --content-type text/markdown < "$data/amy.md"
-
-kj context create council-banto --top --type council --as council -m deepseek/deepseek-v4-flash
-kj context set council-banto --reviewer amy
-kj block create -c council-banto --role user --kind text --content-type text/markdown < "$data/banto.md"
+if ! kj character show council > /dev/null 2>&1; then
+  kj character create council
+fi
+for f in amy banto; do
+  if kj context info "council-$f" > /dev/null 2>&1; then
+    echo "council-$f: present"
+  else
+    kj context create "council-$f" --top --type council --as council -m deepseek/deepseek-v4-flash
+    kj context set "council-$f" --reviewer amy
+    kj block create -c "council-$f" --role user --kind text --content-type text/markdown < "$data/$f.md"
+    echo "council-$f: created"
+  fi
+done

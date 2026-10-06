@@ -670,6 +670,11 @@ impl GateConfig {
                     continue;
                 };
                 if let Some(contexts) = &switch.contexts {
+                    if !switch.enabled {
+                        return Err(GateConfigError::Parse(format!(
+                            "{section} contexts: the council is enabled = false, so the list would do nothing; remove it or enable the council"
+                        )));
+                    }
                     if contexts.is_empty() {
                         return Err(GateConfigError::Parse(format!("{section} contexts: at least one label is required")));
                     }
@@ -2711,19 +2716,35 @@ enabled = false
         assert_eq!(director.contexts, ["council-amy", "council-banto"]);
         let coder = cfg.council_for(Some("coder")).unwrap();
         assert_eq!(coder.contexts, ["voice", "system-rules"]);
-        assert_eq!(director.specs, coder.specs);
-        assert_eq!(director.thresholds, coder.thresholds);
+        // Everything but the list is inherited: mode, deadline, house rules,
+        // voices, agreement, specs, and thresholds.
+        let mut inherited = coder.clone();
+        inherited.contexts = director.contexts.clone();
+        assert_eq!(director, &inherited);
         assert!(cfg.council_for(Some("toolie")).is_none());
         assert!(cfg.council_for(None).is_none());
     }
 
     #[test]
     fn a_context_type_council_rejects_empty_duplicate_and_spec_contexts() {
-        for contexts in ["[]", "[\"\"]", "[\"a\", \"a\"]", "[\"examples\"]"] {
+        for (contexts, why) in [
+            ("[]", "at least one label"),
+            ("[\"\"]", "non-empty"),
+            ("[\"a\", \"a\"]", "listed twice"),
+            ("[\"examples\"]", "already in spec"),
+        ] {
             let base = council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"examples\"]");
             let m = council_err(&format!("{base}\n[context_type.director.council]\nenabled = true\ncontexts = {contexts}\n"));
-            assert!(m.contains("context_type.director.council"), "{m}");
+            assert!(m.contains("context_type.director.council") && m.contains(why), "{contexts}: {m}");
         }
+    }
+
+    /// A list on a disabled council would be validated and then dropped, so
+    /// the file says something it does not do. The load refuses it.
+    #[test]
+    fn a_disabled_type_council_cannot_name_contexts() {
+        let m = council_err(&format!("{COUNCIL_FULL}\n[context_type.director.council]\nenabled = false\ncontexts = [\"council-amy\"]\n"));
+        assert!(m.contains("[context_type.director.council]") && m.contains("enabled = false"), "{m}");
     }
 
     #[test]

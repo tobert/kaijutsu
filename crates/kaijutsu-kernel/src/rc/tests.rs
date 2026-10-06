@@ -111,7 +111,7 @@
 
     async fn shipped_instruction_scripts_preserve_order_and_rendered_prompt_body() {
         use crate::vfs::VfsOps;
-        for context_type in ["default", "coder", "director", "toolie", "musician"] {
+        for context_type in ["default", "coder", "director", "toolie", "musician", "council"] {
             let d = std::sync::Arc::new(test_dispatcher_rc().await);
             d.set_self_arc();
             let prefix = format!("/config/rc/{context_type}/create/");

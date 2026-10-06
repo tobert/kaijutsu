@@ -347,6 +347,37 @@ response has no `queue_ms`, although `docs/council-api.md` lists it, so a
 band's decisions and the gate need a priority or admission story, and a
 producer measuring council latency must use its own wall time.
 
+## Running a kaish script file from a context shell (2026-10-06)
+
+Found while checking `contrib/council/seed-director.kai` on moltar through
+`kjc -c verify sh`. Running a `.kai` file by its path does nothing and
+exits 0. `source` runs it but leaves `$0` empty, so a script that finds its
+data through `$(dirname "$0")` resolves from the working directory. And
+`kjc sh` drops stderr, so a script's own error message is invisible unless
+it is redirected with `2>&1`. Together these made the bench council
+variant's first run on moltar write nothing and report nothing. kaish is a
+shared interface; the path and `$0` behavior go to that lane first.
+
+## Creating a context with an unseeded type falls back to default (2026-10-06)
+
+`council-amy` and `council-banto` on moltar were created with
+`--type council` before the host rc had a `council` type, and
+`kj context info` reports them as `Type: default`, with the default stance
+and loadout. A type with no rc should refuse the create, or say loudly that
+it fell back. Also, `kj block inspect` does not show whether a block is
+excluded, so there is no CLI way to confirm what a council context sends.
+
+## The shell spec is not named in a council `warm` (2026-10-06)
+
+`CouncilSync::hold` hashes a context's body before adding `warm` and skips
+the `PUT` when the hash matches (`crates/kaijutsu-kernel/src/council/sync.rs`).
+A submission's program decisions run first and send each shared context
+with `warm` naming the program spec, so the shell decision finds the head
+held and never names its spec. Per `docs/council-api.md`, the first shell
+read after a context change then rebuilds its spec layer inside that
+decision's deadline. No test covers `warm`. Found in the kaibo review of
+49b6f839.
+
 ## `CancelOnDrop` also fires after a delivered score (2026-10-06)
 
 `ModelOutput::resolve` moves `CancelOnDrop` into its future
