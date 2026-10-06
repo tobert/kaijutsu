@@ -31,7 +31,7 @@ pub use cell::{Body, Cell, CellState, ContextQuery, Fallback, Recipe, ResolverId
 pub use content::{ContentRef, ContextHash};
 pub use engine::{Recovery, ScheduleError, SeedError, SquashEvent, TickClock, Timeline};
 pub use resolver::{ResolveError, ResolveFuture, Resolution, Resolver, ResolverCtx};
-pub use work::{Disposition, FallbackReason, Readiness, WorkId, WorkStatus};
+pub use work::{CostSample, Disposition, FallbackReason, Readiness, SampleOutcome, Timing, WorkId, WorkStatus};
 
 // The CAS hash newtype is the cell-body contract's anchor; re-export it so callers
 // don't reach into `kaijutsu-cas` for the common case.

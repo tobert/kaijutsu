@@ -37,11 +37,12 @@ work. `docs/audio-inference.md` records the workload and measured costs.
    reports each attempt's intended tick, admission, start, readiness, basis
    validity, and disposition (committed, fallback with its reason,
    cancelled, superseded), with the estimate and planned preparation tick
-   beside them, as a table and as JSON. Open: the timeline observes
-   readiness only on a pulse, so true compute time must come from the
-   producer (a measured duration on `Resolution`); queue and transfer
-   durations wait for media delivery in the scenario; no client shows
-   work yet. Measure under overlap
+   beside them, as a table and as JSON. Producers report measured queue
+   and compute time on results and errors, and each timeline keeps the
+   newest 32 samples per resolver (`docs/hyoushigi.md`). Open: nothing
+   reads the window yet (`estimate_cost` is a fixed guess, and the model
+   output resolver estimates zero); transfer durations wait for media
+   delivery in the scenario; no client shows work yet. Measure under overlap
    before choosing lead-time targets; avoid turning unmeasured percentiles
    into guarantees.
 5. **Exercise replacement, then extract.** Run the same scenario with one
@@ -335,6 +336,26 @@ whose `kj context info` reports 0 children and `forked_from` = `amy`. Amy
 could not find her root context (`amy`, f8f4010b, 125 children) in the tui
 either; the root is not labeled as one, and about 150 contexts sit at the
 top level beside it.
+
+## System 1 musicians share the megakernel with the gate (2026-10-06)
+
+The bass prototype (`contrib/chameleon-s1/`) chose one bass cell per bar
+from the megakernel in about 250 ms (median, client wall time, one choice
+question), while moltar's gate decisions ran on the same server. The
+response has no `queue_ms`, although `docs/council-api.md` lists it, so a
+1475 ms outlier has no recorded cause. Before a second musician joins, the
+band's decisions and the gate need a priority or admission story, and a
+producer measuring council latency must use its own wall time.
+
+## `CancelOnDrop` also fires after a delivered score (2026-10-06)
+
+`ModelOutput::resolve` moves `CancelOnDrop` into its future
+(`crates/kaijutsu-kernel/src/hyoushigi/model.rs`), so the turn's interrupt
+fires when the future completes normally, not only when it is dropped. The
+lease is terminal by then, so nothing breaks today, but a change that keeps
+the interrupt state live would hard-cancel a turn on its own successful
+delivery. Disarm the guard on delivery. Found in the kaibo review of the
+timing work.
 
 ## `blocks repair-order` does not converge on one conversation (2026-10-04)
 

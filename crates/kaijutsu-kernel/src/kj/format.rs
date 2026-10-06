@@ -243,6 +243,9 @@ pub fn format_track_table(rows: &[TrackListRow]) -> String {
 
 /// Render `kj transport work` as a table, one row per attempt, oldest first.
 ///
+/// EST is the estimate in ticks; EST_MS is the same estimate in milliseconds.
+/// QUEUE_MS and COMPUTE_MS are what the producer measured for the latest
+/// attempt: waiting for its admission, then doing the work.
 /// MARGIN is how many ticks before START the result was ready. BASIS says
 /// whether the context the result was prepared against still held when it
 /// was checked. OUTCOME is the disposition, or the readiness of open work.
@@ -252,9 +255,13 @@ pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String 
         return "(no work)".to_string();
     }
     let tick = |t: Option<kaijutsu_types::Tick>| t.map(|t| t.get().to_string()).unwrap_or_else(|| "—".to_string());
+    let ms = |d: std::time::Duration| {
+        let ms = d.as_secs_f64() * 1000.0;
+        if ms > 0.0 && ms < 1.0 { "<1".to_string() } else { format!("{ms:.0}") }
+    };
     let mut lines = vec![format!(
-        "{:>8}  {:>8}  {:>4}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
-        "START", "PREPARE", "EST", "STARTED", "READY", "MARGIN", "TRY", "BASIS", "OUTCOME",
+        "{:>8}  {:>8}  {:>4}  {:>7}  {:>8}  {:>10}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
+        "START", "PREPARE", "EST", "EST_MS", "QUEUE_MS", "COMPUTE_MS", "STARTED", "READY", "MARGIN", "TRY", "BASIS", "OUTCOME",
     )];
     for s in statuses {
         let margin = s.ready_at.map(|r| format!("{:+}", (s.start - r).get())).unwrap_or_else(|| "—".to_string());
@@ -279,7 +286,8 @@ pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String 
                     Fallback::Literal(_) => "literal",
                 };
                 match &s.error {
-                    Some(error) => format!("fallback: {reason}, {policy}: {error}"),
+                    // One row per attempt: a multi-line error stays on its row.
+                    Some(error) => format!("fallback: {reason}, {policy}: {}", error.lines().collect::<Vec<_>>().join(" / ")),
                     None => format!("fallback: {reason}, {policy}"),
                 }
             }
@@ -291,11 +299,18 @@ pub fn format_work_table(statuses: &[kaijutsu_hyoushigi::WorkStatus]) -> String 
             }
             .to_string(),
         };
+        let (queued, compute) = match s.timing {
+            Some(t) => (ms(t.queued), ms(t.compute)),
+            None => ("—".to_string(), "—".to_string()),
+        };
         lines.push(format!(
-            "{:>8}  {:>8}  {:>4}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
+            "{:>8}  {:>8}  {:>4}  {:>7}  {:>8}  {:>10}  {:>8}  {:>8}  {:>6}  {:>3}  {:<7}  {}",
             s.start.get(),
             s.prepare_at.get(),
             s.estimate.get(),
+            ms(s.estimate_wall),
+            queued,
+            compute,
             tick(s.started_at),
             tick(s.ready_at),
             margin,
@@ -551,6 +566,7 @@ mod tests {
             start: Tick::new(start),
             admitted_at: Tick::new(start - 20),
             estimate: TickDelta::new(3),
+            estimate_wall: std::time::Duration::from_millis(3000),
             prepare_at: Tick::new(start - 6),
             attempt: 1,
             started_at: Some(Tick::new(start - 6)),
@@ -560,27 +576,36 @@ mod tests {
             actual: None,
             valid,
             error: None,
+            timing: None,
             settled_at: None,
             disposition,
         }
     }
 
     /// A player reads each attempt's intended tick, its estimate, how many
-    /// ticks early it was ready, whether its basis held, and what became of
-    /// it, without decoding JSON.
+    /// ticks early it was ready, what the producer measured, whether its basis
+    /// held, and what became of it, without decoding JSON.
     #[test]
     fn work_table_names_margin_basis_and_outcome() {
         use kaijutsu_hyoushigi::{Disposition, Fallback, FallbackReason};
-        let committed = work(100, Some(95), Some(true), Some(Disposition::Committed {
+        let mut committed = work(100, Some(95), Some(true), Some(Disposition::Committed {
             content: kaijutsu_hyoushigi::ContentRef::of(b"A", "text/plain"),
         }));
+        committed.timing = Some(kaijutsu_hyoushigi::Timing {
+            queued: std::time::Duration::from_micros(400),
+            compute: std::time::Duration::from_millis(2400),
+        });
         let late = work(120, None, None, Some(Disposition::Fallback {
             reason: FallbackReason::DeadlineMissed, policy: Fallback::UseLastGood, content: None,
         }));
         let mut failed = work(140, None, None, Some(Disposition::Fallback {
             reason: FallbackReason::ResolveFailed, policy: Fallback::Skip, content: None,
         }));
-        failed.error = Some("parse error".into());
+        failed.error = Some("parse error\nat bar 3".into());
+        failed.timing = Some(kaijutsu_hyoushigi::Timing {
+            queued: std::time::Duration::ZERO,
+            compute: std::time::Duration::from_millis(7),
+        });
         let changed = work(160, Some(150), Some(false), Some(Disposition::Fallback {
             reason: FallbackReason::InvalidBasis, policy: Fallback::Skip, content: None,
         }));
@@ -589,12 +614,16 @@ mod tests {
         let table = super::format_work_table(&[committed, late, failed, changed, running]);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 6, "{table}");
-        for heading in ["START", "PREPARE", "EST", "READY", "MARGIN", "BASIS", "OUTCOME"] {
-            assert!(lines[0].contains(heading), "{table}");
-        }
+        assert_eq!(lines[0].split_whitespace().collect::<Vec<_>>(), [
+            "START", "PREPARE", "EST", "EST_MS", "QUEUE_MS", "COMPUTE_MS", "STARTED", "READY", "MARGIN", "TRY", "BASIS", "OUTCOME",
+        ], "{table}");
+        let cells = |line: &str| line.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(&cells(lines[1])[2..6], ["3", "3000", "<1", "2400"], "{table}");
+        assert_eq!(&cells(lines[3])[3..6], ["3000", "0", "7"], "{table}");
+        assert_eq!(&cells(lines[5])[3..6], ["3000", "—", "—"], "{table}");
         assert!(lines[1].contains("+5") && lines[1].contains("held") && lines[1].ends_with("committed"), "{table}");
         assert!(lines[2].ends_with("fallback: deadline missed, last good"), "{table}");
-        assert!(lines[3].ends_with("fallback: resolve failed, skip: parse error"), "{table}");
+        assert!(lines[3].ends_with("fallback: resolve failed, skip: parse error / at bar 3"), "{table}");
         assert!(lines[4].contains("changed") && lines[4].ends_with("fallback: basis changed, skip"), "{table}");
         assert!(lines[5].ends_with("running"), "{table}");
         assert_eq!(super::format_work_table(&[]), "(no work)");

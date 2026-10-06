@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use kaijutsu_hyoushigi::{
     Cell, ContextHash, ContextQuery, Fallback, Recipe, Resolution, ResolveError,
-    Resolver, ResolverCtx, ResolverId, Span, TickClock, TickDelta,
+    Resolver, ResolverCtx, ResolverId, SampleOutcome, Span, TickClock, TickDelta, Timing,
 };
 use kaijutsu_kernel::hyoushigi::{Attachment, BeatPolicy};
 use kaijutsu_server::beat::BeatScheduler;
@@ -29,7 +29,7 @@ impl Resolver for AsyncProducer {
     fn resolve(&self, params: &Value, _: &dyn ResolverCtx) -> kaijutsu_hyoushigi::ResolveFuture {
         let receiver = self.0.lock().unwrap().remove(params["name"].as_str().unwrap()).unwrap();
         Box::pin(async move {
-            receiver.await.map_err(|_| ResolveError::Failed("controlled producer disconnected".into()))?
+            receiver.await.map_err(|_| ResolveError::failed("controlled producer disconnected"))?
         })
     }
 }
@@ -46,6 +46,7 @@ async fn work_status(kj: &kaijutsu_client::KernelHandle, context: kaijutsu_types
     } else {
         let lines: Vec<&str> = result.stdout.lines().collect();
         assert!(lines[0].contains("OUTCOME"), "a player reads a table:\n{}", result.stdout);
+        assert!(lines[0].contains("COMPUTE_MS"), "a player reads measured time:\n{}", result.stdout);
         assert_eq!(lines.len(), statuses.len() + 1, "one row per attempt:\n{}", result.stdout);
     }
     statuses
@@ -103,8 +104,10 @@ fn different_producer_paces_share_one_pulse_and_reject_obsolete_output() {
         let fast = "X:1\nK:C\nCDEF|\n";
         let delayed = "X:2\nK:C\nGABc|\n";
         let replacement = "X:3\nK:C\ncBAG|\n";
-        senders.remove("fast").unwrap().send(Ok(Resolution::new(fast.as_bytes(), kaijutsu_audio::ABC_MIME))).unwrap();
-        senders.remove("failed").unwrap().send(Err(ResolveError::Failed("controlled failure".into()))).unwrap();
+        let fast_timing = Timing { queued: Duration::from_millis(12), compute: Duration::from_millis(340) };
+        let failed_timing = Timing { queued: Duration::ZERO, compute: Duration::from_millis(2750) };
+        senders.remove("fast").unwrap().send(Ok(Resolution::new(fast.as_bytes(), kaijutsu_audio::ABC_MIME).with_timing(fast_timing))).unwrap();
+        senders.remove("failed").unwrap().send(Err(ResolveError::failed("controlled failure").with_timing(failed_timing))).unwrap();
         let base = Instant::now();
         scheduler.play(&track, base);
         for beat in 1..=4 {
@@ -132,6 +135,14 @@ fn different_producer_paces_share_one_pulse_and_reject_obsolete_output() {
         assert!(senders.remove("missed").unwrap().send(Ok(Resolution::new(b"too late", "text/plain"))).is_err());
         let final_status = work_status(&kj, context, &track).await;
         let status = |name: &str| final_status.iter().find(|s| s.id == ids[name]).unwrap();
+        assert_eq!(status("fast").timing, Some(fast_timing), "measured time crosses the wire");
+        assert_eq!(status("failed").timing, Some(failed_timing), "a failure carries its measured time");
+        assert_eq!(status("delayed").timing, None, "an unmeasured attempt reports none");
+        assert_eq!(status("fast").estimate_wall, Duration::from_secs(5));
+        let samples: Vec<_> = timeline.lock().cost_samples(&ResolverId::new("async_producer")).cloned().collect();
+        assert_eq!(samples.iter().filter(|s| s.outcome != SampleOutcome::Missed).map(|s| (s.outcome, s.timing)).collect::<Vec<_>>(),
+            [(SampleOutcome::Ready, fast_timing), (SampleOutcome::Failed, failed_timing)]);
+        assert_eq!(samples.iter().filter(|s| s.outcome == SampleOutcome::Missed).count(), 1, "the missed producer was still running");
         assert_eq!(status("delayed").ready_at, Some(origin + TickDelta::new(9)));
         assert_eq!(status("delayed").settled_at, Some(origin + TickDelta::new(9)));
         assert_eq!(status("delayed").valid, Some(true));
@@ -173,7 +184,7 @@ impl Resolver for ControlledProducer {
         Box::pin(std::future::ready((|| {
             match params["abc"].as_str() {
                 Some(abc) => Ok(Resolution::new(abc.as_bytes(), kaijutsu_audio::ABC_MIME)),
-                None => Err(ResolveError::Failed("controlled producer failed".into())),
+                None => Err(ResolveError::failed("controlled producer failed")),
             }
         })()))
     }

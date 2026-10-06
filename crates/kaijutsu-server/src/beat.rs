@@ -2481,7 +2481,7 @@ mod tests {
             _c: &dyn ResolverCtx,
         ) -> kaijutsu_hyoushigi::ResolveFuture {
             Box::pin(std::future::ready((|| {
-                Err(ResolveError::Failed("CAS read failed: missing entry".to_string()))
+                Err(ResolveError::failed("CAS read failed: missing entry".to_string()))
             })()))
         }
     }
@@ -4818,7 +4818,7 @@ mod tests {
             fn estimate_cost(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> Duration { Duration::ZERO }
             fn compute_basis(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> ContextHash { ContextHash::of(b"fixed") }
             fn resolve(&self, _: &serde_json::Value, _: &dyn ResolverCtx) -> kaijutsu_hyoushigi::ResolveFuture {
-                Box::pin(std::future::ready(Err(ResolveError::Failed("source failure".into()))))
+                Box::pin(std::future::ready(Err(ResolveError::failed("source failure"))))
             }
         }
         let (kernel, documents) = fresh_kernel_and_docs().await;

@@ -28,7 +28,7 @@ impl std::future::Future for Pending {
         match self.receiver.try_recv() {
             Ok(result) => Poll::Ready(result),
             Err(mpsc::TryRecvError::Empty) => Poll::Pending,
-            Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(Err(ResolveError::Failed("producer disconnected".into()))),
+            Err(mpsc::TryRecvError::Disconnected) => Poll::Ready(Err(ResolveError::failed("producer disconnected"))),
         }
     }
 }

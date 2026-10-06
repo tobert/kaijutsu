@@ -198,7 +198,8 @@ enum TransportCommand {
     /// `dormant` when it's in the DB but nothing has re-attached it this session.
     List,
     /// Show pending work and the most recent 256 dispositions: each attempt's
-    /// intended tick, estimate, readiness, margin, basis, and outcome. The
+    /// intended tick, estimate in ticks and milliseconds, the queue and compute
+    /// time its producer measured, readiness, margin, basis, and outcome. The
     /// structured result carries the same statuses as JSON. This process-local
     /// history resets when the timeline is removed or the process restarts.
     Work {

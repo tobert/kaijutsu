@@ -107,8 +107,8 @@ At `speculate_at`, snapshot `basis = compute_basis(...)` and run `resolve`. At
 and crystallize to CAS; if it diverged, **squash** — re-speculate if `≥ estimate_cost`
 remains, else fire the fallback. The squash is recorded, not hidden: a `Squashed` event
 carries both the predicted and the actual context digest, which is the most valuable
-output the system produces — it tells you exactly where the anticipation model is wrong,
-and `estimate_cost` learns from the measured cost.
+output the system produces — it tells you exactly where the anticipation model is wrong.
+Measured cost is recorded beside each estimate (below); no estimate learns from it yet.
 
 A resolver error records a `FailureEvent` immediately. The failed source cell
 is terminal, but its scheduled entry retains the commitment deadline. At that
@@ -153,11 +153,34 @@ recorded in the failure ledger, not silently discarded.
 `kj transport work --track <name>` reads current work and the most recent 256 terminal
 dispositions as JSON. It includes the work UUID and attempt number, intended start,
 admission/start/readiness/settlement ticks, predicted and actual basis, validity,
-error, and final disposition. A retry updates the current attempt; squash/failure
+error, final disposition, the estimate in ticks and milliseconds, and the producer's
+measured timing. The table shows the ticks, the estimate beside the measured time, the
+basis result, and the outcome; `--json` adds the IDs, performer, and digests. A retry
+updates the current attempt; squash/failure
 events retain its work ID and attempt number. This history is local to the live
 timeline and is lost on process restart or timeline removal. Committed score blocks
 remain durable. Clock inputs must be finite, with a positive rate and nonnegative
 safety factor and margin.
+
+A producer reports its wall-clock time on the result or the error it returns:
+`Timing { queued, compute }`, the wait for its own admission and the work after
+it. The timeline observes readiness only on a pulse, so only the producer can
+measure either. CAS preparation measures its slot wait as queued and everything
+after it as compute. A model's score output counts everything from admission to
+prepared output as compute, less the preparation slot wait: the model turn,
+including its wait for the context's turn. An interrupted or refused turn
+reports the same way. An attempt without timing is unmeasured, not free: its
+status shows none and it adds no sample.
+
+Each timeline keeps a window of the newest 32 `CostSample`s per resolver,
+`Timeline::cost_samples`: tick, performer, estimate, timing, and outcome. A
+`ready` or `failed` sample is what the producer reported. Work still running at
+its deadline adds a `missed` sample, because an overrun is what the window most
+needs to show; the producer reported nothing, so its compute is a lower bound,
+the ticks it ran at the clock's rate. Work cancelled, superseded, or missed
+before it started adds nothing. The samples stay raw; nothing reads them yet,
+and `estimate_cost` is still each resolver's fixed guess. The window is local
+to the live timeline and is lost on restart.
 
 `timeline_commitment_wire` drives the real scheduler with controlled fast, delayed,
 failed, superseded, missed-deadline, and stale-basis producers. The actual SSH client

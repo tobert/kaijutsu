@@ -6,6 +6,7 @@
 
 use crate::cell::{Cell, ResolverId};
 use crate::content::{ContentRef, ContextHash};
+use crate::work::Timing;
 use kaijutsu_types::Tick;
 use std::time::Duration;
 use thiserror::Error;
@@ -42,6 +43,8 @@ pub struct Resolution {
     pub bytes: Vec<u8>,
     pub mime: String,
     pub emitted: Vec<Cell>,
+    /// What the producer measured for this attempt; see [`Timing`].
+    pub timing: Option<Timing>,
 }
 
 impl Resolution {
@@ -50,7 +53,14 @@ impl Resolution {
             bytes: bytes.into(),
             mime: mime.into(),
             emitted: Vec::new(),
+            timing: None,
         }
+    }
+
+    /// Report the producer's measured wall-clock time for this attempt.
+    pub fn with_timing(mut self, timing: Timing) -> Self {
+        self.timing = Some(timing);
+        self
     }
 
     /// Attach cells this resolve emits into the open future (or the past).
@@ -76,10 +86,24 @@ impl Resolution {
     }
 }
 
+/// A failed attempt: why, and what the producer measured before it failed.
 #[derive(Debug, Error)]
-pub enum ResolveError {
-    #[error("resolver failed: {0}")]
-    Failed(String),
+#[error("resolver failed: {message}")]
+pub struct ResolveError {
+    pub message: String,
+    pub timing: Option<Timing>,
+}
+
+impl ResolveError {
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self { message: message.into(), timing: None }
+    }
+
+    /// Report the producer's measured wall-clock time before the failure.
+    pub fn with_timing(mut self, timing: Timing) -> Self {
+        self.timing = Some(timing);
+        self
+    }
 }
 
 /// The one content-specific capability. A recipe names a `Resolver` by

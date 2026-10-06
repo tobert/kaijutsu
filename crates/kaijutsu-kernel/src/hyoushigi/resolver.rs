@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use kaijutsu_audio::{Clip, CLIP_MIME};
 use kaijutsu_cas::{ContentHash, ContentStore, FileStore};
-use kaijutsu_hyoushigi::{ContextHash, ResolveError, Resolution, Resolver, ResolverCtx, ResolverId};
+use kaijutsu_hyoushigi::{ContextHash, ResolveError, Resolution, Resolver, ResolverCtx, ResolverId, Timing};
 
 use super::{ABC_MIME, validate_abc};
 
@@ -25,13 +25,13 @@ impl CasCommitResolver {
         params
             .get(key)
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ResolveError::Failed(format!("cas_commit: missing `{key}` param")))
+            .ok_or_else(|| ResolveError::failed(format!("cas_commit: missing `{key}` param")))
     }
 
     fn hash_param(params: &serde_json::Value) -> Result<ContentHash, ResolveError> {
         let s = Self::param_str(params, "hash")?;
         ContentHash::from_str_checked(s)
-            .map_err(|e| ResolveError::Failed(format!("cas_commit: malformed hash: {e}")))
+            .map_err(|e| ResolveError::failed(format!("cas_commit: malformed hash: {e}")))
     }
 }
 
@@ -70,17 +70,17 @@ impl CasCommitResolver {
         let hash = Self::hash_param(params)?;
         let mime = Self::param_str(params, "mime")?.to_string();
         let bytes = cas.retrieve(&hash)
-            .map_err(|e| ResolveError::Failed(format!("cas_commit: CAS read: {e}")))?
-            .ok_or_else(|| ResolveError::Failed(format!("cas_commit: hash not in CAS: {}", hash.as_str())))?;
+            .map_err(|e| ResolveError::failed(format!("cas_commit: CAS read: {e}")))?
+            .ok_or_else(|| ResolveError::failed(format!("cas_commit: hash not in CAS: {}", hash.as_str())))?;
         if ContentHash::from_data(&bytes) != hash {
-            return Err(ResolveError::Failed(format!("cas_commit: hash mismatch for {}", hash.as_str())));
+            return Err(ResolveError::failed(format!("cas_commit: hash mismatch for {}", hash.as_str())));
         }
         if mime.as_str() == ABC_MIME {
-            validate_abc(&bytes).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
+            validate_abc(&bytes).map_err(|e| ResolveError::failed(format!("cas_commit: {e}")))?;
         } else if mime.as_str() == CLIP_MIME {
             let json = std::str::from_utf8(&bytes)
-                .map_err(|e| ResolveError::Failed(format!("cas_commit: clip record is not UTF-8: {e}")))?;
-            Clip::parse(json).map_err(|e| ResolveError::Failed(format!("cas_commit: {e}")))?;
+                .map_err(|e| ResolveError::failed(format!("cas_commit: clip record is not UTF-8: {e}")))?;
+            Clip::parse(json).map_err(|e| ResolveError::failed(format!("cas_commit: {e}")))?;
         }
         Ok(Resolution::new(bytes, mime))
     }
@@ -104,14 +104,20 @@ fn prepare_on_runtime(
     Box::pin(async move {
         // A cancelled blocking operation may already be running. Its permit
         // stays with the closure until it finishes, preserving the shared bound.
+        let asked = std::time::Instant::now();
         let permit = slots.acquire_owned().await
-            .map_err(|e| ResolveError::Failed(format!("CAS preparation admission: {e}")))?;
+            .map_err(|e| ResolveError::failed(format!("CAS preparation admission: {e}")))?;
+        let began = std::time::Instant::now();
+        let queued = began - asked;
+        // Compute starts with the slot, so blocking-pool dispatch counts as work.
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            work()
+            let result = work();
+            let timing = Timing { queued, compute: began.elapsed() };
+            result.map(|r| r.with_timing(timing)).map_err(|e| e.with_timing(timing))
         });
         tokio_util::task::AbortOnDropHandle::new(task).await
-            .map_err(|e| ResolveError::Failed(format!("CAS preparation task: {e}")))?
+            .map_err(|e| ResolveError::failed(format!("CAS preparation task: {e}")))?
     })
 }
 
@@ -126,7 +132,7 @@ mod tests {
         let hash = cas.store(b"accepted bytes", "text/plain").unwrap();
         std::fs::write(cas.path(&hash).unwrap(), b"different bytes").unwrap();
         let result = CasCommitResolver::prepare(&cas, &serde_json::json!({"hash": hash.as_str(), "mime": "text/plain"}));
-        assert!(matches!(result, Err(ResolveError::Failed(message)) if message.contains("hash mismatch")));
+        assert!(matches!(result, Err(ResolveError { message, .. }) if message.contains("hash mismatch")));
     }
 
     #[test]
@@ -160,8 +166,31 @@ mod tests {
         ] {
             let store = cas.clone();
             let result = prepare_on_runtime(slots.clone(), move || CasCommitResolver::prepare(&store, &params)).await;
-            assert!(matches!(result, Err(ResolveError::Failed(message)) if message.contains(expected)));
+            assert!(matches!(result, Err(ResolveError { message, .. }) if message.contains(expected)));
             assert_eq!(slots.available_permits(), 1);
+        }
+    }
+
+    /// Preparation reports how long it waited for a slot apart from how long
+    /// the work took, on results and on failures.
+    #[tokio::test]
+    async fn preparation_measures_queue_and_compute_apart() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        for fail in [false, true] {
+            let held = slots.clone().acquire_owned().await.unwrap();
+            let preparation = tokio::spawn(prepare_on_runtime(slots.clone(), move || {
+                std::thread::sleep(Duration::from_millis(30));
+                if fail { Err(ResolveError::failed("measured failure")) } else { Ok(Resolution::new(b"measured", "text/plain")) }
+            }));
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(held);
+            let timing = match preparation.await.unwrap() {
+                Ok(resolution) => resolution.timing,
+                Err(error) => error.timing,
+            }.expect("preparation reports its timing");
+            assert!(timing.queued >= Duration::from_millis(50), "{fail}: {timing:?}");
+            assert!(timing.compute >= Duration::from_millis(30), "{fail}: {timing:?}");
+            assert!(timing.compute < timing.queued, "{fail}: {timing:?}");
         }
     }
 

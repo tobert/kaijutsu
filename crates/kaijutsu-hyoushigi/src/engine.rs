@@ -14,7 +14,10 @@ use kaijutsu_types::{PrincipalId, Tick, TickDelta, TrackId};
 use crate::cell::{Body, Cell, CellState, Fallback, Recipe, ResolverId};
 use crate::content::{ContentRef, ContextHash};
 use crate::resolver::{ResolverCtx, Resolver};
-use crate::{Disposition, FallbackReason, Readiness, ResolveFuture, WorkId, WorkStatus};
+use crate::{CostSample, Disposition, SampleOutcome, FallbackReason, Readiness, ResolveFuture, WorkId, WorkStatus};
+
+/// How many measured attempts each resolver's cost window keeps.
+pub const COST_WINDOW: usize = 32;
 
 /// Convert preparation costs into lead times at the external clock's tick rate.
 /// `safety_factor` widens the initial lead; `commit_margin` leaves time between
@@ -47,6 +50,10 @@ impl TickClock {
         let ticks = (d.as_secs_f64() * self.ticks_per_sec).ceil();
         assert!(ticks.is_finite() && ticks < i64::MAX as f64, "lead time exceeds the tick range");
         TickDelta::new(ticks as i64)
+    }
+
+    fn duration_for(&self, ticks: TickDelta) -> Duration {
+        Duration::from_secs_f64(ticks.get().max(0) as f64 / self.ticks_per_sec)
     }
 }
 
@@ -188,6 +195,9 @@ pub struct Timeline {
     /// Resolver errors, drained by the kernel into each producer's conversation.
     /// Failed work keeps its deadline until its declared fallback settles.
     failures: Vec<FailureEvent>,
+    /// The newest measured attempts per resolver id, oldest first, kept as raw
+    /// samples. Nothing reads them yet; predictions will roll them on the fly.
+    costs: HashMap<String, VecDeque<CostSample>>,
 
 }
 
@@ -207,6 +217,7 @@ impl Timeline {
             cas: HashMap::new(),
             squashes: Vec::new(),
             failures: Vec::new(),
+            costs: HashMap::new(),
         }
     }
 
@@ -223,6 +234,11 @@ impl Timeline {
     /// Open work and the most recent 256 dispositions, local to this timeline.
     pub fn statuses(&self) -> Vec<WorkStatus> {
         self.history.iter().chain(self.future.iter().map(|s| &s.status)).cloned().collect()
+    }
+
+    /// The newest measured attempts of one resolver, oldest first.
+    pub fn cost_samples(&self, resolver: &ResolverId) -> impl Iterator<Item = &CostSample> {
+        self.costs.get(&resolver.0).into_iter().flatten()
     }
 
     pub fn status(&self, id: WorkId) -> Option<&WorkStatus> {
@@ -391,11 +407,12 @@ impl Timeline {
                 id, track: cell.track.clone(), played_by: cell.played_by,
                 start, admitted_at: self.playhead,
                 estimate: est_cost,
+                estimate_wall: est,
                 prepare_at: if preparing { self.playhead } else { start - lead },
                 attempt: 0,
                 started_at: None, ready_at: None, readiness: Readiness::Queued,
                 predicted: None, actual: None, valid: None, error: None,
-                settled_at: None, disposition: None,
+                timing: None, settled_at: None, disposition: None,
             },
             order,
             work: None,
@@ -496,6 +513,7 @@ impl Timeline {
         s.status.predicted = Some(basis.clone());
         s.status.actual = None;
         s.status.valid = None;
+        s.status.timing = None;
         s.work = Some(work);
         self.poll_work(idx);
     }
@@ -507,6 +525,21 @@ impl Timeline {
         let std::task::Poll::Ready(result) = polled else { return };
         s.work = None;
         s.observed_at = self.playhead;
+        let timing = match &result {
+            Ok(res) => res.timing,
+            Err(error) => error.timing,
+        };
+        s.status.timing = timing;
+        if let Some(timing) = timing {
+            let outcome = if result.is_ok() { SampleOutcome::Ready } else { SampleOutcome::Failed };
+            let sample = CostSample {
+                at: self.playhead, played_by: s.cell.played_by,
+                estimate: s.status.estimate_wall, timing, outcome,
+            };
+            let resolver = s.resolver.id();
+            self.record_cost(resolver, sample);
+        }
+        let s = &mut self.future[idx];
         match result {
             Ok(res) => {
                 s.status.readiness = Readiness::Ready;
@@ -514,7 +547,7 @@ impl Timeline {
                 s.resolution = Some(res);
                 s.cell.state = CellState::Speculated;
             }
-            Err(crate::resolver::ResolveError::Failed(error)) => {
+            Err(crate::resolver::ResolveError { message: error, .. }) => {
                 s.status.readiness = Readiness::Failed;
                 s.status.error = Some(error.clone());
                 s.cell.state = CellState::Failed;
@@ -661,8 +694,26 @@ impl Timeline {
     /// by the player: the transport played them. Attributing vamp-insurance to
     /// the player would be false provenance. They stay on the missing cell's
     /// `track` — the lane persists even when no player covered this beat.
+    fn record_cost(&mut self, resolver: ResolverId, sample: CostSample) {
+        let window = self.costs.entry(resolver.0).or_default();
+        if window.len() == COST_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(sample);
+    }
+
     fn fire_fallback(&mut self, idx: usize, reason: FallbackReason) {
         let s = self.future.swap_remove(idx);
+        if s.cell.state == CellState::Speculating
+            && let Some(started) = s.status.started_at
+        {
+            let ran = self.clock.duration_for(self.playhead - started);
+            self.record_cost(s.resolver.id(), CostSample {
+                at: self.playhead, played_by: s.cell.played_by, estimate: s.status.estimate_wall,
+                timing: crate::Timing { queued: Duration::ZERO, compute: ran },
+                outcome: SampleOutcome::Missed,
+            });
+        }
         let Body::Deferred(recipe) = &s.cell.body else { unreachable!("scheduled cells are deferred") };
         let policy = recipe.fallback.clone();
         let content = match &policy {
@@ -761,6 +812,7 @@ mod tests {
     use super::*;
     use crate::cell::{ContextQuery, ResolverId};
     use crate::resolver::{ResolveError, Resolution};
+    use crate::{SampleOutcome, Timing};
     use kaijutsu_types::Span;
     use serde_json::Value;
 
@@ -784,7 +836,7 @@ mod tests {
             Box::pin(std::future::ready((|| {
                 let beat = ctx.ambient("beat").unwrap_or_default();
                 if p.get("fail_on").and_then(Value::as_str).map(str::as_bytes) == Some(beat.as_slice()) {
-                    return Err(ResolveError::Failed("changed input cannot resolve".into()));
+                    return Err(ResolveError::failed("changed input cannot resolve"));
                 }
                 Ok(Resolution::new(beat, "text/plain"))
             })()))
@@ -1123,7 +1175,7 @@ mod tests {
         }
         fn resolve(&self, _p: &Value, _c: &dyn ResolverCtx) -> crate::ResolveFuture {
             Box::pin(std::future::ready((|| {
-                Err(ResolveError::Failed(self.message.to_string()))
+                Err(ResolveError::failed(self.message))
             })()))
         }
     }
@@ -1583,5 +1635,186 @@ mod tests {
             tl3.seed_playhead(Tick::new(3)),
             Err(SeedError::NotVirgin { .. })
         ));
+    }
+
+    /// A producer that reports the wall-clock time its params declare (or the
+    /// ambient `compute_ms`, when set), fails when `fail` is set, never
+    /// finishes when `hang` is set, and takes its basis from ambient `beat`.
+    struct Timed;
+
+    impl Resolver for Timed {
+        fn id(&self) -> ResolverId { ResolverId::new("timed") }
+        fn estimate_cost(&self, p: &Value, _c: &dyn ResolverCtx) -> Duration {
+            Duration::from_millis(p["cost_ms"].as_u64().unwrap_or(1000))
+        }
+        fn compute_basis(&self, _p: &Value, c: &dyn ResolverCtx) -> ContextHash {
+            ContextHash::of(&c.ambient("beat").unwrap_or_default())
+        }
+        fn resolve(&self, p: &Value, c: &dyn ResolverCtx) -> crate::ResolveFuture {
+            if p["hang"].as_bool().unwrap_or(false) {
+                return Box::pin(std::future::pending());
+            }
+            let ambient = c.ambient("compute_ms")
+                .map(|b| String::from_utf8(b).unwrap().parse::<u64>().unwrap());
+            let timing = Timing {
+                queued: Duration::from_millis(p["queued_ms"].as_u64().unwrap_or(0)),
+                compute: Duration::from_millis(ambient.or(p["compute_ms"].as_u64()).unwrap_or(0)),
+            };
+            let result = if p["fail"].as_bool().unwrap_or(false) {
+                Err(ResolveError::failed("timed failure").with_timing(timing))
+            } else {
+                Ok(Resolution::new(b"T".to_vec(), "text/plain").with_timing(timing))
+            };
+            Box::pin(std::future::ready(result))
+        }
+    }
+
+    fn timed_at(start: i64, params: Value) -> Cell {
+        Cell::deferred_on(
+            Span::instant(Tick::new(start)),
+            Recipe {
+                resolver: ResolverId::new("timed"),
+                params,
+                query: ContextQuery::default(),
+                fallback: Fallback::Skip,
+            },
+            TrackId::solo(),
+            PrincipalId::beat(),
+        )
+    }
+
+    fn timed_timeline() -> Timeline {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 1.0,
+            commit_margin: TickDelta::new(0),
+        });
+        tl.register_resolver(Box::new(Timed));
+        tl
+    }
+
+    /// The producer's measured time reaches the work status beside the
+    /// estimate in the same unit, for failures as well as results, and each
+    /// attempt adds one sample to its resolver's window.
+    #[test]
+    fn producer_timing_reaches_status_and_the_cost_window() {
+        let mut tl = timed_timeline();
+        let ok = tl.schedule(timed_at(10, serde_json::json!({
+            "cost_ms": 2000, "queued_ms": 5, "compute_ms": 1500,
+        }))).unwrap();
+        let failed = tl.schedule(timed_at(12, serde_json::json!({
+            "cost_ms": 1000, "compute_ms": 3000, "fail": true,
+        }))).unwrap();
+        for tick in 1..=12 {
+            tl.advance_to(Tick::new(tick));
+        }
+        assert!(matches!(tl.status(ok).unwrap().disposition, Some(Disposition::Committed { .. })));
+
+        let ok = tl.status(ok).unwrap();
+        assert_eq!(ok.estimate_wall, Duration::from_millis(2000));
+        assert_eq!(ok.timing, Some(Timing { queued: Duration::from_millis(5), compute: Duration::from_millis(1500) }));
+        let json = serde_json::to_value(ok).unwrap();
+        assert_eq!(json["estimate_ms"], 2000.0);
+        assert_eq!(json["timing"]["queued_ms"], 5.0);
+        assert_eq!(json["timing"]["compute_ms"], 1500.0);
+        let back: WorkStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back.timing, ok.timing);
+        assert_eq!(back.estimate_wall, ok.estimate_wall);
+
+        let failed = tl.status(failed).unwrap();
+        assert_eq!(failed.timing.unwrap().compute, Duration::from_millis(3000));
+        assert_eq!(failed.error.as_deref(), Some("timed failure"));
+
+        let samples: Vec<_> = tl.cost_samples(&ResolverId::new("timed")).collect();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].outcome, SampleOutcome::Ready);
+        assert_eq!(samples[0].timing.compute, Duration::from_millis(1500));
+        assert_eq!(samples[0].estimate, Duration::from_millis(2000));
+        assert_eq!(samples[1].outcome, SampleOutcome::Failed);
+        assert_eq!(samples[1].timing.compute, Duration::from_millis(3000));
+        assert_eq!(samples[1].played_by, PrincipalId::beat());
+        assert_eq!(tl.cost_samples(&ResolverId::new("echo")).count(), 0);
+    }
+
+    /// Work that reports no timing leaves the status empty and adds no sample:
+    /// an unmeasured attempt is not a zero-cost one.
+    #[test]
+    fn unmeasured_work_adds_no_sample() {
+        let mut tl = timed_timeline();
+        tl.register_resolver(Box::new(EchoBeat { cost: Duration::from_secs(1) }));
+        let id = tl.schedule(deferred_at(5, Fallback::Skip)).unwrap();
+        tl.advance_to(Tick::new(5));
+        assert_eq!(tl.status(id).unwrap().timing, None);
+        assert_eq!(tl.cost_samples(&ResolverId::new("echo")).count(), 0);
+    }
+
+    /// A retry after a squash reports its own timing, and both attempts are
+    /// samples: the squashed attempt still cost what it cost.
+    #[test]
+    fn a_respeculated_attempt_reports_its_own_timing() {
+        let mut tl = Timeline::new(TickClock {
+            ticks_per_sec: 1.0,
+            safety_factor: 2.0,
+            commit_margin: TickDelta::new(3),
+        });
+        tl.register_resolver(Box::new(Timed));
+        tl.set_ambient("beat", *b"A");
+        tl.set_ambient("compute_ms", *b"100");
+        let id = tl.schedule(timed_at(100, serde_json::json!({ "cost_ms": 2000 }))).unwrap();
+        tl.advance_to(Tick::new(96));
+        tl.set_ambient("beat", *b"B");
+        tl.set_ambient("compute_ms", *b"250");
+        tl.advance_to(Tick::new(97));
+        tl.advance_to(Tick::new(100));
+
+        let status = tl.status(id).unwrap();
+        assert_eq!(status.attempt, 2);
+        assert!(matches!(status.disposition, Some(Disposition::Committed { .. })));
+        assert_eq!(status.timing.unwrap().compute, Duration::from_millis(250));
+        let computes: Vec<_> = tl.cost_samples(&ResolverId::new("timed")).map(|s| (s.outcome, s.timing.compute)).collect();
+        assert_eq!(computes, [
+            (SampleOutcome::Ready, Duration::from_millis(100)),
+            (SampleOutcome::Ready, Duration::from_millis(250)),
+        ]);
+    }
+
+    /// Work still running at its deadline is the overrun the window exists to
+    /// show. Its sample is a lower bound: the ticks it ran, at the clock's rate.
+    #[test]
+    fn a_missed_deadline_adds_a_lower_bound_sample() {
+        let mut tl = timed_timeline();
+        let id = tl.schedule(timed_at(10, serde_json::json!({ "cost_ms": 3000, "hang": true }))).unwrap();
+        let never_started = tl.schedule(timed_at(20, serde_json::json!({ "cost_ms": 3000 }))).unwrap();
+        for tick in 1..=10 {
+            tl.advance_to(Tick::new(tick));
+        }
+        let status = tl.status(id).unwrap();
+        assert!(matches!(status.disposition, Some(Disposition::Fallback { reason: FallbackReason::DeadlineMissed, .. })));
+        assert_eq!(status.timing, None, "the producer reported nothing");
+        let samples: Vec<_> = tl.cost_samples(&ResolverId::new("timed")).collect();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].outcome, SampleOutcome::Missed);
+        assert_eq!(samples[0].timing, Timing { queued: Duration::ZERO, compute: Duration::from_secs(3) });
+        assert_eq!(samples[0].estimate, Duration::from_millis(3000));
+
+        // Work that misses before it starts never ran, so it adds nothing.
+        tl.advance_to(Tick::new(25));
+        assert!(matches!(tl.status(never_started).unwrap().disposition, Some(Disposition::Fallback { reason: FallbackReason::DeadlineMissed, .. })));
+        assert_eq!(tl.cost_samples(&ResolverId::new("timed")).count(), 1);
+    }
+
+    /// The window keeps the newest samples, oldest first.
+    #[test]
+    fn the_cost_window_keeps_the_newest_samples() {
+        let mut tl = timed_timeline();
+        let extra = 3;
+        for n in 0..(COST_WINDOW + extra) as i64 {
+            tl.schedule(timed_at(10 + n, serde_json::json!({ "compute_ms": n }))).unwrap();
+            tl.advance_to(Tick::new(10 + n));
+        }
+        let samples: Vec<_> = tl.cost_samples(&ResolverId::new("timed")).collect();
+        assert_eq!(samples.len(), COST_WINDOW);
+        assert_eq!(samples[0].timing.compute, Duration::from_millis(extra as u64));
+        assert_eq!(samples.last().unwrap().timing.compute, Duration::from_millis((COST_WINDOW + extra - 1) as u64));
     }
 }
