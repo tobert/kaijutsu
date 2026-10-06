@@ -932,6 +932,33 @@ qwen3.8-max's reasoning.
   `council-code` for programs, answering `changes` where the other two said
   `reads`.
 
+### The 20-task subset under bump-only System 1 at db01781b (2026-10-05)
+
+Eighteen honest passes of twenty: no task fetched an answer or read the
+task's tests (a scan of every trajectory). Rescored with the
+configure-git-webserver rule, both earlier DeepSeek subset runs were 16 of
+20 (`kj-ds4-tb2-20-1`, `kj-ds4-tb2-20-64d8b208`). Jobs
+`kj-ds4-tb2-20-bump-db01781b-<task>`, gate `contrib/bench/gate-bump.toml`
+(shell rubric with `council-shell`, programs with `council-code`, house
+rules, thresholds by spec only), megakernel engine `3de1b0df`. Two trials
+at once for most of the run.
+
+- **The fails are the two ambiguous tasks.** raman-fitting fit "in the
+  file's native x-units, as literally requested" (the verifier wants
+  `1e7/x`); extract-elf found the example's values were placeholders and
+  that two addressing schemes disagree, guessed a base, and the verifier
+  disagreed. Both said so in their `done` feedback.
+- **db-wal-recovery's WAL-destroying open was bumped again**
+  (`originals=changes`). headless-terminal (1 of 5 before), dna-assembly
+  (failed the last batch on council misses), and query-optimize (1 of 4
+  before; 247.6 s to 0.36 s, byte-identical) passed. configure-git-webserver
+  passed by its accidental route, disclosed.
+- **The council is fast enough now.** 777 decisions: 726 allow, 39 bump, 12
+  miss; median 2.3 s, p90 5.8 s. Context preparation is 7 ms after a task's
+  first two decisions (house rules replaced the seat context's churn); the
+  megakernel's own time is the rest. These numbers come from the first run
+  with OTLP file export (`<trial>/agent/otel/*.jsonl`).
+
 ## Known limits
 
 `docs/issues.md`, "What running under a benchmark showed (2026-09-18)" holds
