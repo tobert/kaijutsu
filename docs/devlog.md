@@ -3292,6 +3292,12 @@ context row pinned `deepseek-v4-flash`, and `kj context rotate` copies the
 pin. `kj context unset --model` now returns a context to its cast or the
 registry default.
 
+Tuning council guidance as chat needs `kj stage exclude` on a live
+context, and `kj` still refused anything but staging while the
+`setBlockExcluded` RPC allowed live too. The same rule had been written in
+two places, and the copies disagreed. `DriftRouter::require_curatable` now
+owns it for both callers.
+
 The TUI hid the underlying draft refusal behind `edit input doc`. It now
 shows the complete error chain. Council tests cover type selection on both
 execution paths, and the rc test covers the chat stance and input loadout.

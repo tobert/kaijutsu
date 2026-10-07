@@ -1,14 +1,10 @@
 //! Stage subcommands: commit, status, include, exclude.
 //!
-//! Manages the liminal staging state during fork curation.
-//! Blocks can be toggled in/out before the conversation goes live.
-//!
-//! Migrated to clap_derive following the `cas`/`block` pattern: one
-//! `StageArgs` struct + a `StageCommand` enum at the top, `dispatch_stage`
-//! parses argv via `try_parse_from`, then matches the variant to the per-verb
-//! function. The handler bodies stayed intact — only argv extraction moved
-//! into the derive. Verb aliases (commit↔go, status↔st, include↔in,
-//! exclude↔ex) are modeled with `#[command(alias = "...")]`.
+//! `commit` and `status` manage the staging state a `kj fork --stage` child
+//! starts in. `include` and `exclude` curate blocks in a live or staging
+//! context; [`crate::drift::DriftRouter::require_curatable`] owns that rule
+//! for `kj` and the `setBlockExcluded` RPC alike.
+//! Verb aliases: commit↔go, status↔st, include↔in, exclude↔ex.
 
 use clap::{Parser, Subcommand};
 use kaijutsu_types::{ContentType, ContextId, ContextState};
@@ -19,7 +15,7 @@ use super::{KjCaller, KjDispatcher, KjResult};
 #[derive(Parser, Debug)]
 #[command(
     name = "stage",
-    about = "Manage liminal staging state for fork curation",
+    about = "Curate a context's blocks, and commit a staged fork",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -37,13 +33,17 @@ enum StageCommand {
     /// Show staging state and block counts.
     #[command(alias = "st")]
     Status,
-    /// Set excluded=false on a block.
+    /// Put an excluded block back. Live and staging contexts only.
     #[command(alias = "in")]
     Include {
         /// Block key (suffix match on the full id key)
         block_key: String,
     },
-    /// Set excluded=true on a block.
+    /// Leave a block out of what models read.
+    ///
+    /// Live and staging contexts only. Instruction blocks and council contexts change on the next turn
+    /// or council decision. History a model has already read stays in its
+    /// live conversation until the next fork.
     #[command(alias = "ex")]
     Exclude {
         /// Block key (suffix match on the full id key)
@@ -94,12 +94,8 @@ impl KjDispatcher {
         match command {
             StageCommand::Commit => self.stage_commit(context_id).await,
             StageCommand::Status => self.stage_status(context_id),
-            StageCommand::Include { block_key } => {
-                self.stage_include(&block_key, context_id)
-            }
-            StageCommand::Exclude { block_key } => {
-                self.stage_exclude(&block_key, context_id)
-            }
+            StageCommand::Include { block_key } => self.stage_toggle(&block_key, context_id, false),
+            StageCommand::Exclude { block_key } => self.stage_toggle(&block_key, context_id, true),
         }
     }
 
@@ -192,21 +188,10 @@ impl KjDispatcher {
         KjResult::ok_ephemeral(lines.join("\n"), ContentType::Markdown)
     }
 
-    fn stage_include(&self, block_key: &str, context_id: ContextId) -> KjResult {
-        if let Err(result) = self.require_staging(context_id) {
-            return result;
-        }
-        self.stage_toggle(block_key, context_id, false)
-    }
-
-    fn stage_exclude(&self, block_key: &str, context_id: ContextId) -> KjResult {
-        if let Err(result) = self.require_staging(context_id) {
-            return result;
-        }
-        self.stage_toggle(block_key, context_id, true)
-    }
-
     fn stage_toggle(&self, block_key: &str, context_id: ContextId, excluded: bool) -> KjResult {
+        if let Err(e) = self.drift_router().read().require_curatable(context_id) {
+            return KjResult::Err(format!("kj stage: {e}"));
+        }
         // Find the block by suffix match on the key
         let blocks = match self.block_store().block_snapshots(context_id) {
             Ok(b) => b,
@@ -258,5 +243,77 @@ impl Classify for StageCommand {
                 Effect::Write
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::kj::test_helpers::*;
+    use crate::kj::KjResult;
+    use kaijutsu_types::{BlockKind, ContentType, ContextState, DocKind, PrincipalId, Role, Status};
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    /// A context with one user text block, in `state`. Returns the context
+    /// and the block's short key.
+    fn context_with_block(
+        d: &crate::kj::KjDispatcher,
+        state: ContextState,
+    ) -> (kaijutsu_types::ContextId, kaijutsu_types::BlockId) {
+        let ctx = register_context(d, Some("c"), None, PrincipalId::new());
+        d.block_store().create_document(ctx, DocKind::Conversation, None).expect("create_document");
+        let block = d
+            .block_store()
+            .insert_block_as(ctx, None, None, Role::User, BlockKind::Text, "old guidance", Status::Done, ContentType::Plain, None)
+            .expect("insert_block_as");
+        d.drift_router().write().set_state(ctx, state).expect("set_state");
+        (ctx, block)
+    }
+
+    fn excluded(d: &crate::kj::KjDispatcher, ctx: kaijutsu_types::ContextId, block: &kaijutsu_types::BlockId) -> bool {
+        d.block_store().block_snapshots(ctx).unwrap().iter().find(|b| b.id == *block).unwrap().excluded
+    }
+
+    #[tokio::test]
+    async fn exclude_and_include_curate_a_live_context() {
+        let d = test_dispatcher().await;
+        let (ctx, block) = context_with_block(&d, ContextState::Live);
+        let c = caller_with_context(ctx);
+        let key = super::super::block::short_key(&block);
+
+        let result = d.dispatch(&[s("stage"), s("exclude"), key.clone()], &c).await;
+        assert!(result.is_ok(), "exclude on a live context: {}", result.message());
+        assert!(excluded(&d, ctx, &block));
+
+        let result = d.dispatch(&[s("stage"), s("include"), key], &c).await;
+        assert!(result.is_ok(), "include on a live context: {}", result.message());
+        assert!(!excluded(&d, ctx, &block));
+    }
+
+    #[tokio::test]
+    async fn exclude_curates_a_staging_context() {
+        let d = test_dispatcher().await;
+        let (ctx, block) = context_with_block(&d, ContextState::Staging);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("stage"), s("ex"), super::super::block::short_key(&block)], &c).await;
+        assert!(result.is_ok(), "exclude on a staging context: {}", result.message());
+        assert!(excluded(&d, ctx, &block));
+    }
+
+    #[tokio::test]
+    async fn exclude_refuses_a_concluded_context() {
+        let d = test_dispatcher().await;
+        let (ctx, block) = context_with_block(&d, ContextState::Concluded);
+        let c = caller_with_context(ctx);
+
+        let result = d.dispatch(&[s("stage"), s("exclude"), super::super::block::short_key(&block)], &c).await;
+        match &result {
+            KjResult::Err(msg) => assert!(msg.contains("concluded"), "names the state: {msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!excluded(&d, ctx, &block));
     }
 }

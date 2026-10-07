@@ -607,6 +607,16 @@ impl DriftRouter {
         self.contexts.get(&id).map(|h| h.state)
     }
 
+    /// Refuse block curation (include/exclude) unless the context is live or
+    /// staging. Concluded and archived contexts keep the blocks they ended with.
+    pub fn require_curatable(&self, id: ContextId) -> Result<(), String> {
+        match self.context_state(id) {
+            Some(ContextState::Live | ContextState::Staging) => Ok(()),
+            Some(state) => Err(format!("context is {state}; only live and staging contexts take include/exclude")),
+            None => Err(format!("context {} not found", id.short())),
+        }
+    }
+
     /// Set the lifecycle state of a context (e.g., Staging → Live).
     pub fn set_state(
         &mut self,
@@ -1718,6 +1728,23 @@ mod tests {
         let handle = router.get(id).unwrap();
         assert_eq!(handle.label.as_deref(), Some("main-session"));
         assert!(handle.forked_from.is_none());
+    }
+
+    #[test]
+    fn only_live_and_staging_contexts_take_curation() {
+        let mut router = DriftRouter::new();
+        let id = ContextId::new();
+        router.register(id, Some("c"), None, PrincipalId::system()).unwrap();
+        for (state, ok) in [
+            (ContextState::Live, true),
+            (ContextState::Staging, true),
+            (ContextState::Concluded, false),
+            (ContextState::Archived, false),
+        ] {
+            router.set_state(id, state).unwrap();
+            assert_eq!(router.require_curatable(id).is_ok(), ok, "{state}");
+        }
+        assert!(router.require_curatable(ContextId::new()).is_err(), "an unknown context");
     }
 
     #[test]

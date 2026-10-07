@@ -7274,26 +7274,8 @@ impl kernel::Server for KernelImpl {
         let block_id = pry!(parse_block_id_from_reader(&block_id_reader));
         let excluded = p.get_excluded();
 
-        // Enforce: excluded toggling allowed in Live or Staging state
-        {
-            let drift = match self.kernel.kernel.drift().try_read() {
-                Some(d) => d,
-                None => {
-                    return Promise::err(capnp::Error::failed("drift router busy".into()));
-                }
-            };
-            match drift.context_state(context_id) {
-                Some(kaijutsu_types::ContextState::Live)
-                | Some(kaijutsu_types::ContextState::Staging) => {} // allowed
-                Some(state) => {
-                    return Promise::err(capnp::Error::failed(format!(
-                        "cannot toggle excluded in {state} state (only live/staging)"
-                    )));
-                }
-                None => {
-                    return Promise::err(capnp::Error::failed("context not found".into()));
-                }
-            }
+        if let Err(e) = self.kernel.kernel.drift().read().require_curatable(context_id) {
+            return Promise::err(capnp::Error::failed(e));
         }
 
         if let Err(e) = self
