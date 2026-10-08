@@ -2512,22 +2512,10 @@ loudly on a cross-mount absolute target.
   automatic wake for a kernel model assigned to review a coder. A directing
   model currently reads the coder's response and uses `kj ledger list|show`.
 
-## The Claude Code advisory hook forwards to the kernel (2026-09-02, shipped; open follow-ups)
+## kaish cannot plan a backgrounded subshell (2026-09-02)
 
-`PreToolUse` Bash → `kaijutsu-mcp hook claude` → `shellDryRun` → PreCall in
-dry-run mode → abandoned ask row, always allow (`docs/kaish-integration.md`).
-Still open: count a day of `kj ledger list --status
-abandoned --since 24h` against the Python hook's verdicts before retiring it;
-the `( … ) &` subshell planning gap (kaish cannot plan it, S45 denies "no
-execution plan") is an ask to the kaish lead; an export verb for corpus
-builders was ruled "later" — they read the ledger directly for now.
-
-Every forwarded dry run warns `approval reviewer unavailable for direct RPC`
-(`context_reviewer*`, `kaijutsu-server/src/rpc.rs`): contexts created by
-kaijutsu-mcp for Claude Code sessions have no reviewer. On 2026-09-25 that was
-98 warnings in 30 minutes, one per Bash call, burying real warnings. Decide
-whether a dry run needs a reviewer at all (then log at debug) or whether
-those contexts should get one.
+`( … ) &` has no execution plan, so the gate denies it (S45, "no execution
+plan"). This is an ask to the kaish lead.
 
 ## A secret source that runs a command has no home yet (2026-08-31)
 
@@ -3201,8 +3189,7 @@ and burn down all the approval options". Delete each line as it ships.
   (`docs/character.md`, "The bridge identity: a key per model character")
   and a `[context_type.mcp]` allow tier wide enough for daily reads.
 - **F8** PreCall denies write no row; tier asks record origin `hook`; RPC
-  auto-allows leave no row; a dry run with no reviewer records nothing;
-  the ORIGIN column is narrower than `shell_gate`.
+  auto-allows leave no row; the ORIGIN column is narrower than `shell_gate`.
 - **F11** Approving a streaming RPC ask authors a Model-role pair and can
   wake the model (inferred).
 - **F12** Digest `--remember` rules do not cross paths (`hook:v1:` vs
@@ -3211,8 +3198,7 @@ and burn down all the approval options". Delete each line as it ships.
   shell paths to kaish, which reports the parse error in its own block.
   Safe while the planner and the executor share kaish's parser; a
   divergence (see "A kaish lexer rejection degrades the gate") reopens it.
-- **F13** A dry-run row is answerable between create and abandon; `kj cc
-  send` through `shell_write` asks twice, unlinked.
+- **F13** `kj cc send` through `shell_write` asks twice, unlinked.
 - **F15** The gate reads kaish's `PlannedValue::Plain`, the literal as it
   renders on a command line, as an argv value (`kj/readonly.rs`,
   `resolved_kj_args`; `gate_policy.rs`, `command_keys`). Structured `kj`

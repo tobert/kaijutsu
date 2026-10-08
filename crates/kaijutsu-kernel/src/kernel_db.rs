@@ -2443,6 +2443,7 @@ impl KernelDb {
     }
 
     /// Record the caller's publication contract before an ask becomes visible.
+    #[cfg(test)]
     pub(crate) fn create_approval_ask(&self, ask: &approval_ledger::types::NewAsk, publishes_pair: bool) -> KernelDbResult<String> {
         self.create_approval_ask_recorded(ask, publishes_pair, |_, _| Ok(()))
     }

@@ -1155,102 +1155,6 @@ fn answer_is_held(
             && (row.exec_source.is_some() || !db.approval_pair_ready(request_id)?)))
 }
 
-/// Record the ask [`run_gate`] would have raised, and ask nobody.
-///
-/// The row carries everything a real ask carries — statements, the
-/// free-variable snapshot, the cwd — and is then abandoned in the same
-/// call. Abandoned is the only status that records a question without
-/// asserting an answer to it, and it is inert in all three directions that
-/// matter: `list_pending_asks` never offers it to a reviewer who could not act
-/// on it, `find_redeemable` admits `allowed`/`denied` only so it can never
-/// authorize a later call, and `undelivered_answers` shares that predicate
-/// so no context is ever woken for it.
-///
-/// Rules are deliberately not consulted. Redeeming an answer is a mutation
-/// that spends it, so this path must not read the other half of the gate's
-/// memory either — reporting "a rule would have allowed it" while being
-/// unable to check whether an answer is already waiting is worse than
-/// reporting what the hook itself decided.
-///
-/// Nothing here runs the gated action. See `docs/kaish-integration.md`.
-#[tracing::instrument(
-    name = "approval.gate.dry_run",
-    skip_all,
-    fields(
-        principal.id = %caller.principal_id,
-        actor.id = %caller.actor_id,
-        reviewer.id = tracing::field::Empty,
-        context.id = tracing::field::Empty,
-        ask.id = tracing::field::Empty,
-    )
-)]
-pub(crate) async fn record_dry_run_ask(
-    kernel: &crate::Kernel,
-    caller: &KjCaller,
-    spec: GateSpec,
-    ledger_flows: &SharedLedgerFlowBus,
-    reason: &str,
-) -> Option<AskRef> {
-    let db = kernel.kernel_db();
-    let approval_span = tracing::Span::current();
-    if let Some(context) = caller.context_id {
-        approval_span.record("context.id", context.to_string());
-    }
-    let mut ask = match build_ask(kernel, caller, &spec).await {
-        Ok(ask) => ask,
-        Err(error) => {
-            tracing::error!("dry run could not capture command inputs: {error}");
-            return None;
-        }
-    };
-    let request_id = {
-        let db = db.lock();
-        let context = match caller.context_id { Some(context) => context, None => { tracing::warn!("dry run ask has no context"); return None; } };
-        let reviewer = match db.effective_approval_reviewer(context, caller.actor_id) {
-            Ok(resolved) => resolved.reviewer(),
-            Err(error) => { tracing::warn!("dry run could not resolve reviewer: {error}"); return None; }
-        };
-        ask.continuation_epoch = match db.continuation_epoch(context) {
-            Ok(epoch) => epoch,
-            Err(error) => { tracing::warn!("dry run could not snapshot continuation epoch: {error}"); return None; }
-        };
-        approval_span.record("reviewer.id", reviewer.to_string());
-        let mut ask = ask;
-        ask.reviewer_id = reviewer.as_bytes().to_vec();
-        match db.create_approval_ask(&ask, false) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::warn!(
-                    "dry run could not record the ask it would have raised: {e} \
-                     (nothing ran and nothing was asked either way)"
-                );
-                return None;
-            }
-        }
-    };
-    approval_span.record("ask.id", request_id.as_str());
-    tracing::info!("dry-run approval ask recorded");
-    let status = {
-        let db = db.lock();
-        match approval_ledger::decide::abandon(db.conn_for_ledger(), &request_id, Some(reason)) {
-            Ok(row) => row.status,
-            Err(e) => {
-                // The row committed and the abandonment did not, so it is
-                // still pending — the one shape this function exists to
-                // avoid. Say so loudly; `kj ledger` can be pointed at it.
-                tracing::error!(
-                    request_id = %request_id,
-                    "dry run left a PENDING ask it could not abandon: {e} — \
-                     nobody is waiting on it and answering it runs nothing"
-                );
-                ApprovalStatus::Pending
-            }
-        }
-    };
-    announce_ledger_change(db, ledger_flows);
-    Some(ask_ref(request_id, status))
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -2505,11 +2409,9 @@ mod tests {
                 "{table}: unreadable captured inputs are not an unset value: {}", outcome.reason);
             assert!(outcome.ask.is_none(), "no reviewer may approve guessed inputs");
             assert!(outcome.reason.contains(table), "{}", outcome.reason);
-            assert!(record_dry_run_ask(d.kernel(), &caller, spec(),
-                d.kernel.ledger_flows(), "fault probe").await.is_none());
             let count: i64 = d.kernel_db.lock().conn_for_ledger()
                 .query_row("SELECT count(*) FROM approvals", [], |row| row.get(0)).unwrap();
-            assert_eq!(count, 0, "neither normal nor dry-run capture may record invented inputs");
+            assert_eq!(count, 0, "capture must not record invented inputs");
         }
     }
 

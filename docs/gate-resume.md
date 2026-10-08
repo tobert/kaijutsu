@@ -856,7 +856,7 @@ It validates all names and refuses duplicates before mutation; temporary overlay
 names cannot collide with any target. A restore failure prevents execution.
 
 Cwd and durable exports are read under one database lock. Storage faults refuse
-before recording an ask, including dry-run audit asks. The hook plan reader also
+before recording an ask. The hook plan reader also
 reports a capture failure before running any hook body. Construction initializes
 kaish at the selected cwd, then validates that directory in its VFS namespace;
 there is no second database restore that can select a newer cwd.

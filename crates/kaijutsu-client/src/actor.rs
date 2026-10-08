@@ -546,11 +546,6 @@ enum RpcCommand {
         context_id: ContextId,
         reply: oneshot::Sender<Result<Vec<crate::rpc::KjCommandInfo>, CallError>>,
     },
-    ShellDryRun {
-        context_id: ContextId,
-        command: String,
-        reply: oneshot::Sender<Result<crate::rpc::ShellDryRunReport, CallError>>,
-    },
 
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
@@ -832,7 +827,6 @@ impl RpcCommand {
             Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKjQuiet { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
-            Self::ShellDryRun { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -1573,21 +1567,6 @@ impl ActorHandle {
         context_id: ContextId,
     ) -> Result<Vec<crate::rpc::KjCommandInfo>, CallError> {
         self.send(|reply| RpcCommand::GetKjCommandCatalog { context_id, reply }).await
-    }
-
-    /// What the kernel's PreCall hooks would have decided about `command`.
-    ///
-    /// The command is never run, no gate is opened, and nothing here can
-    /// refuse anything — see `RpcClient::shell_dry_run`. Callers that mirror
-    /// another harness's commands should not await this on their reply path:
-    /// a slow or absent kernel must not delay the harness.
-    #[tracing::instrument(skip(self, command))]
-    pub async fn shell_dry_run(
-        &self,
-        context_id: ContextId,
-        command: String,
-    ) -> Result<crate::rpc::ShellDryRunReport, CallError> {
-        self.send(|reply| RpcCommand::ShellDryRun { context_id, command, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -3836,12 +3815,6 @@ async fn dispatch_kernel_command(
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
         }
-        // Plain `dispatch!`, not `dispatch_deadline!`: a dry run opens no
-        // gate and waits on no human, so it is an ordinary short call.
-        RpcCommand::ShellDryRun { context_id, command, reply } => {
-            dispatch!(kernel, reply, close_tx, k, k.shell_dry_run(context_id, &command));
-        }
-
         // ── Shell Variables ──
         RpcCommand::GetShellVar { name, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_shell_var(&name));

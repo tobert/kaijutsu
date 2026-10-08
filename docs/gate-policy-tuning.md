@@ -82,9 +82,7 @@ All three RPC paths reach this with `tool = shell_write`, each through a
 runtime entry point that calls `Broker::shell_pre_call_hooks`:
 `kaijutsu-server/src/rpc.rs`'s `execute` (via `runtime::streaming::execute`),
 `execute_shell_command` (via `runtime::interactive::submit`), and
-`execute_kj_command` (via `runtime::structured::execute_kj`). A fourth,
-`shell_dry_run`, takes the same evaluator in dry-run mode and enforces
-nothing (`docs/kaish-integration.md`).
+`execute_kj_command` (via `runtime::structured::execute_kj`).
 
 Inside `run_gate` the evaluator replaces the direct `rules::redeem` call as
 step 1. The archived-context check still runs first and is never bypassed by

@@ -704,7 +704,7 @@ key alone**; the username is not compared. The client's log line
 reads as the wrong identity now that keys carry the identity; it should say
 "ssh user". No personal-key warning fired. The hook socket bound on the new
 hosting pid without waiting. Still to read once: the `mcp` type's governance
-script and the hook pipeline's dry-run path for anything keyed on the
+script for anything keyed on the
 username `amy`, and whether the kernel roster and the cc-peer roster agree
 about who is in the room when one process is two names.
 

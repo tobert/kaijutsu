@@ -121,9 +121,6 @@ is none of those:
   (`kj/gate.rs`, step 2b), so a council allow on a retry would run the
   command beside the worker's run. A council verdict never revives or
   bypasses an earlier ask.
-- **Not in dry runs.** `shell_pre_call_hooks_dry_run` reaches the ask's
-  description but enforces nothing; the council is not consulted, and the
-  dry run says it would be.
 - **The read-only `shell` tool is unchanged.** It enforces its policy
   structurally and runs no gate (`mcp/servers/shell.rs`); the council does
   not run there.

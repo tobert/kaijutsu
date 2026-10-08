@@ -8,7 +8,7 @@
 //! - Routes every emitted notification into `BlockKind::Notification` blocks
 //!   in contexts whose binding allows the emitting instance.
 //! - Evaluates hooks at PreCall, PostCall, OnError, OnNotification, and
-//!   ListTools, enforcing or in dry run (`PhaseMode`).
+//!   ListTools.
 //! - Persists per-context `ContextToolBinding`s and tracks resource
 //!   subscriptions, re-reading a resource into a context on `ResourceUpdated`.
 
@@ -118,7 +118,7 @@ fn enter_hook_depth() -> McpResult<HookDepthGuard> {
     if next > max_hook_depth() {
         return Err(McpError::HookRecursionLimit { depth: next });
     }
-    // Public enforcing and dry-run evaluators install the scope before an
+    // The public evaluator installs the scope before an
     // Invoke body can re-enter the broker.
     let _ = HOOK_DEPTH.try_with(|d| d.set(next));
     Ok(HookDepthGuard)
@@ -339,13 +339,6 @@ fn add_escalation(escalation: &mut Option<(HookId, String)>, hook_id: &HookId, d
     }
 }
 
-fn no_hook_matched(mode: PhaseMode) -> PhaseEval {
-    match mode {
-        PhaseMode::Enforce => PhaseEval::Enforced(PhaseOutcome::Continue),
-        PhaseMode::DryRun => PhaseEval::DryRun(DryRunReport::would_proceed()),
-    }
-}
-
 /// A command hook verdict. The execution owner applies replacement/refusal
 /// to its captured outcome before publishing any terminal projection.
 #[derive(Debug)]
@@ -372,10 +365,6 @@ struct AskTier {
     /// root character.
     council: bool,
 }
-
-/// What a dry run adds to an ask the council would have read first.
-const COUNCIL_DRY_RUN_NOTE: &str =
-    "\n\nThe council would read this submission before the ask; a dry run does not consult it.";
 
 impl Broker {
     pub fn new() -> Self {
@@ -1978,41 +1967,20 @@ impl Broker {
     ) -> McpResult<PhaseOutcome> {
         // Keep the scope wrapper from carrying the full recursive evaluator
         // on every enclosing rc/command future's stack.
-        let evaluation = Box::pin(self.evaluate_phase_with_mode(
-            PhaseMode::Enforce, phase, params, ctx, payload, cancel,
-        ));
-        let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
-            else { inherit_hook_depth(0, evaluation).await };
-        match result? {
-            PhaseEval::Enforced(outcome) => Ok(outcome),
-            // Unreachable by construction — `PhaseMode::Enforce` produces no
-            // dry-run finding. An error rather than a fallback: honoring a
-            // dry-run finding as a verdict would enforce a decision the
-            // evaluator promised not to reach.
-            PhaseEval::DryRun(report) => Err(McpError::Protocol(format!(
-                "enforcing hook evaluation produced a dry-run report ({:?}); \
-                 this is a defect in kaijutsu's phase evaluator",
-                report.outcome
-            ))),
-        }
+        let evaluation = Box::pin(self.evaluate_phase_body(phase, params, ctx, payload, cancel));
+        if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
+            else { inherit_hook_depth(0, evaluation).await }
     }
 
-    /// [`Self::evaluate_phase`]'s body, with the mode explicit.
-    ///
-    /// In [`PhaseMode::DryRun`] every terminal outcome is converted here:
-    /// nothing is denied, no gate is opened, and a would-deny or would-ask
-    /// becomes an abandoned ledger row plus a [`DryRunReport`]. Hook bodies
-    /// still run — that is the point, since the scoring a body does is the
-    /// thing being measured — and see `KJ_HOOK_MODE=dryrun`.
-    async fn evaluate_phase_with_mode(
+    /// [`Self::evaluate_phase`]'s body.
+    async fn evaluate_phase_body(
         &self,
-        mode: PhaseMode,
         phase: McpHookPhase,
         params: &KernelCallParams,
         ctx: &CallContext,
         payload: PhasePayload<'_>,
         cancel: &CancellationToken,
-    ) -> McpResult<PhaseEval> {
+    ) -> McpResult<PhaseOutcome> {
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
         }
@@ -2040,11 +2008,11 @@ impl Broker {
                 Err(e) => {
                     // A fault, not a verdict: the file is the remedy, and
                     // the message names it.
-                    return Ok(PhaseEval::Enforced(PhaseOutcome::GateUnavailable {
+                    return Ok(PhaseOutcome::GateUnavailable {
                         hook_id: HookId(GATE_POLICY_SUBJECT.into()),
                         reason: e.to_string(),
                         ask: None,
-                    }));
+                    });
                 }
             };
             let context_type = self.context_type_for(ctx).await;
@@ -2055,30 +2023,25 @@ impl Broker {
             let policy = match self.program_policy(command, &statements, ctx, layers).await {
                 Ok(policy) => policy,
                 Err(reason) => {
-                    return Ok(PhaseEval::Enforced(PhaseOutcome::GateUnavailable {
+                    return Ok(PhaseOutcome::GateUnavailable {
                         hook_id: HookId(GATE_POLICY_SUBJECT.into()),
                         reason,
                         ask: None,
-                    }));
+                    });
                 }
             };
             match policy.verdict() {
                 approval_ledger::types::AskVerdict::Allow => {
-                    return Ok(no_hook_matched(mode));
+                    return Ok(PhaseOutcome::Continue);
                 }
                 approval_ledger::types::AskVerdict::Deny => {
                     let reason = policy.describe_planned(&statements, false);
                     let hook_id = HookId(GATE_POLICY_SUBJECT.into());
-                    if mode == PhaseMode::DryRun {
-                        return Ok(PhaseEval::DryRun(
-                            self.dry_run_deny(&hook_id, reason, params, ctx).await,
-                        ));
-                    }
-                    return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
+                    return Ok(PhaseOutcome::Deny {
                         hook_id,
                         reason,
                         ask: None,
-                    }));
+                    });
                 }
                 approval_ledger::types::AskVerdict::Escalate => {
                     early_gate_config = Some(config.clone());
@@ -2107,7 +2070,7 @@ impl Broker {
                 .collect()
         };
         if snapshot.is_empty() {
-            return Ok(no_hook_matched(mode));
+            return Ok(PhaseOutcome::Continue);
         }
         let mut ordered = snapshot;
         ordered.sort_by_key(|(idx, e)| (e.priority, *idx));
@@ -2185,46 +2148,23 @@ impl Broker {
                     }
                 }
                 HookAction::Deny(reason) => {
-                    if mode == PhaseMode::DryRun {
-                        return Ok(PhaseEval::DryRun(
-                            self.dry_run_deny(&entry.id, reason, params, ctx).await,
-                        ));
-                    }
-                    return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
+                    return Ok(PhaseOutcome::Deny {
                         hook_id: entry.id,
                         reason,
                         ask: None,
-                    }));
+                    });
                 }
                 HookAction::ShortCircuit(result) => {
-                    if mode == PhaseMode::DryRun {
-                        if let Some((ask_hook, description)) = escalation.take() {
-                            return Ok(PhaseEval::DryRun(self.dry_run_ask(&ask_hook, description, params, ctx).await));
-                        }
-                        // Nothing gate-shaped happened, so there is nothing
-                        // to record — only the fact that the command would
-                        // not have run.
-                        return Ok(PhaseEval::DryRun(DryRunReport {
-                            outcome: DryRunOutcome::WouldShortCircuit,
-                            hook_id: Some(entry.id.0.clone()),
-                            reason: Some(
-                                "a hook would have answered with a synthetic result; \
-                                 the command would not have run"
-                                    .to_string(),
-                            ),
-                            ask: None,
-                        }));
-                    }
                     if let Some((ask_hook, description)) = escalation.take() {
                         match self.settle_escalation(ask_hook, description, params, ctx, phase, &payload, review, cancel).await? {
                             PhaseOutcome::Continue => {}
-                            refused => return Ok(PhaseEval::Enforced(refused)),
+                            refused => return Ok(refused),
                         }
                     }
-                    return Ok(PhaseEval::Enforced(PhaseOutcome::ShortCircuit {
+                    return Ok(PhaseOutcome::ShortCircuit {
                         hook_id: entry.id,
                         result,
-                    }));
+                    });
                 }
                 HookAction::Ask(spec) => {
                     let description = spec.description.clone().unwrap_or_else(|| {
@@ -2242,16 +2182,11 @@ impl Broker {
                                 return Err(McpError::Cancelled);
                             }
                             let reason = format!("hook body `{name}` returned error: {e}");
-                            if mode == PhaseMode::DryRun {
-                                return Ok(PhaseEval::DryRun(
-                                    self.dry_run_deny(&entry.id, reason, params, ctx).await,
-                                ));
-                            }
-                            return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
+                            return Ok(PhaseOutcome::Deny {
                                 hook_id: entry.id,
                                 reason,
                                 ask: None,
-                            }));
+                            });
                         }
                         if cancel.is_cancelled() {
                             return Err(McpError::Cancelled);
@@ -2261,7 +2196,7 @@ impl Broker {
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
                             .run_kaish_hook(
-                                mode, phase, &script, params, ctx, &payload, cancel,
+                                phase, &script, params, ctx, &payload, cancel,
                                 early_gate_config.as_ref(),
                             )
                             .await?;
@@ -2272,7 +2207,7 @@ impl Broker {
                             KaishHookOutcome::Continue => {}
                             KaishHookOutcome::Escalate(description) => add_escalation(&mut escalation, &entry.id, description),
                             KaishHookOutcome::Deny(reason) => {
-                                return Ok(self.phase_deny(mode, entry.id, reason, params, ctx).await);
+                                return Ok(PhaseOutcome::Deny { hook_id: entry.id, reason, ask: None });
                             }
                         }
                     }
@@ -2290,16 +2225,11 @@ impl Broker {
                             Ok(body) => body,
                             Err(err) => {
                                 let reason = unreadable_hook_body_reason(&path, &err);
-                                if mode == PhaseMode::DryRun {
-                                    return Ok(PhaseEval::DryRun(
-                                        self.dry_run_deny(&entry.id, reason, params, ctx).await,
-                                    ));
-                                }
-                                return Ok(PhaseEval::Enforced(PhaseOutcome::Deny {
+                                return Ok(PhaseOutcome::Deny {
                                     hook_id: entry.id,
                                     reason,
                                     ask: None,
-                                }));
+                                });
                             }
                         };
                         if cancel.is_cancelled() {
@@ -2308,7 +2238,7 @@ impl Broker {
                         let _depth_guard = enter_hook_depth()?;
                         let outcome = self
                             .run_kaish_hook(
-                                mode, phase, &body, params, ctx, &payload, cancel,
+                                phase, &body, params, ctx, &payload, cancel,
                                 early_gate_config.as_ref(),
                             )
                             .await?;
@@ -2319,7 +2249,7 @@ impl Broker {
                             KaishHookOutcome::Continue => {}
                             KaishHookOutcome::Escalate(description) => add_escalation(&mut escalation, &entry.id, description),
                             KaishHookOutcome::Deny(reason) => {
-                                return Ok(self.phase_deny(mode, entry.id, reason, params, ctx).await);
+                                return Ok(PhaseOutcome::Deny { hook_id: entry.id, reason, ask: None });
                             }
                         }
                     }
@@ -2327,18 +2257,9 @@ impl Broker {
             }
         }
         let Some((hook_id, description)) = escalation else {
-            return Ok(no_hook_matched(mode));
+            return Ok(PhaseOutcome::Continue);
         };
-        if mode == PhaseMode::DryRun {
-            // The gate is never reached in dry run: opening one mints a
-            // pending row nobody can usefully answer, and redeeming an
-            // answer already given would spend it on a call that is not
-            // happening.
-            return Ok(PhaseEval::DryRun(self.dry_run_ask(&hook_id, description, params, ctx).await));
-        }
-        Ok(PhaseEval::Enforced(
-            self.settle_escalation(hook_id, description, params, ctx, phase, &payload, review, cancel).await?,
-        ))
+        self.settle_escalation(hook_id, description, params, ctx, phase, &payload, review, cancel).await
     }
 
     /// Open the chain's one ask, or collect the answer already given.
@@ -2366,49 +2287,6 @@ impl Broker {
         })
     }
 
-    /// A hook's deny, as the phase's mode reports it.
-    async fn phase_deny(
-        &self,
-        mode: PhaseMode,
-        hook_id: HookId,
-        reason: String,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-    ) -> PhaseEval {
-        if mode == PhaseMode::DryRun {
-            return PhaseEval::DryRun(self.dry_run_deny(&hook_id, reason, params, ctx).await);
-        }
-        PhaseEval::Enforced(PhaseOutcome::Deny { hook_id, reason, ask: None })
-    }
-
-    /// Record the ask a dry-run gate crossing would have raised, and report
-    /// it. Never opens a gate — see [`crate::kj::gate::record_dry_run_ask`].
-    async fn dry_run_ask(
-        &self,
-        hook_id: &HookId,
-        description: String,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-    ) -> DryRunReport {
-        let reason = format!(
-            "dry run: hook `{hook_id}` would have asked its reviewer. Nothing ran, \
-             nobody was asked, and this row authorizes nothing. {description}"
-        );
-        let ask = self
-            .record_dry_run_ask(hook_id, description, params, ctx, &reason)
-            .await;
-        DryRunReport {
-            outcome: DryRunOutcome::WouldAsk,
-            hook_id: Some(hook_id.0.clone()),
-            reason: Some(reason),
-            ask,
-        }
-    }
-
-    /// Record a dry-run would-deny and report it. A deny opens no gate on
-    /// the enforcing path either, so the row here exists for one reason: a
-    /// blocked command is exactly the observation the dry run is for, and a
-    /// finding that only reaches a log cannot be counted later.
     /// `gate.toml` as the kernel's `/config/kernel` mount holds it right
     /// now. A broker with no kernel wired has no config tree to read and
     /// gets the empty config: the builtin layer alone, which is the state
@@ -2428,74 +2306,6 @@ impl Broker {
         let dispatcher = self.kj_dispatcher().await?;
         let db = dispatcher.kernel_db().lock();
         crate::kj::gate_policy::context_type_of(&db, Some(ctx.context_id))
-    }
-
-    async fn dry_run_deny(
-        &self,
-        hook_id: &HookId,
-        deny_reason: String,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-    ) -> DryRunReport {
-        let reason = format!(
-            "dry run: hook `{hook_id}` would have denied this call. Nothing ran, \
-             and this row authorizes nothing. {deny_reason}"
-        );
-        let ask = self
-            .record_dry_run_ask(hook_id, deny_reason, params, ctx, &reason)
-            .await;
-        DryRunReport {
-            outcome: DryRunOutcome::WouldDeny,
-            hook_id: Some(hook_id.0.clone()),
-            reason: Some(reason),
-            ask,
-        }
-    }
-
-    /// Commit the durable half of a dry-run finding: one ask row, built the
-    /// way a real gate would build it and abandoned in the same call.
-    ///
-    /// `None` when there is no `KjDispatcher` to reach the ledger through,
-    /// or when the ledger refused the write. Both are logged and neither is
-    /// fatal. The advisory record grants no authority, so its absence cannot
-    /// change the dry-run verdict or authorize later execution.
-    async fn record_dry_run_ask(
-        &self,
-        hook_id: &HookId,
-        description: String,
-        params: &KernelCallParams,
-        ctx: &CallContext,
-        reason: &str,
-    ) -> Option<AskRef> {
-        let Some(dispatcher) = self.kj_dispatcher().await else {
-            tracing::warn!(
-                target: "kaijutsu::hooks",
-                hook_id = %hook_id,
-                "dry run has no KjDispatcher wired; the finding is reported but not recorded",
-            );
-            return None;
-        };
-        let caller = crate::kj::KjCaller {
-            principal_id: ctx.principal_id,
-            actor_id: ctx.actor_id,
-            reviewer_id: ctx.reviewer_id,
-            context_id: Some(ctx.context_id),
-            session_id: ctx.session_id,
-            confirmed: false,
-            rc_depth: 0,
-            privileged: false,
-            // Ledger attribution only; this caller does not execute commands or rc.
-            cancel: CancellationToken::new(),
-        };
-        let spec = crate::kj::hook_gate::build_hook_gate_spec(&hook_id.0, description, params);
-        crate::kj::gate::record_dry_run_ask(
-            dispatcher.kernel(),
-            &caller,
-            spec,
-            dispatcher.kernel().ledger_flows(),
-            reason,
-        )
-        .await
     }
 
     /// Record a durable ask with the phase's authority. PreCall approval can
@@ -2698,16 +2508,13 @@ impl Broker {
     ///
     /// The script always sees: `KJ_HOOK_PHASE`, `KJ_HOOK_INSTANCE`,
     /// `KJ_HOOK_TOOL`, `KJ_PRINCIPAL`, `KJ_CONTEXT`, `KJ_TOOL_ARGS`
-    /// (JSON of the call params). `KJ_HOOK_MODE` is present, with the value
-    /// `dryrun`, only when the phase is being evaluated in dry run.
-    /// Phase-specific overlays: `KJ_TOOL_RESULT`
+    /// (JSON of the call params). Phase-specific overlays: `KJ_TOOL_RESULT`
     /// (PostCall — JSON of the produced result, real or short-circuited
     /// synthetic) and `KJ_TOOL_ERROR` (OnError — JSON of the failure that
     /// triggered the phase). OnNotification carries its payload in
     /// `KJ_TOOL_ARGS` already; no extra var is added.
     async fn run_kaish_hook(
         &self,
-        mode: PhaseMode,
         phase: McpHookPhase,
         body: &str,
         params: &super::types::KernelCallParams,
@@ -2715,7 +2522,7 @@ impl Broker {
         payload: &PhasePayload<'_>,
         cancel: &CancellationToken,
         // The gate config PreCall's own fast path already loaded for this
-        // call, when it ran (`evaluate_phase_with_mode`, `phase == PreCall`
+        // call, when it ran (`evaluate_phase_body`, `phase == PreCall`
         // on `shell`/`shell_write`) — reused below instead of a second
         // `load_config` for `KJ_TOOL_PLAN`'s tier stamping. `None` when this hook call did not go through that
         // path (a different tool, a different phase, or an unparseable
@@ -2824,20 +2631,6 @@ impl Broker {
             Some(config) => Ok(config.clone()),
             None => crate::kj::gate_policy::load_config(dispatcher.kernel().vfs()).await,
         };
-
-        // `KJ_HOOK_MODE` (docs/kaish-integration.md):
-        // present with the value `dryrun` when nothing this body decides
-        // will be honored, and ABSENT otherwise. A body that never reads it
-        // still cannot block a dry run — the evaluator converts every
-        // terminal outcome — so this exists for a body that wants to say
-        // something different, or count differently, when it is being
-        // measured rather than obeyed.
-        if mode == PhaseMode::DryRun {
-            vars.insert(
-                "KJ_HOOK_MODE".into(),
-                kaish_kernel::ast::Value::String("dryrun".to_string()),
-            );
-        }
 
         match payload {
             PhasePayload::None => {}
@@ -3288,68 +3081,6 @@ impl Broker {
                 Err(PhaseOutcome::GatePending { hook_id, reason, ask })
             }
         })
-    }
-
-    /// Run `PreCall` against `command` the way [`Self::shell_pre_call_hooks`]
-    /// does, and report what it WOULD have decided.
-    ///
-    /// For a player whose commands run somewhere else — a Claude Code
-    /// PreToolUse hook forwarded through kaijutsu-mcp — so the kernel's
-    /// hooks can score them and the ledger can learn from them.
-    ///
-    /// Hook bodies run, and see `KJ_HOOK_MODE=dryrun` alongside everything
-    /// the enforcing path sets. Four things never happen: `command` is never
-    /// executed, no pending ask is minted, no context is woken, and no
-    /// answer a human already gave is spent. The report is advisory in the
-    /// strongest sense — there is no verdict here for a caller to honor.
-    ///
-    /// See `docs/kaish-integration.md`.
-    pub async fn shell_pre_call_hooks_dry_run(
-        &self,
-        command: &str,
-        ctx: &CallContext,
-        cancel: &CancellationToken,
-    ) -> McpResult<DryRunReport> {
-        let params = Self::shell_write_hook_params(command);
-        let evaluation = Box::pin(self.evaluate_phase_with_mode(
-            PhaseMode::DryRun,
-            McpHookPhase::PreCall,
-            &params,
-            ctx,
-            PhasePayload::None,
-            cancel,
-        ));
-        let result = if HOOK_DEPTH.try_with(|_| ()).is_ok() { evaluation.await }
-            else { inherit_hook_depth(0, evaluation).await };
-        match result? {
-            PhaseEval::DryRun(report) if report.outcome == DryRunOutcome::WouldProceed => {
-                match self.ask_tier(command, ctx).await {
-                    Ok(Some(tier)) => {
-                        let hook_id = HookId(GATE_POLICY_SUBJECT.into());
-                        let mut description = tier.description;
-                        if tier.council {
-                            description.push_str(COUNCIL_DRY_RUN_NOTE);
-                        }
-                        Ok(self.dry_run_ask(&hook_id, description, &params, ctx).await)
-                    }
-                    Ok(None) => Ok(report),
-                    Err(reason) => Ok(DryRunReport {
-                        outcome: DryRunOutcome::WouldDeny,
-                        hook_id: Some(GATE_POLICY_SUBJECT.into()),
-                        reason: Some(reason),
-                        ask: None,
-                    }),
-                }
-            }
-            PhaseEval::DryRun(report) => Ok(report),
-            // Unreachable by construction, and an error rather than a
-            // fallback: a verdict reaching this path would mean the
-            // evaluator ran in the enforcing mode after being told not to.
-            PhaseEval::Enforced(outcome) => Err(McpError::Protocol(format!(
-                "dry-run hook evaluation produced an enforceable outcome ({outcome:?}); \
-                 this is a defect in kaijutsu's phase evaluator"
-            ))),
-        }
     }
 
     /// Apply PostCall to captured execution using its original tool invocation.
@@ -3928,66 +3659,6 @@ enum PhaseOutcome {
         reason: String,
         ask: Option<AskRef>,
     },
-}
-
-/// Whether a phase evaluation's verdict is honored.
-///
-/// The mode reaches every terminal point in `evaluate_phase_with_mode`, so a
-/// hook that knows nothing about it still cannot block a dry run: the
-/// conversion is the evaluator's, not the hook's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PhaseMode {
-    /// The verdict is honored: a deny refuses the call, an ask opens a gate.
-    Enforce,
-    /// The verdict is recorded and reported, never honored. Hook bodies run
-    /// and see `KJ_HOOK_MODE=dryrun`; no gate is opened, no answer already
-    /// given is spent, and the call the phase is about never happens.
-    DryRun,
-}
-
-/// What one phase evaluation produced. The two variants correspond exactly
-/// to the two [`PhaseMode`]s, so an enforcing caller cannot be handed a
-/// dry-run finding to act on and a dry-run caller cannot be handed a verdict
-/// to honor.
-#[derive(Debug)]
-enum PhaseEval {
-    Enforced(PhaseOutcome),
-    DryRun(DryRunReport),
-}
-
-/// What the PreCall phase would have decided about a command that was never
-/// run. See `docs/kaish-integration.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DryRunOutcome {
-    /// Every matching hook let the call through.
-    WouldProceed,
-    /// A hook denied outright, with no gate involved.
-    WouldDeny,
-    /// A gate would have opened and a human would have been asked.
-    WouldAsk,
-    /// A hook would have substituted a synthetic result for the command.
-    WouldShortCircuit,
-}
-
-/// The result of one dry-run phase evaluation.
-#[derive(Debug, Clone)]
-pub struct DryRunReport {
-    pub outcome: DryRunOutcome,
-    /// The hook that reached the terminal outcome. `None` for
-    /// `WouldProceed`.
-    pub hook_id: Option<String>,
-    /// Why, in one line. `None` for `WouldProceed`.
-    pub reason: Option<String>,
-    /// The durable row this evaluation recorded, always `Abandoned`: it
-    /// records a question, never an answer to one. `None` when nothing was
-    /// recorded — `WouldProceed`, `WouldShortCircuit`, or a ledger fault.
-    pub ask: Option<AskRef>,
-}
-
-impl DryRunReport {
-    fn would_proceed() -> Self {
-        Self { outcome: DryRunOutcome::WouldProceed, hook_id: None, reason: None, ask: None }
-    }
 }
 
 /// Own a result-review wait without yielding its command for re-execution.
@@ -9380,12 +9051,10 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    // ── Dry-run mode (`docs/kaish-integration.md`) ────
-
-    /// A wired broker plus a REGISTERED context. A dry run records a real
-    /// ask row, and building one reads the context's cwd, so the random id
-    /// `CallContext::test()` hands out is not enough here.
-    async fn dry_run_fixture(
+    /// A wired broker plus a REGISTERED context. An ask row reads the
+    /// context's cwd, so the random id `CallContext::test()` hands out is
+    /// not enough here.
+    async fn registered_shell_write_fixture(
         name: &str,
     ) -> (Arc<Broker>, Arc<crate::kj::KjDispatcher>, CallContext) {
         let (broker, _kernel, kj) = wired_kaish_broker(name).await;
@@ -9421,7 +9090,7 @@ mod tests {
     /// call refuses and mints a pending ask.
     #[tokio::test]
     async fn a_ledger_answer_never_reaches_an_asking_hook() {
-        let (broker, kj, ctx) = dry_run_fixture("ledger-exempt").await;
+        let (broker, kj, ctx) = registered_shell_write_fixture("ledger-exempt").await;
         push_shell_write_hook(
             &broker,
             "ask-everything",
@@ -9442,12 +9111,6 @@ mod tests {
             db.lock().list_pending_asks().unwrap().is_empty(),
             "an exempt program must not mint an ask"
         );
-        let report = broker
-            .shell_pre_call_hooks_dry_run("kj ledger deny 01a0-abc", &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports");
-        assert_eq!(report.outcome, DryRunOutcome::WouldProceed);
-        assert!(report.hook_id.is_none(), "no hook fired: {report:?}");
 
         match broker
             .shell_pre_call_hooks(
@@ -9460,188 +9123,6 @@ mod tests {
             other => panic!("a mixed program is scored like any other, got {other:?}"),
         }
         assert_eq!(db.lock().list_pending_asks().unwrap().len(), 1);
-    }
-
-    /// A `Deny` hook in dry run refuses nothing: the report says what would
-    /// have happened, the durable row records it, and the row is abandoned
-    /// so nobody is asked about a command that already ran somewhere else.
-    ///
-    /// Falsified by enforcing instead of recording (there is no `Denied`
-    /// shape for this call to return), and by skipping the recording
-    /// (`report.ask` is `None`).
-    #[tokio::test]
-    async fn dry_run_records_a_would_deny_and_asks_nobody() {
-        let (broker, kj, ctx) = dry_run_fixture("dry-run-deny").await;
-        push_shell_write_hook(
-            &broker,
-            "deny-everything",
-            HookAction::Deny("no shell for you".into()),
-        )
-        .await;
-
-        let report = broker
-            .shell_pre_call_hooks_dry_run("git push --force", &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports; it does not fail");
-
-        assert_eq!(report.outcome, DryRunOutcome::WouldDeny);
-        assert_eq!(report.hook_id.as_deref(), Some("deny-everything"));
-        assert!(
-            report.reason.as_deref().unwrap_or_default().contains("no shell for you"),
-            "the hook's own reason must survive into the report, got {:?}",
-            report.reason
-        );
-
-        let ask = report.ask.expect("a would-deny is recorded durably");
-        assert_eq!(
-            ask.status,
-            kaijutsu_types::AskStatus::Abandoned,
-            "a dry-run row records a question, never an answer"
-        );
-        let db = kj.kernel_db();
-        let row = db
-            .lock()
-            .get_approval(&ask.request_id)
-            .unwrap()
-            .expect("the recorded row is readable from the ledger");
-        assert_eq!(row.status, approval_ledger::types::ApprovalStatus::Abandoned);
-        assert!(
-            db.lock().list_pending_asks().unwrap().is_empty(),
-            "a dry run must leave nothing for a human to answer"
-        );
-    }
-
-    /// An `Ask` hook in dry run records the question and opens no gate. The
-    /// second half is the non-vacuity guard: the SAME hook on the enforcing
-    /// path does leave exactly one pending ask, and the abandoned row the
-    /// dry run left behind does not answer it.
-    ///
-    /// Falsified by letting the dry-run branch reach `run_permission_ask`:
-    /// the first `list_pending_asks` assertion trips.
-    #[tokio::test]
-    async fn dry_run_would_ask_records_without_minting_a_pending_ask() {
-        let (broker, kj, ctx) = dry_run_fixture("dry-run-ask").await;
-        push_shell_write_hook(
-            &broker,
-            "ask-about-it",
-            HookAction::Ask(AskSpec { description: Some("scored risky".into()) }),
-        )
-        .await;
-
-        let command = "dd if=/dev/zero of=/tmp/kj-dry-run-never";
-        let report = broker
-            .shell_pre_call_hooks_dry_run(command, &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports; it does not fail");
-        assert_eq!(report.outcome, DryRunOutcome::WouldAsk);
-        let recorded = report.ask.expect("a would-ask is recorded durably");
-        assert_eq!(recorded.status, kaijutsu_types::AskStatus::Abandoned);
-
-        let db = kj.kernel_db();
-        assert!(
-            db.lock().list_pending_asks().unwrap().is_empty(),
-            "nobody may be asked about a command the kernel is not running"
-        );
-
-        // The enforcing path, same hook, same command: a real gate opens.
-        match broker.shell_pre_call_hooks(command, &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Denied(_) => {}
-            other => panic!("the enforcing path must refuse and ask, got {other:?}"),
-        }
-        let pending = db.lock().list_pending_asks().unwrap();
-        assert_eq!(
-            pending.len(),
-            1,
-            "the enforcing path leaves exactly one open question"
-        );
-        assert_ne!(
-            pending[0].request_id, recorded.request_id,
-            "and it is a NEW row — the dry run's abandoned row answers nothing"
-        );
-    }
-
-    /// `KJ_HOOK_MODE` is `dryrun` in a dry run and ABSENT on the enforcing
-    /// path. One hook body, two modes, opposite outcomes: exit 0 for
-    /// `dryrun`, exit 1 for absent, exit 2 for anything else — so a wrong
-    /// value fails differently from a missing one.
-    ///
-    /// Falsified by setting the variable unconditionally (the enforcing half
-    /// stops denying) or never (the dry-run half reports a would-deny).
-    #[tokio::test]
-    async fn kj_hook_mode_says_dryrun_only_in_a_dry_run() {
-        let (broker, kj, ctx) = dry_run_fixture("dry-run-mode-var").await;
-        // A person's posture, so an uncovered `echo` meets the hook.
-        seat_a_root(&kj, &ctx);
-        push_shell_write_hook(
-            &broker,
-            "mode-check",
-            HookAction::Invoke(HookBody::Kaish(
-                "mode=\"${KJ_HOOK_MODE:-absent}\"\n\
-                 case \"$mode\" in\n\
-                 dryrun) exit 0 ;;\n\
-                 absent) exit 1 ;;\n\
-                 *) exit 2 ;;\n\
-                 esac"
-                    .into(),
-            )),
-        )
-        .await;
-
-        let report = broker
-            .shell_pre_call_hooks_dry_run("echo hello", &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports; it does not fail");
-        assert_eq!(
-            report.outcome,
-            DryRunOutcome::WouldProceed,
-            "KJ_HOOK_MODE must read `dryrun` in a dry run; got {:?}",
-            report.reason
-        );
-
-        match broker.shell_pre_call_hooks("echo hello", &ctx, &CancellationToken::new()).await {
-            ShellHookVerdict::Denied(err) => {
-                let text = err.to_string();
-                assert!(
-                    text.contains("exit 1"),
-                    "the enforcing path must see KJ_HOOK_MODE ABSENT (exit 1), not a \
-                     different value (exit 2); got {text}"
-                );
-            }
-            other => panic!("expected the hook to deny on the enforcing path, got {other:?}"),
-        }
-    }
-
-    /// The dry-run path evaluates hooks and calls no tool. Pinned with a
-    /// command that would leave a file behind, and a hook that reaches a
-    /// terminal outcome so the evaluation is real rather than empty.
-    #[tokio::test]
-    async fn a_dry_run_never_runs_the_command() {
-        let (broker, _kj, ctx) = dry_run_fixture("dry-run-no-exec").await;
-        push_shell_write_hook(
-            &broker,
-            "ask-about-it",
-            HookAction::Ask(AskSpec { description: None }),
-        )
-        .await;
-
-        let marker = std::env::temp_dir()
-            .join(format!("kj-dry-run-marker-{}", uuid::Uuid::new_v4().simple()));
-        let command = format!("echo ran > {}", marker.display());
-
-        let report = broker
-            .shell_pre_call_hooks_dry_run(&command, &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports; it does not fail");
-        assert_eq!(
-            report.outcome,
-            DryRunOutcome::WouldAsk,
-            "the evaluation must be real, or this test proves nothing"
-        );
-        assert!(
-            !marker.exists(),
-            "a dry run must not run the command; {} was created",
-            marker.display()
-        );
     }
 
     /// A command that fails to parse leaves `KJ_TOOL_PLAN` unset and sets
@@ -10967,12 +10448,6 @@ mod tests {
         }
         assert!(db.lock().list_pending_asks().unwrap().is_empty());
 
-        let report = broker
-            .shell_pre_call_hooks_dry_run("git push origin main", &ctx, &CancellationToken::new())
-            .await
-            .expect("a dry run reports");
-        assert_eq!(report.outcome, DryRunOutcome::WouldAsk, "{report:?}");
-        assert!(db.lock().list_pending_asks().unwrap().is_empty(), "a dry run asks nobody");
 
         match broker.shell_pre_call_hooks("echo hi; git push origin main", &ctx, &CancellationToken::new()).await {
             ShellHookVerdict::Denied(_) => {}

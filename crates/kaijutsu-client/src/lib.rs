@@ -34,7 +34,7 @@ pub use rpc::{
     ContextMcpServerDecl, ContextMembership,
     EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, MountSpec, PeerInfo, PresetInfo,
-    RpcClient, RpcError, ShellDryRunOutcome, ShellDryRunReport, ShellSubmission, ShellValue, SimilarContext,
+    RpcClient, RpcError, ShellSubmission, ShellValue, SimilarContext,
     SnapshotNode, SnapshotResult, StagedDriftInfo, SubmitResult, ToolSchema, TrackInfo,
     VersionSnapshot, VfsActivityEntry, VfsFileType,
 };

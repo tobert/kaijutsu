@@ -1037,21 +1037,11 @@ async fn another_hook_s_ask_stands() {
     }
 }
 
-/// Dry runs and live root characters on the RPC paths never reach the
-/// council; the dry run says it would have. On the tool path a root asks
-/// today, and the council reads for it like any seat.
+/// Live root characters on the RPC paths never reach the council. On the
+/// tool path a root asks today, and the council reads for it like any seat.
 #[tokio::test]
-async fn dry_runs_and_rpc_roots_never_reach_the_council() {
+async fn rpc_roots_never_reach_the_council() {
     let rig = rig(Via::Rpc, Setup { global: "ask = [\"git push\"]", ..Setup::default() }).await;
-    let report = rig
-        .broker
-        .shell_pre_call_hooks_dry_run("touch notes.txt", &rig.ctx, &CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(report.outcome, crate::mcp::DryRunOutcome::WouldAsk, "{report:?}");
-    assert!(report.reason.as_deref().unwrap().contains("The council would read this submission"), "{report:?}");
-    assert!(rig.mock.decisions().is_empty(), "a dry run consults nobody");
-
     rig.seat_a_root();
     rig.submit("touch notes.txt").await.expect("a root's uncovered statement runs");
     assert_pending(Via::Rpc, rig.submit("git push origin main").await);
