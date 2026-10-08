@@ -30,6 +30,7 @@ pub mod approval_identity;
 pub mod kernel;
 pub mod kernel_db;
 pub mod kj;
+pub mod ledger_view;
 pub mod llm;
 pub mod mcp;
 pub mod midi_exchange;

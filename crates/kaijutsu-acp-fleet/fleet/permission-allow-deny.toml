@@ -1,8 +1,17 @@
-description = "A gated shell command asks the client and the turn holds on the answer; allow runs it, deny leaves the workspace untouched, and each turn goes on only after its answer."
+description = "A gated shell command asks the client and the turn holds on the answer; allow runs it, deny leaves the workspace untouched, each turn goes on only after its answer, and the ledger, not the transcript, records each answer."
 
-# An empty policy: every shell_write statement is uncovered and asks.
+# An empty policy: every shell_write statement is uncovered and asks, except
+# jq, which the readback in prompt 3 uses.
 gate = """
 [global]
+allow = ["jq"]
+"""
+
+# The shipped coder does not hold `house`, which `kj ledger` needs. This
+# scenario grants it so the model can read the answers back in prompt 3.
+[rc]
+"coder/create/S11-house.kai" = """
+kj binding allow "house"
 """
 
 # Prompt 1: the call asks, the turn holds, the client allows, the command
@@ -20,14 +29,23 @@ tool_calls = [{ name = "shell_write", input = { command = "mkdir refused" } }]
 text = "refused was not made"
 tool_calls = [{ name = "done", input = { status = "blocked", feedback = "mkdir refused was denied" } }]
 
-# The `kj` call is the ACP bridge recording the client's answer.
+# Prompt 3: the model reads both answers back from the ledger. The history
+# is newest first, and the gate records the readback itself first (an
+# automatic allow, so it asks nothing): the two answers are .[1] and .[2].
+[[model]]
+tool_calls = [{ name = "shell_write", input = { command = "kj ledger show \"$(kj ledger list --history | jq -r '.[1]')\"; kj ledger show \"$(kj ledger list --history | jq -r '.[2]')\"" } }]
+[[model]]
+text = "read the answers back"
+tool_calls = [{ name = "done", input = { status = "done", feedback = "read both answers from the ledger" } }]
+
+# The answers show in no tool call: the ledger is their record.
 [[prompt]]
 text = "make the granted directory"
 permissions = ["allow"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir granted"]
 permission_tool_calls = ["shell_write"]
 text_contains = ["granted exists now"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "make the refused directory"
@@ -35,7 +53,12 @@ permissions = ["deny"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir refused"]
 permission_tool_calls = ["shell_write"]
 text_contains = ["refused was not made"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "done", status = "completed" }]
+
+[[prompt]]
+text = "show how the two asks were answered"
+text_contains = ["read the answers back"]
+tool_calls = [{ title = "shell_write", status = "completed", output_contains = ["statement:  mkdir refused", "decided:    deny", "statement:  mkdir granted", "decided:    allow_once", "decided_by: "] }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "granted"

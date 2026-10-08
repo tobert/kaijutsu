@@ -383,12 +383,7 @@ pub fn escalate_with_authority(conn: &Connection, request_id: &str, caller: &[u8
         &format!("UPDATE approvals SET reviewer_id = ?2 WHERE request_id = ?1 AND status = 'pending' RETURNING {APPROVAL_COLUMNS}"),
         params![request_id, reviewer], row_to_approval,
     )?;
-    let note = format!(
-        "reviewer reassigned from {} to {}",
-        row.reviewer_id.as_deref().unwrap_or_default().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        reviewer.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-    );
-    events::append(&tx, request_id, EventKind::Escalated, Some(caller), None, None, None, Some(&note))?;
+    events::append_escalation(&tx, request_id, caller, row.reviewer_id.as_deref(), reviewer)?;
     tx.commit()?;
     Ok(escalated)
 }
@@ -1263,7 +1258,9 @@ mod tests {
         assert_eq!(row.reviewer_id.as_deref(), Some(&b"amy"[..]));
         let event = list_events(&conn, &request_id).unwrap().pop().unwrap();
         assert_eq!(event.actor.as_deref(), Some(&b"amy"[..]));
-        assert_eq!(event.note.as_deref(), Some("reviewer reassigned from 6c656164 to 616d79"));
+        assert_eq!(event.from_reviewer.as_deref(), Some(&b"lead"[..]));
+        assert_eq!(event.to_reviewer.as_deref(), Some(&b"amy"[..]));
+        assert_eq!(event.note, None, "the reviewers are columns, not prose");
         let self_ask = create_ask(&conn, &minimal_ask()).unwrap();
         escalate(&conn, &self_ask, b"amy", b"lead").unwrap();
         assert!(matches!(escalate_with_authority(&conn, &self_ask, b"amy", b"coder", Some(b"amy")), Err(LedgerError::ReviewerIsActor { .. })));

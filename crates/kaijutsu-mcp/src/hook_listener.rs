@@ -824,6 +824,10 @@ impl HookListener {
                 }
             }
 
+            // No block: the pair is authored on `tool.after`, which carries
+            // the output too. The reply can still carry pending drift.
+            "tool.before" => {}
+
             _ => {}
         }
 

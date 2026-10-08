@@ -54,7 +54,7 @@ text = "move the seed"
 permissions = ["deny"]
 permission_titles = ["shell_write: 1 statement(s) — mv seed.txt moved.txt"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "tier-allowed"

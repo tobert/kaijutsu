@@ -609,6 +609,11 @@ pub struct EventRow {
     pub auto_reason: Option<String>,
     pub note: Option<String>,
     pub created_at: i64,
+    /// An `escalated` event's reviewer before the reassignment.
+    pub from_reviewer: Option<Vec<u8>>,
+    /// An `escalated` event's reviewer after it. Equal to `actor` when the
+    /// caller took the ask over.
+    pub to_reviewer: Option<Vec<u8>>,
 }
 
 /// One `approval_refusals` row — an answer this crate refused on an

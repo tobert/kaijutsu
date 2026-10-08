@@ -63,7 +63,7 @@ text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "doomed"
@@ -107,7 +107,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events, text first; `events` gives the mock backend's raw events instead. See "Ending a task". |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
-| `prompt.release` | Answers for the requests this prompt holds, oldest first, sent while the prompt is open: once every held request has arrived, and after `on_hold`. Each answer after the first waits until the bridge has recorded the one before it. Any answer but `hold`. See "Held requests". |
+| `prompt.release` | Answers for the requests this prompt holds, oldest first, sent while the prompt is open: once every held request has arrived, and after `on_hold`. Each answer after the first waits until the ledger has taken up the one before it. Any answer but `hold`. See "Held requests". |
 | `prompt.on_hold` | `{ write = "<file>", wait_for = "<path>" }`: once every held request has arrived, write the workspace file `write`, then wait for `wait_for` to exist, before sending `release`. See "Held requests". |
 | `prompt.gate` | Replace the kernel's `gate.toml` with this before sending the prompt, as an operator editing it would. Host mode only; the agent then runs with a named `--state-dir` in the scratch directory. |
 | `prompt.permission_titles` | One substring per request, in order, that the request's title must contain. |
@@ -128,6 +128,14 @@ Every scenario is also checked for the Harbor shape; see "Harbor shape".
 A prompt also fails when its agent text contains `stream error:`, which is
 what the ACP bridge sends when a model turn fails outside a prompt. An
 exhausted mock script shows up this way.
+
+A run fails when its update stream shows a permission answer as a tool
+call: a `kj` call that names the ledger, or any call whose input runs
+`ledger allow` or `ledger deny`. The ledger row is the record of an answer,
+and answering authors no block in any transcript (`docs/acp.md`,
+"Permission asks, ledger-driven"). A scenario that checks what was recorded
+has its scripted model read the ledger back, as
+`fleet/permission-allow-deny.toml` does with `kj ledger show`.
 
 ## Ending a task
 
@@ -342,9 +350,9 @@ workspace and removes the scratch directory. `--keep` keeps it.
 A model's gated call holds its turn (`docs/gate-resume.md`, "The turn
 holds"). The call is reported `in_progress`, then `failed` with the waiting
 text, then `pending`; `session/request_permission` arrives while
-`session/prompt` is still open. The bridge records the answer as a `kj`
-tool call, the approved command runs, the call settles `completed` or
-`failed`, and the same turn goes on with the result. A scenario scripts
+`session/prompt` is still open. The bridge sends the answer to the ledger,
+which shows in no tool call; the approved command runs, the call settles
+`completed` or `failed`, and the same turn goes on with the result. A scenario scripts
 one reply after the call and no follow-up turn;
 `fleet/permission-allow-deny.toml` shows the whole shape. That reply calls
 `done`, so the prompt's `tool_calls` ends with it. Since every
@@ -364,8 +372,12 @@ on_hold = { write = "asked", wait_for = "d-drifted" }
 A held request gets no response until the runner sends its `release`
 answer, while the prompt is still open. The runner waits for every
 request the prompt holds, runs `on_hold`, then answers. Between two
-`release` answers it waits for the bridge's `kj` call for the first to
-complete, so the second is decided under whatever the first changed.
+`release` answers it waits until the ledger has taken up the first, so the
+second is decided under whatever the first changed. An answer authors no
+block, so the runner reads this from the agent's stderr: the bridge logs
+`ask_answer="recorded"` or `ask_answer="refused"` for each answer the
+ledger takes up, the way the kernel's `turn_interrupted=true` confirms a
+cancel.
 `fleet/approval/d-shell-write-runs-what-was-shown.toml` uses `on_hold` to
 let a sibling call change the cwd and env after the ask exists and before
 the answer. A held request with no `release` answer is never answered:

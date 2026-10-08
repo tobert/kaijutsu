@@ -208,9 +208,10 @@ None is a commitment; the ones marked *now* ride the first slice.
   taken and popped (`CSI 23;0t`, `run::TITLE_POP`) on every exit path and
   around a suspend, so the shell's own title comes back as found.
 - *landed 2026-09-13* **Desktop notification** (OSC 9 / OSC 777) when an
-  ask lands unfocused: `asks::ask_notification` fires once, from the
-  refresh round's first new ask, only while `!app.focused` — an ask that
-  lands in front of the player is already the card on screen, not a toast.
+  ask lands unfocused: `asks::ask_notification` fires once, for a ledger
+  push that brings a new ask in the context on screen, only while
+  `!app.focused` — an ask that lands in front of the player is already the
+  card on screen, not a toast.
 - **OSC 8 hyperlinks**: detection landed (`present::links` — absolute
   paths with at least two segments at word boundaries, `http(s)` URLs,
   trailing sentence punctuation trimmed, `file://<host>/<path>` targets);
@@ -307,7 +308,7 @@ Two ACP files are client-generic and move **down into `kaijutsu-client`**
 rather than being copied: `rank.rs` (ring seats via
 `kaijutsu_viz::layout::assign_ring_seats`, the same pure function the well
 uses) and the ledger round trip in `permission.rs`. After that, app, ACP and
-TUI share one rank and one ask poll.
+TUI share one rank and one ledger watch.
 
 **Write the renderer generic over `ratatui::Backend`**, with input as a
 `KeyEvent` stream and the kernel reached only through `ActorHandle`. That is
@@ -335,7 +336,7 @@ grammar, and a new surface arrives in the same shape:
 - **"Rules the figure carries"** — bullets for the semantics the picture
   cannot show.
 - **The machinery, named** — the wire or `kj` path behind the surface
-  (`shell_execute`, `subscribeLedgerEvents`, `edit_input`). A surface that
+  (`shell_execute`, `listAsks`/`decideAsk`, `edit_input`). A surface that
   cannot name its kernel path is not designed yet.
 - **Every surface is drawn on the owned screen.** The conversation is the
   transcript area: a scrolling view over the current context's mirror,
@@ -933,8 +934,14 @@ Rules the figure carries:
 
 ### Asks
 
-An ask arrives through `subscribeLedgerEvents` and is answered through
-`kj ledger allow|deny`. It renders as an overlay, never as a modal that
+An ask arrives through the actor's ledger watch (`ActorHandle::ledger`): on
+each connect the actor lists the open asks, subscribes to the kernel's push
+from that generation, and folds every push into one `LedgerState`. Nothing
+polls. We diff that open set against what we show (`asks::fold_ledger`). An
+answer goes through `ActorHandle::decide_ask` with no context: the ledger row
+is the record, and an answer authors no block in any transcript, so it costs
+no model tokens. (Amy, 2026-10-08: *"the ui should indicate but the transcript doesn't
+really need that using up tokens"*.) It renders as an overlay, never as a modal that
 steals the transcript. Same overlay treatment as the picker: it takes the
 rows it needs at the transcript area's foot, key line included, so a long
 statement never pushes `[a]llow once ...` off the bottom — the key-hints
@@ -963,24 +970,39 @@ While the card is armed, `a`/`A`/`d`/`v` answer it and typed text is held:
 the draft never changes under an armed card, so a decision key and a
 typed letter are never confused. A `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act
 exactly as they do with no card up — `Ctrl+A 4` still switches seats, and
-the card goes aside with the switch, since it is always the current
-context's ask; the next refresh raises it again on return. With the
+the card comes down with the switch, since it is always the current
+context's ask, and comes up again on return. With the
 prefix armed, `Ctrl+A d` is the chord `d`, never a deny. (Until
 2026-09-06 the card took every key, which is why `Ctrl+A <digit>` and the
 picker "did not always work": the advisory gate raises a card often.)
 `Esc` puts the card aside with the ask still pending: the seat keeps its
-`!`, the status line its `!n`, and `Ctrl+A l` reaches it. The card also comes down by itself when its ask
-leaves the pending set — answered from another surface (`kj ledger allow`
-in a shell, the app, a sibling session), expired, or abandoned — with a
-status-line notice saying what became of it: `ask 01a04eb6 allow once by
-you`, `by 2b1ffa32e069` (a principal's short id), or `expired` — the ask
-by its first id segment, the one `kj ledger list` keys on. A key
-pressed on an already-answered ask reports the lost race on the status
-line and nothing else happens.
+`!`, the status line its `!n`, and `Ctrl+A l` reaches it. An ask set aside,
+or answered from its card, does not raise its card again while it stays
+open. The card also comes down by itself when its ask leaves the open set —
+answered from another surface (`kj ledger allow` in a shell, the app, a
+sibling session), cancelled, expired, or abandoned — with a status-line
+notice saying what became of it, read with `get_ask`: `ask 01a04eb6 allow
+once by you`, `by lead` (the decider's name), or `expired` — the ask by its
+first id segment, the one `kj ledger list` keys on. Two surfaces may answer
+the same ask; the ledger accepts one, and a key pressed on an
+already-answered ask reports `ask 01a04eb6 was already answered` on the
+status line and nothing else happens.
 
-- An ask landing while the terminal is unfocused notifies the desktop
-  once — OSC 777 and OSC 9 (`asks::ask_notification`); one already on
-  screen notifies nothing. Testing note: the ephemeral kernel this
+Which ask gets the card: while no card is up, the oldest open ask raised
+in the context on screen that was not set aside (`asks::card_candidate`).
+Its full record (`get_ask`) is read on its own task, and the card goes up
+when the read lands if that ask is still the one to show. A read that finds
+nothing or fails is not repeated for that ask until the next ledger push.
+An answer that does not land — a call failure or a refusal other than a
+lost race — puts the ask back, so its card can come up again. An ask raised in
+another context gets that seat's `!` and no card. A card that is up
+follows its ask's summary from each push, so a reassignment shows while it
+is on screen.
+
+- An ask landing in the context on screen while the terminal is unfocused
+  notifies the desktop once — OSC 777 and OSC 9
+  (`asks::ask_notification`); one already on screen notifies nothing, and
+  neither do the asks already open when this client first reads the ledger. Testing note: the ephemeral kernel this
   probes against starts with no reviewer character sheet, so raising an
   ask needs `arrange_a_reviewer` first — `kj binding allow config-write`
   from ROOT, then `kj character create amy` — before any ask can be
@@ -993,7 +1015,7 @@ which shows its approval keys to that actor (`docs/approval-identity.md`).
 The reviewer can approve it in the work context, including the context that
 raised it. A card for another player shows its asker and
 reviewer and offers cancellation or escalation guidance instead of approval
-keys.
+keys; `AskSummary::answerable_by` decides which.
 
 The card's line count is measured at the terminal's own width — the
 statement wraps by width, so a wider count would say fewer lines than a
@@ -1009,8 +1031,12 @@ either view renders, so it is the last thing to disappear.
 The ask above is one row of a view you work from between sessions: every
 pending ask across every context, then the recent decisions with their
 redemption. Same overlay treatment as the picker and the ask card, same
-single-key answers, backed by `kj ledger list` / `show` / `allow` / `deny`
-and the `redeemed:` field.
+single-key answers. PENDING is the open set the ledger watch keeps, oldest
+first; ANSWERED is `list_asks` over the history, newest first, the last 20.
+Each row is read in full with `get_ask`, all at once on their own tasks,
+and the view opens when the reads land; an answer goes through
+`decide_ask`, as on the card. Typing a filter keeps the cursor on a row it
+admits.
 
 ```text
   LEDGER                                                    pending 2   answered today 7
@@ -1029,7 +1055,7 @@ Rules the figure carries:
 - The status line carries the pending count as `!n` next to the rank, so an
   ask in a context you are not looking at is visible from anywhere; the seat
   it belongs to carries `!`.
-- `Enter` shows one ask in full (`kj ledger show`), including the hook that
+- `Enter` shows one ask in full (`get_ask`), including the hook that
   raised it and the statement as the gate saw it.
 - Answered rows keep the answering principal and redemption. Redemption means
   the answer was consumed; it does not prove execution. An invocation retired
@@ -1281,12 +1307,16 @@ ledger) ends with its own key line for the same reason.
 | `q`, `Esc` | back to the live tail |
 | any other key | snap to the tail and handle it there (except `Ctrl+A` and its chord, which switch seats without snapping) |
 
-**A key never waits on the kernel.** The rank, the pending asks and the
-tracks are fetched on their own task (`refresh.rs`) and folded into the
-app when the result lands; the event loop itself awaits no kernel call for
-a refresh, so a kernel busy with a coder turn cannot queue keys behind it.
-A key that asks the kernel for something (`:` verbs, a submit, a seat
-switch) still waits for that one answer.
+**A key never waits on the kernel.** The rank and the tracks are fetched
+on their own task (`refresh.rs`) and folded into the app when the result
+lands; the open asks arrive on the ledger watch. Every ask call runs on
+its own task: an ask key only records its work (`App::ask_work`), and the
+loop runs it and folds the result in when it lands — the card's record,
+an answer, the ledger view's rows, `Enter` on a ledger row. The event loop
+itself awaits no kernel call for any of these, so a kernel busy with a
+coder turn cannot queue keys behind it. A key that asks the kernel for
+something else (`:` verbs, a submit, a seat switch) still waits for that
+one answer.
 
 **Shared `bindings.toml`.** The TUI's bindings file is keyed by vim key
 notation (`<C-a>`, `<Esc>`, `<S-Tab>`), which `modalkit::key::TerminalKey`

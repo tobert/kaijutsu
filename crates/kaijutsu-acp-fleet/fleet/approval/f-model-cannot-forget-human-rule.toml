@@ -28,7 +28,7 @@ text = "make the forbidden directory"
 permissions = ["deny_always"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir forbidden"]
 text_contains = ["noted"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "done", status = "completed" }]
 
 [[prompt]]
 text = "forget the rule"

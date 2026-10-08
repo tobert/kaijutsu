@@ -109,14 +109,6 @@ const EVENT_BROADCAST_CAPACITY: usize = 256;
 /// Broadcast capacity for connection status events.
 const STATUS_BROADCAST_CAPACITY: usize = 16;
 
-/// Broadcast capacity for the approval-ledger change stream. The kernel
-/// already coalesces a burst to one notification per
-/// `context_feed::FEED_BATCH_WINDOW` (`kaijutsu-server`'s
-/// `subscribe_ledger_events`), and only the newest generation ever matters —
-/// so this only needs to be big enough that a momentarily-slow subscriber
-/// doesn't lag off a fast one; it is not a throughput budget the way
-/// `EVENT_BROADCAST_CAPACITY` is.
-const LEDGER_BROADCAST_CAPACITY: usize = 16;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Errors (public API)
@@ -547,6 +539,27 @@ enum RpcCommand {
         reply: oneshot::Sender<Result<Vec<crate::rpc::KjCommandInfo>, CallError>>,
     },
 
+    // ── Approval ledger ──────────────────────────────────────────────────
+    ListAsks {
+        filter: kaijutsu_types::AskFilter,
+        reply: oneshot::Sender<Result<crate::rpc::AskListing, CallError>>,
+    },
+    GetAsk {
+        request_id: String,
+        reply: oneshot::Sender<Result<Option<kaijutsu_types::AskDetail>, CallError>>,
+    },
+    DecideAsk {
+        request_id: String,
+        verdict: kaijutsu_types::AskVerdict,
+        remember: Option<kaijutsu_types::Remember>,
+        reply: oneshot::Sender<Result<crate::rpc::AskAnswer, CallError>>,
+    },
+    EscalateAsk {
+        request_id: String,
+        to: Option<kaijutsu_types::PrincipalId>,
+        reply: oneshot::Sender<Result<crate::rpc::AskAnswer, CallError>>,
+    },
+
     // ── Shell Variables ──────────────────────────────────────────────────
     GetShellVar {
         name: String,
@@ -827,6 +840,10 @@ impl RpcCommand {
             Self::ExecuteKj { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ExecuteKjQuiet { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetKjCommandCatalog { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::ListAsks { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::GetAsk { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::DecideAsk { reply, .. } => { let _ = reply.send(Err(err)); }
+            Self::EscalateAsk { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::GetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::SetShellVar { reply, .. } => { let _ = reply.send(Err(err)); }
             Self::ListShellVars { reply, .. } => { let _ = reply.send(Err(err)); }
@@ -910,9 +927,8 @@ pub struct ActorHandle {
     /// block-events forwarder this actor builds — including the ones a
     /// reconnect rebuilds — so installing once survives reconnects.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    /// The kernel-wide approval-ledger change stream — a `broadcast` fan-out
-    /// (see [`Self::subscribe_ledger_events`] for why).
-    ledger_tx: broadcast::Sender<i64>,
+    /// The open asks, kept current by the ledger push (see [`Self::ledger`]).
+    ledger_tx: watch::Sender<crate::ledger::LedgerState>,
     /// This client's model of the kernel's clock, fed by the liveness pinger
     /// (`docs/midi.md` "The one timebase"). Shared with the actor, so it
     /// survives reconnects to the same kernel.
@@ -949,7 +965,7 @@ impl ActorHandle {
         let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let (status_tx, _) = broadcast::channel(STATUS_BROADCAST_CAPACITY);
         let (_status_watch_tx, status_watch_rx) = watch::channel(ConnectionStatus::Idle);
-        let (ledger_tx, _) = broadcast::channel::<i64>(LEDGER_BROADCAST_CAPACITY);
+        let (ledger_tx, _) = watch::channel(crate::ledger::LedgerState::default());
         let handle = Self {
             tx,
             event_tx,
@@ -1013,22 +1029,11 @@ impl ActorHandle {
         self.event_tx.subscribe()
     }
 
-    /// Subscribe to the kernel-wide approval-ledger change stream — each
-    /// item is the ledger's generation after a change (`LedgerFlow::Changed`
-    /// bridged over `LedgerEvents::onChanged`, coalesced server-side).
-    ///
-    /// A broadcast: `onChanged` expects no answer, so any number of callers
-    /// can subscribe and each receives every notification independently.
-    /// Concretely, this is what lets the Bevy app show a ledger-dirty
-    /// indicator while an ACP adapter, in the same process or a different
-    /// one, separately decides whether to re-render a pending prompt —
-    /// neither has to coordinate with or steal from the other.
-    ///
-    /// Stays valid across reconnects: `connect_handshake` best-effort
-    /// re-subscribes on every successful (re)connect and forwards straight
-    /// into this same persistent sender, so a kernel restart doesn't
-    /// require a caller to notice and re-subscribe.
-    pub fn subscribe_ledger_events(&self) -> broadcast::Receiver<i64> {
+    /// The open asks, kept current across reconnects. Each (re)connect
+    /// lists the queue and subscribes from that listing's generation, and
+    /// every push is folded in (`crate::ledger`). Watch it and diff against
+    /// what a surface shows; nothing here polls.
+    pub fn ledger(&self) -> watch::Receiver<crate::ledger::LedgerState> {
         self.ledger_tx.subscribe()
     }
 
@@ -1567,6 +1572,38 @@ impl ActorHandle {
         context_id: ContextId,
     ) -> Result<Vec<crate::rpc::KjCommandInfo>, CallError> {
         self.send(|reply| RpcCommand::GetKjCommandCatalog { context_id, reply }).await
+    }
+
+    /// Asks matching `filter`, with the generation they were read at.
+    /// [`Self::ledger`] already holds the open asks; this is for history and
+    /// filtered views.
+    #[tracing::instrument(skip(self))]
+    pub async fn list_asks(&self, filter: kaijutsu_types::AskFilter) -> Result<crate::rpc::AskListing, CallError> {
+        self.send(|reply| RpcCommand::ListAsks { filter, reply }).await
+    }
+
+    /// One ask's full record, or `None` when no such ask exists.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_ask(&self, request_id: String) -> Result<Option<kaijutsu_types::AskDetail>, CallError> {
+        self.send(|reply| RpcCommand::GetAsk { request_id, reply }).await
+    }
+
+    /// Answer an ask as this connection's principal. Recorded in the ledger;
+    /// no block is authored. The inner `Err` is the ledger declining.
+    #[tracing::instrument(skip(self))]
+    pub async fn decide_ask(
+        &self,
+        request_id: String,
+        verdict: kaijutsu_types::AskVerdict,
+        remember: Option<kaijutsu_types::Remember>,
+    ) -> Result<crate::rpc::AskAnswer, CallError> {
+        self.send(|reply| RpcCommand::DecideAsk { request_id, verdict, remember, reply }).await
+    }
+
+    /// Reassign a pending ask; naming yourself takes it over.
+    #[tracing::instrument(skip(self))]
+    pub async fn escalate_ask(&self, request_id: String, to: Option<kaijutsu_types::PrincipalId>) -> Result<crate::rpc::AskAnswer, CallError> {
+        self.send(|reply| RpcCommand::EscalateAsk { request_id, to, reply }).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2236,13 +2273,10 @@ struct RpcActor {
     /// Rebuilding the forwarder on reconnect therefore never loses the
     /// installed sink.
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    /// Persistent sender behind `ActorHandle::subscribe_ledger_events`.
-    /// `connect_handshake` builds a fresh `LedgerEventsForwarder` around a
-    /// clone of this on every (re)connect — a `broadcast::Sender` clone can
-    /// be handed straight to the forwarder (the same shape `event_tx` uses
-    /// for `EditorEventsForwarder` et al.), no intermediate per-connect
-    /// channel + forwarding task needed.
-    ledger_tx: broadcast::Sender<i64>,
+    /// Persistent sender behind `ActorHandle::ledger`. `connect_handshake`
+    /// reseeds it and builds a fresh `LedgerEventsForwarder` around a clone
+    /// on every (re)connect.
+    ledger_tx: watch::Sender<crate::ledger::LedgerState>,
     /// Shared with `ActorHandle` and with the liveness pinger: this client's
     /// model of the kernel's clock. Reset only when the kernel ID changes —
     /// a restart of the same kernel keeps the same host clock.
@@ -2325,7 +2359,7 @@ impl RpcActor {
         status_watch_tx: watch::Sender<ConnectionStatus>,
         connection_epoch: Arc<AtomicU64>,
         midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-        ledger_tx: broadcast::Sender<i64>,
+        ledger_tx: watch::Sender<crate::ledger::LedgerState>,
         clock: crate::KernelClockHandle,
     ) -> Self {
         let (close_tx, close_rx) = mpsc::channel(1);
@@ -3209,7 +3243,7 @@ fn spawn_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    ledger_tx: broadcast::Sender<i64>,
+    ledger_tx: watch::Sender<crate::ledger::LedgerState>,
 ) -> JoinHandle<ConnectOutcome> {
     tokio::task::spawn_local(async move {
         connect_handshake(
@@ -3274,7 +3308,7 @@ async fn connect_handshake(
     peer_registration: Option<(PeerConfig, std::sync::mpsc::Sender<PeerInvocation>)>,
     vfs_activity_interval_ms: Option<u32>,
     midi_exchange: Arc<crate::midi_exchange::MidiExchangeSlot>,
-    ledger_tx: broadcast::Sender<i64>,
+    ledger_tx: watch::Sender<crate::ledger::LedgerState>,
 ) -> ConnectOutcome {
     // 1. SSH dial + auth + channel open (with per-phase deadline).
     let client = match tokio::time::timeout(SSH_DIAL_TIMEOUT, connect_ssh(config)).await {
@@ -3391,28 +3425,35 @@ async fn connect_handshake(
         }
     }
 
-    // 3.7. Re-subscribe to the kernel-wide approval-ledger change stream.
-    //      Unconditional on every (re)connect — no opt-in toggle to
-    //      persist. `onChanged` expects no answer, so the forwarder can
-    //      write straight into the persistent `ledger_tx`
-    //      clone with no intermediate per-connect channel or forwarding
-    //      task (the same shape `editor_fwd`/`vfs_activity_fwd` use with
-    //      the shared `event_tx` below). BEST-EFFORT — a hint channel
-    //      failing to (re)subscribe costs a subscriber a late poll, never a
-    //      wrong answer (the ledger itself stays authoritative), so this
+    // 3.7. Reseed the open asks and subscribe to the ledger push from the
+    //      generation the listing was read at, so nothing between the two
+    //      is lost. BEST-EFFORT: a failure leaves the state unsynced and
     //      must not abort an otherwise-healthy handshake.
     {
-        let ledger_client: crate::kaijutsu_capnp::ledger_events::Client =
-            capnp_rpc::new_client(LedgerEventsForwarder { tx: ledger_tx.clone() });
-        match tokio::time::timeout(
-            RPC_CALL_TIMEOUT,
-            kernel.subscribe_ledger_events(ledger_client),
-        )
-        .await
-        {
-            Ok(Ok(())) => log::info!("Re-subscribed ledger events on connect"),
-            Ok(Err(e)) => log::warn!("ledger events subscribe failed (non-fatal): {e}"),
-            Err(_) => log::warn!("ledger events subscribe timed out (non-fatal)"),
+        ledger_tx.send_modify(|state| state.synced = false);
+        match tokio::time::timeout(RPC_CALL_TIMEOUT, kernel.list_asks(&kaijutsu_types::AskFilter::default())).await {
+            Ok(Ok(listing)) => {
+                let generation = listing.generation;
+                ledger_tx.send_replace(crate::ledger::LedgerState::from_listing(generation, listing.asks));
+                let sink = ledger_tx.clone();
+                let ledger_client: crate::kaijutsu_capnp::ledger_events::Client =
+                    capnp_rpc::new_client(LedgerEventsForwarder {
+                        on_push: Box::new(move |push| sink.send_modify(|state| state.apply(&push))),
+                    });
+                match tokio::time::timeout(RPC_CALL_TIMEOUT, kernel.subscribe_ledger_events(ledger_client, generation)).await {
+                    Ok(Ok(())) => log::info!("Subscribed ledger push from generation {generation}"),
+                    Ok(Err(e)) => {
+                        log::warn!("ledger push subscribe failed (non-fatal): {e}");
+                        ledger_tx.send_modify(|state| state.synced = false);
+                    }
+                    Err(_) => {
+                        log::warn!("ledger push subscribe timed out (non-fatal)");
+                        ledger_tx.send_modify(|state| state.synced = false);
+                    }
+                }
+            }
+            Ok(Err(e)) => log::warn!("ledger listing failed (non-fatal): {e}"),
+            Err(_) => log::warn!("ledger listing timed out (non-fatal)"),
         }
     }
 
@@ -3812,6 +3853,18 @@ async fn dispatch_kernel_command(
                 k.execute_kj_quiet(context_id, &argv)
             );
         }
+        RpcCommand::ListAsks { filter, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.list_asks(&filter));
+        }
+        RpcCommand::GetAsk { request_id, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.get_ask(&request_id));
+        }
+        RpcCommand::DecideAsk { request_id, verdict, remember, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.decide_ask(&request_id, verdict, remember));
+        }
+        RpcCommand::EscalateAsk { request_id, to, reply } => {
+            dispatch!(kernel, reply, close_tx, k, k.escalate_ask(&request_id, to));
+        }
         RpcCommand::GetKjCommandCatalog { context_id, reply } => {
             dispatch!(kernel, reply, close_tx, k, k.get_kj_command_catalog(context_id));
         }
@@ -4183,9 +4236,9 @@ pub fn spawn_actor(
     // Created once, outside the reconnect loop, same as `event_tx`/
     // `status_tx` above: `connect_handshake` rebuilds the kernel-side
     // subscription on every (re)connect, but every receiver this sender
-    // ever hands out (via `ActorHandle::subscribe_ledger_events`) survives
+    // ever hands out (via `ActorHandle::ledger`) survives
     // a reconnect untouched.
-    let (ledger_tx, _) = broadcast::channel::<i64>(LEDGER_BROADCAST_CAPACITY);
+    let (ledger_tx, _) = watch::channel(crate::ledger::LedgerState::default());
 
     // One model, shared by the actor's pinger (which feeds it) and the handle
     // (which reads it). Outside the reconnect loop for the same reason as
@@ -4620,7 +4673,7 @@ mod tests {
         let (status_tx, _) = broadcast::channel(8);
         let (status_watch_tx, _) = watch::channel(ConnectionStatus::Idle);
         let connection_epoch = Arc::new(AtomicU64::new(0));
-        let (ledger_tx, _) = broadcast::channel(8);
+        let (ledger_tx, _) = watch::channel(crate::ledger::LedgerState::default());
         RpcActor::new(
             SshConfig::default(),
             None,

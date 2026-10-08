@@ -18,7 +18,7 @@ text = "write the greeting"
 permissions = ["allow_always"]
 permission_titles = ["NOTE: at ask time GREETING=\"hello\""]
 text_contains = ["applied to this ask only; no standing rule was remembered", "GREETING", "wrote the greeting"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "greeting.txt"

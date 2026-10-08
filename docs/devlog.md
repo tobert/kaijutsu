@@ -3303,3 +3303,37 @@ shows the complete error chain. Council tests cover type selection on both
 execution paths, and the rc test covers the chat stance and input loadout.
 
 Credits: Codex.
+
+## The ledger stops borrowing a context (October 8)
+
+A review of how asks flow found that every client needed a context to read
+a kernel-wide ledger, because `kj ledger` was the only door and `executeKj`
+takes a context. Each client picked differently: the TUI and the app used
+the displayed context, and ACP used any live session for reads and the
+ask's own context for answers, which wrote Amy's allow into the coder's
+conversation as a tool pair it never made. The context's `gate.toml` rules
+then applied to the human; moltar's 10-05 coder deny on `kj ledger` blocked
+Amy in a coder seat. Every bump cost a list plus one show per new ask, each
+in a fresh interpreter.
+
+Amy: "the ledger is more about accounting than enforcement ... trust +
+verify". Reviewer assignment, enforced in the ledger, is the boundary; the
+rest is a record. So clients now use typed RPCs with no context —
+`listAsks`, `getAsk`, `decideAsk`, `escalateAsk` — and an answer authors no
+block anywhere: "the ui should indicate but the transcript doesn't really
+need that using up tokens." The push carries the changed asks themselves.
+The generation triggers also stamp each ask in `approval_changes` with the
+generation they produced, in one trigger body, so a subscriber that has seen
+generation `g` reads every later change and coalescing loses nothing. The
+actor lists on connect, subscribes from that generation, and keeps a watch
+of the open asks that each surface diffs. `kj ledger list|show` read through
+the same `ledger_view`, so the shell and the wire agree.
+
+Taking an ask over stays two acts: the lineage root reassigns it to herself,
+then answers. The `escalated` event now records the reviewer before and
+after as columns rather than prose, and `kj ledger show` lists each move.
+
+The same review retired `shellDryRun`. The Claude Code hook had forwarded
+every Bash call into a dry-run PreCall that recorded an abandoned ask; on
+zorak those were a third of all asks and still arriving, each one a bump
+that clients polled on. The broker's evaluator only enforces now.

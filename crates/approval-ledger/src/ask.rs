@@ -687,7 +687,8 @@ pub fn list_signals(conn: &Connection, request_id: &str) -> Result<Vec<SignalRow
 /// claims, decisions, and every rejected late attempt, oldest first.
 pub fn list_events(conn: &Connection, request_id: &str) -> Result<Vec<EventRow>> {
     let mut stmt = conn.prepare(
-        "SELECT seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at
+        "SELECT seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at,
+                from_reviewer, to_reviewer
          FROM approval_events WHERE request_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt
@@ -702,6 +703,8 @@ pub fn list_events(conn: &Connection, request_id: &str) -> Result<Vec<EventRow>>
                 auto_reason: row.get(5)?,
                 note: row.get(6)?,
                 created_at: row.get(7)?,
+                from_reviewer: row.get(8)?,
+                to_reviewer: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

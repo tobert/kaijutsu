@@ -12,6 +12,7 @@ pub mod document_store;
 pub mod kernel_clock;
 pub mod key_select;
 pub mod ledger;
+mod ledger_wire;
 pub mod midi_exchange;
 pub mod rank;
 pub mod rpc;
@@ -30,7 +31,7 @@ pub use actor::{
     UnansweredCommands, spawn_actor,
 };
 pub use rpc::{
-    AuthorBlock, Completion, CompletionKind, ContextCluster, ContextInfo, ContextMcpRefusal,
+    AskAnswer, AskListing, AuthorBlock, Completion, CompletionKind, ContextCluster, ContextInfo, ContextMcpRefusal,
     ContextMcpServerDecl, ContextMembership,
     EditorState, FileAttr, HistoryEntry, Identity, InputState, KernelConfig, KernelHandle, KernelInfo,
     LlmConfigInfo, LlmProviderInfo, McpResource, MountSpec, PeerInfo, PresetInfo,
@@ -44,10 +45,7 @@ pub use context_feed::{
 };
 pub use context_create::{CreateContextError, CreatedContext, ParentChoice, ParentSource, choose_parent, context_create_argv, context_id_from_create_result};
 pub use document_store::{DocumentEntry, DocumentStore, FeedSignal};
-pub use ledger::{
-    AskDetail, AskInfo, EnvVar, LedgerError, PendingAsk, PendingAskPoll, RememberScope, decide_ask,
-    decide_ask_remember, list_history, list_pending, poll_new_asks, show_ask, show_ask_detail,
-};
+pub use ledger::{LedgerPush, LedgerState};
 pub use ask_arming::{ASK_ARM_DELAY, ASK_ARM_TYPING_HOLD, AskArming};
 pub use kernel_clock::{KernelClockHandle, local_epoch_ns};
 pub use key_select::{KeySelectError, resolve_key_source};

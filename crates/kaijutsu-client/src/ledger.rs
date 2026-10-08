@@ -1,728 +1,92 @@
-//! The approval ledger round trip: list pending asks, read one ask's
-//! fields, and write back an allow/deny decision — the machinery every
-//! client that offers asks to a player drives the same way.
+//! The approval ledger as a client sees it: the open asks, kept current by
+//! the kernel's push, and the typed calls that read and answer it.
 //!
-//! This is not a bespoke wire: there is no `PermissionEvents::onAsk`
-//! (see `docs/gate-resume.md`). The ledger is the one durable record and
-//! `kj ledger` is the one write path, from any surface. This module drives
-//! that path through [`ActorHandle::execute_kj`] and
-//! [`ActorHandle::execute_kj_quiet`]; it opens no bespoke connection and
-//! holds no state beyond the `seen` set a caller passes in.
+//! The ledger is kernel-wide, so nothing here takes a context. On every
+//! (re)connect the actor lists the queue, subscribes from the generation
+//! that listing was read at, and applies each push to one [`LedgerState`].
+//! A surface watches that state ([`crate::ActorHandle::ledger`]) and diffs
+//! it against what it shows: an ask that appears is offered, and an ask
+//! that leaves was answered, cancelled, or expired, from any surface.
 //!
-//! # The kernel is the authority, and nothing expires
-//!
-//! There is no ask-timeout budget owned here, and there is no kernel-side
-//! one either: the gate records an ask and returns, and an unanswered ask
-//! stays answerable indefinitely (`docs/gate-resume.md`). Bounding an
-//! outgoing round trip to a *player* (a client waiting on a human) is each
-//! caller's own concern, not this module's.
-//!
-//! # Reads are quiet; the decision is not
-//!
-//! `kj ledger list` and `show` run through
-//! [`ActorHandle::execute_kj_quiet`] and author no blocks — this is the
-//! client's own bookkeeping, not a player's command, and polling it on a
-//! timer must not fill the transcript. [`decide_ask`] and
-//! [`decide_ask_remember`] run through [`ActorHandle::execute_kj`] instead:
-//! an allow/deny is a real decision and leaves a tool-call/tool-result pair
-//! in the answering context. Drive [`poll_new_asks`] from
-//! `ActorHandle::subscribe_ledger_events` (one poll per generation bump) plus
-//! one poll at startup, never from a clock.
-//!
-//! # Racing is fine and expected
-//!
-//! A human can answer the same ask with `kj ledger allow` from a shell while
-//! another surface's prompt is still on someone's screen — the ledger's
-//! `claim`+`decide` transaction makes exactly one answerer win
-//! (`approval-ledger`'s guarantee 5). The loser's [`decide_ask`] comes back
-//! with a nonzero exit code (`AlreadyDecided`); this is not a failure, it is
-//! two players sharing one ledger, and it is the caller's call whether to
-//! log it.
+//! Answers go through [`crate::ActorHandle::decide_ask`]. The ledger is the
+//! record; an answer authors no block in any transcript. Two players may
+//! answer the same ask; the ledger's claim makes exactly one win, and the
+//! other gets [`kaijutsu_types::AskAnswerFailureKind::AlreadyAnswered`].
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
-use kaijutsu_types::{BlockId, ContextId, PrincipalId};
+use kaijutsu_types::AskSummary;
 
-use crate::actor::{ActorHandle, CallError};
-use crate::rpc::KjExecutionResult;
-
-/// One pending ask's `kj ledger show` fields, decoded once so callers don't
-/// hand around a raw `serde_json::Value`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AskInfo {
-    pub context_id: ContextId,
-    pub description: String,
+/// One push from the kernel: every ask that changed after the subscriber's
+/// cursor, each in its current state, and the generation they bring it to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerPush {
+    pub generation: i64,
+    pub asks: Vec<AskSummary>,
 }
 
-/// One ask [`poll_new_asks`] has not offered to the caller before: its
-/// request id plus the fields [`show_ask`] decoded for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingAsk {
-    pub request_id: String,
-    pub info: AskInfo,
+/// The open asks, keyed by request id, and the ledger generation they
+/// reflect. `synced` is false until the first listing after a connect has
+/// landed; until then `open` may be empty because nothing was read yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerState {
+    pub generation: i64,
+    pub open: BTreeMap<String, AskSummary>,
+    pub synced: bool,
 }
 
-/// One authoritative pending-ledger snapshot plus asks not yet presented by
-/// this client. `pending_ids` is not presentation state: callers use it to
-/// retain indicators for asks that are still waiting behind another card.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingAskPoll {
-    pub pending_ids: HashSet<String>,
-    pub new_asks: Vec<PendingAsk>,
-}
+impl LedgerState {
+    /// The state a listing of the queue describes.
+    pub fn from_listing(generation: i64, asks: Vec<AskSummary>) -> Self {
+        let open = asks.into_iter().filter(|ask| ask.status.is_open())
+            .map(|ask| (ask.request_id.clone(), ask)).collect();
+        Self { generation, open, synced: true }
+    }
 
-/// Failure decoding a `kj ledger` round trip: either the RPC call itself
-/// failed, or it ran and the verb reported a nonzero exit.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum LedgerError {
-    #[error(transparent)]
-    Call(#[from] CallError),
-    #[error("kj ledger {verb} exited {exit_code}: {stderr}")]
-    Failed {
-        verb: &'static str,
-        exit_code: i32,
-        stderr: String,
-    },
-    #[error("kj ledger {verb} returned malformed data: {detail}")]
-    Malformed { verb: &'static str, detail: String },
-}
-
-/// List every pending ask's request id, via `kj ledger list` run in `ctx`
-/// (the ledger is kernel-wide state, so which live context the command runs
-/// in doesn't matter).
-pub async fn list_pending(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<String>, LedgerError> {
-    list_ids(actor, ctx, pending_list_args()).await
-}
-
-fn pending_list_args() -> Vec<String> {
-    vec!["--limit".to_string(), u32::MAX.to_string()]
-}
-
-/// Read one ask's context id and description via `kj ledger show`. `None`
-/// on any failure to run or parse — a caller should treat that as "try
-/// again next poll", not as a decision (see [`poll_new_asks`]).
-pub async fn show_ask(actor: &ActorHandle, ctx: ContextId, request_id: &str) -> Option<AskInfo> {
-    let result = match actor
-        .execute_kj_quiet(
-            ctx,
-            vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(request = %request_id, error = %e, "kj ledger show errored");
-            return None;
+    /// Fold one push in: an open ask is added or replaced, a closed one is
+    /// removed. A push older than the state is ignored whole.
+    pub fn apply(&mut self, push: &LedgerPush) {
+        if push.generation < self.generation {
+            return;
         }
-    };
-    if result.exit_code != 0 {
-        tracing::warn!(
-            request = %request_id,
-            exit_code = result.exit_code,
-            stderr = %result.stderr,
-            "kj ledger show failed"
-        );
-        return None;
-    }
-    let data = result.data?;
-    let context_id = match data
-        .get("context_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| ContextId::parse(s).ok())
-    {
-        Some(id) => id,
-        None => {
-            tracing::warn!(request = %request_id, "ledger ask has no parseable context_id; skipping");
-            return None;
+        for ask in &push.asks {
+            if ask.status.is_open() {
+                self.open.insert(ask.request_id.clone(), ask.clone());
+            } else {
+                self.open.remove(&ask.request_id);
+            }
         }
-    };
-    let description = data
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_default();
-    Some(AskInfo {
-        context_id,
-        description,
-    })
-}
-
-/// Write an allow/deny decision back through `kj ledger allow|deny`. Only
-/// the RPC round trip can fail here — a nonzero exit (a race lost to
-/// another answerer, or an expired ask) comes back as `Ok` with that exit
-/// code in [`KjExecutionResult`], for the caller to log or ignore as it
-/// sees fit (see module docs, "Racing is fine").
-pub async fn decide_ask(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    request_id: &str,
-    allow: bool,
-) -> Result<KjExecutionResult, CallError> {
-    let verb = if allow { "allow" } else { "deny" };
-    actor
-        .execute_kj(
-            ctx,
-            vec!["ledger".to_string(), verb.to_string(), request_id.to_string()],
-        )
-        .await
-}
-
-/// Prune `seen` down to the ids still pending, and return the pending ids
-/// not yet in `seen`, in list order. Pure and unit-testable without a
-/// kernel — the one decision in [`poll_new_asks`] that isn't an RPC round
-/// trip.
-fn diff_new(ids: &[String], seen: &HashSet<String>) -> Vec<String> {
-    ids.iter().filter(|id| !seen.contains(id.as_str())).cloned().collect()
-}
-
-/// One poll of the ledger: list pending asks and read the fields of every ask
-/// not yet in `seen`. The returned snapshot lets callers prune presentation
-/// state without mistaking it for the ledger's pending set.
-///
-/// This does **not** insert into `seen` — that is the caller's job, once it
-/// has decided which of the returned asks it will actually offer (e.g.
-/// filtering by whether it owns the ask's context). An ask this call
-/// returns but the caller declines to answer must stay out of `seen`, so it
-/// is offered again if ownership changes on a later poll.
-///
-/// An ask whose `kj ledger show` fails is left out of both `seen` and the
-/// returned list — a transient read failure retries next poll rather than
-/// permanently suppressing the ask.
-pub async fn poll_new_asks(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    seen: &HashSet<String>,
-) -> Result<PendingAskPoll, LedgerError> {
-    let ids = list_pending(actor, ctx).await?;
-    let new_ids = diff_new(&ids, seen);
-
-    let mut new_asks = Vec::with_capacity(new_ids.len());
-    for id in new_ids {
-        if let Some(info) = show_ask(actor, ctx, &id).await {
-            new_asks.push(PendingAsk { request_id: id, info });
-        }
-    }
-    Ok(PendingAskPoll { pending_ids: ids.into_iter().collect(), new_asks })
-}
-
-/// List every asks id in the decided history (`kj ledger list --history`):
-/// allowed, denied, expired, abandoned, most recently created first. The
-/// TUI's ledger view ANSWERED section (`docs/tui.md`, "The ledger") reads
-/// this the same way [`list_pending`] feeds PENDING.
-pub async fn list_history(actor: &ActorHandle, ctx: ContextId) -> Result<Vec<String>, LedgerError> {
-    list_ids(actor, ctx, vec!["--history".to_string()]).await
-}
-
-/// Shared body of [`list_pending`] and [`list_history`]: run `kj ledger
-/// list` with `extra_args` appended, and decode `.data`'s flat array of
-/// request-id strings.
-async fn list_ids(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    extra_args: Vec<String>,
-) -> Result<Vec<String>, LedgerError> {
-    let mut argv = vec!["ledger".to_string(), "list".to_string()];
-    argv.extend(extra_args);
-    let result = actor.execute_kj_quiet(ctx, argv).await?;
-    if result.exit_code != 0 {
-        return Err(LedgerError::Failed {
-            verb: "list",
-            exit_code: result.exit_code,
-            stderr: result.stderr,
-        });
-    }
-    decode_list_ids(result.data)
-}
-
-fn decode_list_ids(data: Option<serde_json::Value>) -> Result<Vec<String>, LedgerError> {
-    let items = match data {
-        Some(serde_json::Value::Array(items)) => items,
-        Some(_) => {
-            return Err(LedgerError::Malformed {
-                verb: "list",
-                detail: "expected an array of request ids".to_string(),
-            });
-        }
-        None => {
-            return Err(LedgerError::Malformed {
-                verb: "list",
-                detail: "missing data".to_string(),
-            });
-        }
-    };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value.as_str().map(str::to_string).ok_or_else(|| LedgerError::Malformed {
-                verb: "list",
-                detail: format!("request id at index {index} is not a string"),
-            })
-        })
-        .collect()
-}
-
-/// One free variable's recorded value on an ask (`approval_env`), as `kj
-/// ledger show`'s `.data.env` carries it: a row exists for every free
-/// variable name the ask's statements read, `value: None` meaning it was
-/// unset at ask time (not "no snapshot taken").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnvVar {
-    pub name: String,
-    pub value: Option<String>,
-}
-
-/// Ask identity, decision, execution inputs, and publication disposition
-/// decoded from `kj ledger show`'s structured data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AskDetail {
-    pub request_id: String,
-    pub context_id: Option<ContextId>,
-    /// The authenticated principal that submitted the request. This is
-    /// distinct from the actor that performed the work: a person can direct
-    /// a coder character, or a lead character can direct another character.
-    pub principal_id: Option<PrincipalId>,
-    /// The current name for [`Self::principal_id`], if its character sheet
-    /// still exists.
-    pub principal_name: Option<String>,
-    /// The character that performed the work which raised this ask.
-    pub actor_id: Option<PrincipalId>,
-    /// The current name for [`Self::actor_id`].
-    pub actor_name: Option<String>,
-    /// The character the delegation names as the eligible reviewer.
-    pub reviewer_id: Option<PrincipalId>,
-    /// The current name for [`Self::reviewer_id`].
-    pub reviewer_name: Option<String>,
-    pub status: String,
-    pub origin: String,
-    /// Ledger `tool` column, e.g. `"shell_write"` — the figure in
-    /// `docs/tui.md`'s Asks section calls this the ask's "hook", but the
-    /// wire field it reads is `tool`, not `hook_id` (`hook_id` is the rc
-    /// hook, when one raised the ask, and is often empty for a shell gate).
-    pub tool: Option<String>,
-    pub hook_id: Option<String>,
-    pub instance: Option<String>,
-    /// The model's ToolCall block whose invocation raised this ask, recorded
-    /// with the ask. `None` for an ask no model call raised, such as one
-    /// from a person's shell.
-    pub tool_call_block_id: Option<BlockId>,
-    pub description: String,
-    pub authorized_label: Option<String>,
-    pub statements: Vec<String>,
-    pub exec_source: Option<String>,
-    pub cwd: Option<String>,
-    pub env: Vec<EnvVar>,
-    /// When the ask was raised, unix-epoch milliseconds.
-    pub created_at: Option<i64>,
-    /// When it was decided, unix-epoch milliseconds; `None` while pending.
-    pub decided_at: Option<i64>,
-    /// Who decided it; `None` while pending or when a rule auto-decided it.
-    pub decided_by: Option<PrincipalId>,
-    /// The current name for [`Self::decided_by`].
-    pub decided_by_name: Option<String>,
-    /// `allow_once` / `allow_always` / `deny` / `auto_allow`; `None` while
-    /// pending. Finer than `status`, which says only `allowed`/`denied`.
-    pub decided_option: Option<String>,
-    pub remember_scope: Option<String>,
-    /// When this answer was consumed, or `None` while pending or unspent.
-    /// Consumption can deliver a refusal or retire an unpublished invocation;
-    /// it does not prove that source executed.
-    pub redeemed_at: Option<i64>,
-    /// Why the caller retired this invocation before publishing its Waiting result.
-    pub publication_abandoned: Option<String>,
-}
-
-impl AskDetail {
-    /// Whether `principal` is the reviewer this ask snapshots. An ask
-    /// whose reviewer IS its actor is a self-confirmation, which that
-    /// actor alone may answer, so being the reviewer is the whole test:
-    /// every other ask names a reviewer distinct from its performer, and
-    /// the performer therefore fails it. Legacy or incomplete rows — one
-    /// of the two identities missing — carry no review authority. The
-    /// kernel remains authoritative if the assignment changes while a
-    /// control is on screen.
-    pub fn can_review(&self, principal: PrincipalId) -> bool {
-        matches!(
-            (self.actor_id, self.reviewer_id),
-            (Some(_), Some(reviewer)) if principal == reviewer
-        )
-    }
-}
-
-/// Read one ask's full detail via `kj ledger show`. `Ok(None)` when the
-/// round trip succeeded but `.data` did not decode — a caller should treat
-/// that as "nothing to show", not as a decision, the same discipline
-/// [`show_ask`] applies to its own decode failures.
-pub async fn show_ask_detail(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    request_id: &str,
-) -> Result<Option<AskDetail>, LedgerError> {
-    let result = actor
-        .execute_kj_quiet(
-            ctx,
-            vec!["ledger".to_string(), "show".to_string(), request_id.to_string()],
-        )
-        .await?;
-    if result.exit_code != 0 {
-        return Err(LedgerError::Failed {
-            verb: "show",
-            exit_code: result.exit_code,
-            stderr: result.stderr,
-        });
-    }
-    let Some(data) = result.data else {
-        tracing::warn!(request = %request_id, "kj ledger show returned no data");
-        return Ok(None);
-    };
-    Ok(decode_ask_detail(&data))
-}
-
-fn decode_ask_detail(data: &serde_json::Value) -> Option<AskDetail> {
-    let request_id = data.get("request_id")?.as_str()?.to_string();
-    let str_field = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    let statements = data
-        .get("statements")
-        .and_then(|v| v.as_array())
-        .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    let env = data
-        .get("env")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let name = item.get("name")?.as_str()?.to_string();
-                    let value = item.get("value").and_then(|v| v.as_str()).map(str::to_string);
-                    Some(EnvVar { name, value })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(AskDetail {
-        request_id,
-        context_id: data
-            .get("context_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| ContextId::parse(s).ok()),
-        principal_id: str_field("principal_id").and_then(|s| PrincipalId::parse(&s).ok()),
-        principal_name: str_field("principal_name"),
-        actor_id: str_field("actor_id").and_then(|s| PrincipalId::parse(&s).ok()),
-        actor_name: str_field("actor_name"),
-        reviewer_id: str_field("reviewer_id").and_then(|s| PrincipalId::parse(&s).ok()),
-        reviewer_name: str_field("reviewer_name"),
-        status: str_field("status").unwrap_or_default(),
-        origin: str_field("origin").unwrap_or_default(),
-        tool: str_field("tool"),
-        hook_id: str_field("hook_id"),
-        instance: str_field("instance"),
-        tool_call_block_id: str_field("tool_call_block_id").and_then(|key| BlockId::from_key(&key)),
-        description: str_field("description").unwrap_or_default(),
-        authorized_label: str_field("authorized_label"),
-        statements,
-        exec_source: str_field("exec_source"),
-        cwd: str_field("cwd"),
-        env,
-        created_at: data.get("created_at").and_then(|v| v.as_i64()),
-        decided_at: data.get("decided_at").and_then(|v| v.as_i64()),
-        decided_by: str_field("decided_by").and_then(|s| PrincipalId::parse(&s).ok()),
-        decided_by_name: str_field("decided_by_name"),
-        decided_option: str_field("decided_option"),
-        remember_scope: str_field("remember_scope"),
-        redeemed_at: data.get("redeemed_at").and_then(|v| v.as_i64()),
-        publication_abandoned: str_field("publication_abandoned"),
-    })
-}
-
-/// `--remember <scope>` on `kj ledger allow|deny`. `Session` covers the
-/// original ask; `Always` creates a global remembered rule for matching
-/// statements and labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RememberScope {
-    Session,
-    Always,
-}
-
-impl RememberScope {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Session => "session",
-            Self::Always => "always",
-        }
-    }
-}
-
-/// The argv `kj ledger allow|deny <id> [--remember <scope>]` builds. Pure,
-/// so the once/always/deny mapping the ledger view's `a`/`A`/`d` keys drive
-/// is unit-tested without a kernel.
-fn decide_argv(request_id: &str, allow: bool, remember: Option<RememberScope>) -> Vec<String> {
-    let mut argv = vec![
-        "ledger".to_string(),
-        if allow { "allow" } else { "deny" }.to_string(),
-        request_id.to_string(),
-    ];
-    if let Some(scope) = remember {
-        argv.push("--remember".to_string());
-        argv.push(scope.as_str().to_string());
-    }
-    argv
-}
-
-/// Write an allow/deny decision back through `kj ledger allow|deny`, same
-/// contract as [`decide_ask`] (only the RPC round trip can fail here — a
-/// nonzero exit is a race or an expired ask, not a [`CallError`]), with the
-/// `--remember` option [`decide_ask`] does not carry — the ledger view's
-/// `[A]llow always` key (`docs/tui.md`, "Asks").
-pub async fn decide_ask_remember(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    request_id: &str,
-    allow: bool,
-    remember: Option<RememberScope>,
-) -> Result<KjExecutionResult, CallError> {
-    actor.execute_kj(ctx, decide_argv(request_id, allow, remember)).await
-}
-
-/// The argv `kj ledger deny <id> --cancelled` builds.
-fn cancelled_argv(request_id: &str) -> Vec<String> {
-    vec!["ledger".to_string(), "deny".to_string(), request_id.to_string(), "--cancelled".to_string()]
-}
-
-/// Deny an ask because the reviewer's prompt was cancelled rather than
-/// answered, through `kj ledger deny <id> --cancelled`. The ledger records the
-/// decided option `prompt_cancelled`. Same contract as [`decide_ask`]: a
-/// nonzero exit is a race or a refusal, not a [`CallError`].
-pub async fn deny_cancelled_ask(
-    actor: &ActorHandle,
-    ctx: ContextId,
-    request_id: &str,
-) -> Result<KjExecutionResult, CallError> {
-    actor.execute_kj(ctx, cancelled_argv(request_id)).await
-}
-
-#[cfg(test)]
-mod detail_tests {
-    use super::*;
-
-    #[test]
-    fn decide_argv_allow_once_carries_no_remember_flag() {
-        assert_eq!(
-            decide_argv("req-1", true, None),
-            vec!["ledger", "allow", "req-1"]
-        );
-    }
-
-    #[test]
-    fn decide_argv_deny_carries_no_remember_flag() {
-        assert_eq!(decide_argv("req-1", false, None), vec!["ledger", "deny", "req-1"]);
-    }
-
-    #[test]
-    fn decide_argv_allow_always_appends_remember_always() {
-        assert_eq!(
-            decide_argv("req-1", true, Some(RememberScope::Always)),
-            vec!["ledger", "allow", "req-1", "--remember", "always"]
-        );
-    }
-
-    /// The full shape `ledger_show` actually emits
-    /// (`kaijutsu-kernel/src/kj/ledger.rs`, `ledger_show`'s `data =
-    /// serde_json::json!({...})`), so a wire-shape drift there fails this
-    /// test rather than surfacing as a client that silently shows nothing.
-    fn full_show_data() -> serde_json::Value {
-        serde_json::json!({
-            "request_id": "01a04eb6-aaaa-bbbb-cccc-000000000001",
-            "context_id": "0198f2b0-0000-7000-8000-000000000001",
-            "principal_id": "0198f2b0-0000-7000-8000-000000000002",
-            "principal_name": "amy",
-            "actor_id": "0198f2b0-0000-7000-8000-000000000004",
-            "actor_name": "coder",
-            "reviewer_id": "0198f2b0-0000-7000-8000-000000000003",
-            "reviewer_name": "amy",
-            "created_at": 1_756_819_300_000i64,
-            "decided_at": 1_756_819_330_000i64,
-            "decided_by": "0198f2b0-0000-7000-8000-000000000003",
-            "decided_by_name": "amy",
-            "decided_option": "allow_once",
-            "remember_scope": null,
-            "redeemed_at": 1_756_819_331_000i64,
-            "status": "allowed",
-            "origin": "shell_gate",
-            "instance": "kaish-1",
-            "tool": "shell_write",
-            "hook_id": null,
-            "tool_call_block_id": kaijutsu_types::BlockId::new(
-                ContextId::parse("0198f2b0-0000-7000-8000-000000000001").unwrap(),
-                PrincipalId::parse("0198f2b0-0000-7000-8000-000000000004").unwrap(),
-                7,
-            ).to_key(),
-            "description": "rm -rf ~/src/wt/kaish-arith",
-            "authorized_label": "worktree-remove",
-            "statements": ["rm -rf ~/src/wt/kaish-arith"],
-            "exec_source": "kaish",
-            "cwd": "/home/amy/src/wt/kaish-arith",
-            "env": [{"name": "TARGET", "value": "kaish-arith"}, {"name": "FORCE", "value": null}],
-        })
-    }
-
-    #[test]
-    fn publication_abandonment_preserves_the_reviewers_decision() {
-        let mut data = full_show_data();
-        data["publication_abandoned"] = "Caller stopped. Source did not run.".into();
-        let detail = decode_ask_detail(&data).unwrap();
-        assert_eq!(detail.status, "allowed");
-        assert_eq!(detail.decided_option.as_deref(), Some("allow_once"));
-        assert!(detail.redeemed_at.is_some());
-        assert_eq!(detail.publication_abandoned.as_deref(), Some("Caller stopped. Source did not run."));
-        data.as_object_mut().unwrap().remove("publication_abandoned");
-        assert!(decode_ask_detail(&data).unwrap().publication_abandoned.is_none());
-        data["publication_abandoned"] = serde_json::Value::Null;
-        assert!(decode_ask_detail(&data).unwrap().publication_abandoned.is_none());
-    }
-
-    #[test]
-    fn decode_ask_detail_reads_every_field() {
-        let detail = decode_ask_detail(&full_show_data()).expect("decodes");
-        assert_eq!(detail.request_id, "01a04eb6-aaaa-bbbb-cccc-000000000001");
-        assert!(detail.context_id.is_some());
-        assert_eq!(detail.principal_name.as_deref(), Some("amy"));
-        assert_eq!(detail.actor_name.as_deref(), Some("coder"));
-        assert_eq!(detail.reviewer_name.as_deref(), Some("amy"));
-        assert_eq!(detail.status, "allowed");
-        assert_eq!(detail.origin, "shell_gate");
-        assert_eq!(detail.tool.as_deref(), Some("shell_write"));
-        assert_eq!(detail.hook_id, None);
-        let call = detail.tool_call_block_id.expect("the fixture names its tool call");
-        assert_eq!((call.context_id, call.principal_id, call.seq), (detail.context_id.unwrap(), detail.actor_id.unwrap(), 7));
-        assert_eq!(detail.description, "rm -rf ~/src/wt/kaish-arith");
-        assert_eq!(detail.statements, vec!["rm -rf ~/src/wt/kaish-arith".to_string()]);
-        assert_eq!(detail.exec_source.as_deref(), Some("kaish"));
-        assert_eq!(detail.cwd.as_deref(), Some("/home/amy/src/wt/kaish-arith"));
-        assert_eq!(detail.redeemed_at, Some(1_756_819_331_000));
-        assert_eq!(detail.created_at, Some(1_756_819_300_000));
-        assert_eq!(detail.decided_at, Some(1_756_819_330_000));
-        assert_eq!(
-            detail.decided_by.map(|p| p.to_string()).as_deref(),
-            Some("0198f2b0-0000-7000-8000-000000000003")
-        );
-        assert_eq!(detail.decided_option.as_deref(), Some("allow_once"));
-        assert_eq!(detail.decided_by_name.as_deref(), Some("amy"));
-        assert_eq!(detail.remember_scope, None);
-        assert_eq!(
-            detail.env,
-            vec![
-                EnvVar { name: "TARGET".to_string(), value: Some("kaish-arith".to_string()) },
-                EnvVar { name: "FORCE".to_string(), value: None },
-            ]
-        );
-    }
-
-    #[test]
-    fn ask_review_requires_complete_distinct_identity_assignment() {
-        let detail = decode_ask_detail(&full_show_data()).expect("decodes");
-        let actor = detail.actor_id.expect("fixture actor");
-        let reviewer = detail.reviewer_id.expect("fixture reviewer");
-        assert!(detail.can_review(reviewer));
-        assert!(!detail.can_review(actor));
-        assert!(!detail.can_review(PrincipalId::new()), "an unknown principal cannot review");
-
-        let mut missing_actor = detail.clone();
-        missing_actor.actor_id = None;
-        assert!(!missing_actor.can_review(reviewer), "missing actor is unresolved identity");
-
-        let mut missing_reviewer = detail.clone();
-        missing_reviewer.reviewer_id = None;
-        assert!(!missing_reviewer.can_review(reviewer), "missing reviewer is unresolved identity");
-
-        // A self-confirmation: reviewer and actor are the same character,
-        // and the controls belong to that character
-        // (`docs/approval-identity.md`).
-        let mut self_confirmation = detail;
-        self_confirmation.reviewer_id = Some(actor);
-        assert!(
-            self_confirmation.can_review(actor),
-            "an ask whose reviewer is its own actor shows its controls to that actor",
-        );
-        assert!(!self_confirmation.can_review(reviewer), "and to nobody else");
-    }
-
-    #[test]
-    fn decode_ask_detail_rejects_a_value_with_no_request_id() {
-        assert!(decode_ask_detail(&serde_json::json!({ "status": "pending" })).is_none());
-    }
-
-    #[test]
-    fn decode_ask_detail_tolerates_missing_optional_fields() {
-        let detail = decode_ask_detail(&serde_json::json!({ "request_id": "r1" })).expect("decodes");
-        assert_eq!(detail.request_id, "r1");
-        assert_eq!(detail.context_id, None);
-        assert_eq!(detail.status, "");
-        assert!(detail.statements.is_empty());
-        assert!(detail.env.is_empty());
-        assert_eq!(detail.redeemed_at, None);
-        assert_eq!(detail.tool_call_block_id, None);
-    }
-
-    #[test]
-    fn a_cancelled_prompt_denies_by_name() {
-        assert_eq!(cancelled_argv("req-1"), vec!["ledger", "deny", "req-1", "--cancelled"]);
+        self.generation = push.generation;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use kaijutsu_types::{AskOrigin, AskStatus};
+
     use super::*;
 
-    #[test]
-    fn pending_list_requests_every_row_explicitly() {
-        assert_eq!(pending_list_args(), vec!["--limit".to_string(), u32::MAX.to_string()]);
-    }
-
-    #[test]
-    fn decode_list_ids_keeps_more_than_the_default_page() {
-        let ids: Vec<String> = (0..25).map(|i| format!("request-{i}")).collect();
-        let data = serde_json::Value::Array(
-            ids.iter().cloned().map(serde_json::Value::String).collect(),
-        );
-
-        assert_eq!(decode_list_ids(Some(data)).expect("valid list"), ids);
-    }
-
-    #[test]
-    fn decode_list_ids_rejects_missing_or_malformed_data() {
-        for data in [
-            None,
-            Some(serde_json::json!({ "request_id": "request-1" })),
-            Some(serde_json::json!(["request-1", 42])),
-        ] {
-            assert!(matches!(decode_list_ids(data), Err(LedgerError::Malformed { .. })));
+    fn ask(id: &str, status: AskStatus) -> AskSummary {
+        AskSummary {
+            request_id: id.into(), status, origin: AskOrigin::ShellGate, context_id: None,
+            description: String::new(), statements: Vec::new(), requester: None, performer: None,
+            reviewer: None, created_at_ms: 0, decided_at_ms: None,
         }
     }
 
     #[test]
-    fn diff_new_reports_ids_not_yet_seen() {
-        let mut seen = HashSet::new();
-        seen.insert("a".to_string());
-        let ids = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(diff_new(&ids, &seen), vec!["b".to_string()]);
+    fn a_push_adds_open_asks_and_removes_closed_ones() {
+        let mut state = LedgerState::from_listing(5, vec![ask("a", AskStatus::Pending)]);
+        state.apply(&LedgerPush { generation: 7, asks: vec![ask("a", AskStatus::Allowed), ask("b", AskStatus::Pending)] });
+        assert_eq!(state.open.keys().collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(state.generation, 7);
     }
 
     #[test]
-    fn diff_new_leaves_presentation_state_unchanged() {
-        let mut seen = HashSet::new();
-        seen.insert("answered".to_string());
-        seen.insert("still-pending".to_string());
-        let ids = vec!["still-pending".to_string()];
-
-        assert_eq!(diff_new(&ids, &seen), Vec::<String>::new());
-        assert_eq!(seen, HashSet::from(["answered".to_string(), "still-pending".to_string()]));
-    }
-
-    #[test]
-    fn diff_new_with_nothing_seen_returns_everything() {
-        let seen = HashSet::new();
-        let ids = vec!["x".to_string(), "y".to_string()];
-        assert_eq!(diff_new(&ids, &seen), ids);
+    fn a_stale_push_changes_nothing() {
+        let mut state = LedgerState::from_listing(9, vec![ask("a", AskStatus::Pending)]);
+        state.apply(&LedgerPush { generation: 8, asks: vec![ask("a", AskStatus::Denied)] });
+        assert!(state.open.contains_key("a"));
+        assert_eq!(state.generation, 9);
     }
 }

@@ -23,7 +23,7 @@ text = "record a run"
 permissions = ["allow_always"]
 permission_titles = ["echo ran >> runs.txt"]
 text_contains = ["noted"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 # An operator then denies echo in gate.toml. The learned allow still wins,
 # with no ask.

@@ -466,6 +466,10 @@ CREATE TABLE IF NOT EXISTS approval_events (
     note           TEXT,
     created_at     INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+    -- An `escalated` event's reviewer before and after; NULL on every
+    -- other kind.
+    from_reviewer  BLOB,
+    to_reviewer    BLOB,
     PRIMARY KEY (request_id, seq)
 );
 
@@ -638,22 +642,42 @@ INSERT OR IGNORE INTO ledger_generation (id, generation) VALUES (1, 0);
 -- a fact that was not actually committed (pinned by
 -- `generation_does_not_advance_on_a_rolled_back_transaction` in
 -- `generation.rs`'s tests).
+--
+-- A trigger for a change to one ask also stamps that ask in
+-- `approval_changes` with the generation it just produced. The bump and the
+-- stamp share one trigger body so their order is fixed: the stamp always
+-- equals the generation that announced it, and a reader that has seen
+-- generation `g` finds every later change with `generation > g`
+-- (`changes.rs`). `migrate` drops an older body that does not stamp
+-- (`STAMPING_TRIGGERS`).
+CREATE TABLE IF NOT EXISTS approval_changes (
+    request_id TEXT    NOT NULL PRIMARY KEY REFERENCES approvals(request_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_changes_generation ON approval_changes(generation);
+
 CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_approval_insert
 AFTER INSERT ON approvals
 BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO approval_changes (request_id, generation)
+        SELECT NEW.request_id, generation FROM ledger_generation WHERE id = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_approval_update
 AFTER UPDATE ON approvals
 BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO approval_changes (request_id, generation)
+        SELECT NEW.request_id, generation FROM ledger_generation WHERE id = 1;
 END;
 
 CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_event_insert
 AFTER INSERT ON approval_events
 BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO approval_changes (request_id, generation)
+        SELECT NEW.request_id, generation FROM ledger_generation WHERE id = 1;
 END;
 
 -- Rules are included on purpose, not only the ask/event tables: a newly
@@ -749,6 +773,8 @@ CREATE TRIGGER IF NOT EXISTS ledger_generation_bump_on_signal_insert
 AFTER INSERT ON approval_signals
 BEGIN
     UPDATE ledger_generation SET generation = generation + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO approval_changes (request_id, generation)
+        SELECT NEW.request_id, generation FROM ledger_generation WHERE id = 1;
 END;
 
 -- ── rc run log (the "checklist of what ran") ────────────────────────
@@ -1036,11 +1062,13 @@ CREATE TABLE IF NOT EXISTS council_voice_skips (
 /// invariants (guarantees 2, 3, 6) are enforced by `CHECK`s and triggers
 /// that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
+    drop_triggers_that_do_not_stamp(conn)?;
     conn.execute_batch(DDL)?;
     // Before the rebuild, not after: a rebuild spec copies a named column
     // list, so any column an old database is missing has to exist before
     // that copy runs or the SELECT names a column that is not there.
     add_columns_if_missing(conn, "approvals", APPROVALS_ADDED_COLUMNS)?;
+    add_columns_if_missing(conn, "approval_events", &[("from_reviewer", "BLOB"), ("to_reviewer", "BLOB")])?;
     rename_columns_if_present(
         conn,
         &[
@@ -1064,6 +1092,29 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_rc_run_scripts_pending_projection
          ON rc_run_scripts(run_id, seq) WHERE result_json IS NOT NULL AND projected_at IS NULL;",
     )?;
+    Ok(())
+}
+
+/// The generation triggers that also stamp `approval_changes`. A database
+/// created before the stamp has these names with a body that only bumps;
+/// `CREATE TRIGGER IF NOT EXISTS` would keep that body, so they are dropped
+/// first and `DDL` recreates them.
+const STAMPING_TRIGGERS: &[&str] = &[
+    "ledger_generation_bump_on_approval_insert",
+    "ledger_generation_bump_on_approval_update",
+    "ledger_generation_bump_on_event_insert",
+    "ledger_generation_bump_on_signal_insert",
+];
+
+fn drop_triggers_that_do_not_stamp(conn: &Connection) -> SqliteResult<()> {
+    for name in STAMPING_TRIGGERS {
+        let sql: Option<String> = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1", [name], |row| row.get(0))
+            .optional()?;
+        if sql.is_some_and(|sql| !sql.contains("approval_changes")) {
+            conn.execute_batch(&format!("DROP TRIGGER {name}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1306,8 +1357,11 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
             note           TEXT,
             created_at     INTEGER NOT NULL
                 DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
+            from_reviewer  BLOB,
+            to_reviewer    BLOB,
             PRIMARY KEY (request_id, seq)",
-        columns: "request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at",
+        columns: "request_id, seq, kind, actor, decided_option, remember_scope, auto_reason, note, created_at, \
+            from_reviewer, to_reviewer",
     },
     ValueEnumRebuildSpec {
         table: "approval_rules",

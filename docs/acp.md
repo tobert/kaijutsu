@@ -45,7 +45,7 @@ Concept mapping — **as built** (`crates/kaijutsu-acp`):
 | `session/update` text/thought | `BlockKind::Text`/`Thinking` char deltas off the context mirror | built |
 | `session/update` tool_call / tool_call_update | `BlockKind::ToolCall` create, then patch; `ToolResult` patches the call it links to | built |
 | `session/cancel` | `interrupt_context(ctx, immediate: false)` — soft | built |
-| `session/request_permission` | approval-ledger ask → `subscribeLedgerEvents` generation bump → `kj ledger list`/`show` poll → ACP session (`rank::session_id_of`) → real round trip → `kj ledger allow`/`deny` | built |
+| `session/request_permission` | approval-ledger ask → `ActorHandle::ledger()` open asks → ACP session (`rank::session_id_of`) → real round trip → `ActorHandle::decide_ask`; withdrawn with `$/cancel_request` when the ask closes elsewhere | built |
 | `mcpServers` declared into session | `declareContextMcpServers` → stdio server on the kernel host, granted to the session's context alone | built, stdio only; `http`/`sse` refused by name — see "Client-declared MCP servers" |
 | `session/update` `plan` | `BlockKind::Task` blocks rebuilt whole-context off the context mirror, one `PlanEntry` per non-cancelled task | built — see "Task → plan" below |
 | `session/update` commands | curated, loadout-aware kj catalog; exact single-text `/name input` prompts execute addressed kj | built |
@@ -408,42 +408,71 @@ sessions take `context_type=coder` (the model-facing stance bundle), not
   test, against a kernel too old to serve `subscribeTurnEvents`.
 
 **Permission asks, ledger-driven.** `permission.rs`'s Ask pathway follows
-the approval ledger, not a bespoke wire — the old `PermissionEvents::onAsk`
-take-once channel is gone (`docs/gate-resume.md`). The `.with_spawned` task registered in `serve_stdio`
-(`permission::start_permission_pump`) subscribes to
-`ActorHandle::subscribe_ledger_events()` — a broadcast of bare generation
-numbers — and on each bump (or a `Lagged` warning) polls `kj ledger list`
-in an arbitrary live session's context, diffing the returned ids against a
-`seen` set. For every unseen id, `kj ledger show <id>` names the ask's
-`context_id`; that resolves to an ACP session (`rank::session_id_of`, no
-side table). If no session here is bound to that context, **the ask is
-skipped, not denied** — some other surface (a shell, another client) may be
-about to answer it; ACP is no longer the only possible answerer. Otherwise
-the round trip is spawned: `session/request_permission` to the client, then
-`kj ledger allow|deny <id>` to write the decision back. The kernel is the
-authority and the timeout — the gate expires the ask itself
-(`effective_gate_wait()`), so `permission::REQUEST_PERMISSION_TIMEOUT`
-bounds only the outgoing ACP call, not the ask. A human answering the same
-ask from a shell while the ACP prompt is still up is expected: the ledger's
-`claim`/`decide` transaction picks exactly one winner, and the loser's `kj
-ledger allow|deny` comes back `AlreadyDecided` — logged at `debug!`, not a
-failure. `PermissionOption.kind`, `AutoAllow`/`PermissionPolicy`, and
-per-ask kernel-supplied options are all gone with the old wire: the ledger
-sends no options, so every real ask gets the same four synthesized options
-(`build_options`): Allow and Deny answer this ask, and "Always allow this
-command" and "Always deny this command" answer it with
-`kj ledger allow|deny <id> --remember always`. That learns an exact-text rule,
-as the tui and app "always" keys do, never a family rule. The rule's creator
-is this connection's principal, so only that reviewer can forget it. When the
-ledger decides the ask but refuses the rule (a statement with a free
-variable), the client gets an agent message that names the reason and says
-the answer applied to this ask only. A `cancelled` outcome denies the ask
-with `kj ledger deny <id> --cancelled`, recorded as the decided option
-`prompt_cancelled`, so a turn holding on the ask reads the refusal and goes
-on.
+the approval ledger, not a bespoke wire (`docs/gate-resume.md`). The
+ledger row is the record of an answer: the bridge reads and answers asks
+through typed RPC with no context, and an answer authors no block in any
+transcript.
+
+The `.with_spawned` task registered in `serve_stdio`
+(`permission::start_permission_pump`) watches `ActorHandle::ledger()`, the
+open asks that the client actor keeps current across reconnects, and the
+session registry's binds. On each change it compares the open asks with the
+prompts it has raised (`diff_open`):
+
+- **Raise.** An open ask is offered when this connection's principal is its
+  reviewer (`AskSummary::answerable_by`). The prompt goes to the session
+  bound to the ask's `context_id` (`rank::session_id_of`, no side table),
+  or else to any session of this connection, so a lead can review a coder
+  context it has no session on. With no session at all, the ask waits
+  until `session/new`, `session/load`, or `session/resume` binds one. An
+  ask is offered once per round trip; see "Offered again" below.
+- **Withdraw.** When a raised ask stops being ours (another surface
+  answered it, it was cancelled or expired, or it was reassigned), the
+  outstanding `session/request_permission` is cancelled with
+  `$/cancel_request` and nothing is recorded. A client that ignores the
+  cancellation and answers anyway has nothing to apply.
+
+An ask with another reviewer is skipped, not denied: that reviewer answers
+it from its own surface. The kernel is the authority, and nothing expires
+(`docs/gate-resume.md`). `permission::REQUEST_PERMISSION_TIMEOUT` (30s)
+bounds one outgoing request, not the ask: a request that times out is
+cancelled and sent again until the ask is answered or withdrawn. Only an
+explicit answer records a verdict. A timed-out request, a transport error,
+or an option the bridge never offered leaves the ask pending, and the
+client gets an agent message saying so.
+
+**Offered again.** A round trip that ends with no answer reaching the
+ledger releases its ask after `permission::REOFFER_AFTER` (10s), and the
+pump offers it again if it is still ours. The causes are: the ledger could
+not read the ask, the request failed in transport, the client chose an
+option the bridge never offered, or the answer call to the kernel failed.
+A failure that repeats re-offers once per `REOFFER_AFTER`, not in a loop.
+An answer the ledger took up, recorded or refused, ends the ask's round
+trips on this connection.
+
+An answer goes to `ActorHandle::decide_ask` as this connection's principal,
+which the ledger checks is the ask's reviewer. Two surfaces answering the
+same ask is expected: the ledger's claim picks exactly one winner, and the
+loser gets `AskAnswerFailureKind::AlreadyAnswered`. That is logged at
+`info!`; any other refusal is logged at `warn!`. Either way the client gets
+an agent message naming the reason the answer did not apply.
+
+The ledger sends no options, so every ask gets the same four synthesized
+options (`build_options`): Allow and Deny answer this ask, and "Always
+allow this command" and "Always deny this command" also ask for a
+remembered rule (`Remember { scope: Always, family: false }`). That learns
+an exact-text rule, as the tui and app "always" keys do, never a family
+rule. The rule's creator is this connection's principal, so only that
+reviewer can forget it. When the ledger records the answer but learns no
+rule (`remembered.learned == false`, such as a statement with a free
+variable), the client gets an agent message that gives the ledger's note
+and says the answer applied to this ask only. A `cancelled` outcome is an
+answer: it records `AskVerdict::PromptCancelled`, a denial with the decided
+option `prompt_cancelled`, so a turn holding on the ask reads the refusal
+and goes on.
 
 The request's `toolCall.toolCallId` names the model's tool call that raised
-the ask, which `kj ledger show` reports as `tool_call_block_id`. The gate
+the ask, which `ActorHandle::get_ask` reports as `tool_call_block_id`. The gate
 records it with the ask, for a foreground or a background call. The request
 waits until its session has sent the `tool_call` that announces the call,
 and is sent under the session's emission lock, so it always follows that

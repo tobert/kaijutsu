@@ -24,7 +24,7 @@ text = "make the benign directory"
 permissions = ["allow"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir benign"]
 text_contains = ["made it"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "benign"

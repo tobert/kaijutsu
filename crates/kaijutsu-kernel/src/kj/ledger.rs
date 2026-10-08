@@ -39,7 +39,10 @@
 use approval_ledger::error::LedgerError;
 use approval_ledger::types::{ApprovalStatus, NewAsk, NewSignal, Origin, RuleScope, SignalSourceKind, SignalVerdict};
 use clap::{Parser, Subcommand};
-use kaijutsu_types::{ContentType, ContextId, PrincipalId};
+use kaijutsu_types::{
+    AskAnswerFailure, AskAnswerFailureKind, AskAnswered, AskFilter, AskOrigin, AskStatus, AskVerdict, AskView, ContentType, ContextId, PrincipalId, Remember,
+    RememberResult, RememberScope,
+};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::effect::{Classify, Effect};
@@ -70,17 +73,10 @@ enum RememberScopeArg {
 }
 
 impl RememberScopeArg {
-    fn as_str(self) -> &'static str {
+    fn to_scope(self) -> RememberScope {
         match self {
-            Self::Session => "session",
-            Self::Always => "always",
-        }
-    }
-
-    fn to_rule_scope(self) -> RuleScope {
-        match self {
-            Self::Session => RuleScope::Session,
-            Self::Always => RuleScope::Always,
+            Self::Session => RememberScope::Session,
+            Self::Always => RememberScope::Always,
         }
     }
 }
@@ -633,35 +629,22 @@ impl KjDispatcher {
             None => None,
         };
 
-        let (statuses, newest_first, is_default_pending) = match status {
-            Some(s) => {
-                let ledger_status = s.to_ledger();
-                (vec![ledger_status], ledger_status.is_terminal(), false)
-            }
-            None if history => (
-                vec![
-                    ApprovalStatus::Allowed,
-                    ApprovalStatus::Denied,
-                    ApprovalStatus::Expired,
-                    ApprovalStatus::Abandoned,
-                ],
-                true,
-                false,
-            ),
-            None => (vec![ApprovalStatus::Pending], false, true),
-        };
-
-        let filter = approval_ledger::ask::AskListFilter {
-            statuses,
-            origin: origin.map(OriginArg::to_ledger),
+        let filter = AskFilter {
+            view: if history { AskView::History } else { AskView::Queue },
+            status: status.map(|s| crate::kj::gate::ask_status(s.to_ledger())),
+            origin: origin.map(|o| crate::ledger_view::ask_origin(o.to_ledger())),
             since_ms,
-            limit: limit as i64,
-            newest_first,
+            limit: Some(limit),
         };
+        let newest_first = match status {
+            Some(s) => s.to_ledger().is_terminal(),
+            None => history,
+        };
+        let is_default_pending = status.is_none() && !history;
         let (rows, total) = {
             let db = self.kernel_db.lock();
-            match approval_ledger::ask::list_asks_filtered(db.conn_for_ledger(), &filter) {
-                Ok(r) => r,
+            match crate::ledger_view::list_asks(&db, &filter) {
+                Ok(listing) => (listing.asks, listing.total),
                 Err(e) => return KjResult::Err(format!("kj ledger list: {e}")),
             }
         };
@@ -742,7 +725,7 @@ impl KjDispatcher {
             }
         }
         lines.push(String::new());
-        if let Some(notice) = truncation_notice(rows.len(), total, "/--origin/--status") {
+        if let Some(notice) = truncation_notice(rows.len(), total as i64, "/--origin/--status") {
             lines.push(notice);
             lines.push(String::new());
         }
@@ -754,89 +737,32 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
-    /// Render a stored id blob, saying so when it does not parse. A
-    /// malformed id here is a defect in whatever wrote the row, and `-`
-    /// would read as "absent" — which these columns never are.
-    fn ledger_id_display(parsed: Option<String>, raw: &[u8]) -> String {
-        parsed.unwrap_or_else(|| format!("<malformed {}-byte id>", raw.len()))
-    }
-
     fn ledger_show(&self, request_id: &str, show_signals: bool) -> KjResult {
-        let db = self.kernel_db.lock();
-        let conn = db.conn_for_ledger();
-        let row = match approval_ledger::ask::get_approval(conn, request_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return KjResult::Err(format!("kj ledger: no such ask {request_id}"));
-            }
-            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
-        };
-        let statements = match approval_ledger::ask::load_ask_statements(conn, request_id) {
-            Ok(s) => s,
-            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
-        };
-        let redeemed_at = match approval_ledger::ask::redeemed_at(conn, request_id) {
-            Ok(at) => at,
-            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
-        };
-        let publication_abandoned = match db.approval_pair_abandoned_reason(request_id) {
-            Ok(reason) => reason,
-            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
-        };
-        let tool_call = match db.approval_tool_call(request_id) {
-            Ok(call) => call.map(|call| call.to_key()),
-            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
-        };
-        let completion_notification = match crate::runtime::completion_notice::summary(&db,
-            &crate::runtime::completion_notice::Source::Approval(request_id.into())) {
-            Ok(notice) => notice,
-            Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
-        };
-        // The free-variable values an approval runs with, recorded on the
-        // ask at raise time (`docs/gate-resume.md`, "The ask carries its
-        // free variables") — always loaded, not gated on `--signals`, since
-        // this is what execution reads, not an advisory extra.
-        let env_rows = match approval_ledger::ask::load_ask_env(conn, request_id) {
-            Ok(e) => e,
-            Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
-        };
-        let signal_rows = if show_signals {
-            match approval_ledger::ask::list_signals(conn, request_id) {
-                Ok(s) => s,
+        let (detail, signal_rows, completion_notification) = {
+            let db = self.kernel_db.lock();
+            let detail = match crate::ledger_view::get_ask(&db, request_id) {
+                Ok(Some(detail)) => detail,
+                Ok(None) => return KjResult::Err(format!("kj ledger: no such ask {request_id}")),
                 Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
-            }
-        } else {
-            Vec::new()
+            };
+            let signal_rows = if show_signals {
+                match approval_ledger::ask::list_signals(db.conn_for_ledger(), request_id) {
+                    Ok(s) => s,
+                    Err(e) => return KjResult::Err(format!("kj ledger show: {e}")),
+                }
+            } else {
+                Vec::new()
+            };
+            let completion_notification = match crate::runtime::completion_notice::summary(&db,
+                &crate::runtime::completion_notice::Source::Approval(request_id.into())) {
+                Ok(notice) => notice,
+                Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
+            };
+            (detail, signal_rows, completion_notification)
         };
-        let principal_name = |raw: &[u8]| -> Result<String, KjResult> {
-            let principal = PrincipalId::try_from_slice(raw)
-                .ok_or_else(|| KjResult::Err(format!("kj ledger show: malformed {}-byte principal id", raw.len())))?;
-            match db.get_character(principal) {
-                Ok(Some(character)) => Ok(character.name),
-                Ok(None) => Ok(principal.short()),
-                Err(e) => Err(KjResult::Err(format!("kj ledger show: could not resolve principal name: {e}"))),
-            }
-        };
-        let actor_name = match row.actor_id.as_deref().map(principal_name).transpose() {
-            Ok(name) => name,
-            Err(result) => return result,
-        };
-        let reviewer_name = match row.reviewer_id.as_deref().map(principal_name).transpose() {
-            Ok(name) => name,
-            Err(result) => return result,
-        };
-        let requester_name = match principal_name(&row.principal_id) {
-            Ok(name) => name,
-            Err(result) => return result,
-        };
-        let decided_by_name = match row.decided_by.as_deref().map(principal_name).transpose() {
-            Ok(name) => name,
-            Err(result) => return result,
-        };
-
-        drop(db);
-        let result_review = if row.origin == Origin::HookResult {
-            let Some(context) = ContextId::try_from_slice(&row.context_id) else {
+        let ask = &detail.summary;
+        let result_review = if ask.origin == AskOrigin::HookResult {
+            let Some(context) = ask.context_id else {
                 return KjResult::Err("kj ledger show: result review has a malformed context id".into());
             };
             match self.kernel().shell_operations().result_review_for_ask(request_id, context) {
@@ -844,60 +770,71 @@ impl KjDispatcher {
                 Err(error) => return KjResult::Err(format!("kj ledger show: {error}")),
             }
         } else { None };
+        let context_display = ask.context_id.map_or_else(|| "<malformed context id>".to_string(), |c| c.to_string());
+        let requester = ask.requester.as_ref().expect("the ledger records every requester");
         let mut lines = vec![
-            format!("request:    {}", row.request_id),
-            format!("status:     {}", row.status),
-            format!("origin:     {}", row.origin),
+            format!("request:    {}", ask.request_id),
+            format!("status:     {}", ask.status),
+            format!("origin:     {}", ask.origin),
             format!(
                 "tool:       {}.{}",
-                row.instance.as_deref().unwrap_or("-"),
-                row.tool.as_deref().unwrap_or("-")
+                detail.instance.as_deref().unwrap_or("-"),
+                detail.tool.as_deref().unwrap_or("-")
             ),
-            format!("label:      {}", row.authorized_label.as_deref().unwrap_or("-")),
+            format!("label:      {}", detail.label.as_deref().unwrap_or("-")),
             // `context` and `principal` are two thirds of what
             // `find_redeemable` matches on, and the only reason to print
             // them here: an answered ask that mints a second ask instead of
             // redeeming has one of them differing, and no other verb shows
             // either.
-            format!("context:    {}", Self::ledger_id_display(ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()), &row.context_id)),
-            format!("principal:  {} ({requester_name})", Self::ledger_id_display(PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()), &row.principal_id)),
-            format!("description: {}", row.description),
+            format!("context:    {context_display}"),
+            format!("principal:  {} ({})", requester.id, requester.name),
         ];
-        if let Some(call) = &tool_call {
-            lines.push(format!("tool_call:  {call}"));
+        for (label, who) in [("performer: ", &ask.performer), ("reviewer:  ", &ask.reviewer)] {
+            match who {
+                Some(p) => lines.push(format!("{label} {} ({})", p.id, p.name)),
+                None => lines.push(format!("{label} -")),
+            }
         }
-        for s in &statements {
-            lines.push(format!("statement:  {}", s.statement.rendered));
+        lines.push(format!("description: {}", ask.description));
+        if let Some(call) = &detail.tool_call_block_id {
+            lines.push(format!("tool_call:  {}", call.to_key()));
+        }
+        for statement in &ask.statements {
+            lines.push(format!("statement:  {statement}"));
         }
         // What an allow actually runs — the source, the directory, and the
         // free variables' recorded values. Omitted line by line when the
-        // ask carries nothing for it (an advisory or non-executing ask has
-        // no `exec_source`/`cwd`, and a statement with no free variable has
-        // no env rows at all).
-        if let Some(exec_source) = &row.exec_source {
+        // ask carries nothing for it.
+        if let Some(exec_source) = &detail.exec_source {
             lines.push(format!("exec_source: {exec_source}"));
         }
-        if let Some(cwd) = &row.cwd {
+        if let Some(cwd) = &detail.cwd {
             lines.push(format!("cwd:        {cwd}"));
         }
-        for e in &env_rows {
+        for e in &detail.env {
             match &e.value {
                 Some(v) => lines.push(format!("env:        {}={v:?}", e.name)),
                 None => lines.push(format!("env:        {} unset", e.name)),
             }
         }
-        if let Some(decided) = &row.decided_option {
+        let decision = detail.decision.as_ref();
+        if let Some(decided) = decision.and_then(|d| d.option.as_deref()) {
             lines.push(format!("decided:    {decided}"));
         }
         // Who answered, so a card closed from another surface can say so
         // (`docs/tui.md`, "Asks"). Absent on a pending or auto-decided ask.
-        if let Some(by) = &row.decided_by {
-            lines.push(format!("decided_by: {} ({})", Self::ledger_id_display(PrincipalId::try_from_slice(by).map(|p| p.to_string()), by), decided_by_name.as_deref().expect("decided identity has a name")));
+        if let Some(by) = decision.and_then(|d| d.decided_by.as_ref()) {
+            lines.push(format!("decided_by: {} ({})", by.id, by.name));
         }
-        if let Some(reason) = &row.auto_reason {
+        if let Some(reason) = decision.and_then(|d| d.auto_reason.as_deref()) {
             lines.push(format!("auto:       {reason}"));
         }
-        if let Some(reason) = &publication_abandoned {
+        for moved in &detail.reassignments {
+            let from = moved.from.as_ref().map_or("-", |p| p.name.as_str());
+            lines.push(format!("reassigned: {from} -> {} by {} at {}", moved.to.name, moved.by.name, moved.at_ms));
+        }
+        if let Some(reason) = &detail.publication_abandoned {
             lines.push(format!("publication: abandoned — {reason}"));
         }
         if let Some(notice) = &completion_notification {
@@ -908,12 +845,12 @@ impl KjDispatcher {
         }
         // Only a decided ask can be spent, so `redeemed: no` on a pending
         // one would state a fact about a question nobody has answered.
-        if matches!(row.status, ApprovalStatus::Allowed | ApprovalStatus::Denied) {
-            match redeemed_at {
+        if matches!(ask.status, AskStatus::Allowed | AskStatus::Denied) {
+            match detail.redeemed_at_ms {
                 Some(at) => lines.push(format!("redeemed:   {at}")),
                 // An allowed stored command is the approval worker's to run;
                 // a caller's retry cannot collect it.
-                None if row.exec_source.is_some() && row.status == ApprovalStatus::Allowed => {
+                None if detail.exec_source.is_some() && ask.status == AskStatus::Allowed => {
                     lines.push("redeemed:   no — the approval worker has not run it yet".into())
                 }
                 None => lines.push("redeemed:   no — this answer is still redeemable".into()),
@@ -940,44 +877,48 @@ impl KjDispatcher {
                 ));
             }
         }
-        // `context_id`, `instance`, `tool` and `hook_id` are here for a
-        // client that has to ROUTE this ask, not just render it: an ACP
-        // session, or the app, needs to know which context an ask belongs
-        // to before it can decide whose screen to put it on. They were
-        // missing while the only reader was a human at a shell, who
-        // already knew.
+        let principal = |p: Option<&kaijutsu_types::PrincipalRef>| (p.map(|p| p.id.to_string()), p.map(|p| p.name.clone()));
+        let (actor_id, actor_name) = principal(ask.performer.as_ref());
+        let (reviewer_id, reviewer_name) = principal(ask.reviewer.as_ref());
+        let (decided_by, decided_by_name) = principal(decision.and_then(|d| d.decided_by.as_ref()));
         let mut data = serde_json::json!({
-            "request_id": row.request_id,
-            "context_id": ContextId::try_from_slice(&row.context_id).map(|c| c.to_string()),
-            "principal_id": PrincipalId::try_from_slice(&row.principal_id).map(|p| p.to_string()),
-            "principal_name": requester_name,
-            "actor_id": row.actor_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "request_id": ask.request_id,
+            "context_id": ask.context_id.map(|c| c.to_string()),
+            "principal_id": requester.id.to_string(),
+            "principal_name": requester.name,
+            "actor_id": actor_id,
             "actor_name": actor_name,
-            "reviewer_id": row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "reviewer_id": reviewer_id,
             "reviewer_name": reviewer_name,
-            "created_at": row.created_at,
-            "decided_at": row.decided_at,
-            "decided_by": row.decided_by.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
+            "created_at": ask.created_at_ms,
+            "decided_at": ask.decided_at_ms,
+            "decided_by": decided_by,
             "decided_by_name": decided_by_name,
-            "decided_option": row.decided_option,
-            "remember_scope": row.remember_scope,
-            "redeemed_at": redeemed_at,
-            "publication_abandoned": publication_abandoned,
+            "decided_option": decision.and_then(|d| d.option.clone()),
+            "remember_scope": decision.and_then(|d| d.remember_scope.clone()),
+            "redeemed_at": detail.redeemed_at_ms,
+            "publication_abandoned": detail.publication_abandoned,
             "completion_notification": completion_notification,
-            "status": row.status.to_string(),
-            "origin": row.origin.to_string(),
-            "instance": row.instance,
-            "tool": row.tool,
-            "hook_id": row.hook_id,
-            "tool_call_block_id": tool_call,
-            "description": row.description,
-            "authorized_label": row.authorized_label,
-            "statements": statements.iter().map(|s| s.statement.rendered.clone()).collect::<Vec<_>>(),
-            "exec_source": row.exec_source,
-            "cwd": row.cwd,
-            "env": env_rows.iter().map(|e| serde_json::json!({
+            "status": ask.status.as_str(),
+            "origin": ask.origin.as_str(),
+            "instance": detail.instance,
+            "tool": detail.tool,
+            "hook_id": detail.hook_id,
+            "tool_call_block_id": detail.tool_call_block_id.map(|b| b.to_key()),
+            "description": ask.description,
+            "authorized_label": detail.label,
+            "statements": ask.statements,
+            "exec_source": detail.exec_source,
+            "cwd": detail.cwd,
+            "env": detail.env.iter().map(|e| serde_json::json!({
                 "name": e.name,
                 "value": e.value,
+            })).collect::<Vec<_>>(),
+            "reassignments": detail.reassignments.iter().map(|m| serde_json::json!({
+                "from": m.from.as_ref().map(|p| p.id.to_string()),
+                "to": m.to.id.to_string(),
+                "by": m.by.id.to_string(),
+                "at": m.at_ms,
             })).collect::<Vec<_>>(),
         });
         if let Some(mut review) = result_review {
@@ -1092,96 +1033,29 @@ impl KjDispatcher {
     /// where nobody is above. The assigned reviewer or the lineage root of
     /// the ask's context may escalate.
     async fn ledger_escalate(&self, request_id: &str, to: Option<&str>, caller: &KjCaller) -> KjResult {
-        let span = tracing::info_span!(
-            "approval.escalate",
-            ask.id = %request_id,
-            decision.actor.id = %caller.actor_id,
-            principal.id = tracing::field::Empty,
-            actor.id = tracing::field::Empty,
-            reviewer.id = tracing::field::Empty,
-            context.id = tracing::field::Empty,
-        );
-        let _guard = span.enter();
-        let result = {
-            let db = self.kernel_db.lock();
-            // The lineage root of the ask's context may reclaim it. When the
-            // lineage has no root, only the assigned reviewer may escalate.
-            let root_authority = match db.get_approval(request_id) {
-                Ok(Some(row)) => kaijutsu_types::ContextId::try_from_slice(&row.context_id)
-                    .and_then(|context| match db.lineage_root(context) {
-                        Ok(root) => Some(root),
-                        Err(error) => {
-                            tracing::warn!(%error, "ask has no lineage root; only the assigned reviewer may escalate");
-                            None
-                        }
-                    }),
-                Ok(None) => return KjResult::Err(format!("kj ledger: no such ask '{request_id}'")),
-                Err(e) => return KjResult::Err(format!("kj ledger: could not read ask '{request_id}': {e}")),
-            };
-            let (target, target_name) = match to {
-                Some(name) => match db.get_character_by_name(name) {
-                    Ok(Some(character)) if character.retired_at.is_none() => (character.principal_id, character.name),
-                    Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{name}' is retired")),
-                    Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{name}'")),
-                    Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{name}': {e}")),
-                },
-                None => {
-                    let row = match db.get_approval(request_id) {
-                        Ok(Some(row)) => row,
-                        Ok(None) => return KjResult::Err(format!("kj ledger: no such ask '{request_id}'")),
-                        Err(e) => return KjResult::Err(format!("kj ledger: could not read ask '{request_id}': {e}")),
-                    };
-                    let current_reviewer = match row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice) {
-                        Some(id) => id,
-                        None => return KjResult::Err(format!("kj ledger: ask '{request_id}' has no current reviewer to escalate above")),
-                    };
-                    let current_name = db.get_character(current_reviewer).ok().flatten()
-                        .map(|character| character.name)
-                        .unwrap_or_else(|| current_reviewer.to_string());
-                    let Some(context) = kaijutsu_types::ContextId::try_from_slice(&row.context_id) else {
-                        return KjResult::Err(format!("kj ledger: ask '{request_id}' has no readable context to walk"));
-                    };
-                    // Exclude the actor as well: escalation climbs past
-                    // whoever already holds the ask, and never lands on
-                    // the character that performed it.
-                    let mut excluded = vec![current_reviewer];
-                    if let Some(actor) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
-                        excluded.push(actor);
-                    }
-                    match db.responsible_character_above(context, &excluded) {
-                        Ok(Some(next)) => match db.get_character(next) {
-                            Ok(Some(character)) => (character.principal_id, character.name),
-                            Ok(None) | Err(_) => return KjResult::Err(format!(
-                                "kj ledger: the character responsible above {current_name} has no character sheet"
-                            )),
-                        },
-                        Ok(None) => return KjResult::Err(format!(
-                            "kj ledger: {current_name} is at the root; nobody above {current_name}"
-                        )),
-                        Err(e) => return KjResult::Err(format!("kj ledger: could not walk the accountability forest: {e}")),
-                    }
-                }
-            };
-            approval_ledger::decide::escalate_with_authority(
-                db.conn_for_ledger(), request_id, caller.actor_id.as_bytes(), target.as_bytes(),
-                root_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
-            ).map(|row| (row, target_name))
+        let target = match to {
+            Some(name) => match self.kernel_db.lock().get_character_by_name(name) {
+                Ok(Some(character)) if character.retired_at.is_none() => Some(character.principal_id),
+                Ok(Some(_)) => return KjResult::Err(format!("kj ledger: character '{name}' is retired")),
+                Ok(None) => return KjResult::Err(format!("kj ledger: no character named '{name}'")),
+                Err(e) => return KjResult::Err(format!("kj ledger: could not resolve character '{name}': {e}")),
+            },
+            None => None,
         };
-        match result {
-            Ok((row, target_name)) => {
-                record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
-                tracing::info!("approval ask escalated");
-                crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
+        match escalate_ask(self.kernel(), caller.actor_id, request_id, target) {
+            Ok(answered) => {
+                let reviewer = answered.summary.reviewer.as_ref();
+                let reviewer_name = reviewer.map(|r| r.name.clone()).unwrap_or_default();
                 KjResult::ok_with_data(
-                    format!("escalated ask {request_id} to {target_name}"),
+                    format!("escalated ask {request_id} to {reviewer_name}"),
                     serde_json::json!({
-                        "request_id": row.request_id,
-                        "reviewer_id": row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice).map(|p| p.to_string()),
-                        "reviewer_name": target_name,
+                        "request_id": answered.summary.request_id,
+                        "reviewer_id": reviewer.map(|r| r.id.to_string()),
+                        "reviewer_name": reviewer_name,
                     }),
                 )
             }
-            Err(e) => KjResult::Err(format!("kj ledger: {e}")),
+            Err(failure) => KjResult::Err(format!("kj ledger: {failure}")),
         }
     }
 
@@ -1204,271 +1078,31 @@ impl KjDispatcher {
         family: bool,
         cancelled: bool,
     ) -> KjResult {
-        let verb = if allow { "allow" } else { "deny" };
-        let span = tracing::info_span!(
-            "approval.decision",
-            ask.id = %request_id,
-            decision.actor.id = %caller.actor_id,
-            decision.verb = verb,
-            principal.id = tracing::field::Empty,
-            actor.id = tracing::field::Empty,
-            reviewer.id = tracing::field::Empty,
-            context.id = tracing::field::Empty,
-        );
-        let _guard = span.enter();
-
-        // The ledger work is scoped so the `KernelDb` guard is RELEASED before
-        // the notification below. `announce_ledger_change` takes the same
-        // mutex to read the committed generation, and `parking_lot::Mutex` is
-        // not reentrant — announcing while still holding it would deadlock the
-        // answerer, which is a far worse failure than the silent hang this
-        // whole slice set out to fix.
-        let result = {
-            let db = self.kernel_db.lock();
-            let conn = db.conn_for_ledger();
-            let principal = caller.actor_id.as_bytes();
-            let context = caller.context_id.map(|c| c.as_bytes().to_vec());
-            let answerer = approval_ledger::decide::Answerer {
-                principal,
-                context: context.as_deref(),
-            };
-
-            // An archived context is inert: it runs nothing and answers
-            // nothing. Checked here, BEFORE the claim, for the same reason
-            // self-approval is — nothing has committed yet, so this returns
-            // without announcing, and no claim is left stranded on an ask
-            // whose answer could never be acted on.
-            //
-            // This is the first of two checks. The second runs at execution
-            // time, because a context can be archived in the gap between an
-            // answer and the run it authorizes, and a check here alone would
-            // not see that. `docs/gate-resume.md`, "Archived contexts are
-            // inert".
-            match approval_ledger::ask::get_approval(conn, request_id) {
-                Ok(Some(row)) => {
-                    record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
-                    if matches!(remember, Some(RememberScopeArg::Session)) {
-                        let ask_ctx = match ContextId::try_from_slice(&row.context_id) {
-                            Some(id) => id,
-                            None => return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: it has no valid context ID"
-                            )),
-                        };
-                        let ask_actor = match row
-                            .actor_id
-                            .as_deref()
-                            .and_then(PrincipalId::try_from_slice)
-                        {
-                            Some(id) => id,
-                            None => return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: it has no performer identity"
-                            )),
-                        };
-                        let requester = match PrincipalId::try_from_slice(&row.principal_id) {
-                            Some(id) => id,
-                            None => return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: it has no valid requester identity"
-                            )),
-                        };
-                        let current = match db.get_context(ask_ctx) {
-                            Ok(Some(context)) => context,
-                            Ok(None) => return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: context {} is missing",
-                                ask_ctx.short()
-                            )),
-                            Err(e) => return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: read context {}: {e}",
-                                ask_ctx.short()
-                            )),
-                        };
-                        let performer = current.played_by.unwrap_or(requester);
-                        if performer != ask_actor {
-                            return KjResult::Err(format!(
-                                "kj ledger: cannot --remember session for ask {request_id}: the context performer changed after this ask was raised"
-                            ));
-                        }
-                    }
-
-                    if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id) {
-                        // A MISSING context row reads as not-archived here,
-                        // and that is a narrow reading of the ruling rather
-                        // than an oversight: `approvals.context_id` carries
-                        // no foreign key on purpose, so an ask outliving its
-                        // context is an expected state, and refusing every
-                        // such ask would close the audit path along with the
-                        // hazard. Widening this to "no live context" is a
-                        // separate decision.
-                        let archived = db
-                            .get_context(ask_ctx)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|c| c.is_archived());
-                        if archived {
-                            return KjResult::Err(format!(
-                                "kj ledger: ask {request_id} belongs to context {}, which is \
-                                 archived — an archived context runs nothing, so answering \
-                                 this would authorize work that can never happen. Unarchive \
-                                 it first if the ask still matters.",
-                                ask_ctx.short()
-                            ));
-                        }
-                    }
-                }
-                Ok(None) => return KjResult::Err(format!("kj ledger: no such ask {request_id}")),
-                Err(e) => return KjResult::Err(format!("kj ledger: {e}")),
-            }
-
-            // No self-approval, checked BEFORE the claim. `decide` enforces it
-            // too, but a claim taken first would leave the ask `claimed` by the
-            // one seat that may not answer it, locking out every seat that may.
-            // Nothing has committed on this path, so it returns without
-            // announcing.
-            if let Err(e) =
-                approval_ledger::decide::ensure_not_self_approval(conn, request_id, answerer)
-            {
-                return match e {
-                    LedgerError::NotFound(_) => {
-                        KjResult::Err(format!("kj ledger: no such ask {request_id}"))
-                    }
-                    e => KjResult::Err(format!("kj ledger: {e}")),
-                };
-            }
-
-            match approval_ledger::claim::claim(conn, request_id, principal) {
-                Ok(_) => {}
-                // Nothing committed on any of these arms, so there is nothing
-                // to announce — return straight out rather than falling
-                // through to the notification below.
-                Err(LedgerError::NotFound(_)) => {
-                    return KjResult::Err(format!("kj ledger: no such ask {request_id}"));
-                }
-                Err(e @ LedgerError::NotClaimable { .. }) => {
-                    // Someone else is answering, or the gate already expired it —
-                    // say which, loudly; a silent no-op here reads as "done".
-                    return KjResult::Err(format!("kj ledger: {e}"));
-                }
-                Err(e) => return KjResult::Err(format!("kj ledger: {e}")),
-            }
-
-            // Past the claim, a mutation HAS committed (pending → claimed), so
-            // every path from here announces — including the error arms. A
-            // failed decide after a successful claim still moved the ledger,
-            // and a client rendering this ask as pending needs to know.
-            match approval_ledger::decide::decide(
-                conn,
-                request_id,
-                approval_ledger::decide::DecideInput {
-                    allow,
-                    decided_by: Some(answerer),
-                    decided_option: Some(match (allow, cancelled) {
-                        (true, _) => "allow_once",
-                        (false, true) => "prompt_cancelled",
-                        (false, false) => "deny",
-                    }),
-                    remember_scope: remember.map(RememberScopeArg::as_str),
-                    auto_reason: None,
-                },
-            ) {
-                Ok(row) => {
-                    tracing::info!(decision.status = %row.status, "approval ask decided");
-                    // Past tense is spelled out, not built by appending "ed"
-                    // to `verb` — that produced "denyed" in shipped output.
-                    // Past tense is spelled out rather than built by appending
-                    // "ed" to `verb` — that construction shipped "denyed".
-                    let decided = if allow { "allowed" } else { "denied" };
-                    let mut message = format!("{decided} ask {request_id} ({})", row.description);
-                    let mut data = serde_json::json!({
-                        "request_id": row.request_id,
-                        "status": row.status.to_string(),
-                        "verb": verb,
-                    });
-
-                    // Step 2, gated on `--remember`: this ask's decision has
-                    // already committed above, so nothing below can undo it —
-                    // a refusal here only changes whether a RULE exists, never
-                    // whether this ask was allowed or denied.
-                    if let Some(remember) = remember
-                        && family
-                    {
-                        match learn_family_for_ask(
-                            conn,
-                            request_id,
-                            remember.to_rule_scope(),
-                            allow,
-                            principal,
-                        ) {
-                            Ok(keys) => {
-                                message.push_str(&format!(
-                                    "; remembered as a standing {} family rule for {}",
-                                    remember.as_str(),
-                                    keys.join(", "),
-                                ));
-                                data["remembered"] = serde_json::json!({
-                                    "scope": remember.as_str(),
-                                    "family": keys,
-                                });
-                            }
-                            Err(e) => {
-                                message.push_str(&format!(
-                                    "; NOT remembered: {e} — the {verb} on THIS ask still stands"
-                                ));
-                                data["remembered"] = serde_json::json!(false);
-                                data["remember_error"] = serde_json::json!({ "message": e });
-                            }
-                        }
-                    } else if let Some(remember) = remember {
-                        match learn_every_statement(
-                            conn,
-                            request_id,
-                            remember.to_rule_scope(),
-                            allow,
-                            principal,
-                        ) {
-                            Ok(n) => {
-                                message.push_str(&format!(
-                                    "; remembered as a standing {} rule ({n} statement{})",
-                                    remember.as_str(),
-                                    if n == 1 { "" } else { "s" },
-                                ));
-                                data["remembered"] = serde_json::json!({
-                                    "scope": remember.as_str(),
-                                    "statements": n,
-                                });
-                            }
-                            Err(e) => {
-                                // The offending variable is the whole point of
-                                // this arm — surface `LedgerError::FreeVariableRule`'s
-                                // fields rather than flattening to `{e}`'s prose, so
-                                // a caller parsing `.data` can act on it too.
-                                message.push_str(&format!(
-                                    "; NOT remembered: {e} — the {verb} on THIS ask still stands"
-                                ));
-                                data["remembered"] = serde_json::json!(false);
-                                data["remember_error"] = serde_json::json!({
-                                    "message": e.to_string(),
-                                    "free_variable": match &e {
-                                        LedgerError::FreeVariableRule { var_name, .. } => {
-                                            serde_json::json!(var_name)
-                                        }
-                                        _ => serde_json::Value::Null,
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    KjResult::ok_with_data(message, data)
-                }
-                Err(LedgerError::AlreadyDecided { status, .. }) => KjResult::Err(format!(
-                    "kj ledger: ask {request_id} was already decided ({status}) — \
-                     your late answer was recorded in the event log but changed nothing"
-                )),
-                Err(e) => KjResult::Err(format!("kj ledger: {e}")),
-            }
+        let verdict = match (allow, cancelled) {
+            (true, _) => AskVerdict::Allow,
+            (false, true) => AskVerdict::PromptCancelled,
+            (false, false) => AskVerdict::Deny,
         };
-
-        crate::kj::gate::announce_ledger_change(&self.kernel_db, self.kernel.ledger_flows());
-        result
+        let remember = remember.map(|scope| Remember { scope: scope.to_scope(), family });
+        let verb = if allow { "allow" } else { "deny" };
+        match decide_ask(self.kernel(), caller.actor_id, caller.context_id, request_id, verdict, remember) {
+            Ok(answered) => {
+                let decided = if allow { "allowed" } else { "denied" };
+                let mut message = format!("{decided} ask {request_id} ({})", answered.summary.description);
+                let mut data = serde_json::json!({
+                    "request_id": answered.summary.request_id,
+                    "status": answered.summary.status.as_str(),
+                    "verb": verb,
+                });
+                if let Some(remembered) = &answered.remembered {
+                    message.push_str("; ");
+                    message.push_str(&remembered.note);
+                    data["remembered"] = serde_json::json!({ "learned": remembered.learned, "note": remembered.note });
+                }
+                KjResult::ok_with_data(message, data)
+            }
+            Err(failure) => KjResult::Err(format!("kj ledger: {failure}")),
+        }
     }
 
     /// `kj ledger rules --limit/--since`, most recently created first.
@@ -1917,6 +1551,295 @@ impl KjDispatcher {
             }
         }
     }
+}
+
+/// Decide one ask as `answerer`, then, when `remember` asks for
+/// it and the decision committed, try to write the standing rule. The
+/// answer stands whether or not the rule is written.
+///
+/// `answerer_context` is where the answerer is, if anywhere; it is recorded
+/// on a refused attempt and decides nothing. `kj ledger allow|deny` and the
+/// `decideAsk` RPC both answer through here.
+///
+/// `decide` checks the answerer against the ask's reviewer snapshot inside
+/// the same write transaction that moves the row. Every path that reaches
+/// `decide` announces, because a refusal or a late answer is recorded too.
+pub fn decide_ask(
+    kernel: &crate::Kernel,
+    answerer: PrincipalId,
+    answerer_context: Option<ContextId>,
+    request_id: &str,
+    verdict: AskVerdict,
+    remember: Option<Remember>,
+) -> Result<AskAnswered, AskAnswerFailure> {
+    let allow = verdict == AskVerdict::Allow;
+    let span = tracing::info_span!(
+        "approval.decision",
+        ask.id = %request_id,
+        decision.actor.id = %answerer,
+        decision.verb = if allow { "allow" } else { "deny" },
+        principal.id = tracing::field::Empty,
+        actor.id = tracing::field::Empty,
+        reviewer.id = tracing::field::Empty,
+        context.id = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+    if verdict == AskVerdict::PromptCancelled && remember.is_some() {
+        return Err(failure(AskAnswerFailureKind::Refused, "a cancelled prompt cannot be remembered as a rule"));
+    }
+    let db_handle = kernel.kernel_db();
+    // The guard is released before the announcement below, which takes the
+    // same non-reentrant mutex to read the committed generation.
+    let result = {
+        let db = db_handle.lock();
+        let conn = db.conn_for_ledger();
+        let principal = answerer.as_bytes();
+        let context = answerer_context.map(|c| c.as_bytes().to_vec());
+        let answerer = approval_ledger::decide::Answerer { principal, context: context.as_deref() };
+
+        let row = match approval_ledger::ask::get_approval(conn, request_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(not_found(request_id)),
+            Err(e) => return Err(refused(e)),
+        };
+        record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
+        if remember.is_some_and(|r| r.scope == RememberScope::Session) {
+            session_remember_applies(&db, request_id, &row)?;
+        }
+        // An archived context runs nothing and answers nothing. Execution
+        // checks again, because a context can be archived between an answer
+        // and its run (`docs/gate-resume.md`, "Archived contexts are inert").
+        // A missing context row reads as not archived: `approvals.context_id`
+        // has no foreign key, and an ask may outlive its context.
+        if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id)
+            && db.get_context(ask_ctx).ok().flatten().is_some_and(|c| c.is_archived())
+        {
+            return Err(failure(AskAnswerFailureKind::Archived, format!(
+                "ask {request_id} belongs to context {}, which is archived — an archived context runs \
+                 nothing, so answering this would authorize work that can never happen. Unarchive it \
+                 first if the ask still matters.",
+                ask_ctx.short()
+            )));
+        }
+        // No separate claim: `decide` checks the answerer against the
+        // reviewer snapshot and moves the row in one write transaction, so
+        // exactly one answer wins and a refused answerer leaves nothing
+        // claimed behind it.
+        let decided = approval_ledger::decide::decide(conn, request_id, approval_ledger::decide::DecideInput {
+            allow,
+            decided_by: Some(answerer),
+            decided_option: Some(match verdict {
+                AskVerdict::Allow => "allow_once",
+                AskVerdict::PromptCancelled => "prompt_cancelled",
+                AskVerdict::Deny => "deny",
+            }),
+            remember_scope: remember.map(|r| remember_scope_str(r.scope)),
+            auto_reason: None,
+        });
+        match decided {
+            Ok(row) => {
+                tracing::info!(decision.status = %row.status, "approval ask decided");
+                let remembered = remember.map(|r| learn_for_answer(conn, request_id, r, allow, principal));
+                crate::ledger_view::summary(&db, &row)
+                    .map(|summary| AskAnswered { summary, remembered })
+                    .map_err(|e| failure(AskAnswerFailureKind::Refused, format!(
+                        "ask {request_id} was {}, but reading it back failed: {e}", row.status
+                    )))
+            }
+            Err(LedgerError::AlreadyDecided { status, .. }) => Err(failure(AskAnswerFailureKind::AlreadyAnswered, format!(
+                "ask {request_id} was already decided ({status}) — your late answer was recorded in the \
+                 event log but changed nothing"
+            ))),
+            Err(LedgerError::NotFound(_)) => Err(not_found(request_id)),
+            Err(e @ (LedgerError::SelfApproval { .. } | LedgerError::UnauthorizedReviewer { .. }
+                | LedgerError::UnresolvedIdentity { .. })) => Err(failure(AskAnswerFailureKind::NotReviewer, e.to_string())),
+            Err(e) => Err(refused(e)),
+        }
+    };
+    crate::kj::gate::announce_ledger_change(db_handle, kernel.ledger_flows());
+    result
+}
+
+/// Write the standing rule an answer asked for. Refusal is a result, not an
+/// error: the decision already committed.
+fn learn_for_answer(conn: &Connection, request_id: &str, remember: Remember, allow: bool, principal: &[u8]) -> RememberResult {
+    let scope = remember_scope_str(remember.scope);
+    let verb = if allow { "allow" } else { "deny" };
+    let rule_scope = match remember.scope {
+        RememberScope::Session => RuleScope::Session,
+        RememberScope::Always => RuleScope::Always,
+    };
+    let learned = if remember.family {
+        learn_family_for_ask(conn, request_id, rule_scope, allow, principal)
+            .map(|keys| format!("remembered as a standing {scope} family rule for {}", keys.join(", ")))
+    } else {
+        learn_every_statement(conn, request_id, rule_scope, allow, principal)
+            .map(|n| format!("remembered as a standing {scope} rule ({n} statement{})", if n == 1 { "" } else { "s" }))
+            .map_err(|e| e.to_string())
+    };
+    match learned {
+        Ok(note) => RememberResult { learned: true, note },
+        Err(e) => RememberResult { learned: false, note: format!("NOT remembered: {e} — the {verb} on THIS ask still stands") },
+    }
+}
+
+/// A session rule binds the ask's context and performer, so it is refused
+/// when the context's performer changed after the ask was raised.
+fn session_remember_applies(
+    db: &crate::kernel_db::KernelDb,
+    request_id: &str,
+    row: &approval_ledger::types::ApprovalRow,
+) -> Result<(), AskAnswerFailure> {
+    let cannot = |why: String| failure(AskAnswerFailureKind::Refused, format!("cannot --remember session for ask {request_id}: {why}"));
+    let ask_ctx = ContextId::try_from_slice(&row.context_id).ok_or_else(|| cannot("it has no valid context ID".into()))?;
+    let ask_actor = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice)
+        .ok_or_else(|| cannot("it has no performer identity".into()))?;
+    let requester = PrincipalId::try_from_slice(&row.principal_id)
+        .ok_or_else(|| cannot("it has no valid requester identity".into()))?;
+    let current = match db.get_context(ask_ctx) {
+        Ok(Some(context)) => context,
+        Ok(None) => return Err(cannot(format!("context {} is missing", ask_ctx.short()))),
+        Err(e) => return Err(cannot(format!("read context {}: {e}", ask_ctx.short()))),
+    };
+    if current.played_by.unwrap_or(requester) != ask_actor {
+        return Err(cannot("the context performer changed after this ask was raised".into()));
+    }
+    Ok(())
+}
+
+/// Reassign a pending ask. `to` names the next reviewer; `None` continues
+/// the walk reviewer resolution made, from the ask's context up
+/// `forked_from`, past the current reviewer and the performer
+/// (`docs/character.md`, "Roots and rotation"), and refuses at a root. The
+/// assigned reviewer or the lineage root of the ask's context may reassign.
+/// A caller who names itself takes the ask over; the `escalated` event
+/// records both reviewers either way.
+pub fn escalate_ask(
+    kernel: &crate::Kernel,
+    caller: PrincipalId,
+    request_id: &str,
+    to: Option<PrincipalId>,
+) -> Result<AskAnswered, AskAnswerFailure> {
+    let span = tracing::info_span!(
+        "approval.escalate",
+        ask.id = %request_id,
+        decision.actor.id = %caller,
+        principal.id = tracing::field::Empty,
+        actor.id = tracing::field::Empty,
+        reviewer.id = tracing::field::Empty,
+        context.id = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+    let db_handle = kernel.kernel_db();
+    let committed;
+    let result = {
+        let db = db_handle.lock();
+        let row = match db.get_approval(request_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(not_found(request_id)),
+            Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!("could not read ask '{request_id}': {e}"))),
+        };
+        // When the lineage has no root, only the assigned reviewer may escalate.
+        let root_authority = ContextId::try_from_slice(&row.context_id).and_then(|context| match db.lineage_root(context) {
+            Ok(root) => Some(root),
+            Err(error) => {
+                tracing::warn!(%error, "ask has no lineage root; only the assigned reviewer may escalate");
+                None
+            }
+        });
+        let target = match to {
+            Some(target) => match db.get_character(target) {
+                Ok(Some(character)) if character.retired_at.is_none() => target,
+                Ok(Some(character)) => return Err(failure(AskAnswerFailureKind::Refused, format!("character '{}' is retired", character.name))),
+                Ok(None) => return Err(failure(AskAnswerFailureKind::Refused, format!("no character {}", target.short()))),
+                Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!("could not resolve character {}: {e}", target.short()))),
+            },
+            None => next_reviewer_above(&db, request_id, &row)?,
+        };
+        if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id)
+            && db.get_context(ask_ctx).ok().flatten().is_some_and(|c| c.is_archived())
+        {
+            return Err(failure(AskAnswerFailureKind::Archived, format!(
+                "ask {request_id} belongs to context {}, which is archived; nobody can answer it",
+                ask_ctx.short()
+            )));
+        }
+        let escalated = approval_ledger::decide::escalate_with_authority(
+            db.conn_for_ledger(), request_id, caller.as_bytes(), target.as_bytes(),
+            root_authority.as_ref().map(|authority| authority.as_bytes().as_slice()),
+        );
+        committed = escalated.is_ok();
+        escalated
+        .map_err(|e| match e {
+            LedgerError::NotFound(_) => not_found(request_id),
+            e @ LedgerError::EscalateUnauthorized { .. } => failure(AskAnswerFailureKind::NotReviewer, e.to_string()),
+            e @ LedgerError::AlreadyDecided { .. } => failure(AskAnswerFailureKind::AlreadyAnswered, e.to_string()),
+            e => refused(e),
+        })
+        .and_then(|row| {
+            record_ask_identity(&span, &row.principal_id, row.actor_id.as_deref(), row.reviewer_id.as_deref(), &row.context_id);
+            tracing::info!("approval ask escalated");
+            crate::ledger_view::summary(&db, &row)
+                .map(|summary| AskAnswered { summary, remembered: None })
+                .map_err(|e| failure(AskAnswerFailureKind::Refused, format!(
+                    "ask {request_id} was reassigned, but reading it back failed: {e}"
+                )))
+        })
+    };
+    if committed {
+        crate::kj::gate::announce_ledger_change(db_handle, kernel.ledger_flows());
+    }
+    result
+}
+
+/// The next responsible character above an ask's current reviewer,
+/// excluding the performer.
+fn next_reviewer_above(
+    db: &crate::kernel_db::KernelDb,
+    request_id: &str,
+    row: &approval_ledger::types::ApprovalRow,
+) -> Result<PrincipalId, AskAnswerFailure> {
+    let refuse = |message: String| failure(AskAnswerFailureKind::Refused, message);
+    let current_reviewer = row.reviewer_id.as_deref().and_then(PrincipalId::try_from_slice)
+        .ok_or_else(|| refuse(format!("ask '{request_id}' has no current reviewer to escalate above")))?;
+    let current_name = db.get_character(current_reviewer).ok().flatten()
+        .map(|character| character.name)
+        .unwrap_or_else(|| current_reviewer.to_string());
+    let context = ContextId::try_from_slice(&row.context_id)
+        .ok_or_else(|| refuse(format!("ask '{request_id}' has no readable context to walk")))?;
+    // Escalation climbs past whoever already holds the ask, and never lands
+    // on the character that performed it.
+    let mut excluded = vec![current_reviewer];
+    if let Some(actor) = row.actor_id.as_deref().and_then(PrincipalId::try_from_slice) {
+        excluded.push(actor);
+    }
+    match db.responsible_character_above(context, &excluded) {
+        Ok(Some(next)) => match db.get_character(next) {
+            Ok(Some(_)) => Ok(next),
+            Ok(None) | Err(_) => Err(refuse(format!("the character responsible above {current_name} has no character sheet"))),
+        },
+        Ok(None) => Err(refuse(format!("{current_name} is at the root; nobody above {current_name}"))),
+        Err(e) => Err(refuse(format!("could not walk the accountability forest: {e}"))),
+    }
+}
+
+fn remember_scope_str(scope: RememberScope) -> &'static str {
+    match scope {
+        RememberScope::Session => "session",
+        RememberScope::Always => "always",
+    }
+}
+
+fn failure(kind: AskAnswerFailureKind, message: impl Into<String>) -> AskAnswerFailure {
+    AskAnswerFailure { kind, message: message.into() }
+}
+
+fn not_found(request_id: &str) -> AskAnswerFailure {
+    failure(AskAnswerFailureKind::NotFound, format!("no such ask {request_id}"))
+}
+
+fn refused(e: impl std::fmt::Display) -> AskAnswerFailure {
+    failure(AskAnswerFailureKind::Refused, e.to_string())
 }
 
 /// Generalize EVERY statement of `request_id` into a standing rule, all in

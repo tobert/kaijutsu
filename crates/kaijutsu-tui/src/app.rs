@@ -1,18 +1,18 @@
 //! Client state: which contexts are watched and how each is shown, the
-//! rank, the pending-ask count, and what the status line says.
+//! rank, the open asks, and what the status line says.
 //!
 //! Pure. Nothing here opens a connection, reads a clock, or draws a cell —
 //! every value a decision needs is handed in, so the whole module is
 //! unit-testable without a kernel and without a terminal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use kaijutsu_client::{
     ConnectionStatus, ContextChange, ContextInfo, ContextMirror, RankedSeat, ranked_seats,
 };
 use kaijutsu_types::{
-    BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
+    AskSummary, BlockId, BlockKind, BlockSnapshot, ContextId, InputEdge, PrincipalId, Role, Status,
 };
 use kaijutsu_viz::layout::Band;
 
@@ -132,8 +132,6 @@ pub struct App {
     pub previous: Option<ContextId>,
     pub views: HashMap<ContextId, ContextView>,
     pub connection: Option<ConnectionStatus>,
-    /// Pending asks across every context (`asks.rs` answers them).
-    pub pending_asks: usize,
     /// The compose surface — a modalkit `VimMachine` over the context's
     /// kernel-owned draft block, and the `:` bar (`compose.rs`).
     pub compose: Compose,
@@ -185,13 +183,27 @@ pub struct App {
     /// parks [`Self::screen`] under the context it belongs to and restores
     /// whatever the target was left in ([`Self::switch_to`]).
     pub parked_screens: HashMap<ContextId, crate::editor::ScreenMode>,
-    /// Which context each pending ask belongs to
-    /// (`kaijutsu_client::AskInfo::context_id`), kept current by
-    /// [`Self::note_ask`]/[`Self::forget_asks_not_in`] from the same poll
-    /// loop that maintains `seen_asks` (`run.rs`) — what
-    /// [`Self::status_model`] reads to mark a seat `!` without re-deriving
-    /// it from the ledger on every frame.
-    pub ask_owners: HashMap<String, ContextId>,
+    /// The open asks across every context, keyed by request id: the last
+    /// synced [`kaijutsu_client::LedgerState`] folded in by
+    /// [`crate::asks::fold_ledger`]. A seat's `!` and the status line's `!n`
+    /// read it.
+    pub open_asks: BTreeMap<String, AskSummary>,
+    /// Open asks whose card must not come up again on its own: put aside
+    /// with `Esc`, answered from the card and waiting for the ledger to
+    /// close it, or left for the ledger view with `v`. Pruned to
+    /// [`Self::open_asks`] on every fold.
+    pub asks_set_aside: HashSet<String>,
+    /// Whether a synced ledger state has been folded in yet. The first fold
+    /// is the baseline: the asks it brings were open before this client
+    /// looked, so they are not news ([`crate::asks::NotifySeen::baseline`]).
+    pub ledger_folded: bool,
+    /// Asks whose card read found nothing or failed. Not read again until
+    /// the next fold, so a stale open set cannot make the card read spin.
+    pub card_reads_missed: HashSet<String>,
+    /// Kernel work about asks that keys asked for. The key path only
+    /// records it; the event loop drains it and runs each item on its own
+    /// task (`crate::run`), so no key waits on the kernel for an ask.
+    pub ask_work: Vec<crate::asks::AskWork>,
     /// The ask card showing in the live region, when one is — never more
     /// than one at a time (`docs/tui.md`, "Asks": it draws as an overlay, it
     /// is not a queue of modals).
@@ -248,7 +260,6 @@ impl App {
             previous: None,
             views: HashMap::new(),
             connection: None,
-            pending_asks: 0,
             compose: Compose::new(),
             palette: Palette::builtin(),
             screen_rows: 24,
@@ -262,7 +273,11 @@ impl App {
             paste_buffer: None,
             screen: crate::editor::ScreenMode::Conversation,
             parked_screens: HashMap::new(),
-            ask_owners: HashMap::new(),
+            open_asks: BTreeMap::new(),
+            asks_set_aside: HashSet::new(),
+            ledger_folded: false,
+            card_reads_missed: HashSet::new(),
+            ask_work: Vec::new(),
             ask_card: None,
             ask_arming: None,
             ledger_view: None,
@@ -384,9 +399,9 @@ impl App {
         if let Some(view) = self.views.get_mut(&id) {
             view.activity = false;
         }
-        // The card is the current context's ask; leaving that context sets
-        // it aside. The ask stays pending and the refresh raises the card
-        // again on return.
+        // The card is the current context's ask; leaving that context takes
+        // it down. The ask stays open and its card comes up again on return
+        // (`crate::asks::card_candidate`).
         self.ask_card = None;
     }
 
@@ -714,7 +729,7 @@ impl App {
                 c.context_used_tokens.map(|used| crate::status::TokenFigure { used, window: c.context_window })
             }),
             cache: self.cache_health(now_millis),
-            pending_asks: self.pending_asks,
+            pending_asks: self.open_asks.len(),
             connection: self.connection.clone(),
             notice: self.notice.clone(),
             track: self.track_figure(),
@@ -745,34 +760,6 @@ impl App {
         {
             view.collapsed.insert(*block_id, *collapsed);
         }
-    }
-
-    /// Record that an ask is pending for `context_id` — called from the
-    /// poll loop (`run.rs`) for every ask [`kaijutsu_client::poll_new_asks`]
-    /// reports.
-    pub fn note_ask(&mut self, request_id: String, context_id: ContextId) {
-        self.ask_owners.insert(request_id, context_id);
-    }
-
-    /// Drop every tracked ask whose id is not in `still_pending` — an ask
-    /// leaves `still_pending` the moment it is decided, by any answerer,
-    /// through any surface, so this is how a seat's `!` clears without this
-    /// client having answered it itself. Same contract as the ledger's own
-    /// `seen` pruning (`kaijutsu_client::ledger`'s `diff_new`).
-    pub fn forget_asks_not_pending(&mut self, still_pending: &HashSet<String>) {
-        self.ask_owners.retain(|id, _| still_pending.contains(id));
-    }
-
-    /// Take the ask card down when its ask is no longer pending — answered
-    /// from another surface, expired, or abandoned — and hand it back so
-    /// the caller can say what became of it. `None` while no card is up or
-    /// its ask is still in `still_pending`. The card's own keys never come
-    /// through here: they take the card before the answer round trip.
-    pub fn take_answered_card(&mut self, still_pending: &HashSet<String>) -> Option<crate::asks::AskCardState> {
-        if self.ask_card.as_ref().is_some_and(|card| !still_pending.contains(&card.request_id)) {
-            return self.ask_card.take();
-        }
-        None
     }
 
     /// Bring the ask card's arming up to `now`, before a frame is drawn.
@@ -824,10 +811,10 @@ impl App {
         false
     }
 
-    /// Whether any tracked ask belongs to `context_id` — [`SeatCell::ask`]'s
+    /// Whether any open ask belongs to `context_id` — [`SeatCell::ask`]'s
     /// derivation.
     pub fn has_pending_ask(&self, context_id: ContextId) -> bool {
-        self.ask_owners.values().any(|c| *c == context_id)
+        self.open_asks.values().any(|ask| ask.context_id == Some(context_id))
     }
 
     /// `bar.beat` + pulse for the playing track: the current context's own
@@ -1328,39 +1315,7 @@ mod tests {
     }
 
     fn ask_card(request_id: &str, context_id: ContextId) -> crate::asks::AskCardState {
-        crate::asks::AskCardState {
-            request_id: request_id.to_string(),
-            context_id,
-            detail: kaijutsu_client::AskDetail {
-                request_id: request_id.to_string(),
-                context_id: Some(context_id),
-                principal_id: None,
-                principal_name: None,
-                actor_id: None,
-                actor_name: None,
-                reviewer_id: None,
-                reviewer_name: None,
-                status: "pending".to_string(),
-                origin: "shell_gate".to_string(),
-                tool: Some("shell_write".to_string()),
-                hook_id: None,
-                instance: None,
-                tool_call_block_id: None,
-                description: "kj cc send".to_string(),
-                authorized_label: None,
-                statements: vec!["kj cc send".to_string()],
-                exec_source: None,
-                cwd: None,
-                env: Vec::new(),
-                created_at: None,
-                decided_at: None,
-                decided_by: None,
-                decided_by_name: None,
-                decided_option: None,
-                remember_scope: None,
-                redeemed_at: None, publication_abandoned: None,
-            },
-        }
+        crate::asks::fixtures::card(request_id, context_id, "kj cc send")
     }
 
     fn ms(n: u64) -> std::time::Duration {
@@ -1466,9 +1421,6 @@ mod tests {
         assert!(!app.ask_card_armed());
     }
 
-    /// An ask answered from another surface leaves the pending set on the
-    /// next poll; the card showing it must come down with it, or every key
-    /// stays swallowed by a card nobody can answer.
     /// A terminal that reports `FocusLost` and never reports again must not
     /// leave the client believing nobody is looking for the rest of the
     /// session: the next key says otherwise.
@@ -1480,24 +1432,9 @@ mod tests {
         assert!(app.focused, "input only reaches a focused terminal");
     }
 
-    #[test]
-    fn an_ask_card_comes_down_when_its_ask_leaves_the_pending_set() {
-        let (mut app, a, _b) = app_with_two();
-        app.ask_card = Some(ask_card("01a05d22", a));
-
-        let still_pending: HashSet<String> = ["01a05d22".to_string()].into_iter().collect();
-        assert!(app.take_answered_card(&still_pending).is_none(), "a pending ask keeps its card");
-        assert!(app.ask_card.is_some());
-
-        let taken = app.take_answered_card(&HashSet::new()).expect("the answered ask's card is handed back");
-        assert_eq!(taken.request_id, "01a05d22");
-        assert!(app.ask_card.is_none(), "the card is down");
-        assert!(app.take_answered_card(&HashSet::new()).is_none(), "nothing to take twice");
-    }
-
     /// The card is always the current context's ask, so leaving that
-    /// context sets it aside: the seat on screen never shows another seat's
-    /// card, and the ask stays pending for the refresh to raise again.
+    /// context takes it down: the seat on screen never shows another seat's
+    /// card, and the ask stays open for its card to come up again on return.
     #[test]
     fn switching_seats_sets_the_ask_card_aside() {
         let (mut app, a, b) = app_with_two();

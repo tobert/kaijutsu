@@ -426,7 +426,7 @@ fn converse(
         if let Some(cancel) = &prompt.cancel {
             cancel_mid_call(agent, &session, id, cancel, &scratch.workspace, timeout).with_context(|| label.clone())?;
         }
-        release_holds(agent, id, prompt, updates_before, permissions_before, &scratch.workspace, timeout)
+        release_holds(agent, id, prompt, permissions_before, &scratch.workspace, timeout)
             .with_context(|| label.clone())?;
         let (response, answered) = agent.wait_response_at(id, "session/prompt").with_context(|| label.clone())?;
         agent.pump_until_quiet(SETTLE, timeout, &label)?;
@@ -439,6 +439,7 @@ fn converse(
         failures.extend(check_prompt(&label, prompt, &seen));
         prompts.push(PromptWire { label, sent, response, answered, ended: agent.arrival() });
     }
+    failures.extend(answers_shown_as_tool_calls(agent.updates()));
     Ok(Transcript {
         initialize: init,
         session_new,
@@ -450,14 +451,14 @@ fn converse(
 
 /// Answer the requests `prompt` holds while its turn waits on them. Once
 /// every held request has arrived, run `on_hold`, then send each `release`
-/// answer, waiting after each one but the last until the agent has recorded
-/// it: its `kj` ledger call completes. The next answer is then decided
-/// under whatever the previous one changed, such as a remembered rule.
+/// answer, waiting after each one but the last until the ledger has taken
+/// it up: the agent logs [`ASK_ANSWER_LOGGED`]. The next answer is then
+/// decided under whatever the previous one changed, such as a remembered
+/// rule.
 fn release_holds(
     agent: &mut AcpClient,
     request: i64,
     prompt: &Prompt,
-    updates_before: usize,
     permissions_before: usize,
     workspace_host: &Path,
     timeout: Duration,
@@ -480,22 +481,61 @@ fn release_holds(
         }
     }
     for (n, answer) in prompt.release.iter().enumerate() {
-        let recorded = completed_ledger_calls(&agent.updates()[updates_before..]);
+        let mark = agent.stderr().len();
         agent.release_held(permissions_before, (*answer).into()).context("release a held permission request")?;
         if n + 1 < prompt.release.len() {
-            let what = format!("the agent to record release answer {}", n + 1);
-            agent.pump_until(Some(request), &what, timeout, |updates| {
-                completed_ledger_calls(&updates[updates_before..]) > recorded
+            let what = format!("the ledger to take up release answer {}", n + 1);
+            agent.pump_until_state(Some(request), &what, timeout, |a| {
+                a.stderr().get(mark..).is_some_and(|tail| tail.contains(ASK_ANSWER_LOGGED))
             })?;
         }
     }
     Ok(())
 }
 
-/// How many `kj` tool calls in `updates` have completed: the ACP bridge
-/// reports each permission answer it records as one.
-fn completed_ledger_calls(updates: &[Value]) -> usize {
-    client::tool_calls(updates).iter().filter(|c| c.title == "kj" && c.status.as_deref() == Some("completed")).count()
+/// What the ACP bridge logs each time the ledger takes up a permission
+/// answer, recorded or refused (`kaijutsu_acp::permission::ASK_ANSWER_LOGGED`).
+/// An answer authors no block, so the update stream never shows it.
+pub const ASK_ANSWER_LOGGED: &str = "ask_answer=";
+
+/// A failure for every tool call in `updates` that shows a permission
+/// answer: a `kj` call that names the ledger, or any call whose input runs
+/// `ledger allow` or `ledger deny`. The ledger row is the record of an
+/// answer, and answering authors no block in any transcript
+/// (`docs/acp.md`, "Permission asks, ledger-driven").
+pub fn answers_shown_as_tool_calls(updates: &[Value]) -> Vec<String> {
+    client::tool_calls(updates)
+        .iter()
+        .filter(|call| {
+            let words = call.raw_input.as_ref().map(input_words).unwrap_or_default();
+            let names_ledger = words.iter().any(|w| w == "ledger");
+            let answers = words.windows(2).any(|pair| pair[0] == "ledger" && (pair[1] == "allow" || pair[1] == "deny"));
+            (call.title == "kj" && names_ledger) || answers
+        })
+        .map(|call| {
+            format!(
+                "a permission answer appeared in the update stream as a tool call: {:?} {}; an answer is recorded \
+                 in the ledger and authors no block",
+                call.title,
+                call.raw_input.as_ref().map_or_else(String::new, Value::to_string)
+            )
+        })
+        .collect()
+}
+
+/// Every whitespace-separated word in the strings of `input`, in order.
+fn input_words(input: &Value) -> Vec<String> {
+    fn collect(value: &Value, words: &mut Vec<String>) {
+        match value {
+            Value::String(text) => words.extend(text.split_whitespace().map(str::to_string)),
+            Value::Array(items) => items.iter().for_each(|item| collect(item, words)),
+            Value::Object(fields) => fields.values().for_each(|field| collect(field, words)),
+            _ => {}
+        }
+    }
+    let mut words = Vec::new();
+    collect(input, &mut words);
+    words
 }
 
 /// What the solo agent's kernel logs once an interrupt has marked a running
@@ -731,6 +771,33 @@ mod tests {
 
     fn chunk(text: &str) -> Value {
         json!({"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}})
+    }
+
+    fn call(id: &str, title: &str, input: Value) -> Value {
+        json!({"update": {"sessionUpdate": "tool_call", "toolCallId": id, "title": title, "status": "completed", "rawInput": input}})
+    }
+
+    #[test]
+    fn a_permission_answer_shown_as_a_tool_call_fails_the_run() {
+        let updates = vec![
+            call("a", "kj", json!({"argv": ["ledger", "allow", "req-1"]})),
+            call("b", "shell_write", json!({"command": "kj ledger deny req-2 --cancelled"})),
+            call("c", "kj", json!({"argv": ["ledger", "show", "req-1"]})),
+        ];
+        let failures = answers_shown_as_tool_calls(&updates);
+        assert_eq!(failures.len(), 3, "{failures:#?}");
+        assert!(failures[0].contains("\"kj\""), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_model_reading_the_ledger_through_its_shell_is_not_an_answer() {
+        let updates = vec![
+            call("a", "shell_write", json!({"command": "kj ledger show \"$(kj ledger list --history | jq -r '.[0]')\""})),
+            call("b", "shell_write", json!({"command": "kj ledger list --history --status denied"})),
+            call("c", "kj", json!({"argv": ["context", "list"]})),
+            call("d", "done", json!({"status": "done", "feedback": "allow deny ledger"})),
+        ];
+        assert_eq!(answers_shown_as_tool_calls(&updates), Vec::<String>::new());
     }
 
     #[test]

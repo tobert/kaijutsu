@@ -823,59 +823,53 @@ impl turn_events::Server for TurnEventsForwarder {
 // Approval-ledger change notification
 // ============================================================================
 
-/// Implements the Cap'n Proto `LedgerEvents::Server` trait, forwarding each
-/// `onChanged` push into a dedicated `broadcast::Sender<i64>`.
-///
-/// Deliberately its own tiny broadcast channel rather than a new
-/// `ServerEvent` variant riding the shared `event_tx`: the payload is one
-/// `i64` generation and nothing else (see `LedgerFlow`'s doc comment in
-/// `kaijutsu-kernel`'s `flows.rs` for why), and every consumer of this
-/// channel — the Bevy app's dirty-indicator, an ACP adapter deciding whether
-/// to re-render a pending prompt — wants exactly that number with no
-/// unrelated block/turn/editor traffic to filter out of.
+/// Implements the Cap'n Proto `LedgerEvents::Server` trait, handing each
+/// `onAsks` push to `on_push`. The actor folds pushes into its
+/// [`crate::ledger::LedgerState`]; [`ledger_events_channel`] broadcasts them.
 pub(crate) struct LedgerEventsForwarder {
-    pub tx: broadcast::Sender<i64>,
+    pub on_push: Box<dyn Fn(crate::ledger::LedgerPush)>,
 }
 
 /// Build a `LedgerEvents` callback client plus the receiver its pushes land
-/// on. Pass the returned client to
-/// [`KernelHandle::subscribe_ledger_events`](crate::rpc::KernelHandle::subscribe_ledger_events);
-/// drain the receiver for the ledger's generation after each change.
-///
-/// A broadcast because `onChanged` expects no answer and several consumers
-/// (the app's dirty-indicator, an ACP adapter deciding whether to re-render
-/// a pending prompt) can all want the same generation hint at once.
-/// `ActorHandle::subscribe_ledger_events` calls `.subscribe()` on the
-/// actor's one persistent sender for exactly this reason.
+/// on. Pass the client to
+/// [`KernelHandle::subscribe_ledger_events`](crate::rpc::KernelHandle::subscribe_ledger_events).
+/// Most callers want [`crate::ActorHandle::ledger`] instead, which keeps
+/// the open asks current across reconnects.
 pub fn ledger_events_channel(
     capacity: usize,
-) -> (crate::kaijutsu_capnp::ledger_events::Client, broadcast::Receiver<i64>) {
+) -> (crate::kaijutsu_capnp::ledger_events::Client, broadcast::Receiver<crate::ledger::LedgerPush>) {
     let (tx, rx) = broadcast::channel(capacity);
-    let client: crate::kaijutsu_capnp::ledger_events::Client =
-        capnp_rpc::new_client(LedgerEventsForwarder { tx });
+    let client: crate::kaijutsu_capnp::ledger_events::Client = capnp_rpc::new_client(LedgerEventsForwarder {
+        on_push: Box::new(move |push| {
+            if tx.send(push).is_err() {
+                tracing::debug!("ledger push dropped: no subscribers");
+            }
+        }),
+    });
     (client, rx)
 }
 
 #[allow(refining_impl_trait)]
 impl ledger_events::Server for LedgerEventsForwarder {
-    fn on_changed(
+    fn on_asks(
         self: Rc<Self>,
-        params: ledger_events::OnChangedParams,
-        _results: ledger_events::OnChangedResults,
+        params: ledger_events::OnAsksParams,
+        _results: ledger_events::OnAsksResults,
     ) -> Promise<(), capnp::Error> {
-        let generation = match params.get() {
-            Ok(p) => p.get_generation(),
-            Err(e) => return Promise::err(e),
-        };
-        // No-subscribers is not an error: a client that never called
-        // `subscribe_ledger_events()` just has nowhere for this hint to go.
-        // `send` returning `Err` only means the receiver count is currently
-        // zero (the persistent sender itself never gets torn down between
-        // reconnects), so this stays `debug!`, not `warn!`.
-        if self.tx.send(generation).is_err() {
-            tracing::debug!(generation, "ledger-changed hint dropped: no subscribers");
+        let push = (|| -> Result<crate::ledger::LedgerPush, crate::rpc::RpcError> {
+            let p = params.get()?;
+            Ok(crate::ledger::LedgerPush {
+                generation: p.get_generation(),
+                asks: p.get_asks()?.iter().map(crate::ledger_wire::ask_summary).collect::<Result<_, _>>()?,
+            })
+        })();
+        match push {
+            Ok(push) => {
+                (self.on_push)(push);
+                Promise::ok(())
+            }
+            Err(e) => Promise::err(capnp::Error::failed(format!("ledger push: {e}"))),
         }
-        Promise::ok(())
     }
 }
 

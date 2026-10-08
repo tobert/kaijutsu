@@ -61,6 +61,7 @@
 //! opinion from an outside model), not forward-ported from a wire shape.
 
 pub mod ask;
+pub mod changes;
 pub mod claim;
 pub mod council;
 pub mod council_observation;

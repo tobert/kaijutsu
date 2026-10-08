@@ -321,6 +321,49 @@ the model under observation has tried."
   tree); its snapshot cadence against `snapshot_bytes`; and how much
   history it keeps before compaction.
 
+## Council presets per context (Amy, 2026-10-08)
+
+Amy: "bumps should only be enabled on coders and optionally. maybe we come
+up with some kind of preset for contexts with bumps, then we can likely put
+in like, mk bumps, lfm2d bumps, and Jev! bumps." Council is enabled per
+context type in `gate.toml` today; moltar dropped the director's council on
+2026-10-08 because Amy watches the director herself. Open: whether a named
+council profile belongs on `kj preset` (which already assigns a cast at
+fork) or as a named section in `gate.toml`, and what distinguishes the mk,
+lfm2d, and Jev! flavors (judge model, rubric, or both).
+
+## Dead test helpers in `mcp/servers/file.rs` (2026-10-08)
+
+`cargo check -p kaijutsu-kernel --tests` warns that `broker_with_vfs_file`
+and `broker_with_vfs_files` (`kaijutsu-kernel/src/mcp/servers/file.rs`) are
+unused. Seen while retiring `shellDryRun`; not caused by it.
+
+## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
+
+The ledger push brings an ask to the TUI sooner than the old poll did, so a
+card more often arms while a person is still typing a draft line. Once armed,
+a typed `d`, `a`, `A` or `v` answers or moves the ask (`docs/tui.md`, "Asks",
+and `kaijutsu_client::AskArming`). Seen in `terminal_fit`'s desktop-notify
+test, where `send` denied the ask. Open: whether arming should also wait for
+the line to be sent or cleared, not only for a pause in typing.
+
+## acp-fleet host scenarios out of step with earlier commits (2026-10-08)
+
+Found while moving the fleet onto the typed ledger; neither failure comes
+from that change.
+
+- `approval/f-model-cannot-forget-human-rule`, prompt 2: `kj ledger forget`
+  now gets "not part of this seat's work" because 13fff761 took `house`
+  from the coder seat, so the scenario never reaches the rule check it was
+  written for. Grant `house` in its rc overlay, as `permission-allow-deny`
+  does, or change the expectation.
+- `harbor-truncated-tool-call` expects "were not valid JSON"; the kernel says
+  "its arguments did not parse" since 33156e27/6eb7603d.
+- The F8 `known_gap` in `approval/a-config-deny-shell*.toml` matches the broad
+  substring "prompt 2: expected tool calls" and now excuses a different
+  failure (the `house` refusal of `kj ledger list`). Narrow the match.
+- Contained scenarios (`fleet/contained`, podman) were not run.
+
 ## Council bump-only has no way to hand an action to Amy (2026-10-06)
 
 In bump-only mode every decision that does not pass bumps, so a command the
@@ -2431,8 +2474,9 @@ failure before that call also needs a complete bootstrap retry.
 ## Bevy approval review: the surfaces shipped, two gaps left (2026-09-12)
 
 The ask sheet (`ui/ask_sheet.rs`) and the ledger ribbon
-(`ui/ledger_ribbon.rs`, `Ctrl+A l`) read `connection::ledger::LedgerMirror`
-and write decisions back through it, with `InputContext::AskSheet` and
+(`ui/ledger_ribbon.rs`, `Ctrl+A l`) read `connection::ledger::LedgerMirror`,
+which follows `ActorHandle::ledger`, and send decisions through it as
+`decide_ask`, with `InputContext::AskSheet` and
 `InputContext::LedgerRibbon` taking the keyboard while either is up. What is
 still missing:
 
@@ -2444,7 +2488,7 @@ still missing:
   character is the director; reviewer assignment follows explicit delegation
   or the Amy default.
 - **The PLAN block renders a flat statement list**, which is all
-  `kj ledger show` carries. A plan tree and per-statement verdicts would
+  the ledger's `AskSummary` carries. A plan tree and per-statement verdicts would
   need kernel fields first; the block is shaped to take them.
 - **Neither surface's state is BRP-visible**, so a live check can only read
   `ActiveInputContexts` to tell whether the sheet or the ribbon has the keys.

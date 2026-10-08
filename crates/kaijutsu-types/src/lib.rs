@@ -43,6 +43,7 @@
 //! | [`BlockSnapshot`] | Serializable block state                     |
 //! |-------------------|----------------------------------------------|
 
+pub mod ask;
 pub mod block;
 pub mod codec;
 pub mod context;
@@ -166,6 +167,10 @@ pub use ids::{
 pub use ids::{PrefixError, PrefixResolvable, resolve_context_prefix, resolve_prefix};
 pub use kernel::Kernel;
 pub use principal::{Credential, CredentialKind};
+pub use ask::{
+    AskAnswerFailure, AskAnswerFailureKind, AskAnswered, AskDecision, AskDetail, AskEnv, AskFilter, AskOrigin, AskReassignment, AskSummary, AskVerdict, AskView, PrincipalRef,
+    Remember, RememberResult, RememberScope,
+};
 pub use refusal::{AskRef, AskStatus, Refusal, RefusalKind};
 pub use session::Session;
 pub use tick::{Span, Tick, TickDelta};

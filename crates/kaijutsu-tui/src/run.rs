@@ -39,7 +39,7 @@ use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
 use crate::picker::{self, Outcome as PickerOutcome};
-use crate::refresh::{self, decision_words, short_ask};
+use crate::refresh;
 use crate::render;
 
 use crossterm::event::KeyEvent;
@@ -596,18 +596,18 @@ async fn event_loop(
     let mut keys = Keys::new();
     let mut interrupt_ladder = interrupt::Ladder::new();
     let mut status = bridge.actor().watch_status();
-    // Ask polling is driven by the ledger's own change stream, not by the
-    // refresh timer (`refresh::Request::poll_asks`).
-    let mut ledger_events = bridge.actor().subscribe_ledger_events();
-    let mut ledger_open = true;
-    let mut seen_asks = std::collections::HashSet::new();
-    let mut poll_asks = true;
-    // The session's first ledger poll is a baseline: it reports every ask
-    // already pending as new, including asks raised before this client
-    // attached. Taken by the round that polls; `round_baseline` carries it
-    // to that round's answer (`asks::NotifySeen::baseline`).
-    let mut first_poll = true;
-    let mut round_baseline = false;
+    // The open asks arrive on the actor's ledger watch, which the kernel's
+    // push keeps current; nothing polls. Marked changed so the state the
+    // actor already holds is folded in on the first turn of the loop.
+    let mut ledger = bridge.actor().ledger();
+    ledger.mark_changed();
+    // The records a fold asks for (the card candidate's, an answered card's
+    // decision) and the work a key asks for (the ledger view, an answer)
+    // run on their own tasks and land here (`spawn_ask_read`,
+    // `spawn_ask_work`).
+    let (ask_read_tx, mut ask_landed) = mpsc::unbounded_channel::<AskLanded>();
+    // The card candidate whose record is being read, so it is read once.
+    let mut card_read: Option<String> = None;
     let mut stop_signals = StopSignals::listen().context("listen for SIGTERM and SIGHUP")?;
     let mut refresh = tokio::time::interval(REFRESH);
     // The round in flight, if one is. Its result lands through the join arm
@@ -673,7 +673,6 @@ async fn event_loop(
                                 ProbePanic::Off => {}
                             }
                         }
-                        let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
                         // The prefix is never the picker's key
                         // ([`Keys::claims`]); `act` runs the chord over it.
                         if app.picker.is_some() && !keys.claims(&key) {
@@ -692,9 +691,10 @@ async fn event_loop(
                                 app.saw_input();
                             }
                         }
-                        if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
-                            poll_asks = true;
-                        }
+                        spawn_ask_work(bridge, app, &ask_read_tx);
+                        // A switch, an `Esc`, or an answer may leave room for
+                        // a card; `raise_card` does nothing while one is up.
+                        raise_card(bridge, app, &ask_read_tx, &mut card_read);
                         if std::mem::take(&mut app.roster_changed) {
                             refresh_wanted = true;
                             refresh.reset_immediately();
@@ -785,16 +785,66 @@ async fn event_loop(
                     app.note("kernel connection lost; turn liveness reset");
                 }
                 app.connection = Some(connection);
-                if matches!(app.connection, Some(kaijutsu_client::ConnectionStatus::Connected { .. })) {
-                    poll_asks = true;
+                // The actor reads the ledger before it reports `Connected`,
+                // so an unsynced ledger here is a listing or subscription
+                // that failed: the asks on screen stop moving, and the
+                // player is told rather than left to trust them.
+                if matches!(app.connection, Some(kaijutsu_client::ConnectionStatus::Connected { .. }))
+                    && !ledger.borrow().synced
+                {
+                    app.note("cannot follow the approval ledger; asks on screen may be stale");
                 }
                 dirty = true;
             }
-            received = ledger_events.recv(), if ledger_open => {
-                match received {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => poll_asks = true,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => ledger_open = false,
+            Ok(()) = ledger.changed() => {
+                let folded = {
+                    let state = ledger.borrow_and_update();
+                    asks::fold_ledger(app, &state)
+                };
+                if let Some(fold) = folded {
+                    if let Some(request_id) = fold.answered {
+                        spawn_ask_read(bridge, &ask_read_tx, request_id, AskReadFor::Answered);
+                    }
+                    raise_card(bridge, app, &ask_read_tx, &mut card_read);
+                    // An ask that landed while nobody was looking says so to
+                    // the desktop; one that landed in front of the player is
+                    // the card on screen (`docs/tui.md`, "Asks").
+                    let seen = asks::NotifySeen {
+                        focused: app.focused,
+                        baseline: fold.baseline,
+                        raised_in: fold.raised_in,
+                        current: app.current,
+                    };
+                    if let Some(context_id) = asks::notify_target(seen)
+                        && let Some(notification) = asks::ask_notification(app.focused, &app.label_for(context_id))
+                    {
+                        let _guard = wires.term_lock.lock();
+                        crossterm::execute!(io::stdout(), Print(notification))
+                            .context("raise a desktop notification")?;
+                    }
+                    dirty = true;
                 }
+            }
+            Some(landed) = ask_landed.recv() => {
+                match landed {
+                    AskLanded::Read { request_id, purpose: AskReadFor::Card, result } => {
+                        if card_read.as_deref() == Some(request_id.as_str()) {
+                            card_read = None;
+                        }
+                        asks::land_card_read(app, &request_id, result);
+                    }
+                    AskLanded::Read { request_id, purpose: AskReadFor::Answered, result } => {
+                        let detail = result.ok().flatten();
+                        app.note(asks::answered_notice(app.principal, &request_id, detail.as_ref()));
+                    }
+                    AskLanded::Ledger(reads) => asks::land_ledger(app, reads, kaijutsu_types::now_millis()),
+                    AskLanded::Shown { request_id, result } => asks::land_show(app, &request_id, result),
+                    AskLanded::Decided { request_id, answer } => asks::land_decision(app, &request_id, answer),
+                }
+                // The candidate may have moved on, or a failed answer put
+                // its ask back; this reads the one to show now.
+                raise_card(bridge, app, &ask_read_tx, &mut card_read);
+                dirty = true;
             }
             signal = stop_signals.recv() => {
                 // The loop ends as `:q` ends it, so the terminal is
@@ -807,55 +857,18 @@ async fn event_loop(
                 // and the next tick starts the next one.
                 if refresh_task.is_none() {
                     refresh_wanted = false;
-                    let poll = poll_asks && app.current.is_some();
-                    if poll {
-                        poll_asks = false;
-                    }
-                    round_baseline = poll && std::mem::take(&mut first_poll);
-                    let request = refresh::Request {
-                        current: app.current,
-                        poll_asks: poll,
-                        seen_asks: seen_asks.clone(),
-                        card: app.ask_card.as_ref().map(|card| (card.request_id.clone(), card.context_id)),
-                    };
-                    refresh_task = Some(tokio::spawn(refresh::fetch(bridge.clone(), request)));
+                    refresh_task = Some(tokio::spawn(refresh::fetch(bridge.clone())));
                 }
             }
             joined = async { refresh_task.as_mut().expect("guarded by is_some").await }, if refresh_task.is_some() => {
                 refresh_task = None;
                 let refreshed = joined.context("background refresh round")?;
-                let presentation = (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone()));
-                // Read before the fold, which consumes the round: the ask
-                // whose arrival may be worth a desktop notification.
-                let raised_in = refreshed
-                    .asks
-                    .as_ref()
-                    .and_then(|poll| poll.new_asks.first())
-                    .map(|ask| ask.info.context_id);
-                let baseline = std::mem::take(&mut round_baseline);
-                refresh::apply(app, refreshed, &mut seen_asks);
-                // An ask that landed while nobody was looking says so to the
-                // desktop; one that landed in front of the player is already
-                // the card on screen (`docs/tui.md`, "Asks"). Decided after
-                // the fold, so `current` is the seat a switch may have moved
-                // to while the round was in flight and the label is the one
-                // this round listed.
-                let seen = asks::NotifySeen { focused: app.focused, baseline, raised_in, current: app.current };
-                if let Some(context_id) = asks::notify_target(seen)
-                    && let Some(notification) = asks::ask_notification(app.focused, &app.label_for(context_id))
-                {
-                    let _guard = wires.term_lock.lock();
-                    crossterm::execute!(io::stdout(), Print(notification))
-                        .context("raise a desktop notification")?;
-                }
+                refresh::apply(app, refreshed);
                 // The rank the hot set reads was just recomputed, so this is
                 // where a promote makes a context resident and a demote lets
                 // one go. Releasing is local; the hydrate rides its own task.
                 release_cold(app, &mut wires.feeds);
                 start_hydrate(bridge, app, &mut wires.feeds);
-                if presentation != (app.current, app.ask_card.as_ref().map(|card| card.request_id.clone())) {
-                    poll_asks = true;
-                }
                 if refresh_wanted {
                     refresh.reset_immediately();
                 }
@@ -1216,7 +1229,7 @@ async fn act(
     // compose text. The `Ctrl+A` prefix pops over it, as it does over the
     // picker and the ask card (`docs/tui.md`, "Keys").
     if app.ledger_view.is_some() && !keys.claims(&key) {
-        handle_ledger_key(bridge, app, key).await;
+        asks::ledger_key(app, key);
         return Ok(Acted::Continue);
     }
     // An ask card owns keys only once it is armed; until then every key
@@ -1247,14 +1260,8 @@ async fn act(
     // no card (`docs/tui.md`, "Asks").
     let intent = if card_owns_key {
         match asks::route_under_card(key, keys) {
-            asks::CardRoute::Card(asks::AskCardKey::Decide(decision)) => {
-                let card = app.ask_card.take().expect("checked Some above");
-                handle_ask_decision(bridge, app, card, decision).await;
-                return Ok(Acted::Continue);
-            }
-            asks::CardRoute::Card(asks::AskCardKey::Aside) => {
-                let card = app.ask_card.take().expect("checked Some above");
-                app.note(format!("ask {} set aside, still pending (Ctrl+A l)", short_ask(&card.request_id)));
+            asks::CardRoute::Card(card_key) => {
+                asks::card_key(app, card_key);
                 return Ok(Acted::Continue);
             }
             asks::CardRoute::Held => return Ok(Acted::Continue),
@@ -1367,7 +1374,7 @@ async fn act(
         Intent::Unbound(code) => {
             app.note(format!("Ctrl+A {} is not bound", crate::keys::key_label(code)))
         }
-        Intent::OpenLedger => open_ledger(bridge, app).await,
+        Intent::OpenLedger => asks::request_ledger(app),
         Intent::Tab => {
             if app.compose.kj_typed().is_some() {
                 apply_kj_completion(app);
@@ -2042,224 +2049,119 @@ fn raise_stop() {
     tracing::warn!("suspend is a unix gesture; nothing to raise here");
 }
 
-/// Open the ledger view (`Ctrl+A l`): every pending and answered ask for the
-/// kernel, resolved to full detail. `kj ledger list`/`list --history` name
-/// the ids; `kj ledger show` is one round trip per id — acceptable at the
-/// default `--limit` (20 pending + 20 history) and no worse than the
-/// kernel's own listing commands already accept
-/// (`kaijutsu-kernel/src/kj/ledger.rs`, `truncation_notice`).
-async fn open_ledger(bridge: &KernelBridge, app: &mut App) {
-    let Some(ctx) = app.current else {
-        app.note("no context attached");
-        return;
-    };
-    let pending_ids = match kaijutsu_client::list_pending(bridge.actor(), ctx).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            app.note(format!("cannot read pending ledger asks: {error}"));
-            return;
-        }
-    };
-    let history_ids = match kaijutsu_client::list_history(bridge.actor(), ctx).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            app.note(format!("cannot read ledger history: {error}"));
-            return;
-        }
-    };
+/// Why an ask's record was read off the loop ([`spawn_ask_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskReadFor {
+    /// The card candidate's record, to put its card up.
+    Card,
+    /// A card that came down because its ask closed elsewhere: the decision
+    /// for its notice ([`asks::answered_notice`]).
+    Answered,
+}
 
-    let mut rows = Vec::with_capacity(pending_ids.len() + history_ids.len());
-    for id in pending_ids {
-        match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
-            Ok(Some(detail)) => rows.push(asks::LedgerRow::Pending(pending_row(app, &detail))),
-            Ok(None) => app.note(format!("cannot decode pending ask {}", short_ask(&id))),
-            Err(error) => app.note(format!("cannot read pending ask {}: {error}", short_ask(&id))),
-        }
-    }
-    for id in history_ids {
-        match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &id).await {
-            Ok(Some(detail)) => rows.push(asks::LedgerRow::Answered(answered_row(app, &detail))),
-            Ok(None) => app.note(format!("cannot decode answered ask {}", short_ask(&id))),
-            Err(error) => app.note(format!("cannot read answered ask {}: {error}", short_ask(&id))),
-        }
-    }
-    app.ledger_view = Some(asks::LedgerViewState {
-        rows,
-        filter: String::new(),
-        selected: 0,
-        filtering: false,
-        detail: None,
+/// Kernel work about asks, landed on the loop's `ask_landed` arm.
+enum AskLanded {
+    Read {
+        request_id: String,
+        purpose: AskReadFor,
+        result: std::result::Result<Option<kaijutsu_types::AskDetail>, kaijutsu_client::actor::CallError>,
+    },
+    Ledger(std::result::Result<asks::LedgerReads, kaijutsu_client::actor::CallError>),
+    Shown {
+        request_id: String,
+        result: std::result::Result<Option<kaijutsu_types::AskDetail>, kaijutsu_client::actor::CallError>,
+    },
+    Decided {
+        request_id: String,
+        answer: std::result::Result<kaijutsu_client::AskAnswer, kaijutsu_client::actor::CallError>,
+    },
+}
+
+/// Read one ask's record on its own task and land it on the loop's
+/// `ask_landed` arm, so no key waits on the kernel for it.
+fn spawn_ask_read(
+    bridge: &KernelBridge,
+    tx: &mpsc::UnboundedSender<AskLanded>,
+    request_id: String,
+    purpose: AskReadFor,
+) {
+    let actor = bridge.actor().clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = actor.get_ask(request_id.clone()).await;
+        // The loop is gone when this fails; nothing is left to show it.
+        let _ = tx.send(AskLanded::Read { request_id, purpose, result });
     });
 }
 
-/// One `AskDetail` as the ledger view's PENDING row.
-fn pending_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::PendingRow {
-    let (context_label, context_type) = detail
-        .context_id
-        .map(|ctx| asks::context_facts(app, ctx))
-        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
-    asks::PendingRow {
-        request_id: detail.request_id.clone(),
-        age: detail.created_at.map(|at| {
-            let now = kaijutsu_types::now_millis();
-            crate::status::format_age(std::time::Duration::from_millis(now.saturating_sub(at as u64)))
-        }),
-        context_label,
-        context_type,
-        hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
-        asker: detail.actor_name.clone(),
-        reviewer: detail.reviewer_name.clone(),
-        reviewable: app.principal.is_some_and(|principal| detail.can_review(principal)),
-        statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
-    }
-}
-
-/// One `AskDetail` as the ledger view's ANSWERED row: when it was decided,
-/// how (`allow once`/`allow always`/`deny`, or `status` for an expired or
-/// abandoned ask), and by whom (`you`, a principal's short id, or `—` for
-/// a rule's auto-decision).
-fn answered_row(app: &App, detail: &kaijutsu_client::AskDetail) -> asks::AnsweredRow {
-    let (context_label, _context_type) = detail
-        .context_id
-        .map(|ctx| asks::context_facts(app, ctx))
-        .unwrap_or_else(|| ("(unknown)".to_string(), "default".to_string()));
-    let redeemed = match detail.redeemed_at {
-        Some(at) => asks::RedeemedMark::At(render::wallclock(at as u64)),
-        None => asks::RedeemedMark::Never,
-    };
-    asks::AnsweredRow {
-        request_id: detail.request_id.clone(),
-        time: detail.decided_at.map(|at| render::wallclock(at as u64)),
-        context_label,
-        decision: Some(decision_words(detail)),
-        principal: detail.decided_by.map(|by| {
-            if app.principal == Some(by) {
-                "you".to_string()
-            } else {
-                detail.decided_by_name.clone().unwrap_or_else(|| by.short())
-            }
-        }),
-        redeemed,
-        statement: detail.statements.first().cloned().unwrap_or_else(|| detail.description.clone()),
-    }
-}
-
-/// Answer the ask card's own ask, then close it.
-async fn handle_ask_decision(
-    bridge: &KernelBridge,
-    app: &mut App,
-    card: asks::AskCardState,
-    decision: asks::AskDecision,
-) {
-    if matches!(decision, asks::AskDecision::ViewLedger) {
-        open_ledger(bridge, app).await;
-        return;
-    }
-    if !app.principal.is_some_and(|principal| card.detail.can_review(principal)) {
-        app.note(format!(
-            "ask {} awaits its assigned reviewer; cancel it or ask that reviewer to escalate",
-            short_ask(&card.request_id)
-        ));
-        app.ask_card = Some(card);
-        return;
-    }
-    let allow = !matches!(decision, asks::AskDecision::Deny);
-    let remember = matches!(decision, asks::AskDecision::AllowAlways)
-        .then_some(kaijutsu_client::RememberScope::Always);
-    let Some(ctx) = app.current else {
-        app.note("no context attached");
-        return;
-    };
-    report_decision(
-        app,
-        &card.request_id,
-        allow,
-        kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &card.request_id, allow, remember).await,
-    );
-}
-
-/// One key inside the ledger view: navigate, filter, show, or answer the
-/// selected row. Closes the view after any decision — the next
-/// `ledger_events` generation bump refreshes the seat flags and the pending
-/// count; re-fetching and re-selecting inline is a follow-up, not this
-/// pass's scope.
-async fn handle_ledger_key(bridge: &KernelBridge, app: &mut App, key: crossterm::event::KeyEvent) {
-    if app.ledger_view.as_ref().is_some_and(|view| view.detail.is_some()) {
-        if key.code == crossterm::event::KeyCode::Esc && key.modifiers.is_empty() {
-            if let Some(view) = app.ledger_view.as_mut() {
-                view.detail = None;
-            }
-        }
-        return;
-    }
-    let Some(view) = app.ledger_view.as_mut() else { return };
-    let filtering = view.filtering;
-    match asks::ledger_key_to_action(key, filtering) {
-        asks::LedgerAction::Back => app.ledger_view = None,
-        asks::LedgerAction::Up => view.move_up(),
-        asks::LedgerAction::Down => view.move_down(),
-        asks::LedgerAction::StartFilter => view.filtering = true,
-        asks::LedgerAction::FilterInsert(c) => view.filter.push(c),
-        asks::LedgerAction::FilterBackspace => {
-            view.filter.pop();
-        }
-        asks::LedgerAction::CommitFilter | asks::LedgerAction::CancelFilter => view.filtering = false,
-        asks::LedgerAction::Show => {
-            let Some(request_id) = view.selected_request_id() else { return };
-            let Some(ctx) = app.current else { return };
-            match kaijutsu_client::show_ask_detail(bridge.actor(), ctx, &request_id).await {
-                Ok(Some(detail)) => {
-                    if let Some(view) = app.ledger_view.as_mut() {
-                        view.detail = Some(detail);
-                    }
+/// Run each item of kernel work a key asked for ([`App::ask_work`]) on its
+/// own task, landing on the loop's `ask_landed` arm.
+fn spawn_ask_work(bridge: &KernelBridge, app: &mut App, tx: &mpsc::UnboundedSender<AskLanded>) {
+    for work in std::mem::take(&mut app.ask_work) {
+        let actor = bridge.actor().clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let landed = match work {
+                asks::AskWork::OpenLedger { open } => AskLanded::Ledger(read_ledger(&actor, open).await),
+                asks::AskWork::Show(request_id) => {
+                    let result = actor.get_ask(request_id.clone()).await;
+                    AskLanded::Shown { request_id, result }
                 }
-                Ok(None) => app.note(format!("cannot decode ask {}", short_ask(&request_id))),
-                Err(error) => app.note(format!("cannot read ask {}: {error}", short_ask(&request_id))),
-            }
-        }
-        asks::LedgerAction::AllowOnce | asks::LedgerAction::AllowAlways | asks::LedgerAction::Deny => {
-            let Some(request_id) = view.selected_request_id() else { return };
-            let reviewable = asks::filtered_rows(&view.rows, &view.filter)
-                .get(view.selected)
-                .is_some_and(|row| row.reviewable());
-            if !reviewable {
-                app.note(format!(
-                    "ask {} awaits its assigned reviewer; cancel it or ask that reviewer to escalate",
-                    short_ask(&request_id)
-                ));
-                return;
-            }
-            let Some(ctx) = app.current else { return };
-            let action = asks::ledger_key_to_action(key, filtering);
-            let allow = !matches!(action, asks::LedgerAction::Deny);
-            let remember = matches!(action, asks::LedgerAction::AllowAlways)
-                .then_some(kaijutsu_client::RememberScope::Always);
-            app.ledger_view = None;
-            report_decision(
-                app,
-                &request_id,
-                allow,
-                kaijutsu_client::decide_ask_remember(bridge.actor(), ctx, &request_id, allow, remember).await,
-            );
-        }
-        asks::LedgerAction::Ignored => {}
+                asks::AskWork::Decide { request_id, verdict, remember } => {
+                    let answer = actor.decide_ask(request_id.clone(), verdict, remember).await;
+                    AskLanded::Decided { request_id, answer }
+                }
+            };
+            // The loop is gone when this fails; nothing is left to show it.
+            let _ = tx.send(landed);
+        });
     }
 }
 
-/// Post the status-line notice for one `kj ledger allow|deny` round trip —
-/// shared by the ask card and the ledger view so the two surfaces report a
-/// decision, a lost race, or a call failure the same way.
-fn report_decision(
-    app: &mut App,
-    request_id: &str,
-    allow: bool,
-    result: std::result::Result<kaijutsu_client::rpc::KjExecutionResult, kaijutsu_client::actor::CallError>,
+/// The ledger view's records: the recent answers listed, then every record
+/// (the open asks named, then the answers) read concurrently.
+async fn read_ledger(
+    actor: &ActorHandle,
+    open: Vec<String>,
+) -> std::result::Result<asks::LedgerReads, kaijutsu_client::actor::CallError> {
+    let history = kaijutsu_types::AskFilter {
+        view: kaijutsu_types::AskView::History,
+        limit: Some(asks::LEDGER_HISTORY_LIMIT),
+        ..Default::default()
+    };
+    let answered = actor.list_asks(history).await?.asks;
+    let ids: Vec<String> = open.into_iter().chain(answered.into_iter().map(|ask| ask.request_id)).collect();
+    let reads: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let actor = actor.clone();
+            let id = id.clone();
+            tokio::spawn(async move { actor.get_ask(id).await })
+        })
+        .collect();
+    let mut landed = Vec::with_capacity(ids.len());
+    for (id, read) in ids.into_iter().zip(reads) {
+        let result = read.await.unwrap_or_else(|join| panic!("a ledger read task failed: {join}"));
+        landed.push((id, result));
+    }
+    Ok(landed)
+}
+
+/// Read the card candidate's record when there is a candidate and no read
+/// for it is in flight. The card goes up when the read lands, if the
+/// candidate is still the same ask ([`asks::open_card`]).
+fn raise_card(
+    bridge: &KernelBridge,
+    app: &App,
+    tx: &mpsc::UnboundedSender<AskLanded>,
+    in_flight: &mut Option<String>,
 ) {
-    let verb = if allow { "allowed" } else { "denied" };
-    match result {
-        Ok(r) if r.exit_code == 0 => app.note(format!("{verb} ask {request_id}")),
-        Ok(r) => app.note(format!("kj ledger {verb}: {}", r.stderr.trim())),
-        Err(e) => app.note(format!("kj ledger {verb}: {e}")),
+    if in_flight.is_some() {
+        return;
+    }
+    if let Some(request_id) = asks::card_candidate(app) {
+        *in_flight = Some(request_id.clone());
+        spawn_ask_read(bridge, tx, request_id, AskReadFor::Card);
     }
 }
 
@@ -3701,8 +3603,8 @@ mod tests {
     }
 
     /// The loop's own kernel calls live on their own tasks — the refresh
-    /// round in `refresh::fetch`, the hot set's hydrate in `start_hydrate`
-    /// — and land through a join arm. Inside the loop they would hold every
+    /// round in `refresh::fetch`, the hot set's hydrate in `start_hydrate`,
+    /// an ask's record in `spawn_ask_read` — and land through a select arm. Inside the loop they would hold every
     /// key until a busy kernel answered (`docs/tui.md`, "Keys").
     ///
     /// A violation can hide one hop down: `event_loop`'s own text calls
@@ -3715,16 +3617,18 @@ mod tests {
     /// same forbidden names. It stays a short, explicit list rather than a
     /// full call-graph walk on purpose: the key path legitimately awaits the
     /// kernel directly for a keystroke's own round trip (`switch_seat`
-    /// awaiting `read_input`, `open_ledger` reading `kj ledger show` to open
-    /// a view, both reached through `act`'s intent dispatch), and walking
-    /// the whole graph would flag those too. `start_rehydrate` and
+    /// awaiting `read_input`, reached through `act`'s intent dispatch), and
+    /// walking the whole graph would flag that too. `act` itself is in
+    /// `HELPERS`: an ask key only records its work (`App::ask_work`), and
+    /// `spawn_ask_work` runs it, so no ask call may appear in its body. `start_rehydrate` and
     /// `start_hydrate` are deliberately NOT in `HELPERS`: both hand their
-    /// kernel call to `tokio::spawn`, so scanning their bodies would flag
+    /// kernel call to `tokio::spawn`, as `spawn_ask_read` does, so scanning
+    /// their bodies would flag
     /// the exact off-loop pattern this test exists to require. Add a name to
     /// `HELPERS` when the feed-apply chain grows another synchronous hop.
     #[test]
     fn the_event_loop_never_awaits_the_kernel_for_background_work() {
-        const HELPERS: &[&str] = &["apply_feed", "apply_delivery", "land_rehydrate"];
+        const HELPERS: &[&str] = &["apply_feed", "apply_delivery", "land_rehydrate", "act"];
 
         let source = include_str!("run.rs");
         let start = source.find("async fn event_loop(").expect("event_loop is in run.rs");
@@ -3737,9 +3641,10 @@ mod tests {
         }
         for call in [
             "list_contexts(",
-            "poll_new_asks(",
             "list_tracks(",
-            "show_ask_detail(",
+            "get_ask(",
+            "list_asks(",
+            "decide_ask(",
             "rehydrate_context(",
             "hydrate_context(",
         ] {

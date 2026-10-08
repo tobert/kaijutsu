@@ -56,12 +56,11 @@ fn typed_client_distinguishes_approval_from_publication_abandonment() {
                     }
                 }
             }).await.expect("client connects");
-            let contexts = actor.list_contexts().await.unwrap();
-            let root = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
-            let detail = kaijutsu_client::ledger::show_ask_detail(&actor, root, &request).await.unwrap().unwrap();
-            assert_eq!(detail.status, if allow { "allowed" } else { "denied" });
-            assert_eq!(detail.decided_option.as_deref(), Some(if allow { "allow_once" } else { "deny" }));
-            assert!(detail.redeemed_at.is_some(), "the abandoned invocation cannot spend this answer later");
+            let detail = actor.get_ask(request.clone()).await.unwrap().expect("the ask exists");
+            let status = if allow { kaijutsu_types::AskStatus::Allowed } else { kaijutsu_types::AskStatus::Denied };
+            assert_eq!(detail.summary.status, status);
+            assert_eq!(detail.decision.and_then(|d| d.option).as_deref(), Some(if allow { "allow_once" } else { "deny" }));
+            assert!(detail.redeemed_at_ms.is_some(), "the abandoned invocation cannot spend this answer later");
             let reason = detail.publication_abandoned.expect("typed client retains the retirement reason");
             assert!(reason.contains("Kernel restarted"), "{reason}");
             assert!(reason.contains("Source did not run."), "{reason}");

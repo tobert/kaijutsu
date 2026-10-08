@@ -1,55 +1,54 @@
 //! The approval ledger, mirrored app-side: one resource holding the kernel's
-//! pending asks plus the last few that were decided, for every renderer that
-//! wants to show them (`docs/approval-identity.md`).
+//! open asks plus the last few that closed, for every renderer that wants to
+//! show them (`docs/approval-identity.md`).
 //!
 //! One mirror, many readers. [`LedgerMirror`] is the only place in the app
-//! that talks to `kj ledger list`/`show`, so a lamp, a dock badge, and a
-//! future review panel all read the same pending set and cannot disagree
-//! about it. The shared client model does the wire work
-//! (`kaijutsu_client::ledger`); nothing here parses ledger JSON.
+//! that reads the ledger or answers an ask, so a lamp, a dock badge, the ask
+//! sheet and the ledger ribbon all read the same open set and cannot disagree
+//! about it. The ledger is kernel-wide: nothing here takes a context.
 //!
-//! **A round runs only when the kernel says the ledger changed.** The
-//! kernel's own change stream (`ActorHandle::subscribe_ledger_events`) hands
-//! us a generation number per change; a bump sets [`LedgerMirror::dirty`] and
-//! one round follows. Connecting and a stream lag also set it, because
-//! neither tells us what we missed. There is no timer and no per-frame RPC:
-//! a round is `kj ledger list` plus one `kj ledger show` per ask that
-//! arrived or left, run in the app's current context.
+//! **The open set comes from the actor's watch.** `ActorHandle::ledger` holds
+//! the open asks, relisted on every (re)connect and kept current by the
+//! kernel's push. [`follow_ledger`] diffs each new value against the mirror:
+//! an ask that appears is offered, and an ask that leaves was answered,
+//! cancelled, or expired, from any surface. There is no timer and no polling.
 //!
-//! **Rounds are single-flight.** [`LedgerMirror::in_flight`] holds while one
-//! runs, and a bump arriving during it leaves `dirty` set, so exactly one
-//! more round follows however many bumps land. The generation is a hint to
-//! re-read, never a cursor: every round lists the whole pending set and the
-//! kernel's answer wins.
+//! **Full records are read once per ask.** The watch carries an
+//! [`AskSummary`]; the sheet also shows the tool, cwd, and environment, so an
+//! ask that arrives has its [`AskDetail`] read with `get_ask`, and an ask
+//! that leaves is read once more so `recent` carries its decision. A read
+//! that fails is retried on the next ledger change, and until it lands the
+//! summary stands in for the record.
 //!
-//! **A result from a replaced connection is discarded.** Each round carries
+//! **An answer is a ledger row and nothing else.** A decision key sends
+//! `decide_ask`; it authors no block in any transcript. The push that closes
+//! the ask is what takes the sheet down.
+//!
+//! **A result from a replaced connection is discarded.** Each read carries
 //! the actor generation and connection epoch it started under, and the drain
-//! drops anything else — a reply queued before a reconnect must not overwrite
-//! the mirror the new connection rebuilt (`docs/issues.md`, "App bootstrap
-//! results need consistent connection scoping").
+//! drops anything else (`docs/issues.md`, "App bootstrap results need
+//! consistent connection scoping").
 //!
-//! **Design split**: the round plan, the fold, and the dirty/in-flight latch
-//! are pure and unit-tested with no Bevy app; only the three systems at the
-//! bottom touch `bevy` or the RPC handle (`view::room::switchboard`'s stance).
+//! **Design split**: the diff, the read bookkeeping, and the answer
+//! classification are pure and unit-tested with no Bevy app; only the
+//! systems at the bottom touch `bevy` or the RPC handle.
+
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
-use kaijutsu_client::AskDetail;
-use kaijutsu_types::ContextId;
-use tokio::sync::broadcast;
+use kaijutsu_client::LedgerState;
+use kaijutsu_types::{
+    AskAnswerFailureKind, AskDetail, AskSummary, AskVerdict, ContextId, Remember, RememberScope,
+};
+use tokio::sync::watch;
 
 use super::actor_plugin::{RpcActor, RpcConnectionState};
 
-/// How many decided asks the mirror keeps behind the pending set. Enough for
-/// a renderer to show what just happened; the ledger itself is the history
+/// How many closed asks the mirror keeps behind the open set. Enough for a
+/// renderer to show what just happened; the ledger itself is the history
 /// (`kj ledger list --history`).
 pub const RECENT_CAP: usize = 3;
-
-/// How many rounds in a row may fail before the mirror stops retrying and
-/// waits for the next generation bump or connection. A failing kernel must
-/// not be re-read on every frame, and there is no timer here to slow a
-/// retry down — the budget is the whole mechanism.
-pub const RETRY_LIMIT: u32 = 3;
 
 // ============================================================================
 // The mirror
@@ -57,42 +56,61 @@ pub const RETRY_LIMIT: u32 = 3;
 
 /// The kernel's approval ledger as this app last read it.
 ///
-/// `pending` is in the order `kj ledger list` returned, so every renderer
-/// shows asks in ledger order rather than inventing one. `recent` holds asks
-/// that left the pending set, most recent first, each re-read so its decision
-/// is known.
+/// `open` is oldest first, so every renderer shows asks in the order they
+/// were raised rather than inventing one. `recent` holds asks that left the
+/// open set, most recent decision first, each re-read so its decision is
+/// known.
 #[derive(Resource, Default, Debug)]
 pub struct LedgerMirror {
-    /// The newest ledger generation the change stream reported, or `None`
-    /// before the first change and after a connection is replaced.
-    pub generation: Option<i64>,
-    /// Every pending ask, in ledger order.
-    pub pending: Vec<AskDetail>,
-    /// Asks that left the pending set, most recent first, capped at
+    /// The ledger generation `open` reflects.
+    pub generation: i64,
+    /// Whether `open` was read on the live connection. False until the first
+    /// listing lands and again while a reconnect relists; the last-known
+    /// open set stays meanwhile, so the lamps do not blink.
+    pub synced: bool,
+    /// Every open ask, oldest first.
+    open: Vec<AskSummary>,
+    /// Full records read for open asks, by request id.
+    records: HashMap<String, AskDetail>,
+    /// Open ids whose record is being read now.
+    reading: HashSet<String>,
+    /// Why an open ask's record could not be read, by request id.
+    unread: HashMap<String, String>,
+    /// Asks that left the open set, most recent decision first, capped at
     /// [`RECENT_CAP`].
-    pub recent: Vec<AskDetail>,
-    /// A round is owed: the ledger changed, the connection is new, or the
-    /// last round could not read every ask.
-    pub dirty: bool,
-    /// A round is running. Cleared by that round's own result.
-    pub in_flight: bool,
-    /// Why the last round failed, for a renderer to show. Cleared by the
-    /// next round that succeeds.
-    pub last_error: Option<String>,
-    /// Rounds that have failed since the last one that succeeded. Reset by a
-    /// generation bump, a new connection, and a round that reads everything.
-    retries: u32,
+    recent: Vec<AskDetail>,
+}
+
+/// What one watch value changed: the request ids that arrived in the open
+/// set and the ones that left it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LedgerDiff {
+    /// Ids newly open, oldest first.
+    pub arrived: Vec<String>,
+    /// Ids no longer open, in the order the mirror held them.
+    pub departed: Vec<String>,
+}
+
+impl LedgerDiff {
+    pub fn is_empty(&self) -> bool {
+        self.arrived.is_empty() && self.departed.is_empty()
+    }
 }
 
 impl LedgerMirror {
-    /// How many asks are waiting for a decision, across every context.
-    pub fn pending_count(&self) -> usize {
-        self.pending.len()
+    /// Every open ask, oldest first.
+    pub fn open(&self) -> &[AskSummary] {
+        &self.open
     }
 
-    /// The pending asks raised in one context, in ledger order.
-    pub fn pending_for_context(&self, context_id: ContextId) -> impl Iterator<Item = &AskDetail> {
-        self.pending
+    /// How many asks are waiting for a decision, across every context.
+    pub fn pending_count(&self) -> usize {
+        self.open.len()
+    }
+
+    /// The open asks raised in one context, oldest first.
+    pub fn pending_for_context(&self, context_id: ContextId) -> impl Iterator<Item = &AskSummary> {
+        self.open
             .iter()
             .filter(move |ask| ask.context_id == Some(context_id))
     }
@@ -103,208 +121,195 @@ impl LedgerMirror {
         self.pending_for_context(context_id).next().is_some()
     }
 
-    /// One ask by request id, pending first, then the decided few. `None`
-    /// means this mirror has never held it, not that the ledger lacks it.
-    pub fn get(&self, request_id: &str) -> Option<&AskDetail> {
-        self.pending
+    /// One open ask's summary. `None` once it has left the open set.
+    pub fn summary(&self, request_id: &str) -> Option<&AskSummary> {
+        self.open.iter().find(|ask| ask.request_id == request_id)
+    }
+
+    /// The best record this mirror holds for an ask: an open ask's full
+    /// record with its live summary, the summary alone while the record is
+    /// unread, or a closed ask from `recent`. `None` means this mirror does
+    /// not hold it, not that the ledger lacks it.
+    ///
+    /// The live summary replaces the one read with the record, because a
+    /// reassignment changes the reviewer of an ask that stays open.
+    pub fn record(&self, request_id: &str) -> Option<AskDetail> {
+        if let Some(summary) = self.summary(request_id) {
+            let mut record = self
+                .records
+                .get(request_id)
+                .cloned()
+                .unwrap_or_else(|| summary_record(summary));
+            record.summary = summary.clone();
+            return Some(record);
+        }
+        self.recent
             .iter()
-            .chain(self.recent.iter())
-            .find(|ask| ask.request_id == request_id)
+            .find(|ask| ask.summary.request_id == request_id)
+            .cloned()
     }
 
-    /// Whether a round should start now. The caller adds its own conditions:
-    /// a live connection and a current context to run `kj` in.
-    pub fn should_start_round(&self) -> bool {
-        self.dirty && !self.in_flight
+    /// Every open ask's [`Self::record`], oldest first.
+    pub fn open_records(&self) -> Vec<AskDetail> {
+        self.open
+            .iter()
+            .filter_map(|ask| self.record(&ask.request_id))
+            .collect()
     }
 
-    /// A ledger generation arrived. Every bump earns a round, including one
-    /// that lands mid-round: `dirty` stays set through
-    /// [`Self::on_round_start`], so exactly one more round follows. A bump is
-    /// also a fresh [`RETRY_LIMIT`] budget — whatever was failing may not be
-    /// failing now.
-    pub fn on_generation(&mut self, generation: i64) {
-        self.generation = Some(match self.generation {
-            Some(known) => known.max(generation),
-            None => generation,
+    /// Asks that left the open set, most recent decision first.
+    pub fn recent(&self) -> &[AskDetail] {
+        &self.recent
+    }
+
+    /// Why an open ask shows its summary in place of its full record:
+    /// `reading` while the read runs, the failure once one has failed, and
+    /// `None` when the record is held.
+    pub fn record_gap(&self, request_id: &str) -> Option<String> {
+        if self.records.contains_key(request_id) || self.summary(request_id).is_none() {
+            return None;
+        }
+        Some(match self.unread.get(request_id) {
+            Some(error) => format!("full record not read: {error}"),
+            None => "reading the full record".to_string(),
+        })
+    }
+
+    /// Fold one watch value in and say what changed.
+    ///
+    /// An unsynced value changes nothing but `synced`: until the relisting
+    /// lands, the last-known open set is the better answer. A record held for
+    /// an ask that left is dropped; the departure read replaces it.
+    pub fn apply_state(&mut self, state: &LedgerState) -> LedgerDiff {
+        if !state.synced {
+            self.synced = false;
+            return LedgerDiff::default();
+        }
+        let mut next: Vec<AskSummary> = state.open.values().cloned().collect();
+        next.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.request_id.cmp(&b.request_id))
         });
-        self.dirty = true;
-        self.retries = 0;
+
+        let held: HashSet<&str> = self.open.iter().map(|a| a.request_id.as_str()).collect();
+        let diff = LedgerDiff {
+            arrived: next
+                .iter()
+                .filter(|a| !held.contains(a.request_id.as_str()))
+                .map(|a| a.request_id.clone())
+                .collect(),
+            departed: self
+                .open
+                .iter()
+                .filter(|a| !state.open.contains_key(&a.request_id))
+                .map(|a| a.request_id.clone())
+                .collect(),
+        };
+        for id in &diff.departed {
+            self.records.remove(id);
+            self.unread.remove(id);
+        }
+        self.open = next;
+        self.generation = state.generation;
+        self.synced = true;
+        diff
     }
 
-    /// This connection can no longer answer for the mirror: a round owed, no
-    /// known generation, and any round still running disowned. Its result is
-    /// discarded by the drain, so the latch is cleared here instead.
-    ///
-    /// The pending asks stay until the next round replaces them. A reconnect
-    /// rebinds the same kernel, so the last-known set is the best answer
-    /// available while the round runs, and the lamps do not blink.
-    pub fn on_connection_changed(&mut self) {
-        self.generation = None;
-        self.dirty = true;
-        self.in_flight = false;
-        self.retries = 0;
+    /// The open ids whose full record should be read now: not held and not
+    /// already being read. Each is marked as being read. A read that failed
+    /// is asked for again here, so it retries on the next ledger change.
+    pub fn take_reads(&mut self) -> Vec<String> {
+        let wanted: Vec<String> = self
+            .open
+            .iter()
+            .map(|ask| ask.request_id.clone())
+            .filter(|id| !self.records.contains_key(id) && !self.reading.contains(id))
+            .collect();
+        self.reading.extend(wanted.iter().cloned());
+        wanted
     }
 
-    /// The change stream dropped generations: a round is owed and the retry
-    /// budget starts over, because what was missed is unknown.
-    pub fn on_stream_gap(&mut self) {
-        self.dirty = true;
-        self.retries = 0;
-    }
-
-    /// A round is starting. `dirty` clears here so a bump during the round
-    /// sets it again.
-    pub fn on_round_start(&mut self) {
-        self.dirty = false;
-        self.in_flight = true;
-    }
-
-    /// A round finished. `retry` asks for one more round — an ask this round
-    /// could not read, or a round that failed outright.
-    ///
-    /// Retries are bounded by [`RETRY_LIMIT`]: past it the mirror goes quiet
-    /// and keeps [`Self::last_error`], rather than re-reading a failing
-    /// ledger for as long as the app runs. The next bump or connection
-    /// starts again.
-    pub fn on_round_done(&mut self, retry: bool) {
-        self.in_flight = false;
-        if !retry {
-            self.retries = 0;
+    /// An open ask's record read landed. A read for an ask that has since
+    /// left the open set is dropped: the departure read answers for it.
+    pub fn on_record(&mut self, request_id: &str, result: Result<Option<AskDetail>, String>) {
+        self.reading.remove(request_id);
+        if self.summary(request_id).is_none() {
             return;
         }
-        self.retries += 1;
-        self.dirty = self.retries < RETRY_LIMIT;
-    }
-}
-
-// ============================================================================
-// Pure: the round
-// ============================================================================
-
-/// What one round has to fetch, from the pending ids the mirror holds and the
-/// ids `kj ledger list` just returned.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct RoundPlan {
-    /// Listed ids the mirror has no detail for, in listed order.
-    pub fetch_new: Vec<String>,
-    /// Ids the mirror holds that the ledger no longer lists, in mirror order.
-    /// Read once more so `recent` carries the decision.
-    pub departed: Vec<String>,
-    /// Listed ids the mirror already holds, in listed order. Their detail is
-    /// reused rather than re-read: a pending ask's fields do not change.
-    pub keep: Vec<String>,
-}
-
-/// Plan one round: which listed asks are new, which held asks are gone, and
-/// which are unchanged.
-pub fn plan_round(current_pending_ids: &[String], listed_ids: &[String]) -> RoundPlan {
-    let held: std::collections::HashSet<&str> =
-        current_pending_ids.iter().map(String::as_str).collect();
-    let listed: std::collections::HashSet<&str> = listed_ids.iter().map(String::as_str).collect();
-    let mut plan = RoundPlan::default();
-    for id in listed_ids {
-        if held.contains(id.as_str()) {
-            plan.keep.push(id.clone());
-        } else {
-            plan.fetch_new.push(id.clone());
-        }
-    }
-    for id in current_pending_ids {
-        if !listed.contains(id.as_str()) {
-            plan.departed.push(id.clone());
-        }
-    }
-    plan
-}
-
-/// One finished round's reads. `None` in either detail list is a
-/// `kj ledger show` that could not be read this round.
-#[derive(Debug, Default)]
-pub struct RoundData {
-    /// Every pending request id, in the order `kj ledger list` returned.
-    pub listed: Vec<String>,
-    /// Detail for the ids [`RoundPlan::fetch_new`] named.
-    pub fetched: Vec<(String, Option<AskDetail>)>,
-    /// Detail for the ids [`RoundPlan::departed`] named.
-    pub departed: Vec<(String, Option<AskDetail>)>,
-}
-
-/// Fold a finished round into the mirror, and return the pending ids it could
-/// not resolve.
-///
-/// The new pending list is in listed order: a fetched detail for a new ask, a
-/// retained one for an ask the mirror already held. An ask whose
-/// `kj ledger show` failed is left out of `pending` and named in the return,
-/// so the caller can set `dirty` and retry it rather than hide a waiting ask
-/// for good.
-///
-/// Departed asks go to the front of `recent`, newest decision first, capped
-/// at [`RECENT_CAP`]. A departed ask whose read failed is dropped: the ledger
-/// has already said it is not pending, and no later round will plan it again.
-pub fn apply_round(mirror: &mut LedgerMirror, round: RoundData) -> Vec<String> {
-    let RoundData {
-        listed,
-        fetched,
-        departed,
-    } = round;
-
-    let mut held: std::collections::HashMap<String, AskDetail> = std::mem::take(&mut mirror.pending)
-        .into_iter()
-        .map(|ask| (ask.request_id.clone(), ask))
-        .collect();
-    for (id, detail) in fetched {
-        match detail {
-            Some(detail) => {
-                held.insert(id, detail);
+        match result {
+            Ok(Some(record)) => {
+                self.unread.remove(request_id);
+                self.records.insert(request_id.to_string(), record);
             }
-            None => {
-                held.remove(&id);
+            Ok(None) => {
+                self.unread
+                    .insert(request_id.to_string(), "the ledger has no such ask".to_string());
+            }
+            Err(error) => {
+                self.unread.insert(request_id.to_string(), error);
             }
         }
     }
 
-    let mut unresolved = Vec::new();
-    let mut pending = Vec::with_capacity(listed.len());
-    for id in &listed {
-        match held.remove(id) {
-            Some(detail) => pending.push(detail),
-            None => unresolved.push(id.clone()),
-        }
+    /// A closed ask's record landed: it goes to the front of `recent`, newest
+    /// decision first, capped at [`RECENT_CAP`]. An ask closed without a
+    /// decision time sorts after the dated ones rather than ahead of them.
+    pub fn on_departed(&mut self, record: AskDetail) {
+        self.recent
+            .retain(|ask| ask.summary.request_id != record.summary.request_id);
+        self.recent.push(record);
+        self.recent
+            .sort_by(|a, b| b.summary.decided_at_ms.cmp(&a.summary.decided_at_ms));
+        self.recent.truncate(RECENT_CAP);
     }
-    mirror.pending = pending;
 
-    let mut left: Vec<AskDetail> = departed.into_iter().filter_map(|(_, detail)| detail).collect();
-    // Newest decision first, and an undecided departure (expired, abandoned,
-    // or a row whose `decided_at` the kernel does not carry) after the dated
-    // ones rather than ahead of them.
-    left.sort_by(|a, b| b.decided_at.cmp(&a.decided_at));
-    left.append(&mut mirror.recent);
-    left.truncate(RECENT_CAP);
-    mirror.recent = left;
+    /// The connection was replaced: reads still running belong to it and
+    /// are discarded by the drain, so none count as running now. The open
+    /// set stays until the new connection's listing replaces it.
+    pub fn on_connection_changed(&mut self) {
+        self.reading.clear();
+        self.synced = false;
+    }
+}
 
-    unresolved
+/// An ask's summary as a record with none of the record's own fields read.
+pub fn summary_record(summary: &AskSummary) -> AskDetail {
+    AskDetail {
+        summary: summary.clone(),
+        instance: None,
+        tool: None,
+        hook_id: None,
+        label: None,
+        tool_call_block_id: None,
+        exec_source: None,
+        cwd: None,
+        env: Vec::new(),
+        decision: None,
+        redeemed_at_ms: None,
+        publication_abandoned: None,
+        reassignments: Vec::new(),
+    }
 }
 
 // ============================================================================
 // Pure: the decision
 // ============================================================================
 
-/// What a decision key asks the kernel for. The three options
-/// `kj ledger allow|deny` carries, named the way the key line names them
-/// (`docs/tui.md`, "Asks").
+/// What a decision key asks the kernel for, named the way the key line names
+/// them (`docs/tui.md`, "Asks").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// `a` — `kj ledger allow <id>`.
+    /// `a` — allow, once.
     AllowOnce,
-    /// `A` — `kj ledger allow <id> --remember always`.
+    /// `A` — allow, and remember the exact statement everywhere.
     AllowAlways,
-    /// `d` — `kj ledger deny <id>`.
+    /// `d` — deny.
     Deny,
 }
 
 impl Decision {
-    /// The words a notice uses, matching `decided_option` as the kernel
+    /// The words a notice uses, matching the decision option as the kernel
     /// records it: `allow once`, `allow always`, `deny`.
     pub fn label(self) -> &'static str {
         match self {
@@ -314,20 +319,25 @@ impl Decision {
         }
     }
 
-    /// `(allow, remember)` as [`kaijutsu_client::decide_ask_remember`] takes
-    /// them.
-    fn verb(self) -> (bool, Option<kaijutsu_client::RememberScope>) {
+    /// The verdict and standing rule `decide_ask` takes.
+    pub fn answer(self) -> (AskVerdict, Option<Remember>) {
         match self {
-            Self::AllowOnce => (true, None),
-            Self::AllowAlways => (true, Some(kaijutsu_client::RememberScope::Always)),
-            Self::Deny => (false, None),
+            Self::AllowOnce => (AskVerdict::Allow, None),
+            Self::AllowAlways => (
+                AskVerdict::Allow,
+                Some(Remember {
+                    scope: RememberScope::Always,
+                    family: false,
+                }),
+            ),
+            Self::Deny => (AskVerdict::Deny, None),
         }
     }
 }
 
 /// A surface asks the kernel to decide one ask. The ask sheet and the ledger
-/// ribbon both write this rather than calling RPC themselves, so `kj ledger`
-/// keeps exactly one caller in the app.
+/// ribbon both write this rather than calling RPC themselves, so the app
+/// answers asks in exactly one place.
 #[derive(Message, Debug, Clone)]
 pub struct AskDecisionRequested {
     pub request_id: String,
@@ -338,14 +348,41 @@ pub struct AskDecisionRequested {
 /// a refused write is never a silent nothing (`docs/tui.md`, "Asks").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionOutcome {
-    /// The kernel took it. The mirror's next round brings the ask down.
-    Accepted,
-    /// The kernel refused because the ask was already answered — a race lost
-    /// to another surface, which the ledger's `claim`+`decide` transaction
-    /// makes normal rather than exceptional (`kaijutsu_client::ledger`).
+    /// The ledger took it; the push that closes the ask follows. `unlearned`
+    /// says why a requested standing rule was not written — the answer
+    /// stands either way.
+    Accepted { unlearned: Option<String> },
+    /// Another answer, an expiry, or a cancellation got there first — a race
+    /// lost to another surface, which the ledger's claim makes normal rather
+    /// than exceptional.
     AlreadyDecided,
-    /// The write could not be made at all.
+    /// The ledger declined, or the call could not be made at all.
     Failed(String),
+}
+
+/// The asks this app has sent a decision for and not yet heard back about.
+///
+/// A second decision key on such an ask is ignored: sending it would make
+/// the first answer's own sender lose a race against itself. The reply
+/// clears the entry, and the push that closes the ask takes it off screen.
+#[derive(Resource, Default, Debug)]
+pub struct DecisionsInFlight(HashSet<String>);
+
+impl DecisionsInFlight {
+    /// Claim `request_id` for a decision. False when one is already in
+    /// flight for it.
+    pub fn begin(&mut self, request_id: &str) -> bool {
+        self.0.insert(request_id.to_string())
+    }
+
+    /// The reply for `request_id` landed.
+    pub fn end(&mut self, request_id: &str) {
+        self.0.remove(request_id);
+    }
+
+    pub fn contains(&self, request_id: &str) -> bool {
+        self.0.contains(request_id)
+    }
 }
 
 /// One finished decision, for a surface to turn into a notice.
@@ -356,28 +393,22 @@ pub struct AskDecisionSettled {
     pub outcome: DecisionOutcome,
 }
 
-/// Read one `kj ledger allow|deny` exit into an outcome.
-///
-/// A nonzero exit is a lost race when the kernel says so and a plain failure
-/// otherwise; `stderr` decides which, because the exit code alone does not
-/// distinguish them.
-pub fn classify_decision(exit_code: i32, stderr: &str) -> DecisionOutcome {
-    if exit_code == 0 {
-        return DecisionOutcome::Accepted;
+/// Read one `decide_ask` reply into an outcome. The outer `Err` is a call
+/// that did not reach the ledger.
+pub fn classify_answer(reply: Result<kaijutsu_client::AskAnswer, String>) -> DecisionOutcome {
+    match reply {
+        Ok(Ok(answered)) => DecisionOutcome::Accepted {
+            unlearned: answered
+                .remembered
+                .filter(|result| !result.learned)
+                .map(|result| result.note),
+        },
+        Ok(Err(failure)) if failure.kind == AskAnswerFailureKind::AlreadyAnswered => {
+            DecisionOutcome::AlreadyDecided
+        }
+        Ok(Err(failure)) => DecisionOutcome::Failed(failure.message),
+        Err(error) => DecisionOutcome::Failed(error),
     }
-    let lowered = stderr.to_lowercase();
-    if lowered.contains("already decided")
-        || lowered.contains("alreadydecided")
-        || lowered.contains("not pending")
-    {
-        return DecisionOutcome::AlreadyDecided;
-    }
-    let detail = stderr.trim();
-    DecisionOutcome::Failed(if detail.is_empty() {
-        format!("exit {exit_code}")
-    } else {
-        detail.lines().next().unwrap_or(detail).to_string()
-    })
 }
 
 /// The first segment of a request id — `01a04eb6` of
@@ -391,24 +422,42 @@ pub fn short_request_id(request_id: &str) -> &str {
 // Bevy glue
 // ============================================================================
 
-/// One round's result, tagged with the connection it ran on.
-struct LedgerRound {
+/// An ask left the open set while it was in the mirror, with its record as
+/// the departure read found it. `None` is a read that failed.
+#[derive(Message, Debug, Clone)]
+pub struct AskLeft {
+    pub request_id: String,
+    pub record: Option<AskDetail>,
+}
+
+/// What one record read was for.
+enum ReadKind {
+    /// An ask that arrived in the open set.
+    Open,
+    /// An ask that left it.
+    Departed,
+}
+
+/// One finished record read, tagged with the connection it ran on.
+struct LedgerRead {
     generation: u64,
     connection_epoch: u64,
-    result: Result<RoundData, String>,
+    kind: ReadKind,
+    request_id: String,
+    result: Result<Option<AskDetail>, String>,
 }
 
-/// Drain-once channel for finished rounds. A dedicated channel rather than
-/// `RpcResultMessage`: a round result is read by exactly one system, and
-/// `RoundData` moves into the mirror instead of being cloned out of Bevy's
+/// Drain-once channel for finished reads. A dedicated channel rather than
+/// `RpcResultMessage`: a read is consumed by exactly one system, and the
+/// record moves into the mirror instead of being cloned out of Bevy's
 /// message storage.
 #[derive(Resource)]
-struct LedgerRoundChannel {
-    tx: crossbeam_channel::Sender<LedgerRound>,
-    rx: crossbeam_channel::Receiver<LedgerRound>,
+struct LedgerReadChannel {
+    tx: crossbeam_channel::Sender<LedgerRead>,
+    rx: crossbeam_channel::Receiver<LedgerRead>,
 }
 
-impl LedgerRoundChannel {
+impl LedgerReadChannel {
     fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self { tx, rx }
@@ -423,7 +472,7 @@ struct DecisionResult {
 }
 
 /// Drain-once channel for finished decisions, the shape
-/// [`LedgerRoundChannel`] uses and for the same reason.
+/// [`LedgerReadChannel`] uses and for the same reason.
 #[derive(Resource)]
 struct DecisionChannel {
     tx: crossbeam_channel::Sender<DecisionResult>,
@@ -438,44 +487,48 @@ impl DecisionChannel {
 }
 
 /// The ledger mirror, the decision write path, and the systems that keep
-/// them current. Add after `ActorPlugin`: the poll systems read `RpcActor`,
-/// and every renderer that reads [`LedgerMirror`] needs the resource to
-/// exist.
+/// them current. Add after `ActorPlugin`: these systems read `RpcActor`, and
+/// every renderer that reads [`LedgerMirror`] needs the resource to exist.
 pub struct LedgerMirrorPlugin;
 
 impl Plugin for LedgerMirrorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LedgerMirror>()
-            .insert_resource(LedgerRoundChannel::new())
+            .insert_resource(LedgerReadChannel::new())
             .insert_resource(DecisionChannel::new())
+            .init_resource::<DecisionsInFlight>()
             .add_message::<AskDecisionRequested>()
             .add_message::<AskDecisionSettled>()
+            .add_message::<AskLeft>()
             .add_systems(
                 Update,
                 (
-                    poll_ledger_events,
-                    start_ledger_round,
-                    drain_ledger_rounds,
+                    follow_ledger,
+                    drain_ledger_reads,
                     start_ask_decisions,
                     drain_ask_decisions,
                 )
-                    .chain(),
+                    .chain()
+                    // Before the surfaces derive their state, so an ask that
+                    // closed this frame takes its sheet down this frame.
+                    .before(crate::input::InputPhase::SyncContext),
             );
     }
 }
 
 /// Carry each requested decision to the kernel.
 ///
-/// The surfaces do not change their own state on a keypress: this writes
-/// `kj ledger allow|deny` and the mirror's next round — the kernel bumps the
-/// ledger generation on a decision — is what brings the ask down. A request
-/// with no live connection is reported straight back as a failure rather
-/// than dropped, so a key never does nothing.
+/// The surfaces do not change their own state on a keypress: this sends
+/// `decide_ask`, and the ledger push that closes the ask is what takes it
+/// off screen. A request with no live connection is reported straight back
+/// as a failure rather than dropped, so a key never does nothing. A request
+/// for an ask whose decision is still in flight is ignored
+/// ([`DecisionsInFlight`]).
 fn start_ask_decisions(
     actor: Option<Res<RpcActor>>,
     conn: Res<RpcConnectionState>,
-    doc_cache: Res<crate::view::document::DocumentCache>,
     channel: Res<DecisionChannel>,
+    mut in_flight: ResMut<DecisionsInFlight>,
     mut requests: MessageReader<AskDecisionRequested>,
     mut settled: MessageWriter<AskDecisionSettled>,
 ) {
@@ -484,11 +537,15 @@ fn start_ask_decisions(
         decision,
     } in requests.read()
     {
-        let ready = actor
-            .as_ref()
-            .filter(|_| conn.connected)
-            .zip(doc_cache.active_id());
-        let Some((actor, context_id)) = ready else {
+        if in_flight.contains(request_id) {
+            log::debug!(
+                "ignoring {} on ask {}: a decision is already in flight",
+                decision.label(),
+                short_request_id(request_id)
+            );
+            continue;
+        }
+        let Some(actor) = actor.as_ref().filter(|_| conn.connected) else {
             settled.write(AskDecisionSettled {
                 request_id: request_id.clone(),
                 decision: *decision,
@@ -497,57 +554,45 @@ fn start_ask_decisions(
             continue;
         };
 
+        in_flight.begin(request_id);
         let handle = actor.handle.clone();
         let tx = channel.tx.clone();
         let request_id = request_id.clone();
         let decision = *decision;
-        let (allow, remember) = decision.verb();
+        let (verdict, remember) = decision.answer();
         bevy::tasks::IoTaskPool::get()
             .spawn(async move {
-                let outcome = match kaijutsu_client::decide_ask_remember(
-                    &handle,
-                    context_id,
-                    &request_id,
-                    allow,
-                    remember,
-                )
-                .await
-                {
-                    Ok(result) => classify_decision(result.exit_code, &result.stderr),
-                    Err(e) => DecisionOutcome::Failed(format!("{e}")),
-                };
+                let reply = handle
+                    .decide_ask(request_id.clone(), verdict, remember)
+                    .await
+                    .map_err(|e| format!("{e}"));
                 let _ = tx.send(DecisionResult {
                     request_id,
                     decision,
-                    outcome,
+                    outcome: classify_answer(reply),
                 });
             })
             .detach();
     }
 }
 
-/// Publish finished decisions, and mark the mirror dirty on one the kernel
-/// took.
-///
-/// The generation bump normally covers that, but a bump we somehow miss must
-/// not leave an answered ask on screen — so this asks for a round outright
-/// rather than trusting the stream for the one change we started ourselves.
+/// Publish finished decisions, and free each ask for another decision.
 fn drain_ask_decisions(
     channel: Res<DecisionChannel>,
-    mut mirror: ResMut<LedgerMirror>,
+    mut in_flight: ResMut<DecisionsInFlight>,
     mut settled: MessageWriter<AskDecisionSettled>,
-    event_loop_proxy: Res<EventLoopProxyWrapper>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
 ) {
     let mut any = false;
     for result in channel.rx.try_iter() {
         any = true;
-        match &result.outcome {
-            DecisionOutcome::Accepted | DecisionOutcome::AlreadyDecided => mirror.dirty = true,
-            DecisionOutcome::Failed(detail) => log::warn!(
-                "kj ledger {} {} failed: {detail}",
+        in_flight.end(&result.request_id);
+        if let DecisionOutcome::Failed(detail) = &result.outcome {
+            log::warn!(
+                "{} on ask {} failed: {detail}",
                 result.decision.label(),
                 short_request_id(&result.request_id)
-            ),
+            );
         }
         settled.write(AskDecisionSettled {
             request_id: result.request_id,
@@ -555,225 +600,181 @@ fn drain_ask_decisions(
             outcome: result.outcome,
         });
     }
-    if any {
-        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    if any && let Some(proxy) = event_loop_proxy {
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
-/// Subscribe to the kernel's ledger change stream, and drain the generations
-/// it pushes.
+/// Follow the actor's ledger watch: fold each new value into the mirror and
+/// start the record reads it calls for.
 ///
-/// The subscription is installed on every new actor and marks the mirror
-/// dirty: a fresh connection knows nothing about the pending set, so the
-/// mirror is rebuilt from the kernel rather than trusted. A lag is the same
-/// answer — the generations that were dropped cannot be recovered, so the
-/// next round re-lists everything.
-fn poll_ledger_events(
+/// A new actor brings a new watch, and the mirror disowns the reads the old
+/// one started. The mirror is written only on a frame where something
+/// changed, because every renderer gates on its change tick.
+fn follow_ledger(
     actor: Option<Res<RpcActor>>,
+    channel: Res<LedgerReadChannel>,
     mut mirror: ResMut<LedgerMirror>,
-    mut receiver: Local<Option<broadcast::Receiver<i64>>>,
+    mut receiver: Local<Option<watch::Receiver<LedgerState>>>,
+    event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Some(actor) = actor else { return };
 
     if actor.is_changed() {
-        *receiver = Some(actor.handle.subscribe_ledger_events());
+        let mut rx = actor.handle.ledger();
+        // The value already in the watch has not been folded in yet.
+        rx.mark_changed();
+        *receiver = Some(rx);
         mirror.on_connection_changed();
     }
 
     let Some(rx) = receiver.as_mut() else { return };
-    loop {
-        match rx.try_recv() {
-            Ok(generation) => mirror.on_generation(generation),
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                log::warn!("ledger change stream lagged by {n}; re-reading the ledger");
-                mirror.on_stream_gap();
-            }
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Closed) => {
-                *receiver = None;
-                break;
-            }
+    match rx.has_changed() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            log::warn!("the ledger watch closed; the mirror keeps its last open set");
+            *receiver = None;
+            return;
         }
     }
-}
+    let state = rx.borrow_and_update().clone();
+    let diff = mirror.apply_state(&state);
+    let reads = mirror.take_reads();
 
-/// Start one round when the mirror owes one, nothing is in flight, the
-/// connection is live, and there is a current context to run `kj` in.
-///
-/// `dirty` stays set while any of those is missing, so the round happens as
-/// soon as they hold.
-fn start_ledger_round(
-    actor: Option<Res<RpcActor>>,
-    conn: Res<RpcConnectionState>,
-    doc_cache: Res<crate::view::document::DocumentCache>,
-    channel: Res<LedgerRoundChannel>,
-    mut mirror: ResMut<LedgerMirror>,
-) {
-    if !mirror.should_start_round() || !conn.connected {
-        return;
-    }
-    let Some(actor) = actor else { return };
-    let Some(context_id) = doc_cache.active_id() else {
-        return;
-    };
-
-    let held: Vec<String> = mirror.pending.iter().map(|ask| ask.request_id.clone()).collect();
-    mirror.on_round_start();
-
-    let handle = actor.handle.clone();
     let generation = actor.generation;
-    let connection_epoch = handle.connection_epoch();
-    let tx = channel.tx.clone();
-
-    bevy::tasks::IoTaskPool::get()
-        .spawn(async move {
-            let result = run_round(&handle, context_id, held).await;
-            let _ = tx.send(LedgerRound {
-                generation,
-                connection_epoch,
-                result,
-            });
-        })
-        .detach();
+    let connection_epoch = actor.handle.connection_epoch();
+    let spawn_read = |kind: ReadKind, request_id: String| {
+        let handle = actor.handle.clone();
+        let tx = channel.tx.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                let result = handle
+                    .get_ask(request_id.clone())
+                    .await
+                    .map_err(|e| format!("{e}"));
+                let _ = tx.send(LedgerRead {
+                    generation,
+                    connection_epoch,
+                    kind,
+                    request_id,
+                    result,
+                });
+            })
+            .detach();
+    };
+    for id in diff.departed.iter().cloned() {
+        spawn_read(ReadKind::Departed, id);
+    }
+    for id in reads {
+        spawn_read(ReadKind::Open, id);
+    }
+    if !diff.is_empty() {
+        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    }
 }
 
-/// One round against the kernel: list the pending asks, then read the detail
-/// of each ask that arrived or left. Every await lives here.
-async fn run_round(
-    handle: &kaijutsu_client::ActorHandle,
-    context_id: ContextId,
-    held: Vec<String>,
-) -> Result<RoundData, String> {
-    let listed = kaijutsu_client::list_pending(handle, context_id)
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let plan = plan_round(&held, &listed);
-
-    let mut fetched = Vec::with_capacity(plan.fetch_new.len());
-    for id in plan.fetch_new {
-        let detail = kaijutsu_client::show_ask_detail(handle, context_id, &id)
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("kj ledger show {id} failed: {e}");
-                None
-            });
-        fetched.push((id, detail));
-    }
-
-    let mut departed = Vec::with_capacity(plan.departed.len());
-    for id in plan.departed {
-        let detail = kaijutsu_client::show_ask_detail(handle, context_id, &id)
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("kj ledger show {id} failed for a decided ask: {e}");
-                None
-            });
-        departed.push((id, detail));
-    }
-
-    Ok(RoundData {
-        listed,
-        fetched,
-        departed,
-    })
-}
-
-/// Fold finished rounds into the mirror, dropping any that belong to a
-/// connection the app has already replaced.
-fn drain_ledger_rounds(
+/// Fold finished record reads into the mirror, dropping any that belong to
+/// a connection the app has already replaced.
+///
+/// A dropped departure read still reports the departure with no record:
+/// the new connection will not read that ask again, and a surface waiting
+/// on it must not wait forever.
+fn drain_ledger_reads(
     actor: Option<Res<RpcActor>>,
-    channel: Res<LedgerRoundChannel>,
+    channel: Res<LedgerReadChannel>,
     mut mirror: ResMut<LedgerMirror>,
-    event_loop_proxy: Res<EventLoopProxyWrapper>,
+    mut left: MessageWriter<AskLeft>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
 ) {
     let mut applied_any = false;
-    for round in channel.rx.try_iter() {
+    for read in channel.rx.try_iter() {
         let live = actor
             .as_ref()
             .map(|actor| {
-                actor.generation == round.generation
-                    && actor.handle.connection_epoch() == round.connection_epoch
+                actor.generation == read.generation
+                    && actor.handle.connection_epoch() == read.connection_epoch
             })
             .unwrap_or(false);
         if !live {
             log::debug!(
-                "discarding a ledger round from actor generation {} epoch {}",
-                round.generation,
-                round.connection_epoch
+                "discarding a ledger read from actor generation {} epoch {}",
+                read.generation,
+                read.connection_epoch
             );
+            if let ReadKind::Departed = read.kind {
+                left.write(AskLeft {
+                    request_id: read.request_id,
+                    record: None,
+                });
+            }
             continue;
         }
         applied_any = true;
-        match round.result {
-            Ok(data) => {
-                let unresolved = apply_round(&mut mirror, data);
-                if unresolved.is_empty() {
-                    mirror.on_round_done(false);
-                    mirror.last_error = None;
-                } else {
-                    log::warn!(
-                        "{} pending ask(s) could not be read; re-reading the ledger",
-                        unresolved.len()
-                    );
-                    mirror.last_error = Some(format!(
-                        "{} pending ask(s) could not be read",
-                        unresolved.len()
-                    ));
-                    mirror.on_round_done(true);
+        let short = short_request_id(&read.request_id).to_string();
+        match read.kind {
+            ReadKind::Open => {
+                if let Err(error) = &read.result {
+                    log::warn!("reading ask {short} failed: {error}");
                 }
+                mirror.on_record(&read.request_id, read.result);
             }
-            Err(error) => {
-                log::warn!("ledger round failed: {error}");
-                mirror.last_error = Some(error);
-                mirror.on_round_done(true);
+            ReadKind::Departed => {
+                let record = match read.result {
+                    Ok(record) => record,
+                    Err(error) => {
+                        log::warn!("reading closed ask {short} failed: {error}");
+                        None
+                    }
+                };
+                if let Some(record) = &record {
+                    mirror.on_departed(record.clone());
+                }
+                left.write(AskLeft {
+                    request_id: read.request_id,
+                    record,
+                });
             }
-        }
-        if !mirror.dirty && mirror.last_error.is_some() {
-            log::warn!(
-                "the ledger mirror is stale after {RETRY_LIMIT} failed round(s); \
-                 waiting for the next ledger change"
-            );
         }
     }
-    if applied_any {
-        let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
+    if applied_any && let Some(proxy) = event_loop_proxy {
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_types::{
+        AskAnswerFailure, AskAnswered, AskOrigin, AskStatus, PrincipalId, PrincipalRef,
+        RememberResult,
+    };
 
-    fn ask(id: &str, context: Option<ContextId>, decided_at: Option<i64>) -> AskDetail {
-        AskDetail {
+    fn ask(id: &str, context: Option<ContextId>, created_at_ms: i64) -> AskSummary {
+        AskSummary {
             request_id: id.to_string(),
+            status: AskStatus::Pending,
+            origin: AskOrigin::ShellGate,
             context_id: context,
-            principal_id: None,
-            principal_name: None,
-            actor_id: None,
-            actor_name: None,
-            reviewer_id: None,
-            reviewer_name: None,
-            status: if decided_at.is_some() { "allowed".into() } else { "pending".into() },
-            origin: "shell_gate".into(),
-            tool: None,
-            hook_id: None,
-            instance: None,
-            tool_call_block_id: None,
             description: format!("ask {id}"),
-            authorized_label: None,
             statements: Vec::new(),
-            exec_source: None,
-            cwd: None,
-            env: Vec::new(),
-            created_at: Some(1),
-            decided_at,
-            decided_by: None,
-            decided_by_name: None,
-            decided_option: None,
-            remember_scope: None,
-            redeemed_at: None, publication_abandoned: None,
+            requester: None,
+            performer: None,
+            reviewer: None,
+            created_at_ms,
+            decided_at_ms: None,
         }
+    }
+
+    fn closed(id: &str, decided_at_ms: Option<i64>) -> AskDetail {
+        let mut summary = ask(id, None, 0);
+        summary.status = AskStatus::Allowed;
+        summary.decided_at_ms = decided_at_ms;
+        summary_record(&summary)
+    }
+
+    fn state(asks: &[AskSummary], generation: i64) -> LedgerState {
+        LedgerState::from_listing(generation, asks.to_vec())
     }
 
     fn ctx(n: u8) -> ContextId {
@@ -786,279 +787,183 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
-    fn mirror_with(pending: &[&str]) -> LedgerMirror {
-        LedgerMirror {
-            pending: pending.iter().map(|id| ask(id, None, None)).collect(),
-            ..Default::default()
-        }
-    }
-
-    fn pending_ids(mirror: &LedgerMirror) -> Vec<String> {
-        mirror.pending.iter().map(|ask| ask.request_id.clone()).collect()
+    fn open_ids(mirror: &LedgerMirror) -> Vec<String> {
+        mirror.open().iter().map(|ask| ask.request_id.clone()).collect()
     }
 
     fn recent_ids(mirror: &LedgerMirror) -> Vec<String> {
-        mirror.recent.iter().map(|ask| ask.request_id.clone()).collect()
+        mirror
+            .recent()
+            .iter()
+            .map(|ask| ask.summary.request_id.clone())
+            .collect()
     }
 
-    // ── plan_round ──
+    // ── the diff ──
 
     #[test]
-    fn plan_round_fetches_only_the_ids_the_mirror_lacks() {
-        let plan = plan_round(&ids(&["a"]), &ids(&["a", "b", "c"]));
-        assert_eq!(plan.fetch_new, ids(&["b", "c"]));
-        assert_eq!(plan.keep, ids(&["a"]));
-        assert!(plan.departed.is_empty());
-    }
-
-    #[test]
-    fn plan_round_reports_held_ids_the_ledger_no_longer_lists() {
-        let plan = plan_round(&ids(&["a", "b"]), &ids(&["b"]));
-        assert_eq!(plan.departed, ids(&["a"]));
-        assert_eq!(plan.keep, ids(&["b"]));
-        assert!(plan.fetch_new.is_empty());
-    }
-
-    #[test]
-    fn plan_round_keeps_listed_order_for_the_ids_it_fetches() {
-        let plan = plan_round(&[], &ids(&["c", "a", "b"]));
-        assert_eq!(plan.fetch_new, ids(&["c", "a", "b"]));
+    fn a_first_listing_arrives_whole_and_oldest_first() {
+        let mut mirror = LedgerMirror::default();
+        let diff = mirror.apply_state(&state(
+            &[ask("c", None, 30), ask("a", None, 10), ask("b", None, 20)],
+            4,
+        ));
+        assert_eq!(diff.arrived, ids(&["a", "b", "c"]));
+        assert!(diff.departed.is_empty());
+        assert_eq!(open_ids(&mirror), ids(&["a", "b", "c"]));
+        assert_eq!(mirror.generation, 4);
+        assert!(mirror.synced);
     }
 
     #[test]
-    fn plan_round_on_an_empty_ledger_departs_everything_held() {
-        let plan = plan_round(&ids(&["a", "b"]), &[]);
-        assert_eq!(plan.departed, ids(&["a", "b"]));
-        assert!(plan.fetch_new.is_empty());
-        assert!(plan.keep.is_empty());
+    fn a_push_names_only_what_changed() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1), ask("b", None, 2)], 1));
+        let diff = mirror.apply_state(&state(&[ask("b", None, 2), ask("c", None, 3)], 2));
+        assert_eq!(diff.arrived, ids(&["c"]));
+        assert_eq!(diff.departed, ids(&["a"]));
+        assert_eq!(open_ids(&mirror), ids(&["b", "c"]));
     }
 
-    // ── apply_round ──
+    #[test]
+    fn the_same_open_set_again_is_not_news() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert!(mirror.apply_state(&state(&[ask("a", None, 1)], 2)).is_empty());
+    }
+
+    /// A reconnect relists; until it lands, the last-known open set is the
+    /// better answer, and nothing is reported as having left.
+    #[test]
+    fn an_unsynced_state_keeps_the_last_known_open_set() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        let diff = mirror.apply_state(&LedgerState::default());
+        assert!(diff.is_empty());
+        assert!(!mirror.synced);
+        assert_eq!(open_ids(&mirror), ids(&["a"]));
+    }
+
+    // ── record reads ──
 
     #[test]
-    fn apply_round_orders_pending_the_way_the_ledger_listed_it() {
-        let mut mirror = mirror_with(&["a"]);
-        let unresolved = apply_round(
-            &mut mirror,
-            RoundData {
-                listed: ids(&["b", "a", "c"]),
-                fetched: vec![
-                    ("b".into(), Some(ask("b", None, None))),
-                    ("c".into(), Some(ask("c", None, None))),
-                ],
-                departed: Vec::new(),
-            },
+    fn an_arrived_ask_is_read_once() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert_eq!(mirror.take_reads(), ids(&["a"]));
+        assert!(mirror.take_reads().is_empty(), "a read in flight is not started again");
+        mirror.on_record("a", Ok(Some(summary_record(&ask("a", None, 1)))));
+        assert!(mirror.take_reads().is_empty(), "a held record is not read again");
+        assert_eq!(mirror.record_gap("a"), None);
+    }
+
+    /// A failed read is retried on the next ledger change rather than
+    /// hiding a waiting ask's record for good, and says why meanwhile.
+    #[test]
+    fn a_failed_read_says_why_and_is_asked_for_again() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert_eq!(mirror.record_gap("a").as_deref(), Some("reading the full record"));
+        mirror.take_reads();
+        mirror.on_record("a", Err("timed out".into()));
+        assert_eq!(
+            mirror.record_gap("a").as_deref(),
+            Some("full record not read: timed out")
         );
-        assert!(unresolved.is_empty());
-        assert_eq!(pending_ids(&mirror), ids(&["b", "a", "c"]));
+        assert_eq!(mirror.take_reads(), ids(&["a"]));
     }
 
+    /// Until the record lands, the summary stands in for it — the ask is
+    /// still offered and still counted.
     #[test]
-    fn apply_round_reuses_the_detail_it_already_held() {
-        let mut mirror = mirror_with(&["a"]);
-        let mut fresh = ask("b", None, None);
-        fresh.description = "fresh".into();
-        apply_round(
-            &mut mirror,
-            RoundData {
-                listed: ids(&["b", "a"]),
-                fetched: vec![("b".into(), Some(fresh))],
-                departed: Vec::new(),
-            },
-        );
-        assert_eq!(pending_ids(&mirror), ids(&["b", "a"]));
-        assert_eq!(mirror.pending[0].description, "fresh");
-        assert_eq!(mirror.pending[1].description, "ask a", "a held ask is not re-read");
-    }
-
-    #[test]
-    fn apply_round_reports_an_ask_it_could_not_read_and_leaves_it_out() {
+    fn an_unread_ask_is_still_shown_from_its_summary() {
         let mut mirror = LedgerMirror::default();
-        let unresolved = apply_round(
-            &mut mirror,
-            RoundData {
-                listed: ids(&["a", "b"]),
-                fetched: vec![("a".into(), None), ("b".into(), Some(ask("b", None, None)))],
-                departed: Vec::new(),
-            },
-        );
-        assert_eq!(unresolved, ids(&["a"]));
-        assert_eq!(pending_ids(&mirror), ids(&["b"]));
+        mirror.apply_state(&state(&[ask("a", Some(ctx(1)), 1)], 1));
+        let record = mirror.record("a").expect("an open ask has a record");
+        assert_eq!(record.summary.description, "ask a");
+        assert_eq!(record.tool, None);
+        assert!(mirror.context_is_asking(ctx(1)));
     }
 
+    /// A reassignment changes the reviewer while the ask stays open; the
+    /// record shows the live summary, not the one read with it.
     #[test]
-    fn apply_round_pushes_departed_asks_onto_recent_newest_first() {
-        let mut mirror = mirror_with(&["old", "new"]);
-        apply_round(
-            &mut mirror,
-            RoundData {
-                listed: Vec::new(),
-                fetched: Vec::new(),
-                departed: vec![
-                    ("old".into(), Some(ask("old", None, Some(10)))),
-                    ("new".into(), Some(ask("new", None, Some(20)))),
-                ],
-            },
-        );
-        assert_eq!(recent_ids(&mirror), ids(&["new", "old"]));
-        assert!(mirror.pending.is_empty());
-    }
-
-    #[test]
-    fn apply_round_caps_recent_and_keeps_the_newest() {
-        let mut mirror = mirror_with(&["d"]);
-        mirror.recent = ["c", "b", "a"].iter().map(|id| ask(id, None, Some(1))).collect();
-        apply_round(
-            &mut mirror,
-            RoundData {
-                listed: Vec::new(),
-                fetched: Vec::new(),
-                departed: vec![("d".into(), Some(ask("d", None, Some(9))))],
-            },
-        );
-        assert_eq!(recent_ids(&mirror), ids(&["d", "c", "b"]));
-        assert_eq!(mirror.recent.len(), RECENT_CAP);
-    }
-
-    #[test]
-    fn apply_round_drops_a_departed_ask_it_could_not_read() {
-        let mut mirror = mirror_with(&["a"]);
-        let unresolved = apply_round(
-            &mut mirror,
-            RoundData {
-                listed: Vec::new(),
-                fetched: Vec::new(),
-                departed: vec![("a".into(), None)],
-            },
-        );
-        assert!(unresolved.is_empty(), "a decided ask is not re-read on a later round");
-        assert!(mirror.pending.is_empty());
-        assert!(mirror.recent.is_empty());
-    }
-
-    // ── the dirty / in-flight latch ──
-
-    #[test]
-    fn a_clean_mirror_starts_no_round() {
-        assert!(!LedgerMirror::default().should_start_round());
-    }
-
-    #[test]
-    fn a_generation_bump_earns_one_round() {
+    fn a_record_carries_the_live_summary() {
         let mut mirror = LedgerMirror::default();
-        mirror.on_generation(7);
-        assert_eq!(mirror.generation, Some(7));
-        assert!(mirror.should_start_round());
-        mirror.on_round_start();
-        assert!(!mirror.should_start_round(), "one bump, one round");
-        mirror.on_round_done(false);
-        assert!(!mirror.should_start_round());
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        mirror.take_reads();
+        let mut read = summary_record(&ask("a", None, 1));
+        read.tool = Some("shell_write".into());
+        mirror.on_record("a", Ok(Some(read)));
+
+        let mut moved = ask("a", None, 1);
+        moved.reviewer = Some(PrincipalRef {
+            id: PrincipalId::from_bytes([7; 16]),
+            name: "banto".into(),
+        });
+        mirror.apply_state(&state(&[moved.clone()], 2));
+        let record = mirror.record("a").expect("open");
+        assert_eq!(record.summary, moved);
+        assert_eq!(record.tool.as_deref(), Some("shell_write"));
     }
 
     #[test]
-    fn bumps_during_a_round_schedule_exactly_one_more() {
+    fn a_read_for_an_ask_that_already_left_is_dropped() {
         let mut mirror = LedgerMirror::default();
-        mirror.on_generation(1);
-        mirror.on_round_start();
-        mirror.on_generation(2);
-        mirror.on_generation(3);
-        assert!(!mirror.should_start_round(), "rounds are single-flight");
-        mirror.on_round_done(false);
-        assert!(mirror.should_start_round());
-        mirror.on_round_start();
-        mirror.on_round_done(false);
-        assert!(!mirror.should_start_round(), "three bumps do not earn three rounds");
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        mirror.take_reads();
+        mirror.apply_state(&state(&[], 2));
+        mirror.on_record("a", Ok(Some(summary_record(&ask("a", None, 1)))));
+        assert!(mirror.record("a").is_none(), "the departure read answers for it");
     }
 
+    /// A replaced connection's reads are discarded, so the mirror must not
+    /// wait on them: every unread ask is read again.
     #[test]
-    fn an_older_generation_still_earns_a_round_without_moving_the_mirror_back() {
+    fn a_replaced_connection_rereads_what_was_in_flight() {
         let mut mirror = LedgerMirror::default();
-        mirror.on_generation(9);
-        mirror.on_round_start();
-        mirror.on_round_done(false);
-        mirror.on_generation(4);
-        assert_eq!(mirror.generation, Some(9));
-        assert!(mirror.should_start_round());
-    }
-
-    #[test]
-    fn a_round_that_left_work_undone_earns_another() {
-        let mut mirror = LedgerMirror::default();
-        mirror.on_generation(1);
-        mirror.on_round_start();
-        mirror.on_round_done(true);
-        assert!(mirror.should_start_round());
-    }
-
-    #[test]
-    fn rounds_that_keep_failing_stop_retrying_until_the_next_trigger() {
-        let mut mirror = LedgerMirror::default();
-        mirror.on_generation(1);
-        for _ in 0..RETRY_LIMIT {
-            assert!(mirror.should_start_round(), "a retry is owed inside the budget");
-            mirror.on_round_start();
-            mirror.on_round_done(true);
-        }
-        assert!(
-            !mirror.should_start_round(),
-            "a failing ledger must not be re-read on every frame"
-        );
-
-        mirror.on_generation(2);
-        assert!(mirror.should_start_round(), "a fresh bump earns a fresh budget");
-    }
-
-    #[test]
-    fn a_round_that_succeeds_restores_the_retry_budget() {
-        let mut mirror = LedgerMirror::default();
-        mirror.on_generation(1);
-        mirror.on_round_start();
-        mirror.on_round_done(true);
-        mirror.on_round_start();
-        mirror.on_round_done(false);
-        mirror.on_generation(2);
-        for _ in 0..RETRY_LIMIT {
-            assert!(mirror.should_start_round());
-            mirror.on_round_start();
-            mirror.on_round_done(true);
-        }
-        assert!(!mirror.should_start_round());
-    }
-
-    #[test]
-    fn a_replaced_connection_owes_a_round_and_disowns_the_running_one() {
-        let mut mirror = LedgerMirror::default();
-        mirror.on_generation(5);
-        mirror.on_round_start();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        mirror.take_reads();
         mirror.on_connection_changed();
-        assert_eq!(mirror.generation, None, "the new connection's generations are unknown");
-        assert!(mirror.should_start_round());
+        assert!(!mirror.synced);
+        assert_eq!(mirror.take_reads(), ids(&["a"]));
+    }
+
+    // ── recent ──
+
+    #[test]
+    fn departed_asks_go_to_recent_newest_decision_first() {
+        let mut mirror = LedgerMirror::default();
+        mirror.on_departed(closed("old", Some(10)));
+        mirror.on_departed(closed("undated", None));
+        mirror.on_departed(closed("new", Some(20)));
+        assert_eq!(recent_ids(&mirror), ids(&["new", "old", "undated"]));
+        assert_eq!(mirror.record("new").map(|a| a.summary.request_id), Some("new".into()));
     }
 
     #[test]
-    fn a_stream_gap_owes_a_round_with_a_fresh_budget() {
+    fn recent_is_capped_and_keeps_the_newest() {
         let mut mirror = LedgerMirror::default();
-        mirror.on_generation(1);
-        for _ in 0..RETRY_LIMIT {
-            mirror.on_round_start();
-            mirror.on_round_done(true);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            mirror.on_departed(closed(id, Some(i as i64)));
         }
-        assert!(!mirror.should_start_round());
-        mirror.on_stream_gap();
-        assert!(mirror.should_start_round());
-        assert_eq!(mirror.generation, Some(1), "a gap says nothing about the generation");
+        assert_eq!(recent_ids(&mirror), ids(&["d", "c", "b"]));
+        assert_eq!(mirror.recent().len(), RECENT_CAP);
     }
 
     // ── reads ──
 
     #[test]
-    fn pending_for_context_selects_that_context_in_ledger_order() {
+    fn pending_for_context_selects_that_context_oldest_first() {
         let mut mirror = LedgerMirror::default();
-        mirror.pending = vec![
-            ask("a", Some(ctx(1)), None),
-            ask("b", Some(ctx(2)), None),
-            ask("c", Some(ctx(1)), None),
-        ];
+        mirror.apply_state(&state(
+            &[
+                ask("a", Some(ctx(1)), 1),
+                ask("b", Some(ctx(2)), 2),
+                ask("c", Some(ctx(1)), 3),
+            ],
+            1,
+        ));
         let selected: Vec<String> = mirror
             .pending_for_context(ctx(1))
             .map(|ask| ask.request_id.clone())
@@ -1070,51 +975,82 @@ mod tests {
     }
 
     #[test]
-    fn get_finds_an_ask_whether_it_is_pending_or_decided() {
+    fn an_ask_with_no_context_is_in_no_context_lamp() {
         let mut mirror = LedgerMirror::default();
-        mirror.pending = vec![ask("a", None, None)];
-        mirror.recent = vec![ask("b", None, Some(5))];
-        assert_eq!(mirror.get("a").map(|a| a.request_id.as_str()), Some("a"));
-        assert_eq!(mirror.get("b").map(|a| a.request_id.as_str()), Some("b"));
-        assert!(mirror.get("c").is_none(), "never held is not the same as not in the ledger");
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert_eq!(mirror.pending_count(), 1);
+        assert!(!mirror.context_is_asking(ctx(1)));
     }
 
     // ── the decision ──
 
+    fn answered(remembered: Option<RememberResult>) -> kaijutsu_client::AskAnswer {
+        Ok(AskAnswered {
+            summary: ask("a", None, 1),
+            remembered,
+        })
+    }
+
+    fn refused(kind: AskAnswerFailureKind, message: &str) -> kaijutsu_client::AskAnswer {
+        Err(AskAnswerFailure {
+            kind,
+            message: message.into(),
+        })
+    }
+
     #[test]
-    fn a_clean_exit_is_the_kernel_taking_the_decision() {
-        assert_eq!(classify_decision(0, ""), DecisionOutcome::Accepted);
+    fn an_answer_the_ledger_took_is_accepted() {
+        assert_eq!(
+            classify_answer(Ok(answered(None))),
+            DecisionOutcome::Accepted { unlearned: None }
+        );
+        let learned = RememberResult { learned: true, note: "learned".into() };
+        assert_eq!(
+            classify_answer(Ok(answered(Some(learned)))),
+            DecisionOutcome::Accepted { unlearned: None }
+        );
+    }
+
+    /// The answer stands when its standing rule was not written, but the
+    /// player asked for one and must hear that it is missing.
+    #[test]
+    fn a_rule_that_was_not_learned_is_reported() {
+        let unlearned = RememberResult { learned: false, note: "compound statement".into() };
+        assert_eq!(
+            classify_answer(Ok(answered(Some(unlearned)))),
+            DecisionOutcome::Accepted { unlearned: Some("compound statement".into()) }
+        );
     }
 
     /// A lost race is normal, not a failure — two players share one ledger
     /// and the kernel makes exactly one of them win.
     #[test]
-    fn a_refusal_that_names_an_answered_ask_is_a_lost_race() {
-        for stderr in [
-            "error: ask already decided",
-            "AlreadyDecided",
-            "request 01a04eb6 is not pending",
-        ] {
-            assert_eq!(
-                classify_decision(1, stderr),
-                DecisionOutcome::AlreadyDecided,
-                "{stderr}"
-            );
-        }
+    fn an_already_answered_ask_is_a_lost_race() {
+        assert_eq!(
+            classify_answer(Ok(refused(AskAnswerFailureKind::AlreadyAnswered, "taken"))),
+            DecisionOutcome::AlreadyDecided
+        );
     }
 
-    /// Every other refusal keeps its own words, and a silent one still says
-    /// something — a key must never do nothing.
+    /// Every other refusal keeps the ledger's own words, and a call that
+    /// never arrived says so.
     #[test]
     fn any_other_refusal_reports_what_the_kernel_said() {
+        for kind in [
+            AskAnswerFailureKind::NotFound,
+            AskAnswerFailureKind::NotReviewer,
+            AskAnswerFailureKind::Archived,
+            AskAnswerFailureKind::Refused,
+        ] {
+            assert_eq!(
+                classify_answer(Ok(refused(kind, "the ledger said no"))),
+                DecisionOutcome::Failed("the ledger said no".into()),
+                "{kind:?}"
+            );
+        }
         assert_eq!(
-            classify_decision(2, "permission denied\nbacktrace..."),
-            DecisionOutcome::Failed("permission denied".to_string()),
-            "the first line is the message, not the backtrace"
-        );
-        assert_eq!(
-            classify_decision(2, "   "),
-            DecisionOutcome::Failed("exit 2".to_string())
+            classify_answer(Err("not connected".into())),
+            DecisionOutcome::Failed("not connected".into())
         );
     }
 
@@ -1127,11 +1063,14 @@ mod tests {
 
     #[test]
     fn allow_always_is_the_only_option_that_remembers() {
-        assert_eq!(Decision::AllowOnce.verb(), (true, None));
-        assert_eq!(Decision::Deny.verb(), (false, None));
+        assert_eq!(Decision::AllowOnce.answer(), (AskVerdict::Allow, None));
+        assert_eq!(Decision::Deny.answer(), (AskVerdict::Deny, None));
         assert_eq!(
-            Decision::AllowAlways.verb(),
-            (true, Some(kaijutsu_client::RememberScope::Always))
+            Decision::AllowAlways.answer(),
+            (
+                AskVerdict::Allow,
+                Some(Remember { scope: RememberScope::Always, family: false })
+            )
         );
     }
 
@@ -1146,11 +1085,100 @@ mod tests {
         assert_eq!(short_request_id("bare"), "bare");
     }
 
+    // ── the systems ──
+
+    /// `start_ask_decisions` and the two drains, with no actor: every
+    /// decision fails for want of a connection and every read is stale.
+    fn decision_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<RpcConnectionState>()
+            .init_resource::<LedgerMirror>()
+            .init_resource::<DecisionsInFlight>()
+            .insert_resource(DecisionChannel::new())
+            .insert_resource(LedgerReadChannel::new())
+            .add_message::<AskDecisionRequested>()
+            .add_message::<AskDecisionSettled>()
+            .add_message::<AskLeft>()
+            .add_systems(
+                Update,
+                (start_ask_decisions, drain_ask_decisions, drain_ledger_reads).chain(),
+            );
+        app
+    }
+
+    fn settled(app: &mut App) -> Vec<(String, DecisionOutcome)> {
+        app.world_mut()
+            .resource_mut::<Messages<AskDecisionSettled>>()
+            .drain()
+            .map(|s| (s.request_id, s.outcome))
+            .collect()
+    }
+
+    /// A second key on an ask whose answer is still in flight is not sent:
+    /// it could only lose the race to the first and report that loss to the
+    /// player who won it.
     #[test]
-    fn an_ask_with_no_context_is_in_no_context_lamp() {
-        let mut mirror = LedgerMirror::default();
-        mirror.pending = vec![ask("a", None, None)];
-        assert_eq!(mirror.pending_count(), 1);
-        assert!(!mirror.context_is_asking(ctx(1)));
+    fn a_decision_in_flight_takes_no_second_answer() {
+        let mut app = decision_app();
+        app.world_mut().resource_mut::<DecisionsInFlight>().begin("a");
+        for id in ["a", "b"] {
+            app.world_mut().write_message(AskDecisionRequested {
+                request_id: id.into(),
+                decision: Decision::AllowOnce,
+            });
+        }
+        app.update();
+        assert_eq!(
+            settled(&mut app),
+            vec![("b".to_string(), DecisionOutcome::Failed("no live connection".into()))],
+            "the in-flight ask is ignored; another is still answered"
+        );
+    }
+
+    /// The reply frees the ask, so a key after it is sent again.
+    #[test]
+    fn a_landed_reply_frees_the_ask_for_another_decision() {
+        let mut app = decision_app();
+        app.world_mut().resource_mut::<DecisionsInFlight>().begin("a");
+        app.world().resource::<DecisionChannel>().tx.send(DecisionResult {
+            request_id: "a".into(),
+            decision: Decision::Deny,
+            outcome: DecisionOutcome::AlreadyDecided,
+        }).unwrap();
+        app.update();
+        assert_eq!(
+            settled(&mut app),
+            vec![("a".to_string(), DecisionOutcome::AlreadyDecided)],
+            "a genuine lost race is still reported"
+        );
+        assert!(!app.world().resource::<DecisionsInFlight>().contains("a"));
+    }
+
+    /// A departure read from a replaced connection is not folded in, but
+    /// the departure is still reported, with no record, so nothing waits on
+    /// it forever. An open-ask read from it reports nothing.
+    #[test]
+    fn a_stale_departure_read_still_reports_the_departure() {
+        let mut app = decision_app();
+        let tx = app.world().resource::<LedgerReadChannel>().tx.clone();
+        for (kind, id) in [(ReadKind::Departed, "gone"), (ReadKind::Open, "open")] {
+            tx.send(LedgerRead {
+                generation: 1,
+                connection_epoch: 1,
+                kind,
+                request_id: id.into(),
+                result: Ok(Some(closed(id, Some(5)))),
+            })
+            .unwrap();
+        }
+        app.update();
+        let left: Vec<(String, bool)> = app
+            .world_mut()
+            .resource_mut::<Messages<AskLeft>>()
+            .drain()
+            .map(|l| (l.request_id, l.record.is_some()))
+            .collect();
+        assert_eq!(left, vec![("gone".to_string(), false)]);
+        assert!(app.world().resource::<LedgerMirror>().recent().is_empty());
     }
 }

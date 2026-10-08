@@ -1476,39 +1476,7 @@ mod tests {
 
     /// An ask card, ready to put on `App::ask_card`.
     fn ask_card(id: ContextId, statement: &str) -> crate::asks::AskCardState {
-        crate::asks::AskCardState {
-            request_id: "01a04eb6".to_string(),
-            context_id: id,
-            detail: kaijutsu_client::AskDetail {
-                request_id: "01a04eb6".to_string(),
-                context_id: Some(id),
-                principal_id: None,
-                principal_name: None,
-                actor_id: None,
-                actor_name: None,
-                reviewer_id: None,
-                reviewer_name: None,
-                status: "pending".to_string(),
-                origin: "shell_gate".to_string(),
-                tool: Some("shell_write".to_string()),
-                hook_id: None,
-                instance: None,
-                tool_call_block_id: None,
-                description: statement.to_string(),
-                authorized_label: None,
-                statements: vec![statement.to_string()],
-                exec_source: None,
-                cwd: None,
-                env: Vec::new(),
-                created_at: None,
-                decided_at: None,
-                decided_by: None,
-                decided_by_name: None,
-                decided_option: None,
-                remember_scope: None,
-                redeemed_at: None, publication_abandoned: None,
-            },
-        }
+        crate::asks::fixtures::card("01a04eb6", id, statement)
     }
 
     /// A ledger view of `n` pending rows.

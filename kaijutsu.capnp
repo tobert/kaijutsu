@@ -453,6 +453,173 @@ struct Refusal {
   remedy @4 :Text;
 }
 
+# ── Typed ledger (docs/approval-identity.md) ─────────────────────────────
+# Clients read and answer the approval ledger with these, with no context:
+# the ledger is kernel-wide, and an answer is recorded in the ledger, not
+# in a transcript. `kj ledger list|show` renders the same values.
+# An absent Text pointer means the field has no value.
+
+enum AskOrigin {
+  # A PreCall hook asks before execution.
+  hook @0;
+  # A result hook reviews captured output; approval never executes source.
+  hookResult @1;
+  # The shell gate asked before executing a command.
+  shellGate @2;
+  # A privileged `kj` verb gated itself.
+  kjVerb @3;
+}
+
+# A principal and the name its character sheet gives it now.
+struct PrincipalRef {
+  id @0 :Data;
+  name @1 :Text;
+}
+
+# What a client needs to show an ask as a card or an indicator.
+struct AskSummary {
+  requestId @0 :Text;
+  status @1 :AskStatus;
+  origin @2 :AskOrigin;
+  # Empty when the stored id is malformed.
+  contextId @3 :Data;
+  description @4 :Text;
+  # Each statement the ask covers, rendered.
+  statements @5 :List(Text);
+  # Absent pointers: the row does not record that identity.
+  requester @6 :PrincipalRef;
+  performer @7 :PrincipalRef;
+  reviewer @8 :PrincipalRef;
+  createdAtMs @9 :Int64;
+  decidedAtMs @10 :Int64;
+  hasDecidedAt @11 :Bool;
+}
+
+# One free variable's value at ask time.
+struct AskEnv {
+  name @0 :Text;
+  # Absent when the variable was unset.
+  value @1 :Text;
+}
+
+struct AskDecision {
+  # Absent when a rule decided it.
+  decidedBy @0 :PrincipalRef;
+  # `allow_once`, `deny`, `prompt_cancelled`, `auto_allow`, and so on.
+  option @1 :Text;
+  rememberScope @2 :Text;
+  autoReason @3 :Text;
+}
+
+struct AskDetail {
+  summary @0 :AskSummary;
+  instance @1 :Text;
+  tool @2 :Text;
+  hookId @3 :Text;
+  label @4 :Text;
+  # The model's ToolCall block whose invocation raised the ask.
+  toolCallBlockId @5 :BlockId;
+  execSource @6 :Text;
+  cwd @7 :Text;
+  env @8 :List(AskEnv);
+  # Absent while open, and on an ask that ended without an answer.
+  decision @9 :AskDecision;
+  redeemedAtMs @10 :Int64;
+  hasRedeemedAt @11 :Bool;
+  publicationAbandoned @12 :Text;
+  # Each time the ask changed reviewer, oldest first.
+  reassignments @13 :List(AskReassignment);
+}
+
+# One change of an ask's reviewer. `by` equal to `to` is a takeover.
+struct AskReassignment {
+  # Absent on an ask that had no reviewer recorded.
+  from @0 :PrincipalRef;
+  to @1 :PrincipalRef;
+  by @2 :PrincipalRef;
+  atMs @3 :Int64;
+}
+
+enum AskView {
+  # Pending asks, oldest first.
+  queue @0;
+  # Decided asks, newest first.
+  history @1;
+}
+
+# A decided `status` selects the history view by itself.
+struct AskFilter {
+  view @0 :AskView;
+  status @1 :AskStatus;
+  hasStatus @2 :Bool;
+  origin @3 :AskOrigin;
+  hasOrigin @4 :Bool;
+  # Only asks created at or after this unix-epoch millisecond.
+  sinceMs @5 :Int64;
+  hasSince @6 :Bool;
+  limit @7 :UInt32;
+  # False lists every matching ask.
+  hasLimit @8 :Bool;
+}
+
+enum AskVerdict {
+  allow @0;
+  deny @1;
+  # The reviewer's prompt was cancelled rather than answered.
+  promptCancelled @2;
+}
+
+enum RememberScope {
+  # The context and principal that asked.
+  session @0;
+  # Any context or principal presenting the same statement and label.
+  always @1;
+}
+
+# A standing rule an answer asks for.
+struct Remember {
+  scope @0 :RememberScope;
+  # Remember the command family rather than the exact text.
+  family @1 :Bool;
+}
+
+# Whether a requested standing rule was written. The answer stands either way.
+struct RememberResult {
+  learned @0 :Bool;
+  note @1 :Text;
+}
+
+enum AskAnswerFailureKind {
+  notFound @0;
+  # The caller is not the assigned reviewer, or performed the work.
+  notReviewer @1;
+  # Another answer, an expiry, or a cancellation got there first.
+  alreadyAnswered @2;
+  # The ask's context is archived and runs nothing.
+  archived @3;
+  # The request was invalid or the ledger refused it for another reason.
+  refused @4;
+}
+
+struct AskAnswered {
+  # The ask after the change.
+  summary @0 :AskSummary;
+  # Absent when no standing rule was requested.
+  remembered @1 :RememberResult;
+}
+
+struct AskAnswerFailure {
+  kind @0 :AskAnswerFailureKind;
+  message @1 :Text;
+}
+
+struct AskAnswerOutcome {
+  union {
+    answered @0 :AskAnswered;
+    failed @1 :AskAnswerFailure;
+  }
+}
+
 # ── Refusable results ────────────────────────────────────────────────────
 # The seven methods a gate or a capability can refuse. Each returns one of
 # these instead of a bare value, so a refusal cannot be missed by a caller
@@ -1772,27 +1939,24 @@ interface ElicitationEvents {
 # ============================================================================
 # Approval-ledger change notification
 # ============================================================================
-# Carries a generation and nothing else — no ask id, no status, no content.
-# Two properties depend on that emptiness:
-#
-# - Coalescing is lossless. N changes inside a delivery window collapse to
-#   one notification bearing the highest generation, and a client that polls
-#   afterwards still observes all N.
-# - A dropped notification cannot corrupt anything; the worst case is a late
-#   poll. The ledger is the authority, and answering is its claim/decide
-#   transaction (exactly one answerer wins), reached through `kj ledger`.
+# Carries every ask that changed after the subscriber's generation, each in
+# its current state, and the generation they bring the subscriber to. The
+# kernel stamps each ask with the generation of its latest change in the
+# same transaction as the change, so a subscriber that has seen generation
+# `g` misses nothing by asking for asks stamped after `g`. Changes inside a
+# delivery window coalesce: an ask appears once, in its latest state.
 #
 # The generation is durable in the ledger's SQLite and maintained by
 # triggers, so it cannot report a change that did not commit. The kernel
-# jumps it ahead by a gap at boot, so a restart reads as a discontinuity
-# rather than a silent resume. Int64 because SQLite's INTEGER is i64.
+# jumps it ahead by a gap at boot. Int64 because SQLite's INTEGER is i64.
 
 interface LedgerEvents {
-  # Next free ordinal: 1. Ordinals are dense and permanent — never
+  # Next free ordinal: 2. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
-  onChanged @0 (generation :Int64) -> ();
+  retired0 @0 ();
+  onAsks @1 (generation :Int64, asks :List(AskSummary)) -> ();
 }
 
 # MCP Completion — argument value suggestions
@@ -1858,7 +2022,7 @@ interface World {
 }
 
 interface Kernel {
-  # Next free ordinal: 107. Ordinals are dense and permanent — never
+  # Next free ordinal: 111. Ordinals are dense and permanent — never
   # reuse one, and never renumber outside a flag day; retiring a method
   # leaves a `retiredNN @NN ();` stub instead.
 
@@ -2479,16 +2643,12 @@ interface Kernel {
   # (docs/gate-resume.md) and announces via subscribeLedgerEvents.
   retired93 @93 ();
 
-  # Kernel-wide: a ledger change can originate from any call path (a gated
-  # `shell_write` in one context, a `kj ledger` answer typed in a shell, a
-  # rule learned by a sibling), so one subscription serves every context.
-  # No per-context filter parameter — the notification carries no context
-  # to filter on.
-  #
-  # Delivery coalesces server-side within the change feed's latency budget
-  # (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`), which is sound
-  # because collapsing generations loses nothing.
-  subscribeLedgerEvents @101 (callback :LedgerEvents);
+  # Kernel-wide: a ledger change can originate from any call path, so one
+  # subscription serves every context. Pushes every ask changed after
+  # `sinceGeneration`; pass the generation a `listAsks` returned. Delivery
+  # coalesces within the change feed's latency budget
+  # (`kaijutsu-server`'s `context_feed::FEED_BATCH_WINDOW`).
+  subscribeLedgerEvents @101 (callback :LedgerEvents, sinceGeneration :Int64);
 
   # ==========================================================================
   # kj (context-addressed command execution)
@@ -2501,7 +2661,7 @@ interface Kernel {
   # catalog is deliberately read-mostly.
   #
   # quiet: run the verb but author no blocks for it. For a client's own
-  # bookkeeping (polling the ledger), never for a player's command.
+  # bookkeeping, never for a player's command.
   executeKj @99 (contextId :Data, argv :List(Text), trace :TraceContext, quiet :Bool) -> (outcome :ExecuteKjOutcome);
 
   # ACP-facing command metadata. argvPrefix is the exact kj argv represented
@@ -2548,4 +2708,27 @@ interface Kernel {
   # false when a server failed to start.
   declareContextMcpServers @106 (contextId :Data, servers :List(ContextMcpServer), trace :TraceContext)
       -> (instances :List(Text), error :Text, invalid :Bool);
+
+  # ── The approval ledger (docs/approval-identity.md) ─────────────────────
+  # No context: the ledger is kernel-wide, and the caller is the
+  # connection's principal.
+
+  # Asks matching `filter`, the ledger generation they were read at, and
+  # how many matched before `limit`.
+  listAsks @107 (filter :AskFilter, trace :TraceContext)
+      -> (generation :Int64, asks :List(AskSummary), total :UInt64);
+
+  # One ask's full record. `ask` is absent when no such ask exists.
+  getAsk @108 (requestId :Text, trace :TraceContext) -> (ask :AskDetail);
+
+  # Answer an ask as its assigned reviewer. Recorded in the ledger only;
+  # no block is authored. `remember` absent: no standing rule.
+  decideAsk @109 (requestId :Text, verdict :AskVerdict, remember :Remember, trace :TraceContext)
+      -> (outcome :AskAnswerOutcome);
+
+  # Reassign a pending ask. The assigned reviewer or the lineage root of the
+  # ask's context may. An empty `to` names the next responsible character
+  # above the current reviewer.
+  escalateAsk @110 (requestId :Text, to :Data, trace :TraceContext)
+      -> (outcome :AskAnswerOutcome);
 }

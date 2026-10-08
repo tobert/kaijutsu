@@ -106,7 +106,6 @@ use kaijutsu_kernel::{
     block_store::BlockStore,
     flows::EditorFlow,
     flows::FlowMessage,
-    flows::LedgerFlow,
     flows::{TurnFlow, TurnOrigin, TurnStopReason},
     shared_block_flow_bus,
 };
@@ -4067,6 +4066,88 @@ impl kernel::Server for KernelImpl {
         }.instrument(trace_span))
     }
 
+    fn list_asks(
+        self: Rc<Self>,
+        params: kernel::ListAsksParams,
+        mut results: kernel::ListAsksResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "list_asks").entered();
+        let filter = pry!(crate::ledger_wire::read_ask_filter(pry!(p.get_filter())));
+        let listing = pry!(
+            kaijutsu_kernel::ledger_view::list_asks(&self.kernel.kernel_db.lock(), &filter)
+                .map_err(|e| capnp::Error::failed(format!("listAsks: {e}")))
+        );
+        let mut r = results.get();
+        r.set_generation(listing.generation);
+        r.set_total(listing.total);
+        let mut asks = r.init_asks(listing.asks.len() as u32);
+        for (i, ask) in listing.asks.iter().enumerate() {
+            crate::ledger_wire::set_ask_summary(asks.reborrow().get(i as u32), ask);
+        }
+        Promise::ok(())
+    }
+
+    fn get_ask(
+        self: Rc<Self>,
+        params: kernel::GetAskParams,
+        mut results: kernel::GetAskResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "get_ask").entered();
+        let request_id = pry!(pry!(p.get_request_id()).to_str()).to_owned();
+        let detail = pry!(
+            kaijutsu_kernel::ledger_view::get_ask(&self.kernel.kernel_db.lock(), &request_id)
+                .map_err(|e| capnp::Error::failed(format!("getAsk: {e}")))
+        );
+        if let Some(detail) = detail {
+            crate::ledger_wire::set_ask_detail(results.get().init_ask(), &detail);
+        }
+        Promise::ok(())
+    }
+
+    /// Answer as the connection's principal, from no context: the answer is
+    /// recorded in the ledger and no block is authored.
+    fn decide_ask(
+        self: Rc<Self>,
+        params: kernel::DecideAskParams,
+        mut results: kernel::DecideAskResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "decide_ask").entered();
+        let request_id = pry!(pry!(p.get_request_id()).to_str()).to_owned();
+        let verdict = crate::ledger_wire::read_verdict(pry!(p.get_verdict()));
+        let remember = if p.has_remember() {
+            Some(pry!(crate::ledger_wire::read_remember(pry!(p.get_remember()))))
+        } else {
+            None
+        };
+        let principal = self.connection.borrow().principal;
+        let outcome = kaijutsu_kernel::kj::ledger::decide_ask(&self.kernel.kernel, principal, None, &request_id, verdict, remember);
+        crate::ledger_wire::set_answer_outcome(results.get().init_outcome(), &outcome);
+        Promise::ok(())
+    }
+
+    fn escalate_ask(
+        self: Rc<Self>,
+        params: kernel::EscalateAskParams,
+        mut results: kernel::EscalateAskResults,
+    ) -> Promise<(), capnp::Error> {
+        let p = pry!(params.get());
+        let _span = extract_rpc_trace(p.get_trace(), "escalate_ask").entered();
+        let request_id = pry!(pry!(p.get_request_id()).to_str()).to_owned();
+        let to = pry!(p.get_to());
+        let to = if to.is_empty() {
+            None
+        } else {
+            Some(pry!(PrincipalId::try_from_slice(to).ok_or_else(|| capnp::Error::failed("invalid principal ID".into()))))
+        };
+        let principal = self.connection.borrow().principal;
+        let outcome = kaijutsu_kernel::kj::ledger::escalate_ask(&self.kernel.kernel, principal, &request_id, to);
+        crate::ledger_wire::set_answer_outcome(results.get().init_outcome(), &outcome);
+        Promise::ok(())
+    }
+
     fn declare_context_mcp_servers(
         self: Rc<Self>,
         params: kernel::DeclareContextMcpServersParams,
@@ -4314,143 +4395,121 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    /// Push channel: bridges the kernel's `LedgerFlow` bus (one topic,
-    /// `ledger.changed`) onto the client's `LedgerEvents` callback.
+    /// Push channel: on each `LedgerFlow` change, sends the client every ask
+    /// that changed after its cursor (`approval_ledger::changes`), then moves
+    /// the cursor. The first push catches up from `sinceGeneration` at once,
+    /// so nothing committed between the client's `listAsks` and this call
+    /// is lost.
     ///
-    /// Kernel-wide, same reasoning as `subscribe_permission_events`/
-    /// `subscribe_turn_events` — a ledger change can originate from any call
-    /// path, so one subscription serves every context a client cares about.
+    /// Kernel-wide, same reasoning as `subscribe_turn_events`: a ledger
+    /// change can originate from any call path.
     ///
-    /// Two deliberate departures from `subscribe_editor`'s shape, both
-    /// required by `LedgerFlow` living on `TopicClass::Timing`
-    /// (drop-oldest-on-overflow, never terminates — see `flows.rs`'s doc
-    /// comment on `LedgerFlow`):
-    ///
-    /// - **Coalesce before sending.** Once the first event arrives, hold
+    /// - **Coalesce before reading.** Once a bus event arrives, hold
     ///   `context_feed::FEED_BATCH_WINDOW` open and drain everything else
-    ///   ready, then send ONE `on_changed` carrying the *highest* generation
-    ///   seen. Reusing the change feed's own latency budget rather than a
-    ///   second constant is deliberate — one number to tune, and the capnp
-    ///   doc comment on `subscribeLedgerEvents` already promises this. This
-    ///   coalescing is lossless for this payload: N changes collapsing into
-    ///   one notification bearing the newest generation loses no fact a
-    ///   client can observe, because a client that polls after the
-    ///   notification sees everything up to and including generation N
-    ///   regardless of how many intermediate generations were ever
-    ///   announced. That would NOT be true of a content-bearing event.
-    /// - **`FlowRecv::Terminated` does not disconnect.** `subscribe_editor`
-    ///   treats a termination as a reason to drop the connection because a
-    ///   gap in editor state means a renderer silently shows a stale buffer.
-    ///   Here a dropped notification costs a subscriber nothing but a late
-    ///   poll — the ledger, not this message, is the authority — and the
-    ///   Timing lane's contract means this should never actually fire.
-    ///   Logged loudly as a should-not-happen and the subscription task
-    ///   ends cleanly, but the connection lives on.
+    ///   ready, then read once. The read returns each ask in its latest
+    ///   state, so coalescing loses nothing.
+    /// - **A push with no asks is skipped.** A rule change bumps the
+    ///   generation without changing an ask; the cursor still moves.
+    /// - **A push that cannot be delivered drops the connection.** A failed
+    ///   read, a failed or timed-out callback, or a bus termination would
+    ///   otherwise leave the client folding from a gap it cannot see. The
+    ///   cursor moves only after a delivered push, and the connection is
+    ///   brought down so the client reconnects, lists, and resubscribes —
+    ///   the block bridge's rule (`kick_slow_subscriber`).
     fn subscribe_ledger_events(
         self: Rc<Self>,
         params: kernel::SubscribeLedgerEventsParams,
         _results: kernel::SubscribeLedgerEventsResults,
     ) -> Promise<(), capnp::Error> {
         let _span = tracing::info_span!("rpc", method = "subscribe_ledger_events").entered();
-        let callback = pry!(pry!(params.get()).get_callback());
-        {
-            let ledger_flows = self.kernel.kernel.ledger_flows().clone();
-            let kernel_id = self.kernel.id;
-            let conn_cancel = self.connection.borrow().cancel_token();
+        let p = pry!(params.get());
+        let callback = pry!(p.get_callback());
+        let since = p.get_since_generation();
+        let ledger_flows = self.kernel.kernel.ledger_flows().clone();
+        let kernel_db = self.kernel.kernel_db.clone();
+        let kernel_id = self.kernel.id;
+        let conn_cancel = self.connection.borrow().cancel_token();
+        let disconnect = self.connection.borrow().disconnect_token();
+        // Subscribe before the catch-up read, so a change committed between
+        // the two still wakes the loop.
+        let mut sub = ledger_flows.subscribe("ledger.changed");
 
-            tokio::task::spawn_local(async move {
-                let mut sub = ledger_flows.subscribe("ledger.changed");
-                let mut health = SubscriberHealth::new(SUBSCRIBER_FAILURE_STREAK_TIMEOUT);
-                const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-                log::debug!("Started ledger-events subscription for kernel {}", kernel_id);
+        tokio::task::spawn_local(async move {
+            const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let mut cursor = since;
+            log::debug!("Started ledger-events subscription for kernel {kernel_id} from generation {since}");
 
-                'outer: loop {
-                    // 1. Block until the first event (or the connection dying).
-                    let first = tokio::select! {
-                        _ = conn_cancel.cancelled() => {
-                            log::debug!("ledger-events bridge cancelled with connection");
-                            break;
-                        }
-                        ev = sub.recv_event() => ev,
-                    };
-                    let mut highest_generation = match first {
-                        None => break,
-                        Some(kaijutsu_kernel::flows::FlowRecv::Message(m)) => {
-                            let LedgerFlow::Changed { generation } = m.payload;
-                            generation
-                        }
-                        // Should-not-happen: this bus is on the Timing lane
-                        // (drop-oldest, never-terminate — see `LedgerFlow`'s
-                        // doc comment), so a subscription is never supposed
-                        // to observe a termination. Log loudly and end just
-                        // this subscription task; a hint channel losing a
-                        // late poll is not a reason to drop the connection.
-                        Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info)) => {
-                            tracing::error!(
-                                kernel = %kernel_id,
-                                topic = info.topic,
-                                delivered = info.delivered,
-                                "ledger-events subscriber was terminated on a \
-                                 lane documented to never terminate — bus bug; \
-                                 ending this subscription, connection stays up"
-                            );
-                            break;
-                        }
-                    };
-
-                    // 2. Hold the window open, coalescing to the highest
-                    //    generation seen. Lossless for this payload — see the
-                    //    doc comment above.
-                    let deadline =
-                        tokio::time::Instant::now() + crate::context_feed::FEED_BATCH_WINDOW;
-                    loop {
-                        let next = tokio::select! {
-                            _ = conn_cancel.cancelled() => {
-                                log::debug!("ledger-events bridge cancelled with connection");
-                                break 'outer;
-                            }
-                            ev = tokio::time::timeout_at(deadline, sub.recv_event()) => ev,
-                        };
-                        match next {
-                            // Window expired, or the bus closed — ship what we have.
-                            Err(_) | Ok(None) => break,
-                            Ok(Some(kaijutsu_kernel::flows::FlowRecv::Message(m))) => {
-                                let LedgerFlow::Changed { generation } = m.payload;
-                                highest_generation = highest_generation.max(generation);
-                            }
-                            Ok(Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info))) => {
-                                tracing::error!(
-                                    kernel = %kernel_id,
-                                    topic = info.topic,
-                                    delivered = info.delivered,
-                                    "ledger-events subscriber was terminated on a \
-                                     lane documented to never terminate — bus bug; \
-                                     ending this subscription, connection stays up"
-                                );
-                                break 'outer;
-                            }
-                        }
+            'outer: loop {
+                // 1. Push what changed after the cursor.
+                let read = kaijutsu_kernel::ledger_view::asks_changed_since(&kernel_db.lock(), cursor);
+                let (generation, asks) = match read {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        tracing::error!(kernel = %kernel_id, %error,
+                            "ledger-events could not read changed asks; dropping the connection so it resyncs");
+                        disconnect.cancel();
+                        break;
                     }
-
-                    // 3. Send the one coalesced notification.
-                    let mut req = callback.on_changed_request();
-                    req.get().set_generation(highest_generation);
-                    let success =
-                        await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await;
-
-                    if !health.record(success) {
-                        log::warn!(
-                            "ledger-events bridge for kernel {} stopping: callback \
-                             failures continuous for over {:?} — reaping subscriber",
-                            kernel_id,
-                            SUBSCRIBER_FAILURE_STREAK_TIMEOUT,
-                        );
+                };
+                if !asks.is_empty() {
+                    let mut req = callback.on_asks_request();
+                    req.get().set_generation(generation);
+                    let mut list = req.get().init_asks(asks.len() as u32);
+                    for (i, ask) in asks.iter().enumerate() {
+                        crate::ledger_wire::set_ask_summary(list.reborrow().get(i as u32), ask);
+                    }
+                    if !await_editor_callback(req.send().promise, CALLBACK_TIMEOUT, kernel_id).await {
+                        tracing::error!(kernel = %kernel_id, cursor, generation,
+                            "ledger push was not delivered; dropping the connection so it resyncs");
+                        disconnect.cancel();
                         break;
                     }
                 }
-                log::debug!("ledger-events bridge task for kernel {} ended", kernel_id);
-            });
-        }
+                cursor = generation;
+
+                // 2. Wait for the next change, or the connection dying.
+                let first = tokio::select! {
+                    _ = conn_cancel.cancelled() => break,
+                    ev = sub.recv_event() => ev,
+                };
+                match first {
+                    None => break,
+                    Some(kaijutsu_kernel::flows::FlowRecv::Message(_)) => {}
+                    Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info)) => {
+                        tracing::error!(
+                            kernel = %kernel_id, topic = info.topic, delivered = info.delivered,
+                            "ledger-events subscriber was terminated on a lane documented to never \
+                             terminate — bus bug; dropping the connection so it resyncs"
+                        );
+                        disconnect.cancel();
+                        break;
+                    }
+                }
+
+                // 3. Hold the window open and drain, then read once.
+                let deadline = tokio::time::Instant::now() + crate::context_feed::FEED_BATCH_WINDOW;
+                loop {
+                    let next = tokio::select! {
+                        _ = conn_cancel.cancelled() => break 'outer,
+                        ev = tokio::time::timeout_at(deadline, sub.recv_event()) => ev,
+                    };
+                    match next {
+                        Err(_) | Ok(None) => break,
+                        Ok(Some(kaijutsu_kernel::flows::FlowRecv::Message(_))) => {}
+                        Ok(Some(kaijutsu_kernel::flows::FlowRecv::Terminated(info))) => {
+                            tracing::error!(
+                                kernel = %kernel_id, topic = info.topic, delivered = info.delivered,
+                                "ledger-events subscriber was terminated on a lane documented to never \
+                                 terminate — bus bug; dropping the connection so it resyncs"
+                            );
+                            disconnect.cancel();
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            log::debug!("ledger-events bridge task for kernel {kernel_id} ended");
+        });
         Promise::ok(())
     }
 
@@ -9648,7 +9707,6 @@ fn set_refusal(
     builder: &mut crate::kaijutsu_capnp::refusal::Builder<'_>,
     refusal: &kaijutsu_types::Refusal,
 ) {
-    use kaijutsu_types::AskStatus as S;
     use kaijutsu_types::RefusalKind as K;
     builder.set_kind(match refusal.kind {
         K::Denied => RefusalKind::Denied,
@@ -9664,14 +9722,7 @@ fn set_refusal(
     if let Some(ask) = &refusal.ask {
         let mut a = builder.reborrow().init_ask();
         a.set_request_id(&ask.request_id);
-        a.set_status(match ask.status {
-            S::Pending => AskStatus::Pending,
-            S::Claimed => AskStatus::Claimed,
-            S::Allowed => AskStatus::Allowed,
-            S::Denied => AskStatus::Denied,
-            S::Expired => AskStatus::Expired,
-            S::Abandoned => AskStatus::Abandoned,
-        });
+        a.set_status(crate::ledger_wire::wire_ask_status(ask.status));
     }
 }
 

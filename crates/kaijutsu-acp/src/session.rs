@@ -79,9 +79,17 @@ impl Session {
 }
 
 /// All bound sessions, keyed by ACP session id.
-#[derive(Default)]
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
+    /// Marked changed on every new binding, so the permission pump can
+    /// offer an ask that had no session to carry it.
+    binds: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self { sessions: Mutex::default(), binds: tokio::sync::watch::channel(()).0 }
+    }
 }
 
 impl SessionRegistry {
@@ -98,6 +106,8 @@ impl SessionRegistry {
         }
         let session = Arc::new(session);
         map.insert(id, Arc::clone(&session));
+        drop(map);
+        self.binds.send_replace(());
         Some(session)
     }
 
@@ -117,13 +127,9 @@ impl SessionRegistry {
         self.len() == 0
     }
 
-    /// An arbitrary live session's context id, to run an admin `kj` command
-    /// in when it doesn't matter which one — e.g. `kj ledger list`, which
-    /// reads kernel-wide state and is not scoped to any particular context.
-    /// `None` when no session is bound (`permission::poll_ledger` skips its
-    /// tick in that case rather than picking nothing to run in).
-    pub fn any_context_id(&self) -> Option<ContextId> {
-        self.sessions.lock().values().next().map(|s| s.context_id)
+    /// Changes on every new binding.
+    pub fn subscribe_binds(&self) -> tokio::sync::watch::Receiver<()> {
+        self.binds.subscribe()
     }
 
     /// One live ACP session to host a kernel-wide notification when the

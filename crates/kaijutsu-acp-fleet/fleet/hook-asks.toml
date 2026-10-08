@@ -23,7 +23,7 @@ text = "make the doomed directory"
 permissions = ["deny"]
 permission_titles = ["fleet hook asks about: mkdir doomed"]
 text_contains = ["left it alone"]
-tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "failed", output_contains = "denied by solo (deny)" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "doomed"

@@ -9,6 +9,7 @@ pub mod config_mounts;
 pub mod constants;
 pub mod context_feed;
 pub mod init;
+mod ledger_wire;
 pub mod migrate_keyring;
 pub mod offline;
 pub mod rpc;

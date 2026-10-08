@@ -21,8 +21,8 @@ text = "the rule refused it"
 tool_calls = [{ name = "done", input = { status = "blocked", feedback = "a rule denies mkdir late" } }]
 
 # Both requests are held until both have arrived. The first is answered
-# "always deny", which remembers a deny rule; only once the bridge has
-# recorded that is the second allowed. The rule came after the second ask
+# "always deny", which remembers a deny rule; only once the ledger has
+# taken up that answer (recorded or refused) is the second allowed. The rule came after the second ask
 # was evaluated, so the approval runs.
 [[prompt]]
 text = "make the late directory twice"
@@ -31,13 +31,11 @@ release = ["deny_always", "allow"]
 permission_titles = ["mkdir late", "mkdir late"]
 text_contains = ["one refused, one ran"]
 # The two calls may ask in either order, so their statuses are not checked
-# here; `late` existing afterward is the approved one. The `kj` calls are the
-# bridge recording each answer, in the order the runner sent them.
+# here; `late` existing afterward is the approved one. The answers show in
+# no tool call; prompt 2 shows the remembered rule.
 tool_calls = [
   { title = "shell_write" },
   { title = "shell_write" },
-  { title = "kj", status = "completed", output_contains = "remembered as a standing always rule" },
-  { title = "kj", status = "completed", output_contains = "allowed ask" },
   { title = "done", status = "completed" },
 ]
 

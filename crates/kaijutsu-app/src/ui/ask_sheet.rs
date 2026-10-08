@@ -1,9 +1,9 @@
 //! The ask sheet — the app's answer to an approval ask waiting on you.
 //!
 //! An ask is a request the kernel recorded and will not act on until a
-//! reviewer answers it (`docs/approval-identity.md`). Until now the app could
-//! only *show* that one was waiting: a lamp on the switchboard, `!n` on the
-//! hints line. This is the surface you answer from.
+//! reviewer answers it (`docs/approval-identity.md`). The switchboard lamp
+//! and `!n` on the hints line say one is waiting; this is the surface you
+//! answer from.
 //!
 //! ## A popup over the screen, not a widget in it
 //!
@@ -15,26 +15,29 @@
 //!
 //! ## It raises itself
 //!
-//! A pending ask in the context on screen raises the sheet on
+//! An open ask in the context on screen raises the sheet on
 //! `Screen::Conversation` and `Screen::Room`, and never on `Screen::Editor`
 //! or `Screen::Diff` — a vi surface owns the keys wherever it is live
-//! (`docs/input.md`, "Escape — two meanings total"). Esc puts the ask
-//! **aside**: the ask stays pending, the `!n` marker stays, and the sheet
-//! re-raises only on a context switch back or when a new ask arrives.
+//! (`docs/input.md`, "Escape — two meanings total"). Someone else's ask
+//! raises it too, read-only: [`AskSummary::answerable_by`] decides only
+//! whether the answer keys are live. Esc puts the ask **aside**: the ask stays open, the `!n` marker stays, and
+//! the sheet re-raises only on a context switch back or when a new ask
+//! arrives.
 //!
-//! ## Decisions are kernel verbs
+//! ## Decisions are ledger rows
 //!
 //! `a`/`A`/`d` write an [`AskDecisionRequested`] and change nothing here.
-//! The kernel decides; its ledger-generation bump refreshes
-//! [`LedgerMirror`], and the ask leaving the pending set is what takes the
-//! sheet down — with a notice saying what became of it. A refusal, a lost
-//! race, or an ask that is not yours to answer all produce a notice too:
-//! a decision key never does nothing silently.
+//! The mirror sends it as `decide_ask`, which authors no block in any
+//! transcript. The ledger push that closes the ask is what takes the sheet
+//! down, whichever surface answered — and once the closed ask's record is
+//! read, a notice says what became of it. A refusal, a lost race, or an ask
+//! that is not yours to answer all produce a notice too: a decision key never
+//! does nothing silently.
 //!
 //! ## Honesty
 //!
-//! The PLAN block renders exactly the statements `kj ledger show` carries.
-//! There is no plan tree and no per-statement verdict, because the wire has
+//! The PLAN block renders exactly the statements the ledger carries. There
+//! is no plan tree and no per-statement verdict, because the wire has
 //! neither; the block is shaped to take them when it does.
 
 use std::collections::HashSet;
@@ -42,12 +45,12 @@ use std::time::Duration;
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
-use kaijutsu_client::{AskArming, AskDetail};
-use kaijutsu_types::{ContextId, PrincipalId};
+use kaijutsu_client::AskArming;
+use kaijutsu_types::{AskDetail, AskSummary, ContextId, PrincipalId, PrincipalRef};
 
 use crate::connection::ledger::{
-    short_request_id, AskDecisionRequested, AskDecisionSettled, Decision, DecisionOutcome,
-    LedgerMirror,
+    short_request_id, AskDecisionRequested, AskDecisionSettled, AskLeft, Decision,
+    DecisionOutcome, LedgerMirror,
 };
 use crate::input::events::ActionFired;
 use crate::input::{Action, InputContext};
@@ -110,13 +113,16 @@ impl AskNotice {
 pub struct AskSheetState {
     /// The request id on screen, or `None` when the sheet is down.
     pub showing: Option<String>,
-    /// Ids put aside with Esc. They stay pending and keep their `!`; they
+    /// Ids put aside with Esc. They stay open and keep their `!`; they
     /// simply do not raise the sheet again until the situation changes.
     pub aside: HashSet<String>,
-    /// Pending ids this state has already seen, so a genuinely NEW ask can
-    /// be told from the same set polled again — the arrival of one lifts the
+    /// Open ids this state has already seen, so a genuinely NEW ask can be
+    /// told from the same set read again — the arrival of one lifts the
     /// aside set.
     known: HashSet<String>,
+    /// Asks whose sheet came down because they left the open set, each
+    /// until its departure read lands ([`note_ask_departures`]).
+    left: HashSet<String>,
     /// First plan row drawn (`j`/`k`).
     pub scroll: usize,
     /// The context the sheet last looked at, to notice a switch.
@@ -213,27 +219,28 @@ pub fn refresh_aside(state: &mut AskSheetState, pending_ids: &[&str], context_ch
 
 /// Which ask the sheet should show now.
 ///
-/// An ask already on screen stays on screen while it is pending, whatever
-/// context it belongs to — `]`/`[` walk the whole pending set, so the sheet
-/// must not snap back to the current context between keypresses. A context
-/// switch is the exception: attention moved, so the choice is made afresh
-/// from the new context's own asks, skipping anything put aside.
+/// An ask already on screen stays on screen while it is open, whatever
+/// context it belongs to — `]`/`[` walk the whole open set, so the sheet must
+/// not snap back to the current context between keypresses. A context switch
+/// is the exception: attention moved, so the choice is made afresh from the
+/// new context's own asks, skipping anything put aside. Whether the player
+/// may answer does not matter here; it only decides whether the keys are
+/// live.
 pub fn raise_choice(
     showing: Option<&str>,
-    pending: &[AskDetail],
+    open: &[AskSummary],
     current: Option<ContextId>,
     aside: &HashSet<String>,
     context_changed: bool,
 ) -> Option<String> {
     if !context_changed
         && let Some(id) = showing
-        && pending.iter().any(|ask| ask.request_id == id)
+        && open.iter().any(|ask| ask.request_id == id)
     {
         return Some(id.to_string());
     }
     let current = current?;
-    pending
-        .iter()
+    open.iter()
         .find(|ask| ask.context_id == Some(current) && !aside.contains(&ask.request_id))
         .map(|ask| ask.request_id.clone())
 }
@@ -253,47 +260,54 @@ pub fn step_showing(showing: Option<&str>, pending_ids: &[&str], delta: isize) -
     Some(pending_ids[next].to_string())
 }
 
-/// The one-line outcome of an ask that left the pending set (`docs/tui.md`,
-/// "Asks"): `ask 01a04eb6 allow once by you`, `… by 2b1ffa32`, `… expired`.
+/// The one-line outcome of an ask that left the open set (`docs/tui.md`,
+/// "Asks"): `ask 01a04eb6 allow once by you`, `… by banto`, `… expired`.
 ///
-/// The words come from `decided_option` when the kernel recorded one and from
-/// `status` when it did not — an expired or abandoned ask was never decided
-/// by anyone, and saying "allow" about it would be a lie.
+/// The words come from the recorded decision option when there is one and
+/// from the status when there is not — an expired or abandoned ask was never
+/// decided by anyone, and saying "allow" about it would be a lie.
 pub fn departure_notice(ask: &AskDetail, me: Option<PrincipalId>) -> String {
-    let id = short_request_id(&ask.request_id);
-    let Some(option) = ask.decided_option.as_deref().filter(|s| !s.is_empty()) else {
-        let status = if ask.status.is_empty() {
-            "gone"
-        } else {
-            ask.status.as_str()
-        };
-        return format!("ask {id} {status}");
+    let id = short_request_id(&ask.summary.request_id);
+    let decision = ask.decision.as_ref();
+    let Some(option) = decision
+        .and_then(|d| d.option.as_deref())
+        .filter(|s| !s.is_empty())
+    else {
+        return format!("ask {id} {}", ask.summary.status);
     };
     let words = option.replace('_', " ");
-    let by = match (ask.decided_by, me) {
-        (Some(who), Some(me)) if who == me => Some("you".to_string()),
-        (Some(who), _) => Some(
-            ask.decided_by_name
-                .clone()
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| who.short()),
-        ),
-        // A remembered rule decides without a principal; there is no "by".
-        (None, _) => None,
-    };
+    // A remembered rule decides without a principal; there is no "by".
+    let by = decision.and_then(|d| d.decided_by.as_ref()).map(|who| {
+        if me == Some(who.id) {
+            "you".to_string()
+        } else {
+            name_of(who)
+        }
+    });
     match by {
         Some(by) => format!("ask {id} {words} by {by}"),
         None => format!("ask {id} {words}"),
     }
 }
 
-/// The notice for a decision the kernel refused.
+/// The notice for an ask whose sheet came down but whose closed record could
+/// not be read: it is closed, and that is all this app knows.
+pub fn departure_unread_notice(request_id: &str) -> String {
+    format!("ask {} closed", short_request_id(request_id))
+}
+
+/// The notice for a finished decision, or `None` when the ask closing says
+/// it already.
 pub fn settled_notice(request_id: &str, decision: Decision, outcome: &DecisionOutcome) -> Option<String> {
     let id = short_request_id(request_id);
     match outcome {
-        // Taken: the ask leaving the pending set says so, with the decider's
+        // Taken: the ask leaving the open set says so, with the decider's
         // name attached. A second notice here would only race it.
-        DecisionOutcome::Accepted => None,
+        DecisionOutcome::Accepted { unlearned: None } => None,
+        // The answer stands, but the rule the player asked for does not.
+        DecisionOutcome::Accepted { unlearned: Some(note) } => {
+            Some(format!("ask {id} {}, but no rule was learned: {note}", decision.label()))
+        }
         DecisionOutcome::AlreadyDecided => {
             Some(format!("ask {id} was already answered \u{2014} {} lost the race", decision.label()))
         }
@@ -304,13 +318,10 @@ pub fn settled_notice(request_id: &str, decision: Decision, outcome: &DecisionOu
 }
 
 /// The notice for a decision key on an ask this player may not answer.
-pub fn not_yours_notice(ask: &AskDetail) -> String {
-    match ask.reviewer_name.as_deref().filter(|n| !n.is_empty()) {
-        Some(name) => format!("not yours to answer: reviewer {name}"),
-        None => match ask.reviewer_id {
-            Some(id) => format!("not yours to answer: reviewer {}", id.short()),
-            None => "not yours to answer: this ask names no reviewer".to_string(),
-        },
+pub fn not_yours_notice(ask: &AskSummary) -> String {
+    match &ask.reviewer {
+        Some(reviewer) => format!("not yours to answer: reviewer {}", name_of(reviewer)),
+        None => "not yours to answer: this ask names no reviewer".to_string(),
     }
 }
 
@@ -318,72 +329,72 @@ pub fn not_yours_notice(ask: &AskDetail) -> String {
 // PURE: THE ROWS
 // ============================================================================
 
-/// A name for display: the character's name when the sheet has one, its short
-/// principal id when it does not, and `\u{2014}` when the ask records no one
-/// at all. An empty slot never renders as blank — "nobody is assigned" and
-/// "the name did not arrive" are different facts.
-fn who(name: &Option<String>, id: &Option<PrincipalId>) -> String {
-    if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
-        return name.to_string();
+/// A principal's name for display, or its short id when the name is empty.
+/// Never blank: "nobody is assigned" and "the name did not arrive" are
+/// different facts.
+pub fn name_of(who: &PrincipalRef) -> String {
+    if who.name.is_empty() {
+        who.id.short()
+    } else {
+        who.name.clone()
     }
-    match id {
-        Some(id) => id.short(),
+}
+
+/// A name for a slot an ask may leave empty: [`name_of`], or `\u{2014}` when
+/// the ask records no one at all.
+pub fn who(slot: &Option<PrincipalRef>) -> String {
+    match slot {
+        Some(who) => name_of(who),
         None => "\u{2014}".to_string(),
     }
 }
 
-/// The fixed rows above the plan: what the ask is, who it is between, and
-/// what it says it will do.
 /// How many wrapped lines of the escalation "why" the sheet shows before
 /// it caps with a "+n more" marker (the full text is in `kj ledger show`).
 const DESCRIPTION_MAX_ROWS: usize = 4;
 
+/// The fixed rows above the plan: what the ask is, who it is between, and
+/// what it says it will do.
 pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: usize) -> Vec<PanelLine> {
+    let summary = &ask.summary;
     let mut rows = Vec::new();
 
-    let mut header = format!("ask {}", short_request_id(&ask.request_id));
+    let mut header = format!("ask {}", short_request_id(&summary.request_id));
     if let Some(tool) = ask.tool.as_deref().filter(|t| !t.is_empty()) {
         header.push_str(&format!("  {tool}"));
     }
-    let waiting = match ask.created_at {
-        Some(at) => format_age(now_ms.saturating_sub(at)),
-        // The kernel stamps `created_at`; no stamp is a fact, not a zero.
-        None => "?".to_string(),
-    };
-    header.push_str(&format!("  waiting {waiting}"));
+    header.push_str(&format!(
+        "  waiting {}",
+        format_age(now_ms.saturating_sub(summary.created_at_ms))
+    ));
     rows.push(PanelLine {
         text: truncate(&header, cols),
         tone: LineTone::Head,
     });
 
     // Provenance, only what the ask actually carries.
-    let mut provenance: Vec<String> = Vec::new();
-    if !ask.origin.is_empty() {
-        provenance.push(format!("origin {}", ask.origin));
-    }
+    let mut provenance = vec![format!("origin {}", summary.origin)];
     for (label, value) in [
         ("instance", &ask.instance),
         ("hook", &ask.hook_id),
-        ("label", &ask.authorized_label),
+        ("label", &ask.label),
     ] {
         if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
             provenance.push(format!("{label} {value}"));
         }
     }
-    if !provenance.is_empty() {
-        rows.push(PanelLine {
-            text: truncate(&provenance.join("  "), cols),
-            tone: LineTone::Dim,
-        });
-    }
+    rows.push(PanelLine {
+        text: truncate(&provenance.join("  "), cols),
+        tone: LineTone::Dim,
+    });
 
     // The heads: who asked, who acted, who may answer.
-    let can_review = me.is_some_and(|me| ask.can_review(me));
+    let can_review = me.is_some_and(|me| summary.answerable_by(me));
     let mut heads = format!(
         "requester {}  performer {}  reviewer {}",
-        who(&ask.principal_name, &ask.principal_id),
-        who(&ask.actor_name, &ask.actor_id),
-        who(&ask.reviewer_name, &ask.reviewer_id),
+        who(&summary.requester),
+        who(&summary.performer),
+        who(&summary.reviewer),
     );
     if can_review {
         heads.push_str(" \u{00b7} you");
@@ -398,7 +409,7 @@ pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: u
         for text in wrap(
             &format!(
                 "not yours to answer \u{2014} the reviewer runs: kj ledger allow {}",
-                short_request_id(&ask.request_id)
+                short_request_id(&summary.request_id)
             ),
             cols,
             2,
@@ -417,21 +428,26 @@ pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: u
 /// environment it would run in.
 ///
 /// The plan is the ask's `statements`, numbered, one per statement. That is
-/// all `kj ledger show` carries today — no tree, no per-statement verdict —
-/// and inventing either would put words in the kernel's mouth.
-pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
+/// all the ledger carries today — no tree, no per-statement verdict — and
+/// inventing either would put words in the kernel's mouth.
+///
+/// `gap` is [`LedgerMirror::record_gap`]: while the full record is unread,
+/// the sheet says so where the environment would be, so an empty environment
+/// is never mistaken for one the ask recorded.
+pub fn sheet_body(ask: &AskDetail, gap: Option<&str>, cols: usize) -> Vec<PanelLine> {
+    let summary = &ask.summary;
     let mut rows = vec![PanelLine {
         text: "PLAN".to_string(),
         tone: LineTone::Head,
     }];
 
-    if ask.statements.is_empty() {
+    if summary.statements.is_empty() {
         rows.push(PanelLine {
             text: "no statements recorded".to_string(),
             tone: LineTone::Warn,
         });
     }
-    for (i, statement) in ask.statements.iter().enumerate() {
+    for (i, statement) in summary.statements.iter().enumerate() {
         for text in wrap(&format!("{:>2}. {statement}", i + 1), cols, PLAN_INDENT) {
             rows.push(PanelLine {
                 text,
@@ -440,6 +456,14 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
         }
     }
 
+    if let Some(gap) = gap {
+        for text in wrap(gap, cols, 2) {
+            rows.push(PanelLine {
+                text,
+                tone: LineTone::Warn,
+            });
+        }
+    }
     if let Some(cwd) = ask.cwd.as_deref().filter(|c| !c.is_empty()) {
         for text in wrap(&format!("cwd {cwd}"), cols, 4) {
             rows.push(PanelLine {
@@ -450,7 +474,7 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
     }
     for var in &ask.env {
         // `None` is "unset at ask time", which is a recorded value, not a
-        // missing row (`kaijutsu_client::EnvVar`).
+        // missing row (`kaijutsu_types::AskEnv`).
         let text = match &var.value {
             Some(value) => format!("env {}={value}", var.name),
             None => format!("env {} unset", var.name),
@@ -472,12 +496,12 @@ pub fn sheet_body(ask: &AskDetail, cols: usize) -> Vec<PanelLine> {
     // Why the gate escalated, capped: the hook's or gate's note is useful but
     // secondary to the plan, so it sits below it and never crowds the
     // statement off the top. It scrolls with the rest of the body.
-    if !ask.description.is_empty() {
+    if !summary.description.is_empty() {
         rows.push(PanelLine {
             text: "why".to_string(),
             tone: LineTone::Head,
         });
-        let wrapped = wrap(&ask.description, cols, 2);
+        let wrapped = wrap(&summary.description, cols, 2);
         let shown = wrapped.len().min(DESCRIPTION_MAX_ROWS);
         for text in wrapped.iter().take(shown) {
             rows.push(PanelLine {
@@ -518,12 +542,14 @@ pub fn sheet_keys(can_review: bool, pending_total: usize) -> String {
 }
 
 /// Every row of the sheet, in order, for a panel this many characters wide
-/// and this many rows tall. `armed` is [`AskSheetState::keys_armed`].
+/// and this many rows tall. `armed` is [`AskSheetState::keys_armed`]; `gap`
+/// is as [`sheet_body`] takes it.
 ///
 /// The key line is laid down last and the plan scrolls above it, so it never
 /// leaves the bottom edge however long the plan gets.
 pub fn sheet_rows(
     ask: &AskDetail,
+    gap: Option<&str>,
     me: Option<PrincipalId>,
     now_ms: i64,
     pending_total: usize,
@@ -533,10 +559,11 @@ pub fn sheet_rows(
     armed: bool,
 ) -> Vec<PanelLine> {
     let head = sheet_head(ask, me, now_ms, cols);
-    let body = sheet_body(ask, cols);
+    let body = sheet_body(ask, gap, cols);
     let keys = if armed {
+        let can_review = me.is_some_and(|me| ask.summary.answerable_by(me));
         PanelLine {
-            text: truncate(&sheet_keys(me.is_some_and(|me| ask.can_review(me)), pending_total), cols),
+            text: truncate(&sheet_keys(can_review, pending_total), cols),
             tone: LineTone::Head,
         }
     } else {
@@ -553,18 +580,26 @@ pub fn sheet_rows(
 }
 
 /// How far `j` may scroll the plan for a panel of this shape.
-pub fn sheet_max_scroll(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: usize, rows: usize) -> usize {
+pub fn sheet_max_scroll(
+    ask: &AskDetail,
+    gap: Option<&str>,
+    me: Option<PrincipalId>,
+    now_ms: i64,
+    cols: usize,
+    rows: usize,
+) -> usize {
     let head_len = sheet_head(ask, me, now_ms, cols).len();
     let body_rows = rows.saturating_sub(head_len + 1).max(1);
-    max_scroll(sheet_body(ask, cols).len(), body_rows)
+    max_scroll(sheet_body(ask, gap, cols).len(), body_rows)
 }
 
 // ============================================================================
 // SYSTEMS
 // ============================================================================
 
-/// Decide what the sheet shows this frame, and say what became of an ask that
-/// left.
+/// Decide what the sheet shows this frame. An ask on screen that left the
+/// open set takes the sheet down, and [`note_ask_departures`] says what
+/// became of it once its closed record is read.
 ///
 /// Runs before `input::context::sync_input_context` so the contexts derived
 /// this frame already know whether the sheet is up.
@@ -575,13 +610,27 @@ pub fn sync_ask_sheet(
     mirror: Res<LedgerMirror>,
     doc_cache: Res<crate::view::document::DocumentCache>,
     screen: Res<State<Screen>>,
-    session: Res<crate::cell::SessionPrincipal>,
     time: Res<Time>,
     mut state: ResMut<AskSheetState>,
-    mut notice: ResMut<AskNotice>,
 ) {
     let current = doc_cache.active_id();
     let context_changed = state.context != current;
+
+    let open_ids: Vec<&str> = mirror
+        .open()
+        .iter()
+        .map(|ask| ask.request_id.as_str())
+        .collect();
+
+    // An ask that was on screen and is no longer open is waiting for its
+    // closing notice.
+    if let Some(showing) = state.showing.as_deref()
+        && !open_ids.contains(&showing)
+        && !state.left.contains(showing)
+    {
+        let showing = showing.to_string();
+        state.left.insert(showing);
+    }
 
     if !screen_allows_sheet(*screen.get()) {
         // A vi surface has the keys. Put the sheet down without putting the
@@ -595,29 +644,12 @@ pub fn sync_ask_sheet(
         return;
     }
 
-    let pending_ids: Vec<&str> = mirror
-        .pending
-        .iter()
-        .map(|ask| ask.request_id.as_str())
-        .collect();
-
-    // An ask that was on screen and is no longer pending gets its one line.
-    if let Some(showing) = state.showing.as_deref()
-        && !pending_ids.contains(&showing)
-        && let Some(ask) = mirror.get(showing)
-    {
-        notice.say(
-            departure_notice(ask, session.0),
-            time.elapsed_secs_f64(),
-        );
-    }
-
-    if aside_needs_refresh(&state, &pending_ids, context_changed) {
-        refresh_aside(&mut state, &pending_ids, context_changed);
+    if aside_needs_refresh(&state, &open_ids, context_changed) {
+        refresh_aside(&mut state, &open_ids, context_changed);
     }
     let next = raise_choice(
         state.showing.as_deref(),
-        &mirror.pending,
+        mirror.open(),
         current,
         &state.aside,
         context_changed,
@@ -687,16 +719,16 @@ pub fn handle_ask_sheet_actions(
                     Action::AskAllowAlways => Decision::AllowAlways,
                     _ => Decision::Deny,
                 };
-                // The ask may have left the pending set between the frame
+                // The ask may have left the open set between the frame
                 // that drew the key line and this one.
-                let Some(ask) = mirror.get(&showing) else {
+                let Some(ask) = mirror.summary(&showing) else {
                     notice.say(
-                        format!("ask {} is no longer readable", short_request_id(&showing)),
+                        format!("ask {} is no longer open", short_request_id(&showing)),
                         time.elapsed_secs_f64(),
                     );
                     continue;
                 };
-                if !session.0.is_some_and(|me| ask.can_review(me)) {
+                if !session.0.is_some_and(|me| ask.answerable_by(me)) {
                     notice.say(not_yours_notice(ask), time.elapsed_secs_f64());
                     continue;
                 }
@@ -706,13 +738,13 @@ pub fn handle_ask_sheet_actions(
                 });
             }
 
-            // `v` — the ledger over the sheet. The ask stays pending and the
+            // `v` — the ledger over the sheet. The ask stays open and the
             // sheet stays raised behind it.
             Action::OpenLedger => ribbon.open = true,
 
             Action::AskNext | Action::AskPrev => {
                 let ids: Vec<&str> = mirror
-                    .pending
+                    .open()
                     .iter()
                     .map(|ask| ask.request_id.as_str())
                     .collect();
@@ -727,7 +759,7 @@ pub fn handle_ask_sheet_actions(
             Action::StepNext => state.scroll = state.scroll.saturating_add(1),
             Action::StepPrev => state.scroll = state.scroll.saturating_sub(1),
 
-            // Esc — aside, with the ask still pending.
+            // Esc — aside, with the ask still open.
             Action::AskAside => {
                 state.aside.insert(showing);
                 state.showing = None;
@@ -740,7 +772,7 @@ pub fn handle_ask_sheet_actions(
 }
 
 /// Turn a refused or raced decision into a notice. An accepted one needs
-/// none: the ask leaving the pending set says it, with the decider attached.
+/// none: the ask leaving the open set says it, with the decider attached.
 pub fn note_ask_decisions(
     mut settled: MessageReader<AskDecisionSettled>,
     time: Res<Time>,
@@ -755,6 +787,29 @@ pub fn note_ask_decisions(
         if let Some(text) = settled_notice(request_id, *decision, outcome) {
             notice.say(text, time.elapsed_secs_f64());
         }
+    }
+}
+
+/// Say what became of the ask whose sheet came down, once its closed record
+/// is read. Asks that closed while off screen get no notice; the ribbon's
+/// ANSWERED rows carry them.
+pub fn note_ask_departures(
+    mut left: MessageReader<AskLeft>,
+    session: Res<crate::cell::SessionPrincipal>,
+    time: Res<Time>,
+    mut state: ResMut<AskSheetState>,
+    mut notice: ResMut<AskNotice>,
+) {
+    for AskLeft { request_id, record } in left.read() {
+        // Clearing the wait changes nothing the context derivation reads.
+        if !state.bypass_change_detection().left.remove(request_id) {
+            continue;
+        }
+        let text = match record {
+            Some(record) => departure_notice(record, session.0),
+            None => departure_unread_notice(request_id),
+        };
+        notice.say(text, time.elapsed_secs_f64());
     }
 }
 
@@ -839,9 +894,10 @@ pub fn render_ask_sheet(
     if !state.is_changed() && !mirror.is_changed() && !theme.is_changed() && !stale {
         return;
     }
-    let Some(ask) = mirror.get(&showing) else {
+    let Some(ask) = mirror.record(&showing) else {
         return;
     };
+    let gap = mirror.record_gap(&showing);
     let Ok(window) = windows.single() else {
         return;
     };
@@ -862,7 +918,8 @@ pub fn render_ask_sheet(
     let rows = rows_for_height(max_height);
 
     let lines = sheet_rows(
-        ask,
+        &ask,
+        gap.as_deref(),
         session.0,
         kaijutsu_types::now_millis() as i64,
         mirror.pending_count(),
@@ -903,7 +960,7 @@ pub fn clamp_ask_sheet_scroll(
         return;
     };
     let (Some(ask), Ok(window), Some(font)) = (
-        mirror.get(&showing),
+        mirror.record(&showing),
         windows.single(),
         fonts.get(&handles.mono),
     ) else {
@@ -913,7 +970,8 @@ pub fn clamp_ask_sheet_scroll(
     let cols = columns(width, measure_char_width(font));
     let rows = rows_for_height((window.height() * panel::PANEL_MAX_HEIGHT_FRACTION) as f64);
     let limit = sheet_max_scroll(
-        ask,
+        &ask,
+        mirror.record_gap(&showing).as_deref(),
         session.0,
         kaijutsu_types::now_millis() as i64,
         cols,
@@ -952,6 +1010,7 @@ impl Plugin for AskSheetPlugin {
                 (
                     handle_ask_sheet_actions,
                     note_ask_decisions,
+                    note_ask_departures,
                     expire_notice,
                     clamp_ask_sheet_scroll,
                     sync_ask_sheet_visibility,
@@ -971,7 +1030,7 @@ impl Plugin for AskSheetPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kaijutsu_client::EnvVar;
+    use kaijutsu_types::{AskDecision, AskEnv, AskOrigin, AskStatus};
 
     fn ctx(n: u8) -> ContextId {
         let mut bytes = [0u8; 16];
@@ -985,37 +1044,57 @@ mod tests {
         PrincipalId::from_bytes(bytes)
     }
 
-    /// A pending ask the given principal may review.
+    fn named(id: PrincipalId, name: &str) -> PrincipalRef {
+        PrincipalRef { id, name: name.into() }
+    }
+
+    /// An open ask the given principal may review: performed by `coder`,
+    /// reviewed by `reviewer`.
     fn ask(id: &str, context: Option<ContextId>, reviewer: PrincipalId) -> AskDetail {
         AskDetail {
-            request_id: format!("{id}-aaaa-bbbb-cccc-000000000001"),
-            context_id: context,
-            principal_id: Some(principal(9)),
-            principal_name: Some("amy".into()),
-            actor_id: Some(principal(4)),
-            actor_name: Some("coder".into()),
-            reviewer_id: Some(reviewer),
-            reviewer_name: Some("amy".into()),
-            status: "pending".into(),
-            origin: "shell_gate".into(),
+            summary: AskSummary {
+                request_id: format!("{id}-aaaa-bbbb-cccc-000000000001"),
+                status: AskStatus::Pending,
+                origin: AskOrigin::ShellGate,
+                context_id: context,
+                description: "rm -rf ~/src/wt/kaish-arith".into(),
+                statements: vec!["rm -rf ~/src/wt/kaish-arith".into()],
+                requester: Some(named(principal(9), "amy")),
+                performer: Some(named(principal(4), "coder")),
+                reviewer: Some(named(reviewer, "amy")),
+                created_at_ms: 0,
+                decided_at_ms: None,
+            },
+            instance: Some("kaish-1".into()),
             tool: Some("shell_write".into()),
             hook_id: None,
-            instance: Some("kaish-1".into()),
+            label: None,
             tool_call_block_id: None,
-            description: "rm -rf ~/src/wt/kaish-arith".into(),
-            authorized_label: None,
-            statements: vec!["rm -rf ~/src/wt/kaish-arith".into()],
             exec_source: Some("kaish".into()),
             cwd: Some("/home/amy/src/wt/kaish-arith".into()),
             env: Vec::new(),
-            created_at: Some(0),
-            decided_at: None,
-            decided_by: None,
-            decided_by_name: None,
-            decided_option: None,
-            remember_scope: None,
-            redeemed_at: None, publication_abandoned: None,
+            decision: None,
+            redeemed_at_ms: None,
+            publication_abandoned: None,
+            reassignments: Vec::new(),
         }
+    }
+
+    /// The open set a list of asks makes, as the mirror holds it.
+    fn open(asks: &[AskDetail]) -> Vec<AskSummary> {
+        asks.iter().map(|ask| ask.summary.clone()).collect()
+    }
+
+    /// `ask` closed by `by` with `option`.
+    fn decided(mut ask: AskDetail, option: &str, by: Option<PrincipalRef>) -> AskDetail {
+        ask.summary.status = AskStatus::Allowed;
+        ask.decision = Some(AskDecision {
+            decided_by: by,
+            option: Some(option.into()),
+            remember_scope: None,
+            auto_reason: None,
+        });
+        ask
     }
 
     fn aside(ids: &[&str]) -> HashSet<String> {
@@ -1161,8 +1240,8 @@ mod tests {
     fn a_disarmed_sheet_says_so_instead_of_offering_keys() {
         let me = principal(1);
         let a = ask("01a04eb6", Some(ctx(1)), me);
-        let disarmed = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, false);
-        let armed = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, true);
+        let disarmed = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, false);
+        let armed = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, true);
         let last = disarmed.last().expect("rows");
         assert_eq!(last.text, SHEET_ARMING_LINE);
         assert_eq!(last.tone, LineTone::Dim);
@@ -1187,7 +1266,7 @@ mod tests {
         let me = principal(1);
         let pending = vec![ask("aaaa", Some(ctx(2)), me), ask("bbbb", Some(ctx(1)), me)];
         assert_eq!(
-            raise_choice(None, &pending, Some(ctx(1)), &HashSet::new(), false),
+            raise_choice(None, &open(&pending), Some(ctx(1)), &HashSet::new(), false),
             Some(full_id("bbbb")),
             "the current context's ask, not merely the first pending one"
         );
@@ -1199,7 +1278,7 @@ mod tests {
     fn an_ask_in_another_context_does_not_raise_the_sheet() {
         let pending = vec![ask("aaaa", Some(ctx(2)), principal(1))];
         assert_eq!(
-            raise_choice(None, &pending, Some(ctx(1)), &HashSet::new(), false),
+            raise_choice(None, &open(&pending), Some(ctx(1)), &HashSet::new(), false),
             None
         );
     }
@@ -1210,7 +1289,7 @@ mod tests {
     fn an_ask_put_aside_stays_down_while_nothing_changes() {
         let pending = vec![ask("aaaa", Some(ctx(1)), principal(1))];
         assert_eq!(
-            raise_choice(None, &pending, Some(ctx(1)), &aside(&[&full_id("aaaa")]), false),
+            raise_choice(None, &open(&pending), Some(ctx(1)), &aside(&[&full_id("aaaa")]), false),
             None
         );
     }
@@ -1224,7 +1303,7 @@ mod tests {
         assert_eq!(
             raise_choice(
                 Some(&full_id("aaaa")),
-                &pending,
+                &open(&pending),
                 Some(ctx(1)),
                 &HashSet::new(),
                 false
@@ -1243,7 +1322,7 @@ mod tests {
         assert_eq!(
             raise_choice(
                 Some(&full_id("aaaa")),
-                &pending,
+                &open(&pending),
                 Some(ctx(1)),
                 &HashSet::new(),
                 true
@@ -1349,31 +1428,33 @@ mod tests {
     #[test]
     fn a_decision_of_yours_reads_as_by_you() {
         let me = principal(1);
-        let mut decided = ask("01a04eb6", Some(ctx(1)), me);
-        decided.decided_option = Some("allow_once".into());
-        decided.decided_by = Some(me);
-        decided.decided_by_name = Some("amy".into());
+        let closed = decided(ask("01a04eb6", Some(ctx(1)), me), "allow_once", Some(named(me, "amy")));
         assert_eq!(
-            departure_notice(&decided, Some(me)),
+            departure_notice(&closed, Some(me)),
             "ask 01a04eb6 allow once by you"
         );
     }
 
     #[test]
     fn someone_elses_decision_names_them() {
-        let mut decided = ask("01a04eb6", Some(ctx(1)), principal(1));
-        decided.decided_option = Some("allow_always".into());
-        decided.decided_by = Some(principal(7));
-        decided.decided_by_name = Some("banto".into());
+        let closed = decided(
+            ask("01a04eb6", Some(ctx(1)), principal(1)),
+            "allow_always",
+            Some(named(principal(7), "banto")),
+        );
         assert_eq!(
-            departure_notice(&decided, Some(principal(1))),
+            departure_notice(&closed, Some(principal(1))),
             "ask 01a04eb6 allow always by banto"
         );
 
         // No name on the sheet: the short principal id, never a blank.
-        decided.decided_by_name = None;
+        let nameless = decided(
+            ask("01a04eb6", Some(ctx(1)), principal(1)),
+            "allow_always",
+            Some(named(principal(7), "")),
+        );
         assert_eq!(
-            departure_notice(&decided, Some(principal(1))),
+            departure_notice(&nameless, Some(principal(1))),
             format!("ask 01a04eb6 allow always by {}", principal(7).short())
         );
     }
@@ -1383,17 +1464,20 @@ mod tests {
     #[test]
     fn an_ask_that_expired_says_expired_and_names_nobody() {
         let mut gone = ask("01a04eb6", Some(ctx(1)), principal(1));
-        gone.status = "expired".into();
+        gone.summary.status = AskStatus::Expired;
         assert_eq!(departure_notice(&gone, Some(principal(1))), "ask 01a04eb6 expired");
     }
 
     /// A remembered rule decides with no principal behind it.
     #[test]
     fn an_auto_decision_names_no_decider() {
-        let mut auto = ask("01a04eb6", Some(ctx(1)), principal(1));
-        auto.decided_option = Some("auto_allow".into());
-        auto.status = "allowed".into();
+        let auto = decided(ask("01a04eb6", Some(ctx(1)), principal(1)), "auto_allow", None);
         assert_eq!(departure_notice(&auto, Some(principal(1))), "ask 01a04eb6 auto allow");
+    }
+
+    #[test]
+    fn a_closed_ask_whose_record_was_not_read_still_gets_a_line() {
+        assert_eq!(departure_unread_notice(&full_id("01a04eb6")), "ask 01a04eb6 closed");
     }
 
     /// A key on an already-answered ask reports the lost race. Silence would
@@ -1401,9 +1485,13 @@ mod tests {
     #[test]
     fn a_lost_race_is_reported_and_an_accepted_decision_is_not() {
         assert_eq!(
-            settled_notice(&full_id("01a04eb6"), Decision::AllowOnce, &DecisionOutcome::Accepted),
+            settled_notice(
+                &full_id("01a04eb6"),
+                Decision::AllowOnce,
+                &DecisionOutcome::Accepted { unlearned: None }
+            ),
             None,
-            "the ask leaving the pending set already says this"
+            "the ask leaving the open set already says this"
         );
         let raced = settled_notice(
             &full_id("01a04eb6"),
@@ -1423,21 +1511,36 @@ mod tests {
         assert!(failed.contains("no live connection"), "{failed}");
     }
 
+    /// `A` asked for a standing rule. When none was learned the answer
+    /// stands, but the player must not believe the rule exists.
+    #[test]
+    fn an_allow_always_that_learned_nothing_says_so() {
+        let text = settled_notice(
+            &full_id("01a04eb6"),
+            Decision::AllowAlways,
+            &DecisionOutcome::Accepted { unlearned: Some("compound statement".into()) },
+        )
+        .expect("a missing rule is reported");
+        assert_eq!(
+            text,
+            "ask 01a04eb6 allow always, but no rule was learned: compound statement"
+        );
+    }
+
     #[test]
     fn an_ask_that_is_not_yours_names_its_reviewer() {
-        let other = ask("01a04eb6", Some(ctx(1)), principal(3));
+        let other = ask("01a04eb6", Some(ctx(1)), principal(3)).summary;
         assert_eq!(not_yours_notice(&other), "not yours to answer: reviewer amy");
 
         let mut nameless = other.clone();
-        nameless.reviewer_name = None;
+        nameless.reviewer = Some(named(principal(3), ""));
         assert_eq!(
             not_yours_notice(&nameless),
             format!("not yours to answer: reviewer {}", principal(3).short())
         );
 
         let mut unassigned = other;
-        unassigned.reviewer_name = None;
-        unassigned.reviewer_id = None;
+        unassigned.reviewer = None;
         assert!(not_yours_notice(&unassigned).contains("names no reviewer"));
     }
 
@@ -1460,17 +1563,6 @@ mod tests {
         let rows = sheet_head(&ask("01a04eb6", Some(ctx(1)), me), Some(me), 12_000, 120);
         assert_eq!(rows[0].text, "ask 01a04eb6  shell_write  waiting 12s");
         assert_eq!(rows[0].tone, LineTone::Head);
-    }
-
-    /// A missing `created_at` is a fact, not a zero — "waiting now" would be
-    /// a claim the kernel never made.
-    #[test]
-    fn an_ask_with_no_creation_stamp_says_so() {
-        let me = principal(1);
-        let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.created_at = None;
-        let rows = sheet_head(&a, Some(me), 12_000, 120);
-        assert!(rows[0].text.ends_with("waiting ?"), "{:?}", rows[0].text);
     }
 
     #[test]
@@ -1527,8 +1619,8 @@ mod tests {
     fn the_plan_numbers_the_statements_the_gate_recorded() {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.statements = vec!["git worktree remove".into(), "rm -rf /tmp/x".into()];
-        let rows = sheet_body(&a, 120);
+        a.summary.statements = vec!["git worktree remove".into(), "rm -rf /tmp/x".into()];
+        let rows = sheet_body(&a, None, 120);
         assert_eq!(rows[0].text, "PLAN");
         assert_eq!(rows[1].text, " 1. git worktree remove");
         assert_eq!(rows[2].text, " 2. rm -rf /tmp/x");
@@ -1540,8 +1632,8 @@ mod tests {
     fn a_plan_with_no_statements_says_so() {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.statements.clear();
-        let rows = sheet_body(&a, 120);
+        a.summary.statements.clear();
+        let rows = sheet_body(&a, None, 120);
         assert_eq!(rows[1].text, "no statements recorded");
         assert_eq!(rows[1].tone, LineTone::Warn);
     }
@@ -1553,18 +1645,34 @@ mod tests {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
         a.env = vec![
-            EnvVar { name: "TARGET".into(), value: Some("kaish-arith".into()) },
-            EnvVar { name: "FORCE".into(), value: None },
+            AskEnv { name: "TARGET".into(), value: Some("kaish-arith".into()) },
+            AskEnv { name: "FORCE".into(), value: None },
         ];
-        let all = text(&sheet_body(&a, 120));
+        let all = text(&sheet_body(&a, None, 120));
         assert!(all.contains("env TARGET=kaish-arith"), "{all}");
         assert!(all.contains("env FORCE unset"), "{all}");
+    }
+
+    /// While the full record is unread, the sheet says so where the
+    /// environment would be: an empty environment must not read as one the
+    /// ask recorded.
+    #[test]
+    fn an_unread_record_says_so_where_the_environment_would_be() {
+        let me = principal(1);
+        let a = crate::connection::ledger::summary_record(&ask("01a04eb6", Some(ctx(1)), me).summary);
+        let rows = sheet_body(&a, Some("reading the full record"), 120);
+        let gap = rows
+            .iter()
+            .find(|r| r.text == "reading the full record")
+            .expect("the gap is a row");
+        assert_eq!(gap.tone, LineTone::Warn);
+        assert!(!text(&sheet_body(&a, None, 120)).contains("reading"));
     }
 
     #[test]
     fn the_environment_follows_the_plan() {
         let me = principal(1);
-        let all = text(&sheet_body(&ask("01a04eb6", Some(ctx(1)), me), 120));
+        let all = text(&sheet_body(&ask("01a04eb6", Some(ctx(1)), me), None, 120));
         assert!(all.contains("cwd /home/amy/src/wt/kaish-arith"), "{all}");
         assert!(all.contains("source kaish"), "{all}");
     }
@@ -1577,9 +1685,9 @@ mod tests {
     fn the_key_line_is_always_the_last_row() {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.statements = (0..60).map(|i| format!("statement number {i}")).collect();
+        a.summary.statements = (0..60).map(|i| format!("statement number {i}")).collect();
         for rows in [8usize, 14, 40] {
-            let out = sheet_rows(&a, Some(me), 0, 1, 100, rows, 0, true);
+            let out = sheet_rows(&a, None, Some(me), 0, 1, 100, rows, 0, true);
             assert!(
                 out.last().expect("rows").text.starts_with("[a]llow once"),
                 "rows={rows} got {:?}",
@@ -1594,21 +1702,21 @@ mod tests {
     fn a_long_plan_scrolls_and_counts_what_it_hides() {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.statements = (0..60).map(|i| format!("statement number {i}")).collect();
-        let top = sheet_rows(&a, Some(me), 0, 1, 100, 14, 0, true);
+        a.summary.statements = (0..60).map(|i| format!("statement number {i}")).collect();
+        let top = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, true);
         let joined = text(&top);
         assert!(joined.contains("\u{2191}0 \u{2193}"), "{joined}");
 
-        let scrolled = sheet_rows(&a, Some(me), 0, 1, 100, 14, 5, true);
+        let scrolled = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 5, true);
         assert!(text(&scrolled).contains("\u{2191}5 \u{2193}"), "{}", text(&scrolled));
         assert_ne!(text(&top), text(&scrolled), "j moved the plan");
 
         // And `j` stops: the limit is what the panel can actually show.
-        let limit = sheet_max_scroll(&a, Some(me), 0, 100, 14);
+        let limit = sheet_max_scroll(&a, None, Some(me), 0, 100, 14);
         assert!(limit > 0);
         assert_eq!(
-            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit, true)),
-            text(&sheet_rows(&a, Some(me), 0, 1, 100, 14, limit + 50, true)),
+            text(&sheet_rows(&a, None, Some(me), 0, 1, 100, 14, limit, true)),
+            text(&sheet_rows(&a, None, Some(me), 0, 1, 100, 14, limit + 50, true)),
             "scrolling past the end shows the end"
         );
     }
@@ -1619,11 +1727,11 @@ mod tests {
     fn no_row_is_wider_than_the_panel() {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
-        a.description = "x".repeat(300);
-        a.statements = vec!["/very/long/path/".repeat(40)];
+        a.summary.description = "x".repeat(300);
+        a.summary.statements = vec!["/very/long/path/".repeat(40)];
         a.cwd = Some("/another/very/long/path/".repeat(20));
         for cols in [24usize, 40, 80] {
-            for row in sheet_rows(&a, Some(me), 0, 4, cols, 30, 0, true) {
+            for row in sheet_rows(&a, None, Some(me), 0, 4, cols, 30, 0, true) {
                 assert!(
                     row.text.chars().count() <= cols,
                     "cols={cols} overflowed with {:?}",
@@ -1631,5 +1739,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── the sheet follows the open set ───────────────────────────────────
+
+    /// `sync_ask_sheet` and `note_ask_departures` over a mirror the test
+    /// feeds, as the mirror plugin would.
+    fn sheet_app(me: PrincipalId) -> App {
+        let mut app = App::new();
+        let mut docs = crate::view::document::DocumentCache::default();
+        docs.set_active(ctx(1));
+        app.init_resource::<Time>()
+            .init_resource::<LedgerMirror>()
+            .init_resource::<AskSheetState>()
+            .init_resource::<AskNotice>()
+            .insert_resource(docs)
+            .insert_resource(State::new(Screen::Conversation))
+            .insert_resource(crate::cell::SessionPrincipal(Some(me)))
+            .add_message::<AskLeft>()
+            .add_systems(Update, (sync_ask_sheet, note_ask_departures).chain());
+        app
+    }
+
+    fn set_open(app: &mut App, asks: &[AskDetail], generation: i64) {
+        let state = kaijutsu_client::LedgerState::from_listing(generation, open(asks));
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&state);
+    }
+
+    fn showing(app: &App) -> Option<String> {
+        app.world().resource::<AskSheetState>().showing.clone()
+    }
+
+    fn notice(app: &App) -> Option<String> {
+        let now = app.world().resource::<Time>().elapsed_secs_f64();
+        app.world().resource::<AskNotice>().current(now).map(str::to_string)
+    }
+
+    /// An ask that arrives in the open set, in the context on screen, for
+    /// this player, raises the sheet; the same ask leaving the open set —
+    /// answered here or anywhere — takes it down, and its closed record
+    /// says what became of it.
+    #[test]
+    fn the_sheet_rises_with_an_open_ask_and_falls_when_it_closes() {
+        let me = principal(1);
+        let mut app = sheet_app(me);
+        let a = ask("01a04eb6", Some(ctx(1)), me);
+
+        set_open(&mut app, &[a.clone()], 1);
+        app.update();
+        assert_eq!(showing(&app), Some(full_id("01a04eb6")));
+
+        set_open(&mut app, &[], 2);
+        app.update();
+        assert_eq!(showing(&app), None, "a closed ask takes its sheet down");
+        assert_eq!(notice(&app), None, "nothing is said before the record is read");
+
+        app.world_mut().write_message(AskLeft {
+            request_id: full_id("01a04eb6"),
+            record: Some(decided(a, "deny", Some(named(principal(7), "banto")))),
+        });
+        app.update();
+        assert_eq!(notice(&app).as_deref(), Some("ask 01a04eb6 deny by banto"));
+    }
+
+    /// Someone else's ask in the context on screen raises the sheet
+    /// read-only: it is shown, and its keys offer no answer.
+    #[test]
+    fn someone_elses_ask_raises_a_read_only_sheet() {
+        let me = principal(1);
+        let mut app = sheet_app(me);
+        let theirs = ask("01a04eb6", Some(ctx(1)), principal(3));
+        set_open(&mut app, &[theirs.clone()], 1);
+        app.update();
+        assert_eq!(showing(&app), Some(full_id("01a04eb6")));
+        assert!(!sheet_keys(theirs.summary.answerable_by(me), 1).contains("[a]llow"));
+    }
+
+    /// An ask that closed while it was not on screen is not announced; the
+    /// ribbon's ANSWERED rows carry it.
+    #[test]
+    fn an_ask_that_closed_off_screen_is_not_announced() {
+        let me = principal(1);
+        let mut app = sheet_app(me);
+        let theirs = ask("01a04eb6", Some(ctx(2)), principal(3));
+
+        set_open(&mut app, &[theirs.clone()], 1);
+        app.update();
+        assert_eq!(showing(&app), None, "an ask in another context does not raise");
+
+        set_open(&mut app, &[], 2);
+        app.update();
+        app.world_mut().write_message(AskLeft {
+            request_id: full_id("01a04eb6"),
+            record: Some(decided(theirs, "allow_once", Some(named(principal(3), "amy")))),
+        });
+        app.update();
+        assert_eq!(notice(&app), None);
+    }
+
+    /// Two sheets that come down before either departure read lands each
+    /// get their line: the second must not overwrite the first's wait.
+    #[test]
+    fn two_departures_in_a_row_each_get_their_notice() {
+        let me = principal(1);
+        let mut app = sheet_app(me);
+        let a = ask("aaaaaaaa", Some(ctx(1)), me);
+        let b = ask("bbbbbbbb", Some(ctx(1)), me);
+
+        set_open(&mut app, &[a.clone(), b.clone()], 1);
+        app.update();
+        assert_eq!(showing(&app), Some(full_id("aaaaaaaa")));
+        set_open(&mut app, &[b.clone()], 2);
+        app.update();
+        assert_eq!(showing(&app), Some(full_id("bbbbbbbb")));
+        set_open(&mut app, &[], 3);
+        app.update();
+        assert_eq!(showing(&app), None);
+
+        app.world_mut().write_message(AskLeft {
+            request_id: full_id("aaaaaaaa"),
+            record: Some(decided(a, "deny", Some(named(me, "amy")))),
+        });
+        app.update();
+        assert_eq!(notice(&app).as_deref(), Some("ask aaaaaaaa deny by you"));
+
+        app.world_mut().write_message(AskLeft { request_id: full_id("bbbbbbbb"), record: None });
+        app.update();
+        assert_eq!(notice(&app).as_deref(), Some("ask bbbbbbbb closed"));
+        assert!(app.world().resource::<AskSheetState>().left.is_empty(), "nothing waits forever");
     }
 }

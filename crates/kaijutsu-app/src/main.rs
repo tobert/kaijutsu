@@ -256,7 +256,7 @@ fn main() {
         .insert_resource(connection::client_id::ClientId(client_id))
         // Connection plugin (spawns background thread)
         .add_plugins(connection::ActorPlugin { ssh_config: ssh_config.clone() })
-        // The approval ledger's pending set, mirrored once for every
+        // The approval ledger's open asks, mirrored once for every
         // renderer that shows an ask. After ActorPlugin: its systems read
         // `RpcActor`, and the switchboard lamps and dock band both take
         // `Res<LedgerMirror>`.
@@ -284,9 +284,9 @@ fn main() {
         // `Ctrl+A h` holds it (docs/input.md).
         .add_plugins(ui::quick_context::QuickContextPlugin)
         // Approval review (docs/tui.md "Asks" and "The ledger"): the ask
-        // sheet raises itself on a pending ask in the context on screen, and
-        // `Ctrl+A l` opens the ledger ribbon over it. Both read
-        // `LedgerMirror` and write their decisions back through it, so they
+        // sheet raises itself on an open ask in the context on screen that
+        // this player may answer, and `Ctrl+A l` opens the ledger ribbon over
+        // it. Both read `LedgerMirror` and send their decisions through it, so they
         // must come after LedgerMirrorPlugin; the dock's hints line reads
         // `AskNotice`, which AskSheetPlugin owns.
         .add_plugins(ui::ask_sheet::AskSheetPlugin)

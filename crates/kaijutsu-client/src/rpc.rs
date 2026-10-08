@@ -1587,26 +1587,84 @@ impl KernelHandle {
         Ok(())
     }
 
-    /// Subscribe to the kernel-wide approval-ledger change notification.
-    ///
-    /// Kernel-wide: a ledger change can originate from any call path — a
-    /// gated `shell_write` in one context, a `kj ledger` answer typed in a
-    /// shell, a rule learned by a sibling — so one subscription serves
-    /// every context. Delivers no decision and expects no answer:
-    /// `onChanged` carries only the ledger's generation after the change,
-    /// coalesced server-side (see `kaijutsu-server`'s
-    /// `subscribe_ledger_events` handler). See
-    /// [`crate::subscriptions::ledger_events_channel`] for building the
+    /// Subscribe to the kernel-wide ledger push: every ask that changed
+    /// after `since_generation`, then each later change. Pass the generation
+    /// a [`Self::list_asks`] returned so nothing between the two is lost.
+    /// See [`crate::subscriptions::ledger_events_channel`] for building the
     /// callback client.
     #[tracing::instrument(skip(self, callback), name = "rpc_client.subscribe_ledger_events")]
     pub async fn subscribe_ledger_events(
         &self,
         callback: crate::kaijutsu_capnp::ledger_events::Client,
+        since_generation: i64,
     ) -> Result<(), RpcError> {
         let mut request = self.kernel.subscribe_ledger_events_request();
         request.get().set_callback(callback);
+        request.get().set_since_generation(since_generation);
         request.send().promise.await?;
         Ok(())
+    }
+
+    /// Asks matching `filter`, with the generation they were read at. No
+    /// context: the ledger is kernel-wide.
+    #[tracing::instrument(skip(self), name = "rpc_client.list_asks")]
+    pub async fn list_asks(&self, filter: &kaijutsu_types::AskFilter) -> Result<AskListing, RpcError> {
+        let mut request = self.kernel.list_asks_request();
+        crate::ledger_wire::set_ask_filter(request.get().init_filter(), filter);
+        set_trace(request.get().init_trace());
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        Ok(AskListing {
+            generation: r.get_generation(),
+            asks: r.get_asks()?.iter().map(crate::ledger_wire::ask_summary).collect::<Result<_, _>>()?,
+            total: r.get_total(),
+        })
+    }
+
+    /// One ask's full record, or `None` when no such ask exists.
+    #[tracing::instrument(skip(self), name = "rpc_client.get_ask")]
+    pub async fn get_ask(&self, request_id: &str) -> Result<Option<kaijutsu_types::AskDetail>, RpcError> {
+        let mut request = self.kernel.get_ask_request();
+        request.get().set_request_id(request_id);
+        set_trace(request.get().init_trace());
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        if r.has_ask() { Ok(Some(crate::ledger_wire::ask_detail(r.get_ask()?)?)) } else { Ok(None) }
+    }
+
+    /// Answer an ask as this connection's principal. The answer is recorded
+    /// in the ledger; no block is authored. The inner `Err` is the ledger
+    /// declining the answer, not a transport fault.
+    #[tracing::instrument(skip(self), name = "rpc_client.decide_ask")]
+    pub async fn decide_ask(
+        &self,
+        request_id: &str,
+        verdict: kaijutsu_types::AskVerdict,
+        remember: Option<kaijutsu_types::Remember>,
+    ) -> Result<AskAnswer, RpcError> {
+        let mut request = self.kernel.decide_ask_request();
+        request.get().set_request_id(request_id);
+        request.get().set_verdict(crate::ledger_wire::wire_verdict(verdict));
+        if let Some(remember) = remember {
+            crate::ledger_wire::set_remember(request.get().init_remember(), remember);
+        }
+        set_trace(request.get().init_trace());
+        let response = request.send().promise.await?;
+        crate::ledger_wire::answer_outcome(response.get()?.get_outcome()?)
+    }
+
+    /// Reassign a pending ask to `to`, or to the next responsible character
+    /// above its reviewer when `to` is `None`. Naming yourself takes it over.
+    #[tracing::instrument(skip(self), name = "rpc_client.escalate_ask")]
+    pub async fn escalate_ask(&self, request_id: &str, to: Option<PrincipalId>) -> Result<AskAnswer, RpcError> {
+        let mut request = self.kernel.escalate_ask_request();
+        request.get().set_request_id(request_id);
+        if let Some(to) = to {
+            request.get().set_to(to.as_bytes());
+        }
+        set_trace(request.get().init_trace());
+        let response = request.send().promise.await?;
+        crate::ledger_wire::answer_outcome(response.get()?.get_outcome()?)
     }
 
     // =========================================================================
@@ -4674,6 +4732,24 @@ fn refusal_from_capnp(
         ask,
         remedy,
     })
+}
+
+/// A ledger listing: the asks, the generation they were read at, and how
+/// many matched before the limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskListing {
+    pub generation: i64,
+    pub asks: Vec<kaijutsu_types::AskSummary>,
+    pub total: u64,
+}
+
+/// The ledger's reply to an answer or reassignment.
+pub type AskAnswer = Result<kaijutsu_types::AskAnswered, kaijutsu_types::AskAnswerFailure>;
+
+fn set_trace(mut trace: crate::kaijutsu_capnp::trace_context::Builder<'_>) {
+    let (traceparent, tracestate) = kaijutsu_telemetry::inject_trace_context();
+    trace.set_traceparent(&traceparent);
+    trace.set_tracestate(&tracestate);
 }
 
 #[derive(Debug, thiserror::Error)]

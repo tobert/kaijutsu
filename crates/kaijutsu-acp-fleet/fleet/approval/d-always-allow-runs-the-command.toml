@@ -15,7 +15,7 @@ text = "make the made directory"
 permissions = ["allow_always"]
 permission_titles = ["shell_write: 1 statement(s) — mkdir made"]
 text_contains = ["ran once"]
-tool_calls = [{ title = "shell_write", status = "completed" }, { title = "kj", status = "completed" }, { title = "done", status = "completed" }]
+tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 
 [[verify]]
 path = "made"

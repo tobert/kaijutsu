@@ -177,6 +177,22 @@ and the actual caller, and refuses to assign the performer. The requester or
 performer may cancel a pending ask. Cancellation runs nothing; it does not
 undo an executed action.
 
+Clients read and answer the ledger with typed RPCs that take no context:
+`listAsks`, `getAsk`, `decideAsk`, and `escalateAsk`, with
+`subscribeLedgerEvents` pushing every ask that changed after a generation.
+The caller is the connection's principal. The ledger row is the record of an
+answer: `decideAsk` authors no block in any transcript, and the asking
+context learns the outcome through its own completion notice or held turn.
+Amy, 2026-10-08: "the ledger is more about accounting than enforcement";
+reviewer assignment is the boundary, and the ledger enforces it.
+
+Only the assigned reviewer answers. To answer an ask assigned to someone
+else, the lineage root first reassigns it to herself (`kj ledger escalate
+<id> --to amy`, or `escalateAsk`), then answers. The ledger records each
+reassignment with the reviewer before and after and the caller who moved it,
+and `kj ledger show` lists them as `reassigned:` lines; a caller who names
+itself took the ask over.
+
 The TUI displays the authenticated character and offers approval controls only
 to the assigned reviewer. A second context is unnecessary. The global ledger
 also exposes asks raised in other contexts. ACP permission prompts follow the
@@ -297,9 +313,9 @@ superseded request need explicit linkage so rotation does not duplicate work.
 
 ## Current implementation
 
-- A pending gate returns immediately. The model loop receives its tool result
-  and can continue, including writing a handoff; pending does not itself force
-  the turn to stop.
+- A model's in-kernel turn holds on an ask its own tool call raised, and
+  continues when the answer lands (`docs/gate-resume.md`, "The turn holds").
+  The MCP and RPC shell paths return `Pending` immediately.
 - Shell uses `run_in_background: false` by default and waits for the result.
   Both modes execute kaish and use the same gate. An unknown old `foreground`
   parameter is rejected. `run_in_background: true` returns a stable, non-error

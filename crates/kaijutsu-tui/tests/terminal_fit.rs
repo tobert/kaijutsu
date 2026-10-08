@@ -656,11 +656,14 @@ fn an_ask_notifies_the_desktop_only_while_unfocused() {
     // The focus report goes out *after* the line, and the pty delivers them
     // in order: typing is itself input, and input implies focus
     // (`App::saw_input`), so a focus-out sent first would be undone by the
-    // very keys that raise the ask.
+    // very keys that raise the ask. The ledger push reaches the client as
+    // soon as the ask exists, so the shell waits a second before raising
+    // it: the ask lands after the focus-out whichever event the loop takes
+    // first.
     session.send("\x1b");
     std::thread::sleep(Duration::from_millis(200));
-    session.send(":kj cc send foo hi\r");
-    session.send("\x1b[O"); // focus out, before the poll round lands
+    session.send(":!sleep 1; kj cc send foo hi\r");
+    session.send("\x1b[O"); // focus out, before the ask lands
     let notified = session.wait_until(Duration::from_secs(15), |_| session.notifications() == (1, 1));
     assert!(
         notified,
@@ -669,6 +672,11 @@ fn an_ask_notifies_the_desktop_only_while_unfocused() {
         session.dump("unfocused ask")
     );
 
+    // The first card must be armed before `Esc` reaches it: a disarmed
+    // card lets `Esc` through to the draft, and if it armed during the
+    // line below, the `d` in `send` would deny its ask.
+    let armed = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "Esc aside"));
+    assert!(armed, "the first ask's card never armed: {}", session.dump("first card"));
     // Nothing is sent to regain focus: typing the next line is what says
     // the player is here, which is the rule this half pins.
     colon_line(&session, ":kj cc send bar hi");

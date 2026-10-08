@@ -26,7 +26,7 @@ each reading a different store, and they do not agree:
 
 | Checker | Reads | Where consulted |
 |---|---|---|
-| PreCall exemption | const tables, `kj/readonly.rs` | broker PreCall only (`mcp/broker.rs`, `evaluate_phase_with_mode`) |
+| PreCall exemption | const tables, `kj/readonly.rs` | broker PreCall only (`mcp/broker.rs`, `evaluate_phase_body`) |
 | Hook exemptions | jq filters over `KJ_TOOL_PLAN` | the risk-classifier hook body under `assets/defaults/rc/lib/hooks/` (since removed) |
 | Rules redeem | `approval_rules` (SQLite, digest-keyed) | `run_gate` (`kj/gate.rs`), which both ask origins already flow through: the shell gate (`mcp/servers/shell.rs:497`) and hook escalation (`mcp/broker.rs:2323`) |
 
@@ -415,10 +415,14 @@ work, and reversing it is a decision to record here, not a drift.
 Two structural rules stay outside the class because they are not about a
 verb's effect:
 
-- **`kj ledger`** is exempt as a whole verb via `is_gate_exempt_kj`. It is
-  the gate's answer path, and a gated answer path is not one. `ledger
-  list` is a Read verb and `ledger allow` a Write verb by class, and the
-  exemption applies over both.
+- **`kj ledger`** is allowed as a whole verb in the builtin layer via
+  `is_gate_exempt_kj`, so no hook asks about an answer. The builtin layer
+  sits beneath `gate.toml`, so a `[context_type.<type>]` key can still deny
+  part of the verb to a seat; moltar denies coders `kj ledger list` and
+  `kj ledger show` and leaves `kj ledger cancel` open. People answer through
+  the typed ledger RPCs (`listAsks`, `decideAsk`; `docs/approval-identity.md`),
+  which take no context and never meet a gate. Reviewer assignment, enforced
+  in the ledger, decides who may answer.
 - **The `--help` rule** is a flag pattern (last word `--help`/`-h`, no
   intervening flag), not a verb. It moves into the evaluator as a
   structural rule in slice 2, with a Rust test for the `--content --help`

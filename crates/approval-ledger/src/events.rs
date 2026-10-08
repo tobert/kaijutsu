@@ -33,6 +33,26 @@ pub(crate) fn append(
     Ok(())
 }
 
+/// Append an `escalated` event naming both reviewers.
+pub(crate) fn append_escalation(
+    conn: &Connection,
+    request_id: &str,
+    actor: &[u8],
+    from_reviewer: Option<&[u8]>,
+    to_reviewer: &[u8],
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO approval_events (
+            request_id, seq, kind, actor, from_reviewer, to_reviewer
+         ) VALUES (
+            ?1, (SELECT COALESCE(MAX(seq), -1) + 1 FROM approval_events WHERE request_id = ?1),
+            ?2, ?3, ?4, ?5
+         )",
+        params![request_id, EventKind::Escalated.as_str(), actor, from_reviewer, to_reviewer],
+    )?;
+    Ok(())
+}
+
 /// Append an `approval_refusals` row — an answer this crate refused on an
 /// invariant, which by definition committed nothing else. Same monotonic
 /// per-`request_id` `seq` assignment as [`append`], computed inside the

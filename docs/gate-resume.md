@@ -210,7 +210,9 @@ kaijutsu meaning lives one layer up, in `kj/gate.rs`.
       │                                          │
       │                                          ▼  trigger on insert
       │                                     ledger_generation ──→ LedgerFlow::
-      │                                     (one counter)         Changed → clients
+      │                                     (one counter;         Changed → onAsks
+      │                                      approval_changes     (changed asks)
+      │                                      stamps each ask)     → clients
       │
       └──────────────────────────────────► approval_redemptions  (request_id PK)
                                             "this answer has been delivered".
@@ -223,8 +225,10 @@ kaijutsu meaning lives one layer up, in `kj/gate.rs`.
 anything kaijutsu wants to commit alongside it share a transaction.
 
 **Who a human talks to.** `kj/ledger.rs` — `kj ledger list` / `show` / `allow`
-/ `deny` / `rules` / `forget`. That is the only surface that decides an ask,
-and it writes through the same `decide`/`claim` functions the gate reads.
+/ `deny` / `rules` / `forget` — and the typed RPCs `listAsks` / `getAsk` /
+`decideAsk` / `escalateAsk` that clients use. Both read through
+`ledger_view.rs` and decide through `kj::ledger::decide_ask`, which writes
+through the same `decide`/`claim` functions the gate reads.
 
 ## The shape
 
