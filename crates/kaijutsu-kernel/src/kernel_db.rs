@@ -1266,9 +1266,8 @@ CREATE INDEX IF NOT EXISTS idx_cast_slots_backend ON cast_slots(backend_id);
 -- The persistent someone a name resolves to: a principal id plus a small,
 -- normalized sheet. `principal_id` carries no FK — the kernel never reads
 -- `auth.db`, so it is a bare id here exactly as `contexts.created_by` is.
--- `handoff_ctx`, `root`, and `root_ctx` have shipped; the rest of the sheet
--- (default_cast_id, rc_dir, memory_root) arrives with the slice that reads
--- it. See docs/character.md, "Character = principal + sheet".
+-- The rest of the sheet (rc_dir, memory_root) arrives with the slice that
+-- reads it. See docs/character.md, "Character = principal + sheet".
 CREATE TABLE IF NOT EXISTS characters (
     principal_id     BLOB NOT NULL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
@@ -1289,7 +1288,11 @@ CREATE TABLE IF NOT EXISTS characters (
     -- A root character's root context: type `root`, labeled with the
     -- character's name, played by it, with no parent. NULL for an ordinary
     -- character. SET NULL on delete for the same reason as `handoff_ctx`.
-    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL
+    root_ctx         BLOB REFERENCES contexts(context_id) ON DELETE SET NULL,
+    -- The cast a context this character plays resolves through when the
+    -- context has no cast of its own (docs/character.md, "A character has a
+    -- default cast"). Removing the cast clears it.
+    default_cast_id  BLOB REFERENCES casts(cast_id) ON DELETE SET NULL
 );
 
 -- ── Model aliases ──────────────────────────────────────────────
@@ -2740,6 +2743,7 @@ impl KernelDb {
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
+            "ALTER TABLE characters ADD COLUMN default_cast_id BLOB REFERENCES casts(cast_id) ON DELETE SET NULL",
             "ALTER TABLE backend_models ADD COLUMN max_tokens INTEGER CHECK (max_tokens IS NULL OR max_tokens > 0)",
             "ALTER TABLE backend_models ADD COLUMN temperature REAL \
                  CHECK (temperature IS NULL OR (temperature >= 0.0 AND temperature <= 2.0))",
@@ -8088,6 +8092,54 @@ impl KernelDb {
     /// Set or clear a character's `root` flag. A root has no model: it
     /// cannot be cast as a context's performer and turn identity refuses
     /// it (`docs/character.md`, "Roots and rotation").
+    /// Set or clear the cast that contexts this character plays resolve
+    /// through when they have no cast of their own.
+    pub fn set_character_default_cast(&self, principal_id: PrincipalId, cast_id: Option<CastId>) -> KernelDbResult<()> {
+        let updated = self.conn.execute(
+            "UPDATE characters SET default_cast_id = ?1 WHERE principal_id = ?2",
+            params![cast_id.map(|c| c.as_bytes().to_vec()), blob_param(principal_id.as_bytes())],
+        )?;
+        if updated == 0 {
+            return Err(KernelDbError::NotFound(format!("character {}", principal_id.short())));
+        }
+        Ok(())
+    }
+
+    /// The character's default cast, or `None` when it has none or no sheet.
+    pub fn character_default_cast(&self, principal_id: PrincipalId) -> KernelDbResult<Option<CastRow>> {
+        let cast_id: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT default_cast_id FROM characters WHERE principal_id = ?1",
+                params![blob_param(principal_id.as_bytes())],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        match cast_id {
+            Some(bytes) => {
+                let bytes: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                    KernelDbError::Validation(format!("character {} has a malformed default cast id", principal_id.short()))
+                })?;
+                self.get_cast(CastId::from_bytes(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The cast `row` resolves its models through: its own cast, else its
+    /// performer's default cast, else none (`model_resolution`). A
+    /// `cast_id` that names no cast row is treated as none.
+    pub fn effective_cast(&self, row: &ContextRow) -> KernelDbResult<Option<CastRow>> {
+        if let Some(cast_id) = row.cast_id {
+            return self.get_cast(cast_id);
+        }
+        match row.played_by {
+            Some(performer) => self.character_default_cast(performer),
+            None => Ok(None),
+        }
+    }
+
     pub fn update_character_root(&self, principal_id: PrincipalId, root: bool) -> KernelDbResult<()> {
         let updated = self.conn.execute(
             "UPDATE characters SET root = ?1 WHERE principal_id = ?2",

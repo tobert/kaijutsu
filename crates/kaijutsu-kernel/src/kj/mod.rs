@@ -1148,10 +1148,7 @@ impl KjDispatcher {
             .get(context_id)
             .map(|h| (h.provider.clone(), h.model.clone()))
             .unwrap_or((None, None));
-        let cast_label = row
-            .cast_id
-            .and_then(|cid| self.kernel_db().lock().get_cast(cid).ok().flatten())
-            .map(|c| c.label);
+        let cast_label = self.kernel_db().lock().effective_cast(&row).ok().flatten().map(|c| c.label);
         let resolved = crate::model_resolution::resolve_context_model(
             &row.context_type,
             provider_override.as_deref(),

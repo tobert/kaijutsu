@@ -344,8 +344,10 @@ grows with the gate.
   shadow inherits the seat's cast. A cast with a `judge` slot gives the
   seat a judge, pointing at the megakernel, lfm2d, or Jev through
   OpenRouter; a cast with no such slot gives none. "mk bumps", "lfm2d
-  bumps", and "Jev bumps" become casts, assigned with `kj context set
-  --cast` or recalled by `kj preset` at fork.
+  bumps", and "Jev bumps" become casts. A seat with no cast of its own
+  uses its performer's default cast (`kj character set coder --cast
+  mk-judge`), so every seat a `coder` character plays gets the judge with
+  nothing to turn on per seat; `kj context create --cast` pins another.
 - **Outward actions only.** Council time is limited on our hardware, so a
   shadow records what the seat does to the world, not what it reads. The
   gate already draws that line: the read-only `shell` tool runs no gate,

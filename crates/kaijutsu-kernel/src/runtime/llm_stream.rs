@@ -559,31 +559,25 @@ pub(super) async fn spawn_admitted_turn(
     // Resolve provider + model through `resolve_context_model` (the one
     // function that answers "what model does this context play?").
     // Priority: explicit param > per-context (DriftRouter) > cast slot on
-    // this context's context_type > registry default. The context_type and
+    // this context's context_type (its own cast, else its performer's
+    // default cast) > registry default. The context_type and
     // cast label are read once per turn here; the pure resolution itself
     // lives in `crate::model_resolution` where it's unit-tested.
     let (context_type, cast_label) = {
         let db = kernel_db.lock();
         match db.get_context(context_id) {
             Ok(Some(row)) => {
-                let label = row.cast_id.and_then(|id| match db.get_cast(id) {
-                    Ok(Some(cast)) => Some(cast.label),
-                    // A dangling cast_id (cast removed; FK is SET NULL so
-                    // this is a race at worst) falls through to the
-                    // default — resolution handles None; log it so the
-                    // fallthrough is observable.
-                    Ok(None) => {
-                        tracing::warn!(
-                            "context {context_id} carries cast_id {id} with no cast row; \
-                             falling through to default resolution"
-                        );
-                        None
-                    }
+                // The context's own cast, else its performer's default. A
+                // dangling id (FK is SET NULL, so a race at worst) falls
+                // through to the default; a read failure is logged so the
+                // fallthrough is observable.
+                let label = match db.effective_cast(&row) {
+                    Ok(cast) => cast.map(|c| c.label),
                     Err(e) => {
                         tracing::warn!("cast lookup for context {context_id} failed: {e}");
                         None
                     }
-                });
+                };
                 (row.context_type, label)
             }
             // No row / read failure: resolution still works (no cast, no

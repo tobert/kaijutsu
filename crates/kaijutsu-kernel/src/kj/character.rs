@@ -60,7 +60,8 @@ enum CharacterCommand {
         /// The character's name.
         name: String,
     },
-    /// Update a character's sheet. Currently only `root`.
+    /// Update a character's sheet: whether it is a root, and its default
+    /// cast.
     Set {
         /// The character to update.
         name: String,
@@ -71,6 +72,13 @@ enum CharacterCommand {
         /// Make this character an ordinary one that a model can play.
         #[arg(long = "no-root", conflicts_with = "root")]
         no_root: bool,
+        /// The cast a context this character plays uses when the context
+        /// has no cast of its own. A context's own `--cast` wins.
+        #[arg(long, value_name = "CAST", conflicts_with = "no_cast")]
+        cast: Option<String>,
+        /// Clear the default cast.
+        #[arg(long = "no-cast", conflicts_with = "cast")]
+        no_cast: bool,
     },
     /// Retire a character and conclude and archive every live context it plays.
     /// The contexts retain their performer assignment.
@@ -135,7 +143,20 @@ impl KjDispatcher {
             CharacterCommand::Create { name, root } => self.character_create(&name, root, caller).await,
             CharacterCommand::List { all, json } => self.character_list(all, json),
             CharacterCommand::Show { name } => self.character_show(&name),
-            CharacterCommand::Set { name, root, no_root } => {
+            CharacterCommand::Set { name, root, no_root, cast, no_cast } => {
+                if !root && !no_root && cast.is_none() && !no_cast {
+                    return KjResult::Err(
+                        "kj character set: specify --root, --no-root, --cast <cast>, or --no-cast".to_string(),
+                    );
+                }
+                if (cast.is_some() || no_cast)
+                    && let Err(error) = self.character_set_cast(&name, cast.as_deref())
+                {
+                    return error;
+                }
+                if !root && !no_root {
+                    return self.character_show(&name);
+                }
                 self.character_set(&name, root, no_root, caller).await
             }
             CharacterCommand::Retire { name } => self.character_retire(&name),
@@ -461,18 +482,25 @@ impl KjDispatcher {
         let db = self.kernel_db().lock();
         match db.get_character_by_name(name) {
             Ok(Some(row)) => {
+                let default_cast = match db.character_default_cast(row.principal_id) {
+                    Ok(cast) => cast.map(|c| c.label),
+                    Err(e) => return KjResult::Err(format!("kj character show: {e}")),
+                };
                 let text = format!(
                     "Character:       {}\nID:              {}\nRoot:            {}\n\
-                     Created:         {}\nRetired:         {}",
+                     Default cast:    {}\nCreated:         {}\nRetired:         {}",
                     row.name,
                     row.principal_id.to_hex(),
                     if row.root { "yes" } else { "no" },
+                    default_cast.as_deref().unwrap_or("-"),
                     super::format::format_timestamp(row.created_at),
                     row.retired_at
                         .map(super::format::format_timestamp)
                         .unwrap_or_else(|| "-".to_string()),
                 );
-                KjResult::ok_with_data(text, character_to_json(&row))
+                let mut data = character_to_json(&row);
+                data["default_cast"] = serde_json::json!(default_cast);
+                KjResult::ok_with_data(text, data)
             }
             // A missing mapping is corruption, never a fallback to a
             // default identity — say so loudly rather than rendering
@@ -483,6 +511,35 @@ impl KjDispatcher {
             )),
             Err(e) => KjResult::Err(format!("kj character show: {e}")),
         }
+    }
+
+    /// Set or clear the character's default cast. `Err` carries the
+    /// refusal to return.
+    fn character_set_cast(&self, name: &str, cast: Option<&str>) -> Result<(), KjResult> {
+        let db = self.kernel_db().lock();
+        let row = match db.get_character_by_name(name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Err(KjResult::Err(format!(
+                    "kj character set: no character named '{name}' — `kj character list` to see who exists"
+                )));
+            }
+            Err(e) => return Err(KjResult::Err(format!("kj character set: {e}"))),
+        };
+        let cast_id = match cast {
+            None => None,
+            Some(label) => match db.get_cast_by_label(label) {
+                Ok(Some(cast)) => Some(cast.cast_id),
+                Ok(None) => {
+                    return Err(KjResult::Err(format!(
+                        "kj character set: no cast labeled '{label}' — `kj cast list` to see the casts"
+                    )));
+                }
+                Err(e) => return Err(KjResult::Err(format!("kj character set: {e}"))),
+            },
+        };
+        db.set_character_default_cast(row.principal_id, cast_id)
+            .map_err(|e| KjResult::Err(format!("kj character set: {e}")))
     }
 
     /// Set or clear `root`. A root has no model: it cannot be cast as a

@@ -804,6 +804,7 @@ impl KjDispatcher {
             workspace_paths,
             workspace_label,
             cast_label,
+            cast_from_performer,
             played_by_name,
         ) = {
             let db = self.kernel_db().lock();
@@ -867,14 +868,11 @@ impl KjDispatcher {
                 .and_then(|wsid| db.get_workspace(wsid).ok().flatten())
                 .map(|ws| ws.label);
 
-            // Cast label — the row only carries the id; resolve it here for
-            // display the same way `workspace_label` above resolves a
-            // `workspace_id`. A dangling id (cast removed between reads)
-            // shows as absent, not an error.
-            let cast_label = row
-                .cast_id
-                .and_then(|cid| db.get_cast(cid).ok().flatten())
-                .map(|c| c.label);
+            // The cast the context resolves through: its own, else its
+            // performer's default (`KernelDb::effective_cast`). A dangling id
+            // (cast removed between reads) shows as absent, not an error.
+            let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
+            let cast_from_performer = row.cast_id.is_none() && cast_label.is_some();
 
             // Resolve the performer's name for live and archived contexts.
             // Retirement preserves both the sheet and this relationship.
@@ -897,6 +895,7 @@ impl KjDispatcher {
                 workspace_paths,
                 workspace_label,
                 cast_label,
+                cast_from_performer,
                 played_by_name,
             )
         };
@@ -1035,7 +1034,8 @@ impl KjDispatcher {
         }
 
         if let Some(ref label) = cast_label {
-            info.push_str(&format!("\nCast:    {label}"));
+            let from = if cast_from_performer { " (the performer's default)" } else { "" };
+            info.push_str(&format!("\nCast:    {label}{from}"));
         }
 
         if let Some(ref name) = played_by_name {
@@ -1190,10 +1190,7 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context prompt: {e}")),
             };
 
-            let cast_label = row
-                .cast_id
-                .and_then(|cid| db.get_cast(cid).ok().flatten())
-                .map(|c| c.label);
+            let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
 
             let character = |principal_id: PrincipalId| -> Result<crate::llm::CharacterIdentity, KjResult> {
                 let sheet = db.get_character(principal_id)

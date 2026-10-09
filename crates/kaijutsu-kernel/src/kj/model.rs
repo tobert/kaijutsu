@@ -206,9 +206,7 @@ impl KjDispatcher {
             };
             match db.get_context(ctx_id) {
                 Ok(Some(row)) => {
-                    let cast_label = row.cast_id.and_then(|id| {
-                        db.get_cast(id).ok().flatten().map(|c| c.label)
-                    });
+                    let cast_label = db.effective_cast(&row).ok().flatten().map(|c| c.label);
                     (ctx_id, row.provider, row.model, row.context_type, cast_label)
                 }
                 Ok(None) => {
@@ -771,6 +769,71 @@ mod tests {
         // The slot sets no tunables, so the model's own row answers.
         assert_eq!(data["tunables"]["max_tokens"], 65536);
         assert_eq!(data["tunables"]["effort"], "high");
+    }
+
+    /// A context with no cast of its own resolves through its performer's
+    /// default cast, and a context's own cast wins over it. Clearing the
+    /// default falls through to the registry default.
+    ///
+    /// Falsified by reading only the context's cast (the first probe reports
+    /// the registry default) or by letting the performer's default win over
+    /// the context's own cast.
+    #[tokio::test]
+    async fn model_resolves_through_the_performers_default_cast() {
+        let d = test_dispatcher().await;
+        {
+            let mut db = d.kernel_db().lock();
+            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
+        }
+        d.reload_llm_registry().await.unwrap();
+        let principal = PrincipalId::new();
+        let parent = crate::kj::test_helpers::register_context(&d, Some("parent"), None, principal);
+        let c = crate::kj::test_helpers::caller_with_context(parent);
+        for (cast, model) in [("band", "deepseek-v4-pro"), ("house", "deepseek-flash")] {
+            assert!(d.dispatch(&[s("cast"), s("create"), s(cast)], &c).await.is_ok());
+            let r = d
+                .dispatch(
+                    &[s("cast"), s("slot"), s("set"), s(cast), s("coder"), s("--backend"), s("deepseek"), s("--model"), s(model)],
+                    &c,
+                )
+                .await;
+            assert!(r.is_ok(), "slot set failed: {}", r.message());
+        }
+        assert!(d.dispatch(&[s("character"), s("create"), s("coder")], &c).await.is_ok());
+        let r = d.dispatch(&[s("character"), s("set"), s("coder"), s("--cast"), s("band")], &c).await;
+        assert!(r.is_ok(), "character set --cast failed: {}", r.message());
+        let shown = d.dispatch(&[s("character"), s("show"), s("coder")], &c).await;
+        assert!(shown.message().contains("Default cast:    band"), "{}", shown.message());
+
+        let coder = d.kernel_db().lock().get_character_by_name("coder").unwrap().unwrap().principal_id;
+        let played = |label: &str, cast: Option<&str>| {
+            let mut argv = vec![s("context"), s("create"), s(label), s("--type"), s("coder")];
+            if let Some(cast) = cast {
+                argv.extend([s("--cast"), s(cast)]);
+            }
+            argv
+        };
+        for (label, cast) in [("probe", None), ("own", Some("house"))] {
+            let r = d.dispatch(&played(label, cast), &c).await;
+            assert!(r.is_ok(), "context create failed: {}", r.message());
+            let db = d.kernel_db().lock();
+            let id = db.find_context_by_label(label).unwrap().unwrap().context_id;
+            db.update_context_review(id, Some(coder), None).unwrap();
+        }
+        let source = |result: crate::kj::KjResult| match result {
+            crate::kj::KjResult::Ok { data: Some(v), .. } => (v["model"].as_str().unwrap().to_string(), v["source"].as_str().unwrap().to_string()),
+            other => panic!("expected data, got {other:?}"),
+        };
+
+        let probe = source(d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await);
+        assert_eq!(probe, (s("deepseek-v4-pro"), s("cast band")), "the performer's default cast answers");
+        let own = source(d.dispatch(&[s("model"), s("--context"), s("own")], &c).await);
+        assert_eq!(own, (s("deepseek-flash"), s("cast house")), "the context's own cast wins");
+
+        let r = d.dispatch(&[s("character"), s("set"), s("coder"), s("--no-cast")], &c).await;
+        assert!(r.is_ok(), "character set --no-cast failed: {}", r.message());
+        let cleared = source(d.dispatch(&[s("model"), s("--context"), s("probe")], &c).await);
+        assert_eq!(cleared.1, "default", "with no default cast the registry default answers");
     }
 
     /// A context with no cast seat runs its model's own tunables, the same

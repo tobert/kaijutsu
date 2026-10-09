@@ -44,7 +44,7 @@ set `--as banto` on the seat, or create a successor with `--as banto`, then
 
 Still planned: character rc composition (slice 5), roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet still has no
-`default_cast_id`, `rc_dir`, or `memory_root` fields. The handoff
+`rc_dir` or `memory_root` fields. The handoff
 is a context, not a transport track. Requester and performer remain separate;
 setting `played_by` changes subsequent model invocation and output attribution;
 it never changes credentials or rewrites existing asks and block authors.
@@ -93,7 +93,16 @@ Two things follow, and they are the ones to check a change against:
   Opaque UUIDv7 id in records and `.data`; given name in the UI and as the
   drift address. The word fits the cast vocabulary kaijutsu already uses: a
   character is what an actor is cast *as*, and a context is one performance.
-- **A character has a default cast.** A gig may pin another.
+- **A character has a default cast.** A gig may pin another. Built: `kj
+  character set <name> --cast <cast>` (`--no-cast` clears it), shown by `kj
+  character show`. A context with no cast of its own resolves its models
+  through its performer's default cast, so the order is the context's
+  model, the context's cast, the performer's default cast, then the
+  registry default (`KernelDb::effective_cast`, `model_resolution.rs`).
+  `kj context create --cast` pins another. One cast covers every type a
+  character plays, since a cast holds one slot per role; a `judge` slot
+  gives the seats it plays a judge shadow (`docs/council.md`, "Shadow
+  voice").
 - **Accountability replaces any group concept.** Every model character
   answers to a character above it; a human is a root. No party. Superseded
   in shape by "Roots and rotation": the relation is between contexts, not
@@ -957,8 +966,8 @@ Each slice is independently shippable and leaves the tree green.
    doc comment said otherwise until 2026-09-05.
 7. **Drift to a character.** `@name` addressing; one resolver.
 8. **Janitor, then proctor.** The `yakin` character, its track, its tick rc;
-   `default_cast_id` arrives with the character rows that
-   need them; the distill-cast refusal and `--distill-model` on pull.
+   the distill-cast refusal and `--distill-model` on pull.
+   `default_cast_id` shipped on its own, 2026-10-09, for the judge shadow.
 
 Deferred: saifu, availability, and `memory_root` until a reader exists.
 `root_ctx` has its reader, rotation ("Roots and rotation" above), and is
@@ -986,8 +995,6 @@ it.
   and app; they did not establish every consumer. Anything that treats a
   block's principal as the authenticated requester needs a separate field
   or durable turn provenance, not a second overload of the author field.
-- **Does a character carry one default cast, or one per type?** Start with
-  one.
 - **A musician's memory.** Bass-san's `memory_root` is NULL by choice.
 - **Socket-protocol liveness** for driving a Claude Code session
   (`docs/cc-peer.md`).

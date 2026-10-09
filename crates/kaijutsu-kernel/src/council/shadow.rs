@@ -380,8 +380,9 @@ fn append(kernel: &crate::Kernel, shadow: ContextId, role: Role, text: String) -
         .map_err(|e| e.to_string())
 }
 
-/// The seat's live judge shadow, created when the seat's cast has a
-/// [`JUDGE`] slot and no shadow exists yet. The shadow is found by its fork
+/// The seat's live judge shadow, created when the cast the seat resolves
+/// through (its own, else its performer's default) has a [`JUDGE`] slot and
+/// no shadow exists yet. The shadow is found by its fork
 /// edge and type, never by its label.
 fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<Judge>> {
     let _create = CREATE.lock();
@@ -390,7 +391,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
-        let Some(cast_id) = seat_row.cast_id else { return Ok(None) };
+        let Some(cast_id) = db.effective_cast(&seat_row)?.map(|c| c.cast_id) else { return Ok(None) };
         let Some(slot) = db.get_cast_slot(cast_id, JUDGE)? else { return Ok(None) };
         let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id);
         let server = backend.filter(|b| b.kind == "mk").and_then(|b| b.base_url);

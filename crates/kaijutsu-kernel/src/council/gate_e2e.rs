@@ -2686,3 +2686,36 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     assert!(outcome.starts_with("ran; judge: ask (p="), "{outcome}");
     rig.finish().await;
 }
+
+/// A seat with no cast of its own gets a judge from its performer's default
+/// cast, and the shadow plays that cast.
+///
+/// Falsified by reading only the seat's own cast: no shadow.
+#[tokio::test]
+async fn a_seat_gets_a_judge_from_its_performer_s_default_cast() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    give_judge_cast(&rig, "judge-model");
+    let cast = {
+        let db = rig.d.kernel_db();
+        let db = db.lock();
+        let cast = db.get_context(rig.ctx.context_id).unwrap().unwrap().cast_id.unwrap();
+        db.update_cast(rig.ctx.context_id, None).unwrap();
+        db.insert_character(&crate::kernel_db::CharacterRow {
+            principal_id: rig.ctx.actor_id,
+            name: "coder".into(),
+            created_at: 0,
+            retired_at: None,
+            handoff_ctx: None,
+            root_ctx: None,
+            root: false,
+        })
+        .unwrap();
+        db.set_character_default_cast(rig.ctx.actor_id, Some(cast)).unwrap();
+        cast
+    };
+    rig.submit("echo performer").await.unwrap();
+    let shadows = judge_shadows(&rig);
+    assert_eq!(shadows.len(), 1, "the performer's default cast has a judge slot");
+    assert_eq!(shadows[0].cast_id, Some(cast));
+    rig.finish().await;
+}
