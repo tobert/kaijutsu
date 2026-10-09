@@ -12,8 +12,14 @@
 //! seat's shell spec, so the server holds the dialogue before it is asked
 //! about it. A judge on a chat backend is hydrated whole when it is asked.
 //!
+//! After the council decides a judged seat's call, [`spawn_judge`] reads the
+//! decision's configured contexts and the shadow on the judge's server,
+//! under the same spec and case. The answer is recorded as an observation
+//! of that decision and added to the call's outcome turn. A call the static
+//! rules decided is recorded but not judged.
+//!
 //! A shadow records and decides nothing. Every failure here is logged at
-//! error level and leaves the gate's decision alone.
+//! error level, or recorded as a miss, and leaves the gate's decision alone.
 
 use std::sync::Arc;
 
@@ -34,10 +40,32 @@ pub(crate) const CALL_INPUT_BYTES: usize = 800;
 /// both create one.
 static CREATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// Bounds a judge read: preparing the server and the decision together.
+/// The read runs off the gate's path, so it waits longer than a decision.
+const JUDGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A call [`record_call`] wrote: the shadow and the user turn.
 pub(crate) struct ShadowCall {
     shadow: ContextId,
     call: BlockId,
+    judge: Option<JudgeRead>,
+}
+
+impl ShadowCall {
+    /// The judge read for this call, when the judge is on a council server.
+    pub(crate) fn judge_read(&self) -> Option<JudgeRead> {
+        self.judge.clone()
+    }
+}
+
+/// What a judge read after the gate's decision needs.
+#[derive(Clone, Debug)]
+pub(crate) struct JudgeRead {
+    seat: ContextId,
+    seat_name: String,
+    shadow: ContextId,
+    call: BlockId,
+    server: String,
 }
 
 /// A seat's judge shadow and where its model is served.
@@ -80,7 +108,14 @@ pub(crate) fn record_call(
         }
     };
     spawn_prime(kernel, &judge, config);
-    Some(ShadowCall { shadow, call })
+    let read = judge.server.clone().map(|server| JudgeRead {
+        seat,
+        seat_name: judge.seat_name.clone(),
+        shadow,
+        call: call.clone(),
+        server,
+    });
+    Some(ShadowCall { shadow, call, judge: read })
 }
 
 /// Primes a council-server judge on a task of its own. The judge is read
@@ -110,6 +145,183 @@ fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLo
             Err(miss) => tracing::error!(target: "kaijutsu::council", %shadow, %server, "shadow: priming failed: {}", miss.0),
         }
     });
+}
+
+/// Reads the judge about the call `read` names, after the council decision
+/// `decision_id` committed: `council`'s contexts and the spec's own, then the
+/// shadow, on the judge's server, under the decision's shell spec and case
+/// `state`. Records the answer, or the miss, as an observation of the
+/// decision, and adds an answer to the call's outcome turn.
+pub(crate) fn spawn_judge(
+    kernel: Arc<crate::Kernel>,
+    council: crate::kj::gate_policy::CouncilConfig,
+    decision_id: Vec<u8>,
+    state: kaijutsu_mk::Json,
+    read: JudgeRead,
+) {
+    tokio::spawn(async move {
+        let row = judge_one(&kernel, council, &decision_id, &state, &read).await;
+        let recorded = approval_ledger::council_observation::insert_council_observation(
+            kernel.kernel_db().lock().conn_for_ledger(),
+            &row.observation,
+        );
+        if let Err(error) = recorded {
+            tracing::error!(target: "kaijutsu::council", shadow = %read.shadow, "shadow: the judge's answer could not be recorded: {error}");
+        }
+        match (row.choice, &row.observation.miss_cause) {
+            (Some(choice), _) => {
+                tracing::info!(target: "kaijutsu::council", shadow = %read.shadow, %choice, p = row.p, "a judge answered");
+                add_answer(&kernel, &read, &format!("judge: {choice} (p={:.2})", row.p));
+            }
+            (None, cause) => tracing::warn!(
+                target: "kaijutsu::council", shadow = %read.shadow,
+                miss_cause = cause.as_deref().unwrap_or("unknown"), "a judge gave no answer"
+            ),
+        }
+    });
+}
+
+/// One judge read: the observation row, and the pooled probability of its
+/// choice.
+struct Judged {
+    observation: approval_ledger::council_observation::NewCouncilObservation,
+    choice: Option<String>,
+    p: f64,
+}
+
+async fn judge_one(
+    kernel: &crate::Kernel,
+    mut council: crate::kj::gate_policy::CouncilConfig,
+    decision_id: &[u8],
+    state: &kaijutsu_mk::Json,
+    read: &JudgeRead,
+) -> Judged {
+    use approval_ledger::council::CouncilServer;
+    use approval_ledger::council_observation::{CouncilObservationOutcome, NewCouncilObservation};
+    use kaijutsu_mk::council::wire::PooledAnswer;
+
+    let started = std::time::Instant::now();
+    let label = shadow_label(&read.seat_name);
+    let spec = super::gate::shell_spec(&council).cloned();
+    let mut judged = Judged {
+        observation: NewCouncilObservation {
+            decision_id: decision_id.to_vec(),
+            voice_label: label.clone(),
+            voice_context_id: Some(read.shadow.as_bytes().to_vec()),
+            spec_name: spec.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            spec_id: String::new(),
+            server: CouncilServer {
+                model: String::new(),
+                weight_hash: String::new(),
+                tokenizer_hash: String::new(),
+                template: String::new(),
+                engine: String::new(),
+            },
+            outcome: CouncilObservationOutcome::Miss,
+            choice: None,
+            miss_cause: None,
+            snapshot: None,
+            expected_head: None,
+            queue_ms: 0,
+            ms: 0,
+            questions: Vec::new(),
+        },
+        choice: None,
+        p: 0.0,
+    };
+    let miss = |mut judged: Judged, cause: String| {
+        judged.observation.miss_cause = Some(cause);
+        judged.observation.ms = started.elapsed().as_millis() as i64;
+        judged
+    };
+    let Some(spec) = spec else {
+        return miss(judged, "gate.toml declares no council shell spec for the seat's type".into());
+    };
+    council.server = read.server.clone();
+    council.deadline_ms = JUDGE_DEADLINE.as_millis() as u64;
+    let deadline = tokio::time::Instant::now() + JUDGE_DEADLINE;
+    let mut labels = council.contexts.clone();
+    labels.extend(spec.contexts.iter().cloned());
+    let seat = council.house_rules.then_some(read.seat);
+    let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, deadline).await {
+        Ok(prepared) => prepared,
+        Err(cause) => return miss(judged, cause),
+    };
+    let primed = kernel.council_sync().prime_shadow(kernel, &read.server, &spec.name, read.shadow, &read.seat_name);
+    let head = match tokio::time::timeout_at(deadline, primed).await {
+        Ok(Ok(head)) => head,
+        Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
+        Err(_) => return miss(judged, "the shadow could not be sent in time".into()),
+    };
+    judged.observation.expected_head = Some(head.to_string());
+    judged.observation.spec_id = prepared.spec_id.to_string();
+    prepared.contexts.push(super::sync::PreparedContext {
+        label: label.clone(),
+        context_id: read.shadow,
+        head,
+        house_rules: false,
+    });
+    let request = super::gate::decision_request(&prepared, &council, state.clone());
+    let asked = std::time::Instant::now();
+    let response = match super::gate::ask_within(kernel, &prepared, &request, &council, deadline).await {
+        Ok(response) => response,
+        Err(cause) => return miss(judged, cause),
+    };
+    if let Err(mismatch) = kaijutsu_mk::council::math::verify(&response, &request) {
+        return miss(judged, format!("the answer's numbers do not recompute ({mismatch})"));
+    }
+    judged.observation.server = CouncilServer {
+        model: response.identity.model.clone(),
+        weight_hash: response.identity.weight_hash.clone(),
+        tokenizer_hash: response.identity.tokenizer_hash.clone(),
+        template: response.identity.template.clone(),
+        engine: response.identity.engine.clone(),
+    };
+    judged.observation.queue_ms = response.queue_ms.unwrap_or(0.0).round() as i64;
+    let shadow_id = read.shadow.to_string();
+    if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_id.as_str())) {
+        judged.observation.snapshot = shadow_read.snapshot.as_ref().map(|s| s.to_string());
+        judged.observation.questions =
+            shadow_read.answers.iter().map(|(id, answer)| super::gate::read_question(id, answer)).collect();
+    }
+    let Some(PooledAnswer::Choice(pooled)) = response.answers.get(super::gate::VERDICT) else {
+        return miss(judged, format!("the answer has no pooled `{}` choice", super::gate::VERDICT));
+    };
+    judged.p = pooled.probabilities.get(&pooled.choice).copied().unwrap_or(0.0);
+    judged.choice = Some(pooled.choice.clone());
+    judged.observation.choice = Some(pooled.choice.clone());
+    judged.observation.outcome = CouncilObservationOutcome::Answered;
+    judged.observation.ms = asked.elapsed().as_millis() as i64;
+    judged
+}
+
+/// Adds `answer` to the model turn after the call `read` names. The gate
+/// writes that turn before any judge answers; a turn not there yet is
+/// logged and left alone.
+fn add_answer(kernel: &crate::Kernel, read: &JudgeRead, answer: &str) {
+    let blocks = kernel.blocks();
+    let snapshots = match blocks.block_snapshots(read.shadow) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            tracing::error!(shadow = %read.shadow, "shadow: cannot read the dialogue to add the judge's answer: {error}");
+            return;
+        }
+    };
+    let after_call = snapshots.iter().skip_while(|b| b.id != read.call).nth(1);
+    let Some(outcome) = after_call.filter(|b| b.role == Role::Model) else {
+        tracing::warn!(shadow = %read.shadow, "shadow: the call has no outcome turn yet; the judge's answer is only in the record");
+        return;
+    };
+    let text = format!("{}; {answer}", outcome.content);
+    let replaced = blocks.replace_text_if_unchanged_as(read.shadow, &outcome.id, &outcome.content, &text, Some(PrincipalId::system()));
+    if let Err(error) = replaced {
+        tracing::error!(shadow = %read.shadow, "shadow: cannot add the judge's answer: {error}");
+    }
+}
+
+/// A judge shadow's label: `judge-` and the seat's name.
+fn shadow_label(seat_name: &str) -> String {
+    format!("{JUDGE}-{seat_name}")
 }
 
 /// Appends what the gate did with a call as the model turn after it.
@@ -214,7 +426,7 @@ fn shadow_row(seat: &ContextRow, cast_id: kaijutsu_types::CastId) -> ContextRow 
     let seat_name = seat.label.clone().unwrap_or_else(|| seat.context_id.short());
     ContextRow {
         context_id: ContextId::new(),
-        label: Some(format!("{JUDGE}-{seat_name}")),
+        label: Some(shadow_label(&seat_name)),
         provider: None,
         model: None,
         system_prompt: None,

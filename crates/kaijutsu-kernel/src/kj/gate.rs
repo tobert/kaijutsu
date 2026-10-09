@@ -460,7 +460,10 @@ pub(crate) async fn run_gate(
     }
     let shadow = crate::council::shadow::record_call(kernel, caller.context_id, &spec, config);
     let (outcome, bump_flavor) = match crate::council::gate::consult(kernel, caller, &spec, config).await {
-        Ok(council) => {
+        Ok(mut council) => {
+            if let (Some(council), Some(judge)) = (council.as_mut(), shadow.as_ref().and_then(|s| s.judge_read())) {
+                council.set_judge(judge);
+            }
             let bump_flavor = council.as_ref().and_then(|c| c.submission_bump()).map(|b| b.flavor);
             let outcome = run_gate_recorded(kernel, caller, spec, ledger_flows, config, council, &|_, _| Ok(())).await;
             (outcome, bump_flavor)

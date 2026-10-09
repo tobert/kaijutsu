@@ -380,9 +380,11 @@ grows with the gate.
   Kaijutsu manages the bulk of that cache itself, choosing what to keep,
   park, and drop, rather than leaving it to the server's eviction. No cap
   or compaction until measurements call for one.
-- **The record.** Each recorded answer is stored beside the gate's
-  decision with whether the outcome would have differed and how long
-  preparing and answering took.
+- **The record.** Each judge answer is a `council_observations` row on
+  the gate's decision: the choice, each question's answer from the
+  shadow's read, the head it read, and the time it took. Comparing its
+  choice with the decision's outcome shows where the history changed the
+  answer.
 - **Open.** Whether feeding its own past answers back anchors a model; the
   record shows it. How a council spec names the case when the call is
   already the shadow's last turn. How a shadow is switched from recording
@@ -417,11 +419,18 @@ shipped. A fresh session resumes at the first step not marked done.
    (logged). Priming has its own lock and a 30 s timeout, so it never
    holds up a decision. A judge on any other backend is not primed. Test:
    `a_judge_on_a_council_server_is_primed_with_each_call`.
-3. **Asking and recording.** Adds the `judge` context_type rc seed for
-   the framing. After the gate decides, the kernel asks the judge about
-   the last call, writes its answer as the model turn, and
-   records it beside the decision with timings and whether it differs from
-   the outcome. Nothing changes the gate's decision.
+3. **Done: asking and recording.** After the council decides a judged
+   seat's call, a task of its own reads `[council] contexts`, the shell
+   spec's own contexts, and the house rules when they are on, then the
+   shadow, on the judge's server, under the decision's spec and case,
+   with a 30 s deadline (`shadow::spawn_judge`). Voices are not read. The
+   answer is a `council_observations` row on the decision, with
+   `voice_label` `judge-<seat>`, and it is added to the call's outcome
+   turn as `; judge: <choice> (p=<pooled p>)`. A call a static rule
+   decided is recorded but not judged. The judge never changes the
+   decision. Test: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`.
+   Still open: the `judge` type's rc framing (the framing is a constant
+   in `projection.rs`), and whether the judge should read the voices.
 4. **Measure on moltar.** Deploy, give banto's coders a cast with a
    `judge` slot on the megakernel, and read priming time, answer time,
    snapshot count, and the disagreement rate. Record the numbers in

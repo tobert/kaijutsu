@@ -2578,6 +2578,7 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     assert_eq!(turns[4].1, "shell_write: rm /work/marker");
     assert_eq!(turns[5].1, "asked the reviewer");
     assert!(rig.mock.puts_for(shadow.context_id).is_empty(), "a judge on a chat backend is hydrated whole, never primed");
+    assert_eq!(rig.mock.decisions().len(), 2, "only the gate's two decisions: a chat judge is not asked yet");
     rig.finish().await;
 }
 
@@ -2630,5 +2631,58 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let puts = rig.mock.wait_for_puts(shadow, 2).await;
     let turns: Vec<&str> = puts[1].turns.iter().map(|t| t.content.as_str()).collect();
     assert_eq!(turns[..3], ["shell_write: echo one", "ran", "shell_write: echo two"], "{turns:?}");
+    assert!(rig.mock.decisions().is_empty(), "a call no council decided is recorded, not judged");
+    rig.finish().await;
+}
+
+/// After the council decides a judged seat's call, the judge reads the
+/// decision's contexts and the shadow, under the same spec and case, on its
+/// own task. Its answer is recorded as an observation of that decision and
+/// added to the call's outcome turn; the gate's decision stands.
+///
+/// Falsified by reading the shadow without the decision's contexts, by
+/// letting the judge's ask change the council's allow, or by leaving the
+/// answer out of the dialogue.
+#[tokio::test]
+async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
+    const JUDGE_ASKS: [[f64; 3]; 3] = [[-4.0, -0.03, -5.0], [-3.5, -0.04, -5.0], [-4.0, -0.02, -6.0]];
+    let rig = rig(Via::Tool, Setup::default()).await;
+    let base = rig.mock.base.clone();
+    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    rig.mock.set(|req| {
+        if Rig::read_ids(req).len() == 3 { Reply::ok(answer(req, &JUDGE_ASKS)) } else { allow_each(req) }
+    });
+    rig.submit("echo judged").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    let ask = rig.only_ask();
+    assert_eq!(ask.status, ApprovalStatus::Allowed, "the judge's answer never changes the decision");
+    let decision = the_decision(&rig, &ask);
+
+    let rows = rig.observations(&decision.decision_id, 1).await;
+    let o = &rows[0].observation;
+    assert_eq!(o.voice_label, "judge-council-seat");
+    assert_eq!(o.spec_name, "shell-gate");
+    assert_eq!(o.outcome, CouncilObservationOutcome::Answered, "{o:?}");
+    assert_eq!(o.choice.as_deref(), Some("ask"));
+
+    let shadow = judge_shadows(&rig)[0].context_id;
+    let judged: Vec<DecisionRequest> = rig.mock.decisions().into_iter().filter(|r| Rig::read_ids(r).len() == 3).collect();
+    assert_eq!(judged.len(), 1, "one judge read");
+    assert_eq!(
+        Rig::read_ids(&judged[0]),
+        [rig.context_of("voice"), rig.context_of("system-rules"), shadow.to_string()],
+        "the judge reads the decision's contexts, then the shadow"
+    );
+    assert!(judged[0].contexts.as_ref().unwrap()[2].at.is_some(), "the shadow is pinned");
+    assert_eq!(serde_json::to_value(&judged[0].state).unwrap()["command"], "echo judged");
+
+    let mut outcome = String::new();
+    for _ in 0..500 {
+        outcome = dialogue(&rig, shadow)[1].1.clone();
+        if outcome.contains("judge:") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(outcome.starts_with("ran; judge: ask (p="), "{outcome}");
     rig.finish().await;
 }

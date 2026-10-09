@@ -731,6 +731,9 @@ pub(crate) struct CouncilVerdict {
     /// The flavors of the bumps this submission already got, when it has
     /// reached the bump limit and so asks.
     bump_history: Vec<String>,
+    /// The seat's judge, read after the decision commits
+    /// (`super::shadow`).
+    judge: Option<super::shadow::JudgeRead>,
 }
 
 /// A decision's bump: what it is called and what it tells the seat.
@@ -1034,10 +1037,14 @@ impl CouncilVerdict {
         }
     }
 
-    /// Read the observing voices against `decision_id` on a task of their
-    /// own. Call it once the decision's record has committed; nothing waits
-    /// for the task, and its failures are its own records.
+    /// Read the observing voices, and the seat's judge when it has one,
+    /// against `decision_id` on tasks of their own. Call it once the
+    /// decision's record has committed; nothing waits for the tasks, and
+    /// their failures are their own records.
     pub(crate) fn observe(&self, kernel: Arc<crate::Kernel>, decision_id: Vec<u8>) {
+        if let Some(judge) = &self.judge {
+            super::shadow::spawn_judge(kernel.clone(), self.council.clone(), decision_id.clone(), self.state.clone(), judge.clone());
+        }
         let _detached = super::observe::spawn_observe(
             kernel,
             self.council.clone(),
@@ -1045,6 +1052,12 @@ impl CouncilVerdict {
             self.observing.clone(),
             self.state.clone(),
         );
+    }
+
+    /// Reads `judge` after this decision commits, beside the observing
+    /// voices.
+    pub(crate) fn set_judge(&mut self, judge: super::shadow::JudgeRead) {
+        self.judge = Some(judge);
     }
 }
 
@@ -1307,6 +1320,7 @@ fn build_verdict(
         bump: None,
         reads: String::new(),
         bump_history: Vec::new(),
+        judge: None,
     }
 }
 
