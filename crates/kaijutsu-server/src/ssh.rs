@@ -452,6 +452,33 @@ fn spawn_signal_shutdown(kernel: std::sync::Weak<crate::rpc::SharedKernelState>)
     });
 }
 
+/// The russh settings every listener runs with.
+fn russh_config(host_key: PrivateKey) -> russh::server::Config {
+    russh::server::Config {
+        // 100ms delay on rejected keys (after the first, which is 0ms).
+        // This is a local dev server bound to 127.0.0.1 — brute-force
+        // timing attack defense is unnecessary, and 1s per rejected agent
+        // key adds painful latency during SSH agent enumeration.
+        auth_rejection_time: std::time::Duration::from_millis(100),
+        auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+        keys: vec![host_key],
+        // Server-side keepalive: emit SSH_MSG_GLOBAL_REQUEST every 30s and
+        // tear down the session if 3 in a row go unanswered. Without this,
+        // a silently-vanished client (TCP half-open after NAT timeout, app
+        // crash without graceful shutdown) leaves the per-connection RPC
+        // thread running and its FlowBus bridge holding subscriptions.
+        // 30s × 3 = ~90s upper bound on dead-peer detection, matched to
+        // the client-side keepalive in kaijutsu-client::constants.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
+        // Interactive traffic: one keystroke is one small RPC write, and
+        // Nagle would hold it until the previous write is acknowledged,
+        // which delayed ACK can stretch to 40ms.
+        nodelay: true,
+        ..Default::default()
+    }
+}
+
 impl SshServer {
     pub fn new(config: SshServerConfig) -> Self {
         Self { config }
@@ -542,25 +569,7 @@ impl SshServer {
             );
         }
 
-        let config = russh::server::Config {
-            // 100ms delay on rejected keys (after the first, which is 0ms).
-            // This is a local dev server bound to 127.0.0.1 — brute-force
-            // timing attack defense is unnecessary, and 1s per rejected agent
-            // key adds painful latency during SSH agent enumeration.
-            auth_rejection_time: std::time::Duration::from_millis(100),
-            auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
-            keys: vec![host_key],
-            // Server-side keepalive: emit SSH_MSG_GLOBAL_REQUEST every 30s and
-            // tear down the session if 3 in a row go unanswered. Without this,
-            // a silently-vanished client (TCP half-open after NAT timeout, app
-            // crash without graceful shutdown) leaves the per-connection RPC
-            // thread running and its FlowBus bridge holding subscriptions.
-            // 30s × 3 = ~90s upper bound on dead-peer detection, matched to
-            // the client-side keepalive in kaijutsu-client::constants.
-            keepalive_interval: Some(std::time::Duration::from_secs(30)),
-            keepalive_max: 3,
-            ..Default::default()
-        };
+        let config = russh_config(host_key);
 
         // One kernel per data directory (`docs/server-cli.md`): held for the
         // life of this function, which returns only at server shutdown.
@@ -1308,6 +1317,13 @@ impl server::Handler for ConnectionHandler {
 mod tests {
     use super::*;
     use futures::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn accepted_sockets_disable_nagle() {
+        let key = PrivateKey::random(&mut rand_v10::rng(), russh::keys::Algorithm::Ed25519)
+            .expect("generate a host key");
+        assert!(russh_config(key).nodelay, "keystroke-sized writes must not wait on Nagle");
+    }
 
     #[test]
     fn signal_shutdown_waits_for_shell_settlement() {

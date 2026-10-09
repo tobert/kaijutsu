@@ -226,12 +226,7 @@ impl SshClient {
         &mut self,
         subsystem: &str,
     ) -> Result<Channel<client::Msg>, SshError> {
-        let config = Config {
-            inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
-            keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
-            keepalive_max: SSH_KEEPALIVE_MAX,
-            ..<_>::default()
-        };
+        let config = russh_config();
 
         let handler = ClientHandler {
             host: self.config.host.clone(),
@@ -542,9 +537,28 @@ impl SshError {
     }
 }
 
+/// The russh settings every connection runs with.
+fn russh_config() -> Config {
+    Config {
+        inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: SSH_KEEPALIVE_MAX,
+        // Interactive traffic: one keystroke is one small RPC write, and
+        // Nagle would hold it until the previous write is acknowledged,
+        // which delayed ACK can stretch to 40ms.
+        nodelay: true,
+        ..<_>::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connections_disable_nagle() {
+        assert!(russh_config().nodelay, "keystroke-sized writes must not wait on Nagle");
+    }
 
     #[test]
     fn agent_missing_is_permanent() {
