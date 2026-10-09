@@ -438,27 +438,16 @@ pub(super) async fn spawn_admitted_turn(
     let kernel_db = kernel.kernel_db().clone();
     let conversation_cache = kernel.turns().conversations().clone();
 
-    let (actor, director) = {
+    // A startup error is returned, not recorded here: `queue_startup`
+    // records every startup failure once (`turn_request::report_failure`).
+    let director = {
         let db = kernel_db.lock();
-        let row = db.get_context(context_id)
+        db.get_context(context_id)
             .map_err(|e| format!("Could not read performer assignment: {e}"))?
-            .ok_or_else(|| format!("No such context: {context_id}"))?;
-        (row.played_by, row.director_id)
+            .ok_or_else(|| format!("No such context: {context_id}"))?
+            .director_id
     };
-    let identity = async {
-        super::turn_identity::require_performer(actor)?;
-        let review = kernel_arc.resolve_context_review(context_id).await?;
-        let db = kernel_db.lock();
-        super::turn_identity::resolve(&db, actor, review.reviewer.principal_id)
-            .map(|identity| (identity, review))
-    }.await;
-    let (identity, review) = match identity {
-        Ok(resolved) => resolved,
-        Err(detail) => {
-            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
-            return Err(detail);
-        }
-    };
+    let (identity, review) = super::turn_identity::resolve_for_context(&kernel_arc, context_id).await?;
     let performer = {
         let db = kernel_db.lock();
         let character = |principal_id: PrincipalId| -> Result<crate::CharacterIdentity, String> {
@@ -635,7 +624,6 @@ pub(super) async fn spawn_admitted_turn(
         Ok(v) => v,
         Err(detail) => {
             tracing::error!("LLM resolution failed for context {context_id}: {detail}");
-            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
             return Err(detail);
         }
     };
@@ -650,7 +638,6 @@ pub(super) async fn spawn_admitted_turn(
                 "Could not resolve this context's tool bindings: {e}. \
                  The turn was stopped instead of running the model with no tools."
             );
-            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
             return Err(detail);
         }
     };
@@ -678,7 +665,6 @@ pub(super) async fn spawn_admitted_turn(
                 "Could not read this context's instruction blocks: {e}. The turn was stopped."
             );
             tracing::error!("System prompt read failed for context {context_id}: {e}");
-            insert_pre_stream_error_block(&documents, context_id, after_block_id, &detail);
             return Err(detail);
         }
     };
@@ -7633,9 +7619,63 @@ mod lifetime_tests {
         assert!(events.try_recv().is_none());
     }
 
+    /// A submit to a context with no performer is refused before anything
+    /// commits: the draft stays as typed, and no user or error block lands.
+    /// The caller's "it failed" is then the whole truth.
+    #[tokio::test]
+    async fn a_submit_without_a_performer_is_refused_before_the_input_commits() {
+        let (kernel, context, _after, call) = fixture(Some(MockClient::new(""))).await;
+        let player = call.principal_id;
+        kernel.kernel_db().lock().update_context_review_assignment(context, None, None, None).unwrap();
+        kernel.blocks().edit_draft(context, player, 0, "keep me", 0).unwrap();
+        let landed = kernel.blocks().non_draft_snapshots(context).unwrap().len();
+
+        let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
+            crate::runtime::prompt::PromptSource::Draft { edge: None }).await.unwrap_err();
+        assert!(error.contains("No performer assigned"), "{error}");
+        let draft = kernel.blocks().draft_block(context, player).unwrap().expect("the draft survives");
+        assert_eq!(draft.content, "keep me");
+        assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
+
+        let error = crate::runtime::prompt::submit(&kernel, context, player, SessionId::new(),
+            crate::runtime::prompt::PromptSource::Text { content: "typed".into(), model: None }).await.unwrap_err();
+        assert!(error.contains("No performer assigned"), "{error}");
+        assert_eq!(kernel.blocks().non_draft_snapshots(context).unwrap().len(), landed, "nothing landed");
+        assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// Once the input commits, the submit has happened: a turn that then
+    /// fails to start is reported once in the transcript and as
+    /// `TurnFlow::Failed`, and the submit returns the input's block.
+    #[tokio::test]
+    async fn a_turn_that_fails_after_the_input_commits_still_returns_the_input() {
+        let (kernel, context, _after, call) = fixture(None).await;
+        let mut flows = kernel.turn_flows().subscribe("turn.*");
+        let block = crate::runtime::prompt::submit(&kernel, context, call.principal_id, SessionId::new(),
+            crate::runtime::prompt::PromptSource::Text { content: "landed".into(), model: None }).await
+            .expect("the input landed, so the submit succeeded");
+
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
+        let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
+        assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
+        assert!(errors[0].contains("No LLM backend configured"), "{errors:?}");
+        let failed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
+                    return;
+                }
+            }
+        }).await;
+        assert!(failed.is_ok(), "observers learn the turn failed");
+        assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
     /// A context with a director but no performer names the missing
     /// performer, not the reviewer walk that cannot start without one, and
-    /// the transcript carries the same text.
+    /// a headless turn's transcript carries the same text, once.
     #[tokio::test]
     async fn a_context_without_a_performer_names_the_missing_performer() {
         let (kernel, context, after, call) = fixture(Some(MockClient::new(""))).await;
@@ -7653,10 +7693,30 @@ mod lifetime_tests {
             kernel.admit_context(context).unwrap()).await.unwrap_err();
         assert!(error.contains("No performer assigned"), "{error}");
         assert!(!error.contains("no reviewer"), "{error}");
+
+        // A headless request has no submit to refuse up front, so startup
+        // records the refusal (`turn_request::report_failure`).
+        use super::super::turn_request::{TurnAdmission, TurnRequest};
+        let mut flows = kernel.turn_flows().subscribe("turn.*");
+        let admission = kernel.request_turn(TurnRequest {
+            score: None,
+            context_id: context, after_block_id: after, content: String::new(),
+            principal_id: call.principal_id, model: None, continuation_epoch: None,
+        }).unwrap();
+        assert!(matches!(admission, TurnAdmission::Accepted { .. }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
+                    return;
+                }
+            }
+        }).await.expect("the refused turn is reported");
         let recorded = kernel.blocks().block_snapshots(context).unwrap().into_iter()
-            .any(|block| block.status == Status::Error && block.content.contains("No performer assigned"));
-        assert!(recorded, "the refusal is recorded in the transcript");
+            .filter(|block| block.status == Status::Error && block.content.contains("No performer assigned"))
+            .count();
+        assert_eq!(recorded, 1, "the refusal is recorded in the transcript once");
         assert!(!kernel.turn_in_flight(context));
+        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

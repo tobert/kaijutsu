@@ -12,7 +12,10 @@ pub enum PromptSource {
 }
 
 /// Persist input before preparation. Accepted work owns its turn before the
-/// first await and survives caller disconnect; the reply reports startup only.
+/// first await and survives caller disconnect. An error means the input did
+/// not commit: a context with no performer or reviewer is refused first.
+/// Once the input commits the reply is its block, and a turn that then fails
+/// to start is reported in the transcript and on `TurnFlow::Failed`.
 ///
 /// Reserves a worker-pool slot before minting the `ContextAdmission`, before
 /// the user block is inserted, and before a draft is consumed
@@ -29,6 +32,9 @@ pub async fn submit(
         let turn_live = kernel.turn_in_flight(context);
         (admission, kernel.turns().begin(context), turn_live)
     };
+    // A turn with no performer or reviewer cannot start, so the input is
+    // refused before it commits. Startup checks again for the race.
+    super::turn_identity::resolve_for_context(kernel, context).await?;
     let documents = kernel.blocks();
     let (after_block_id, model, tool_ctx, submit) = match source {
         PromptSource::Text { content, model } => {
@@ -59,14 +65,25 @@ pub async fn submit(
             (block, None, None, Some((info, caller)))
         }
     };
-    queue_startup(kernel, StartupRequest {
+    let startup = queue_startup(kernel, StartupRequest {
         admission, lease, request: TurnRequest {
             context_id: context, after_block_id, content: String::new(),
             principal_id: principal, model, continuation_epoch: None, score: None,
         },
         origin: crate::flows::TurnOrigin::Interactive, tool_ctx, session, submit,
         joins_live_turn: true,
-    }, None, slot)?.await.map_err(|_| "turn preparation stopped before replying".to_string())??;
+    }, None, slot)?;
+    match startup.await {
+        Ok(Ok(())) => {}
+        // The input has committed, so the submit happened. A turn that then
+        // fails to start says so in the transcript and on `TurnFlow::Failed`
+        // (`turn_request::report_failure`), not by failing the submit.
+        Ok(Err(error)) => {
+            tracing::warn!(context.id = %context, block.id = %after_block_id, %error,
+                "input committed; its turn did not start");
+        }
+        Err(_) => return Err("turn preparation stopped before replying".to_string()),
+    }
     Ok(after_block_id)
 }
 

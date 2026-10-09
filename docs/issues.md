@@ -368,13 +368,6 @@ the line to be sent or cleared, not only for a pause in typing.
 
 ## Input latency follow-ups from the Nagle and draft outbox work (2026-10-09)
 
-- **A refused submit still commits the user message.** On a context with no
-  performer, `submit_input` records the user message (the transcript shows
-  it and two `stream error` rows), clears the kernel draft, and then
-  returns `No performer assigned`. The tui treats the error as "nothing
-  happened" and keeps its local draft, which no longer matches the
-  kernel's empty one. Either the refusal should come before the commit, or
-  the error should say the message landed.
 - **The app's input lag is not measured.** The app echoes locally and does
   not wait on `edit_input`. A likely contributing factor is the reactive
   `UpdateMode` (100 ms when focused, `kaijutsu-app/src/main.rs`): if a key

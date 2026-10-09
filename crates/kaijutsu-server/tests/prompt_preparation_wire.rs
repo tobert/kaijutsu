@@ -58,10 +58,13 @@ fn shutdown_joins_submit_lifecycle_before_finishing_the_turn() {
         assert!(server.kernel.turn_in_flight(context), "submit lifecycle already owns its turn");
         tokio::time::timeout(Duration::from_secs(3), server.kernel.shutdown_runtime_worker()).await
             .expect("shutdown must signal the script and join its cleanup").unwrap();
-        assert!(request.await.unwrap().is_err());
+        // The draft committed before the lifecycle ran, so the submit
+        // happened; the stopped turn reports itself as a completion.
+        let submitted = request.await.unwrap().expect("a committed submit returns its block");
         assert!(matches!(recv_terminal(&mut turns, context).await, ServerEvent::TurnCompleted { .. }));
         let retained = kj.get_blocks(context, &kaijutsu_types::BlockQuery::All).await.unwrap();
-        assert!(retained.iter().any(|block| block.content == "retained submitted draft" && block.status == Status::Done));
+        assert!(retained.iter().any(|block| block.id == submitted.block_id
+            && block.content == "retained submitted draft" && block.status == Status::Done));
         assert!(retained.iter().any(|block| block.content == "submit-entered"));
         assert!(!retained.iter().any(|block| block.content == "must-not-run" || block.role == Role::Model));
         assert!(!server.kernel.turn_in_flight(context));

@@ -441,6 +441,12 @@ durable user block, the way `drift` fires after a drift block lands
 (`rc/mod.rs`, `rc::run`). It runs awaited inline, so
 anything a script writes is durable before `submitInput` returns.
 
+A submit either commits or fails with nothing changed (`prompt::submit`).
+A context with no performer or no reviewer is refused before the draft
+commits, so the draft stays as typed. Once the input commits, `submitInput`
+returns its block; a turn that then fails to start is recorded once in the
+transcript and published as a turn failure, not returned as a submit error.
+
 Its scripts read the submit facts as `KJ_*` variables. Every name is always
 set, empty rather than absent when the fact does not apply:
 

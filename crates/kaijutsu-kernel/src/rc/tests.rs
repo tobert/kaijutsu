@@ -2884,6 +2884,19 @@ esac
                     .create_document(ctx, crate::DocumentKind::Conversation, None)
                     .unwrap();
                 d.block_store().edit_draft(ctx, principal, 0, "hello", 0).unwrap();
+                // A submit with no performer is refused before it commits,
+                // so the context gets a performer and a reviewer.
+                {
+                    let db = d.kernel_db().lock();
+                    let (performer, reviewer) = (PrincipalId::new(), PrincipalId::new());
+                    for (id, name) in [(performer, "performer"), (reviewer, "reviewer")] {
+                        db.insert_character(&crate::kernel_db::CharacterRow {
+                            principal_id: id, name: name.into(), created_at: 0, retired_at: None,
+                            handoff_ctx: None, root_ctx: None, root: false,
+                        }).unwrap();
+                    }
+                    db.update_context_review_assignment(ctx, Some(performer), Some(reviewer), None).unwrap();
+                }
                 // No provider is configured, so startup fails after the
                 // lifecycle; only the run row is under test.
                 let _ = crate::runtime::prompt::submit(

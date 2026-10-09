@@ -1,7 +1,9 @@
 //! Resolve the performer and reviewer before starting model work.
 
+use crate::Kernel;
+use crate::approval_identity::ResolvedContextReview;
 use crate::kernel_db::KernelDb;
-use kaijutsu_types::PrincipalId;
+use kaijutsu_types::{ContextId, PrincipalId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TurnIdentity {
@@ -94,4 +96,22 @@ mod tests {
         db.retire_character(coder, 1).unwrap();
         assert!(resolve(&db, Some(coder), amy).unwrap_err().contains("performer 'coder' is retired"));
     }
+}
+
+/// Resolve the identity a model turn in `context_id` needs: its performer
+/// and the reviewer chained above it. `prompt::submit` runs this before the
+/// input commits and turn startup runs it again, so a refusal can come
+/// before anything lands.
+pub(crate) async fn resolve_for_context(
+    kernel: &Kernel,
+    context_id: ContextId,
+) -> Result<(TurnIdentity, ResolvedContextReview), String> {
+    let actor = kernel.kernel_db().lock().get_context(context_id)
+        .map_err(|e| format!("Could not read performer assignment: {e}"))?
+        .ok_or_else(|| format!("No such context: {context_id}"))?
+        .played_by;
+    require_performer(actor)?;
+    let review = kernel.resolve_context_review(context_id).await?;
+    let db = kernel.kernel_db().lock();
+    resolve(&db, actor, review.reviewer.principal_id).map(|identity| (identity, review))
 }

@@ -208,15 +208,15 @@ fn a_burst_longer_than_one_read_reaches_the_draft_whole() {
 /// is long so its edits are still on the wire when `Enter` arrives; a
 /// submit that did not wait would snapshot a prefix.
 ///
-/// The ephemeral kernel has no performer, so the turn itself is refused,
-/// but the kernel has already recorded the user message by then, and that
-/// message is what this probe reads. The terminal is wide so the unsent
-/// draft left in the band stays short enough to keep `❯` on screen.
+/// The context gets a performer so the submit commits; the ephemeral
+/// kernel has no model, so the turn then fails to start, after the user
+/// message this probe reads has landed.
 #[test]
 fn a_submit_right_after_typing_carries_every_keystroke() {
     let _serial = serial();
-    let (server, _key_dir, session) = spawn_session(24, 250);
+    let (server, _key_dir, session) = spawn_session(24, 80);
     wait_for_attach(&session);
+    support::cast_a_performer(&server);
 
     let typed = format!("{}endmark", "word ".repeat(200));
     session.send(&format!("i{typed}"));
@@ -235,11 +235,15 @@ fn a_submit_right_after_typing_carries_every_keystroke() {
     );
     session.send("\r");
 
+    // Submitted: the band is back to one empty draft line, the transcript
+    // above it ends with the whole text, and the kernel's draft is empty.
     let recorded = session.wait_until(Duration::from_secs(15), |screen| {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
         compose_row(&rows).is_some_and(|draft| rows[..draft].iter().any(|l| l.contains("endmark")))
     });
     assert!(recorded, "the user message lacks the last keystrokes: {}", session.dump("after submit"));
+    let drafts = support::kernel_drafts(&server);
+    assert!(drafts.iter().all(|d| d.is_empty()), "keystrokes outlived the submit: {drafts:?}");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1635,6 +1639,9 @@ fn switching_through_the_picker_loads_the_new_contexts_draft() {
         let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
         picker_row_for(&rows, "altseat").is_some()
             && picker_row_for(&rows, kaijutsu_server::SshServerConfig::EPHEMERAL_ROOT).is_none()
+            // The filter line has closed: frames are drawn as keys land, so
+            // the list narrows while `/altseat` is still being typed.
+            && rows.iter().any(|l| l.contains("Enter switch"))
     });
     assert!(filtered, "the filter never narrowed to the fork: {}", session.dump("filter"));
     for _ in 0..tabs_to_section(&session.screen_text(), "altseat") {
