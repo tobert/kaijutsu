@@ -28,9 +28,13 @@ async fn wait_child(server: &SharedKernel, label: &str) -> ContextId {
         loop {
             let context = server.kernel_db.lock().list_active_contexts().unwrap().into_iter()
                 .find(|row| row.label.as_deref() == Some(label)).map(|row| row.context_id);
+            // The context's row lands before its document, so a missing
+            // document is "not yet", like a missing row.
             if let Some(context) = context {
-                if server.documents.block_snapshots(context).unwrap().iter().any(|block| block.content == "child-entered") {
-                    return context;
+                match server.documents.block_snapshots(context) {
+                    Ok(blocks) if blocks.iter().any(|block| block.content == "child-entered") => return context,
+                    Ok(_) | Err(kaijutsu_kernel::BlockStoreError::DocumentNotFound(_)) => {}
+                    Err(e) => panic!("read the child's blocks: {e}"),
                 }
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

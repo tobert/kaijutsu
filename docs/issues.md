@@ -368,6 +368,19 @@ the line to be sent or cleared, not only for a pause in typing.
 
 ## Input latency follow-ups from the Nagle and draft outbox work (2026-10-09)
 
+- **Faster transport exposed two test races, and one kernel window.** With
+  Nagle off, `reconnect_fsm` and `rc_lifecycle_wire` probes ran into
+  windows the 40 ms delay had hidden. Their probes now wait correctly. The
+  streaming `execute` answers when a command starts and holds the
+  connection's one execution slot until output is delivered; no shipped
+  client calls it twice in a row, but a caller has no completion signal
+  to wait on besides the output subscription. Separately, a new context's
+  row is visible (`list_active_contexts`, `kj context list`) before its
+  document exists, so a reader that lists and then reads blocks can get
+  `DocumentNotFound`. Open: create the document before the row is
+  visible, or make readers treat a listed context with no document as
+  empty.
+
 - **The app's input lag is not measured.** The app echoes locally and does
   not wait on `edit_input`. A likely contributing factor is the reactive
   `UpdateMode` (100 ms when focused, `kaijutsu-app/src/main.rs`): if a key

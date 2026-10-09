@@ -692,6 +692,28 @@ impl Drop for CuttableProxy {
 
 /// Count the blocks the kernel currently holds for `ctx` (via this actor).
 /// A transport-down call surfaces as 0 so the poll keeps trying.
+/// Run `code` on the actor's shell once the connection's execution slot is
+/// free. A connection runs one streaming execution at a time, and `execute`
+/// answers when the command starts, not when its output has been delivered;
+/// the actor exposes no completion event. Seeing a command's effect (a
+/// context switch, a block) therefore does not mean its slot is free, so
+/// the next command retries "execution already in progress" and nothing
+/// else.
+async fn execute_when_free(actor: &ActorHandle, code: &str) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match actor.execute(code).await {
+            Ok(exec_id) => return exec_id,
+            Err(e) if e.to_string().contains("execution already in progress")
+                && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("execute {code:?}: {e}"),
+        }
+    }
+}
+
 async fn block_count(actor: &ActorHandle, ctx: ContextId) -> usize {
     actor.get_all_blocks(ctx).await.map(|b| b.len()).unwrap_or(0)
 }
@@ -788,10 +810,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
         // Land a baseline block (`kj block create` writes a real kernel block to
         // the current context — shell stdout does not) and let it settle.
         let pre = block_count(&writer, ctx).await;
-        writer
-            .execute("kj block create --role user --kind text --content before-outage")
-            .await
-            .expect("pre block");
+        execute_when_free(&writer, "kj block create --role user --kind text --content before-outage").await;
         let baseline =
             wait_for_blocks_at_least(&writer, ctx, pre + 1, Duration::from_secs(10), "baseline")
                 .await;
@@ -826,10 +845,7 @@ fn reconnect_resyncs_blocks_appended_during_outage() {
 
         // During the outage the writer (kernel still alive) appends a block.
         let pre_gap = block_count(&writer, ctx).await;
-        writer
-            .execute("kj block create --role user --kind text --content during-outage")
-            .await
-            .expect("gap block");
+        execute_when_free(&writer, "kj block create --role user --kind text --content during-outage").await;
         let gap_count = wait_for_blocks_at_least(
             &writer,
             ctx,
