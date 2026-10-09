@@ -316,10 +316,13 @@ the model under observation has tried."
   rules dropped the seat's narration because it changed every few decisions
   and forced re-sends (29 in 18 minutes); an append-only command list only
   extends, so a held snapshot stays useful.
-- **Open.** Whether it votes or only observes; whether bumped and denied
-  commands go in, marked as such; how it is keyed (seat context, fork
-  tree); its snapshot cadence against `snapshot_bytes`; and how much
-  history it keeps before compaction.
+- **Design.** `docs/council.md`, "Shadow voice (design, not built)". Amy,
+  2026-10-09: start with shell calls, then every tool call; the shadow is a
+  fork child of the seat; get it flowing into a megakernel context and
+  measure before doing more. Amy, later that day: the judge rides on the
+  cast; the shadow is a command/opinion dialogue, fed per turn to council
+  servers and hydrated whole for chat models; kaijutsu manages the server
+  cache, no cap yet. Open items are listed in the design.
 
 ## Council presets per context (Amy, 2026-10-08)
 
@@ -331,6 +334,11 @@ context type in `gate.toml` today; moltar dropped the director's council on
 council profile belongs on `kj preset` (which already assigns a cast at
 fork) or as a named section in `gate.toml`, and what distinguishes the mk,
 lfm2d, and Jev! flavors (judge model, rubric, or both).
+
+Proposed 2026-10-09: the flavors are casts whose `shadow` slot names the
+judge (`docs/council.md`, "Shadow voice"). Whether the voting council's
+judge also moves onto the cast is open; today `[council] server` in
+`gate.toml` names one server for every decision.
 
 ## Dead test helpers in `mcp/servers/file.rs` (2026-10-08)
 
@@ -371,6 +379,12 @@ rules say "needs Amy" can only be bumped again. On 2026-10-06 banto stopped
 after four bumps and reported, which was the right move, but the system
 offered it no ask. Whether bump-only should open an ask for a `report`
 verdict, or after N bumps of one goal, is open.
+
+Amy, 2026-10-09: escalate after N consecutive bumps in N minutes, but
+observe first. Many bumps are often fine: they force a seat to break work
+into smaller, safer steps, at some cost. Bring back a risk read in the
+council queries, watch the bump metrics, and pick the escalation points
+from what we see.
 
 ## Council mass floor misses a decision every read agreed on (2026-10-06)
 

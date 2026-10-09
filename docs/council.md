@@ -305,6 +305,120 @@ context holds those rules and nothing the seat said or did.
   "'the seat' is a terrible name and I think we got that wrong. It can stop
   with AGENTS.md. It should not get a running dialog from the model."
 
+## Shadow voice (design, not built)
+
+A shadow voice is a council context that holds what one seat has done to the
+world: each outward call it made, in order, with no results, narration, or
+thinking. The
+council judges each command alone today, so a cleanup of scratch the seat
+made an hour ago looks like destroying an original (`.partb`, 2026-10-06).
+The shadow gives it that history. Amy, 2026-10-06: "each command, not the
+model's full output, would go into the council member. maybe tool calls
+too. not the results. so it's small and makes up the workstream of things
+the model under observation has tried." It starts with `shell_write` and
+grows with the gate.
+
+- **Contexts and casts, not `gate.toml`.** Amy, 2026-10-09: "I want to do
+  less in gate.toml over time and move to more configurable and
+  transparent setups with casts and contexts." A shadow needs no
+  `gate.toml` entry: its context_type's rc says what it does, and the
+  seat's cast says which model plays it.
+- **Two types: `judge` and `bump`.** A `judge` gives its opinion of each
+  command. A `bump` answers proceed or bump, as bumper mode does today,
+  with the seat's history. Each type's rc holds its framing and its
+  question. Both start in recording mode: the answer is written to the
+  dialogue and the record and changes no decision. Moving bumper mode
+  from `[council]` onto a `bump` shadow that acts comes after the
+  recordings show the history helps.
+- **One child per type, a fork child of the seat.** A shadow is a
+  kaijutsu context of context_type `judge` or `bump` whose fork parent is
+  the observed seat, so it shows in the seat's tree and archiving the seat
+  archives it. It inherits no blocks and has no performer; the kernel, not
+  a seat turn, asks its model. The kernel records the seat-to-shadow edge
+  durably, so it does not find a shadow by its label. The label is
+  `<type>-<seat label>`; it does not start with `council-`, so the
+  reviewer-chain walk never takes it for a character's voice. Each child
+  keeps its own dialogue, so a judge sees only its own earlier opinions.
+- **The cast picks the model.** A context already resolves its model from
+  the cast slot named by its context_type (`model_resolution.rs`), and a
+  shadow inherits the seat's cast. A cast with a `judge` slot gives the
+  seat a judge, pointing at the megakernel, lfm2d, or Jev through
+  OpenRouter; a cast with no such slot gives none. "mk bumps", "lfm2d
+  bumps", and "Jev bumps" become casts, assigned with `kj context set
+  --cast` or recalled by `kj preset` at fork.
+- **Outward actions only.** Council time is limited on our hardware, so a
+  shadow records what the seat does to the world, not what it reads. The
+  gate already draws that line: the read-only `shell` tool runs no gate,
+  and `shell_write` does. A shadow records every call the gate evaluates
+  for its seat, whatever the gate decides, including calls an allow rule
+  passes (`mkdir .partb` is the history that makes a later `rm -rf .partb`
+  routine). A tool that comes under the gate later enters the shadow with
+  no change here.
+- **The gate writes the shadow.** It has the call when it evaluates and
+  the outcome when it decides, so it is the one writer: the call before
+  the decision, the answer after it. A shadow block records the seat block
+  it came from, so writing it again is a no-op.
+- **A dialogue: the call, then the answer.** Each call is a user text turn
+  holding the tool name and its input, such as `shell_write: rm -rf
+  .partb`, cut to a budget. The shadow's answer comes back as the model
+  turn after it, with what the gate did (ran, bumped with its flavor,
+  asked, refused). A council server answers with option probabilities,
+  not prose, so the kernel writes its answer as text from the top options.
+- **Each model is fed the way its API works.** The stored dialogue is the
+  same; hydration differs by backend.
+  - A council server (megakernel, lfm2d) gets each call as it arrives: the
+    kernel `PUT`s the new tail with `warm` off the hot path, so the held
+    snapshot is primed when the question comes.
+  - A chat model (Jev) is hydrated whole for each request: the dialogue is
+    rendered as one script-like transcript in a single prompt, with the
+    question about its last call.
+- **Append-only keeps a council server cheap.** `snap` falls on every
+  eighth turn by position, so each new turn re-feeds at most eight turns.
+  Each snapshot costs `snapshot_bytes`, about 112 MiB on the megakernel.
+  Kaijutsu manages the bulk of that cache itself, choosing what to keep,
+  park, and drop, rather than leaving it to the server's eviction. No cap
+  or compaction until measurements call for one.
+- **The record.** Each recorded answer is stored beside the gate's
+  decision with whether the outcome would have differed and how long
+  preparing and answering took.
+- **Open.** Whether feeding its own past answers back anchors a model; the
+  record shows it. How a council spec names the case when the call is
+  already the shadow's last turn. How a shadow is switched from recording
+  to acting, on the context or in its type.
+- **Out of scope.** A human's commands on the RPC shell paths make no
+  tool-call block and get no shadow. Drift is an edge between players; the
+  shadow is written by the kernel and is not drift.
+
+
+### Shadow build order
+
+Each step lands with its tests, and its line here changes to say what
+shipped. A fresh session resumes at the first step not marked done.
+
+1. **The judge child and its dialogue.** A kernel test stands up a kernel,
+   gives a coder seat a cast with a `judge` slot, and submits a
+   `shell_write` call through the gate. Expect: a `judge` fork child of the
+   seat, created on that first call, holding the call as a user turn and
+   the gate's outcome as the model turn after it; a second call appends,
+   and a seat whose cast has no `judge` slot gets no child. Adds the
+   `judge` context_type rc seed and the seat-to-shadow edge.
+2. **Priming a council server.** After each appended call, the kernel
+   `PUT`s the shadow with `warm`, off the hot path. Test against the fake
+   council server: one `PUT` per call, re-feeding at most eight turns.
+3. **Asking and recording.** After the gate decides, the kernel asks the
+   judge about the last call, writes its answer as the model turn, and
+   records it beside the decision with timings and whether it differs from
+   the outcome. Nothing changes the gate's decision.
+4. **Measure on moltar.** Deploy, give banto's coders a cast with a
+   `judge` slot on the megakernel, and read priming time, answer time,
+   snapshot count, and the disagreement rate. Record the numbers in
+   `docs/devlog.md`.
+5. **Jev hydration.** A chat-model judge gets the whole dialogue as one
+   script-like transcript per request. Compare it with the megakernel on
+   the same seats.
+6. **`bump` recording, then acting.** A `bump` type records proceed or bump
+   with the history. Moving bumper mode off `[council]` waits for step 4
+   and 6 numbers.
 ## Specs and cases
 
 The gate holds one spec per kind of case: the shell spec and the program
