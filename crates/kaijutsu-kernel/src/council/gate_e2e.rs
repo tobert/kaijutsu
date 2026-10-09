@@ -348,6 +348,12 @@ enabled = {enabled}
     )
 }
 
+/// The shipped `judge` type's create scripts, which write a shadow's framing.
+const JUDGE_RC: [(&str, &str); 2] = [
+    ("/config/rc/judge/create/S00-stance.kai", include_str!("../../../../assets/defaults/rc/judge/create/S00-stance.kai")),
+    ("/config/rc/judge/create/S00-stance.md", include_str!("../../../../assets/defaults/rc/judge/create/S00-stance.md")),
+];
+
 /// The program spec and its threshold, as `gate.toml` lines.
 const PROGRAM_SPEC_TOML: &str = r#"
 [[council.spec]]
@@ -413,6 +419,11 @@ async fn rig(via: Via, setup: Setup) -> Rig {
     .await
     .unwrap();
     d.kernel().mount("/work", crate::vfs::MemoryBackend::new()).await;
+    let _ = vfs.mkdir(std::path::Path::new("/config/rc"), 0o755).await;
+    for (path, body) in JUDGE_RC {
+        let _ = vfs.mkdir(std::path::Path::new(path).parent().unwrap(), 0o755).await;
+        vfs.write_all(std::path::Path::new(path), body.as_bytes()).await.unwrap();
+    }
     vfs.write_all(
         std::path::Path::new("/config/kernel/council/direction-check.json"),
         crate::config_seed::DEFAULT_COUNCIL_DIRECTION_CHECK.as_bytes(),
@@ -2537,9 +2548,11 @@ fn judge_shadows(rig: &Rig) -> Vec<crate::kernel_db::ContextRow> {
     children.into_iter().filter(|c| c.context_type == super::shadow::JUDGE).collect()
 }
 
-/// A shadow's dialogue: each block's role and text, in document order.
+/// A shadow's dialogue: each user and model block's role and text, in
+/// document order, after its stance.
 fn dialogue(rig: &Rig, shadow: kaijutsu_types::ContextId) -> Vec<(kaijutsu_types::Role, String)> {
-    rig.d.kernel().blocks().block_snapshots(shadow).unwrap().into_iter().map(|b| (b.role, b.content)).collect()
+    let blocks = rig.d.kernel().blocks().block_snapshots(shadow).unwrap();
+    blocks.into_iter().filter(|b| b.role != kaijutsu_types::Role::System).map(|b| (b.role, b.content)).collect()
 }
 
 /// A seat whose cast has a `judge` slot gets one judge shadow, a fork child
@@ -2612,8 +2625,8 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
 /// Each `PUT` may also carry the call's outcome, which can land first.
 ///
 /// Falsified by priming only at decision time (no `PUT` for a static
-/// allow), or by projecting the shadow as a council context (its framing
-/// does not call it the seat's history).
+/// allow), or by framing the shadow with anything but the `judge` type's
+/// stance and the seat's name.
 #[tokio::test]
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
@@ -2625,7 +2638,8 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     // Priming runs on its own task, so it may read the outcome turn too.
     let turns: Vec<&str> = puts[0].turns.iter().map(|t| t.content.as_str()).collect();
     assert_eq!(turns[0], "shell_write: echo one", "{turns:?}");
-    assert!(puts[0].system.contains("the history of the seat \"council-seat\""), "the framing names the seat: {}", puts[0].system);
+    assert!(puts[0].system.contains("This context is the history of one seat."), "the judge stance frames it: {}", puts[0].system);
+    assert!(puts[0].system.contains("The seat is \"council-seat\"."), "a runtime fact names the seat: {}", puts[0].system);
 
     rig.submit("echo two").await.unwrap();
     let puts = rig.mock.wait_for_puts(shadow, 2).await;
@@ -2717,5 +2731,24 @@ async fn a_seat_gets_a_judge_from_its_performer_s_default_cast() {
     let shadows = judge_shadows(&rig);
     assert_eq!(shadows.len(), 1, "the performer's default cast has a judge slot");
     assert_eq!(shadows[0].cast_id, Some(cast));
+    rig.finish().await;
+}
+
+/// A shadow whose `judge` create lifecycle wrote no stance is never sent:
+/// priming fails loudly rather than send a dialogue with no framing.
+#[tokio::test]
+async fn a_shadow_without_its_stance_is_not_primed() {
+    use crate::vfs::VfsOps;
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    for (path, _) in JUDGE_RC {
+        rig.d.kernel().vfs().unlink(std::path::Path::new(path)).await.unwrap();
+    }
+    let base = rig.mock.base.clone();
+    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    rig.submit("echo one").await.unwrap();
+    let shadow = judge_shadows(&rig)[0].context_id;
+    rig.submit("echo two").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(rig.mock.puts_for(shadow).is_empty(), "no PUT without the stance");
     rig.finish().await;
 }

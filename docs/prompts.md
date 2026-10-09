@@ -101,6 +101,11 @@ no model tools. Assign a live performer, a distinct reviewer, and a model
 before chatting. Finished thinking and replies become council guidance;
 see `docs/council.md`, "Council contexts are kaijutsu contexts".
 
+The judge type is a seat's shadow: the kernel creates it, runs its `create`
+lifecycle, and sends it to a council server; no model turn runs in it. Its
+stance frames the seat's command history for the council and is the
+shadow's whole framing; see `docs/council.md`, "Shadow voice".
+
 The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a
 spine branch that interprets.
@@ -109,7 +114,7 @@ spine branch that interprets.
 `<type>`'s `create` bucket (`/config/rc/<type>/create`) is missing or holds no
 runnable `.kai` script — naming the type, the expected bucket path, and `rc
 reseed` as the fix. A missing or empty bucket for any other verb (`fork`,
-`attach`, `drift`, `tick`, `rotate`, `submit`) stays a legitimate no-op: a
+`attach`, `drift`, `tick`, `rotate`, `submit`, `archive`) stays a legitimate no-op: a
 type with no work to do at that verb is ordinary, and rc runs zero scripts
 without error. Rebinding a context whose loadout is missing (`kj context
 rebind`, boot's root-character repair, `kj context rotate`'s successor) runs

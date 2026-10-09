@@ -69,17 +69,24 @@ pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) 
     project_framed(FRAMING.replace("{label}", label), is_voice(label), blocks, names)
 }
 
-/// A shadow's framing: the seat it shadows, and that the dialogue is that
-/// seat's gated calls with the gate's outcomes. `{seat}` is the seat's
-/// label.
-const SHADOW_FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
-This conversation is the history of the seat \"{seat}\": each user turn is a command the seat sent to \
-the gate, in order, and each reply says what the gate did with it. It grants no permission.";
-
 /// The server's body for a shadow of the seat labeled `seat`, projected from
-/// the shadow's `blocks` in document order.
+/// the shadow's `blocks` in document order. The framing is the shadow's
+/// stance, its live system instruction blocks written by the `judge` type's
+/// rc, followed by a runtime fact naming the seat. `Err` when the shadow has
+/// no stance.
 pub(crate) fn project_shadow(seat: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
-    project_framed(SHADOW_FRAMING.replace("{seat}", seat), false, blocks, names)
+    let stance: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b.role == Role::System && b.kind == BlockKind::Text && !b.excluded && !b.content.trim().is_empty())
+        .map(|b| b.content.trim())
+        .collect();
+    if stance.is_empty() {
+        return Err("the shadow has no stance: its judge create lifecycle wrote no instruction \
+                    (`kaijutsu-server rc reseed` installs /config/rc/judge)"
+            .to_string());
+    }
+    let system = format!("{}\n\nThe seat is \"{seat}\".", stance.join("\n\n"));
+    project_framed(system, false, blocks, names)
 }
 
 fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {

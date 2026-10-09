@@ -409,14 +409,25 @@ shipped. A fresh session resumes at the first step not marked done.
    `refused`, `not run: the gate was unavailable`). Tests in
    `council/gate_e2e.rs`, `a_judged_seat_records_…` and the two after it.
    1b. **The RPC shell path.** Seats that reach the gate through
-   `shell_pre_call_hooks` (ACP and MCP clients) are not recorded yet.
-   1c. **Archive with the seat.** Archiving a seat does not archive its
-   shadow yet.
+   `shell_pre_call_hooks` (MCP clients) are not recorded yet. ACP seats
+   run kernel model turns, so their `shell_write` calls are recorded.
+   1c. **Done: archive with the seat.** The shipped `coder` archive script
+   (`rc/coder/archive/S10-shadows.kai`) runs `kj context archive
+   --children --type judge --confirm`, so a seat's judge shadows are
+   archived with it (`docs/kaish-integration.md`, the `archive` verb).
+   1d. **Done: the stance.** A new shadow runs the `judge` type's `create`
+   lifecycle (`rc/judge/create/S00-stance.md`). Its system instruction
+   blocks are the shadow's framing, followed by a runtime fact naming the
+   seat. A shadow with no stance is never sent; priming fails and names
+   `rc reseed`. Synthesized 2026-10-09 from the council-shell examples: the
+   seat's own earlier work is routine to remove, data it did not create
+   is an original, a resend after a bump is a new attempt, and earlier
+   answers are not repeated for their own sake.
 2. **Done: priming a council server.** A `judge` slot whose backend has
    kind `mk` names the server by its `base_url` (the megakernel serves
    `/council/v1` at the same address). After each recorded call, a task
    of its own `PUT`s the shadow whole (`CouncilSync::prime_shadow`), under
-   a framing that calls it the seat's history, warming the seat's shell
+   its stance (1d), warming the seat's shell
    spec from `gate.toml`; a seat type with no council there is not primed
    (logged). Priming has its own lock and a 30 s timeout, so it never
    holds up a decision. A judge on any other backend is not primed. Test:
@@ -431,8 +442,7 @@ shipped. A fresh session resumes at the first step not marked done.
    turn as `; judge: <choice> (p=<pooled p>)`. A call a static rule
    decided is recorded but not judged. The judge never changes the
    decision. Test: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`.
-   Still open: the `judge` type's rc framing (the framing is a constant
-   in `projection.rs`), and whether the judge should read the voices.
+   Still open: whether the judge should read the voices.
 4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
    `mk-judge` (one `judge` slot), and a `coder` character whose default
    cast is `mk-judge`. A smoke seat played by `coder` ran `mkdir` then

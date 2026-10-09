@@ -7,6 +7,9 @@
 //! has a judge shadow when its cast has a [`JUDGE`] slot; the shadow is
 //! created on the first call the gate evaluates for that seat.
 //!
+//! A new shadow runs the `judge` type's `create` rc lifecycle, whose stance
+//! becomes the shadow's framing (`projection::project_shadow`).
+//!
 //! A judge on a council server (a backend of kind `mk`) is primed after
 //! each call: the shadow is sent whole on a task of its own, warming the
 //! seat's shell spec, so the server holds the dialogue before it is asked
@@ -83,7 +86,7 @@ struct Judge {
 /// the shadow on the seat's first call, and primes a council-server judge.
 /// `None` when the seat has no judge slot in its cast, or when writing
 /// failed (logged).
-pub(crate) fn record_call(
+pub(crate) async fn record_call(
     kernel: &Arc<crate::Kernel>,
     seat: Option<ContextId>,
     spec: &GateSpec,
@@ -91,7 +94,12 @@ pub(crate) fn record_call(
 ) -> Option<ShadowCall> {
     let seat = seat?;
     let judge = match judge_shadow(kernel, seat) {
-        Ok(Some(judge)) => judge,
+        Ok(Some((judge, created))) => {
+            if created {
+                run_create_lifecycle(kernel, judge.shadow).await;
+            }
+            judge
+        }
         Ok(None) => return None,
         Err(error) => {
             tracing::error!(%seat, "shadow: cannot find or create the judge shadow: {error}");
@@ -384,7 +392,40 @@ fn append(kernel: &crate::Kernel, shadow: ContextId, role: Role, text: String) -
 /// through (its own, else its performer's default) has a [`JUDGE`] slot and
 /// no shadow exists yet. The shadow is found by its fork
 /// edge and type, never by its label.
-fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<Judge>> {
+/// Runs the new shadow's `judge` `create` lifecycle, which writes its
+/// stance. A failure is logged; a shadow with no stance is never sent to a
+/// council server (`projection::project_shadow`).
+async fn run_create_lifecycle(kernel: &crate::Kernel, shadow: ContextId) {
+    let Some(dispatcher) = kernel.broker().kj_dispatcher().await else {
+        tracing::error!(%shadow, "shadow: no kj dispatcher, so the judge create lifecycle cannot run");
+        return;
+    };
+    let admission = match kernel.admit_context(shadow) {
+        Ok(admission) => admission,
+        Err(error) => {
+            tracing::error!(%shadow, "shadow: the judge create lifecycle was not admitted: {error}");
+            return;
+        }
+    };
+    let caller = crate::kj::KjCaller {
+        principal_id: PrincipalId::system(),
+        actor_id: PrincipalId::system(),
+        reviewer_id: None,
+        context_id: Some(shadow),
+        session_id: kaijutsu_types::SessionId::new(),
+        confirmed: false,
+        rc_depth: 0,
+        privileged: true,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let invocation = crate::rc::RcInvocation::new(crate::rc::VERB_CREATE, &admission, &caller.cancel);
+    if let Err(error) = crate::rc::run(&dispatcher, invocation, &caller).await {
+        tracing::error!(%shadow, "shadow: the judge create lifecycle could not settle: {error}");
+    }
+}
+
+/// Returns the judge and whether this call created its shadow.
+fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<(Judge, bool)>> {
     let _create = CREATE.lock();
     let (row, judge) = {
         let db = kernel.kernel_db().lock();
@@ -403,7 +444,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         };
         if let Some(existing) = db.structural_children(seat)?.into_iter().find(|c| c.context_type == JUDGE) {
             judge.shadow = existing.context_id;
-            return Ok(Some(judge));
+            return Ok(Some((judge, false)));
         }
         let row = shadow_row(&seat_row, cast_id);
         db.in_transaction(|db| crate::kj::context::insert_new_context_rows(db, &row, Some(seat)))?;
@@ -418,7 +459,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
     if let Err(error) = registered {
         tracing::error!(%seat, shadow = %row.context_id, "shadow: label not registered: {error}");
     }
-    Ok(Some(judge))
+    Ok(Some((judge, true)))
 }
 
 /// A judge shadow's row: a fork child of the seat playing the seat's cast,
