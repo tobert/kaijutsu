@@ -1,0 +1,3 @@
+# A coder's judge shadow holds the coder's history for the council
+# (docs/council.md, "Shadow voice"); it does not outlive its seat.
+kj context archive --children --type judge --confirm

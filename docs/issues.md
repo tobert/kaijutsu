@@ -324,6 +324,17 @@ the model under observation has tried."
   servers and hydrated whole for chat models; kaijutsu manages the server
   cache, no cap yet. Open items are listed in the design.
 
+## Archive paths that skip the archive lifecycle (2026-10-09)
+
+`kj context archive` and `kj character retire` run the `archive` rc
+lifecycle before they commit. Two paths archive without it:
+`kj context rotate` (the predecessor, inside the rotation transaction) and
+`kj context demote` on an already demoted context (`KernelDb::demote_context`).
+A rotated coder therefore keeps a live judge shadow. Rotation is where a
+summary script would help most, so fire the lifecycle on the predecessor
+before the rotation transaction, and decide what a failed rotation after it
+means.
+
 ## Council presets per context (Amy, 2026-10-08)
 
 Amy: "bumps should only be enabled on coders and optionally. maybe we come

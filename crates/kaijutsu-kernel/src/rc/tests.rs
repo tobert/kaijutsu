@@ -2896,6 +2896,17 @@ esac
                 .await;
                 ctx
             }
+            VERB_ARCHIVE => {
+                let ctx = register_context(&d, Some("wired-archive"), None, principal);
+                set_context_type(&d, ctx, "test");
+                d.block_store()
+                    .create_document(ctx, crate::DocumentKind::Conversation, None)
+                    .unwrap();
+                let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+                let r = d.dispatch(&argv(&["context", "archive", "wired-archive"]), &caller).await;
+                assert!(r.is_ok(), "archive failed: {}", r.message());
+                ctx
+            }
             other => panic!(
                 "RC_VERBS gained '{other}': add its real caller here, or list it in \
                  SERVER_FIRED_VERBS and cover it in kaijutsu-server beat tests"
@@ -3299,4 +3310,126 @@ esac
         .unwrap()
         .join()
         .unwrap();
+    }
+
+    // ── archive verb ────────────────────────────────────────────────────
+
+    /// A live context of `context_type` with a conversation document, a
+    /// structural child of `parent` when given, as `kj context create` makes.
+    fn archivable(d: &KjDispatcher, label: &str, parent: Option<ContextId>, context_type: &str) -> ContextId {
+        let ctx = register_context(d, Some(label), parent, PrincipalId::new());
+        set_context_type(d, ctx, context_type);
+        if let Some(parent) = parent {
+            d.kernel_db()
+                .lock()
+                .insert_edge(&crate::kernel_db::ContextEdgeRow {
+                    edge_id: uuid::Uuid::now_v7(),
+                    source_id: parent,
+                    target_id: ctx,
+                    kind: kaijutsu_types::EdgeKind::Structural,
+                    metadata: None,
+                    created_at: kaijutsu_types::now_millis() as i64,
+                })
+                .unwrap();
+        }
+        d.block_store().create_document(ctx, crate::DocumentKind::Conversation, None).unwrap();
+        ctx
+    }
+
+    async fn archive_dispatcher() -> std::sync::Arc<KjDispatcher> {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        d
+    }
+
+    /// The archive lifecycle runs while the context is still live, so its
+    /// scripts can write into it (a summary, say), and then the context is
+    /// archived.
+    ///
+    /// Falsified by running the lifecycle after the archive commits: the
+    /// archived context admits no new work and the block is missing.
+    #[tokio::test]
+    async fn the_archive_lifecycle_runs_before_the_archive_commits() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(
+            &d,
+            "/config/rc/test/archive/S10-summary.kai",
+            "kj block create --role system --kind text --content 'archive summary written'",
+        )
+        .await;
+        let ctx = archivable(&d, "summarized", None, "test");
+        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let r = d.dispatch(&argv(&["context", "archive", "summarized"]), &caller).await;
+        assert!(r.is_ok(), "archive failed: {}", r.message());
+        assert_eq!(count_blocks_containing(&d, ctx, "archive summary written"), 1, "{:?}", block_contents_in(&d, ctx));
+        assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
+    }
+
+    /// A failing archive script is recorded and the archive still commits:
+    /// a broken script must not trap a context.
+    #[tokio::test]
+    async fn a_failing_archive_script_does_not_stop_the_archive() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(&d, "/config/rc/test/archive/S10-broken.kai", "false").await;
+        let ctx = archivable(&d, "broken-rc", None, "test");
+        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let r = d.dispatch(&argv(&["context", "archive", "broken-rc"]), &caller).await;
+        assert!(r.is_ok(), "archive failed: {}", r.message());
+        assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
+        assert!(block_kinds_in(&d, ctx).contains(&kaijutsu_types::BlockKind::Error), "the failure is recorded");
+    }
+
+    /// `--children --type` archives the context's live children of that
+    /// type, each through its own archive lifecycle, and leaves the others.
+    #[tokio::test]
+    async fn archive_children_of_a_type_runs_each_child_s_lifecycle() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(&d, "/config/rc/judge/archive/S00-noop.kai", "true").await;
+        let seat = archivable(&d, "seat", None, "test");
+        let judge = archivable(&d, "judge-seat", Some(seat), "judge");
+        let other = archivable(&d, "other-child", Some(seat), "test");
+        let caller = KjCaller { confirmed: true, ..caller_with_context(seat) };
+        let r = d.dispatch(&argv(&["context", "archive", "--children", "--type", "judge"]), &caller).await;
+        assert!(r.is_ok(), "archive --children failed: {}", r.message());
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(judge).unwrap().unwrap().archived_at.is_some());
+        assert!(db.get_context(other).unwrap().unwrap().archived_at.is_none(), "another type stays live");
+        assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_none(), "the parent stays live");
+        drop(db);
+        assert!(find_run_for_context(&d, judge, VERB_ARCHIVE).is_some(), "the child's own archive lifecycle ran");
+    }
+
+    /// The shipped coder archive script archives the seat's judge shadows,
+    /// so a shadow does not outlive its seat.
+    #[tokio::test]
+    async fn archiving_a_coder_archives_its_judge_shadow() {
+        let d = std::sync::Arc::new(test_dispatcher_rc().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let seat = archivable(&d, "coder-seat", None, "coder");
+        let judge = archivable(&d, "judge-coder-seat", Some(seat), "judge");
+        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        let r = d.dispatch(&argv(&["context", "archive", "coder-seat"]), &caller).await;
+        assert!(r.is_ok(), "archive failed: {}", r.message());
+        let db = d.kernel_db().lock();
+        assert!(db.get_context(seat).unwrap().unwrap().archived_at.is_some());
+        assert!(db.get_context(judge).unwrap().unwrap().archived_at.is_some(), "the shadow is archived with its seat");
+    }
+
+    /// Retiring a character runs the archive lifecycle of each context it
+    /// plays.
+    #[tokio::test]
+    async fn retire_runs_the_archive_lifecycle_of_each_played_context() {
+        let d = archive_dispatcher().await;
+        install_rc_script_file(&d, "/config/rc/test/archive/S00-noop.kai", "true").await;
+        let caller = KjCaller { confirmed: true, ..console_caller(&d) };
+        assert!(d.dispatch(&argv(&["character", "create", "retiree"]), &caller).await.is_ok());
+        let retiree = d.kernel_db().lock().get_character_by_name("retiree").unwrap().unwrap().principal_id;
+        let ctx = archivable(&d, "retiree-seat", None, "test");
+        d.kernel_db().lock().update_context_review(ctx, Some(retiree), None).unwrap();
+        let r = d.dispatch(&argv(&["character", "retire", "retiree"]), &caller).await;
+        assert!(r.is_ok(), "retire failed: {}", r.message());
+        assert!(find_run_for_context(&d, ctx, VERB_ARCHIVE).is_some(), "the played context's archive lifecycle ran");
+        assert!(d.kernel_db().lock().get_context(ctx).unwrap().unwrap().archived_at.is_some());
     }

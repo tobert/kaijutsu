@@ -144,6 +144,12 @@ pub const VERB_ROTATE: &str = "rotate";
 /// and settlement before starting provider work.
 pub const VERB_SUBMIT: &str = "submit";
 
+/// The archive verb: fired before a context is archived, while it still
+/// admits work, so scripts can write a summary into it or archive the
+/// contexts it owns (a coder archives its judge shadows). A failing script
+/// is recorded and the archive still commits.
+pub const VERB_ARCHIVE: &str = "archive";
+
 /// Canonical verbs shared by lifecycle dispatch and script path validation.
 pub const RC_VERBS: &[&str] = &[
     VERB_CREATE,
@@ -153,6 +159,7 @@ pub const RC_VERBS: &[&str] = &[
     VERB_TICK,
     VERB_ROTATE,
     VERB_SUBMIT,
+    VERB_ARCHIVE,
 ];
 
 fn verb_is_wired(verb: &str) -> bool {

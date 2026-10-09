@@ -216,9 +216,20 @@ enum ContextCommand {
     },
     /// Archive one context, retaining its history (latched). Children keep
     /// their parent edge and state. Restore with `kj context promote <id>`.
+    /// The context's `archive` rc lifecycle runs first, while it is still
+    /// live; a failing script is recorded and the archive still commits.
     Archive {
         /// Context to archive. Ids and labels come from `kj context list`.
-        context: String,
+        /// With `--children`, the parent whose children are archived
+        /// (default: current).
+        context: Option<String>,
+        /// Archive the context's live children instead of the context,
+        /// each through its own `archive` lifecycle.
+        #[arg(long)]
+        children: bool,
+        /// With `--children`, archive only children of this context type.
+        #[arg(long = "type", value_name = "TYPE", requires = "children")]
+        context_type: Option<String>,
     },
     /// Conclude a context — mark this work "done" (the time-well's hot→recent
     /// transition). Reversible via fork; not latched, not destructive.
@@ -733,7 +744,15 @@ impl KjDispatcher {
                 self.context_unset(context.as_deref(), env.as_deref(), cast, model, caller)
             }
             ContextCommand::Log { context } => self.context_log(context.as_deref(), caller),
-            ContextCommand::Archive { context } => self.context_archive(&context, caller).await,
+            ContextCommand::Archive { context, children: false, .. } => match context {
+                Some(context) => Box::pin(self.context_archive(&context, caller)).await,
+                None => KjResult::Err(
+                    "kj context archive: name the context to archive, or pass --children".to_string(),
+                ),
+            },
+            ContextCommand::Archive { context, children: true, context_type } => {
+                Box::pin(self.context_archive_children(context.as_deref(), context_type.as_deref(), caller)).await
+            }
             ContextCommand::Rotate { context } => self.context_rotate(context.as_deref(), caller).await,
             ContextCommand::Conclude { context } => self.context_conclude(&context, caller).await,
             ContextCommand::Promote { context } => self.context_promote(&context, caller).await,
@@ -2313,6 +2332,10 @@ impl KjDispatcher {
             (target_id, label)
         };
 
+        if let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
+            return KjResult::Err(format!("kj context archive: {target_label} stays live: {e}"));
+        }
+
         let archived = {
             let db = self.kernel_db().lock();
             match db.archive_context(target_id) {
@@ -2333,6 +2356,56 @@ impl KjDispatcher {
         } else {
             KjResult::ok(format!("{target_label} already archived"))
         }
+    }
+
+    /// Run `target`'s `archive` rc lifecycle while it is still live. An
+    /// already archived context admits no work and runs nothing. Script
+    /// failures are recorded by the lifecycle and are not errors here;
+    /// cancellation and a lifecycle that cannot settle are, and the caller
+    /// leaves the context live.
+    pub(crate) async fn run_archive_lifecycle(&self, target: ContextId, caller: &KjCaller) -> Result<(), String> {
+        let Ok(admission) = self.kernel().admit_context(target) else { return Ok(()) };
+        // Boxed: an inline lifecycle future would grow every `kj context`
+        // dispatch future past the default test-thread stack.
+        let lifecycle = Box::pin(crate::rc::run(
+            self,
+            crate::rc::RcInvocation::new(crate::rc::VERB_ARCHIVE, &admission, &caller.cancel),
+            caller,
+        ))
+        .await;
+        if caller.cancel.is_cancelled() {
+            return Err("its archive lifecycle was cancelled".to_string());
+        }
+        lifecycle.map_err(|e| format!("its archive lifecycle could not settle: {e}"))
+    }
+
+    /// `kj context archive --children [<parent>] [--type <type>]`: archive
+    /// each live structural child of the parent, optionally of one type,
+    /// each through [`Self::context_archive`].
+    async fn context_archive_children(&self, parent_ref: Option<&str>, context_type: Option<&str>, caller: &KjCaller) -> KjResult {
+        let children = {
+            let db = self.kernel_db().lock();
+            let parent = match super::refs::resolve_context_arg(parent_ref, caller, &db) {
+                Ok(id) => id,
+                Err(e) => return KjResult::Err(format!("kj context archive --children: {e}")),
+            };
+            match db.structural_children(parent) {
+                Ok(children) => children,
+                Err(e) => return KjResult::Err(format!("kj context archive --children: {e}")),
+            }
+        };
+        let mut archived = Vec::new();
+        for child in children.into_iter().filter(|c| context_type.is_none_or(|t| c.context_type == t)) {
+            let result = Box::pin(self.context_archive(&child.context_id.to_hex(), caller)).await;
+            if !result.is_ok() {
+                return result;
+            }
+            archived.push(child.label.unwrap_or_else(|| child.context_id.short()));
+        }
+        if archived.is_empty() {
+            return KjResult::ok("no live children to archive".to_string());
+        }
+        KjResult::ok(format!("archived {}", archived.join(", ")))
     }
 
     /// `kj context rotate [<ctx>]` — replace a context with a successor that

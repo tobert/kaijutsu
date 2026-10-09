@@ -159,7 +159,7 @@ impl KjDispatcher {
                 }
                 self.character_set(&name, root, no_root, caller).await
             }
-            CharacterCommand::Retire { name } => self.character_retire(&name),
+            CharacterCommand::Retire { name } => self.character_retire(&name, caller).await,
         }
     }
 
@@ -621,7 +621,30 @@ impl KjDispatcher {
     /// character has anything live to archive — the archival loop below is
     /// not separately confirmed, since that one latch already covers the
     /// whole batch as one act.
-    fn character_retire(&self, name: &str) -> KjResult {
+    async fn character_retire(&self, name: &str, caller: &KjCaller) -> KjResult {
+        let live = {
+            let db = self.kernel_db().lock();
+            match db.get_character_by_name(name) {
+                Ok(Some(row)) if row.retired_at.is_none() => match db.contexts_played_by(row.principal_id) {
+                    Ok(live) => live,
+                    Err(e) => return KjResult::Err(format!("kj character retire: {e}")),
+                },
+                _ => Vec::new(),
+            }
+        };
+        for ctx in &live {
+            if let Err(e) = self.run_archive_lifecycle(ctx.context_id, caller).await {
+                return KjResult::Err(format!(
+                    "kj character retire: {name} stays live, and {} stays live: {e}",
+                    ctx.label.as_deref().unwrap_or(&ctx.context_id.short())
+                ));
+            }
+        }
+        self.character_retire_commit(name)
+    }
+
+    /// Retire after each played context's archive lifecycle has run.
+    fn character_retire_commit(&self, name: &str) -> KjResult {
         let db = self.kernel_db().lock();
         let row = match db.get_character_by_name(name) {
             Ok(Some(r)) => r,

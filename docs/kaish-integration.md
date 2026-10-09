@@ -39,6 +39,15 @@ Contexts are retained. `kj context archive <id> --confirm` removes a context
 from the active set while preserving lineage, blocks, execution receipts and
 approval history. `kj context promote <id>` restores it. There is no context
 removal command, and document deletion refuses documents owned by contexts.
+Before `kj context archive` commits, it runs the context's `archive` rc
+lifecycle while the context still admits work, so a script can write a
+summary into it or archive the contexts it owns; `kj character retire` runs
+it for each context the character plays. A failing script is recorded and
+the archive still commits; a cancelled lifecycle, or one that cannot
+settle, leaves the context live. Rotation and demotion archive without it
+for now (`docs/issues.md`, "Archive paths that skip the archive lifecycle").
+`kj context archive --children [--type <type>]` archives a context's live
+children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.
 The migrated execution entry points order admission against archive under the kernel database lock:
 archive first refuses new work before user input, drafts, receipts or lifecycle
@@ -585,7 +594,7 @@ remove the obsolete API in the same change as its final caller.
 | Partial | Model turns and conversation state | kernel `runtime/llm_stream.rs`, `runtime/turn_state.rs`, `runtime/interrupt.rs`, `runtime/turn_identity.rs` | Shared identity/provider selection, conversation exclusion, hydration, terminal events, per-turn leases, worker placement, headless admission, shutdown, and selective open-block cleanup; approval ownership transfer remains open |
 | Partial | Approval resume | kernel `runtime/approval_resume.rs`, `runtime/command.rs` | Original actor/reviewer, captured cwd/env, retained pair/receipt, single-use claim, runtime ownership, startup readiness, cancellation, joined settlement, preparation unwind cleanup; explicit publication handoff; terminal/restart retirement; registered and receiptless original-pair recovery; durable completion delivery; abrupt live failure and continuation admission remain open |
 | Partial | Model/MCP waiting and background shells | kernel `mcp/servers/shell.rs`, `runtime/tool_command.rs`, `runtime/worker.rs` | Shared execution/hooks, structural read-only policy, stdin, typed review, job/receipt settlement, state, cooperative shutdown, and unwind settlement migrated; durable completion delivery migrated; pre-admission drop leaves no receipt; post-admission drop settles; job results retain captured outcomes through projection failure; terminal retention retries without execution; ask/checkpoint/link admission is atomic; interruption shares the original outcome without storage reads; result retention and unanswered-ask closure are atomic; admission receipts survive preparation/refusal and execution-entry read faults; abrupt worker destruction and remaining job/controller lifetimes remain open |
-| Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; durable script admission, full returned results, atomic projections, retry/restart without replay, and truthful committed-state failures |
+| Migrated | Rc lifecycle | kernel `rc/mod.rs`; create/fork/attach/drift/tick/rotate/submit/archive callers | Discovery, ordering, lifecycle facts, run records, failure visibility, recursion, and explicit rc authority migrated; inline re-entry carries cancellation and joins kaish; scheduled tick/rotate retains admission on the joined runtime; durable script admission, full returned results, atomic projections, retry/restart without replay, and truthful committed-state failures |
 | Migrated | Hook bodies | kernel `mcp/broker.rs`, command result review | Contextual identity/session, snapshot versus path-read semantics, internal output/verdict protocol, real timeout, owner cancellation with joined cleanup, recursion-depth propagation, retained result review, and owned notification emission |
 | Migrated | Editor shell reads | kernel `runtime/editor_read.rs`, `kernel.rs::fetch_editor_io` | Kernel ownership, caller/shutdown cancellation, re-entry, complete UTF-8, fail-before-splice, full opener identity, context captured at open, and refusal of editor entry/input through read-only shells |
 | Migrated | Environment setup and approved environment restore | `ContextShellInputs`, `apply_ask_env`, `runtime/shell_state.rs`, `kj/env_snapshot.rs` | One atomic cwd/export snapshot and shared defaults; validated typed restore preserves unset values and avoids overlay collisions; approval uses original identities and captured inputs; transactional write-back stays explicit |
