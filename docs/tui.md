@@ -1163,12 +1163,13 @@ another principal does not arrive: it goes to the `kaijutsu-app` fallback.
 Exact-window targeting is `docs/vi.md`'s open item, and it is what would let a
 terminal and an app window stop both popping.
 
-**The wire carries a cursor, no selection anchor.** `EditorState` has
-`cursor @2` and nothing else positional, so no client can draw a visual-mode
-highlight — the TUI renders the mode label and no band. Adding a selection
-range to the kernel's `EditorState` and to the capnp struct is step 1 of
-`docs/vi.md`'s "Selection rects", and it is what unblocks both renderers at
-once.
+**A visual-mode selection draws from the wire.** `EditorState.selection`
+carries the kernel's selection as char spans (`docs/vi.md`, "Three
+pieces"), and the frame builder gives every cell inside a span the
+`editor_selection` style, the same look as the scrolled transcript's `v`
+mark. A selected line break draws as one blank cell past the line's last
+char, as in vim, so a selected empty line still shows. The terminal cursor
+stays where the kernel puts it. The tui keeps no anchor of its own.
 
 **Every key but the prefix goes to vim.** While the alternate screen is up a
 key goes to `editor_keys` verbatim, so `Ctrl+C` is vim's interrupt — the

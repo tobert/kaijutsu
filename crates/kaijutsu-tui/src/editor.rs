@@ -157,18 +157,18 @@ pub fn editor_frame(
         screen.left = col + 1 - cols;
     }
 
-    let text_style = palette.editor_text();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(height as usize);
     let buffer: Vec<&str> = screen.state.text.split('\n').collect();
+    let mut row_start: usize = buffer
+        .iter()
+        .take(screen.top)
+        .map(|line| line.chars().count() + 1)
+        .sum();
     for i in 0..body_h {
         match buffer.get(screen.top + i) {
             Some(row_text) => {
-                let visible: String = row_text
-                    .chars()
-                    .skip(screen.left)
-                    .take(cols)
-                    .collect();
-                lines.push(Line::from(Span::styled(visible, text_style)));
+                lines.push(buffer_row(screen, row_text, row_start, cols, palette));
+                row_start += row_text.chars().count() + 1;
             }
             // vi's empty-line marker, so "past the end" is never mistaken for a
             // run of blank lines in the file.
@@ -188,6 +188,51 @@ pub fn editor_frame(
         ),
     };
     EditorFrame { lines, cursor }
+}
+
+/// One visible buffer row, whose first char is at char offset `row_start`.
+///
+/// Cells inside the selection take the selection style. A selected line break
+/// draws as one blank cell past the line's last char, as in vim, so a
+/// selected empty line still shows.
+fn buffer_row(
+    screen: &EditorScreen,
+    row_text: &str,
+    row_start: usize,
+    cols: usize,
+    palette: &Palette,
+) -> Line<'static> {
+    let text_style = palette.editor_text();
+    let Some(selection) = &screen.state.selection else {
+        let visible: String = row_text.chars().skip(screen.left).take(cols).collect();
+        return Line::from(Span::styled(visible, text_style));
+    };
+    let selected_style = palette.editor_selection();
+    let row_len = row_text.chars().count();
+    let cells = row_text
+        .chars()
+        .enumerate()
+        .chain(std::iter::once((row_len, ' ')).filter(|_| selection.contains(row_start + row_len)))
+        .skip(screen.left)
+        .take(cols);
+    // Group neighboring cells of one style into one span.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_selected = false;
+    for (col, ch) in cells {
+        let selected = selection.contains(row_start + col);
+        if selected != run_selected && !run.is_empty() {
+            let style = if run_selected { selected_style } else { text_style };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_selected = selected;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        let style = if run_selected { selected_style } else { text_style };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 /// `foo.kai [+]                          -- INSERT --            12,3`
@@ -480,6 +525,7 @@ pub fn abandon() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaijutsu_types::editor::{EditorSelection, SelectionShape};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::Paragraph;
@@ -520,6 +566,72 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Which cells of the first `rows` buffer rows carry the selection's
+    /// background, as `(column, row)`.
+    fn selected_cells(screen: &mut EditorScreen, width: u16, height: u16, rows: u16) -> Vec<(u16, u16)> {
+        let palette = Palette::builtin();
+        let frame = editor_frame(screen, width, height, &palette);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(frame.lines), f.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let selected = palette.editor_selection().bg.expect("the selection style sets a background");
+        (0..rows)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].bg == selected)
+            .collect()
+    }
+
+    fn select(shape: SelectionShape, spans: Vec<std::ops::Range<usize>>) -> Option<EditorSelection> {
+        Some(EditorSelection { shape, spans })
+    }
+
+    #[test]
+    fn a_charwise_selection_highlights_only_its_cells() {
+        let mut s = screen("alpha\nbeta", 1);
+        s.state.selection = select(SelectionShape::Charwise, vec![1..4]);
+        assert_eq!(selected_cells(&mut s, 12, 5, 2), vec![(1, 0), (2, 0), (3, 0)]);
+    }
+
+    /// The line break is one cell past the line's last char, as in vim.
+    #[test]
+    fn a_selection_across_a_line_break_marks_the_break_cell() {
+        let mut s = screen("ab\ncd", 1);
+        s.state.selection = select(SelectionShape::Charwise, vec![1..4]);
+        assert_eq!(selected_cells(&mut s, 12, 5, 2), vec![(1, 0), (2, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn an_empty_selected_line_shows_one_cell() {
+        let mut s = screen("a\n\nb", 0);
+        s.state.selection = select(SelectionShape::Linewise, vec![0..3]);
+        assert_eq!(selected_cells(&mut s, 12, 6, 3), vec![(0, 0), (1, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn a_blockwise_selection_highlights_each_span() {
+        let mut s = screen("abcd\nx\nefgh", 1);
+        s.state.selection = select(SelectionShape::Blockwise, vec![1..3, 8..10]);
+        assert_eq!(selected_cells(&mut s, 12, 6, 3), vec![(1, 0), (2, 0), (1, 2), (2, 2)]);
+    }
+
+    /// Columns scrolled off the left keep their offsets: the highlight moves
+    /// with the text, not with the screen.
+    #[test]
+    fn a_horizontally_scrolled_row_keeps_its_highlight_on_its_text() {
+        let mut s = screen("0123456789", 9);
+        s.state.selection = select(SelectionShape::Charwise, vec![6..8]);
+        // A 5-column window holding the cursor at 9 shows columns 5..10.
+        assert_eq!(selected_cells(&mut s, 5, 4, 1), vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn no_selection_draws_no_highlight() {
+        let mut s = screen("alpha\nbeta", 1);
+        assert!(selected_cells(&mut s, 12, 5, 2).is_empty());
     }
 
     #[test]

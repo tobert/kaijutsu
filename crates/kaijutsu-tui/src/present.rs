@@ -185,6 +185,12 @@ impl Palette {
         Style::new().fg(Color::Reset)
     }
 
+    /// The editor's visual-mode selection. It looks like the scrolled
+    /// transcript's mark, so a selection reads the same on both surfaces.
+    pub fn editor_selection(&self) -> Style {
+        self.copy_selection()
+    }
+
     /// The editor's transient message line (vim `E492`).
     pub fn editor_message(&self) -> Style {
         Style::new().fg(Color::Yellow)
