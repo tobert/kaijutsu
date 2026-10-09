@@ -355,6 +355,33 @@ and `kaijutsu_client::AskArming`). Seen in `terminal_fit`'s desktop-notify
 test, where `send` denied the ask. Open: whether arming should also wait for
 the line to be sent or cleared, not only for a pause in typing.
 
+## Input latency follow-ups from the Nagle and draft outbox work (2026-10-09)
+
+- **A raw key burst over 1024 bytes stalls the tui.** Sent as one pty write
+  without bracketed paste, the client reads exactly 1024 bytes and then
+  stops reading until more input arrives; the kernel draft holds the first
+  1023 typed characters. The same happens on the code before the outbox, so
+  the key reader or crossterm's read chunking is the likely place. A
+  bracketed paste arrives as one `Paste` event and is not affected.
+  `terminal_fit`'s submit probe keeps its burst under 1024 bytes for now.
+- **A refused submit still commits the user message.** On a context with no
+  performer, `submit_input` records the user message (the transcript shows
+  it and two `stream error` rows), clears the kernel draft, and then
+  returns `No performer assigned`. The tui treats the error as "nothing
+  happened" and keeps its local draft, which no longer matches the
+  kernel's empty one. Either the refusal should come before the commit, or
+  the error should say the message landed.
+- **The app's input lag is not measured.** The app echoes locally and does
+  not wait on `edit_input`. A likely contributing factor is the reactive
+  `UpdateMode` (100 ms when focused, `kaijutsu-app/src/main.rs`): if a key
+  needs a second frame to reach the screen, that frame waits for the
+  timeout. Count frames from key to glyph before changing it. Amy,
+  2026-10-09: the app waits behind larger work.
+- **Per-keystroke kernel cost.** On the ephemeral test kernel an
+  `edit_input` takes about 2 ms end to end. Zorak's disk is not measured.
+  The outbox keeps that cost off the key path, but a long burst still
+  drains at that rate.
+
 ## acp-fleet host scenarios out of step with earlier commits (2026-10-08)
 
 Found while moving the fleet onto the typed ledger; neither failure comes

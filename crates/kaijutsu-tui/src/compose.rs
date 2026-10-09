@@ -150,6 +150,14 @@ pub struct Compose {
     /// acknowledged. A mirror older than this does not yet carry our
     /// keystrokes, and reconciling against it would delete them.
     acked: u64,
+    /// Which draft this is: [`Self::load_draft`] starts a new one, so an
+    /// edit sent for the last draft cannot settle this one.
+    generation: u64,
+    /// Our edits sent for this draft and not yet landed.
+    in_flight: usize,
+    /// The newest mirror refused while edits were in flight, as text and
+    /// context version. Checked again when the last one lands.
+    held: Option<(String, u64)>,
     /// The `:` line's local history — a session fact, not a per-draft one,
     /// so it survives [`Self::reset`] and [`Self::load_draft`] (both go
     /// through the same path) rather than being wiped every submit or
@@ -178,6 +186,9 @@ impl Compose {
         let mut compose = Self {
             editor: EditorCore::new(""),
             acked: 0,
+            generation: 0,
+            in_flight: 0,
+            held: None,
             colon_history: ColonHistory::default(),
         };
         compose.load_draft(text);
@@ -194,6 +205,9 @@ impl Compose {
         editor.apply_keys("G$");
         self.editor = editor;
         self.acked = 0;
+        self.generation += 1;
+        self.in_flight = 0;
+        self.held = None;
     }
 
     /// The draft's text.
@@ -286,9 +300,32 @@ impl Compose {
         CursorShape::for_mode(self.editor.mode().as_deref())
     }
 
-    /// Record the context version an `edit_input` acknowledged.
-    pub fn record_ack(&mut self, version: u64) {
-        self.acked = self.acked.max(version);
+    /// Count one edit as sent for this draft. Returns the draft generation
+    /// to hand back to [`Self::landed`].
+    pub fn sent(&mut self) -> u64 {
+        self.in_flight += 1;
+        self.generation
+    }
+
+    /// One of our edits came back: `Some(version)` when the kernel
+    /// acknowledged it, `None` when it failed. An edit for an earlier draft
+    /// is ignored. When the last edit in flight lands, a mirror held for it
+    /// is reconciled; returns whether the buffer moved.
+    pub fn landed(&mut self, generation: u64, version: Option<u64>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.in_flight = self.in_flight.checked_sub(1).expect("an edit landed that was never sent");
+        if let Some(version) = version {
+            self.acked = self.acked.max(version);
+        }
+        match self.held.take() {
+            Some((text, version)) if self.in_flight == 0 => self.reconcile(&text, version),
+            held => {
+                self.held = held;
+                false
+            }
+        }
     }
 
     /// Reconcile the draft against the kernel block a sibling just edited.
@@ -296,9 +333,16 @@ impl Compose {
     /// `version` is the mirror's context version, the same number `edit_input`
     /// acknowledges. A mirror older than our last ack has not seen our own
     /// keystrokes yet, so applying it would delete them — that is the echo
-    /// race, and refusing early is what closes it. Returns whether the buffer
-    /// moved.
+    /// race, and refusing early is what closes it. While our edits are in
+    /// flight no mirror can be known to carry them, so the newest one is
+    /// held for [`Self::landed`]. Returns whether the buffer moved.
     pub fn reconcile(&mut self, kernel_text: &str, version: u64) -> bool {
+        if self.in_flight > 0 {
+            if self.held.as_ref().is_none_or(|(_, held)| version >= *held) {
+                self.held = Some((kernel_text.to_string(), version));
+            }
+            return false;
+        }
         if version < self.acked {
             return false;
         }
@@ -560,6 +604,12 @@ mod tests {
         ops
     }
 
+    /// One edit sent and acknowledged at `version`.
+    fn ack(compose: &mut Compose, version: u64) {
+        let generation = compose.sent();
+        compose.landed(generation, Some(version));
+    }
+
     /// `i` into insert mode — what every test that types a draft presses
     /// first, because a fresh draft rests in normal mode.
     fn insert(compose: &mut Compose) {
@@ -699,7 +749,7 @@ mod tests {
     #[test]
     fn a_siblings_edit_reaches_the_draft() {
         let mut compose = Compose::new();
-        compose.record_ack(4);
+        ack(&mut compose, 4);
         assert!(compose.reconcile("a sibling typed this", 5));
         assert_eq!(compose.text(), "a sibling typed this");
     }
@@ -712,9 +762,80 @@ mod tests {
         let mut compose = Compose::new();
         insert(&mut compose);
         typed(&mut compose, "ab");
-        compose.record_ack(9);
+        ack(&mut compose, 9);
         assert!(!compose.reconcile("a", 8), "a stale mirror is refused");
         assert_eq!(compose.text(), "ab");
+    }
+
+    /// A mirror that lands while our later edits are still in flight was
+    /// cut before they reached the kernel, whatever its version says
+    /// against the acks so far. Applying it would delete the keystrokes
+    /// still on the wire.
+    #[test]
+    fn a_mirror_waits_while_our_edits_are_in_flight() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        typed(&mut compose, "ab");
+        let generation = compose.sent();
+        compose.sent();
+        compose.landed(generation, Some(6));
+        assert!(!compose.reconcile("a", 6), "b is still on the wire");
+        assert_eq!(compose.text(), "ab");
+        // The last ack is newer than the held mirror, so the mirror is
+        // dropped, not applied late.
+        assert!(!compose.landed(generation, Some(7)));
+        assert_eq!(compose.text(), "ab");
+    }
+
+    /// The feed and the acks travel separately, so our echo can arrive
+    /// before the ack that names it. The held mirror is applied once the
+    /// last edit lands, so a sibling's edit it carries is not lost when no
+    /// later delivery comes.
+    #[test]
+    fn a_mirror_held_for_our_acks_applies_when_they_land() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        typed(&mut compose, "ab");
+        let generation = compose.sent();
+        compose.sent();
+        assert!(!compose.reconcile("Xab", 7), "held while two edits are in flight");
+        assert!(!compose.landed(generation, Some(6)), "one edit is still in flight");
+        assert_eq!(compose.text(), "ab");
+        assert!(compose.landed(generation, Some(7)), "the held mirror applies");
+        assert_eq!(compose.text(), "Xab");
+    }
+
+    /// A failed edit is no longer in flight; it does not hold the draft
+    /// against the feed forever.
+    #[test]
+    fn a_failed_edit_stops_holding_the_draft() {
+        let mut compose = Compose::new();
+        let generation = compose.sent();
+        compose.landed(generation, None);
+        assert!(compose.reconcile("a sibling typed this", 3));
+        assert_eq!(compose.text(), "a sibling typed this");
+    }
+
+    /// An ack for the last draft, landing after a submit or a switch loaded
+    /// a new one, neither counts against the new draft's edits nor raises
+    /// its ack floor.
+    #[test]
+    fn an_ack_for_the_last_draft_does_not_settle_this_one() {
+        let mut compose = Compose::new();
+        insert(&mut compose);
+        typed(&mut compose, "old");
+        let old = compose.sent();
+        compose.load_draft("");
+        insert(&mut compose);
+        typed(&mut compose, "n");
+        let generation = compose.sent();
+        assert!(!compose.landed(old, Some(40)));
+        assert!(!compose.reconcile("", 20), "our edit for this draft is still in flight");
+        assert_eq!(compose.text(), "n");
+        assert!(!compose.landed(generation, Some(25)), "the held mirror is older than our ack");
+        assert_eq!(compose.text(), "n");
+        assert!(compose.reconcile("n sibling", 30), "the old ack did not raise the floor to 40");
+        assert_eq!(compose.text(), "n sibling");
     }
 
     #[test]
@@ -722,7 +843,7 @@ mod tests {
         let mut compose = Compose::new();
         insert(&mut compose);
         typed(&mut compose, "ab");
-        compose.record_ack(3);
+        ack(&mut compose, 3);
         assert!(!compose.reconcile("ab", 3), "identical text is no change at all");
     }
 

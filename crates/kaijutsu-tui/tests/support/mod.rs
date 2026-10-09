@@ -119,6 +119,39 @@ pub fn write_ephemeral_key(server: &EphemeralServer, dir: &Path) -> PathBuf {
     path
 }
 
+/// Every context's draft as the kernel holds it for `server`'s root
+/// principal, read over a client connection of its own: the kernel side of
+/// what the client's compose line shows.
+pub fn kernel_drafts(server: &EphemeralServer) -> Vec<String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build draft-reader runtime");
+    // The connection's tasks are dropped with the `LocalSet`, which must
+    // happen inside the runtime.
+    let _enter = rt.enter();
+    let local = tokio::task::LocalSet::new();
+    let drafts = local.block_on(&rt, async {
+        let client = kaijutsu_client::connect_ssh(kaijutsu_client::SshConfig {
+            host: server.addr.ip().to_string(),
+            port: server.addr.port(),
+            username: "probe".into(),
+            key_source: kaijutsu_client::KeySource::InMemory(server.root_key.clone()),
+            insecure: true,
+        })
+        .await
+        .expect("connect the draft reader");
+        let (kernel, _) = client.bind_kernel().await.expect("bind the draft reader");
+        let mut drafts = Vec::new();
+        for info in kernel.list_contexts().await.expect("list contexts") {
+            drafts.push(kernel.get_input_state(info.id).await.expect("read a draft").content);
+        }
+        drafts
+    });
+    drop(local);
+    drafts
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // The pty session
 // ────────────────────────────────────────────────────────────────────────────

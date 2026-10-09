@@ -49,6 +49,7 @@ pub mod inflight;
 pub mod interrupt;
 pub mod keys;
 pub mod layout;
+pub mod outbox;
 pub mod picker;
 pub mod refresh;
 pub mod present;

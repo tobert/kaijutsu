@@ -453,6 +453,15 @@ Rules the figure carries:
   reach it as `crossterm::event::KeyEvent` through
   `EditorCore::apply_key_event` — the vim-notation string cannot carry a
   literal `<`.
+- **The key path never waits on the kernel.** The screen draws the local
+  buffer as soon as the loop has read every key waiting, not on the next
+  80 ms tick. Each `edit_input` goes on the draft outbox
+  (`crate::outbox`): one writer task sends them in typed order, one at a
+  time, because each op is addressed against the text the ones before it
+  left. A submit and a seat switch first wait for the outbox to drain, so
+  the kernel holds every keystroke the player saw before it snapshots the
+  draft or is asked for it; the third `Ctrl+C` queues its delete behind
+  them.
 - A fresh draft rests in normal mode, as vim opens a buffer; `i`, `a` or
   `o` start typing, and a submit returns to normal mode. A resumed draft
   opens with the cursor on its last character, so `a` continues it. The
@@ -466,7 +475,10 @@ Rules the figure carries:
   the change feed, and `edit_input` acknowledges the same context version the
   feed speaks, so a mirror older than this client's last ack is refused rather
   than applied — otherwise our own echo, arriving one keystroke behind, would
-  delete what was just typed.
+  delete what was just typed. While our edits are in flight no mirror can
+  be known to carry them, so the newest one is held and checked again when
+  the last edit lands (`Compose::landed`). The feed and the acks travel
+  separately, so the echo can arrive before its ack.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
   indent under the prompt; Enter in insert mode is a newline. Every row

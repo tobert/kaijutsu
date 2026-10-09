@@ -35,6 +35,7 @@ use crate::inflight;
 use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
 use crate::compose::{Compose, CursorShape};
+use crate::outbox::{self, Landed};
 use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
@@ -225,6 +226,8 @@ struct Wires {
     /// `open_editor` peer signals — the only notification that a vi session
     /// opened. See [`attach_editor_peer`].
     editor_opens: mpsc::Receiver<EditorOpen>,
+    /// Acks for our own draft edits ([`crate::outbox`]).
+    draft_landed: mpsc::UnboundedReceiver<Landed>,
 }
 
 /// Run the client until it quits, restoring the terminal on the way out.
@@ -287,6 +290,8 @@ pub async fn run(
     app.identity = identity.display_name;
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
+    let (drafts, draft_landed) = outbox::spawn(bridge.clone());
+    app.drafts = drafts;
 
     // A panic on this thread, outside any task, past this point unwinds
     // through the screen without reaching `leave_terminal`. The hook
@@ -342,6 +347,7 @@ pub async fn run(
         hydrated_rx,
         server_events,
         editor_opens: open_rx,
+        draft_landed,
     };
     let result = event_loop(&bridge, &mut app, &mut terminal, &mut wires).await;
     leave_terminal(&mut terminal, &term_lock, &reader_stop);
@@ -620,17 +626,7 @@ async fn event_loop(
     let mut tick = tokio::time::interval(TICK);
     let mut dirty = true;
     let mut last_strip_frame = Instant::now();
-    // The cursor shape last sent to the terminal; `None` until the first
-    // frame and again after a suspend, since the host shell may have set
-    // its own.
-    let mut cursor_shape: Option<CursorShape> = None;
-    // The window title last sent; `None` until the first context is on
-    // screen and again after a suspend, since the host shell titled the
-    // window while it had it.
-    let mut title: Option<String> = None;
-    // The screen mode the last frame drew, so crossing between the
-    // conversation and a full-screen surface can say the cursor shape again.
-    let mut was_full_screen = false;
+    let mut presented = Presented::default();
     // `KAIJUTSU_TUI_PROBE_PANIC=frame` armed by `F12`: the next frame panics
     // with a synchronized update open.
     let mut panic_in_frame = false;
@@ -649,11 +645,13 @@ async fn event_loop(
         if let Some(message) = TASK_PANIC.lock().take() {
             return Err(anyhow::anyhow!(message));
         }
+        let mut input = false;
         tokio::select! {
             Some(event) = wires.key_rx.recv() => {
                 match event {
                     Event::Key(key) => {
                         dirty = true;
+                        input = true;
                         // Input only reaches a focused terminal, whatever
                         // the last focus report said (`App::saw_input`).
                         app.saw_input();
@@ -684,8 +682,8 @@ async fn event_loop(
                                 == Acted::Suspend
                             {
                                 suspend(terminal, &wires.term_lock)?;
-                                cursor_shape = None;
-                                title = None;
+                                presented.cursor_shape = None;
+                                presented.title = None;
                                 // `fg` put this terminal back in front of
                                 // the player; a report may never say so.
                                 app.saw_input();
@@ -702,6 +700,7 @@ async fn event_loop(
                     }
                     Event::Paste(text) => {
                         dirty = true;
+                        input = true;
                         app.saw_input();
                         paste_text(bridge, app, text).await;
                     }
@@ -728,6 +727,11 @@ async fn event_loop(
                         beat_wake = None;
                     }
                     _ => {}
+                }
+            }
+            Some(landed) = wires.draft_landed.recv() => {
+                if land_draft_edit(app, landed) {
+                    dirty = true;
                 }
             }
             Some((context_id, event)) = wires.feed_rx.recv() => {
@@ -961,21 +965,56 @@ async fn event_loop(
                 }
                 if dirty {
                     dirty = false;
-                    draw(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame)?;
-                    // A terminal may keep a cursor shape per screen buffer,
-                    // and a full-screen surface owns its own, so crossing
-                    // either way forgets what was sent.
-                    if app.screen.is_full_screen() != was_full_screen {
-                        was_full_screen = app.screen.is_full_screen();
-                        cursor_shape = None;
-                    }
-                    let _guard = wires.term_lock.lock();
-                    set_cursor_shape(&mut cursor_shape, wanted_cursor_shape(app))?;
-                    set_title(&mut title, wanted_title(app))?;
+                    present(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame, &mut presented)?;
                 }
             }
         }
+        // Input is answered on screen now rather than at the next tick. A
+        // burst of keys draws once, after the last key already read.
+        if dirty && input && wires.key_rx.is_empty() {
+            dirty = false;
+            present(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame, &mut presented)?;
+        }
     }
+    Ok(())
+}
+
+/// What the terminal was last told beyond the frame itself.
+#[derive(Default)]
+struct Presented {
+    /// The cursor shape last sent; `None` until the first frame and again
+    /// after a suspend, since the host shell may have set its own.
+    cursor_shape: Option<CursorShape>,
+    /// The window title last sent; `None` until the first context is on
+    /// screen and again after a suspend, since the host shell titled the
+    /// window while it had it.
+    title: Option<String>,
+    /// The screen mode the last frame drew, so crossing between the
+    /// conversation and a full-screen surface can say the cursor shape
+    /// again.
+    full_screen: bool,
+}
+
+/// Draw a frame, then bring the cursor shape and title up to date.
+fn present(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    term_lock: &TermLock,
+    app: &mut App,
+    armed: bool,
+    panic_in_frame: bool,
+    presented: &mut Presented,
+) -> Result<()> {
+    draw(terminal, term_lock, app, armed, panic_in_frame)?;
+    // A terminal may keep a cursor shape per screen buffer, and a
+    // full-screen surface owns its own, so crossing either way forgets what
+    // was sent.
+    if app.screen.is_full_screen() != presented.full_screen {
+        presented.full_screen = app.screen.is_full_screen();
+        presented.cursor_shape = None;
+    }
+    let _guard = term_lock.lock();
+    set_cursor_shape(&mut presented.cursor_shape, wanted_cursor_shape(app))?;
+    set_title(&mut presented.title, wanted_title(app))?;
     Ok(())
 }
 
@@ -1334,7 +1373,7 @@ async fn act(
         Intent::Paste => match (app.current, app.paste_buffer.clone()) {
             (Some(ctx), Some(text)) => {
                 let ops = app.compose.paste(&text);
-                mirror_ops(bridge, app, ctx, &ops).await;
+                mirror_ops(app, ctx, &ops);
             }
             (None, _) => app.note("no context attached"),
             (_, None) => app.note("paste buffer empty — scroll up, then v and y to fill it"),
@@ -1366,7 +1405,7 @@ async fn act(
         Intent::PrefillKj(body) => match app.current {
             Some(ctx) => {
                 let ops = app.compose.open_command(body);
-                mirror_ops(bridge, app, ctx, &ops).await;
+                mirror_ops(app, ctx, &ops);
             }
             None => app.note("no context attached"),
         },
@@ -1617,7 +1656,7 @@ async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
                 return;
             };
             let ops = app.compose.paste(&text);
-            mirror_ops(bridge, app, ctx, &ops).await;
+            mirror_ops(app, ctx, &ops);
         }
     }
 }
@@ -1644,6 +1683,11 @@ async fn switch_seat(
     if let Err(e) = watch_context(bridge, app, id, feeds).await {
         app.note(format!("cannot watch {}: {e}", app.label_for(id)));
         return;
+    }
+    // Switching back to a context whose last keystrokes are still on the
+    // wire would read the draft without them.
+    if let Err(e) = app.drafts.flush().await {
+        app.note(format!("draft edits may be lost: {e:#}"));
     }
     let draft = bridge.read_input(id).await;
     app.switch_to(id);
@@ -1674,18 +1718,30 @@ fn hydrating_notice(app: &App, id: ContextId) -> String {
 }
 
 /// Mirror what the vi engine did to the draft onto the context's draft
-/// block, one `edit_input` per op.
-async fn mirror_ops(bridge: &KernelBridge, app: &mut App, ctx: ContextId, ops: &[kaijutsu_editor::EditOp]) {
+/// block, one `edit_input` per op, queued on the draft outbox. The key path
+/// does not wait for the kernel; the acks land through [`land_draft_edit`].
+fn mirror_ops(app: &mut App, ctx: ContextId, ops: &[kaijutsu_editor::EditOp]) {
     for op in ops {
-        match bridge
-            .edit_input(ctx, op.offset as u64, &op.insert, op.delete as u64)
-            .await
-        {
-            Ok(version) => app.compose.record_ack(version),
-            // The draft is the kernel's copy; a failed edit means the two have
-            // diverged, and saying so beats typing into a line that is no
-            // longer going anywhere.
-            Err(e) => app.note(draft_edit_failure(&e)),
+        let generation = app.compose.sent();
+        if let Err(e) = app.drafts.edit(ctx, generation, op.clone()) {
+            app.compose.landed(generation, None);
+            app.note(draft_edit_failure(&e));
+        }
+    }
+}
+
+/// One of our draft edits came back from the kernel ([`crate::outbox`]).
+/// Returns whether the screen changed.
+fn land_draft_edit(app: &mut App, landed: Landed) -> bool {
+    match landed.result {
+        Ok(version) => app.compose.landed(landed.generation, Some(version)),
+        // The draft is the kernel's copy; a failed edit means the two have
+        // diverged, and saying so beats typing into a line that is no
+        // longer going anywhere.
+        Err(e) => {
+            app.compose.landed(landed.generation, None);
+            app.note(draft_edit_failure(&anyhow::anyhow!(e)));
+            true
         }
     }
 }
@@ -1707,7 +1763,7 @@ async fn compose_key(
         return Ok(());
     };
     let action = app.compose.press(key);
-    mirror_ops(bridge, app, ctx, &action.ops).await;
+    mirror_ops(app, ctx, &action.ops);
     if let Some(line) = action.command {
         handle_colon_line(bridge, app, ctx, line, feeds).await;
         return Ok(());
@@ -1722,6 +1778,12 @@ async fn compose_key(
         // view after the kernel has already moved it (`docs/prompts.md`,
         // "The submit verb").
         let edge = app.views.get(&ctx).and_then(|view| view.edge());
+        // The kernel snapshots its own copy of the draft, so every keystroke
+        // still on the wire must land first.
+        if let Err(e) = app.drafts.flush().await {
+            app.note(format!("submit failed: {e:#}"));
+            return Ok(());
+        }
         match bridge.submit_input(ctx, edge).await {
             Ok(block_id) => {
                 app.mark_submitted(block_id);
@@ -1733,7 +1795,10 @@ async fn compose_key(
                 // `ServerEvent::TurnStarted` (`mark_turn_liveness`).
                 app.mark_turn_running(ctx);
             }
-            Err(e) => app.note(format!("submit failed: {e}")),
+            Err(e) => {
+                tracing::warn!(context = %ctx.short(), error = %format!("{e:#}"), "submit failed");
+                app.note(format!("submit failed: {e:#}"));
+            }
         }
     }
     Ok(())
@@ -1877,21 +1942,20 @@ async fn interrupt_ctrl_c(bridge: &KernelBridge, app: &mut App, ladder: &mut int
         }
         InterruptStep::HardAndClear => {
             let _ = bridge.interrupt_context(ctx, true).await;
-            clear_draft(bridge, app, ctx).await;
+            clear_draft(app, ctx);
             app.note("aborted, draft cleared");
         }
     }
 }
 
 /// The 3rd `Ctrl+C` press: clear the draft both locally and on the kernel's
-/// copy — `edit_input` deletes the whole text, then `reset` puts compose
-/// back in its fresh-draft shape (`docs/tui.md`, "Ctrl+C reclaimed").
-async fn clear_draft(bridge: &KernelBridge, app: &mut App, ctx: ContextId) {
-    let len = app.compose.text().chars().count() as u64;
-    if len > 0
-        && let Ok(version) = bridge.edit_input(ctx, 0, "", len).await
-    {
-        app.compose.record_ack(version);
+/// copy — one edit deletes the whole text, queued behind the keystrokes
+/// that wrote it, then `reset` puts compose back in its fresh-draft shape
+/// (`docs/tui.md`, "Ctrl+C reclaimed").
+fn clear_draft(app: &mut App, ctx: ContextId) {
+    let len = app.compose.text().chars().count();
+    if len > 0 {
+        mirror_ops(app, ctx, &[kaijutsu_editor::EditOp { offset: 0, insert: String::new(), delete: len }]);
     }
     app.compose.reset();
 }

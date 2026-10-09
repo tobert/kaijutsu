@@ -148,6 +148,84 @@ fn typing_lands_on_the_compose_row() {
     assert!(ok, "{}", session.dump("after typing hello"));
 }
 
+/// A burst of typing reaches the kernel's draft whole and in typed order,
+/// backspaces included. The key path queues each edit without waiting for
+/// the kernel (`kaijutsu_tui::outbox`), so this probes that the queue keeps
+/// order end to end and that the kernel's echo of the draft never rewinds
+/// the line on screen.
+#[test]
+fn a_burst_of_typing_reaches_the_kernel_draft_in_order() {
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(24, 80);
+    wait_for_attach(&session);
+
+    // One write, so the client reads the keys as fast as its reader can.
+    session.send("ithe quick brown fox jumps over the lazy dog\x7f\x7f\x7fcat, typed fast");
+    let expected = "the quick brown fox jumps over the lazy cat, typed fast";
+
+    let on_screen = |screen: &vt100::Screen| {
+        screen.rows(0, screen.size().1).any(|line| line.contains('❯') && line.contains(expected))
+    };
+    assert!(session.wait_until(Duration::from_secs(5), on_screen), "{}", session.dump("after the burst"));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut drafts = support::kernel_drafts(&server);
+    while !drafts.iter().any(|d| d == expected) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        drafts = support::kernel_drafts(&server);
+    }
+    assert!(drafts.iter().any(|d| d == expected), "kernel drafts: {drafts:?}");
+
+    // The echo has had time to land; the line still reads as typed.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        session.screen_text().iter().any(|line| line.contains('❯') && line.contains(expected)),
+        "{}",
+        session.dump("after the echo")
+    );
+}
+
+/// A submit right behind a burst carries every keystroke: the client flushes
+/// its queued draft edits before the kernel snapshots the draft. The burst
+/// is long so its edits are still on the wire when `Enter` arrives; a
+/// submit that did not wait would snapshot a prefix.
+///
+/// The ephemeral kernel has no performer, so the turn itself is refused,
+/// but the kernel has already recorded the user message by then, and that
+/// message is what this probe reads. The terminal is wide so the unsent
+/// draft left in the band stays short enough to keep `❯` on screen.
+#[test]
+fn a_submit_right_after_typing_carries_every_keystroke() {
+    let _serial = serial();
+    let (server, _key_dir, session) = spawn_session(24, 250);
+    wait_for_attach(&session);
+
+    // Under 1024 bytes: a longer raw burst stalls the client's key reader
+    // (`docs/issues.md`).
+    let typed = format!("{}endmark", "word ".repeat(200));
+    session.send(&format!("i{typed}"));
+    // The screen answers from the local buffer, well ahead of the kernel.
+    let echoed = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "endmark"));
+    assert!(echoed, "{}", session.dump("after the burst"));
+    // `Esc` on its own, so it is not read with the next byte as `Alt+`.
+    session.send("\x1b");
+    let normal = session.wait_until(Duration::from_secs(5), |screen| screen_contains_str(screen, "-- NORMAL --"));
+    assert!(normal, "{}", session.dump("after Esc"));
+    let queued = support::kernel_drafts(&server);
+    assert!(
+        queued.iter().all(|d| !d.contains("endmark")),
+        "the burst must still be on the wire for this probe to mean anything: {} chars landed",
+        queued.iter().map(|d| d.len()).max().unwrap_or(0)
+    );
+    session.send("\r");
+
+    let recorded = session.wait_until(Duration::from_secs(15), |screen| {
+        let rows: Vec<String> = screen.rows(0, screen.size().1).collect();
+        compose_row(&rows).is_some_and(|draft| rows[..draft].iter().any(|l| l.contains("endmark")))
+    });
+    assert!(recorded, "the user message lacks the last keystrokes: {}", session.dump("after submit"));
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // c. The picker is an overlay and leaves the transcript intact
 // ────────────────────────────────────────────────────────────────────────────
@@ -313,6 +391,23 @@ fn readout(session: &TuiSession) -> Option<(usize, usize)> {
 
 /// Wait for the scrolled hint to take the band's status row, and assert the
 /// readout names a real position rather than the frame before's `line 0/0`.
+/// The `line N/M` readout once it holds still. Blocks that land after the
+/// scroll, such as a fork's own result, grow `M` under a reader who has not
+/// moved, and a frame is drawn as soon as a key is handled, so the first
+/// scrolled frame can precede them.
+fn settled_readout(session: &TuiSession) -> (usize, usize) {
+    let mut last = readout(session).expect("a readout while scrolled");
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = readout(session).expect("a readout while scrolled");
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    panic!("the readout never settled: {}", session.dump("settling"));
+}
+
 fn wait_for_scrolled(session: &TuiSession, label: &str) {
     let scrolled = session.wait_until(Duration::from_secs(5), |screen| {
         screen.rows(0, screen.size().1).any(|l| l.contains("q leave"))
@@ -1815,7 +1910,7 @@ fn a_scrolled_context_comes_back_scrolled_after_a_switch() {
 
     wheel_up(&session);
     wait_for_scrolled(&session, "after three Up");
-    let place = readout(&session).expect("a readout while scrolled");
+    let place = settled_readout(&session);
 
     switch_to_seat(&session, other);
     // A line only the fork has, so "the fork is on screen" is something the
@@ -2219,3 +2314,5 @@ fn a_lone_escape_leaves_insert_mode_under_the_kitty_protocol() {
 
     quit(&mut session);
 }
+
+
