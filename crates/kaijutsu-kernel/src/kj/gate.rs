@@ -458,7 +458,7 @@ pub(crate) async fn run_gate(
     if spec.origin != Origin::ShellGate {
         return run_gate_recorded(kernel, caller, spec, ledger_flows, config, None, &|_, _| Ok(())).await;
     }
-    let shadow = crate::council::shadow::record_call(kernel, caller.context_id, &spec);
+    let shadow = crate::council::shadow::record_call(kernel, caller.context_id, &spec, config);
     let (outcome, bump_flavor) = match crate::council::gate::consult(kernel, caller, &spec, config).await {
         Ok(council) => {
             let bump_flavor = council.as_ref().and_then(|c| c.submission_bump()).map(|b| b.flavor);

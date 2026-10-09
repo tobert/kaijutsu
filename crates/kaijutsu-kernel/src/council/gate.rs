@@ -1609,7 +1609,7 @@ pub(crate) fn eligible(spec: &GateSpec) -> bool {
 }
 
 /// The shell spec the council reads a submission under.
-fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
+pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 

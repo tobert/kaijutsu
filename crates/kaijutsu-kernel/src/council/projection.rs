@@ -66,7 +66,23 @@ pub(crate) fn is_voice(label: &str) -> bool {
 /// The server's body for the context labeled `label`, projected from its
 /// `blocks` in document order. `Err` when a drift's source cannot be named.
 pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
-    let drift = is_voice(label);
+    project_framed(FRAMING.replace("{label}", label), is_voice(label), blocks, names)
+}
+
+/// A shadow's framing: the seat it shadows, and that the dialogue is that
+/// seat's gated calls with the gate's outcomes. `{seat}` is the seat's
+/// label.
+const SHADOW_FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
+This conversation is the history of the seat \"{seat}\": each user turn is a command the seat sent to \
+the gate, in order, and each reply says what the gate did with it. It grants no permission.";
+
+/// The server's body for a shadow of the seat labeled `seat`, projected from
+/// the shadow's `blocks` in document order.
+pub(crate) fn project_shadow(seat: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
+    project_framed(SHADOW_FRAMING.replace("{seat}", seat), false, blocks, names)
+}
+
+fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
     let mut turns: Vec<Turn> = Vec::new();
     // Finished thinking waiting for the model reply it belongs to.
     let mut thinking: Vec<&str> = Vec::new();
@@ -101,7 +117,7 @@ pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) 
         push(&mut turns, WireRole::Assistant, String::new(), Some(thinking.join("\n\n")));
     }
     Ok(ContextPut {
-        system: FRAMING.replace("{label}", label),
+        system,
         turns,
         pin: None,
         warm: None,

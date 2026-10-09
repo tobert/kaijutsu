@@ -80,6 +80,8 @@ struct Mock {
     put_delays: Arc<Mutex<VecDeque<Duration>>>,
     /// Holds the next decision until the test releases it.
     hold: Arc<Mutex<Option<Hold>>>,
+    /// Every context `PUT`: the context id and its body, in arrival order.
+    puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>>,
 }
 
 impl Mock {
@@ -120,6 +122,24 @@ impl Mock {
 
     fn decisions(&self) -> Vec<DecisionRequest> {
         self.decisions.lock().unwrap().clone()
+    }
+
+    /// The bodies `PUT` for `context`, in arrival order.
+    fn puts_for(&self, context: kaijutsu_types::ContextId) -> Vec<kaijutsu_mk::council::wire::ContextPut> {
+        let id = context.to_string();
+        self.puts.lock().unwrap().iter().filter(|(c, _)| *c == id).map(|(_, body)| body.clone()).collect()
+    }
+
+    /// Waits until `context` has had `want` `PUT`s, and returns them.
+    async fn wait_for_puts(&self, context: kaijutsu_types::ContextId, want: usize) -> Vec<kaijutsu_mk::council::wire::ContextPut> {
+        for _ in 0..500 {
+            let puts = self.puts_for(context);
+            if puts.len() >= want {
+                return puts;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{context} had {} PUTs, not {want}", self.puts_for(context).len());
     }
 }
 
@@ -172,14 +192,15 @@ async fn serve() -> Mock {
     let calls: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
     let put_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
     let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
+    let puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>> = Arc::default();
     let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
-    let holding = hold.clone();
+    let (holding, bodies) = (hold.clone(), puts.clone());
     tokio::spawn(async move {
         let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
-            let holding = holding.clone();
+            let (holding, bodies) = (holding.clone(), bodies.clone());
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
@@ -192,6 +213,8 @@ async fn serve() -> Mock {
                     }
                     ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
                         let n = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let id = p.rsplit('/').next().unwrap().to_string();
+                        bodies.lock().unwrap().push((id, serde_json::from_str(&body).unwrap()));
                         let delay = held.lock().unwrap().pop_front().unwrap_or(Duration::ZERO);
                         Reply {
                             delay,
@@ -225,7 +248,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, put_delays, hold }
+    Mock { base, decisions, behavior, calls, put_delays, hold, puts }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2458,6 +2481,11 @@ async fn without_a_mode_the_gate_is_a_gatekeeper() {
 /// Gives the rig's seat a cast whose `judge` slot names `model`, so the seat
 /// gets a judge shadow (`docs/council.md`, "Shadow voice").
 fn give_judge_cast(rig: &Rig, model: &str) {
+    give_judge_cast_on(rig, model, "anthropic", None);
+}
+
+/// [`give_judge_cast`] on a backend of `kind`, at `base_url` when given.
+fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>) {
     use crate::kernel_db::{CastRow, CastSlotRow};
     let db = rig.d.kernel_db();
     let db = db.lock();
@@ -2473,9 +2501,9 @@ fn give_judge_cast(rig: &Rig, model: &str) {
     let backend = db
         .upsert_backend(&crate::kernel_db::BackendRow {
             backend_id: kaijutsu_types::BackendId::new(),
-            name: "judge-backend".into(),
-            kind: "anthropic".into(),
-            base_url: None,
+            name: format!("judge-{kind}"),
+            kind: kind.into(),
+            base_url: base_url.map(str::to_owned),
             api_key_env: None,
             api_key_file: None,
             key_optional: true,
@@ -2549,6 +2577,7 @@ async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
     assert_eq!(turns[3].1, "ran");
     assert_eq!(turns[4].1, "shell_write: rm /work/marker");
     assert_eq!(turns[5].1, "asked the reviewer");
+    assert!(rig.mock.puts_for(shadow.context_id).is_empty(), "a judge on a chat backend is hydrated whole, never primed");
     rig.finish().await;
 }
 
@@ -2573,5 +2602,33 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
     rig.submit("echo static").await.unwrap();
     assert!(judge_shadows(&rig).is_empty());
+    rig.finish().await;
+}
+
+/// A judge on a council server is primed with each call as it arrives: the
+/// shadow is `PUT` whole after the call is recorded, under a framing that
+/// names the seat, and each later `PUT` extends the one before.
+/// Each `PUT` may also carry the call's outcome, which can land first.
+///
+/// Falsified by priming only at decision time (no `PUT` for a static
+/// allow), or by projecting the shadow as a council context (its framing
+/// does not call it the seat's history).
+#[tokio::test]
+async fn a_judge_on_a_council_server_is_primed_with_each_call() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    let base = rig.mock.base.clone();
+    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    rig.submit("echo one").await.unwrap();
+    let shadow = judge_shadows(&rig)[0].context_id;
+    let puts = rig.mock.wait_for_puts(shadow, 1).await;
+    // Priming runs on its own task, so it may read the outcome turn too.
+    let turns: Vec<&str> = puts[0].turns.iter().map(|t| t.content.as_str()).collect();
+    assert_eq!(turns[0], "shell_write: echo one", "{turns:?}");
+    assert!(puts[0].system.contains("the history of the seat \"council-seat\""), "the framing names the seat: {}", puts[0].system);
+
+    rig.submit("echo two").await.unwrap();
+    let puts = rig.mock.wait_for_puts(shadow, 2).await;
+    let turns: Vec<&str> = puts[1].turns.iter().map(|t| t.content.as_str()).collect();
+    assert_eq!(turns[..3], ["shell_write: echo one", "ran", "shell_write: echo two"], "{turns:?}");
     rig.finish().await;
 }

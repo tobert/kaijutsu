@@ -22,7 +22,7 @@ use kaijutsu_mk::{MkClient, MkError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
 
-use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules};
+use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules, project_shadow};
 use crate::kj::gate_policy::CouncilConfig;
 
 /// Everything one decision needs from the server's side.
@@ -56,6 +56,10 @@ pub(crate) struct PreparedContext {
     /// labeled council context. Its id comes from its body.
     pub(crate) house_rules: bool,
 }
+
+/// Bounds each call that primes a shadow. Priming runs off the gate's path,
+/// so it waits longer than a decision's deadline.
+const SHADOW_PRIME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The label the house-rules context goes by in reports and miss causes.
 pub(crate) const HOUSE_RULES_LABEL: &str = "house-rules";
@@ -96,6 +100,10 @@ pub(crate) struct CouncilSync {
     /// Serializes `prepare`, so two decisions never `PUT` the same context
     /// against the same head.
     serial: tokio::sync::Mutex<()>,
+    /// Serializes [`CouncilSync::prime_shadow`] apart from `prepare`: a
+    /// decision never reads a shadow while shadows only record, so a slow
+    /// priming `PUT` never holds up the gate.
+    shadow_serial: tokio::sync::Mutex<()>,
     state: parking_lot::Mutex<State>,
 }
 
@@ -259,6 +267,33 @@ impl CouncilSync {
 
         let spec = spec_body;
         Ok(Prepared { client, identity, spec, spec_id, contexts })
+    }
+
+    /// Sends the shadow `shadow` of the seat labeled `seat` to `server`, so
+    /// the server holds its dialogue before the next question about it.
+    /// Warms the spec named `spec_name` when the server can. Sends nothing
+    /// when the server already holds this body.
+    pub(crate) async fn prime_shadow(
+        &self,
+        kernel: &crate::Kernel,
+        server: &str,
+        spec_name: &str,
+        shadow: ContextId,
+        seat: &str,
+    ) -> Result<SnapshotId, PrepareMiss> {
+        let _serial = self.shadow_serial.lock().await;
+        let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(server, "client", e))?;
+        let identity = self.identity(&client, server).await?;
+        let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
+        self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
+        let blocks = kernel
+            .blocks()
+            .block_snapshots(shadow)
+            .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be read: {e}")))?;
+        let body = project_shadow(seat, &blocks, &*kernel.kernel_db().lock())
+            .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
+        let label = format!("shadow of {seat}");
+        self.hold(&client, server, &identity, &spec_id, &label, shadow, body, true).await
     }
 
     /// Makes the server hold `body` as `context_id` and returns its head.

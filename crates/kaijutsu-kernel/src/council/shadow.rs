@@ -7,13 +7,21 @@
 //! has a judge shadow when its cast has a [`JUDGE`] slot; the shadow is
 //! created on the first call the gate evaluates for that seat.
 //!
+//! A judge on a council server (a backend of kind `mk`) is primed after
+//! each call: the shadow is sent whole on a task of its own, warming the
+//! seat's shell spec, so the server holds the dialogue before it is asked
+//! about it. A judge on a chat backend is hydrated whole when it is asked.
+//!
 //! A shadow records and decides nothing. Every failure here is logged at
 //! error level and leaves the gate's decision alone.
+
+use std::sync::Arc;
 
 use kaijutsu_types::{BlockId, BlockKind, ContentType, ContextId, ContextState, DocKind, PrincipalId, Role, Status};
 
 use crate::kernel_db::{ContextRow, KernelDbError, KernelDbResult};
 use crate::kj::gate::{GateOutcome, GateSpec, GateVerdict};
+use crate::kj::gate_policy::GateConfigLoad;
 
 /// The context_type, and the cast slot role, of a judge shadow.
 pub(crate) const JUDGE: &str = "judge";
@@ -32,27 +40,76 @@ pub(crate) struct ShadowCall {
     call: BlockId,
 }
 
+/// A seat's judge shadow and where its model is served.
+struct Judge {
+    shadow: ContextId,
+    /// The seat's label, or its short id when it has none.
+    seat_name: String,
+    seat_type: String,
+    /// The council server that holds the shadow: the `judge` slot's backend
+    /// address when its kind is `mk`. `None` for a chat backend.
+    server: Option<String>,
+}
+
 /// Appends the call `spec` describes to the judge shadow of `seat`, creating
-/// the shadow on the seat's first call. `None` when the seat has no judge
-/// slot in its cast, or when writing failed (logged).
-pub(crate) fn record_call(kernel: &crate::Kernel, seat: Option<ContextId>, spec: &GateSpec) -> Option<ShadowCall> {
+/// the shadow on the seat's first call, and primes a council-server judge.
+/// `None` when the seat has no judge slot in its cast, or when writing
+/// failed (logged).
+pub(crate) fn record_call(
+    kernel: &Arc<crate::Kernel>,
+    seat: Option<ContextId>,
+    spec: &GateSpec,
+    config: &GateConfigLoad,
+) -> Option<ShadowCall> {
     let seat = seat?;
-    let shadow = match judge_shadow(kernel, seat) {
-        Ok(Some(shadow)) => shadow,
+    let judge = match judge_shadow(kernel, seat) {
+        Ok(Some(judge)) => judge,
         Ok(None) => return None,
         Err(error) => {
             tracing::error!(%seat, "shadow: cannot find or create the judge shadow: {error}");
             return None;
         }
     };
+    let shadow = judge.shadow;
     let text = call_text(&spec.tool, &spec.authorized_label);
-    match append(kernel, shadow, Role::User, text) {
-        Ok(call) => Some(ShadowCall { shadow, call }),
+    let call = match append(kernel, shadow, Role::User, text) {
+        Ok(call) => call,
         Err(error) => {
             tracing::error!(%seat, %shadow, "shadow: cannot record the call: {error}");
-            None
+            return None;
         }
-    }
+    };
+    spawn_prime(kernel, &judge, config);
+    Some(ShadowCall { shadow, call })
+}
+
+/// Primes a council-server judge on a task of its own. The judge is read
+/// under the seat's shell spec from `gate.toml`; a seat whose type has no
+/// council there is not primed.
+fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLoad) {
+    let Some(server) = judge.server.clone() else { return };
+    let spec_name = config
+        .as_ref()
+        .ok()
+        .and_then(|c| c.council_for(Some(&judge.seat_type)))
+        .and_then(super::gate::shell_spec)
+        .map(|s| s.name.clone());
+    let Some(spec_name) = spec_name else {
+        tracing::warn!(shadow = %judge.shadow, seat_type = %judge.seat_type, "shadow: not primed: gate.toml declares no council shell spec for the seat's type");
+        return;
+    };
+    let (kernel, shadow, seat_name) = (kernel.clone(), judge.shadow, judge.seat_name.clone());
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        match kernel.council_sync().prime_shadow(&kernel, &server, &spec_name, shadow, &seat_name).await {
+            Ok(head) => tracing::info!(
+                target: "kaijutsu::council",
+                %shadow, %server, head = %head, elapsed_ms = started.elapsed().as_millis() as u64,
+                "shadow primed"
+            ),
+            Err(miss) => tracing::error!(target: "kaijutsu::council", %shadow, %server, "shadow: priming failed: {}", miss.0),
+        }
+    });
 }
 
 /// Appends what the gate did with a call as the model turn after it.
@@ -114,23 +171,31 @@ fn append(kernel: &crate::Kernel, shadow: ContextId, role: Role, text: String) -
 /// The seat's live judge shadow, created when the seat's cast has a
 /// [`JUDGE`] slot and no shadow exists yet. The shadow is found by its fork
 /// edge and type, never by its label.
-fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<ContextId>> {
+fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Option<Judge>> {
     let _create = CREATE.lock();
-    let row = {
+    let (row, judge) = {
         let db = kernel.kernel_db().lock();
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
         let Some(cast_id) = seat_row.cast_id else { return Ok(None) };
-        if db.get_cast_slot(cast_id, JUDGE)?.is_none() {
-            return Ok(None);
-        }
+        let Some(slot) = db.get_cast_slot(cast_id, JUDGE)? else { return Ok(None) };
+        let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id);
+        let server = backend.filter(|b| b.kind == "mk").and_then(|b| b.base_url);
+        let mut judge = Judge {
+            shadow: seat,
+            seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),
+            seat_type: seat_row.context_type.clone(),
+            server,
+        };
         if let Some(existing) = db.structural_children(seat)?.into_iter().find(|c| c.context_type == JUDGE) {
-            return Ok(Some(existing.context_id));
+            judge.shadow = existing.context_id;
+            return Ok(Some(judge));
         }
         let row = shadow_row(&seat_row, cast_id);
         db.in_transaction(|db| crate::kj::context::insert_new_context_rows(db, &row, Some(seat)))?;
-        row
+        judge.shadow = row.context_id;
+        (row, judge)
     };
     kernel
         .blocks()
@@ -140,7 +205,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
     if let Err(error) = registered {
         tracing::error!(%seat, shadow = %row.context_id, "shadow: label not registered: {error}");
     }
-    Ok(Some(row.context_id))
+    Ok(Some(judge))
 }
 
 /// A judge shadow's row: a fork child of the seat playing the seat's cast,

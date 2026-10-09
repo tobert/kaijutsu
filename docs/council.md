@@ -408,9 +408,15 @@ shipped. A fresh session resumes at the first step not marked done.
    `shell_pre_call_hooks` (ACP and MCP clients) are not recorded yet.
    1c. **Archive with the seat.** Archiving a seat does not archive its
    shadow yet.
-2. **Priming a council server.** After each appended call, the kernel
-   `PUT`s the shadow with `warm`, off the hot path. Test against the fake
-   council server: one `PUT` per call, re-feeding at most eight turns.
+2. **Done: priming a council server.** A `judge` slot whose backend has
+   kind `mk` names the server by its `base_url` (the megakernel serves
+   `/council/v1` at the same address). After each recorded call, a task
+   of its own `PUT`s the shadow whole (`CouncilSync::prime_shadow`), under
+   a framing that calls it the seat's history, warming the seat's shell
+   spec from `gate.toml`; a seat type with no council there is not primed
+   (logged). Priming has its own lock and a 30 s timeout, so it never
+   holds up a decision. A judge on any other backend is not primed. Test:
+   `a_judge_on_a_council_server_is_primed_with_each_call`.
 3. **Asking and recording.** Adds the `judge` context_type rc seed for
    the framing. After the gate decides, the kernel asks the judge about
    the last call, writes its answer as the model turn, and
