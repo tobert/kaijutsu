@@ -357,13 +357,6 @@ the line to be sent or cleared, not only for a pause in typing.
 
 ## Input latency follow-ups from the Nagle and draft outbox work (2026-10-09)
 
-- **A raw key burst over 1024 bytes stalls the tui.** Sent as one pty write
-  without bracketed paste, the client reads exactly 1024 bytes and then
-  stops reading until more input arrives; the kernel draft holds the first
-  1023 typed characters. The same happens on the code before the outbox, so
-  the key reader or crossterm's read chunking is the likely place. A
-  bracketed paste arrives as one `Paste` event and is not affected.
-  `terminal_fit`'s submit probe keeps its burst under 1024 bytes for now.
 - **A refused submit still commits the user message.** On a context with no
   performer, `submit_input` records the user message (the transcript shows
   it and two `stream error` rows), clears the kernel draft, and then

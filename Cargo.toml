@@ -202,7 +202,10 @@ editor-types = "0.0.2"
 # same crossterm the workspace already carries through modalkit, so one
 # crossterm serves both the renderer and the vi surfaces.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "underline-color", "scrolling-regions"] }
-crossterm = { version = "0.29" }
+# `use-dev-tty` selects crossterm's poll(2) input reader. The default mio
+# reader is edge-triggered and returns after a full 1024-byte read without
+# draining the tty, so a longer burst stalls until the next key arrives.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 unicode-width = "0.2"
 
 # Cross-platform PTY spawning — the real `kaijutsu-tui` binary runs inside

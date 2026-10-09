@@ -185,6 +185,24 @@ fn a_burst_of_typing_reaches_the_kernel_draft_in_order() {
     );
 }
 
+/// A raw burst longer than one 1024-byte read reaches the draft whole.
+/// crossterm's default mio reader returns after a full read without
+/// draining the tty, and its edge-triggered wakeup never fires for the
+/// bytes left behind, so the client used to stop at exactly 1024 bytes
+/// until the next key arrived. The `use-dev-tty` reader polls level-
+/// triggered and keeps reading.
+#[test]
+fn a_burst_longer_than_one_read_reaches_the_draft_whole() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 250);
+    wait_for_attach(&session);
+
+    let typed = format!("{}endmark", "word ".repeat(300));
+    session.send(&format!("i{typed}"));
+    let whole = session.wait_until(Duration::from_secs(15), |screen| screen_contains_str(screen, "endmark"));
+    assert!(whole, "the burst stopped short: {}", session.dump("after a 1500-byte burst"));
+}
+
 /// A submit right behind a burst carries every keystroke: the client flushes
 /// its queued draft edits before the kernel snapshots the draft. The burst
 /// is long so its edits are still on the wire when `Enter` arrives; a
@@ -200,8 +218,6 @@ fn a_submit_right_after_typing_carries_every_keystroke() {
     let (server, _key_dir, session) = spawn_session(24, 250);
     wait_for_attach(&session);
 
-    // Under 1024 bytes: a longer raw burst stalls the client's key reader
-    // (`docs/issues.md`).
     let typed = format!("{}endmark", "word ".repeat(200));
     session.send(&format!("i{typed}"));
     // The screen answers from the local buffer, well ahead of the kernel.
