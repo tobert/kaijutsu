@@ -153,6 +153,7 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
 }
 
 #[test]
+#[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 fn visual_selection_travels_over_the_wire() {
     // The renderers draw a visual-mode highlight from `EditorState.selection`
     // alone (docs/vi.md, "Selection rects"): the keys() return and the push

@@ -889,6 +889,7 @@ fn transform_cursor(cursor: usize, op: &EditOp) -> usize {
 /// The half-open char spans a selection covers in `text`, between the sorted
 /// `(line, column)` ends `start` and `end` (both ends included, as in vim).
 /// Every span is clamped to the text; see [`EditorSelection`].
+#[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 fn selection_spans(
     text: &str,
     start: (usize, usize),
@@ -996,6 +997,7 @@ fn named_key(token: &str) -> Option<TerminalKey> {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 mod tests {
     use super::*;
 

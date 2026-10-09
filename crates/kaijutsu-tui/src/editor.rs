@@ -523,6 +523,7 @@ pub fn abandon() {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 mod tests {
     use super::*;
     use kaijutsu_types::editor::{EditorSelection, SelectionShape};

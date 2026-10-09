@@ -1077,6 +1077,7 @@ mod session_tests {
     /// The visual selection rides the state and its JSON shape; leaving
     /// visual mode clears both.
     #[tokio::test]
+    #[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
     async fn visual_selection_rides_the_state_and_its_json() {
         let (blocks, target) = seeded(b"hello world").await;
         let mut sessions = EditorSessions::new();
