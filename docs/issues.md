@@ -2095,17 +2095,6 @@ hydrate delivery is still landing, not a wrong anchor. Reproduce under
 load before changing the anchor logic; the probe passes alone, so a fix
 that only changes the probe's waits is suspect too.
 
-## An editor edit publishes after it releases the lock (2026-09-14, inherited)
-
-`Kernel::editor_keys_checked` and `Kernel::editor_insert` compute the new
-state under the sessions lock, release it, run `mark_dirty` (a database
-write), and only then `publish_editor_state`. A reconciler merge landing in
-that window publishes the merged state first and the older snapshot second,
-so a renderer ends on a buffer missing the peer's edit until the next push.
-Not new with the paste slice; `editor_keys` has had the same window. Fix
-is to publish the state read under the lock before the database write, or
-re-read after it. Found by the kaibo review of the paste slice.
-
 ## The tui takes the kernel-wide firehose (2026-09-10)
 
 `crates/kaijutsu-tui/src/bridge.rs` spawns the actor with

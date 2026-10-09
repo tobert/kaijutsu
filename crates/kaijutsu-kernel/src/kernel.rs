@@ -1640,7 +1640,7 @@ impl Kernel {
                     .mark_dirty(fp)
                     .map_err(|e| format!("editor :r: failed to mark {fp} dirty: {e}"))?;
             }
-            self.publish_editor_state(id, &state);
+            let state = self.publish_current_editor_state(id, state.message)?;
             return Ok(state);
         }
 
@@ -1694,7 +1694,7 @@ impl Kernel {
                         state = self.editor_sessions.lock().0.save(id)?;
                     }
                 }
-                self.publish_editor_state(id, &state);
+                let state = self.publish_current_editor_state(id, state.message)?;
                 Ok(state)
             }
             crate::editor::KeysOutcome::Closed(update) => {
@@ -1791,7 +1791,7 @@ impl Kernel {
                 .mark_dirty(fp)
                 .map_err(|e| format!("editor insert: failed to mark {fp} dirty: {e}"))?;
         }
-        self.publish_editor_state(id, &state);
+        let state = self.publish_current_editor_state(id, state.message)?;
         Ok(state)
     }
 
@@ -1891,7 +1891,7 @@ impl Kernel {
                 state = self.editor_sessions.lock().0.save(id)?;
             }
         }
-        self.publish_editor_state(id, &state);
+        let state = self.publish_current_editor_state(id, state.message)?;
         Ok(state)
     }
 
@@ -1978,17 +1978,30 @@ impl Kernel {
         }
     }
 
-    /// Publish a session's current state on the editor push channel.
-    fn publish_editor_state(
+    /// Publish a session's state on the editor push channel, read and
+    /// published under one hold of the sessions lock.
+    ///
+    /// Every `StateChanged` goes out this way, so the order of publications
+    /// for a session is the order of its states: a state computed earlier
+    /// (before a database write, a flush, or a `:r` fetch) never reaches a
+    /// renderer after a newer one. `message` carries the transient status
+    /// line of the caller's batch, which a fresh read does not have. The
+    /// publish is a non-blocking send, safe under the lock. Returns the
+    /// state that was published.
+    fn publish_current_editor_state(
         &self,
         id: crate::editor::EditorSessionId,
-        state: &crate::editor::EditorState,
-    ) {
+        message: Option<String>,
+    ) -> Result<crate::editor::EditorState, String> {
+        let mut sessions = self.editor_sessions.lock();
+        let mut state = sessions.0.state(id)?;
+        state.message = message;
         self.editor_flows
             .publish(crate::flows::EditorFlow::StateChanged {
                 session_id: id.as_u64(),
                 state: state.clone(),
             });
+        Ok(state)
     }
 
     /// Reconcile open editor sessions after a block's text changed underneath
@@ -2004,13 +2017,16 @@ impl Kernel {
         context_id: kaijutsu_types::ContextId,
         block_id: kaijutsu_types::BlockId,
     ) {
-        let changed = self
-            .editor_sessions
-            .lock()
-            .0
-            .reconcile_block(context_id, block_id, self.blocks());
+        // Publish under the sessions lock, like every edit path
+        // ([`publish_current_editor_state`](Self::publish_current_editor_state)).
+        let mut sessions = self.editor_sessions.lock();
+        let changed = sessions.0.reconcile_block(context_id, block_id, self.blocks());
         for (id, state) in &changed {
-            self.publish_editor_state(*id, state);
+            self.editor_flows
+                .publish(crate::flows::EditorFlow::StateChanged {
+                    session_id: id.as_u64(),
+                    state: state.clone(),
+                });
         }
     }
 
@@ -2765,6 +2781,97 @@ mod tests {
         let kernel = Kernel::new_ephemeral("test").await;
         kernel.mount("/mem", MemoryBackend::new()).await;
         kernel
+    }
+
+    /// Open two sessions on one file, then run `edit` (an edit of session A)
+    /// on a second thread while this thread holds the file cache's entry
+    /// table, which parks `mark_dirty`. The edit has already been applied to A's
+    /// buffer when it parks, so a peer's merge landing now is exactly the
+    /// reconciler racing an edit's publication. Returns the states published
+    /// for A, in arrival order.
+    async fn editor_states_published_while_an_edit_waits_to_mark_dirty(
+        edit: impl FnOnce(&Kernel, crate::editor::EditorSessionId) + Send,
+    ) -> Vec<crate::editor::EditorState> {
+        use crate::vfs::VfsOps as _;
+        use std::path::Path;
+
+        let kernel = kernel_with_mem_fs().await;
+        kernel.vfs().write_all(Path::new("/mem/note.txt"), b"hello").await.unwrap();
+        let (a, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        let (b, _) = kernel.editor_open("/mem/note.txt").await.unwrap();
+        let target = crate::editor::resolve_editor_target("/mem/note.txt", kernel.file_cache())
+            .await
+            .unwrap();
+        let mut sub = kernel.editor_flows().subscribe("editor.*");
+        let actor = kaijutsu_types::PrincipalId::system();
+
+        let held = kernel.file_cache().hold_entry_table_for_test();
+        std::thread::scope(|scope| {
+            let editing = scope.spawn(|| edit(&kernel, a));
+            // A's buffer changes under the sessions lock before the edit
+            // reaches `mark_dirty`, which cannot pass while we hold the table.
+            while !kernel.editor_sessions.lock().0.state(a).unwrap().dirty {
+                std::thread::yield_now();
+            }
+            // A peer's edit lands on the block and the reconciler merges it
+            // into A, publishing the merged state.
+            kernel
+                .editor_sessions
+                .lock()
+                .0
+                .keys(b, "iPEER<Esc>", kernel.blocks(), actor)
+                .unwrap();
+            kernel.editor_reconcile_block(target.context_id, target.block_id);
+            drop(held);
+            editing.join().unwrap();
+        });
+
+        let mut published = Vec::new();
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+        {
+            if let crate::flows::EditorFlow::StateChanged { session_id, state } = msg.payload
+                && session_id == a.as_u64()
+            {
+                published.push(state);
+            }
+        }
+        published
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editor_insert_never_publishes_a_state_older_than_a_peer_merge() {
+        let published = editor_states_published_while_an_edit_waits_to_mark_dirty(|kernel, a| {
+            kernel
+                .editor_insert(a, "MINE", kaijutsu_types::PrincipalId::system())
+                .unwrap();
+        })
+        .await;
+        let last = published.last().expect("A had states published");
+        assert!(
+            last.text.contains("PEER") && last.text.contains("MINE"),
+            "the last published state must carry both edits, got {:?} (all: {:?})",
+            last.text,
+            published.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editor_keys_never_publishes_a_state_older_than_a_peer_merge() {
+        let handle = tokio::runtime::Handle::current();
+        let published = editor_states_published_while_an_edit_waits_to_mark_dirty(|kernel, a| {
+            handle
+                .block_on(kernel.editor_keys(a, "iMINE<Esc>", kaijutsu_types::PrincipalId::system()))
+                .unwrap();
+        })
+        .await;
+        let last = published.last().expect("A had states published");
+        assert!(
+            last.text.contains("PEER") && last.text.contains("MINE"),
+            "the last published state must carry both edits, got {:?} (all: {:?})",
+            last.text,
+            published.iter().map(|s| s.text.as_str()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

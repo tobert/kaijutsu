@@ -714,6 +714,15 @@ impl FileDocumentCache {
             .map_err(|e| format!("invalidate_document({path}): {e}"))
     }
 
+    /// Hold the entry table's write lock so a `mark_dirty` parks until the
+    /// guard drops. Lets a test act inside the window between an editor
+    /// edit and its publication without touching the database, which block
+    /// writes need.
+    #[cfg(test)]
+    pub(crate) fn hold_entry_table_for_test(&self) -> impl Drop + '_ {
+        self.cache.write()
+    }
+
     /// Mark a file as dirty (needs flush to VFS). Also records the durable
     /// swap-file marker (`dirty_file_buffers`, docs/file-buffers.md) so the
     /// edit survives a cold cache — a swallowed failure here means unsaved
