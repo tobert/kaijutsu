@@ -433,9 +433,14 @@ shipped. A fresh session resumes at the first step not marked done.
    decision. Test: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`.
    Still open: the `judge` type's rc framing (the framing is a constant
    in `projection.rs`), and whether the judge should read the voices.
-4. **Measure on moltar.** Deploy, give banto's coders a cast with a
-   `judge` slot on the megakernel, and read priming time, answer time,
-   snapshot count, and the disagreement rate. Record the numbers in
+4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
+   `mk-judge` (one `judge` slot), and a `coder` character whose default
+   cast is `mk-judge`. A smoke seat played by `coder` ran `mkdir` then
+   `rmdir`: priming took 1.6 s and 4.2 s, the gate's council answered
+   proceed at 0.992 and 0.953, and the judge with the history answered
+   proceed at 0.994 and 0.967. Still to do: run banto's coders as
+   `coder`, then read priming time, answer time, snapshot count, and the
+   disagreement rate. Record the numbers in
    `docs/devlog.md`.
 5. **Jev hydration.** A chat-model judge gets the whole dialogue as one
    script-like transcript per request. Compare it with the megakernel on
