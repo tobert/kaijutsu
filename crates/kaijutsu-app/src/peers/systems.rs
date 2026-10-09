@@ -113,6 +113,8 @@ fn dispatch_peer_action(
                     // An open carries no status message — it's set only when a
                     // later `:`-line errors (arriving via the editor push).
                     message: None,
+                    // A fresh session is in normal mode, so it selects nothing.
+                    selection: None,
                 },
             });
 

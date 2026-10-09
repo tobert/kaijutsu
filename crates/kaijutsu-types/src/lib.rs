@@ -48,6 +48,7 @@ pub mod block;
 pub mod codec;
 pub mod context;
 pub mod dag;
+pub mod editor;
 pub mod enums;
 pub mod error_block;
 pub mod ids;

@@ -13,3 +13,4 @@ workspace = true
 modalkit = { workspace = true }
 editor-types = { workspace = true }
 regex = { workspace = true }
+kaijutsu-types = { workspace = true }

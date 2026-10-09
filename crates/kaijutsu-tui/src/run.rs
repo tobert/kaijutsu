@@ -3638,6 +3638,7 @@ mod tests {
                     dirty: false,
                     command_line: None,
                     message: None,
+                    selection: None,
                 },
             },
         );

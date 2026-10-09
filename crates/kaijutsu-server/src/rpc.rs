@@ -8723,6 +8723,22 @@ fn set_editor_state(
     b.set_dirty(state.dirty);
     b.set_command_line(state.command_line.as_deref().unwrap_or(""));
     b.set_message(state.message.as_deref().unwrap_or(""));
+    if let Some(selection) = &state.selection {
+        use crate::kaijutsu_capnp::SelectionShape as Wire;
+        use kaijutsu_kernel::editor::SelectionShape;
+        let mut sb = b.init_selection();
+        sb.set_shape(match selection.shape {
+            SelectionShape::Charwise => Wire::Charwise,
+            SelectionShape::Linewise => Wire::Linewise,
+            SelectionShape::Blockwise => Wire::Blockwise,
+        });
+        let mut spans = sb.init_spans(selection.spans.len() as u32);
+        for (i, span) in selection.spans.iter().enumerate() {
+            let mut out = spans.reborrow().get(i as u32);
+            out.set_start(span.start as u64);
+            out.set_end(span.end as u64);
+        }
+    }
 }
 
 // ============================================================================

@@ -153,6 +153,50 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
 }
 
 #[test]
+fn visual_selection_travels_over_the_wire() {
+    // The renderers draw a visual-mode highlight from `EditorState.selection`
+    // alone (docs/vi.md, "Selection rects"): the keys() return and the push
+    // both carry it, and leaving visual mode clears it.
+    use kaijutsu_types::editor::{EditorSelection, SelectionShape};
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let (callback, mut rx) = editor_events_channel(64);
+        kernel.subscribe_editor(callback).await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        assert_eq!(opened.selection, None, "a fresh session selects nothing");
+        let first_line = opened.text.split('\n').next().unwrap().chars().count();
+        assert!(first_line >= 2, "the seeded rc script's first line has two chars to select");
+
+        let charwise = kernel.editor_keys(session, "vl").await.unwrap();
+        let expected = EditorSelection { shape: SelectionShape::Charwise, spans: vec![0..2] };
+        assert_eq!(charwise.selection.as_ref(), Some(&expected));
+        let pushed = recv_state_for(&mut rx, session).await;
+        assert_eq!(pushed.selection, Some(expected), "the push carries the selection");
+
+        // The line break is selected too, except at the end of the text.
+        let line_end = (first_line + 1).min(opened.text.chars().count());
+        let linewise = kernel.editor_keys(session, "V").await.unwrap();
+        assert_eq!(
+            linewise.selection,
+            Some(EditorSelection { shape: SelectionShape::Linewise, spans: vec![0..line_end] }),
+            "V selects the whole first line"
+        );
+
+        let normal = kernel.editor_keys(session, "<Esc>").await.unwrap();
+        assert_eq!(normal.selection, None, "Esc clears the selection on the wire");
+        let polled = kernel.editor_state(session).await.unwrap();
+        assert_eq!(polled.selection, None);
+
+        kernel.editor_quit(session).await.unwrap();
+    });
+}
+
+#[test]
 fn editor_insert_pastes_at_the_cursor_and_pushes_over_the_wire() {
     // The paste target (docs/vi.md): `editorInsert` lands text at the cursor
     // without touching the session's mode, and mirrors + pushes exactly like

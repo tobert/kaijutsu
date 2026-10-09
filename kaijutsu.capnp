@@ -1103,6 +1103,30 @@ struct EditorState {
   dirty @4 :Bool;        # buffer differs from the last open/save checkpoint
   commandLine @5 :Text;  # the ":"-line while command mode is active (":wq"); "" = bar unfocused
   message @6 :Text;      # transient status/error line (vim E492); "" = none
+  selection @7 :EditorSelection;  # visual-mode selection; unset outside visual mode
+}
+
+# The vim visual-mode kind a selection came from.
+enum SelectionShape {
+  charwise @0;   # v
+  linewise @1;   # V
+  blockwise @2;  # <C-v>
+}
+
+# A visual-mode selection as the char ranges a renderer highlights. Each span
+# is half-open over char offsets into `EditorState.text`, in document order.
+# Charwise and linewise selections have one span; a blockwise selection has
+# one span per line that reaches its left column. A span covering a "\n"
+# selects the line break, drawn as one cell past the line's last char.
+struct EditorSelection {
+  shape @0 :SelectionShape;
+  spans @1 :List(CharSpan);
+}
+
+# A half-open range of char offsets: [start, end).
+struct CharSpan {
+  start @0 :UInt64;
+  end @1 :UInt64;
 }
 
 # Callback for receiving editor-session state pushes (the in-app vi editor).

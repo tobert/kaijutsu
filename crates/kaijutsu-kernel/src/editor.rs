@@ -77,6 +77,7 @@ pub async fn resolve_editor_target(
 use std::collections::HashMap;
 
 use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo};
+pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
 /// A one-line census entry for an open session — what `kj editor list` shows.
 /// Full ids (never truncated), matching the `.data` convention every other
@@ -201,6 +202,9 @@ pub struct EditorState {
     /// cleared on the next keystroke batch. The session stays open — a bad
     /// `:`-line reports here instead of erroring the whole `editor_keys` call.
     pub message: Option<String>,
+    /// The visual-mode selection as char spans to highlight; `None` outside
+    /// visual mode. Rebuilt from `EditorCore` on every state.
+    pub selection: Option<EditorSelection>,
 }
 
 impl EditorState {
@@ -217,6 +221,7 @@ impl EditorState {
             "dirty": self.dirty,
             "command_line": self.command_line,
             "message": self.message,
+            "selection": self.selection,
         })
     }
 }
@@ -899,12 +904,14 @@ fn state_of(core: &mut EditorCore, checkpoint: &str) -> EditorState {
     let cursor = core.cursor();
     let mode = core.mode();
     let command_line = core.command_line();
+    let selection = core.selection();
     EditorState {
         text,
         cursor,
         mode,
         dirty,
         command_line,
+        selection,
         // A fresh state carries no status message; the command path sets one only
         // when a `:`-line errored, and it clears on the next keystroke batch.
         message: None,
@@ -1065,6 +1072,28 @@ mod session_tests {
         // The invariant that makes this surface trustworthy: the kernel block now
         // equals the editor buffer (edit mirroring is faithful).
         assert_eq!(block_text(&blocks, &target).unwrap(), "Xhello");
+    }
+
+    /// The visual selection rides the state and its JSON shape; leaving
+    /// visual mode clears both.
+    #[tokio::test]
+    async fn visual_selection_rides_the_state_and_its_json() {
+        let (blocks, target) = seeded(b"hello world").await;
+        let mut sessions = EditorSessions::new();
+        let (id, st) = sessions.open(RC_PATH, target, &blocks, None).unwrap();
+        assert_eq!(st.selection, None);
+
+        let outcome = sessions.keys(id, "wve", &blocks, PrincipalId::system()).unwrap();
+        let expected = EditorSelection { shape: SelectionShape::Charwise, spans: vec![6..11] };
+        assert_eq!(outcome.state().selection, Some(expected));
+        assert_eq!(
+            outcome.state().to_json(id)["selection"],
+            serde_json::json!({"shape": "charwise", "spans": [{"start": 6, "end": 11}]})
+        );
+
+        let outcome = sessions.keys(id, "<Esc>", &blocks, PrincipalId::system()).unwrap();
+        assert_eq!(outcome.state().selection, None);
+        assert!(outcome.state().to_json(id)["selection"].is_null());
     }
 
     #[tokio::test]

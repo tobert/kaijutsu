@@ -6763,6 +6763,7 @@ name = "kaijutsu-editor"
 version = "0.1.0"
 dependencies = [
  "editor-types",
+ "kaijutsu-types",
  "modalkit",
  "regex",
 ]

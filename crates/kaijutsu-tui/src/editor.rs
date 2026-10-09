@@ -315,6 +315,8 @@ pub fn parse_open_signal(params: &[u8]) -> Result<EditorOpen, String> {
             dirty: signal.dirty,
             command_line: signal.command_line,
             message: None,
+            // A fresh session is in normal mode, so it selects nothing.
+            selection: None,
         },
     })
 }
@@ -491,6 +493,7 @@ mod tests {
             dirty: false,
             command_line: None,
             message: None,
+            selection: None,
         }
     }
 

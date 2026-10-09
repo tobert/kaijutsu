@@ -17,14 +17,16 @@
 
 use editor_types::application::EmptyInfo;
 use editor_types::context::EditContext;
-use editor_types::prelude::{CloseFlags, EditTarget, RepeatType, SearchType, ViewportContext};
+use editor_types::prelude::{
+    CloseFlags, EditTarget, RepeatType, SearchType, TargetShape, ViewportContext,
+};
 use editor_types::{
     Action, CommandBarAction, CursorAction, EditorAction, PromptAction, WindowAction,
 };
 
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
-use modalkit::editing::cursor::Cursor;
+use modalkit::editing::cursor::{Cursor, CursorGroup, CursorState};
 use modalkit::editing::store::Store;
 use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
 use modalkit::env::vim::VimState;
@@ -32,6 +34,9 @@ use modalkit::key::TerminalKey;
 use modalkit::keybindings::{BindingMachine, InputBindings, InputState};
 
 use std::collections::VecDeque;
+use std::ops::Range;
+
+pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -278,6 +283,21 @@ impl EditorCore {
         usize::from(self.buffer.get().cursor_to_offset(&cur))
     }
 
+    /// The leader's visual-mode selection as the char spans a renderer
+    /// highlights; `None` outside visual mode. Read from modalkit's anchor and
+    /// cursor, so it follows every motion modalkit knows. See
+    /// [`EditorSelection`] for the span rules of each shape.
+    pub fn selection(&mut self) -> Option<EditorSelection> {
+        let (start, end, shape) = self.buffer.get_leader_selection(self.group)?;
+        let shape = match shape {
+            TargetShape::CharWise => SelectionShape::Charwise,
+            TargetShape::LineWise => SelectionShape::Linewise,
+            TargetShape::BlockWise => SelectionShape::Blockwise,
+        };
+        let spans = selection_spans(&self.text(), (start.y, start.x), (end.y, end.x), shape);
+        Some(EditorSelection { shape, spans })
+    }
+
     /// The vim mode banner (`None` in normal mode; `Some("-- INSERT --")` etc.).
     pub fn mode(&self) -> Option<String> {
         self.machine.show_mode()
@@ -302,10 +322,28 @@ impl EditorCore {
         let Some(op) = diff_op(&old, new_text) else {
             return false; // identical — nothing to merge (self-write echo)
         };
-        let new_cursor = transform_cursor(self.cursor(), &op).min(new_text.chars().count());
+        let new_len = new_text.chars().count();
+        // A visual selection keeps covering the same text: its anchor moves
+        // by the same rule as the cursor. modalkit hands the selection back
+        // sorted, so the anchor is whichever end the cursor is not.
+        let cursor_pos = self.buffer.get_leader(self.group);
+        let anchor = self.buffer.get_leader_selection(self.group).map(|(start, end, shape)| {
+            let anchor = if start == cursor_pos { end } else { start };
+            let offset = usize::from(self.buffer.get().cursor_to_offset(&anchor));
+            (transform_cursor(offset, &op).min(new_len), shape)
+        });
+        let new_cursor = transform_cursor(self.cursor(), &op).min(new_len);
         self.buffer.set_text(new_text);
         let (line, col) = line_col(new_text, new_cursor);
-        self.buffer.set_leader(self.group, Cursor::new(line, col));
+        let cursor = Cursor::new(line, col);
+        match anchor {
+            Some((anchor, shape)) => {
+                let (aline, acol) = line_col(new_text, anchor);
+                let leader = CursorState::Selection(cursor, Cursor::new(aline, acol), shape);
+                self.buffer.set_group(self.group, CursorGroup::new(leader, Vec::new()));
+            }
+            None => self.buffer.set_leader(self.group, cursor),
+        }
         true
     }
 
@@ -845,6 +883,50 @@ fn transform_cursor(cursor: usize, op: &EditOp) -> usize {
         cursor
     } else {
         op.offset + insert_len
+    }
+}
+
+/// The half-open char spans a selection covers in `text`, between the sorted
+/// `(line, column)` ends `start` and `end` (both ends included, as in vim).
+/// Every span is clamped to the text; see [`EditorSelection`].
+fn selection_spans(
+    text: &str,
+    start: (usize, usize),
+    end: (usize, usize),
+    shape: SelectionShape,
+) -> Vec<Range<usize>> {
+    let total = text.chars().count();
+    let mut line_starts = Vec::new();
+    let mut line_lens = Vec::new();
+    let mut at = 0;
+    for line in text.split('\n') {
+        let len = line.chars().count();
+        line_starts.push(at);
+        line_lens.push(len);
+        at += len + 1;
+    }
+    let last = line_starts.len() - 1;
+    // Offset of `(line, col)`; a column past the line end lands on its break.
+    let offset = |(line, col): (usize, usize)| {
+        let line = line.min(last);
+        (line_starts[line] + col.min(line_lens[line])).min(total)
+    };
+    match shape {
+        SelectionShape::Charwise => {
+            vec![offset(start)..(offset(end) + 1).min(total)]
+        }
+        SelectionShape::Linewise => {
+            let last_line = end.0.min(last);
+            vec![offset((start.0, 0))..(line_starts[last_line] + line_lens[last_line] + 1).min(total)]
+        }
+        SelectionShape::Blockwise => {
+            let left = start.1.min(end.1);
+            let right = start.1.max(end.1).saturating_add(1);
+            (start.0.min(last)..=end.0.min(last))
+                .filter(|&line| left < line_lens[line])
+                .map(|line| line_starts[line] + left..line_starts[line] + right.min(line_lens[line]))
+                .collect()
+        }
     }
 }
 
@@ -1916,5 +1998,109 @@ baz");
         // offset must be 4, not a byte offset.
         let op = diff_op("café", "cafés").unwrap();
         assert_eq!(op, EditOp { offset: 4, insert: "s".into(), delete: 0 });
+    }
+
+    // ── Visual-mode selection ────────────────────────────────────────────────
+    //
+    // `selection()` reads modalkit's own anchor + cursor; spans are half-open
+    // char ranges a renderer highlights as-is.
+
+    fn spans(ed: &mut EditorCore) -> Option<(SelectionShape, Vec<std::ops::Range<usize>>)> {
+        ed.selection().map(|s| (s.shape, s.spans))
+    }
+
+    #[test]
+    fn no_selection_in_normal_or_insert_mode() {
+        let mut ed = EditorCore::new("hello world");
+        assert_eq!(ed.selection(), None, "a fresh editor selects nothing");
+        ed.apply_keys("w");
+        assert_eq!(ed.selection(), None);
+        ed.apply_keys("ix");
+        assert_eq!(ed.selection(), None, "insert mode selects nothing");
+    }
+
+    #[test]
+    fn charwise_selection_includes_both_ends() {
+        let mut ed = EditorCore::new("hello world");
+        ed.apply_keys("v");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![0..1])), "v alone selects the cursor char");
+        ed.apply_keys("e");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![0..5])), "`ve` covers `hello`");
+        ed.apply_keys("w");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![0..7])), "`w` extends onto `w` of world");
+    }
+
+    #[test]
+    fn charwise_selection_spans_a_line_break() {
+        let mut ed = EditorCore::new("ab\ncd");
+        ed.apply_keys("lvj");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![1..5])), "`b\\nc` plus `d` under the cursor");
+    }
+
+    #[test]
+    fn selection_is_sorted_when_the_anchor_is_after_the_cursor() {
+        let mut ed = EditorCore::new("hello world");
+        ed.apply_keys("$vb");
+        assert_eq!(ed.cursor(), 6, "the cursor moved back to `world`");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![6..11])));
+    }
+
+    #[test]
+    fn linewise_selection_covers_whole_lines_and_their_breaks() {
+        let mut ed = EditorCore::new("one\ntwo\nthree");
+        ed.apply_keys("lV");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Linewise, vec![0..4])), "line one and its break");
+        ed.apply_keys("j");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Linewise, vec![0..8])));
+        ed.apply_keys("j");
+        assert_eq!(
+            spans(&mut ed),
+            Some((SelectionShape::Linewise, vec![0..13])),
+            "the last line has no break; the span stops at the text end"
+        );
+    }
+
+    #[test]
+    fn blockwise_selection_is_one_span_per_line() {
+        let mut ed = EditorCore::new("abcd\nx\nefgh");
+        ed.apply_keys("l<C-v>jjl");
+        assert_eq!(
+            spans(&mut ed),
+            Some((SelectionShape::Blockwise, vec![1..3, 8..10])),
+            "columns 1..=2 on lines one and three; line two is too short to reach column 1"
+        );
+    }
+
+    #[test]
+    fn escape_and_an_operator_clear_the_selection() {
+        let mut ed = EditorCore::new("hello world");
+        ed.apply_keys("ve<Esc>");
+        assert_eq!(ed.selection(), None, "Esc leaves visual mode");
+        ed.apply_keys("vey");
+        assert_eq!(ed.selection(), None, "an operator ends visual mode");
+        ed.apply_keys("vev");
+        assert_eq!(ed.selection(), None, "a second v toggles visual mode off");
+    }
+
+    /// A peer edit shifts the anchor and the cursor the same way, so the
+    /// selection keeps covering the same text.
+    #[test]
+    fn remote_text_shifts_the_selection_with_its_text() {
+        let mut ed = EditorCore::new("hello world");
+        ed.apply_keys("wve");
+        assert_eq!(spans(&mut ed), Some((SelectionShape::Charwise, vec![6..11])));
+        assert!(ed.apply_remote_text(">> hello world"));
+        assert_eq!(
+            spans(&mut ed),
+            Some((SelectionShape::Charwise, vec![9..14])),
+            "an insert before the selection shifts both ends"
+        );
+        assert_eq!(ed.mode().as_deref(), Some("-- VISUAL --"), "the merge keeps visual mode");
+        assert!(ed.apply_remote_text(">> hello"));
+        assert_eq!(
+            spans(&mut ed),
+            Some((SelectionShape::Charwise, vec![8..8])),
+            "a delete under the selection collapses it to the text end, in bounds"
+        );
     }
 }

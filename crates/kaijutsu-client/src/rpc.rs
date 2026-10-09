@@ -4597,6 +4597,9 @@ pub struct EditorState {
     /// A transient status/error line (vim `E492`), e.g. an unknown `:command` or
     /// a bad `:s` regex; `None` when there's nothing to report. Drawn read-only.
     pub message: Option<String>,
+    /// The visual-mode selection as char spans to highlight; `None` outside
+    /// visual mode. (docs/vi.md → Selection rects.)
+    pub selection: Option<kaijutsu_types::editor::EditorSelection>,
 }
 
 /// Parse a capnp `EditorState` reader into the client struct. Shared by the
@@ -4623,7 +4626,31 @@ pub(crate) fn parse_editor_state(
         } else {
             Some(message)
         },
+        selection: if r.has_selection() {
+            Some(parse_editor_selection(r.get_selection()?)?)
+        } else {
+            None
+        },
     })
+}
+
+/// Parse a capnp `EditorSelection` into the shared selection type.
+fn parse_editor_selection(
+    r: crate::kaijutsu_capnp::editor_selection::Reader<'_>,
+) -> Result<kaijutsu_types::editor::EditorSelection, RpcError> {
+    use crate::kaijutsu_capnp::SelectionShape as Wire;
+    use kaijutsu_types::editor::{EditorSelection, SelectionShape};
+    let shape = match r.get_shape()? {
+        Wire::Charwise => SelectionShape::Charwise,
+        Wire::Linewise => SelectionShape::Linewise,
+        Wire::Blockwise => SelectionShape::Blockwise,
+    };
+    let spans = r
+        .get_spans()?
+        .iter()
+        .map(|span| span.get_start() as usize..span.get_end() as usize)
+        .collect();
+    Ok(EditorSelection { shape, spans })
 }
 
 /// Schema for a broker tool visible to the current context.

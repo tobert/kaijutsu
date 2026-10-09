@@ -161,7 +161,7 @@ mod tests {
                 this.calls.borrow_mut().push(call);
                 Ok(EditorState {
                     session, text: String::new(), cursor: 0, mode: None, dirty: false,
-                    command_line: None, message: None,
+                    command_line: None, message: None, selection: None,
                 })
             }
         }
