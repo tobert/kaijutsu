@@ -334,8 +334,8 @@ grows with the gate.
   kaijutsu context of context_type `judge` or `bump` whose fork parent is
   the observed seat, so it shows in the seat's tree and archiving the seat
   archives it. It inherits no blocks and has no performer; the kernel, not
-  a seat turn, asks its model. The kernel records the seat-to-shadow edge
-  durably, so it does not find a shadow by its label. The label is
+  a seat turn, asks its model. The kernel finds a shadow by its structural
+  fork edge and its context_type, never by its label. The label is
   `<type>-<seat label>`; it does not start with `council-`, so the
   reviewer-chain walk never takes it for a character's voice. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
@@ -356,8 +356,10 @@ grows with the gate.
   no change here.
 - **The gate writes the shadow.** It has the call when it evaluates and
   the outcome when it decides, so it is the one writer: the call before
-  the decision, the answer after it. A shadow block records the seat block
-  it came from, so writing it again is a no-op.
+  the decision, the answer after it (`council/shadow.rs`, called from
+  `run_gate`). The gate evaluates each call once; a call sent again after
+  a bump is a new call and a new turn. A shadow write that fails is logged
+  at error level and never changes the gate's decision.
 - **A dialogue: the call, then the answer.** Each call is a user text turn
   holding the tool name and its input, such as `shell_write: rm -rf
   .partb`, cut to a budget. The shadow's answer comes back as the model
@@ -395,18 +397,23 @@ grows with the gate.
 Each step lands with its tests, and its line here changes to say what
 shipped. A fresh session resumes at the first step not marked done.
 
-1. **The judge child and its dialogue.** A kernel test stands up a kernel,
-   gives a coder seat a cast with a `judge` slot, and submits a
-   `shell_write` call through the gate. Expect: a `judge` fork child of the
-   seat, created on that first call, holding the call as a user turn and
-   the gate's outcome as the model turn after it; a second call appends,
-   and a seat whose cast has no `judge` slot gets no child. Adds the
-   `judge` context_type rc seed and the seat-to-shadow edge.
+1. **Done: the judge child and its dialogue,** on the `shell_write` tool
+   path. A seat whose cast has a `judge` slot gets one `judge` fork child
+   on the first call the gate evaluates; each call is a user turn
+   (`shell_write: <command>`, cut at 800 bytes) and the outcome is the
+   model turn (`ran`, `asked the reviewer`, `bumped (<flavor>)`,
+   `refused`, `not run: the gate was unavailable`). Tests in
+   `council/gate_e2e.rs`, `a_judged_seat_records_…` and the two after it.
+   1b. **The RPC shell path.** Seats that reach the gate through
+   `shell_pre_call_hooks` (ACP and MCP clients) are not recorded yet.
+   1c. **Archive with the seat.** Archiving a seat does not archive its
+   shadow yet.
 2. **Priming a council server.** After each appended call, the kernel
    `PUT`s the shadow with `warm`, off the hot path. Test against the fake
    council server: one `PUT` per call, re-feeding at most eight turns.
-3. **Asking and recording.** After the gate decides, the kernel asks the
-   judge about the last call, writes its answer as the model turn, and
+3. **Asking and recording.** Adds the `judge` context_type rc seed for
+   the framing. After the gate decides, the kernel asks the judge about
+   the last call, writes its answer as the model turn, and
    records it beside the decision with timings and whether it differs from
    the outcome. Nothing changes the gate's decision.
 4. **Measure on moltar.** Deploy, give banto's coders a cast with a

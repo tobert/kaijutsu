@@ -445,8 +445,9 @@ pub(crate) fn announce_ledger_change(
 ///
 /// A `shell_write` submission (`Origin::ShellGate`) is read by the council
 /// first when `gate.toml` enables it for the caller's context type
-/// (`crate::council::gate::consult`); every other origin goes straight to
-/// [`run_gate_recorded`].
+/// (`crate::council::gate::consult`), and recorded with its outcome in the
+/// seat's shadow when it has one (`crate::council::shadow`); every other
+/// origin goes straight to [`run_gate_recorded`].
 pub(crate) async fn run_gate(
     kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
@@ -454,15 +455,22 @@ pub(crate) async fn run_gate(
     ledger_flows: &SharedLedgerFlowBus,
     config: &super::gate_policy::GateConfigLoad,
 ) -> GateOutcome {
-    let council = if spec.origin == Origin::ShellGate {
-        match crate::council::gate::consult(kernel, caller, &spec, config).await {
-            Ok(council) => council,
-            Err(reason) => return GateOutcome::unavailable_without_row(reason),
+    if spec.origin != Origin::ShellGate {
+        return run_gate_recorded(kernel, caller, spec, ledger_flows, config, None, &|_, _| Ok(())).await;
+    }
+    let shadow = crate::council::shadow::record_call(kernel, caller.context_id, &spec);
+    let (outcome, bump_flavor) = match crate::council::gate::consult(kernel, caller, &spec, config).await {
+        Ok(council) => {
+            let bump_flavor = council.as_ref().and_then(|c| c.submission_bump()).map(|b| b.flavor);
+            let outcome = run_gate_recorded(kernel, caller, spec, ledger_flows, config, council, &|_, _| Ok(())).await;
+            (outcome, bump_flavor)
         }
-    } else {
-        None
+        Err(reason) => (GateOutcome::unavailable_without_row(reason), None),
     };
-    run_gate_recorded(kernel, caller, spec, ledger_flows, config, council, &|_, _| Ok(())).await
+    if let Some(shadow) = shadow {
+        crate::council::shadow::record_outcome(kernel, shadow, &outcome, bump_flavor.as_deref());
+    }
+    outcome
 }
 
 /// The ask that still holds this submission: one still open, or an answer

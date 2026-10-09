@@ -363,7 +363,7 @@ fn insert_new_context_checked(
 
 /// The body of [`insert_new_context_checked`], for a caller that already
 /// holds a transaction and writes more rows in it.
-fn insert_new_context_rows(
+pub(crate) fn insert_new_context_rows(
     db: &KernelDb,
     row: &ContextRow,
     parent_id: Option<ContextId>,

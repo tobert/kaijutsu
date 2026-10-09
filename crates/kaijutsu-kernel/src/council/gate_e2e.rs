@@ -2454,3 +2454,124 @@ async fn without_a_mode_the_gate_is_a_gatekeeper() {
         rig.finish().await;
     }
 }
+
+/// Gives the rig's seat a cast whose `judge` slot names `model`, so the seat
+/// gets a judge shadow (`docs/council.md`, "Shadow voice").
+fn give_judge_cast(rig: &Rig, model: &str) {
+    use crate::kernel_db::{CastRow, CastSlotRow};
+    let db = rig.d.kernel_db();
+    let db = db.lock();
+    let cast_id = kaijutsu_types::CastId::new();
+    db.insert_cast(&CastRow {
+        cast_id,
+        label: format!("judged-{model}"),
+        description: None,
+        created_at: 0,
+        created_by: PrincipalId::system(),
+    })
+    .unwrap();
+    let backend = db
+        .upsert_backend(&crate::kernel_db::BackendRow {
+            backend_id: kaijutsu_types::BackendId::new(),
+            name: "judge-backend".into(),
+            kind: "anthropic".into(),
+            base_url: None,
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            created_at: 0,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+    db.set_cast_slot(&CastSlotRow {
+        cast_id,
+        role: super::shadow::JUDGE.into(),
+        backend_id: backend.backend_id,
+        model: model.into(),
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+        loadout: None,
+        extra: None,
+    })
+    .unwrap();
+    db.update_cast(rig.ctx.context_id, Some(cast_id)).unwrap();
+}
+
+/// The seat's judge shadows: its live structural children of type `judge`.
+fn judge_shadows(rig: &Rig) -> Vec<crate::kernel_db::ContextRow> {
+    let children = rig.d.kernel_db().lock().structural_children(rig.ctx.context_id).unwrap();
+    children.into_iter().filter(|c| c.context_type == super::shadow::JUDGE).collect()
+}
+
+/// A shadow's dialogue: each block's role and text, in document order.
+fn dialogue(rig: &Rig, shadow: kaijutsu_types::ContextId) -> Vec<(kaijutsu_types::Role, String)> {
+    rig.d.kernel().blocks().block_snapshots(shadow).unwrap().into_iter().map(|b| (b.role, b.content)).collect()
+}
+
+/// A seat whose cast has a `judge` slot gets one judge shadow, a fork child
+/// created on the first call the gate evaluates. Each call is a user turn
+/// and what the gate did is the model turn after it, whether a static rule
+/// or the council decided.
+///
+/// Falsified by recording only council decisions (the static allow is
+/// missing), by creating a shadow per call (two children), or by finding
+/// the shadow by label alone.
+#[tokio::test]
+async fn a_judged_seat_records_each_gated_call_and_its_outcome_in_one_shadow() {
+    use kaijutsu_types::Role::{Model, User};
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    give_judge_cast(&rig, "judge-model");
+    rig.mock.answers(&ALLOW);
+    rig.submit("echo static").await.unwrap();
+    rig.submit("touch /work/marker").await.unwrap();
+    rig.mock.answers(&ASK);
+    assert_pending(Via::Tool, rig.submit("rm /work/marker").await);
+
+    let shadows = judge_shadows(&rig);
+    assert_eq!(shadows.len(), 1, "one judge shadow per seat: {shadows:?}");
+    let shadow = &shadows[0];
+    assert_eq!(shadow.forked_from, Some(rig.ctx.context_id));
+    assert_eq!(shadow.label.as_deref(), Some("judge-council-seat"));
+    assert!(shadow.played_by.is_none(), "the kernel asks a shadow's model, not a performer");
+
+    let turns = dialogue(&rig, shadow.context_id);
+    let roles: Vec<_> = turns.iter().map(|(r, _)| *r).collect();
+    assert_eq!(roles, [User, Model, User, Model, User, Model], "{turns:?}");
+    assert_eq!(turns[0].1, "shell_write: echo static");
+    assert_eq!(turns[1].1, "ran");
+    assert_eq!(turns[2].1, "shell_write: touch /work/marker");
+    assert_eq!(turns[3].1, "ran");
+    assert_eq!(turns[4].1, "shell_write: rm /work/marker");
+    assert_eq!(turns[5].1, "asked the reviewer");
+    rig.finish().await;
+}
+
+/// A bump is recorded with its flavor, so a cleanup sent again after it
+/// shows in the history as a second attempt.
+#[tokio::test]
+async fn a_bump_is_recorded_in_the_shadow_with_its_flavor() {
+    let rig = rig(Via::Tool, bumper(3)).await;
+    give_judge_cast(&rig, "judge-model");
+    rig.mock.bumper_says(TRY_HARDER);
+    refusal_text(Via::Tool, rig.submit("touch /work/marker").await);
+    let shadows = judge_shadows(&rig);
+    let turns = dialogue(&rig, shadows[0].context_id);
+    assert_eq!(turns[1].1, "bumped (try_harder)", "{turns:?}");
+    rig.finish().await;
+}
+
+/// A seat whose cast has no `judge` slot, or that has no cast, gets no
+/// shadow.
+#[tokio::test]
+async fn a_seat_without_a_judge_slot_gets_no_shadow() {
+    let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
+    rig.submit("echo static").await.unwrap();
+    assert!(judge_shadows(&rig).is_empty());
+    rig.finish().await;
+}

@@ -12,5 +12,6 @@ pub(crate) mod observe;
 pub(crate) mod programs;
 mod projection;
 pub(crate) mod report_stop;
+pub(crate) mod shadow;
 pub(crate) mod sync;
 pub(crate) mod voices;
