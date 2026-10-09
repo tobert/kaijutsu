@@ -185,7 +185,7 @@ fn sync_block_fx(
 /// [`OverlayCursorGeometry`] carries **one** selection rect, which is all the
 /// compose overlay's single-line selection needs. The material now takes many
 /// ([`selection`]); a surface with a real multi-row selection — the editor
-/// panel, once its wire carries a selection anchor — builds its rects from
+/// panel — builds its rects from
 /// `parley::Selection::geometry`, coalesces them, and calls
 /// [`pack_selection_rects`] itself rather than coming through here.
 pub fn cursor_selection_uniforms(

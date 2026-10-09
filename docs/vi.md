@@ -47,27 +47,24 @@ and dot-repeat" under the `:` dialect).
 
 **Open** (only in this doc; the backlog proper is `docs/issues.md`):
 
-- **Selection rects** on the editor panel — the cursor quad ships; selection is
-  more than render wiring. It needs, in order: (1) a selection range on the
-  kernel's `EditorState` (`kaijutsu-kernel/src/editor.rs`) *and* the capnp
-  `EditorState` struct (`kaijutsu.capnp`) — the wire carries only a cursor
-  today, no selection anchor; ~~(2) a `BlockFxMaterial`/shader extension~~
-  **DONE 2026-08-04** (diff slice 6 phase B): the material takes up to 16
-  UV-space rects with a live count, and `shaders::selection` carries the
-  pixel-space rect type, the coalescing rule, and the packer; (3) only then the
-  parley `Selection::geometry(layout)` render wiring, which *is* off-the-shelf
-  in parley 0.7 — and is now *already used*, by the diff viewer, through
-  `text::diff::layout_rects`.
-
-  So step (1) is the whole remaining cost. When it lands, the editor's path is:
-  `Selection::geometry` → `layout_rects` (one rect per visual row, bidi rows
-  unioned) → `coalesce_selection_rects` (interior rows become one full-width
-  band, which bounds a contiguous selection at three rects) →
-  `pack_selection_rects` → `mat.selection_rects`. The diff viewer draws the
-  *same* rects as `MsdfBlockGeometry` quads instead, because a diff selection
-  has to sit on top of the `+`/`-` bands; the editor has no bands and wants the
-  shader's over-the-text composite. Neither could use the other's compositor —
-  which is exactly why the rect *producer* is shared and the drawing is not.
+- **Selection rects: the app draw is not runner-verified.** The visual-mode
+  selection travels end to end: `EditorCore::selection()` reads modalkit's
+  anchor and cursor, the kernel's `EditorState.selection` and the capnp
+  `EditorState.selection @7` carry it as an `EditorSelection` (shape plus
+  half-open char spans, `kaijutsu-types/src/editor.rs`), and `kj editor`
+  emits it in `to_json`. The tui draws it (`docs/tui.md`, "Editor and
+  diff"). The app builds rects through `Selection::geometry` →
+  `layout_rects` → `coalesce_selection_rects` → `pack_selection_rects` →
+  `mat.selection_rects`; unit tests cover the span → rect mapping against a
+  real parley layout, but nobody has looked at it in the running app yet.
+  The diff viewer draws the *same* rects as `MsdfBlockGeometry` quads
+  instead, because a diff selection has to sit on top of the `+`/`-` bands;
+  the editor has no bands and wants the shader's over-the-text composite.
+  Left: a runner check of the app highlight (including a selected empty
+  line and a blockwise block), and a blockwise selection taller than 16
+  rows, which overflows the material's rect uniform — `pack_selection_rects`
+  drops the extra rows with a warning. The visual-mode cursor is hidden in
+  the app, as before; the tui shows the terminal cursor.
 - **Search and dot-repeat gaps** — search has no offsets (`/pat/e`), no
   wrap notice ("search hit BOTTOM"), no incremental highlight, and no `/` or
   `?` history recall. `.` after leaving Visual mode with `<Esc>` and no
@@ -151,7 +148,13 @@ The contract everything else is tested against:
   end); identical text returns `false` (the self-write-echo skip).
 - Intent drains: `take_close()` (`ZZ`/`ZQ`), `take_commands()` (`:` verbs),
   `take_io()` (`:r` fetches) — the editor surfaces *intent*; the kernel acts.
-- State accessors: `text()`, `cursor()`, `mode()`, `command_line()`, `dirty()`.
+- State accessors: `text()`, `cursor()`, `mode()`, `command_line()`,
+  `selection()`, `dirty()`. `selection()` is `None` outside visual mode.
+  Charwise (`v`) and linewise (`V`) give one span; blockwise (`<C-v>`) gives
+  one span per row that reaches the block's left column. A selected line
+  break is part of a span. A peer merge (`apply_remote_text`) moves the
+  anchor by the same rule as the cursor, so the selection keeps covering
+  the same text and visual mode stays on.
 
 **modalkit `0.0.25` pulls `crossterm 0.29` into the kernel/server dependency
 graph.** The key *types* don't need a live TTY, so this is sound — accepted
@@ -173,12 +176,13 @@ The registry is kernel-wide behind a mutex (`SendSessions`; the `!Send`
 | `editor_open(path)` | `resolve_editor_target(path)` → load block text into a fresh `EditorCore` → return a session handle + initial state. `editor_open_signaled` also fires the `open_editor` peer invoke at the submitter principal's app windows (falling back to `APP_PEER_NICK`; a missing renderer is a `warn`, never fatal — the session is already open). |
 | `editor_keys(session, keys)` | `EditorCore::apply_keys` → mirror the edit-ops onto the block (`block_store.edit_text`) → drain intents (`take_close`/`take_commands`/`take_io`) and act → return new state. A dirty file-backed edit marks the swap row; a `:w`/`:wq`/`:x`/`ZZ` inside the batch flushes to disk too (`docs/file-buffers.md`). **Async** since `:r` (and now the flush) — sync-lock, release, await, sync-lock again; `EditorCore` never crosses the await, only the fetched `String`/flush result does. |
 | `editor_insert(session, text)` | A paste, not keystrokes: `EditorCore::insert_at_cursor` splices `text` at the live cursor and mirrors the edit onto the block, the same as a key batch's plain edit — no write intent, so nothing to flush. It never touches the vim state machine, so the mode is exactly what it was before the call: insert stays insert, normal stays normal. Refuses with the state unchanged while the `:` command line is open, reporting on `EditorState.message` — the same dialect-level channel a bad `:s` regex uses. Synchronous. |
-| `editor_state(session)` | read text/cursor/mode/command-line/dirty (what a renderer draws). |
+| `editor_state(session)` | read text/cursor/mode/command-line/dirty/selection (what a renderer draws). |
 | `editor_save(session)` | `ZZ` / `:w` — flush the document to its owner; advance the checkpoint. |
 | `editor_quit(session)` | `ZQ` / `:q!` — diff-rollback to checkpoint (see Rollback; skipped when entangled with peer work), drop the session. |
 
 **The wire surface mirrors the input-doc surface.** capnp: `EditorState`
-struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`) +
+struct (text, cursor, mode, dirty, `commandLine @5`, `message @6`,
+`selection @7`) +
 `editorOpen/Keys/State/Save/Quit @74–78` + `subscribeEditor @79` +
 `editorInsert @105` with `EditorEvents` callbacks. **The render channel is
 push, not poll** (decided
@@ -219,6 +223,8 @@ scope):
   glyph buffer near the page bottom.
 - Cursor geometry is computed via parley (`Cursor::from_byte_index(..).geometry`)
   into `OverlayCursorGeometry`, pushed to the material by `sync_editor_cursor`.
+  Selection rects (`editor_selection_rects`) ride `EditorSelectionGeometry`
+  on the same surface and reach the material in the same system.
 - `editor_dispatch_keys` (gated `in_state(Screen::Editor)`) drains
   `KeyboardInput`, translates to modalkit key notation, and ships *every* key
   to `editor_keys`. The push subscription returns the new state.
@@ -475,16 +481,17 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Concern | Location |
 |---|---|
 | Editor sessions + resolver + state shape | `kaijutsu-kernel/src/editor.rs` (`resolve_editor_target`, `EditorSessions`, `EditorState::to_json`, `APP_PEER_NICK`) |
-| Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`) |
+| Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`, `selection`) |
+| Selection value | `kaijutsu-types/src/editor.rs` (`EditorSelection`, `SelectionShape`) |
 | `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `runtime/context_shell.rs` |
 | `kj editor` | `kaijutsu-kernel/src/kj/editor.rs` |
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |
-| Wire schema | `kaijutsu.capnp` (`EditorState`, `editorOpen @74` … `subscribeEditor @79`, `editorInsert @105`) |
+| Wire schema | `kaijutsu.capnp` (`EditorState`, `EditorSelection`, `editorOpen @74` … `subscribeEditor @79`, `editorInsert @105`) |
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
-| Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `sync_editor_cursor`) |
+| Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `editor_selection_rects`, `sync_editor_cursor`) |
 | Precedent: input-doc surface | `kaijutsu-kernel/src/input_doc.rs` |
 | Compose vim (untouched) | `kaijutsu-app/src/input/vim/` (`mod.rs`, `dispatch.rs`) |
 | File doc cache | `kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`, `try_get_or_load`) |
