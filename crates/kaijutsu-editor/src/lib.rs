@@ -16,16 +16,22 @@
 //! `docs/vi.md`.
 
 use editor_types::application::EmptyInfo;
-use editor_types::prelude::{CloseFlags, ViewportContext};
-use editor_types::{Action, CommandBarAction, PromptAction, WindowAction};
+use editor_types::context::EditContext;
+use editor_types::prelude::{CloseFlags, EditTarget, RepeatType, SearchType, ViewportContext};
+use editor_types::{
+    Action, CommandBarAction, CursorAction, EditorAction, PromptAction, WindowAction,
+};
 
 use modalkit::actions::Editable;
 use modalkit::editing::buffer::{CursorGroupId, EditBuffer};
 use modalkit::editing::cursor::Cursor;
 use modalkit::editing::store::Store;
 use modalkit::env::vim::keybindings::{VimBindings, VimMachine};
+use modalkit::env::vim::VimState;
 use modalkit::key::TerminalKey;
-use modalkit::keybindings::{BindingMachine, InputBindings};
+use modalkit::keybindings::{BindingMachine, InputBindings, InputState};
+
+use std::collections::VecDeque;
 
 use modalkit::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -117,6 +123,16 @@ pub struct EditorCore {
     /// like vim's `:`-line. Reset on each focus.
     cmdline: EditBuffer<EmptyInfo>,
     cmdline_group: CursorGroupId,
+    /// The action modalkit focused the bar with, and the context it carried.
+    /// For `/`·`?` it is the search motion (with any pending operator, as in
+    /// `d/pat`), run against the document when the bar submits.
+    cmdline_action: Option<(Action<EmptyInfo>, EditContext)>,
+    /// The last change `.` replays: modalkit's tracked edit sequence, copied
+    /// out of the machine before the `:`·`/`·`?` bar opens and on each `.`.
+    /// The copy exists because leaving the bar makes modalkit record its
+    /// return-to-normal cursor reset as a new edit sequence, which would
+    /// make `.` after `/pat` or `:w` do nothing.
+    last_change: Vec<(Action<EmptyInfo>, EditContext)>,
     /// A `ZZ`/`ZQ` close intent produced by the last `apply_keys`, awaiting the
     /// kernel to consume it via [`take_close`](EditorCore::take_close).
     pending_close: Option<CloseRequest>,
@@ -161,6 +177,8 @@ impl EditorCore {
             cmdline_prefix: String::new(),
             cmdline,
             cmdline_group,
+            cmdline_action: None,
+            last_change: Vec::new(),
             pending_close: None,
             pending_commands: None,
             pending_substitution: None,
@@ -177,9 +195,10 @@ impl EditorCore {
 
     /// Take any `:`-line command batch the most recent `apply_keys` submitted.
     /// `None` if no command was entered; `Some(Ok(cmds))` for a parsed dialect
-    /// (possibly empty — a bare `:` or an unwired `/` search); `Some(Err(msg))`
-    /// for an unknown command, which the kernel surfaces (fail loud, vim's
-    /// "Not an editor command"). Consumed like [`take_close`](Self::take_close).
+    /// (possibly empty, as for a bare `:`); `Some(Err(msg))` for a message the
+    /// kernel shows on the status line: an unknown command (vim's "Not an
+    /// editor command"), a bad `:s`, or a failed `/`·`?`·`n`·`N` search
+    /// ("Pattern not found"). Consumed like [`take_close`](Self::take_close).
     pub fn take_commands(&mut self) -> Option<Result<Vec<CommandRequest>, String>> {
         self.pending_commands.take()
     }
@@ -334,26 +353,53 @@ impl EditorCore {
         // kernel block — not modalkit's trailing-newline'd rope.
         let before = strip_one_trailing_newline(&self.buffer.get_text());
         self.machine.input_key(key);
-        while let Some((action, ctx)) = self.machine.pop() {
+        // Actions taken out of the machine to read its edit sequence wait
+        // here, ahead of anything the machine still holds.
+        let mut queue: VecDeque<(Action<EmptyInfo>, EditContext)> = VecDeque::new();
+        while let Some((action, ctx)) = queue.pop_front().or_else(|| self.machine.pop()) {
             match action {
                 // `:`/`/`/`?` focus the command-line/search bar — a separate
                 // `EditBuffer` (`cmdline`). Reset it and remember the prefix
                 // so subsequent keystrokes type into it, not the document.
-                Action::CommandBar(CommandBarAction::Focus(prefix, _ct, _act)) => {
+                Action::CommandBar(CommandBarAction::Focus(prefix, _ct, act)) => {
                     self.cmdline_active = true;
                     self.cmdline_prefix = prefix;
                     self.cmdline = EditBuffer::<EmptyInfo>::from_str(String::new(), "");
                     self.cmdline_group = self.cmdline.create_group();
+                    self.cmdline_action = Some((*act, ctx));
+                    self.save_last_change(&mut queue, None);
                 }
                 Action::CommandBar(CommandBarAction::Unfocus) => {
                     self.cmdline_active = false;
+                    self.cmdline_action = None;
                 }
-                // `<CR>` in the bar submits: parse the typed line for its
+                // `<CR>` in a `/`·`?` bar stores the pattern as modalkit's
+                // last search and runs the search motion on the document. An
+                // empty pattern keeps the previous one, as in vim.
+                Action::Prompt(PromptAction::Submit)
+                    if self.cmdline_active && !self.cmdline_prefix.starts_with(':') =>
+                {
+                    self.cmdline_active = false;
+                    let pattern = strip_one_trailing_newline(&self.cmdline.get_text());
+                    let focused = self.cmdline_action.take();
+                    if !pattern.is_empty() {
+                        if let Err(e) = regex::Regex::new(&pattern) {
+                            self.pending_commands = Some(Err(format!("invalid search pattern: {e}")));
+                            continue;
+                        }
+                        self.store.registers.set_last_search(pattern.as_str());
+                    }
+                    if let Some((Action::Editor(ea), actx)) = focused {
+                        self.edit_document(&ea, &actx);
+                    }
+                }
+                // `<CR>` in a `:` bar submits: parse the typed line for its
                 // dialect. Lifecycle verbs (`:w`/`:q`/…) queue intents the
                 // kernel acts on; a `:s` queues a buffer edit applied below.
                 Action::Prompt(PromptAction::Submit) if self.cmdline_active => {
+                    self.cmdline_action = None;
                     let body = strip_one_trailing_newline(&self.cmdline.get_text());
-                    match parse_command_line(&self.cmdline_prefix, &body) {
+                    match parse_ex_command(&body) {
                         Ok(ParsedLine::Commands(cmds)) => {
                             self.pending_commands = Some(Ok(cmds));
                         }
@@ -363,7 +409,6 @@ impl EditorCore {
                         Ok(ParsedLine::Io(io)) => {
                             self.pending_io = Some(io);
                         }
-                        Ok(ParsedLine::Noop) => {}
                         Err(e) => self.pending_commands = Some(Err(e)),
                     }
                     self.cmdline_active = false;
@@ -372,6 +417,7 @@ impl EditorCore {
                 // the bar without running anything.
                 Action::Prompt(_) if self.cmdline_active => {
                     self.cmdline_active = false;
+                    self.cmdline_action = None;
                 }
                 // While the bar is focused, edits go to `cmdline` — real
                 // command-line editing (insert, backspace, motion).
@@ -379,11 +425,16 @@ impl EditorCore {
                     let ictx = (self.cmdline_group, &self.viewport, &ctx);
                     let _ = self.cmdline.editor_command(&ea, &ictx, &mut self.store);
                 }
-                Action::Editor(ea) => {
-                    let ictx = (self.group, &self.viewport, &ctx);
-                    // Editing errors (e.g. motion off the end) are non-fatal
-                    // vim behavior, not corruption — drop them, keep the buffer.
-                    let _ = self.buffer.editor_command(&ea, &ictx, &mut self.store);
+                Action::Editor(ea) => self.edit_document(&ea, &ctx),
+                // `.` replays the last change through this loop, like typed
+                // keys. The `.` context overrides the recorded count, and the
+                // override sticks, so `3.` after `x` is `3x` and a later `.`
+                // is `3x` again (modalkit's `VimState::merge`, as in vim).
+                Action::Repeat(RepeatType::EditSequence) if !self.cmdline_active => {
+                    self.save_last_change(&mut queue, Some(ctx));
+                    for pair in self.last_change.iter().rev() {
+                        queue.push_front(pair.clone());
+                    }
                 }
                 // `ZZ`/`ZQ`: modalkit knows the real mode, so it only emits a
                 // window-close here when the keys truly mean quit (an inserted
@@ -410,6 +461,73 @@ impl EditorCore {
             ops.push(op);
         }
         ops
+    }
+
+    /// Copy modalkit's current edit sequence into `last_change`, unless it is
+    /// only the cursor reset modalkit records on leaving the `:`·`/`·`?` bar.
+    /// `overrides` (the `.` context) is merged into the sequence and kept,
+    /// in the machine and in the copy.
+    ///
+    /// `repeat` is the machine's only way to read the sequence: it puts the
+    /// sequence at the front of the machine's action queue. The actions
+    /// already queued move to `queue` first, so they keep their order and
+    /// the sequence can be popped off cleanly.
+    fn save_last_change(
+        &mut self,
+        queue: &mut VecDeque<(Action<EmptyInfo>, EditContext)>,
+        overrides: Option<EditContext>,
+    ) {
+        while let Some(pair) = self.machine.pop() {
+            queue.push_back(pair);
+        }
+        self.machine.repeat(RepeatType::EditSequence, overrides.clone());
+        let mut sequence = Vec::new();
+        while let Some(pair) = self.machine.pop() {
+            sequence.push(pair);
+        }
+        let only_bar_exit = sequence.iter().all(|(a, _)| {
+            matches!(a, Action::Editor(EditorAction::Cursor(CursorAction::Close(_))))
+        });
+        if !only_bar_exit {
+            self.last_change = sequence;
+        } else if let Some(overrides) = overrides {
+            for (_, c) in self.last_change.iter_mut() {
+                *c = VimState::<EmptyInfo>::merge(c.clone(), &overrides);
+            }
+        }
+    }
+
+    /// Run one editor action against the document buffer. A regex search
+    /// (`/`·`?` submit, `n`, `N`, or an operator over one) first checks the
+    /// last search pattern: without a pattern or a match it reports on the
+    /// status line and leaves the cursor, because modalkit would treat an
+    /// empty pattern as matching everywhere and report nothing on no match.
+    fn edit_document(&mut self, ea: &EditorAction, ctx: &EditContext) {
+        if let EditorAction::Edit(_, EditTarget::Search(SearchType::Regex, _, _)) = ea
+            && let Err(msg) = self.check_last_search()
+        {
+            self.pending_commands = Some(Err(msg));
+            return;
+        }
+        let ictx = (self.group, &self.viewport, ctx);
+        // Editing errors (e.g. motion off the end) are non-fatal vim behavior,
+        // not corruption — drop them, keep the buffer.
+        let _ = self.buffer.editor_command(ea, &ictx, &mut self.store);
+    }
+
+    /// Check that the last search pattern exists, compiles, and matches
+    /// somewhere in the document.
+    fn check_last_search(&self) -> Result<(), String> {
+        let pattern = self.store.registers.get_last_search().to_string();
+        if pattern.is_empty() {
+            return Err("No previous regular expression".to_string());
+        }
+        let regex = regex::Regex::new(&pattern).map_err(|e| format!("invalid search pattern: {e}"))?;
+        if regex.is_match(&self.buffer.get_text()) {
+            Ok(())
+        } else {
+            Err(format!("Pattern not found: {pattern}"))
+        }
     }
 
     /// Run a parsed `:s` substitution against the document buffer and move the
@@ -439,25 +557,11 @@ fn strip_one_trailing_newline(s: &str) -> String {
 
 /// What a submitted `:`-line parsed into. Lifecycle verbs ([`CommandRequest`])
 /// are handed to the kernel; a [`Substitution`] is applied to the buffer here;
-/// [`Noop`](ParsedLine::Noop) is a bare `:` or an unwired `/` search.
+/// an [`EditorIo`] is handed to the kernel to fetch.
 enum ParsedLine {
     Commands(Vec<CommandRequest>),
     Substitute(Substitution),
     Io(EditorIo),
-    Noop,
-}
-
-/// Parse a submitted command line. `prefix` selects the dialect: `:` is the
-/// ex-command line; `/`·`?` are search, **not wired yet** — a safe no-op so an
-/// accidental search never edits the document. `body` is the text after the
-/// prefix.
-fn parse_command_line(prefix: &str, body: &str) -> Result<ParsedLine, String> {
-    if prefix.starts_with(':') {
-        parse_ex_command(body)
-    } else {
-        // `/`·`?` search — deferred (docs/vi.md). Submitting one does nothing.
-        Ok(ParsedLine::Noop)
-    }
 }
 
 /// Parse the ex-command dialect. Substitute (`[range]s/pat/rep/flags`) is
@@ -1399,10 +1503,8 @@ mod tests {
         }
     }
 
-    /// Command-line (`:`) and search (`/`·`?`) route through modalkit's prompt
-    /// infrastructure we don't wire yet. They must be a safe no-op on the
-    /// document, not leak their query text into it. (Fixed: `EditorCore`
-    /// suppresses document edits while the command bar is focused.)
+    /// The bar is a separate buffer: neither an ex-command nor a search may
+    /// leak its typed text into the document.
     #[test]
     fn command_line_keys_must_not_corrupt_the_buffer() {
         let mut ed = EditorCore::new("hello");
@@ -1410,12 +1512,315 @@ mod tests {
         assert_eq!(ed.text(), "hello", "an unhandled ex-command must not edit the buffer");
 
         let mut ed = EditorCore::new("hello world");
-        ed.apply_keys("/wor<CR>");
-        assert_eq!(ed.text(), "hello world", "an unhandled search must not edit the buffer");
+        let ops = ed.apply_keys("/wor<CR>");
+        assert_eq!(ed.text(), "hello world", "a search must not edit the buffer");
+        assert!(ops.is_empty(), "a search emits no EditOp");
 
-        // ...and normal editing must resume once the prompt closes (flag cleared).
+        // ...and normal editing resumes once the bar closes, at the match.
         ed.apply_keys("x");
-        assert_eq!(ed.text(), "ello world", "editing resumes after the command-line closes");
+        assert_eq!(ed.text(), "hello orld", "editing resumes at the search match");
+    }
+
+    // ── Search (`/` `?` `n` `N`) ─────────────────────────────────────────────
+    //
+    // The bar submit stores the pattern in modalkit's last-search register and
+    // runs the search motion the bar was focused with. The pattern is Rust
+    // regex, like `:s`.
+
+    mod search {
+        use super::*;
+
+        /// The error message a batch reported, if any.
+        fn message(ed: &mut EditorCore) -> Option<String> {
+            ed.take_commands().and_then(Result::err)
+        }
+
+        #[test]
+        fn slash_moves_forward_to_the_next_match() {
+            let mut ed = EditorCore::new("foo bar foo baz");
+            let ops = ed.apply_keys("/ba<CR>");
+            assert_eq!(ed.cursor(), 4, "/ba lands on bar");
+            assert!(ops.is_empty());
+            assert_eq!(ed.text(), "foo bar foo baz");
+            assert_eq!(message(&mut ed), None, "a found match reports nothing");
+            assert_eq!(ed.command_line(), None, "the bar closes on submit");
+        }
+
+        #[test]
+        fn slash_skips_a_match_under_the_cursor() {
+            let mut ed = EditorCore::new("foo bar foo baz");
+            ed.apply_keys("/foo<CR>");
+            assert_eq!(ed.cursor(), 8, "the match at the cursor is not the next one");
+        }
+
+        #[test]
+        fn slash_wraps_to_the_top() {
+            let mut ed = EditorCore::new("foo bar
+baz");
+            ed.apply_keys("j"); // line 1
+            ed.apply_keys("/foo<CR>");
+            assert_eq!(ed.cursor(), 0, "the search wraps past the end");
+        }
+
+        #[test]
+        fn question_moves_backward_and_wraps() {
+            let mut ed = EditorCore::new("foo bar foo baz");
+            ed.apply_keys("$"); // offset 14
+            ed.apply_keys("?foo<CR>");
+            assert_eq!(ed.cursor(), 8, "?foo finds the previous foo");
+
+            let mut ed = EditorCore::new("foo bar foo baz");
+            ed.apply_keys("?baz<CR>");
+            assert_eq!(ed.cursor(), 12, "?baz from the start wraps to the end");
+        }
+
+        #[test]
+        fn n_repeats_and_capital_n_reverses() {
+            let mut ed = EditorCore::new("a x a x a");
+            ed.apply_keys("/a<CR>");
+            assert_eq!(ed.cursor(), 4);
+            ed.apply_keys("n");
+            assert_eq!(ed.cursor(), 8);
+            ed.apply_keys("n");
+            assert_eq!(ed.cursor(), 0, "n wraps");
+            ed.apply_keys("N");
+            assert_eq!(ed.cursor(), 8, "N goes the other way and wraps");
+            ed.apply_keys("N");
+            assert_eq!(ed.cursor(), 4);
+        }
+
+        #[test]
+        fn n_after_question_goes_backward() {
+            let mut ed = EditorCore::new("a x a x a");
+            ed.apply_keys("?a<CR>");
+            assert_eq!(ed.cursor(), 8, "?a from the start wraps to the last a");
+            ed.apply_keys("n");
+            assert_eq!(ed.cursor(), 4, "n keeps the ? direction");
+            ed.apply_keys("N");
+            assert_eq!(ed.cursor(), 8, "N reverses it");
+        }
+
+        #[test]
+        fn count_n_skips_matches() {
+            let mut ed = EditorCore::new("a x a x a x a");
+            ed.apply_keys("/a<CR>");
+            assert_eq!(ed.cursor(), 4);
+            ed.apply_keys("2n");
+            assert_eq!(ed.cursor(), 12);
+        }
+
+        #[test]
+        fn no_match_reports_and_leaves_the_cursor() {
+            let mut ed = EditorCore::new("hello world");
+            ed.apply_keys("w"); // offset 6
+            let ops = ed.apply_keys("/zzz<CR>");
+            assert!(ops.is_empty());
+            assert_eq!(ed.cursor(), 6, "no match leaves the cursor");
+            assert_eq!(ed.text(), "hello world");
+            let msg = message(&mut ed).expect("no match reports a message");
+            assert!(msg.contains("Pattern not found") && msg.contains("zzz"), "{msg}");
+        }
+
+        #[test]
+        fn n_without_a_previous_search_reports() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys("l");
+            ed.apply_keys("n");
+            assert_eq!(ed.cursor(), 1, "n with no pattern does not move");
+            let msg = message(&mut ed).expect("n with no pattern reports");
+            assert!(msg.contains("No previous regular expression"), "{msg}");
+        }
+
+        #[test]
+        fn n_after_a_failed_search_reports_again() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys("/zzz<CR>");
+            assert!(message(&mut ed).is_some());
+            ed.apply_keys("n");
+            let msg = message(&mut ed).expect("n repeats the failing pattern");
+            assert!(msg.contains("zzz"), "{msg}");
+        }
+
+        #[test]
+        fn empty_pattern_reuses_the_last_one() {
+            let mut ed = EditorCore::new("x a x b x");
+            ed.apply_keys("/x<CR>");
+            assert_eq!(ed.cursor(), 4);
+            ed.apply_keys("/<CR>");
+            assert_eq!(ed.cursor(), 8, "/<CR> searches for x again");
+            assert_eq!(message(&mut ed), None);
+            ed.apply_keys("?<CR>");
+            assert_eq!(ed.cursor(), 4, "?<CR> reuses x backward");
+        }
+
+        #[test]
+        fn empty_pattern_with_no_history_reports() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys("/<CR>");
+            assert_eq!(ed.cursor(), 0);
+            assert!(message(&mut ed).is_some_and(|m| m.contains("No previous regular expression")));
+        }
+
+        #[test]
+        fn invalid_pattern_reports() {
+            let mut ed = EditorCore::new("a[b");
+            ed.apply_keys("/[<CR>");
+            assert_eq!(ed.cursor(), 0);
+            assert_eq!(ed.text(), "a[b");
+            assert!(message(&mut ed).is_some_and(|m| m.contains("invalid search pattern")));
+        }
+
+        #[test]
+        fn pattern_is_rust_regex() {
+            let mut ed = EditorCore::new("ab 12 cd 345");
+            ed.apply_keys("/\\b[0-9]+<CR>");
+            assert_eq!(ed.cursor(), 3);
+            ed.apply_keys("n");
+            assert_eq!(ed.cursor(), 9, "\\b skips the 2 inside 12");
+        }
+
+        #[test]
+        fn typing_in_the_search_bar_edits_nothing() {
+            let mut ed = EditorCore::new("hello");
+            let ops = ed.apply_keys("/xyz<BS>q");
+            assert!(ops.is_empty(), "bar keystrokes emit no EditOp");
+            assert_eq!(ed.text(), "hello");
+            assert_eq!(ed.command_line().as_deref(), Some("/xyq"));
+            let ops = ed.apply_keys("<Esc>");
+            assert!(ops.is_empty());
+            assert_eq!(ed.text(), "hello");
+            assert_eq!(ed.cursor(), 0, "an aborted search does not move");
+            assert_eq!(ed.take_commands(), None, "an aborted search reports nothing");
+        }
+
+        #[test]
+        fn remote_text_reconciles_after_a_search() {
+            let mut ed = EditorCore::new("hello world");
+            ed.apply_keys("/wor<CR>");
+            assert_eq!(ed.cursor(), 6);
+            assert!(ed.apply_remote_text("AB hello world"));
+            assert_eq!(ed.cursor(), 9, "the cursor tracks its char past a peer insert");
+            ed.apply_keys("x");
+            assert_eq!(ed.text(), "AB hello orld", "the next edit lands at the tracked cursor");
+        }
+
+        #[test]
+        fn delete_to_a_search_match_is_an_edit() {
+            let mut ed = EditorCore::new("one two three");
+            let ops = ed.apply_keys("d/thr<CR>");
+            assert_eq!(ed.text(), "three");
+            assert_eq!(ops, vec![EditOp { offset: 0, insert: String::new(), delete: 8 }]);
+        }
+    }
+
+    // ── Dot repeat (`.`) ─────────────────────────────────────────────────────
+    //
+    // `.` replays modalkit's last edit sequence through the same action loop
+    // a typed change takes, so it emits the same kind of EditOps.
+
+    mod dot {
+        use super::*;
+
+        fn case(initial: &str, keys: &str, expected: &str) {
+            let mut ed = EditorCore::new(initial);
+            ed.apply_keys(keys);
+            assert_eq!(ed.text(), expected, "keys {keys:?} on {initial:?}");
+        }
+
+        #[test]
+        fn repeats_x() {
+            let mut ed = EditorCore::new("hello");
+            ed.apply_keys("x");
+            let ops = ed.apply_keys(".");
+            assert_eq!(ed.text(), "llo");
+            assert_eq!(ops, vec![EditOp { offset: 0, insert: String::new(), delete: 1 }]);
+        }
+
+        #[test]
+        fn repeats_dw() {
+            case("one two three", "dw.", "three");
+        }
+
+        #[test]
+        fn repeats_ciw_with_its_inserted_text() {
+            let mut ed = EditorCore::new("foo bar baz");
+            ed.apply_keys("ciwX<Esc>w");
+            let ops = ed.apply_keys(".");
+            assert_eq!(ed.text(), "X X baz");
+            assert_eq!(ed.mode(), None, "the repeat ends in normal mode");
+            assert_eq!(ops, vec![EditOp { offset: 2, insert: "X".into(), delete: 3 }]);
+        }
+
+        #[test]
+        fn repeats_append_at_end_of_line() {
+            case("a\nbc", "A!<Esc>j.", "a!\nbc!");
+        }
+
+        #[test]
+        fn repeats_dd() {
+            case("a\nb\nc", "dd.", "c");
+        }
+
+        #[test]
+        fn count_overrides_the_repeated_count() {
+            // `x` then `3.` is `3x`.
+            case("abcdef", "x3.", "ef");
+            case("a b c d e", "dw2.", "d e");
+        }
+
+        #[test]
+        fn an_overriding_count_sticks() {
+            // vim: the count given to `.` replaces the change's count for
+            // later repeats too.
+            case("abcdefgh", "x2..", "fgh");
+            case("abcdefgh", "x2.:w<CR>.", "fgh");
+        }
+
+        #[test]
+        fn survives_an_ex_command() {
+            let mut ed = EditorCore::new("abc");
+            ed.apply_keys("x:w<CR>");
+            assert_eq!(
+                ed.take_commands(),
+                Some(Ok(vec![CommandRequest::Write { force: false }]))
+            );
+            ed.apply_keys(".");
+            assert_eq!(ed.text(), "c", "`.` after :w repeats the x");
+        }
+
+        #[test]
+        fn survives_an_aborted_bar() {
+            case("abc", "x:foo<Esc>.", "c");
+        }
+
+        #[test]
+        fn a_newer_change_replaces_the_saved_one() {
+            // `x`, a search (saves x), then `dw`: `.` must repeat dw, not x.
+            case("ab cd ef gh", "x/e<CR>dw.", "b cd ");
+        }
+
+        #[test]
+        fn a_motion_between_does_not_replace_the_change() {
+            case("ab cd", "xw.", "b d");
+        }
+
+        #[test]
+        fn a_search_between_does_not_replace_the_change() {
+            case("ab cd", "x/d<CR>.", "b c");
+        }
+
+        #[test]
+        fn nothing_to_repeat_is_a_noop() {
+            let mut ed = EditorCore::new("hello");
+            let ops = ed.apply_keys(".");
+            assert!(ops.is_empty());
+            assert_eq!(ed.text(), "hello");
+        }
+
+        #[test]
+        fn dot_in_insert_mode_is_text() {
+            case("", "ia.b<Esc>", "a.b");
+        }
     }
 
     #[test]

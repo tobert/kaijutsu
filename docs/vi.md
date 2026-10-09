@@ -42,6 +42,8 @@ restart. The W12 changed-under-us guard shipped too
 (`FileDocumentCache::flush_one_guarded`): a plain `:w` refuses when the disk
 generation has moved past the buffer's load generation, reporting on the
 status line and leaving the session open and dirty; `:w!` overrides.
+`/`·`?` search with `n`/`N`, and `.` dot-repeat, also shipped (see "Search
+and dot-repeat" under the `:` dialect).
 
 **Open** (only in this doc; the backlog proper is `docs/issues.md`):
 
@@ -66,10 +68,15 @@ status line and leaving the session open and dirty; `:w!` overrides.
   has to sit on top of the `+`/`-` bands; the editor has no bands and wants the
   shader's over-the-text composite. Neither could use the other's compositor —
   which is exactly why the rect *producer* is shared and the drawing is not.
-- **`/`·`?` search and `.` dot-repeat** — safe no-ops today (the command-bar
-  suppression guard makes them inert, not corrupting). Real search needs the
-  bar submit wired to a search action; real `.` needs modalkit's
-  last-edit-sequence machinery.
+- **Search and dot-repeat gaps** — search has no offsets (`/pat/e`), no
+  wrap notice ("search hit BOTTOM"), no incremental highlight, and no `/` or
+  `?` history recall. `.` after leaving Visual mode with `<Esc>` and no
+  operator repeats nothing, because modalkit records the return-to-normal
+  cursor reset as the new edit sequence; the `:`·`/`·`?` bar has the same
+  modalkit behavior, and `EditorCore` works around it there only. `.` does
+  not repeat an operator over a typed search (`d/pat<CR>`): `EditorCore`
+  runs that motion itself at bar submit, outside modalkit's edit sequence
+  (`dn` repeats).
 - **`:s` refinements** — bare `:s` (repeat-last) errors; `.`/`$` symbolic
   ranges, `&`/`~` repeat, and finer-than-`set_text` undo granularity deferred.
 - **Exact-window peer targeting.** The `open_editor` signal fans out to the
@@ -426,9 +433,27 @@ push channel; the app renders it read-only.
   existing `open_editor` signal). vim only grew `:!` because it had nowhere
   else to go; kaijutsu does. (`:%!filter` is also out of scope; the shell
   filters.)
+- **Search and dot-repeat.** `/pat<CR>` moves forward to the next match and
+  `?pat<CR>` moves backward, wrapping past either end; `n` repeats in the
+  same direction and `N` in the opposite one, and both take a count. An empty
+  pattern (`/<CR>`) reuses the last one. The pattern is Rust regex, like
+  `:s`. A search moves the cursor and never edits the document, unless an
+  operator is pending (`d/pat<CR>` deletes up to the match). No match leaves
+  the cursor and reports `Pattern not found: <pat>`; `n` with no earlier
+  pattern reports `No previous regular expression`. modalkit owns the
+  pieces: the bar submit stores the pattern in its last-search register and
+  runs the search motion the bar was opened with. `.` replays modalkit's
+  tracked edit sequence (`dw`, `x`, `ciwfoo<Esc>`, `A!<Esc>`, ...) through the
+  same action loop as typed keys, so it emits ordinary `EditOp`s. A count
+  replaces the change's count and keeps replacing it for later `.`s (`x`
+  then `3.` is `3x`). `EditorCore` keeps its own copy of the last change,
+  taken before the bar opens and on each `.`, because leaving the bar makes
+  modalkit record a cursor reset as a new edit sequence; without the copy,
+  `.` after `/pat` or `:w` would do nothing.
 - **Errors report on the `:` line.** Every **dialect-level** failure — an
   unknown command (E492), a bad `:s` regex, a dirty-buffer `:q` refusal (E37),
-  a failed `:r` (missing file, denied/failed command, no opener) — sets the
+  a failed `:r` (missing file, denied/failed command, no opener), a failed or
+  invalid search — sets the
   transient `EditorState.message` and keeps the session open; it clears on the
   next keystroke batch. Hard `editor_keys` errors are **reserved for
   session/infrastructure failures** (no such session, a block-mirror failure) —
