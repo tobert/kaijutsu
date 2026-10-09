@@ -17,6 +17,7 @@ use kaijutsu_types::{
 use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
+use crate::editor_outbox::EditorOutbox;
 use crate::outbox::DraftOutbox;
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
@@ -138,6 +139,8 @@ pub struct App {
     pub compose: Compose,
     /// Where compose edits go to reach the kernel's draft, in order.
     pub drafts: DraftOutbox,
+    /// Where keys and pastes for a full-screen editor session go, in order.
+    pub editor_keys: EditorOutbox,
     pub palette: Palette,
     /// The terminal's row count, from the last size the event loop read.
     /// Sizes what may grow with the screen (the compose cap).
@@ -265,6 +268,7 @@ impl App {
             connection: None,
             compose: Compose::new(),
             drafts: DraftOutbox::default(),
+            editor_keys: EditorOutbox::default(),
             palette: Palette::builtin(),
             screen_rows: 24,
             wrap: WrapCache::new(),

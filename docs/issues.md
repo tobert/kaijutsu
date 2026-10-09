@@ -2106,18 +2106,18 @@ Not new with the paste slice; `editor_keys` has had the same window. Fix
 is to publish the state read under the lock before the database write, or
 re-read after it. Found by the kaibo review of the paste slice.
 
-## The tui takes the kernel-wide firehose and blocks on one RPC per keystroke (2026-09-10)
+## The tui takes the kernel-wide firehose (2026-09-10)
 
-`crates/kaijutsu-tui/src/bridge.rs:78` spawns the actor with
+`crates/kaijutsu-tui/src/bridge.rs` spawns the actor with
 `scope_blocks_to_context: false` on purpose (the tui is a mux), so with
 500+ live contexts it receives every block event, including
-`report_audio_inventory` bumping a revision every 10 s. `run.rs:782`
-(`mirror_ops`) awaits one `edit_input` per vi op with no per-RPC timeout —
-the only timeout is `connect_timeout` (`main.rs`) — so under IO stall
-typing blocks rather than timing out. Fix is the same as the app's entry
-above: `watch_contexts` for the set the mux shows, and one `edit_input` per
-keystroke batch. The "kernel events lost" notices are in the tui's log file
-(`docs/tui.md`, "Every way out restores the terminal") since 2026-09-13.
+`report_audio_inventory` bumping a revision every 10 s. Fix is the same as
+the app's entry above: `watch_contexts` for the set the mux shows. The
+draft and the editor no longer block the key path on a call
+(`crate::outbox`, `crate::editor_outbox`), but neither has a per-call
+timeout: under an IO stall their queues grow instead of failing. The
+"kernel events lost" notices are in the tui's log file (`docs/tui.md`,
+"Every way out restores the terminal") since 2026-09-13.
 
 ## kaish children inherit the kernel's priority (2026-09-10)
 

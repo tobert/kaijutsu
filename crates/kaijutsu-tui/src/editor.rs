@@ -2,8 +2,9 @@
 //!
 //! The kernel owns the editor session; this module is a renderer and a key
 //! forwarder, exactly as the Bevy app is (`docs/vi.md`, "App renderer"). Every
-//! key travels to `editor_keys` in the kernel's vi notation, and the resulting
-//! [`EditorState`] is what gets drawn. There is no local VimMachine, no mode
+//! key travels to `editor_keys` in the kernel's vi notation, batched on the
+//! editor outbox (`crate::editor_outbox`), and the resulting [`EditorState`]
+//! is what gets drawn. There is no local VimMachine, no mode
 //! detection, and no quit detection: `ZZ`/`ZQ`/`:q` are ordinary keys, and the
 //! kernel answers them with an `EditorClosed` push.
 //!
@@ -366,24 +367,7 @@ pub fn enter_editor(app: &mut crate::app::App, open: EditorOpen) {
 pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEvent) -> bool {
     use kaijutsu_client::ServerEvent;
     match event {
-        ServerEvent::EditorStateChanged { state } => {
-            if let Some(screen) = app.screen.editor_mut()
-                && screen.session == state.session
-            {
-                screen.state = state.clone();
-                return true;
-            }
-            // A session parked under another context keeps its state
-            // current; nothing on screen changed.
-            for parked in app.parked_screens.values_mut() {
-                if let Some(screen) = parked.editor_mut()
-                    && screen.session == state.session
-                {
-                    screen.state = state.clone();
-                }
-            }
-            false
-        }
+        ServerEvent::EditorStateChanged { state } => apply_state(app, state.clone()),
         ServerEvent::EditorClosed { session_id } => {
             if app.screen.editor().is_some_and(|s| s.session == *session_id) {
                 app.screen = ScreenMode::Conversation;
@@ -395,6 +379,27 @@ pub fn apply_push(app: &mut crate::app::App, event: &kaijutsu_client::ServerEven
         }
         _ => false,
     }
+}
+
+/// Take a session's new state, pushed or answered, onto the screen that
+/// holds it. A session parked under another context keeps its state
+/// current too. Returns whether the screen on view changed.
+pub fn apply_state(app: &mut crate::app::App, state: EditorState) -> bool {
+    if let Some(screen) = app.screen.editor_mut()
+        && screen.session == state.session
+    {
+        screen.state = state;
+        return true;
+    }
+    for parked in app.parked_screens.values_mut() {
+        if let Some(screen) = parked.editor_mut()
+            && screen.session == state.session
+        {
+            screen.state = state;
+            return false;
+        }
+    }
+    false
 }
 
 /// A connection that will not come back cannot carry an editor session's

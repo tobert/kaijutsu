@@ -135,6 +135,14 @@ mod tests {
         }
     }
 
+    /// The next ack, or a failure rather than a hang when it never comes.
+    async fn next(landed: &mut mpsc::UnboundedReceiver<Landed>) -> Landed {
+        tokio::time::timeout(Duration::from_secs(2), landed.recv())
+            .await
+            .expect("an ack within 2 s")
+            .expect("the writer is running")
+    }
+
     fn op(offset: usize, insert: &str) -> EditOp {
         EditOp { offset, insert: insert.into(), delete: 0 }
     }
@@ -165,7 +173,7 @@ mod tests {
 
             sink.gate.add_permits(3);
             for version in 1..=3 {
-                let got = landed.recv().await.unwrap();
+                let got = next(&mut landed).await;
                 assert_eq!(got, Landed { generation: 1, result: Ok(version) });
             }
             assert_eq!(*sink.seen.borrow(), ["a", "b", "c"], "the kernel saw them in typed order");
@@ -184,12 +192,12 @@ mod tests {
             outbox.edit(ctx, 1, op(1, "b")).unwrap();
             settle().await;
             sink.gate.add_permits(1);
-            landed.recv().await.unwrap();
+            next(&mut landed).await;
             settle().await;
             assert_eq!(*sink.seen.borrow(), ["a"], "b waits for its own permit");
             assert_eq!(sink.gate.available_permits(), 0);
             sink.gate.add_permits(1);
-            landed.recv().await.unwrap();
+            next(&mut landed).await;
             assert_eq!(*sink.seen.borrow(), ["a", "b"]);
         });
     }
@@ -232,11 +240,11 @@ mod tests {
             for (i, c) in ["a", "b", "c"].into_iter().enumerate() {
                 outbox.edit(ctx, 7, op(i, c)).unwrap();
             }
-            assert_eq!(landed.recv().await.unwrap().result, Ok(1));
-            let failed = landed.recv().await.unwrap();
+            assert_eq!(next(&mut landed).await.result, Ok(1));
+            let failed = next(&mut landed).await;
             assert_eq!(failed.generation, 7);
             assert_eq!(failed.result, Err("refused b".to_string()));
-            assert_eq!(landed.recv().await.unwrap().result, Ok(2));
+            assert_eq!(next(&mut landed).await.result, Ok(2));
         });
     }
 

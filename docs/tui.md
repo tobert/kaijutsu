@@ -1189,8 +1189,16 @@ parked surface. The
 notation `kaijutsu-editor`'s `parse_keys` accepts is a literal char, `<Esc>`,
 `<CR>`, `<BS>`, `<Tab>`, a space, and `<C-x>`; an arrow, a function key and a
 literal `<` have no token, and are refused rather than sent and silently
-dropped. The loop awaits one `editor_keys` call per key, so keystrokes cannot
-reorder in flight and no ordering pipe is needed.
+dropped.
+
+**Keys never wait on the kernel.** They go on the editor outbox
+(`crate::editor_outbox`): one writer keeps one call in flight, and the keys
+that queue behind it go out as one `editor_keys` batch, since vim notation
+concatenates. A paste is its own `editorInsert` and keeps its place: the keys
+before it go first, and a batch never reaches across it. The kernel still
+owns the mode and the buffer, so nothing is drawn ahead of it. Each state,
+answered or pushed, is drawn as soon as no more keys are waiting, not on the
+80 ms tick.
 
 **Restart staleness gives the viewport back.** A kernel restart drops the
 in-memory sessions while the persisted kernel id is unchanged, so the

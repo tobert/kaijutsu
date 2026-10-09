@@ -1823,6 +1823,35 @@ fn the_prefix_pops_over_the_open_picker() {
     assert!(!rows.contains("archive"), "a chord reached the picker as a verb: {}", session.dump("picker"));
 }
 
+/// Keys typed into the full-screen editor faster than the kernel answers
+/// reach it in order, backspaces and a paste among them, and the screen
+/// settles on the kernel's buffer as typed. The editor draws only what the
+/// kernel answers (`docs/vi.md`, "Decisions"), so the screen is the kernel's
+/// buffer.
+#[test]
+fn a_burst_into_the_editor_lands_in_order_with_a_paste_in_place() {
+    let _serial = serial();
+    let (_server, _key_dir, session) = spawn_session(24, 100);
+    wait_for_attach(&session);
+
+    session.send(":!vi /config/rc/lib/create/S00-base.md\r");
+    let in_editor = |screen: &vt100::Screen| screen_contains_str(screen, "S00-base.md") && !screen_contains(screen, '\u{276f}');
+    assert!(session.wait_until(Duration::from_secs(15), in_editor), "vi never opened: {}", session.dump("vi"));
+
+    session.send("ggOone two\x7f\x7f\x7fthree");
+    session.send("\x1b[200~PASTED\x1b[201~");
+    session.send("four");
+    let typed = session.wait_until(Duration::from_secs(10), |screen| screen_contains_str(screen, "one threePASTEDfour"));
+    assert!(typed, "the editor did not land the burst in order: {}", session.dump("burst"));
+
+    // Leave without writing: `Esc` on its own, then `:q!`.
+    session.send("\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send(":q!\r");
+    let back = session.wait_until(Duration::from_secs(10), |screen| screen_contains(screen, '\u{276f}'));
+    assert!(back, "the editor did not close: {}", session.dump("quit"));
+}
+
 /// The prefix pops over the full-screen editor: a seat chord shows the other
 /// context's conversation, the editor stays with the context it was opened
 /// in, and `Ctrl+A Ctrl+A` lands back in it (`docs/tui.md`, "Editor and

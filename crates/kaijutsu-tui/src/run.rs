@@ -36,6 +36,7 @@ use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
 use crate::compose::{Compose, CursorShape};
 use crate::outbox::{self, Landed};
+use crate::editor_outbox;
 use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
@@ -228,6 +229,8 @@ struct Wires {
     editor_opens: mpsc::Receiver<EditorOpen>,
     /// Acks for our own draft edits ([`crate::outbox`]).
     draft_landed: mpsc::UnboundedReceiver<Landed>,
+    /// Answers to our own editor keys and pastes ([`crate::editor_outbox`]).
+    editor_landed: mpsc::UnboundedReceiver<editor_outbox::Landed>,
 }
 
 /// Run the client until it quits, restoring the terminal on the way out.
@@ -292,6 +295,8 @@ pub async fn run(
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
     let (drafts, draft_landed) = outbox::spawn(bridge.clone());
     app.drafts = drafts;
+    let (editor_keys, editor_landed) = editor_outbox::spawn(bridge.clone());
+    app.editor_keys = editor_keys;
 
     // A panic on this thread, outside any task, past this point unwinds
     // through the screen without reaching `leave_terminal`. The hook
@@ -348,6 +353,7 @@ pub async fn run(
         server_events,
         editor_opens: open_rx,
         draft_landed,
+        editor_landed,
     };
     let result = event_loop(&bridge, &mut app, &mut terminal, &mut wires).await;
     leave_terminal(&mut terminal, &term_lock, &reader_stop);
@@ -645,13 +651,14 @@ async fn event_loop(
         if let Some(message) = TASK_PANIC.lock().take() {
             return Err(anyhow::anyhow!(message));
         }
-        let mut input = false;
+        // Something the player is waiting to see: drawn now, not on the tick.
+        let mut answer = false;
         tokio::select! {
             Some(event) = wires.key_rx.recv() => {
                 match event {
                     Event::Key(key) => {
                         dirty = true;
-                        input = true;
+                        answer = true;
                         // Input only reaches a focused terminal, whatever
                         // the last focus report said (`App::saw_input`).
                         app.saw_input();
@@ -700,9 +707,9 @@ async fn event_loop(
                     }
                     Event::Paste(text) => {
                         dirty = true;
-                        input = true;
+                        answer = true;
                         app.saw_input();
-                        paste_text(bridge, app, text).await;
+                        paste_text(app, text);
                     }
                     // The frame is rebuilt at the new size on the next tick:
                     // the transcript re-wraps and the band follows.
@@ -727,6 +734,12 @@ async fn event_loop(
                         beat_wake = None;
                     }
                     _ => {}
+                }
+            }
+            Some(landed) = wires.editor_landed.recv() => {
+                if land_editor_answer(app, landed) {
+                    dirty = true;
+                    answer = true;
                 }
             }
             Some(landed) = wires.draft_landed.recv() => {
@@ -761,6 +774,8 @@ async fn event_loop(
                 }
                 if observe_editor_event(bridge, app, &event).await {
                     dirty = true;
+                    // An editor push is the answer to a key, ours or a peer's.
+                    answer = true;
                 }
                 // The picker's tail buffer (`docs/tui.md`, "The picker") is
                 // fed ungated, like the app's `ContextTails` — every context,
@@ -969,9 +984,10 @@ async fn event_loop(
                 }
             }
         }
-        // Input is answered on screen now rather than at the next tick. A
-        // burst of keys draws once, after the last key already read.
-        if dirty && input && wires.key_rx.is_empty() {
+        // Input, and the editor states answering it, are drawn now rather
+        // than at the next tick. A burst of keys draws once, after the last
+        // key already read.
+        if dirty && answer && wires.key_rx.is_empty() {
             dirty = false;
             present(terminal, &wires.term_lock, app, keys.armed(), panic_in_frame, &mut presented)?;
         }
@@ -1261,7 +1277,7 @@ async fn act(
     // vi surface has the screen every key belongs to it, `Ctrl+C` included,
     // except the `Ctrl+A` prefix and its chord ([`Keys::claims`]).
     if editor::route_key(app, keys.claims(&key)) == editor::KeyRoute::FullScreen {
-        act_full_screen(bridge, app, key).await?;
+        act_full_screen(app, key);
         return Ok(Acted::Continue);
     }
     // The ledger view captures its own keys while open — j/k/Esc are never
@@ -1317,7 +1333,7 @@ async fn act(
         match chord_over_full_screen(&intent) {
             OverFullScreen::Run => {}
             OverFullScreen::ToSurface(key) => {
-                act_full_screen(bridge, app, key).await?;
+                act_full_screen(app, key);
                 return Ok(Acted::Continue);
             }
             OverFullScreen::Hold => {
@@ -1615,10 +1631,9 @@ fn paste_target(app: &App) -> PasteTarget {
 /// terminals differ on what they send for a pasted newline. The draft
 /// takes it as one edit at the cursor, like `Ctrl+A ]`; the `:` bar takes
 /// it flattened onto one line at its end; an open editor session takes it
-/// as one `editorInsert` call, the same awaited-per-call shape
-/// `editor_keys` uses (`act_full_screen`) — a paste never leaves two editor
-/// calls in flight.
-async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
+/// as one `editorInsert` call, queued on the editor outbox behind the keys
+/// before it (`crate::editor_outbox`).
+fn paste_text(app: &mut App, text: String) {
     let text = normalize_paste(&text);
     // A paste is typing: past a disarmed ask card it lands in the draft and
     // pushes arming out, as a key would.
@@ -1630,26 +1645,11 @@ async fn paste_text(bridge: &KernelBridge, app: &mut App, text: String) {
             let flat = text.lines().collect::<Vec<_>>().join(" ");
             app.compose.set_command_body(&format!("{body}{flat}"));
         }
-        PasteTarget::Editor(session) => match bridge.actor().editor_insert(session, &text).await {
-            Ok(state) => {
-                if let Some(screen) = app.screen.editor_mut()
-                    && screen.session == state.session
-                {
-                    screen.state = state;
-                }
+        PasteTarget::Editor(session) => {
+            if let Err(e) = app.editor_keys.insert(session, &text) {
+                app.note(format!("paste not sent: {e:#}"));
             }
-            Err(e) => {
-                let message = e.to_string();
-                if editor::is_session_lost(&message) {
-                    editor::leave_on_session_lost(
-                        app,
-                        "editor session lost (kernel restarted?); reopen with vi",
-                    );
-                } else {
-                    tracing::warn!(session, error = %message, "editor_insert failed");
-                }
-            }
-        },
+        }
         PasteTarget::Draft => {
             let Some(ctx) = app.current else {
                 app.note("no context attached");
@@ -1802,6 +1802,26 @@ async fn compose_key(
         }
     }
     Ok(())
+}
+
+/// One answer from the editor outbox. A state is drawn on whichever screen
+/// holds its session, on screen or parked; a lost session gives the
+/// conversation back. Returns whether the screen changed.
+fn land_editor_answer(app: &mut App, landed: editor_outbox::Landed) -> bool {
+    match landed.result {
+        Ok(state) => editor::apply_state(app, state),
+        Err(message) if editor::is_session_lost(&message) => {
+            // A kernel restart: the sessions are in memory and the persisted
+            // kernel id is unchanged, so the buffer on screen is dead and
+            // typing echoes nothing. Give the conversation back instead of
+            // freezing.
+            editor::leave_on_session_lost(app, "editor session lost (kernel restarted?); reopen with vi")
+        }
+        Err(message) => {
+            tracing::warn!(session = landed.session, sent = %landed.sent, error = %message, "editor call failed");
+            false
+        }
+    }
 }
 
 /// What a prefix chord does over the full-screen editor or diff viewer.
@@ -2722,42 +2742,20 @@ async fn observe_editor_event(bridge: &KernelBridge, app: &mut App, event: &Serv
 }
 
 /// A key while a full-screen surface has the screen.
-async fn act_full_screen(bridge: &KernelBridge, app: &mut App, key: KeyEvent) -> Result<()> {
+fn act_full_screen(app: &mut App, key: KeyEvent) {
     if let Some(session) = app.screen.editor().map(|s| s.session) {
         // A key with no notation is refused rather than sent: the kernel's
         // `parse_keys` drops an unknown `<...>` token silently, so forwarding
         // one would look like a working key that does nothing.
         let Some(notation) = editor::key_notation(&key) else {
-            return Ok(());
+            return;
         };
-        // One awaited call per key: the loop handles keys in order and never
-        // has two in flight, so keystrokes cannot reorder on the wire and no
-        // ordering pipe is needed.
-        match bridge.actor().editor_keys(session, &notation).await {
-            Ok(state) => {
-                if let Some(screen) = app.screen.editor_mut()
-                    && screen.session == state.session
-                {
-                    screen.state = state;
-                }
-            }
-            Err(e) => {
-                let message = e.to_string();
-                if editor::is_session_lost(&message) {
-                    // A kernel restart: the sessions are in memory and the
-                    // persisted kernel id is unchanged, so the buffer on
-                    // screen is dead and typing echoes nothing. Give the
-                    // conversation back instead of freezing.
-                    editor::leave_on_session_lost(
-                        app,
-                        "editor session lost (kernel restarted?); reopen with vi",
-                    );
-                } else {
-                    tracing::warn!(session, keys = %notation, error = %message, "editor_keys failed");
-                }
-            }
+        // Queued on the editor outbox: one call in flight, keys behind it
+        // batched, and the answer lands through `land_editor_answer`.
+        if let Err(e) = app.editor_keys.keys(session, &notation) {
+            app.note(format!("editor key not sent: {e:#}"));
         }
-        return Ok(());
+        return;
     }
 
     if let ScreenMode::Diff(screen) = &mut app.screen {
@@ -2766,8 +2764,6 @@ async fn act_full_screen(bridge: &KernelBridge, app: &mut App, key: KeyEvent) ->
             app.screen = ScreenMode::Conversation;
         }
     }
-
-    Ok(())
 }
 
 /// Write the OSC 52 clipboard sequence (`copy::osc52_sequence`) directly to
