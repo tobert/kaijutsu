@@ -10,7 +10,7 @@
 # "Contained mode", says how a run uses it.
 FROM docker.io/library/archlinux:latest
 
-RUN pacman -Sy --noconfirm --needed git && rm -rf /var/cache/pacman/pkg
+RUN pacman -Sy --noconfirm --needed git socat && rm -rf /var/cache/pacman/pkg
 
 # A commit needs an identity; the model's commands should not have to pass one.
 RUN git config --system user.name "acp fleet" \

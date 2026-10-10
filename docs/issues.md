@@ -412,10 +412,23 @@ the line to be sent or cleared, not only for a pause in typing.
   The outbox keeps that cost off the key path, but a long burst still
   drains at that rate.
 
-## acp-fleet contained scenarios not run since the typed ledger (2026-10-08)
+## kaish argument globs skip `build/`, and say only "no matches" (2026-10-10)
 
-`fleet/contained` needs podman and the fleet image; it was not run when
-the host scenarios were brought up to date on 2026-10-10.
+In a coder seat, `cat build/obj/*.o` fails with `no matches:
+build/obj/*.o` while `build/obj/greeting.o` exists, and the `glob` file
+tool's `**/*` lists nothing under `build/`; the kaish builtin `glob
+build/obj/*.o` finds the file, and the same `cat` under `other/obj/`
+works. kaish's agent ignore defaults
+(`kaish-glob` `IgnoreFilter::with_defaults`: `build`, `dist`, `target`,
+`node_modules`, and others) apply to argument expansion. Seen in the
+contained live fleet (`fleet/contained/live/council-cleanup.toml`, an
+earlier draft): a DeepSeek seat spent most of a prompt probing why its
+build left `build/app` empty, guessed at `.gitignore`, and read the gate
+config. Contributing factors: the error does not say a rule skipped the
+match, and the `glob` builtin and argument expansion disagree. A seat
+cleaning up `build/*` by glob would remove nothing and be told there was
+nothing. Open: whether agent ignore rules belong in argument expansion at
+all, or only in search tools; this is kaish's to decide.
 
 ## Council bump-only has no way to hand an action to Amy (2026-10-06)
 

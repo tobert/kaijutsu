@@ -6,6 +6,8 @@
 //! the agent's `TMPDIR`. The agent is a fresh process per scenario, so no state
 //! crosses between scenarios. A `[council]` scenario also gets a scripted
 //! council server for the run, and a `[live]` one talks to a real model API.
+//! A contained agent reaches either one only through the relay
+//! ([`crate::relay`]).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,8 +17,9 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
-use crate::container;
+use crate::container::{self, Endpoint, Reach};
 use crate::council::ScriptedCouncil;
+use crate::relay::Relay;
 use crate::scenario::{
     Answer, COUNCIL_PLACEHOLDER, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative,
 };
@@ -326,18 +329,14 @@ fn drive(
         std::fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
     }
 
+    // Lives until this function returns, after the agent has exited.
+    let mut relay = None;
     let (command, session_cwd) = match scenario.mode {
         Mode::Host => {
             let mut command = AgentCommand::new(&config.agent);
             command = match &scenario.live {
                 Some(live) => {
-                    let path = live.key_path()?;
-                    let key = std::fs::read_to_string(&path)
-                        .with_context(|| format!("[live] read the API key file {}", path.display()))?;
-                    let key = key.trim();
-                    if key.is_empty() {
-                        bail!("[live] the API key file {} is empty", path.display());
-                    }
+                    let key = read_key(&live.key_path()?)?;
                     command
                         .arg("--backend-kind")
                         .arg(&live.backend_kind)
@@ -345,7 +344,7 @@ fn drive(
                         .arg(&live.model)
                         .arg("--api-key-env")
                         .arg(LIVE_KEY_ENV)
-                        .env(LIVE_KEY_ENV, key)
+                        .env(LIVE_KEY_ENV, key.trim())
                 }
                 None => command
                     .arg("--backend-kind")
@@ -371,12 +370,32 @@ fn drive(
         Mode::Contained => {
             let gate = format!("{}/gate.toml", container::FLEET);
             let rc = format!("{}/rc", container::FLEET);
-            let mut args = vec!["--backend-kind", "mock", "--model", MOCK_MODEL, "--gate-config", &gate];
+            let mut args = match &scenario.live {
+                Some(live) => vec!["--backend-kind", &live.backend_kind, "--model", &live.model, "--api-key-env", LIVE_KEY_ENV],
+                None => vec!["--backend-kind", "mock", "--model", MOCK_MODEL],
+            };
+            args.extend(["--gate-config", &gate]);
             if !overlay.is_empty() {
                 args.extend(["--rc-overlay", &rc]);
             }
+            let endpoints = contained_endpoints(scenario, council.as_deref())?;
+            if !endpoints.is_empty() {
+                relay = Some(Relay::start(&config.scratch_root, &endpoints)?);
+            }
+            let key_file = match &scenario.live {
+                Some(live) => {
+                    let path = live.key_path()?;
+                    read_key(&path)?;
+                    Some(path)
+                }
+                None => None,
+            };
+            let reach = Reach {
+                relay: relay.as_ref().map(|r| (r.dir(), endpoints.as_slice())),
+                key: key_file.as_deref().map(|path| (path, LIVE_KEY_ENV)),
+            };
             let command =
-                container::agent_command(&config.agent, &scratch.workspace, &scratch.fleet, &scratch.id, &args);
+                container::agent_command(&config.agent, &scratch.workspace, &scratch.fleet, &scratch.id, &args, reach)?;
             (command, PathBuf::from(container::WORKSPACE))
         }
     };
@@ -392,8 +411,9 @@ fn drive(
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &session_cwd, scratch, council.as_deref(), config.timeout, failures)
-        .map(|wire| *transcript = Some(wire));
+    let result =
+        converse(&mut agent, scenario, &session_cwd, scratch, council.as_deref(), scripted.as_ref(), config.timeout, failures, notes)
+            .map(|wire| *transcript = Some(wire));
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
     let shutdown = agent.shutdown(Duration::from_secs(60));
@@ -401,6 +421,9 @@ fn drive(
     drop(agent);
     if scenario.mode == Mode::Contained {
         container::remove(&scratch.id);
+    }
+    if let Some(relay) = &relay {
+        notes.extend(relay.report());
     }
     if let Some(scripted) = &scripted {
         let answered = scripted.answered();
@@ -431,6 +454,33 @@ fn drive(
     Ok(())
 }
 
+/// Read an API key file, failing when it is unreadable or blank. The key is
+/// returned for a host agent's environment and never printed.
+fn read_key(path: &Path) -> Result<String> {
+    let key = std::fs::read_to_string(path).with_context(|| format!("[live] read the API key file {}", path.display()))?;
+    if key.trim().is_empty() {
+        bail!("[live] the API key file {} is empty", path.display());
+    }
+    Ok(key)
+}
+
+/// What a contained agent reaches through the relay: the council, at the
+/// address its gate names, and the model API of a `[live]` scenario. Each
+/// appears once.
+pub fn contained_endpoints(scenario: &Scenario, council: Option<&str>) -> Result<Vec<Endpoint>> {
+    let mut endpoints = Vec::new();
+    if let Some(council) = council {
+        endpoints.push(Endpoint::from_url(council).context("the council's address")?);
+    }
+    if let Some(live) = &scenario.live {
+        let api = live.api_endpoint().with_context(|| format!("[live] no model API is known for {:?}", live.backend_kind))?;
+        if !endpoints.contains(&api) {
+            endpoints.push(api);
+        }
+    }
+    Ok(endpoints)
+}
+
 /// The gate policy a contained scenario runs under when it names none: every
 /// statement no key covers runs, with no ask.
 pub const YOLO_GATE: &str = "\
@@ -459,15 +509,20 @@ fn with_council(gate: &str, council: Option<&str>) -> String {
     }
 }
 
-/// `workspace` is the session cwd as the agent sees it.
+/// `workspace` is the session cwd as the agent sees it. With a scripted
+/// council, each prompt of a scenario with more than one notes the answers
+/// the council gave during it.
+#[allow(clippy::too_many_arguments)]
 fn converse(
     agent: &mut AcpClient,
     scenario: &Scenario,
     workspace: &Path,
     scratch: &Scratch,
     council: Option<&str>,
+    scripted: Option<&ScriptedCouncil>,
     timeout: Duration,
     failures: &mut Vec<String>,
+    notes: &mut Vec<String>,
 ) -> Result<Transcript> {
     let init = agent.initialize()?;
     if init.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
@@ -488,6 +543,12 @@ fn converse(
             std::fs::write(&path, with_council(gate, council))
                 .with_context(|| format!("{label}: replace {}", path.display()))?;
         }
+        let answered_before = scripted.map_or(0, |s| s.answered().len());
+        if let Some(scripted) = scripted
+            && !prompt.council_verdicts.is_empty()
+        {
+            scripted.restart(prompt.council_verdicts.clone()).with_context(|| label.clone())?;
+        }
         let id = agent.start_prompt(&session, &prompt.text).with_context(|| label.clone())?;
         if let Some(cancel) = &prompt.cancel {
             cancel_mid_call(agent, &session, id, cancel, &scratch.workspace, timeout).with_context(|| label.clone())?;
@@ -503,6 +564,12 @@ fn converse(
             permissions: &agent.permissions()[permissions_before..],
         };
         failures.extend(check_prompt(&label, prompt, &seen));
+        if let Some(scripted) = scripted
+            && scenario.prompt.len() > 1
+        {
+            let during = scripted.answered().split_off(answered_before);
+            notes.push(format!("{label}: scripted council answered {} decision(s): {}", during.len(), during.join(", ")));
+        }
         prompts.push(PromptWire { label, sent, response, answered, ended: agent.arrival() });
     }
     failures.extend(answers_shown_as_tool_calls(agent.updates()));
@@ -1034,6 +1101,21 @@ mod tests {
     fn the_gate_gets_the_council_servers_address() {
         let council = scenario("gate = \"[council]\\nserver = \\\"{council}\\\"\\n\"\n[council]\nverdicts = [\"proceed\"]");
         assert_eq!(gate_policy(&council, Some("http://127.0.0.1:9")), "[council]\nserver = \"http://127.0.0.1:9\"\n");
+    }
+
+    #[test]
+    fn a_contained_agent_reaches_only_its_council_and_model_api() {
+        let mock = scenario("mode = \"contained\"");
+        assert_eq!(contained_endpoints(&mock, None).unwrap(), Vec::<Endpoint>::new());
+        let live = scenario(
+            "mode = \"contained\"\n[live]\nbackend_kind = \"deepseek\"\nmodel = \"m\"\napi_key_file = \"/k\"",
+        );
+        let reached: Vec<String> =
+            contained_endpoints(&live, Some("http://127.0.0.1:41000")).unwrap().iter().map(|e| e.to_string()).collect();
+        assert_eq!(reached, ["127.0.0.1:41000", "api.deepseek.com:443"]);
+        let reached: Vec<String> =
+            contained_endpoints(&live, Some("http://zorak:8090")).unwrap().iter().map(|e| e.to_string()).collect();
+        assert_eq!(reached, ["zorak:8090", "api.deepseek.com:443"]);
     }
 
     #[test]

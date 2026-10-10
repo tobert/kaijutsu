@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::client::PermissionAnswer;
+use crate::container::Endpoint;
 use crate::council::{Script, Undo, Verdict};
 
 /// The text a scenario's `gate` uses for the council server's address. The
@@ -84,7 +85,22 @@ pub struct Live {
     pub api_key_file: String,
 }
 
+/// The model API host each backend kind talks to by default, which is
+/// the one endpoint a contained live agent reaches for its model.
+pub const API_HOSTS: &[(&str, &str)] =
+    &[("anthropic", "api.anthropic.com"), ("deepseek", "api.deepseek.com"), ("openai", "api.openai.com")];
+
 impl Live {
+    /// The model API a contained agent must reach: the backend kind's
+    /// default host, on 443. `None` for a backend kind the fleet does not
+    /// know.
+    pub fn api_endpoint(&self) -> Option<Endpoint> {
+        API_HOSTS
+            .iter()
+            .find(|(kind, _)| *kind == self.backend_kind)
+            .map(|(_, host)| Endpoint { host: host.to_string(), port: 443 })
+    }
+
     /// `api_key_file` with a leading `~/` expanded from `$HOME`.
     pub fn key_path(&self) -> Result<PathBuf> {
         match self.api_key_file.strip_prefix("~/") {
@@ -98,7 +114,8 @@ impl Live {
 }
 
 /// The council a scenario's gate reads: `verdicts` for a council the runner
-/// serves on 127.0.0.1, or `server` for a real one.
+/// serves on 127.0.0.1, or `server` for a real one. A contained agent reaches
+/// either through the relay (`crate::relay`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Council {
@@ -213,6 +230,11 @@ pub struct Prompt {
     /// as an operator editing it would. Host mode only.
     #[serde(default)]
     pub gate: Option<String>,
+    /// From this prompt on, the scripted council answers these verdicts,
+    /// starting from the first; the last one repeats. Needs `[council]
+    /// verdicts`.
+    #[serde(default)]
+    pub council_verdicts: Vec<Verdict>,
 }
 
 /// When to send `session/cancel` during a prompt, and what to do after the
@@ -250,7 +272,8 @@ pub enum Mode {
     /// The agent runs on the host, and verifiers are declarative.
     #[default]
     Host,
-    /// The agent runs in a container with no network and no host home, and
+    /// The agent runs in a container with no network of its own and no host
+    /// home, reaching only its council and model API through the relay, and
     /// `[[verify]]` may run a script in another container.
     Contained,
 }
@@ -357,8 +380,13 @@ impl Scenario {
             if !self.model.is_empty() {
                 bail!("[live] talks to a real model, so [[model]] replies would never be read; remove one or the other");
             }
-            if self.mode != Mode::Host {
-                bail!("[live] needs the network, and contained scenarios have none; use mode = \"host\"");
+            if self.mode == Mode::Contained && live.api_endpoint().is_none() {
+                bail!(
+                    "[live] a contained agent reaches only the model API the fleet knows for its backend, and it knows \
+                     none for {:?}; use one of {:?}",
+                    live.backend_kind,
+                    API_HOSTS.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()
+                );
             }
             for (key, value) in [("backend_kind", &live.backend_kind), ("model", &live.model), ("api_key_file", &live.api_key_file)] {
                 if value.trim().is_empty() {
@@ -373,9 +401,6 @@ impl Scenario {
             .any(|g| g.contains(COUNCIL_PLACEHOLDER));
         match &self.council {
             Some(council) => {
-                if self.mode != Mode::Host {
-                    bail!("[council] serves on 127.0.0.1, which a contained agent cannot reach; use mode = \"host\"");
-                }
                 match (&council.server, council.verdicts.is_empty()) {
                     (Some(_), false) => bail!("[council] give `verdicts` for a scripted council or `server` for a real one, not both"),
                     (None, true) => bail!("[council] needs `verdicts`, at least one, or a `server`"),
@@ -384,6 +409,9 @@ impl Scenario {
                     }
                     (Some(server), true) if !server.starts_with("http://") && !server.starts_with("https://") => {
                         bail!("[council] `server` {server:?} must start with http:// or https://")
+                    }
+                    (Some(server), true) if self.mode == Mode::Contained => {
+                        Endpoint::from_url(server).context("[council] `server`")?;
                     }
                     _ => {}
                 }
@@ -413,6 +441,9 @@ impl Scenario {
         for (n, prompt) in self.prompt.iter().enumerate() {
             if prompt.gate.is_some() && self.mode != Mode::Host {
                 bail!("[[prompt]] {}: `gate` edits the kernel's config on the host; contained scenarios cannot use it", n + 1);
+            }
+            if !prompt.council_verdicts.is_empty() && self.council.as_ref().is_none_or(|c| c.verdicts.is_empty()) {
+                bail!("[[prompt]] {}: `council_verdicts` restarts the scripted council, and [council] has no `verdicts`", n + 1);
             }
             if prompt.release.contains(&Answer::Hold) {
                 bail!("[[prompt]] {}: `release` answers held requests; `hold` is not an answer there", n + 1);
@@ -735,11 +766,18 @@ exists = true
     }
 
     #[test]
-    fn a_live_scenario_refuses_scripted_replies_containers_and_stray_keys() {
+    fn a_contained_live_scenario_reaches_its_backends_api() {
+        let contained = Scenario::parse(&format!("mode = \"contained\"\n{LIVE}"), "contained").unwrap();
+        assert_eq!(contained.live.unwrap().api_endpoint(), Some(Endpoint { host: "api.deepseek.com".into(), port: 443 }));
+        let unknown = format!("mode = \"contained\"\n{}", LIVE.replace("\"deepseek\"", "\"local\""));
+        assert!(refusal(&unknown).contains("knows none for \"local\""), "{}", refusal(&unknown));
+        Scenario::parse(&LIVE.replace("\"deepseek\"", "\"local\""), "host").unwrap();
+    }
+
+    #[test]
+    fn a_live_scenario_refuses_scripted_replies_and_stray_keys() {
         let scripted = format!("{LIVE}\n[[model]]\ntext = \"hi\"\n");
         assert!(refusal(&scripted).contains("[[model]] replies would never be read"), "{}", refusal(&scripted));
-        let contained = format!("mode = \"contained\"\n{LIVE}");
-        assert!(refusal(&contained).contains("needs the network"), "{}", refusal(&contained));
         let stray = LIVE.replace("model = \"deepseek-flash\"", "model = \"deepseek-flash\"\napi_key = \"sk-x\"");
         assert!(refusal(&stray).contains("api_key"), "{}", refusal(&stray));
         let empty = LIVE.replace("deepseek-flash", " ");
@@ -774,10 +812,31 @@ exists = true
         assert!(refusal(&unnamed).contains("no `gate` names it"), "{}", refusal(&unnamed));
         let undo_on_real = with_council("server = \"http://zorak:8090\"\nundo = \"normal\"", COUNCIL_GATE);
         assert!(refusal(&undo_on_real).contains("answers for itself"), "{}", refusal(&undo_on_real));
-        let contained = format!("mode = \"contained\"\n{}", with_council("verdicts = [\"proceed\"]", COUNCIL_GATE));
-        assert!(refusal(&contained).contains("cannot reach"), "{}", refusal(&contained));
         let orphan = format!("gate = {COUNCIL_GATE:?}\n{MINIMAL}");
         assert!(refusal(&orphan).contains("no [council]"), "{}", refusal(&orphan));
+    }
+
+    #[test]
+    fn a_prompt_restarts_only_a_scripted_council() {
+        let restart = |council: &str| {
+            with_council(council, COUNCIL_GATE).replace("text = \"say hi\"", "text = \"say hi\"\ncouncil_verdicts = [\"do_less\"]")
+        };
+        let scenario = Scenario::parse(&restart("verdicts = [\"proceed\"]"), "scripted").unwrap();
+        assert_eq!(scenario.prompt[0].council_verdicts, [Verdict::DoLess]);
+        let real = restart("server = \"http://zorak:8090\"");
+        assert!(refusal(&real).contains("has no `verdicts`"), "{}", refusal(&real));
+        let none = MINIMAL.replace("text = \"say hi\"", "text = \"say hi\"\ncouncil_verdicts = [\"do_less\"]");
+        assert!(refusal(&none).contains("has no `verdicts`"), "{}", refusal(&none));
+    }
+
+    #[test]
+    fn a_contained_council_is_scripted_or_a_named_server() {
+        let contained = |council: &str| format!("mode = \"contained\"\n{}", with_council(council, COUNCIL_GATE));
+        Scenario::parse(&contained("verdicts = [\"proceed\"]"), "scripted").unwrap();
+        Scenario::parse(&contained("server = \"http://zorak:8090\""), "named").unwrap();
+        let address = contained("server = \"http://192.168.1.5:8090\"");
+        assert!(refusal(&address).contains("name the host"), "{}", refusal(&address));
+        Scenario::parse(&with_council("server = \"http://192.168.1.5:8090\"", COUNCIL_GATE), "host").unwrap();
     }
 
     #[test]

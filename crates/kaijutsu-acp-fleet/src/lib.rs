@@ -9,6 +9,7 @@
 //! - [`client`]: a reusable ACP v1 client over a child process's stdio.
 //! - [`container`]: the podman commands contained scenarios run with.
 //! - [`council`]: a scripted council server a scenario's gate can point at.
+//! - [`relay`]: the host end of a contained agent's network.
 //! - [`scenario`]: the scenario file format.
 //! - [`run`]: runs one scenario and judges it.
 //! - [`shape`]: the Harbor-shape invariants every transcript is checked for.
@@ -16,6 +17,7 @@
 pub mod client;
 pub mod container;
 pub mod council;
+pub mod relay;
 pub mod run;
 pub mod scenario;
 pub mod shape;
@@ -29,6 +31,10 @@ pub const APPROVAL_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/appro
 
 /// The contained-mode scenarios shipped with this crate.
 pub const CONTAINED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/contained");
+
+/// Contained scenarios that drive a real model API (`[live]`). Like
+/// [`LIVE_DIR`], nothing runs them by default.
+pub const CONTAINED_LIVE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet/contained/live");
 
 /// Scenarios that drive a real model API (`[live]`). They spend money, so
 /// nothing runs them by default: `acp-fleet run --live`, or name them.

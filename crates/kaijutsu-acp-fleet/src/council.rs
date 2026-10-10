@@ -6,7 +6,8 @@
 //! and answers each decision with the scenario's next verdict. Every answer
 //! carries numbers `math::verify` recomputes, so the kernel reads it as a
 //! real council's. One verdict answers one decision, in order, and the last
-//! one repeats.
+//! one repeats. [`ScriptedCouncil::restart`] replaces the verdicts between
+//! prompts.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -215,6 +216,9 @@ struct Shared {
     specs: Mutex<HashMap<String, Spec>>,
     /// Each decision's answer, in order: the verdict, and the `undo` read.
     answered: Mutex<Vec<String>>,
+    /// The script answering now, and the number of the decision it answers
+    /// first, counted from 0 across the run.
+    script: Mutex<Option<(Script, usize)>>,
     /// Requests it could not serve, each named.
     errors: Mutex<Vec<String>>,
     puts: AtomicU64,
@@ -235,9 +239,8 @@ impl ScriptedCouncil {
         }
         let listener = TcpListener::bind("127.0.0.1:0").context("bind the scripted council")?;
         let addr = listener.local_addr().context("the scripted council's address")?;
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared { script: Mutex::new(Some((script, 0))), ..Shared::default() });
         let stop = Arc::new(AtomicBool::new(false));
-        let script = Arc::new(script);
         let (state, stopping) = (shared.clone(), stop.clone());
         let accept = std::thread::spawn(move || {
             for sock in listener.incoming() {
@@ -245,8 +248,8 @@ impl ScriptedCouncil {
                     return;
                 }
                 let Ok(sock) = sock else { continue };
-                let (state, script) = (state.clone(), script.clone());
-                std::thread::spawn(move || serve_one(sock, &state, &script));
+                let state = state.clone();
+                std::thread::spawn(move || serve_one(sock, &state));
             }
         });
         Ok(Self { base: format!("http://{addr}"), shared, stop, accept: Some(accept) })
@@ -255,6 +258,19 @@ impl ScriptedCouncil {
     /// The server's address, as `[council] server` takes it.
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// Answer the next decision with the first of `verdicts`, then on in
+    /// order; the last one repeats. The `undo` read stays as it was.
+    pub fn restart(&self, verdicts: Vec<Verdict>) -> Result<()> {
+        if verdicts.is_empty() {
+            bail!("a scripted council needs at least one verdict");
+        }
+        let answered = self.shared.answered.lock().map_err(|_| anyhow::anyhow!("the answer log is poisoned"))?;
+        let mut script = self.shared.script.lock().map_err(|_| anyhow::anyhow!("the script is poisoned"))?;
+        let undo = script.as_ref().and_then(|(s, _)| s.undo);
+        *script = Some((Script { verdicts, undo }, answered.len()));
+        Ok(())
     }
 
     /// Each decision's answer so far, in order, such as `try_harder` or
@@ -316,10 +332,10 @@ fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
     Ok((method, path, String::from_utf8_lossy(&buf[head_end..]).to_string()))
 }
 
-fn serve_one(mut sock: TcpStream, shared: &Shared, script: &Script) {
+fn serve_one(mut sock: TcpStream, shared: &Shared) {
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
     let request = read_request(&mut sock);
-    let (status, body) = match request.and_then(|(method, path, body)| route(&method, &path, &body, shared, script)) {
+    let (status, body) = match request.and_then(|(method, path, body)| route(&method, &path, &body, shared)) {
         Ok(body) => (200, body.to_string()),
         Err(error) => {
             let message = format!("{error:#}");
@@ -337,7 +353,7 @@ fn serve_one(mut sock: TcpStream, shared: &Shared, script: &Script) {
     let _ = sock.shutdown(std::net::Shutdown::Both);
 }
 
-fn route(method: &str, path: &str, body: &str, shared: &Shared, script: &Script) -> Result<Value> {
+fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value> {
     match (method, path) {
         ("GET", "/council/v1/identity") => Ok(server_identity()),
         ("POST", "/council/v1/specs") => {
@@ -364,7 +380,9 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared, script: &Script)
                 .cloned()
                 .with_context(|| format!("a decision names spec {spec_id}, which was never posted"))?;
             let mut answered = shared.answered.lock().map_err(|_| anyhow::anyhow!("the answer log is poisoned"))?;
-            let verdict = script.verdict(answered.len());
+            let script = shared.script.lock().map_err(|_| anyhow::anyhow!("the script is poisoned"))?;
+            let (script, first) = script.as_ref().context("the scripted council has no script")?;
+            let verdict = script.verdict(answered.len() - first);
             let reply = answer(&request, &spec, verdict, script.undo)?;
             answered.push(match script.undo {
                 Some(undo) => format!("{} undo={}", verdict.option(), undo.option()),
@@ -468,6 +486,10 @@ mod tests {
             (0..3).map(|_| pooled_choice(&call("POST", "/council/v1/decisions", &decision).1, "verdict")).collect();
         assert_eq!(verdicts, ["try_harder", "do_less", "do_less"]);
         assert_eq!(council.answered(), ["try_harder", "do_less", "do_less"]);
+        council.restart(vec![Verdict::Proceed, Verdict::TryHarder]).unwrap();
+        let verdicts: Vec<String> =
+            (0..3).map(|_| pooled_choice(&call("POST", "/council/v1/decisions", &decision).1, "verdict")).collect();
+        assert_eq!(verdicts, ["proceed", "try_harder", "try_harder"], "a restart answers from its first verdict");
         assert!(council.errors().is_empty(), "{:?}", council.errors());
         let (status, _) = call("POST", "/council/v1/nowhere", "");
         assert_eq!(status, 500);

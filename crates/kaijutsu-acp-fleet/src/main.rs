@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use kaijutsu_acp_fleet::run::{RunConfig, run_file};
-use kaijutsu_acp_fleet::{DEFAULT_SCRATCH, FLEET_DIR, LIVE_DIR, scenario};
+use kaijutsu_acp_fleet::{CONTAINED_LIVE_DIR, DEFAULT_SCRATCH, FLEET_DIR, LIVE_DIR, scenario};
 
 /// Run ACP scenarios against an agent driven by a scripted model, or by a
 /// real model API for a `[live]` scenario.
@@ -24,12 +24,13 @@ enum Command {
     Run {
         /// Scenario files, or directories whose *.toml files are scenarios.
         /// Default: the host scenarios shipped with this crate; contained ones
-        /// are in its fleet/contained directory, and live ones in fleet/live.
-        /// A live scenario named here runs without --live.
+        /// are in its fleet/contained directory, and live ones in fleet/live
+        /// and fleet/contained/live. A live scenario named here runs without
+        /// --live.
         scenarios: Vec<PathBuf>,
-        /// Also run the live scenarios in fleet/live, which talk to a real
-        /// model API and spend money. With no scenarios named, they are
-        /// skipped and the run says so.
+        /// Also run the live scenarios in fleet/live and fleet/contained/live,
+        /// which talk to a real model API and spend money. With no scenarios
+        /// named, they are skipped and the run says so.
         #[arg(long)]
         live: bool,
         /// The agent binary: kaijutsu-solo-acp built with --features test-mock.
@@ -69,10 +70,11 @@ fn real_main() -> Result<bool> {
         None => sibling_agent()?,
     };
     let named = !scenarios.is_empty();
+    let live_dirs = [PathBuf::from(LIVE_DIR), PathBuf::from(CONTAINED_LIVE_DIR)];
     let paths = match (named, live) {
-        (true, true) => [scenarios, vec![PathBuf::from(LIVE_DIR)]].concat(),
+        (true, true) => [scenarios, live_dirs.to_vec()].concat(),
         (true, false) => scenarios,
-        (false, true) => vec![PathBuf::from(FLEET_DIR), PathBuf::from(LIVE_DIR)],
+        (false, true) => [vec![PathBuf::from(FLEET_DIR)], live_dirs.to_vec()].concat(),
         (false, false) => vec![PathBuf::from(FLEET_DIR)],
     };
     let files = scenario::discover(&paths)?;
@@ -80,9 +82,12 @@ fn real_main() -> Result<bool> {
         bail!("no scenario files found in {paths:?}");
     }
     if !named && !live {
-        let skipped = scenario::discover(&[PathBuf::from(LIVE_DIR)])?;
+        let skipped = scenario::discover(&live_dirs)?;
         if !skipped.is_empty() {
-            println!("SKIP {} live scenario(s) in {LIVE_DIR}; they spend money, so pass --live or name one", skipped.len());
+            println!(
+                "SKIP {} live scenario(s) in {LIVE_DIR} and {CONTAINED_LIVE_DIR}; they spend money, so pass --live or name one",
+                skipped.len()
+            );
         }
     }
 
