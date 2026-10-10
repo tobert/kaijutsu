@@ -343,6 +343,18 @@ looking for a writable place, outside its brief. Open: warn or refuse at
 create when a writing seat's cwd is not under a read-write mount, and say
 which mounts are writable in the coder's runtime facts.
 
+## The judge shadow misses under a burst of calls (2026-10-10)
+
+On moltar, `shadow-coder-2` sent about ten shell calls in two minutes at
+the end of a task. The gate, judge priming, and judge reads share one
+megakernel (`mk-zorak`), and four judge reads missed their 30 s deadline,
+on `git clean -fdX`, `git add && git commit`, and `make clean`: the
+cleanup steps whose history the judge exists for. Gate time also rose
+from about 1 s to 13 s during a burst on the first seat. Open: queue or
+coalesce priming per shadow (send the latest tail, not every one), give
+the judge its own deadline or server, and measure priming time from the
+server.
+
 ## Council presets per context (Amy, 2026-10-08)
 
 Amy: "bumps should only be enabled on coders and optionally. maybe we come
