@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use approval_ledger::council::{CouncilDecision, CouncilOutcome};
 use approval_ledger::council_observation::{
-    CouncilObservation, CouncilObservationOutcome, list_council_observations_for_decision, list_council_voice_skips,
+    CouncilObservation, CouncilObservationOutcome, list_council_observations_for_decision, list_council_reviewer_skips,
 };
 use approval_ledger::types::{ApprovalRow, ApprovalStatus, SignalRow, SignalSourceKind, SignalVerdict};
 use kaijutsu_mk::council::wire::DecisionRequest;
@@ -269,12 +269,12 @@ struct Setup {
     /// Replaces the mock's address, for a server that is down.
     server: Option<String>,
     global: &'static str,
-    /// `[council] voices`.
-    voices: bool,
+    /// `[council] reviewer_contexts`.
+    reviewer_contexts: bool,
     /// The seat is reviewed by banto, a model character, and forked from a
     /// context Amy, a live root, plays; `[council] contexts` is
     /// `["council-system"]`. Otherwise the seat's reviewer is a lone
-    /// character and the contexts are `["voice", "system-rules"]`.
+    /// character and the contexts are `["reviewer", "system-rules"]`.
     chain: bool,
     /// `gate.toml` declares the program spec, `program-gate`, with a
     /// threshold for the test server.
@@ -298,7 +298,7 @@ impl Default for Setup {
             deadline_ms: 700,
             server: None,
             global: "",
-            voices: false,
+            reviewer_contexts: false,
             chain: false,
             programs: false,
             house_rules: false,
@@ -318,7 +318,7 @@ fn gate_toml(server: &str, setup: &Setup) -> String {
 [council]
 server = "{server}"
 contexts = {contexts}
-voices = {voices}
+reviewer_contexts = {reviewer_contexts}
 house_rules = {house_rules}
 {mode}
 pool = {{ method = "loglinear", weights = "mass" }}
@@ -338,8 +338,8 @@ mass_floor = -0.05
 enabled = {enabled}
 "#,
         global = setup.global,
-        contexts = if setup.chain { r#"["council-system"]"# } else { r#"["voice", "system-rules"]"# },
-        voices = setup.voices,
+        contexts = if setup.chain { r#"["council-system"]"# } else { r#"["reviewer", "system-rules"]"# },
+        reviewer_contexts = setup.reviewer_contexts,
         house_rules = setup.house_rules,
         mode = match (setup.bump_only, setup.bump_limit) {
             (true, _) => "mode = \"bump-only\"".to_string(),
@@ -446,7 +446,7 @@ async fn rig(via: Via, setup: Setup) -> Rig {
         let banto = character(d.kernel(), "banto", false);
         (banto, Some(crate::kj::test_helpers::register_root_context(&d)))
     } else {
-        live_context(d.kernel(), "voice");
+        live_context(d.kernel(), "reviewer");
         live_context(d.kernel(), "system-rules");
         (character(d.kernel(), "council-seat-reviewer", false), None)
     };
@@ -619,7 +619,7 @@ impl Rig {
         request.contexts.iter().flatten().map(|c| c.id.clone()).collect()
     }
 
-    /// Every decision request except the reads of the voice `observed` alone.
+    /// Every decision request except the reads of the council context `observed` alone.
     fn gate_requests(&self, observed: &str) -> Vec<DecisionRequest> {
         self.mock.decisions().into_iter().filter(|r| Self::read_ids(r) != [observed.to_string()]).collect()
     }
@@ -648,7 +648,7 @@ impl Rig {
     fn skips(&self, decision_id: &[u8]) -> Vec<String> {
         let db = self.d.kernel_db();
         let db = db.lock();
-        list_council_voice_skips(db.conn_for_ledger(), decision_id).unwrap().into_iter().map(|s| s.character_name).collect()
+        list_council_reviewer_skips(db.conn_for_ledger(), decision_id).unwrap().into_iter().map(|s| s.character_name).collect()
     }
 }
 
@@ -831,7 +831,7 @@ async fn a_council_report_asks_and_emits_the_report_event() {
         assert_eq!(field(report, "context_id"), Some(rig.ctx.context_id.to_string().as_str()));
         assert_eq!(field(report, "actor_id"), Some(rig.ctx.actor_id.to_string().as_str()));
         let answers = field(report, "answers").unwrap();
-        assert!(answers.contains("voice") && answers.contains("system-rules") && answers.contains("report"), "{answers}");
+        assert!(answers.contains("reviewer") && answers.contains("system-rules") && answers.contains("report"), "{answers}");
         // The submitter has no character sheet, so the seat is autonomous;
         // no turn runs here and no continuation is open.
         assert_eq!(field(report, "council.report_stop"), Some("nothing_running"), "{report:?}");
@@ -1266,17 +1266,17 @@ fn latest_decision(rig: &Rig) -> CouncilDecision {
     rig.decisions().into_iter().max_by_key(|d| d.created_at).expect("a council decision")
 }
 
-/// With voices on, a seat reviewed by banto for Amy reads the system rules
-/// and Amy's voice in the decision, and banto's voice is read after it,
+/// With reviewer contexts on, a seat reviewed by banto for Amy reads the system rules
+/// and Amy's council context in the decision, and banto's council context is read after it,
 /// alone under `direction-check`, recorded against the decision.
 ///
 /// Falsified by `consult` reading only `[council] contexts`: the request
 /// reads one context. Falsified by no observation spawn: nothing is
 /// recorded against the decision.
 #[tokio::test]
-async fn voices_compose_amy_into_the_decision_and_banto_observes_it() {
+async fn reviewer_contexts_compose_amy_into_the_decision_and_banto_observes_it() {
     for via in BOTH {
-        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        let rig = rig(via, Setup { reviewer_contexts: true, chain: true, ..Setup::default() }).await;
         let amy = live_context(rig.d.kernel(), "council-amy");
         append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
         let banto = live_context(rig.d.kernel(), "council-banto");
@@ -1290,43 +1290,43 @@ async fn voices_compose_amy_into_the_decision_and_banto_observes_it() {
                 allow_each(req)
             }
         });
-        rig.submit("echo voices").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
+        rig.submit("echo reviewers").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
 
         let sent = rig.gate_requests(&banto_id);
         assert_eq!(sent.len(), 1, "{via:?}: one gate decision");
         assert_eq!(
             Rig::read_ids(&sent[0]),
             [rig.context_of("council-system"), rig.context_of("council-amy")],
-            "{via:?}: the decision reads the system rules, then Amy's voice"
+            "{via:?}: the decision reads the system rules, then Amy's council context"
         );
         let decision = the_decision(&rig, &rig.only_ask());
         assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
-        assert!(rig.skips(&decision.decision_id).is_empty(), "{via:?}: every voice is held");
+        assert!(rig.skips(&decision.decision_id).is_empty(), "{via:?}: every council context is held");
 
         let rows = rig.observations(&decision.decision_id, 1).await;
         assert_eq!(rows.len(), 1, "{via:?}: {rows:#?}");
         let o = &rows[0].observation;
-        assert_eq!(o.voice_label, "council-banto");
+        assert_eq!(o.reviewer_label, "council-banto");
         assert_eq!(o.spec_name, "direction-check");
         assert_eq!(o.outcome, CouncilObservationOutcome::Answered, "{via:?}: {o:?}");
         assert_eq!(o.choice.as_deref(), Some("strays"));
         let observed: Vec<DecisionRequest> =
             rig.mock.decisions().into_iter().filter(|r| Rig::read_ids(r) == [banto_id.clone()]).collect();
-        assert_eq!(observed.len(), 1, "{via:?}: banto's voice is read once, alone");
-        assert_eq!(serde_json::to_value(&observed[0].state).unwrap()["command"], "echo voices");
+        assert_eq!(observed.len(), 1, "{via:?}: banto's council context is read once, alone");
+        assert_eq!(serde_json::to_value(&observed[0].state).unwrap()["command"], "echo reviewers");
         assert_ne!(observed[0].spec_id, sent[0].spec_id, "the observation reads its own spec");
         rig.finish().await;
     }
 }
 
-/// A character on the chain with no voice context is skipped, and the skip
-/// is recorded with the decision; the decision still reads Amy's voice.
+/// A character on the chain with no council context is skipped, and the skip
+/// is recorded with the decision; the decision still reads Amy's council context.
 ///
 /// Falsified by a decision record written without the chain's skips.
 #[tokio::test]
-async fn a_character_without_a_voice_is_recorded_as_a_skip() {
+async fn a_character_without_a_reviewer_context_is_recorded_as_a_skip() {
     for via in BOTH {
-        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        let rig = rig(via, Setup { reviewer_contexts: true, chain: true, ..Setup::default() }).await;
         live_context(rig.d.kernel(), "council-amy");
         rig.mock.set(allow_each);
         rig.submit("echo skipped").await.unwrap_or_else(|e| panic!("{via:?}: the council allows: {e:?}"));
@@ -1343,7 +1343,7 @@ async fn a_character_without_a_voice_is_recorded_as_a_skip() {
 #[tokio::test]
 async fn an_observation_that_fails_leaves_the_gate_alone() {
     for via in BOTH {
-        let rig = rig(via, Setup { voices: true, chain: true, ..Setup::default() }).await;
+        let rig = rig(via, Setup { reviewer_contexts: true, chain: true, ..Setup::default() }).await;
         live_context(rig.d.kernel(), "council-amy");
         let banto = live_context(rig.d.kernel(), "council-banto").to_string();
         let observed = banto.clone();
@@ -1367,10 +1367,10 @@ async fn an_observation_that_fails_leaves_the_gate_alone() {
     }
 }
 
-/// With voices off, a decision reads exactly `[council] contexts`, even
-/// when the reviewer chain has voices, and nothing observes it.
+/// With reviewer contexts off, a decision reads exactly `[council] contexts`, even
+/// when the reviewer chain has council contexts, and nothing observes it.
 #[tokio::test]
-async fn with_voices_off_the_decision_reads_the_configured_contexts() {
+async fn with_reviewer_contexts_off_the_decision_reads_the_configured_contexts() {
     for via in BOTH {
         let rig = rig(via, Setup { chain: true, ..Setup::default() }).await;
         live_context(rig.d.kernel(), "council-amy");
@@ -1390,7 +1390,7 @@ async fn with_voices_off_the_decision_reads_the_configured_contexts() {
         rig.mock.answers(&ALLOW);
         rig.submit("echo configured").await.unwrap();
         let sent = rig.mock.decisions();
-        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("reviewer"), rig.context_of("system-rules")], "{via:?}");
         rig.finish().await;
     }
 }
@@ -1410,7 +1410,7 @@ async fn a_context_type_reads_its_own_council_without_changing_other_types() {
         rig.submit("echo director").await.unwrap();
         let sent = rig.mock.decisions();
         assert_eq!(sent.len(), 2, "{via:?}");
-        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}");
+        assert_eq!(Rig::read_ids(&sent[0]), [rig.context_of("reviewer"), rig.context_of("system-rules")], "{via:?}");
         assert_eq!(Rig::read_ids(&sent[1]), [rig.context_of("council-amy"), rig.context_of("council-banto")], "{via:?}");
         rig.finish().await;
     }
@@ -1983,9 +1983,9 @@ async fn a_spec_reads_its_own_contexts_and_no_other_spec_does() {
         rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
         let sent = rig.mock.decisions();
         assert_eq!(sent.len(), 2, "{via:?}: a shell and a program decision");
-        let (voice, rules, code) = (rig.context_of("voice"), rig.context_of("system-rules"), rig.context_of("code"));
+        let (reviewer, rules, code) = (rig.context_of("reviewer"), rig.context_of("system-rules"), rig.context_of("code"));
         for request in &sent {
-            let want = if is_program(request) { vec![voice.clone(), rules.clone(), code.clone()] } else { vec![voice.clone(), rules.clone()] };
+            let want = if is_program(request) { vec![reviewer.clone(), rules.clone(), code.clone()] } else { vec![reviewer.clone(), rules.clone()] };
             assert_eq!(Rig::read_ids(request), want, "{via:?}: program={}", is_program(request));
         }
         rig.finish().await;
@@ -2023,7 +2023,7 @@ async fn the_house_rules_context_joins_the_shell_and_program_decisions() {
         rig.mock.set(allow_each);
         rig.submit("echo no-agents-md").await.unwrap_or_else(|e| panic!("{via:?}: {e:?}"));
         let first = rig.mock.decisions();
-        assert_eq!(Rig::read_ids(&first[0]), [rig.context_of("voice"), rig.context_of("system-rules")], "{via:?}: no AGENTS.md, no extra read");
+        assert_eq!(Rig::read_ids(&first[0]), [rig.context_of("reviewer"), rig.context_of("system-rules")], "{via:?}: no AGENTS.md, no extra read");
 
         append_dialogue(rig.d.kernel(), rig.ctx.context_id, &["recover the records", "The WAL is XORed; no backup yet."]);
         rig.write("/work/AGENTS.md", "Back up data before changing it.\n").await;
@@ -2044,7 +2044,7 @@ async fn the_house_rules_context_joins_the_shell_and_program_decisions() {
         for request in &sent {
             assert_eq!(
                 Rig::read_ids(request),
-                [rig.context_of("voice"), rig.context_of("system-rules"), held.clone()],
+                [rig.context_of("reviewer"), rig.context_of("system-rules"), held.clone()],
                 "{via:?}: program={}",
                 is_program(request)
             );
@@ -2519,7 +2519,7 @@ async fn a_decision_that_does_not_pass_logs_each_contexts_answers() {
     let (bump, reads) = &outcomes[0];
     assert_eq!(bump, "bump", "{outcomes:?}");
     let reads = reads.as_deref().unwrap_or_default();
-    assert!(reads.contains("voice: verdict=proceed") && reads.contains("system-rules: verdict=try_harder"), "{reads}");
+    assert!(reads.contains("reviewer: verdict=proceed") && reads.contains("system-rules: verdict=try_harder"), "{reads}");
     assert_eq!(outcomes[1].0, "allow");
     assert!(outcomes[1].1.as_deref().unwrap_or_default().is_empty(), "an allow logs no reads: {outcomes:?}");
     drop(events);
@@ -2790,7 +2790,7 @@ async fn without_a_mode_the_gate_is_a_gatekeeper() {
 }
 
 /// Gives the rig's seat a cast whose `judge` slot names `model`, so the seat
-/// gets a judge shadow (`docs/council.md`, "Shadow voice").
+/// gets a judge shadow (`docs/council.md`, "Shadow context").
 fn give_judge_cast(rig: &Rig, model: &str) {
     give_judge_cast_on(rig, model, "anthropic", None);
 }
@@ -2988,7 +2988,7 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
 
     let rows = rig.observations(&decision.decision_id, 1).await;
     let o = &rows[0].observation;
-    assert_eq!(o.voice_label, "judge-council-seat");
+    assert_eq!(o.reviewer_label, "judge-council-seat");
     assert_eq!(o.spec_name, "shell-gate");
     assert_eq!(o.outcome, CouncilObservationOutcome::Answered, "{o:?}");
     assert_eq!(o.choice.as_deref(), Some("ask"));
@@ -2998,7 +2998,7 @@ async fn a_judge_answers_after_the_decision_and_its_answer_is_recorded() {
     assert_eq!(judged.len(), 1, "one judge read");
     assert_eq!(
         Rig::read_ids(&judged[0]),
-        [rig.context_of("voice"), rig.context_of("system-rules"), shadow.to_string()],
+        [rig.context_of("reviewer"), rig.context_of("system-rules"), shadow.to_string()],
         "the judge reads the decision's contexts, then the shadow"
     );
     assert!(judged[0].contexts.as_ref().unwrap()[2].at.is_some(), "the shadow is pinned");

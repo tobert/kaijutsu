@@ -1,92 +1,92 @@
-//! The council voices a decision composes along the reviewer chain
+//! The reviewer contexts a decision composes along the reviewer chain
 //! (`docs/council.md`, "Council contexts are kaijutsu contexts").
 //!
-//! [`voice_chain`] starts at the submitting seat's reviewer, resolved the way
+//! [`reviewer_context_chain`] starts at the submitting seat's reviewer, resolved the way
 //! the gate resolves an ask's reviewer (`KernelDb::effective_approval_reviewer`),
 //! and climbs the way `kj ledger escalate` does
 //! (`KernelDb::responsible_character_above`, excluding the actor and every
 //! character already on the chain) until it reaches the first live root
-//! character. Each character on the chain contributes its voice context,
+//! character. Each character on the chain contributes its council context,
 //! labeled `council-<character>`:
 //!
-//! - a live root's voice **votes**: the gate adds it to the decision's
-//!   contexts ([`VoiceChain::decision_labels`]);
-//! - a model character's voice **observes**: it is read under the
+//! - a live root's council context **votes**: the gate adds it to the decision's
+//!   contexts ([`ReviewerContextChain::decision_labels`]);
+//! - a model character's council context **observes**: it is read under the
 //!   `direction-check` spec after the gate decides (`super::observe`);
-//! - a character with no live voice context is **skipped**, and the skip is
+//! - a character with no live council context is **skipped**, and the skip is
 //!   recorded; it is not a miss.
 
 use kaijutsu_types::{ContextId, PrincipalId};
 
-use super::projection::{SYSTEM_RULES, VOICE_PREFIX};
+use super::projection::{SYSTEM_RULES, COUNCIL_CONTEXT_PREFIX};
 use crate::kernel_db::KernelDb;
 use crate::kj::gate_policy::{CouncilConfig, CouncilSpec};
 
 /// A character on the chain with no `council-<character>` context.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SkippedVoice {
+pub(crate) struct SkippedReviewerContext {
     pub(crate) principal_id: PrincipalId,
     pub(crate) name: String,
 }
 
-impl SkippedVoice {
+impl SkippedReviewerContext {
     /// The ledger row for this skip.
-    pub(crate) fn recorded(&self) -> approval_ledger::council_observation::CouncilVoiceSkip {
-        approval_ledger::council_observation::CouncilVoiceSkip {
+    pub(crate) fn recorded(&self) -> approval_ledger::council_observation::CouncilReviewerSkip {
+        approval_ledger::council_observation::CouncilReviewerSkip {
             principal_id: self.principal_id.as_bytes().to_vec(),
             character_name: self.name.clone(),
         }
     }
 }
 
-/// The voices along one submission's reviewer chain, nearest reviewer first.
+/// The reviewer contexts along one submission's reviewer chain, nearest reviewer first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct VoiceChain {
-    /// Live root characters' voice labels; at most one, the chain's top.
+pub(crate) struct ReviewerContextChain {
+    /// Live root characters' council labels; at most one, the chain's top.
     pub(crate) voting: Vec<String>,
-    /// Model characters' voice labels.
+    /// Model characters' council labels.
     pub(crate) observing: Vec<String>,
-    pub(crate) skipped: Vec<SkippedVoice>,
+    pub(crate) skipped: Vec<SkippedReviewerContext>,
 }
 
-impl VoiceChain {
+impl ReviewerContextChain {
     /// The labels a gate decision on `spec` reads: `[council] contexts`, the
-    /// spec's own contexts, then each voting voice those do not already hold.
+    /// spec's own contexts, then each voting reviewer context those do not already hold.
     pub(crate) fn decision_labels(&self, council: &CouncilConfig, spec: &CouncilSpec) -> Vec<String> {
         let mut labels = council.contexts.clone();
         labels.extend(spec.contexts.iter().cloned());
-        for voice in &self.voting {
-            if !labels.contains(voice) {
-                labels.push(voice.clone());
+        for label in &self.voting {
+            if !labels.contains(label) {
+                labels.push(label.clone());
             }
         }
         labels
     }
 }
 
-/// The voice context label for the character named `name`.
-pub(crate) fn voice_label(name: &str) -> String {
-    format!("{VOICE_PREFIX}{name}")
+/// The council context label for the character named `name`.
+pub(crate) fn reviewer_label(name: &str) -> String {
+    format!("{COUNCIL_CONTEXT_PREFIX}{name}")
 }
 
 /// Walk the reviewer chain above `actor` in `context` and collect each
-/// character's voice. Empty when `[council] voices` is off.
+/// character's council context. Empty when `[council] reviewer_contexts` is off.
 /// `Err` when the reviewer cannot be resolved, the walk refuses (a retired
-/// responsible character, a broken forest), or a character's voice label
+/// responsible character, a broken forest), or a character's council context label
 /// would be the system rules context.
-pub(crate) fn voice_chain(
+pub(crate) fn reviewer_context_chain(
     db: &KernelDb,
     council: &CouncilConfig,
     context: ContextId,
     actor: PrincipalId,
-) -> Result<VoiceChain, String> {
-    let mut chain = VoiceChain::default();
-    if !council.voices {
+) -> Result<ReviewerContextChain, String> {
+    let mut chain = ReviewerContextChain::default();
+    if !council.reviewer_contexts {
         return Ok(chain);
     }
     let first = db
         .effective_approval_reviewer(context, actor)
-        .map_err(|e| format!("the council voices need the seat's reviewer: {e}"))?
+        .map_err(|e| format!("the reviewer contexts need the seat's reviewer: {e}"))?
         .reviewer();
     let mut seen: Vec<PrincipalId> = Vec::new();
     let mut next = Some(first);
@@ -94,23 +94,23 @@ pub(crate) fn voice_chain(
         seen.push(principal);
         let sheet = db
             .get_character(principal)
-            .map_err(|e| format!("the council voices could not read a reviewer's character sheet: {e}"))?
-            .ok_or_else(|| format!("reviewer {} on the council voice chain has no character sheet", principal.short()))?;
-        let label = voice_label(&sheet.name);
+            .map_err(|e| format!("the reviewer contexts could not read a reviewer's character sheet: {e}"))?
+            .ok_or_else(|| format!("reviewer {} on the reviewer chain has no character sheet", principal.short()))?;
+        let label = reviewer_label(&sheet.name);
         if label == SYSTEM_RULES {
             return Err(format!(
-                "character '{}' on the council voice chain would read {SYSTEM_RULES}, the system rules, as its \
-                 voice; rename the character or turn [council] voices off",
+                "character '{}' on the reviewer chain would read {SYSTEM_RULES}, the system rules, as its \
+                 council context; rename the character or turn [council] reviewer_contexts off",
                 sheet.name
             ));
         }
         let held = db
             .find_context_by_label(&label)
-            .map_err(|e| format!("the council voices could not look up \"{label}\": {e}"))?
+            .map_err(|e| format!("the reviewer contexts could not look up \"{label}\": {e}"))?
             .is_some();
         let root = sheet.is_live_root();
         match (held, root) {
-            (false, _) => chain.skipped.push(SkippedVoice { principal_id: principal, name: sheet.name }),
+            (false, _) => chain.skipped.push(SkippedReviewerContext { principal_id: principal, name: sheet.name }),
             (true, true) => chain.voting.push(label),
             (true, false) => chain.observing.push(label),
         }
@@ -121,7 +121,7 @@ pub(crate) fn voice_chain(
         excluded.push(actor);
         next = db
             .responsible_character_above(context, &excluded)
-            .map_err(|e| format!("the council voices could not walk the accountability forest: {e}"))?;
+            .map_err(|e| format!("the reviewer contexts could not walk the accountability forest: {e}"))?;
     }
     Ok(chain)
 }
@@ -132,11 +132,11 @@ mod tests {
     use super::*;
     use crate::Kernel;
 
-    const VOICES_ON: &str = r#"
+    const REVIEWER_CONTEXTS_ON: &str = r#"
 [council]
 server = "http://127.0.0.1:1"
 contexts = ["council-system"]
-voices = true
+reviewer_contexts = true
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700
 
@@ -161,7 +161,7 @@ case = "shell"
     }
 
     async fn forest() -> Forest {
-        let kernel = Kernel::new_ephemeral("council-voices").await;
+        let kernel = Kernel::new_ephemeral("council-reviewer-contexts").await;
         let amy = character(&kernel, "amy", true);
         let banto = character(&kernel, "banto", false);
         let coder = character(&kernel, "coder", false);
@@ -180,8 +180,8 @@ case = "shell"
     }
 
     impl Forest {
-        fn chain(&self, text: &str, context: ContextId, actor: PrincipalId) -> Result<VoiceChain, String> {
-            voice_chain(&self.kernel.kernel_db().lock(), config(text).council().expect("[council]"), context, actor)
+        fn chain(&self, text: &str, context: ContextId, actor: PrincipalId) -> Result<ReviewerContextChain, String> {
+            reviewer_context_chain(&self.kernel.kernel_db().lock(), config(text).council().expect("[council]"), context, actor)
         }
     }
 
@@ -190,38 +190,38 @@ case = "shell"
         let f = forest().await;
         live_context(&f.kernel, "council-amy");
         live_context(&f.kernel, "council-banto");
-        let chain = f.chain(VOICES_ON, f.lane, f.coder).unwrap();
+        let chain = f.chain(REVIEWER_CONTEXTS_ON, f.lane, f.coder).unwrap();
         assert_eq!(chain.voting, ["council-amy"]);
         assert_eq!(chain.observing, ["council-banto"]);
         assert!(chain.skipped.is_empty());
-        let council = config(VOICES_ON);
+        let council = config(REVIEWER_CONTEXTS_ON);
         let council = council.council().unwrap();
         assert_eq!(chain.decision_labels(council, &council.specs[0]), ["council-system", "council-amy"]);
-        let coded = config(&VOICES_ON.replace("case = \"shell\"", "case = \"shell\"\ncontexts = [\"council-code\"]"));
+        let coded = config(&REVIEWER_CONTEXTS_ON.replace("case = \"shell\"", "case = \"shell\"\ncontexts = [\"council-code\"]"));
         let coded = coded.council().unwrap();
         assert_eq!(
             chain.decision_labels(coded, &coded.specs[0]),
             ["council-system", "council-code", "council-amy"],
-            "a spec's own contexts come after [council] contexts and before the voices"
+            "a spec's own contexts come after [council] contexts and before the reviewer contexts"
         );
     }
 
     #[tokio::test]
-    async fn a_character_without_a_voice_is_skipped_not_missed() {
+    async fn a_character_without_a_reviewer_context_is_skipped_not_missed() {
         let f = forest().await;
         live_context(&f.kernel, "council-amy");
-        let chain = f.chain(VOICES_ON, f.lane, f.coder).unwrap();
+        let chain = f.chain(REVIEWER_CONTEXTS_ON, f.lane, f.coder).unwrap();
         assert_eq!(chain.voting, ["council-amy"]);
         assert!(chain.observing.is_empty());
-        assert_eq!(chain.skipped, [SkippedVoice { principal_id: f.banto, name: "banto".into() }]);
+        assert_eq!(chain.skipped, [SkippedReviewerContext { principal_id: f.banto, name: "banto".into() }]);
         assert_eq!(chain.skipped[0].recorded().character_name, "banto");
     }
 
     #[tokio::test]
-    async fn a_root_confirming_itself_reads_its_own_voice() {
+    async fn a_root_confirming_itself_reads_its_own_council_context() {
         let f = forest().await;
         live_context(&f.kernel, "council-amy");
-        let chain = f.chain(VOICES_ON, f.root, f.amy).unwrap();
+        let chain = f.chain(REVIEWER_CONTEXTS_ON, f.root, f.amy).unwrap();
         assert_eq!(chain.voting, ["council-amy"]);
         assert!(chain.observing.is_empty() && chain.skipped.is_empty());
     }
@@ -243,25 +243,25 @@ case = "shell"
         for label in ["council-amy", "council-banto", "council-lead", "council-coder"] {
             live_context(&f.kernel, label);
         }
-        let chain = f.chain(VOICES_ON, leaf, worker).unwrap();
+        let chain = f.chain(REVIEWER_CONTEXTS_ON, leaf, worker).unwrap();
         assert_eq!(chain.observing, ["council-lead", "council-coder", "council-banto"]);
         assert_eq!(chain.voting, ["council-amy"]);
     }
 
     #[tokio::test]
-    async fn voices_off_reads_no_chain() {
+    async fn reviewer_contexts_off_reads_no_chain() {
         let f = forest().await;
         live_context(&f.kernel, "council-amy");
         live_context(&f.kernel, "council-banto");
-        let off = VOICES_ON.replace("voices = true\n", "");
-        assert_eq!(f.chain(&off, f.lane, f.coder).unwrap(), VoiceChain::default());
+        let off = REVIEWER_CONTEXTS_ON.replace("reviewer_contexts = true\n", "");
+        assert_eq!(f.chain(&off, f.lane, f.coder).unwrap(), ReviewerContextChain::default());
     }
 
     #[tokio::test]
-    async fn a_voice_already_listed_is_not_read_twice() {
+    async fn a_reviewer_context_already_listed_is_not_read_twice() {
         let f = forest().await;
         live_context(&f.kernel, "council-amy");
-        let listed = VOICES_ON.replace(r#"contexts = ["council-system"]"#, r#"contexts = ["council-system", "council-amy"]"#);
+        let listed = REVIEWER_CONTEXTS_ON.replace(r#"contexts = ["council-system"]"#, r#"contexts = ["council-system", "council-amy"]"#);
         let chain = f.chain(&listed, f.lane, f.coder).unwrap();
         let council = config(&listed);
         let council = council.council().unwrap();
@@ -276,7 +276,7 @@ case = "shell"
             r.played_by = Some(f.coder);
             r.reviewer_id = Some(system);
         });
-        let error = f.chain(VOICES_ON, ctx, f.coder).unwrap_err();
+        let error = f.chain(REVIEWER_CONTEXTS_ON, ctx, f.coder).unwrap_err();
         assert!(error.contains("council-system"), "{error}");
     }
 }

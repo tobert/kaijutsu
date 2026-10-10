@@ -3284,7 +3284,7 @@ with .db files or /var/lib or similar." `originals` now passes ordinary
 file work as `changes_routine` and keeps the backup demand for databases
 and system state, and four council-shell examples teach that line. The bump template no longer
 forbids sending a command again, and an `unjudged` bump says a retry is
-fair. A seat's command history as a council voice is recorded in
+fair. A seat's command history as a council context is recorded in
 `docs/issues.md`.
 
 banto also ran on DeepSeek although tenchi's qwen is the default: its
@@ -3383,3 +3383,16 @@ backend that is not a council server is a miss naming it, never a quiet
 fall back to `[council] server`. Enablement, mode, and thresholds stay in
 `gate.toml`; whether a threshold should name the server it was fit for is
 open in `docs/issues.md`.
+
+"Voices" collided with music voices as the instrument grew toward music
+(Amy: "as we do more music it's gonna be confusing"), so the council term
+changed. A character's council context is the context labeled
+`council-<character>`; the reviewer contexts are the set read along the
+reviewer chain. The config key `[council] voices` is now `reviewer_contexts`,
+and the old key fails the parse naming the new one. The module is
+`council/reviewer_contexts.rs`, and the ledger columns `voice_label` and
+`voice_context_id` became `reviewer_label` and `reviewer_context_id`
+(`context_id` alone would be ambiguous against `council_decisions` in a
+join), with `council_voice_skips` now `council_reviewer_skips`. The
+migration renames in place, so recorded rows survive. The shadow voice is
+now the shadow context.

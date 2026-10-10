@@ -446,10 +446,10 @@ pub(crate) struct CouncilConfig {
     /// Bounds a whole decision: preparing the server and the decision call.
     pub(crate) deadline_ms: u64,
     pub(crate) require_agree: bool,
-    /// `[council] voices`: compose `council-<character>` contexts along the
+    /// `[council] reviewer_contexts`: compose `council-<character>` contexts along the
     /// reviewer chain (`docs/council.md`, "Council contexts are kaijutsu
     /// contexts"). Off by default.
-    pub(crate) voices: bool,
+    pub(crate) reviewer_contexts: bool,
     /// `[council] house_rules`: each decision also reads the house rules of
     /// the proposing seat's workspace, from its `AGENTS.md` when one is
     /// found (`docs/council.md`, "House rules"). Off by default.
@@ -500,7 +500,7 @@ struct CouncilToml {
     #[serde(default = "default_require_agree")]
     require_agree: bool,
     #[serde(default)]
-    voices: bool,
+    reviewer_contexts: bool,
     #[serde(default)]
     house_rules: bool,
     #[serde(default = "default_house_rules_tokens")]
@@ -511,6 +511,10 @@ struct CouncilToml {
     seat: Option<toml::Value>,
     #[serde(default)]
     seat_tokens: Option<toml::Value>,
+    /// The key `reviewer_contexts` replaced. Parsed only to refuse it with
+    /// the new name.
+    #[serde(default)]
+    voices: Option<toml::Value>,
     #[serde(default = "default_mode")]
     mode: String,
     #[serde(default)]
@@ -779,6 +783,9 @@ impl GateConfig {
         if raw.seat_tokens.is_some() {
             return Err(err("[council] seat_tokens: the seat context is gone; the key is now `house_rules_tokens`".into()));
         }
+        if raw.voices.is_some() {
+            return Err(err("[council] voices: the key is now `reviewer_contexts`".into()));
+        }
         if raw.house_rules_tokens <= 0 {
             return Err(err(format!(
                 "[council] house_rules_tokens: {} must be an integer greater than 0",
@@ -920,7 +927,7 @@ impl GateConfig {
             pool_weights,
             deadline_ms: raw.deadline_ms as u64,
             require_agree: raw.require_agree,
-            voices: raw.voices,
+            reviewer_contexts: raw.reviewer_contexts,
             house_rules: raw.house_rules,
             house_rules_tokens: raw.house_rules_tokens as u64,
             mode,
@@ -2799,7 +2806,7 @@ uncovered = "allow"
     const COUNCIL_FULL: &str = r#"
 [council]
 server = "http://zorak:8090"
-contexts = ["voice", "system-rules"]
+contexts = ["reviewer", "system-rules"]
 pool = { method = "loglinear", weights = "mass" }
 deadline_ms = 700
 
@@ -2837,7 +2844,7 @@ enabled = false
         let cfg = config(COUNCIL_FULL);
         let c = cfg.council().expect("council declared");
         assert_eq!(c.server, "http://zorak:8090");
-        assert_eq!(c.contexts, ["voice", "system-rules"]);
+        assert_eq!(c.contexts, ["reviewer", "system-rules"]);
         assert_eq!(c.pool_method, CouncilPoolMethod::LogLinear);
         assert_eq!(c.pool_weights, CouncilPoolWeights::Mass);
         assert_eq!(c.deadline_ms, 700);
@@ -2852,12 +2859,12 @@ enabled = false
     }
 
     #[test]
-    fn voices_are_off_unless_the_council_turns_them_on() {
-        assert!(!config(COUNCIL_FULL).council().unwrap().voices, "voices default to false");
-        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = true"));
-        assert!(on.council().unwrap().voices);
-        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = \"yes\""));
-        assert!(m.contains("voices"), "{m}");
+    fn reviewer_contexts_are_off_unless_the_council_turns_them_on() {
+        assert!(!config(COUNCIL_FULL).council().unwrap().reviewer_contexts, "reviewer_contexts defaults to false");
+        let on = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nreviewer_contexts = true"));
+        assert!(on.council().unwrap().reviewer_contexts);
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nreviewer_contexts = \"yes\""));
+        assert!(m.contains("reviewer_contexts"), "{m}");
     }
 
     #[test]
@@ -2882,6 +2889,14 @@ enabled = false
         assert!(m.contains("[council] seat") && m.contains("house_rules"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nseat_tokens = 500"));
         assert!(m.contains("[council] seat_tokens") && m.contains("house_rules_tokens"), "{m}");
+    }
+
+    /// A gate.toml that still says `voices` fails to parse, and the message
+    /// names `reviewer_contexts`.
+    #[test]
+    fn the_old_voices_key_fails_and_names_its_replacement() {
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nvoices = true"));
+        assert!(m.contains("[council] voices") && m.contains("reviewer_contexts"), "{m}");
     }
 
     #[test]
@@ -2978,9 +2993,9 @@ enabled = false
         let director = cfg.council_for(Some("director")).unwrap();
         assert_eq!(director.contexts, ["council-amy", "council-banto"]);
         let coder = cfg.council_for(Some("coder")).unwrap();
-        assert_eq!(coder.contexts, ["voice", "system-rules"]);
+        assert_eq!(coder.contexts, ["reviewer", "system-rules"]);
         // Everything but the list is inherited: mode, deadline, house rules,
-        // voices, agreement, specs, and thresholds.
+        // reviewer contexts, agreement, specs, and thresholds.
         let mut inherited = coder.clone();
         inherited.contexts = director.contexts.clone();
         assert_eq!(director, &inherited);
@@ -3048,12 +3063,12 @@ enabled = false
 
     #[test]
     fn council_contexts_must_be_nonempty_distinct_labels() {
-        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[]"));
+        let m = council_err(&council_with("[\"reviewer\", \"system-rules\"]", "[]"));
         assert!(m.contains("[council] contexts") && m.contains("at least one"), "{m}");
-        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[\"voice\", \"\"]"));
+        let m = council_err(&council_with("[\"reviewer\", \"system-rules\"]", "[\"reviewer\", \"\"]"));
         assert!(m.contains("[council] contexts") && m.contains("non-empty"), "{m}");
-        let m = council_err(&council_with("[\"voice\", \"system-rules\"]", "[\"voice\", \"voice\"]"));
-        assert!(m.contains("[council] contexts") && m.contains("voice") && m.contains("twice"), "{m}");
+        let m = council_err(&council_with("[\"reviewer\", \"system-rules\"]", "[\"reviewer\", \"reviewer\"]"));
+        assert!(m.contains("[council] contexts") && m.contains("reviewer") && m.contains("twice"), "{m}");
     }
 
     #[test]
@@ -3085,8 +3100,8 @@ enabled = false
         assert_eq!(council.specs[0].contexts, ["council-code"]);
         let plain = config(COUNCIL_FULL);
         assert!(plain.council().unwrap().specs[0].contexts.is_empty());
-        let m = council_err(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"voice\"]"));
-        assert!(m.contains("[[council.spec]] shell-gate contexts") && m.contains("voice"), "{m}");
+        let m = council_err(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"reviewer\"]"));
+        assert!(m.contains("[[council.spec]] shell-gate contexts") && m.contains("reviewer"), "{m}");
         let m = council_err(&council_with("case = \"shell\"", "case = \"shell\"\ncontexts = [\"a\", \"a\"]"));
         assert!(m.contains("[[council.spec]] shell-gate contexts") && m.contains("twice"), "{m}");
     }

@@ -1,13 +1,13 @@
-//! Durable record of council observations and voice skips
+//! Durable record of council observations and reviewer skips
 //! (`docs/council.md`, "Council contexts are kaijutsu contexts").
 //!
-//! An observation is one read of a model character's voice under its own
+//! An observation is one read of a model character's council context under its own
 //! spec, made after the gate decided. It hangs off the decision it observed
 //! and never changes that decision's rows. A skip records a character on the
-//! reviewer chain that has no voice context.
+//! reviewer chain that has no council context.
 //!
 //! [`insert_council_observation`] writes an observation and its question and
-//! option rows in one transaction; [`insert_council_voice_skips`] writes a
+//! option rows in one transaction; [`insert_council_reviewer_skips`] writes a
 //! decision's skips in one transaction. Readers return rows in the order they
 //! were written.
 
@@ -45,11 +45,11 @@ impl CouncilObservationOutcome {
 pub struct NewCouncilObservation {
     /// The council decision observed.
     pub decision_id: Vec<u8>,
-    /// The voice context's label, `council-<character>`.
-    pub voice_label: String,
-    /// The voice context's id; `None` when the label resolved to no live
+    /// The council context's label, `council-<character>`.
+    pub reviewer_label: String,
+    /// The council context's id; `None` when the label resolved to no live
     /// context by the time it was read.
-    pub voice_context_id: Option<Vec<u8>>,
+    pub reviewer_context_id: Option<Vec<u8>>,
     pub spec_name: String,
     /// Empty when the spec was never prepared.
     pub spec_id: String,
@@ -61,7 +61,7 @@ pub struct NewCouncilObservation {
     pub miss_cause: Option<String>,
     /// The snapshot the server read, when it answered.
     pub snapshot: Option<String>,
-    /// The head the kernel expected the voice context to be at.
+    /// The head the kernel expected the council context to be at.
     pub expected_head: Option<String>,
     pub queue_ms: i64,
     pub ms: i64,
@@ -79,7 +79,7 @@ pub struct CouncilObservation {
 
 /// A character on the reviewer chain with no `council-<character>` context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CouncilVoiceSkip {
+pub struct CouncilReviewerSkip {
     pub principal_id: Vec<u8>,
     pub character_name: String,
 }
@@ -128,15 +128,15 @@ pub fn insert_council_observation(conn: &Connection, o: &NewCouncilObservation) 
     let observation_id = uuid::Uuid::now_v7().as_bytes().to_vec();
     tx.execute(
         "INSERT INTO council_observations (
-            observation_id, decision_id, voice_label, voice_context_id, spec_name, spec_id, server_model,
+            observation_id, decision_id, reviewer_label, reviewer_context_id, spec_name, spec_id, server_model,
             weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause, snapshot,
             expected_head, queue_ms, ms, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             observation_id,
             o.decision_id,
-            o.voice_label,
-            o.voice_context_id,
+            o.reviewer_label,
+            o.reviewer_context_id,
             o.spec_name,
             o.spec_id,
             o.server.model,
@@ -172,7 +172,7 @@ pub fn insert_council_observation(conn: &Connection, o: &NewCouncilObservation) 
     Ok(observation_id)
 }
 
-const OBSERVATION_COLUMNS: &str = "observation_id, decision_id, voice_label, voice_context_id, spec_name, spec_id, \
+const OBSERVATION_COLUMNS: &str = "observation_id, decision_id, reviewer_label, reviewer_context_id, spec_name, spec_id, \
     server_model, weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause, snapshot, \
     expected_head, queue_ms, ms, created_at";
 
@@ -187,8 +187,8 @@ fn decode(row: &Row<'_>) -> rusqlite::Result<CouncilObservation> {
         created_at: row.get("created_at")?,
         observation: NewCouncilObservation {
             decision_id: row.get("decision_id")?,
-            voice_label: row.get("voice_label")?,
-            voice_context_id: row.get("voice_context_id")?,
+            reviewer_label: row.get("reviewer_label")?,
+            reviewer_context_id: row.get("reviewer_context_id")?,
             spec_name: row.get("spec_name")?,
             spec_id: row.get("spec_id")?,
             server: CouncilServer {
@@ -248,34 +248,34 @@ pub fn list_council_observations_for_decision(conn: &Connection, decision_id: &[
     Ok(observations)
 }
 
-/// Record a decision's voice skips, in chain order, in a single transaction.
+/// Record a decision's reviewer skips, in chain order, in a single transaction.
 /// A `decision_id` that names no decision is refused.
-pub fn insert_council_voice_skips(conn: &Connection, decision_id: &[u8], skips: &[CouncilVoiceSkip]) -> Result<()> {
+pub fn insert_council_reviewer_skips(conn: &Connection, decision_id: &[u8], skips: &[CouncilReviewerSkip]) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    insert_council_voice_skips_within(&tx, decision_id, skips)?;
+    insert_council_reviewer_skips_within(&tx, decision_id, skips)?;
     tx.commit()?;
     Ok(())
 }
 
-/// [`insert_council_voice_skips`] for a caller that already holds a
+/// [`insert_council_reviewer_skips`] for a caller that already holds a
 /// transaction on `conn`, such as the one that records the decision.
 /// Nothing commits here.
-pub fn insert_council_voice_skips_within(conn: &Connection, decision_id: &[u8], skips: &[CouncilVoiceSkip]) -> Result<()> {
+pub fn insert_council_reviewer_skips_within(conn: &Connection, decision_id: &[u8], skips: &[CouncilReviewerSkip]) -> Result<()> {
     require_decision(conn, decision_id)?;
     for (seq, skip) in skips.iter().enumerate() {
         conn.execute(
-            "INSERT INTO council_voice_skips (decision_id, seq, principal_id, character_name) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO council_reviewer_skips (decision_id, seq, principal_id, character_name) VALUES (?1, ?2, ?3, ?4)",
             params![decision_id, seq as i64, skip.principal_id, skip.character_name],
         )?;
     }
     Ok(())
 }
 
-/// A decision's voice skips, in chain order.
-pub fn list_council_voice_skips(conn: &Connection, decision_id: &[u8]) -> Result<Vec<CouncilVoiceSkip>> {
+/// A decision's reviewer skips, in chain order.
+pub fn list_council_reviewer_skips(conn: &Connection, decision_id: &[u8]) -> Result<Vec<CouncilReviewerSkip>> {
     Ok(conn
-        .prepare("SELECT principal_id, character_name FROM council_voice_skips WHERE decision_id = ?1 ORDER BY seq")?
-        .query_map([decision_id], |row| Ok(CouncilVoiceSkip { principal_id: row.get(0)?, character_name: row.get(1)? }))?
+        .prepare("SELECT principal_id, character_name FROM council_reviewer_skips WHERE decision_id = ?1 ORDER BY seq")?
+        .query_map([decision_id], |row| Ok(CouncilReviewerSkip { principal_id: row.get(0)?, character_name: row.get(1)? }))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -329,8 +329,8 @@ mod tests {
     fn answered(decision_id: &[u8]) -> NewCouncilObservation {
         NewCouncilObservation {
             decision_id: decision_id.to_vec(),
-            voice_label: "council-banto".into(),
-            voice_context_id: Some(vec![4, 4]),
+            reviewer_label: "council-banto".into(),
+            reviewer_context_id: Some(vec![4, 4]),
             spec_name: "direction-check".into(),
             spec_id: "sha256:b".into(),
             server: server(),
@@ -383,7 +383,7 @@ mod tests {
         miss.outcome = CouncilObservationOutcome::Miss;
         miss.choice = None;
         miss.miss_cause = Some("council context \"council-banto\" names no live context".into());
-        miss.voice_context_id = None;
+        miss.reviewer_context_id = None;
         miss.spec_id = String::new();
         miss.server = CouncilServer {
             model: String::new(),
@@ -418,7 +418,7 @@ mod tests {
 
         let raw = |outcome: &str, choice: &str, cause: &str| {
             format!(
-                "INSERT INTO council_observations (observation_id, decision_id, voice_label, spec_name, spec_id,
+                "INSERT INTO council_observations (observation_id, decision_id, reviewer_label, spec_name, spec_id,
                     server_model, weight_hash, tokenizer_hash, template, engine, outcome, choice, miss_cause,
                     queue_ms, ms)
                  VALUES (randomblob(16), X'{}', 'council-banto', 'direction-check', '', '', '', '', '', '',
@@ -440,9 +440,9 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         let err = insert_council_observation(&conn, &answered(&[7; 16])).expect_err("no such decision");
         assert!(matches!(err, LedgerError::InvalidCouncilObservation(ref m) if m.contains("0707")), "{err:?}");
-        let skip = CouncilVoiceSkip { principal_id: vec![1], character_name: "lead".into() };
-        assert!(insert_council_voice_skips(&conn, &[7; 16], &[skip]).is_err());
-        assert_eq!(count(&conn, "council_observations") + count(&conn, "council_voice_skips"), 0);
+        let skip = CouncilReviewerSkip { principal_id: vec![1], character_name: "lead".into() };
+        assert!(insert_council_reviewer_skips(&conn, &[7; 16], &[skip]).is_err());
+        assert_eq!(count(&conn, "council_observations") + count(&conn, "council_reviewer_skips"), 0);
     }
 
     #[test]
@@ -470,16 +470,16 @@ mod tests {
     }
 
     #[test]
-    fn voice_skips_keep_chain_order() {
+    fn reviewer_skips_keep_chain_order() {
         let conn = open_memory();
         let d = decision(&conn);
         let skips = vec![
-            CouncilVoiceSkip { principal_id: vec![2], character_name: "lead".into() },
-            CouncilVoiceSkip { principal_id: vec![1], character_name: "banto".into() },
+            CouncilReviewerSkip { principal_id: vec![2], character_name: "lead".into() },
+            CouncilReviewerSkip { principal_id: vec![1], character_name: "banto".into() },
         ];
-        insert_council_voice_skips(&conn, &d, &skips).unwrap();
-        assert_eq!(list_council_voice_skips(&conn, &d).unwrap(), skips);
-        assert!(list_council_voice_skips(&conn, &[0; 16]).unwrap().is_empty());
+        insert_council_reviewer_skips(&conn, &d, &skips).unwrap();
+        assert_eq!(list_council_reviewer_skips(&conn, &d).unwrap(), skips);
+        assert!(list_council_reviewer_skips(&conn, &[0; 16]).unwrap().is_empty());
     }
 
     #[test]
@@ -501,7 +501,7 @@ mod tests {
         assert!(questions.contains("USING PRIMARY KEY") || questions.contains("sqlite_autoindex"), "{questions}");
         let options = plan("SELECT option FROM council_observation_options WHERE observation_id = X'01'");
         assert!(options.contains("USING PRIMARY KEY") || options.contains("sqlite_autoindex"), "{options}");
-        let skips = plan("SELECT character_name FROM council_voice_skips WHERE decision_id = X'01' ORDER BY seq");
+        let skips = plan("SELECT character_name FROM council_reviewer_skips WHERE decision_id = X'01' ORDER BY seq");
         assert!(skips.contains("USING PRIMARY KEY") || skips.contains("sqlite_autoindex"), "{skips}");
     }
 }

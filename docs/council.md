@@ -181,35 +181,35 @@ compacting."
 | Context | Holds | Built by |
 |---|---|---|
 | system rules (`council-system`) | the house rules every seat shares | Amy and banto, by chat |
-| a character's council voice (`council-<character>`) | that character's guidance: Amy's words in `council-amy`, banto's directions in `council-banto` | forking from that character's working contexts with fork filters, then chat, drift, and exclusions |
+| a character's council context (`council-<character>`) | that character's guidance: Amy's words in `council-amy`, banto's directions in `council-banto` | forking from that character's working contexts with fork filters, then chat, drift, and exclusions |
 
-- **A decision composes voices along the reviewer chain.** It starts at the
+- **A decision composes reviewer contexts along the reviewer chain.** It starts at the
   submitting seat's reviewer (`docs/approval-identity.md`, reviewer
   resolution) and climbs to the first live root character, collecting each
   character's `council-<character>` context. A coder banto runs for Amy
   reads `council-system`, `council-amy`, and `council-banto`. Several coders
-  under one banto share `council-banto`. A character with no voice context
+  under one banto share `council-banto`. A character with no council context
   is skipped and the skip is recorded; it is not a miss.
-- **A root's voice votes; a director's voice observes, for now.** Amy's voice
-  and the system rules are pooled into the verdict. A model director's voice
-  is read under its own `direction-check` spec ("is this action following my
+- **A root's council context votes; a director's observes, for now.** Amy's
+  council context and the system rules are pooled into the verdict. A model
+  director's council context is read under its own `direction-check` spec ("is this action following my
   directions?"), after the gate has decided, off the hot path, and recorded
   with the decision. It never enters the pool or changes the outcome. Amy:
   "It's an experiment; I'm unsure where it'll in authority." Giving it a
   vote is a later choice, made from the recorded answers.
-- **A voice is built like a fork, not fed.** Nothing copies prompts into a
-  voice automatically. A voice context is made and refreshed the way a fork
+- **A council context is built like a fork, not fed.** Nothing copies
+  prompts into one automatically. A council context is made and refreshed the way a fork
   is: copy from the character's working contexts through fork filters
   (`docs/fork-filters.md`), shape it with `kj stage exclude`, and later
-  compact it. A director may also drift into its own voice as it goes, so
-  the projection reads drift blocks in voice contexts.
+  compact it. A director may also drift into its own council context as it goes, so
+  the projection reads drift blocks in council contexts.
 - **First reading, 2026-10-10.** In a container (`fleet/contained`, mock
   seat, zorak's council, moltar thresholds `allow_at` 0.8 and
   `mass_floor` -2.5), a seat sent `rm -rf build build.log`, then
   `rm notes/original.md`, then `rm -rf data`. The reviewer's council
   context said notes/ and data/ are the human's and build output is the
-  seat's. With voices off all three ran, the human's files included.
-  With voices on the build removal ran and both deletions were bumped as
+  seat's. With `reviewer_contexts` off all three ran, the human's files included.
+  With it on the build removal ran and both deletions were bumped as
   `originals=changes`, with `undo` read `irreversible` at 0.79 and 0.88.
   Three runs each, the same every time.
 - **The chain follows the reviewer, for now.** Amy: "reviewer is fine for
@@ -220,8 +220,8 @@ compacting."
   root.
 - **`council-system` is reserved.** A character named `system` would collide
   with it, so the chain walk fails loudly on one.
-- **Voices count against the server's limit.** The system context plus the
-  voting voices must fit `identity.limits.contexts_per_decision` (8 on the
+- **Reviewer contexts count against the server's limit.** The system context
+  plus the voting reviewer contexts must fit `identity.limits.contexts_per_decision` (8 on the
   megakernel); a longer chain is a miss naming the limit, not a silent cut.
 - **A worked example keeps its thinking.** A model's finished thinking rides
   on its next reply as that turn's `reasoning` (council API 0.2.2), so a
@@ -261,7 +261,7 @@ context holds those rules and nothing the seat said or did.
 
 - **On with `[council] house_rules = true`.** Off by default. Every
   decision, the shell decision and each program decision, reads it after
-  `[council] contexts` and the voting voices. Observations do not. The old
+  `[council] contexts` and the voting reviewer contexts. Observations do not. The old
   keys `seat` and `seat_tokens` fail the parse with a message naming
   `house_rules` and `house_rules_tokens`.
 - **What it holds.** The first `AGENTS.md` found walking up from the seat's
@@ -291,12 +291,12 @@ context holds those rules and nothing the seat said or did.
   "Council house rules: what is open", records that.
 - **It is pinned and counted.** The decision pins it with `at`, like every
   context, so it reads the rules as of the submission. `[council] contexts`,
-  the voting voices, and the house-rules context together must fit
+  the voting reviewer contexts, and the house-rules context together must fit
   `identity.limits.contexts_per_decision`; a miss names the limit.
 - **It is ephemeral on the server.** When the server lists the `persist`
   capability (council API 0.2.5), the kernel sends a house-rules context with
   `persist: false`: it sends the context again after a restart, so the
-  server need not park it to disk. `council-system` and the voices stay
+  server need not park it to disk. `council-system` and the reviewer contexts stay
   persistent. Amy, 2026-10-05: "we will have councils over time that are
   ephemeral in nature and our hardware is limited." A capability the kernel
   does not know is ignored, so a server can add one without breaking older
@@ -314,9 +314,9 @@ context holds those rules and nothing the seat said or did.
   "'the seat' is a terrible name and I think we got that wrong. It can stop
   with AGENTS.md. It should not get a running dialog from the model."
 
-## Shadow voice (design, not built)
+## Shadow context (design, not built)
 
-A shadow voice is a council context that holds what one seat has done to the
+A shadow context is a council context that holds what one seat has done to the
 world: each outward call it made, in order, with no results, narration, or
 thinking. The
 council judges each command alone today, so a cleanup of scratch the seat
@@ -346,7 +346,7 @@ grows with the gate.
   a seat turn, asks its model. The kernel finds a shadow by its structural
   fork edge and its context_type, never by its label. The label is
   `<type>-<seat label>`; it does not start with `council-`, so the
-  reviewer-chain walk never takes it for a character's voice. Each child
+  reviewer-chain walk never takes it for a character's council context. Each child
   keeps its own dialogue, so a judge sees only its own earlier opinions.
 - **The cast picks the model.** A context already resolves its model from
   the cast slot named by its context_type (`model_resolution.rs`), and a
@@ -445,13 +445,13 @@ shipped. A fresh session resumes at the first step not marked done.
    seat's call, a task of its own reads `[council] contexts`, the shell
    spec's own contexts, and the house rules when they are on, then the
    shadow, on the judge's server, under the decision's spec and case,
-   with a 30 s deadline (`shadow::spawn_judge`). Voices are not read. The
+   with a 30 s deadline (`shadow::spawn_judge`). Reviewer contexts are not read. The
    answer is a `council_observations` row on the decision, with
-   `voice_label` `judge-<seat>`, and it is added to the call's outcome
+   `reviewer_label` `judge-<seat>`, and it is added to the call's outcome
    turn as `; judge: <choice> (p=<pooled p>)`. A call a static rule
    decided is recorded but not judged. The judge never changes the
    decision. Test: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`.
-   Still open: whether the judge should read the voices.
+   Still open: whether the judge should read the reviewer contexts.
 4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
    `mk-judge` (one `judge` slot), and a `coder` character whose default
    cast is `mk-judge`. A smoke seat played by `coder` ran `mkdir` then
@@ -649,7 +649,7 @@ before any host file gains these lines.
 [council]
 server = "http://zorak:8090"
 contexts = ["council-system"]  # read for every decision
-voices = true                  # compose council-<character> along the reviewer chain
+reviewer_contexts = true        # compose council-<character> along the reviewer chain
 house_rules = true             # read the AGENTS.md above the seat's cwd; off by default
 house_rules_tokens = 2000      # the house-rules context's budget
 pool = { method = "loglinear", weights = "mass" }
@@ -691,16 +691,16 @@ each decision. The role is `gate`, not `council`, because `council` is a
 context type: a council context playing a cast with a `council` slot
 would take that slot as its chat model. The cast chooses only the server;
 whether a type gets the council, `mode`, specs, thresholds, contexts, and
-`deadline_ms` stay in `gate.toml`. The decision and the observing voices
+`deadline_ms` stay in `gate.toml`. The decision and the observing reviewer contexts
 read after it go to the cast's server, under that server's endpoint
 concurrency limit (`docs/retries-and-ratelimits.md`).
 
 A context type's `contexts` replaces `[council] contexts` for that type.
 Omitting it keeps the shared list. The replacement must hold at least one
 distinct, non-empty label and cannot repeat a spec's own context. Specs,
-thresholds, worked examples, voices, and house rules keep their shared
+thresholds, worked examples, reviewer contexts, and house rules keep their shared
 settings. Explicitly listing `council-banto` makes it a voting read; this
-does not enable reviewer-chain voices or their observations.
+does not enable reviewer contexts or their observations.
 
 To chat with a council context, give it `facade:edit_input` and
 `facade:submit_input`, a live model performer with a distinct reviewer,
@@ -717,7 +717,7 @@ outcome line's `reads` field (`label: question=choice ...`, reads joined by
 `; `), so a run's log names the context that dissented.
 
 A spec's `contexts` are read by that spec's decisions alone, after
-`[council] contexts` and before the voting voices. A label already in
+`[council] contexts` and before the voting reviewer contexts. A label already in
 `[council] contexts`, or listed twice, fails the parse. A code context with
 worked examples belongs to the program spec; the shell decision does not
 need it.
@@ -776,7 +776,7 @@ would put an authority decision in a script.
 1. **The contract.** These docs, the OpenAPI file, and a conformance suite
    both servers run. The megakernel serves `/council/v1/`.
 2. **The gate, enforcing.** The parser change, the kernel port, the record
-   tables, one spec, the system-rules context and Amy's voice sent before a
+   tables, one spec, the system-rules context and Amy's council context sent before a
    decision that reads them, traces, the report event, and a report interrupting an
    autonomous seat's turn. Deployed on zorak against
    the megakernel, with coder seats moved back to `uncovered = "ask"`.

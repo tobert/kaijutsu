@@ -599,13 +599,13 @@ fn require_live_context_for_gate(db: &KernelDb, context_id: ContextId) -> Kernel
 /// council allows, unless an earlier ask still holds the submission
 /// ([`ask_holding_submission`]) or an approved run of it has not settled
 /// ([`approved_run_unsettled`]); both are read under the guard that applies
-/// the allow. Every verdict is recorded with its voice
+/// the allow. Every verdict is recorded with its reviewer context
 /// skips: with the ask it led to, in the transaction that creates it, or
 /// unlinked when the gate stopped before an ask existed. A record that
 /// cannot be written refuses the call as gate unavailable. A report whose
 /// ask exists stops the seat when it is autonomous and leaves the ask
 /// redeemable (`CouncilVerdict::report`). Once the record commits, the
-/// verdict's observing voices are read on a task of their own
+/// verdict's observing reviewer contexts are read on a task of their own
 /// (`CouncilVerdict::observe`); the gate does not wait for them.
 pub(crate) async fn run_gate_recorded(
     kernel: &Arc<crate::Kernel>,
@@ -757,7 +757,7 @@ async fn refuse_bump(
     }
 }
 
-/// Record a council decision no ask links to, with its voice skips, in one
+/// Record a council decision no ask links to, with its reviewer skips, in one
 /// transaction, and return its id.
 fn record_unlinked_council_decision(
     conn: &rusqlite::Connection,

@@ -1,5 +1,5 @@
-//! Shadow voices: a seat's outward calls as a dialogue in a fork child
-//! (`docs/council.md`, "Shadow voice").
+//! Shadow reviewer_contexts: a seat's outward calls as a dialogue in a fork child
+//! (`docs/council.md`, "Shadow context").
 //!
 //! The gate is the shadow's only writer. [`record_call`] runs before the
 //! gate decides and appends the call as a user turn; [`record_outcome`] runs
@@ -216,8 +216,8 @@ async fn judge_one(
     let mut judged = Judged {
         observation: NewCouncilObservation {
             decision_id: decision_id.to_vec(),
-            voice_label: label.clone(),
-            voice_context_id: Some(read.shadow.as_bytes().to_vec()),
+            reviewer_label: label.clone(),
+            reviewer_context_id: Some(read.shadow.as_bytes().to_vec()),
             spec_name: spec.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
             spec_id: String::new(),
             server: CouncilServer {

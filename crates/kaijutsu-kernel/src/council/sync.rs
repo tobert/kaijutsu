@@ -229,8 +229,8 @@ impl CouncilSync {
     /// Brings the server up to date for a decision on the spec named
     /// `spec_name` (`/config/kernel/council/<spec_name>.json`) over exactly
     /// `labels`, in that order. A gate decision passes `[council] contexts`
-    /// followed by its voting voices ([`super::voices::VoiceChain::decision_labels`]);
-    /// an observation passes the one voice it reads.
+    /// followed by its voting reviewer contexts ([`super::reviewer_contexts::ReviewerContextChain::decision_labels`]);
+    /// an observation passes the one context it reads.
     ///
     /// `seat` names the proposing seat's context when `[council] house_rules`
     /// is on. Its working directory finds the house rules, whose projection
@@ -730,7 +730,7 @@ mod tests {
         mock: Mock,
         council: CouncilConfig,
         spec: CouncilSpec,
-        voice: ContextId,
+        reviewer: ContextId,
         config: tempfile::TempDir,
     }
 
@@ -743,18 +743,18 @@ mod tests {
             .vfs()
             .mount(kaijutsu_types::paths::CONFIG_ROOT, LocalBackend::new(config.path()))
             .await;
-        let voice = live_context(&kernel, "voice");
-        append_dialogue(&kernel, voice, &["never rm -rf the repo", "understood"]);
+        let reviewer = live_context(&kernel, "reviewer");
+        append_dialogue(&kernel, reviewer, &["never rm -rf the repo", "understood"]);
         let mock = serve().await;
         let spec = CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None };
         let council = CouncilConfig {
             server: mock.base.clone(),
-            contexts: vec!["voice".into()],
+            contexts: vec!["reviewer".into()],
             pool_method: CouncilPoolMethod::Linear,
             pool_weights: CouncilPoolWeights::Uniform,
             deadline_ms: 5000,
             require_agree: false,
-            voices: false,
+            reviewer_contexts: false,
             house_rules: false,
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
@@ -763,7 +763,7 @@ mod tests {
             specs: vec![spec.clone()],
             thresholds: vec![],
         };
-        Rig { kernel, mock, council, spec, voice, config }
+        Rig { kernel, mock, council, spec, reviewer, config }
     }
 
     impl Rig {
@@ -772,10 +772,10 @@ mod tests {
         }
 
         fn grow(&self, text: &str) {
-            let ids = self.kernel.blocks().block_snapshots(self.voice).unwrap();
+            let ids = self.kernel.blocks().block_snapshots(self.reviewer).unwrap();
             super::super::projection::fixtures::append(
                 &self.kernel,
-                self.voice,
+                self.reviewer,
                 ids.last().map(|b| &b.id),
                 kaijutsu_types::Role::User,
                 kaijutsu_types::BlockKind::Text,
@@ -797,7 +797,7 @@ mod tests {
         r.grow("and never force push");
         let mut slow = reply(
             200,
-            json!({"id": r.voice.to_string(), "head": snap(7), "tokens": 1, "kept": 0, "fed": 1,
+            json!({"id": r.reviewer.to_string(), "head": snap(7), "tokens": 1, "kept": 0, "fed": 1,
                    "dry_run": false, "snapshots": []})
             .to_string(),
         );
@@ -836,8 +836,8 @@ mod tests {
         assert_eq!(puts[0].1["turns"].as_array().unwrap().len(), 2);
         assert!(puts[0].1.get("warm").is_none() && puts[0].1.get("dry_run").is_none());
         assert_eq!(p.contexts.len(), 1);
-        assert_eq!(p.contexts[0].label, "voice");
-        assert_eq!(p.contexts[0].context_id, r.voice);
+        assert_eq!(p.contexts[0].label, "reviewer");
+        assert_eq!(p.contexts[0].context_id, r.reviewer);
         assert_eq!(p.contexts[0].head.as_str(), snap(1));
         assert_eq!(p.spec_id, canon::spec_id(&p.spec).unwrap());
         assert_eq!(p.identity.engine, "e");
@@ -857,10 +857,10 @@ mod tests {
     async fn a_changed_context_puts_again_with_the_last_head_in_if_match() {
         let r = rig().await;
         let first = r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
         super::super::projection::fixtures::append(
             &r.kernel,
-            r.voice,
+            r.reviewer,
             ids.last().map(|b| &b.id),
             kaijutsu_types::Role::User,
             kaijutsu_types::BlockKind::Text,
@@ -879,10 +879,10 @@ mod tests {
     async fn a_404_on_put_sends_the_context_again_without_if_match() {
         let r = rig().await;
         r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
         super::super::projection::fixtures::append(
             &r.kernel,
-            r.voice,
+            r.reviewer,
             ids.last().map(|b| &b.id),
             kaijutsu_types::Role::User,
             kaijutsu_types::BlockKind::Text,
@@ -905,10 +905,10 @@ mod tests {
     async fn a_412_is_a_miss_and_the_next_prepare_puts_fresh() {
         let r = rig().await;
         r.prepare().await.unwrap();
-        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
         super::super::projection::fixtures::append(
             &r.kernel,
-            r.voice,
+            r.reviewer,
             ids.last().map(|b| &b.id),
             kaijutsu_types::Role::User,
             kaijutsu_types::BlockKind::Text,
@@ -924,18 +924,18 @@ mod tests {
             ),
         );
         let miss = r.prepare().await.err().expect("a miss");
-        assert!(miss.0.contains("voice") && miss.0.contains(&snap(9)), "{}", miss.0);
+        assert!(miss.0.contains("reviewer") && miss.0.contains(&snap(9)), "{}", miss.0);
         let p = r.prepare().await.expect("recovers on the next call");
         let puts = r.mock.puts();
         assert_eq!(puts.last().unwrap().0, None, "fresh PUT carries no If-Match");
-        assert_eq!(p.contexts[0].label, "voice");
+        assert_eq!(p.contexts[0].label, "reviewer");
     }
 
     #[tokio::test]
     async fn invalidate_makes_the_next_prepare_send_the_context_again() {
         let r = rig().await;
         r.prepare().await.unwrap();
-        r.kernel.council_sync().invalidate(r.voice);
+        r.kernel.council_sync().invalidate(r.reviewer);
         r.prepare().await.unwrap();
         let puts = r.mock.puts();
         assert_eq!(puts.len(), 2);
@@ -987,10 +987,10 @@ mod tests {
         r.prepare().await.unwrap();
         assert_eq!(r.mock.calls("GET").len(), 1, "cached across prepares");
 
-        let ids = r.kernel.blocks().block_snapshots(r.voice).unwrap();
+        let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
         super::super::projection::fixtures::append(
             &r.kernel,
-            r.voice,
+            r.reviewer,
             ids.last().map(|b| &b.id),
             kaijutsu_types::Role::User,
             kaijutsu_types::BlockKind::Text,
@@ -1045,14 +1045,14 @@ mod tests {
         let r = rig().await;
         let amy = live_context(&r.kernel, "council-amy");
         append_dialogue(&r.kernel, amy, &["keep main green"]);
-        let labels = vec!["voice".to_string(), "council-amy".to_string()];
+        let labels = vec!["reviewer".to_string(), "council-amy".to_string()];
         let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.unwrap();
-        assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["voice", "council-amy"]);
+        assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["reviewer", "council-amy"]);
         assert_eq!(p.contexts[1].context_id, amy);
 
         let one = vec!["council-amy".to_string()];
         let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None, far(), &SlotWaits::default()).await.unwrap();
-        assert_eq!(p.contexts.len(), 1, "a single voice, without [council] contexts");
+        assert_eq!(p.contexts.len(), 1, "a single reviewer, without [council] contexts");
         assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
         let p = prepare_seat(&r, seat).await.expect("prepared");
         assert_eq!(
             p.contexts.iter().map(|c| (c.label.as_str(), c.house_rules)).collect::<Vec<_>>(),
-            [("voice", false), ("house-rules", true)]
+            [("reviewer", false), ("house-rules", true)]
         );
         let puts = r.mock.puts();
         assert_eq!(puts.len(), 2);
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(h1.context_id, h2.context_id, "one body, one id");
         assert_ne!(h1.context_id, one);
         assert_ne!(h1.context_id, two);
-        assert_eq!(r.mock.puts().len(), 2, "the voice, and the rules once");
+        assert_eq!(r.mock.puts().len(), 2, "the reviewer, and the rules once");
 
         write_rules(&r, "Back up data. Never push.").await;
         let p3 = prepare_seat(&r, one).await.unwrap();
@@ -1234,9 +1234,9 @@ mod tests {
         let labels: Vec<String> = (0..5).map(|i| format!("ctx-{i}")).collect();
         let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("at most 4"), "{}", miss.0);
-        let twice = vec!["voice".to_string(), "voice".to_string()];
+        let twice = vec!["reviewer".to_string(), "reviewer".to_string()];
         let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, far(), &SlotWaits::default()).await.err().unwrap();
-        assert!(miss.0.contains("\"voice\" twice"), "{}", miss.0);
+        assert!(miss.0.contains("\"reviewer\" twice"), "{}", miss.0);
         assert!(r.mock.puts().is_empty());
     }
 }

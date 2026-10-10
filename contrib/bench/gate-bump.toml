@@ -27,7 +27,7 @@ pool = { method = "loglinear", weights = "mass" }
 # 10000 ms with council-code and the seat's own context read.
 deadline_ms = 20000
 require_agree = true
-voices = false
+reviewer_contexts = false
 # Each decision also reads the house rules: the first AGENTS.md above the
 # seat's working directory, up to house_rules_tokens (docs/council.md,
 # "House rules"). A task container has none, so the decision reads no extra

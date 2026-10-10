@@ -991,11 +991,11 @@ CREATE TABLE IF NOT EXISTS council_programs (
 );
 
 -- ── Council observations ─────────────────────────────────────────────
--- One row per read of a model character's voice context
+-- One row per read of a model character's council context
 -- (`council-<character>`) under its own spec, made after the gate decided
 -- (`docs/council.md`, "Council contexts are kaijutsu contexts"). It hangs
 -- off the decision it observed and never changes that decision's rows.
--- `voice_context_id` is NULL when the label resolved to no live context;
+-- `reviewer_context_id` is NULL when the label resolved to no live context;
 -- `spec_id` and the identity columns are empty strings when the server never
 -- reported them, as in `council_decisions`. `outcome` follows the
 -- growable-value-set rule in `DDL`'s doc comment
@@ -1005,8 +1005,8 @@ CREATE TABLE IF NOT EXISTS council_programs (
 CREATE TABLE IF NOT EXISTS council_observations (
     observation_id  BLOB    NOT NULL PRIMARY KEY,
     decision_id     BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
-    voice_label     TEXT    NOT NULL,
-    voice_context_id BLOB,
+    reviewer_label  TEXT    NOT NULL,
+    reviewer_context_id BLOB,
     spec_name       TEXT    NOT NULL,
     spec_id         TEXT    NOT NULL,
     server_model    TEXT    NOT NULL,
@@ -1053,7 +1053,7 @@ CREATE TABLE IF NOT EXISTS council_observation_options (
 
 -- One row per character on a decision's reviewer chain that has no
 -- `council-<character>` context, in chain order. A skip is not a miss.
-CREATE TABLE IF NOT EXISTS council_voice_skips (
+CREATE TABLE IF NOT EXISTS council_reviewer_skips (
     decision_id    BLOB    NOT NULL REFERENCES council_decisions(decision_id) ON DELETE CASCADE,
     seq            INTEGER NOT NULL,
     principal_id   BLOB    NOT NULL,
@@ -1073,6 +1073,7 @@ CREATE TABLE IF NOT EXISTS council_voice_skips (
 /// that do not depend on FK enforcement being on.
 pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     drop_triggers_that_do_not_stamp(conn)?;
+    rename_table_if_present(conn, "council_voice_skips", "council_reviewer_skips")?;
     conn.execute_batch(DDL)?;
     // Before the rebuild, not after: a rebuild spec copies a named column
     // list, so any column an old database is missing has to exist before
@@ -1085,8 +1086,10 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         conn,
         &[
             ("council_decisions", "seat_head", "house_rules_head"),
-            ("council_observations", "seat_label", "voice_label"),
-            ("council_observations", "seat_context_id", "voice_context_id"),
+            ("council_observations", "seat_label", "reviewer_label"),
+            ("council_observations", "seat_context_id", "reviewer_context_id"),
+            ("council_observations", "voice_label", "reviewer_label"),
+            ("council_observations", "voice_context_id", "reviewer_context_id"),
         ],
     )?;
     add_columns_if_missing(conn, "council_decisions", &[("house_rules_head", "TEXT"), ("bump_flavor", "TEXT")])?;
@@ -1169,6 +1172,21 @@ fn rename_columns_if_present(conn: &Connection, renames: &[(&str, &str, &str)]) 
         if existing.iter().any(|name| name == old) && !existing.iter().any(|name| name == new) {
             conn.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {old} TO {new}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Renames `old` to `new` when `old` exists and `new` does not, so rows
+/// written under the old name survive. Runs before `DDL`, which would
+/// otherwise create `new` empty beside `old`.
+fn rename_table_if_present(conn: &Connection, old: &str, new: &str) -> SqliteResult<()> {
+    let has = |name: &str| -> SqliteResult<bool> {
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)", [name], |row| {
+            row.get(0)
+        })
+    };
+    if has(old)? && !has(new)? {
+        conn.execute_batch(&format!("ALTER TABLE {old} RENAME TO {new}"))?;
     }
     Ok(())
 }
@@ -1785,7 +1803,7 @@ mod tests {
 
     /// A database built when the column was `seat_head` and the observation
     /// columns were `seat_label` and `seat_context_id` keeps its rows under
-    /// the new names: `house_rules_head`, `voice_label`, `voice_context_id`.
+    /// the new names: `house_rules_head`, `reviewer_label`, `reviewer_context_id`.
     /// A second `migrate` is a no-op.
     ///
     /// Falsified by a migration that only adds the new columns: the old
@@ -1796,8 +1814,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let old = DDL
             .replace("house_rules_head  TEXT", "seat_head         TEXT")
-            .replace("voice_label     TEXT", "seat_label      TEXT")
-            .replace("voice_context_id BLOB", "seat_context_id BLOB");
+            .replace("reviewer_label  TEXT    NOT NULL", "seat_label      TEXT    NOT NULL")
+            .replace("reviewer_context_id BLOB", "seat_context_id BLOB");
         for column in ["    seat_head         TEXT,", "    seat_label      TEXT    NOT NULL,", "    seat_context_id BLOB,"] {
             assert!(old.contains(column), "the fixture gives the old shape `{column}`");
         }
@@ -1821,7 +1839,7 @@ mod tests {
             conn.query_row("SELECT house_rules_head FROM council_decisions", [], |row| row.get(0)).unwrap();
         assert_eq!(head.as_deref(), Some("snap:old"));
         let (label, ctx): (String, Option<Vec<u8>>) = conn
-            .query_row("SELECT voice_label, voice_context_id FROM council_observations", [], |row| {
+            .query_row("SELECT reviewer_label, reviewer_context_id FROM council_observations", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })
             .unwrap();
@@ -1831,6 +1849,62 @@ mod tests {
                 .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = '{}'", gone.0, gone.1), [], |r| r.get(0))
                 .unwrap();
             assert_eq!(n, 0, "{} still has {}", gone.0, gone.1);
+        }
+    }
+
+    /// A database built when the observation columns were `voice_label` and
+    /// `voice_context_id` and the skip table was `council_voice_skips` keeps
+    /// its rows under `reviewer_label`, `reviewer_context_id`, and
+    /// `council_reviewer_skips`. A second `migrate` is a no-op.
+    ///
+    /// Falsified by a migration that only creates the new names: the old rows
+    /// stay behind under the old names and the new table reads empty.
+    #[test]
+    fn migrate_renames_the_voice_names_and_keeps_their_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old = DDL
+            .replace("reviewer_label  TEXT    NOT NULL", "voice_label     TEXT    NOT NULL")
+            .replace("reviewer_context_id BLOB", "voice_context_id BLOB")
+            .replace("council_reviewer_skips", "council_voice_skips");
+        for needle in ["    voice_label     TEXT    NOT NULL,", "    voice_context_id BLOB,", "council_voice_skips ("] {
+            assert!(old.contains(needle), "the fixture gives the old shape `{needle}`");
+        }
+        conn.execute_batch(&old).unwrap();
+        conn.execute_batch(
+            "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms)
+             VALUES (X'01', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                'miss', 'down', 0, 0, 0);
+             INSERT INTO council_observations (observation_id, decision_id, voice_label, voice_context_id, spec_name,
+                spec_id, server_model, weight_hash, tokenizer_hash, template, engine, outcome, miss_cause,
+                queue_ms, ms)
+             VALUES (X'0A', X'01', 'council-banto', X'0B', 'direction-check', '', '', '', '', '', '', 'miss',
+                'late', 0, 0);
+             INSERT INTO council_voice_skips (decision_id, seq, principal_id, character_name)
+             VALUES (X'01', 0, X'0C', 'carol');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let (label, ctx): (String, Option<Vec<u8>>) = conn
+            .query_row("SELECT reviewer_label, reviewer_context_id FROM council_observations", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((label.as_str(), ctx), ("council-banto", Some(vec![0x0B])));
+        let skipped: String =
+            conn.query_row("SELECT character_name FROM council_reviewer_skips", [], |row| row.get(0)).unwrap();
+        assert_eq!(skipped, "carol");
+        let old_table: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'council_voice_skips'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_table, 0);
+        for gone in ["voice_label", "voice_context_id"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('council_observations') WHERE name = '{gone}'"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "council_observations still has {gone}");
         }
     }
 

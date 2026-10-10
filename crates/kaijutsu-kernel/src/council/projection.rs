@@ -10,9 +10,9 @@
 //! assistant turn of its own. System instructions, tool calls and results,
 //! and unsubmitted drafts stay out.
 //!
-//! A character's voice context (`council-<character>`, every `council-`
+//! A character's council context (`council-<character>`, every `council-`
 //! label except [`SYSTEM_RULES`]) also reads finished drift blocks, since a
-//! director drifts its directions into its voice. Each becomes a user turn
+//! director drifts its directions into its council context. Each becomes a user turn
 //! whose first line names the sender and the context it came from. Drift
 //! stays out of every other council context.
 
@@ -27,11 +27,11 @@ use kaijutsu_types::{BlockKind, BlockSnapshot, ContextId, PrincipalId, Role, Sta
 /// are appended, so a change at the tail re-feeds at most this many turns.
 pub(crate) const SNAP_EVERY: usize = 8;
 
-/// The prefix every character's voice context label carries.
-pub(crate) const VOICE_PREFIX: &str = "council-";
+/// The prefix every character's council context label carries.
+pub(crate) const COUNCIL_CONTEXT_PREFIX: &str = "council-";
 
 /// The house rules every seat shares; a `council-` label that is not a
-/// character's voice.
+/// character's council context.
 pub(crate) const SYSTEM_RULES: &str = "council-system";
 
 /// The framing every council context carries as its system message; `{label}`
@@ -57,16 +57,16 @@ impl Names for crate::kernel_db::KernelDb {
     }
 }
 
-/// Whether the context labeled `label` is a character's voice, which reads
+/// Whether the context labeled `label` is a character's council context, which reads
 /// drift blocks.
-pub(crate) fn is_voice(label: &str) -> bool {
-    label.starts_with(VOICE_PREFIX) && label != SYSTEM_RULES
+pub(crate) fn is_reviewer_context(label: &str) -> bool {
+    label.starts_with(COUNCIL_CONTEXT_PREFIX) && label != SYSTEM_RULES
 }
 
 /// The server's body for the context labeled `label`, projected from its
 /// `blocks` in document order. `Err` when a drift's source cannot be named.
 pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
-    project_framed(FRAMING.replace("{label}", label), is_voice(label), blocks, names)
+    project_framed(FRAMING.replace("{label}", label), is_reviewer_context(label), blocks, names)
 }
 
 /// The server's body for a shadow of the seat labeled `seat`, projected from
@@ -404,12 +404,12 @@ mod tests {
     #[tokio::test]
     async fn turns_follow_document_order_not_block_id_order() {
         let kernel = Kernel::new_ephemeral("proj-order").await;
-        let ctx = live_context(&kernel, "voice");
+        let ctx = live_context(&kernel, "reviewer");
         let texts: Vec<String> = (0..12).map(|i| format!("turn {i}")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         append_dialogue(&kernel, ctx, &refs);
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
-        let p = project("voice", &blocks, &*kernel.kernel_db().lock()).unwrap();
+        let p = project("reviewer", &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), refs);
         assert_eq!(p.turns[0].role, WireRole::User);
         assert_eq!(p.turns[1].role, WireRole::Assistant);
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn excluded_and_non_text_blocks_stay_out() {
         let kernel = Kernel::new_ephemeral("proj-filter").await;
-        let ctx = live_context(&kernel, "voice");
+        let ctx = live_context(&kernel, "reviewer");
         let ids = append_dialogue(&kernel, ctx, &["keep one", "drop me", "keep two"]);
         let mut last = ids.last().cloned();
         for (role, kind, status, text) in [
@@ -433,7 +433,7 @@ mod tests {
         append(&kernel, ctx, last.as_ref(), Role::User, BlockKind::Text, Status::Done, "keep three");
         kernel.blocks().set_excluded(ctx, &ids[1], true).unwrap();
         let blocks = kernel.blocks().block_snapshots(ctx).unwrap();
-        let p = project("voice", &blocks, &*kernel.kernel_db().lock()).unwrap();
+        let p = project("reviewer", &blocks, &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(contents(&p), ["keep one", "keep two", "keep three"]);
     }
 
@@ -496,16 +496,16 @@ mod tests {
     #[tokio::test]
     async fn snap_flags_fall_on_every_eighth_turn_and_stay_when_a_turn_is_appended() {
         let kernel = Kernel::new_ephemeral("proj-snap").await;
-        let ctx = live_context(&kernel, "voice");
+        let ctx = live_context(&kernel, "reviewer");
         let texts: Vec<String> = (0..17).map(|i| format!("t{i}")).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let ids = append_dialogue(&kernel, ctx, &refs[..16]);
-        let before = project("voice", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
+        let before = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         let snapped: Vec<usize> =
             before.turns.iter().enumerate().filter(|(_, t)| t.snap).map(|(i, _)| i).collect();
         assert_eq!(snapped, vec![7, 15]);
         append(&kernel, ctx, ids.last(), Role::User, BlockKind::Text, Status::Done, "t16");
-        let after = project("voice", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
+        let after = project("reviewer", &kernel.blocks().block_snapshots(ctx).unwrap(), &*kernel.kernel_db().lock()).unwrap();
         assert_eq!(after.turns.len(), 17);
         assert_eq!(
             before.turns.iter().map(|t| t.snap).collect::<Vec<_>>(),
@@ -528,20 +528,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_voice_reads_drift_as_user_turns_naming_the_sender_and_source() {
+    async fn a_reviewer_context_reads_drift_as_user_turns_naming_the_sender_and_source() {
         let kernel = Kernel::new_ephemeral("proj-drift").await;
         let banto = character(&kernel, "banto", false);
         let seat = live_context(&kernel, "banto-seat");
-        let voice = live_context(&kernel, "council-banto");
-        let ids = append_dialogue(&kernel, voice, &["keep the coders on the parser work"]);
-        let d1 = append_drift(&kernel, voice, ids.last(), banto, seat, Some("qwen3"), "only touch crates/kaish-parser");
+        let reviewer = live_context(&kernel, "council-banto");
+        let ids = append_dialogue(&kernel, reviewer, &["keep the coders on the parser work"]);
+        let d1 = append_drift(&kernel, reviewer, ids.last(), banto, seat, Some("qwen3"), "only touch crates/kaish-parser");
         let unlabeled = kaijutsu_types::ContextId::new();
-        let d2 = append_drift(&kernel, voice, Some(&d1), PrincipalId::new(), unlabeled, None, "no pushes today");
-        let gone = append_drift(&kernel, voice, Some(&d2), banto, seat, None, "excluded direction");
-        kernel.blocks().set_excluded(voice, &gone, true).unwrap();
-        append(&kernel, voice, Some(&gone), Role::User, BlockKind::Text, Status::Done, "after the drift");
+        let d2 = append_drift(&kernel, reviewer, Some(&d1), PrincipalId::new(), unlabeled, None, "no pushes today");
+        let gone = append_drift(&kernel, reviewer, Some(&d2), banto, seat, None, "excluded direction");
+        kernel.blocks().set_excluded(reviewer, &gone, true).unwrap();
+        append(&kernel, reviewer, Some(&gone), Role::User, BlockKind::Text, Status::Done, "after the drift");
 
-        let p = projected(&kernel, "council-banto", voice);
+        let p = projected(&kernel, "council-banto", reviewer);
         assert_eq!(
             contents(&p),
             [
@@ -593,12 +593,12 @@ mod tests {
         let kernel = Kernel::new_ephemeral("proj-nodrift").await;
         let banto = character(&kernel, "banto", false);
         let seat = live_context(&kernel, "banto-seat");
-        for label in ["council-system", "voice", "system-rules"] {
+        for label in ["council-system", "reviewer", "system-rules"] {
             let ctx = live_context(&kernel, label);
             let ids = append_dialogue(&kernel, ctx, &["a house rule"]);
             append_drift(&kernel, ctx, ids.last(), banto, seat, None, "a drifted direction");
             assert_eq!(contents(&projected(&kernel, label, ctx)), ["a house rule"], "{label}");
         }
-        assert!(is_voice("council-amy") && !is_voice("council-system") && !is_voice("voice"));
+        assert!(is_reviewer_context("council-amy") && !is_reviewer_context("council-system") && !is_reviewer_context("reviewer"));
     }
 }

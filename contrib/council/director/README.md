@@ -34,4 +34,4 @@ contexts = ["council-amy", "council-banto"]
 The `council` context type owns the acknowledgment prompt and input loadout
 under `assets/defaults/rc/council/create/`. Its regular model thinks about
 submitted guidance and acknowledges it; the council server judges actions.
-This context list does not enable automatic reviewer-chain voices.
+This context list does not enable automatic reviewer contexts.

@@ -30,10 +30,10 @@
 //! Only an allow changes what the gate does, and only for statements no
 //! static layer covered.
 //!
-//! With `[council] voices` on, [`consult`] walks the reviewer chain
-//! (`super::voices`): the voting voices join the decision's contexts, the
+//! With `[council] reviewer_contexts` on, [`consult`] walks the reviewer chain
+//! (`super::reviewer_contexts`): the voting reviewer contexts join the decision's contexts, the
 //! skipped characters are recorded with the decision, and the observing
-//! voices are read after the decision's record commits
+//! reviewer contexts are read after the decision's record commits
 //! ([`CouncilVerdict::observe`]).
 
 use std::sync::Arc;
@@ -56,7 +56,7 @@ use tracing::Instrument;
 
 use super::sync::{PrepareMiss, Prepared, no_slot_cause};
 use crate::llm::endpoint::SlotWaits;
-use super::voices::{SkippedVoice, VoiceChain};
+use super::reviewer_contexts::{SkippedReviewerContext, ReviewerContextChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
     CouncilCase, CouncilConfig, CouncilMode, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec,
@@ -736,9 +736,9 @@ pub(crate) struct CouncilVerdict {
     record: NewCouncilDecision,
     signal: NewSignal,
     note: String,
-    /// Characters on the reviewer chain with no voice context.
-    skipped: Vec<SkippedVoice>,
-    /// Voice labels read after the decision, under the `direction-check` spec.
+    /// Characters on the reviewer chain with no council context.
+    skipped: Vec<SkippedReviewerContext>,
+    /// Reviewer context labels read after the decision, under the `direction-check` spec.
     observing: Vec<String>,
     council: CouncilConfig,
     /// The case state the decision read; the observations read it too.
@@ -946,7 +946,7 @@ impl CouncilVerdict {
         record
     }
 
-    /// Record this decision, its voice skips, each program decision, and
+    /// Record this decision, its reviewer skips, each program decision, and
     /// the program rows that link them, in the caller's transaction, and
     /// return the shell decision's id.
     pub(crate) fn insert_within(
@@ -955,7 +955,7 @@ impl CouncilVerdict {
         request_id: Option<&str>,
     ) -> approval_ledger::error::Result<Vec<u8>> {
         let id = approval_ledger::council::insert_council_decision_within(conn, &self.record_for(request_id))?;
-        approval_ledger::council_observation::insert_council_voice_skips_within(conn, &id, &self.skips())?;
+        approval_ledger::council_observation::insert_council_reviewer_skips_within(conn, &id, &self.skips())?;
         let mut rows = Vec::new();
         for program in &self.programs {
             let (program_decision_id, unread_cause) = match &program.decision {
@@ -1061,9 +1061,9 @@ impl CouncilVerdict {
         key
     }
 
-    /// The voice skips recorded with the decision, in chain order.
-    pub(crate) fn skips(&self) -> Vec<approval_ledger::council_observation::CouncilVoiceSkip> {
-        self.skipped.iter().map(SkippedVoice::recorded).collect()
+    /// The reviewer skips recorded with the decision, in chain order.
+    pub(crate) fn skips(&self) -> Vec<approval_ledger::council_observation::CouncilReviewerSkip> {
+        self.skipped.iter().map(SkippedReviewerContext::recorded).collect()
     }
 
     /// For a report, stop the seat when it is autonomous and `asked` (the
@@ -1115,7 +1115,7 @@ impl CouncilVerdict {
         }
     }
 
-    /// Read the observing voices, and the seat's judge when it has one,
+    /// Read the observing reviewer contexts, and the seat's judge when it has one,
     /// against `decision_id` on tasks of their own. Call it once the
     /// decision's record has committed; nothing waits for the tasks, and
     /// their failures are their own records.
@@ -1133,7 +1133,7 @@ impl CouncilVerdict {
     }
 
     /// Reads `judge` after this decision commits, beside the observing
-    /// voices.
+    /// reviewer contexts.
     pub(crate) fn set_judge(&mut self, judge: super::shadow::JudgeRead) {
         self.judge = Some(judge);
     }
@@ -1220,10 +1220,10 @@ enum Seen<'a> {
     Answered(&'a Prepared, &'a DecisionResponse),
 }
 
-/// The voices and case state a verdict carries to its record and its
+/// The reviewer contexts and case state a verdict carries to its record and its
 /// observation.
 struct Carried {
-    chain: VoiceChain,
+    chain: ReviewerContextChain,
     state: Json,
     /// The decision's slot waits at the council server's endpoint.
     waits: SlotWaits,
@@ -1430,7 +1430,7 @@ pub(crate) async fn decide(
     case: CaseInput,
     council: &CouncilConfig,
     spec: &CouncilSpec,
-    chain: Result<VoiceChain, String>,
+    chain: Result<ReviewerContextChain, String>,
 ) -> CouncilVerdict {
     let span = tracing::info_span!(
         "council.decide",
@@ -1499,7 +1499,7 @@ async fn decide_inner(
     case: CaseInput,
     council: &CouncilConfig,
     spec: &CouncilSpec,
-    chain: Result<VoiceChain, String>,
+    chain: Result<ReviewerContextChain, String>,
 ) -> CouncilVerdict {
     let span = tracing::Span::current();
     let started = Instant::now();
@@ -1510,7 +1510,7 @@ async fn decide_inner(
     let chain = match chain {
         Ok(chain) => chain,
         Err(cause) => {
-            let carried = Carried { chain: VoiceChain::default(), state, waits: SlotWaits::default() };
+            let carried = Carried { chain: ReviewerContextChain::default(), state, waits: SlotWaits::default() };
             return build_verdict(caller, &case, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
@@ -1833,7 +1833,7 @@ pub(crate) async fn consult(
         let db = kernel.kernel_db().lock();
         let cast_server = cast_council_server(&db, context_id)
             .map_err(|e| format!("the council could not read the seat's cast: {e} (fail-closed — a database fault, not a decision)"))?;
-        (cast_server, super::voices::voice_chain(&db, council, context_id, caller.actor_id))
+        (cast_server, super::reviewer_contexts::reviewer_context_chain(&db, council, context_id, caller.actor_id))
     };
     // A seat's cast may name the council server; a slot that names none is
     // a miss for every decision on this submission, before any server is
@@ -1889,7 +1889,7 @@ pub(crate) async fn consult(
                         text: text.text.clone(),
                     };
                     let mut decision = decide(kernel, caller, case, council, program_spec, chain).await;
-                    // Voices are observed and skips recorded once, on the
+                    // Reviewer contexts are observed and skips recorded once, on the
                     // shell decision.
                     decision.skipped.clear();
                     decision.observing.clear();
@@ -2054,12 +2054,12 @@ mod tests {
     fn council(allow_at: f64, mass_floor: f64, require_agree: bool) -> CouncilConfig {
         CouncilConfig {
             server: "http://127.0.0.1:1".into(),
-            contexts: vec!["voice".into(), "system-rules".into()],
+            contexts: vec!["reviewer".into(), "system-rules".into()],
             pool_method: CouncilPoolMethod::LogLinear,
             pool_weights: CouncilPoolWeights::Mass,
             deadline_ms: 700,
             require_agree,
-            voices: false,
+            reviewer_contexts: false,
             house_rules: false,
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,

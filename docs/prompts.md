@@ -104,7 +104,7 @@ see `docs/council.md`, "Council contexts are kaijutsu contexts".
 The judge type is a seat's shadow: the kernel creates it, runs its `create`
 lifecycle, and sends it to a council server; no model turn runs in it. Its
 stance frames the seat's command history for the council and is the
-shadow's whole framing; see `docs/council.md`, "Shadow voice".
+shadow's whole framing; see `docs/council.md`, "Shadow context".
 
 The executable filename controls order. Default handles general work;
 assistant remains fleet coordination, with a helper branch that observes and a

@@ -1,16 +1,16 @@
-//! A model character's voice observes a gate decision (`docs/council.md`,
+//! A model character's council context observes a gate decision (`docs/council.md`,
 //! "Council contexts are kaijutsu contexts").
 //!
-//! After the gate decides, each observing voice the reviewer chain found
-//! ([`super::voices::VoiceChain::observing`]) is read alone under the
+//! After the gate decides, each observing reviewer context the reviewer chain found
+//! ([`super::reviewer_contexts::ReviewerContextChain::observing`]) is read alone under the
 //! `direction-check` spec, with the same case state the decision read. The
 //! answer is verified and recorded with the decision
 //! (`approval_ledger::council_observation`). It never enters the decision's
-//! pool and never changes its outcome: the read names only the voice, and
+//! pool and never changes its outcome: the read names only that context, and
 //! nothing here writes a decision row.
 //!
 //! [`spawn_observe`] runs the reads off the hot path. Every failure, from
-//! preparing the voice to writing the record, is the observation's own
+//! preparing the context to writing the record, is the observation's own
 //! outcome: a miss in the record, or an error in the log and in
 //! [`Observed::record`]. Nothing reaches the gate.
 
@@ -25,7 +25,7 @@ use kaijutsu_mk::council::wire::{DecisionResponse, ReadAnswer, SpecQuestion};
 use super::sync::Prepared;
 use crate::kj::gate_policy::CouncilConfig;
 
-/// The spec an observing voice is read under,
+/// The spec an observing reviewer context is read under,
 /// `/config/kernel/council/direction-check.json`.
 pub(crate) const DIRECTION_CHECK: &str = "direction-check";
 
@@ -41,7 +41,7 @@ pub(crate) enum Seen {
     Miss(String),
 }
 
-/// One observing voice's read and whether its record was written.
+/// One observing reviewer context's read and whether its record was written.
 #[derive(Clone, Debug)]
 pub(crate) struct Observed {
     pub(crate) label: String,
@@ -58,21 +58,21 @@ impl Observed {
         match (&self.record, &self.seen) {
             (Err(error), _) => tracing::error!(
                 target: "kaijutsu::council",
-                voice = %label,
+                context = %label,
                 error = %error,
                 "a council observation could not be recorded; the gate's decision stands"
             ),
             (Ok(_), Seen::Miss(cause)) => tracing::warn!(
                 target: "kaijutsu::council",
-                voice = %label,
+                context = %label,
                 miss_cause = %cause,
-                "a council voice gave no observation"
+                "a council context gave no observation"
             ),
             (Ok(_), Seen::Answered(choice)) => tracing::info!(
                 target: "kaijutsu::council",
-                voice = %label,
+                context = %label,
                 choice = %choice,
-                "a council voice observed a decision"
+                "a council context observed a decision"
             ),
         }
     }
@@ -91,12 +91,12 @@ pub(crate) fn spawn_observe(
     if labels.is_empty() {
         return None;
     }
-    Some(tokio::spawn(async move { observe_voices(&kernel, &council, &decision_id, &labels, &state).await }))
+    Some(tokio::spawn(async move { observe_reviewer_contexts(&kernel, &council, &decision_id, &labels, &state).await }))
 }
 
 /// Read each of `labels` alone under [`DIRECTION_CHECK`], one after
 /// another, and record each against `decision_id`.
-pub(crate) async fn observe_voices(
+pub(crate) async fn observe_reviewer_contexts(
     kernel: &crate::Kernel,
     council: &CouncilConfig,
     decision_id: &[u8],
@@ -130,7 +130,7 @@ fn empty_server() -> CouncilServer {
     }
 }
 
-/// The observation row for one voice. Every failure is a miss row.
+/// The observation row for one reviewer context. Every failure is a miss row.
 async fn observe_one(
     kernel: &crate::Kernel,
     council: &CouncilConfig,
@@ -141,8 +141,8 @@ async fn observe_one(
     let started = Instant::now();
     let mut row = NewCouncilObservation {
         decision_id: decision_id.to_vec(),
-        voice_label: label.to_string(),
-        voice_context_id: None,
+        reviewer_label: label.to_string(),
+        reviewer_context_id: None,
         spec_name: DIRECTION_CHECK.to_string(),
         spec_id: String::new(),
         server: empty_server(),
@@ -169,9 +169,9 @@ async fn observe_one(
         Ok(prepared) => prepared,
         Err(cause) => return miss(row, cause, started.elapsed()),
     };
-    let voice = &prepared.contexts[0];
-    row.voice_context_id = Some(voice.context_id.as_bytes().to_vec());
-    row.expected_head = Some(voice.head.to_string());
+    let reviewer = &prepared.contexts[0];
+    row.reviewer_context_id = Some(reviewer.context_id.as_bytes().to_vec());
+    row.expected_head = Some(reviewer.head.to_string());
     row.spec_id = prepared.spec_id.to_string();
     row.server = CouncilServer {
         model: prepared.identity.model.clone(),
@@ -223,7 +223,7 @@ fn spec_lacks_follows(prepared: &Prepared) -> Option<String> {
     }
 }
 
-/// The verified read of the one voice: its snapshot, every question it
+/// The verified read of the one context: its snapshot, every question it
 /// answered, and its top option for [`FOLLOWS`].
 fn read_answer(
     prepared: &Prepared,
@@ -237,13 +237,13 @@ fn read_answer(
     {
         return Err(format!("the server read spec {read}, not the spec asked for, {asked}"));
     }
-    let voice = prepared.contexts[0].context_id.to_string();
+    let reviewer = prepared.contexts[0].context_id.to_string();
     let [read] = response.reads.as_slice() else {
-        return Err(format!("the answer has {} reads, not the one voice asked for", response.reads.len()));
+        return Err(format!("the answer has {} reads, not the one context asked for", response.reads.len()));
     };
-    if read.context.as_deref() != Some(voice.as_str()) {
+    if read.context.as_deref() != Some(reviewer.as_str()) {
         return Err(format!(
-            "the answer read {}, not the voice asked for, {voice}",
+            "the answer read {}, not the context asked for, {reviewer}",
             read.context.as_deref().unwrap_or("the spec alone")
         ));
     }
@@ -369,7 +369,7 @@ mod tests {
             pool_weights: CouncilPoolWeights::Mass,
             deadline_ms: 5000,
             require_agree: true,
-            voices: false,
+            reviewer_contexts: false,
             house_rules: false,
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_voice_is_read_alone_and_recorded_without_touching_the_decision() {
+    async fn a_reviewer_context_is_read_alone_and_recorded_without_touching_the_decision() {
         let r = rig().await;
         let before = load_council_decision(r.kernel.kernel_db().lock().conn_for_ledger(), &r.decision).unwrap();
         let observed = r.observe(&["council-banto"]).await;
@@ -446,7 +446,7 @@ mod tests {
         let decisions = r.mock.bodies("/council/v1/decisions");
         assert_eq!(decisions.len(), 1);
         let contexts = decisions[0]["contexts"].as_array().unwrap();
-        assert_eq!(contexts.len(), 1, "only the voice is read, never the decision's pool");
+        assert_eq!(contexts.len(), 1, "only the reviewer context is read, never the decision's pool");
         assert_eq!(contexts[0]["id"], r.banto.to_string());
         assert_eq!(decisions[0]["state"]["command"], "git push --force");
         let specs = r.mock.bodies("/council/v1/specs");
@@ -456,8 +456,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let o = &rows[0].observation;
         assert_eq!(rows[0].observation_id, id);
-        assert_eq!(o.voice_label, "council-banto");
-        assert_eq!(o.voice_context_id.as_deref(), Some(r.banto.as_bytes().as_slice()));
+        assert_eq!(o.reviewer_label, "council-banto");
+        assert_eq!(o.reviewer_context_id.as_deref(), Some(r.banto.as_bytes().as_slice()));
         assert_eq!(o.choice.as_deref(), Some("strays"));
         assert_eq!(o.server.weight_hash, "w1");
         assert_eq!(o.questions.len(), 1);
@@ -496,12 +496,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_voice_gone_by_read_time_is_a_miss_without_a_seat() {
+    async fn a_reviewer_context_gone_by_read_time_is_a_miss_without_a_seat() {
         let r = rig().await;
         let observed = r.observe(&["council-ghost"]).await;
         let Seen::Miss(cause) = &observed[0].seen else { panic!("a miss") };
         assert!(cause.contains("council-ghost"), "{cause}");
-        assert_eq!(r.recorded()[0].observation.voice_context_id, None);
+        assert_eq!(r.recorded()[0].observation.reviewer_context_id, None);
         assert!(r.mock.bodies("/council/v1/decisions").is_empty());
     }
 

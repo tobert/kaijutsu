@@ -231,9 +231,9 @@ over time)."
   benchmark seat that never set one reads the host's file if it has one.
   Decide whether no working directory should mean no house rules.
 - **Observations do not read the house rules.** A director's
-  `direction-check` reads its voice alone.
+  `direction-check` reads its council context alone.
 - **The zorak `council-system` lacks the house-rules sentence.**
-  `contrib/council/seed-voices.kai` has it, but it runs once; replace the
+  `contrib/council/seed-council-contexts.kai` has it, but it runs once; replace the
   seat sentence in the live context by chat.
 - **Elided program text depends on spelling.** The shell case elides a
   judged program's text only where it appears verbatim; `-c` text with
@@ -268,7 +268,7 @@ a deny would refuse it or an ask would wait on a human. Amy, 2026-10-05:
   rc so we can tune it the way we tune prompts. It directs and does not
   invite an argument. Amy: "Try harder, a different approach, or look for
   more ways to verify safety before mutations." A bump that arrives as a
-  drift reaches no council context but a character's voice.
+  drift reaches no council context but a character's council context.
 - **The ledger needs garbage collection.** The ui gets slow on the long list
   of old entries, and bumps will add more of them.
 
@@ -298,7 +298,7 @@ bump record and limit, and the message template. Still open:
 - **Per-spec council contexts** are on main under `[[council.spec]]`; bumper
   mode touches only the `[council]` table.
 
-## Council: a shadow voice holding the seat's command history (2026-10-06)
+## Council: a shadow context holding the seat's command history (2026-10-06)
 
 The council judges each command alone. It cannot tell that `.partb` is
 scratch the seat made an hour ago, so a cleanup of the seat's own work looks
@@ -314,7 +314,7 @@ the model under observation has tried."
   rules dropped the seat's narration because it changed every few decisions
   and forced re-sends (29 in 18 minutes); an append-only command list only
   extends, so a held snapshot stays useful.
-- **Design.** `docs/council.md`, "Shadow voice (design, not built)". Amy,
+- **Design.** `docs/council.md`, "Shadow context (design, not built)". Amy,
   2026-10-09: start with shell calls, then every tool call; the shadow is a
   fork child of the seat; get it flowing into a megakernel context and
   measure before doing more. Amy, later that day: the judge rides on the
@@ -368,7 +368,7 @@ up with some kind of preset for contexts with bumps, then we can likely put
 in like, mk bumps, lfm2d bumps, and Jev! bumps." Built 2026-10-10 (Amy:
 "yes cast slot"): a cast's `gate` slot names the council server a seat's
 gate decisions run on, and its `judge` slot names the judge
-(`docs/council.md`, "Configuration" and "Shadow voice"). Enablement and
+(`docs/council.md`, "Configuration" and "Shadow context"). Enablement and
 mode stay per context type in `gate.toml`.
 
 Open: one spec has one threshold for every server. A threshold is fit to

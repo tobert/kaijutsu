@@ -204,7 +204,7 @@ pub enum LedgerError {
     #[error("invalid council decision: {0}")]
     InvalidCouncilDecision(String),
 
-    /// A council observation or voice skip that breaks a rule the schema
+    /// A council observation or reviewer skip that breaks a rule the schema
     /// also enforces (a miss without a cause, an answer without a choice),
     /// or that names no council decision. Refused before any row is written.
     #[error("invalid council observation: {0}")]
