@@ -144,7 +144,9 @@ fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLo
     let (kernel, shadow, seat_name) = (kernel.clone(), judge.shadow, judge.seat_name.clone());
     tokio::spawn(async move {
         let started = std::time::Instant::now();
-        match kernel.council_sync().prime_shadow(&kernel, &server, &spec_name, shadow, &seat_name).await {
+        let deadline = tokio::time::Instant::now() + super::sync::SHADOW_PRIME_TIMEOUT;
+        let waits = crate::llm::endpoint::SlotWaits::default();
+        match kernel.council_sync().prime_shadow(&kernel, &server, &spec_name, shadow, &seat_name, deadline, &waits).await {
             Ok(head) => tracing::info!(
                 target: "kaijutsu::council",
                 %shadow, %server, head = %head, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -237,9 +239,11 @@ async fn judge_one(
         choice: None,
         p: 0.0,
     };
+    let waits = crate::llm::endpoint::SlotWaits::default();
     let miss = |mut judged: Judged, cause: String| {
         judged.observation.miss_cause = Some(cause);
         judged.observation.ms = started.elapsed().as_millis() as i64;
+        judged.observation.queue_ms = super::gate::queue_ms(&waits, None);
         judged
     };
     let Some(spec) = spec else {
@@ -251,15 +255,22 @@ async fn judge_one(
     let mut labels = council.contexts.clone();
     labels.extend(spec.contexts.iter().cloned());
     let seat = council.house_rules.then_some(read.seat);
-    let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, deadline).await {
+    let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, deadline, &waits).await {
         Ok(prepared) => prepared,
         Err(cause) => return miss(judged, cause),
     };
-    let primed = kernel.council_sync().prime_shadow(kernel, &read.server, &spec.name, read.shadow, &read.seat_name);
+    let primed =
+        kernel.council_sync().prime_shadow(kernel, &read.server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
     let head = match tokio::time::timeout_at(deadline, primed).await {
         Ok(Ok(head)) => head,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
-        Err(_) => return miss(judged, "the shadow could not be sent in time".into()),
+        Err(_) => {
+            let cause = match waits.open() {
+                Some(wait) => format!("the shadow could not be sent in time: the deadline passed {wait}"),
+                None => "the shadow could not be sent in time".into(),
+            };
+            return miss(judged, cause);
+        }
     };
     judged.observation.expected_head = Some(head.to_string());
     judged.observation.spec_id = prepared.spec_id.to_string();
@@ -271,7 +282,7 @@ async fn judge_one(
     });
     let request = super::gate::decision_request(&prepared, &council, state.clone());
     let asked = std::time::Instant::now();
-    let response = match super::gate::ask_within(kernel, &prepared, &request, &council, deadline).await {
+    let response = match super::gate::ask_within(kernel, &prepared, &request, &council, deadline, &waits).await {
         Ok(response) => response,
         Err(cause) => return miss(judged, cause),
     };
@@ -285,7 +296,7 @@ async fn judge_one(
         template: response.identity.template.clone(),
         engine: response.identity.engine.clone(),
     };
-    judged.observation.queue_ms = response.queue_ms.unwrap_or(0.0).round() as i64;
+    judged.observation.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
     let shadow_id = read.shadow.to_string();
     if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_id.as_str())) {
         judged.observation.snapshot = shadow_read.snapshot.as_ref().map(|s| s.to_string());

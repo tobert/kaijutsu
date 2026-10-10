@@ -8,12 +8,17 @@
 //! contexts, so a `PUT` carries the head the server last reported as
 //! `If-Match`; a head that moved anyway is a miss, not a retry.
 //!
+//! Every call takes a slot at the server's endpoint first
+//! (`llm::endpoint::mk_call`), waiting no later than the caller's deadline,
+//! and a 429 is sent again after its cooldown.
+//!
 //! The caller bounds `prepare_labels` with the decision's deadline and may
 //! drop it part way. A `PUT` dropped before its answer may still have
 //! landed, so the context is forgotten and the next `PUT` carries no
 //! `If-Match`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use kaijutsu_mk::council::canon;
@@ -24,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 use super::projection::{HOUSE_RULES_BYTES_PER_TOKEN, HouseRules, project, project_house_rules, project_shadow};
 use crate::kj::gate_policy::CouncilConfig;
+use crate::llm::endpoint::{Endpoint, NoSlot, SlotWaits, mk_call};
 
 /// Everything one decision needs from the server's side.
 pub(crate) struct Prepared {
@@ -31,6 +37,8 @@ pub(crate) struct Prepared {
     /// each call `prepare_labels` makes; a decision passes the time its
     /// deadline leaves.
     pub(crate) client: MkClient,
+    /// The server's endpoint, which each call takes a slot from.
+    pub(crate) endpoint: Arc<Endpoint>,
     pub(crate) identity: ServerIdentity,
     pub(crate) spec: Spec,
     pub(crate) spec_id: SpecId,
@@ -59,7 +67,7 @@ pub(crate) struct PreparedContext {
 
 /// Bounds each call that primes a shadow. Priming runs off the gate's path,
 /// so it waits longer than a decision's deadline.
-const SHADOW_PRIME_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SHADOW_PRIME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The label the house-rules context goes by in reports and miss causes.
 pub(crate) const HOUSE_RULES_LABEL: &str = "house-rules";
@@ -73,6 +81,47 @@ const HOUSE_RULES_NAMESPACE: uuid::Uuid = uuid::uuid!("5c1f0b0e-9a47-4d3b-8e62-7
 /// for every seat, and a changed body is a new id.
 fn house_rules_id(body: &kaijutsu_mk::council::wire::ContextPut) -> Result<ContextId, PrepareMiss> {
     Ok(ContextId::from(uuid::Uuid::new_v5(&HOUSE_RULES_NAMESPACE, &body_hash(body)?)))
+}
+
+/// The miss cause for a call that got no slot at its endpoint before the
+/// deadline.
+pub(crate) fn no_slot_cause(deadline_ms: u64, no_slot: &NoSlot) -> String {
+    format!(
+        "no answer within the {deadline_ms} ms deadline: the deadline passed waiting {} ms for a slot at {} ({})",
+        no_slot.waited.as_millis(),
+        no_slot.endpoint,
+        no_slot.why
+    )
+}
+
+/// The council server one decision or priming talks to: its client, its
+/// endpoint, and the deadline that bounds every slot wait.
+struct Link<'a> {
+    client: &'a MkClient,
+    server: &'a str,
+    endpoint: Arc<Endpoint>,
+    deadline: tokio::time::Instant,
+    deadline_ms: u64,
+    waits: &'a SlotWaits,
+}
+
+impl Link<'_> {
+    /// One call through the endpoint. No slot before the deadline is a miss.
+    async fn send<T, F, Fut>(&self, call: F) -> Result<Result<T, MkError>, PrepareMiss>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, MkError>>,
+    {
+        match mk_call(&self.endpoint, self.deadline, self.waits, call).await {
+            Ok((_slot, result)) => Ok(result),
+            Err(no_slot) => Err(PrepareMiss(no_slot_cause(self.deadline_ms, &no_slot))),
+        }
+    }
+}
+
+/// The endpoint `server` addresses.
+fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<Arc<Endpoint>, PrepareMiss> {
+    kernel.endpoints().for_url(server).map_err(|e| PrepareMiss(format!("council server {server}: {e}")))
 }
 
 /// Why the council cannot be asked right now, in plain words; the gate
@@ -193,6 +242,10 @@ impl CouncilSync {
     /// when the server lacks the `describe` capability, a label listed twice,
     /// and more contexts, the house rules included, than the server's
     /// `contexts_per_decision`.
+    ///
+    /// Each call waits for a slot no later than `deadline`, adding its wait
+    /// to `waits`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prepare_labels(
         &self,
         kernel: &crate::Kernel,
@@ -200,13 +253,17 @@ impl CouncilSync {
         spec_name: &str,
         labels: &[String],
         seat: Option<ContextId>,
+        deadline: tokio::time::Instant,
+        waits: &SlotWaits,
     ) -> Result<Prepared, PrepareMiss> {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
         let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
             .map_err(|e| self.failed(server, "client", e))?;
+        let endpoint = endpoint_of(kernel, server)?;
+        let link = Link { client: &client, server, endpoint: endpoint.clone(), deadline, deadline_ms: council.deadline_ms, waits };
 
-        let identity = self.identity(&client, server).await?;
+        let identity = self.identity(&link).await?;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         if let Some(text) = spec_body.questions.iter().find(|q| matches!(q, SpecQuestion::Text(_)))
             && !identity.capabilities.contains(&Capability::Describe)
@@ -247,7 +304,7 @@ impl CouncilSync {
                 identity.limits.contexts_per_decision
             )));
         }
-        self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
+        self.ensure_spec(&link, &spec_body, &spec_id).await?;
 
         let mut contexts = Vec::with_capacity(reads);
         for label in labels {
@@ -257,22 +314,25 @@ impl CouncilSync {
             })?;
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
-            let head = self.hold(&client, server, &identity, &spec_id, label, context_id, body, true).await?;
+            let head = self.hold(&link, &identity, &spec_id, label, context_id, body, true).await?;
             contexts.push(PreparedContext { label: label.clone(), context_id, head, house_rules: false });
         }
         if let Some((context_id, body)) = house {
-            let head = self.hold(&client, server, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
+            let head = self.hold(&link, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
             contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, head, house_rules: true });
         }
 
         let spec = spec_body;
-        Ok(Prepared { client, identity, spec, spec_id, contexts })
+        drop(link);
+        Ok(Prepared { client, endpoint, identity, spec, spec_id, contexts })
     }
 
     /// Sends the shadow `shadow` of the seat labeled `seat` to `server`, so
     /// the server holds its dialogue before the next question about it.
     /// Warms the spec named `spec_name` when the server can. Sends nothing
-    /// when the server already holds this body.
+    /// when the server already holds this body. Each call waits for a slot
+    /// no later than `deadline`, adding its wait to `waits`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn prime_shadow(
         &self,
         kernel: &crate::Kernel,
@@ -280,12 +340,16 @@ impl CouncilSync {
         spec_name: &str,
         shadow: ContextId,
         seat: &str,
+        deadline: tokio::time::Instant,
+        waits: &SlotWaits,
     ) -> Result<SnapshotId, PrepareMiss> {
         let _serial = self.shadow_serial.lock().await;
         let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(server, "client", e))?;
-        let identity = self.identity(&client, server).await?;
+        let deadline_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
+        let link = Link { client: &client, server, endpoint: endpoint_of(kernel, server)?, deadline, deadline_ms, waits };
+        let identity = self.identity(&link).await?;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
-        self.ensure_spec(&client, server, &spec_body, &spec_id).await?;
+        self.ensure_spec(&link, &spec_body, &spec_id).await?;
         let blocks = kernel
             .blocks()
             .block_snapshots(shadow)
@@ -293,7 +357,7 @@ impl CouncilSync {
         let body = project_shadow(seat, &blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
-        self.hold(&client, server, &identity, &spec_id, &label, shadow, body, true).await
+        self.hold(&link, &identity, &spec_id, &label, shadow, body, true).await
     }
 
     /// Makes the server hold `body` as `context_id` and returns its head.
@@ -304,8 +368,7 @@ impl CouncilSync {
     #[allow(clippy::too_many_arguments)]
     async fn hold(
         &self,
-        client: &MkClient,
-        server: &str,
+        link: &Link<'_>,
         identity: &ServerIdentity,
         spec_id: &SpecId,
         label: &str,
@@ -313,6 +376,7 @@ impl CouncilSync {
         body: kaijutsu_mk::council::wire::ContextPut,
         persistent: bool,
     ) -> Result<SnapshotId, PrepareMiss> {
+        let server = link.server;
         let hash = body_hash(&body)?;
         let key = (server.to_string(), context_id);
         let held = self.state.lock().contexts.get(&key).cloned();
@@ -330,7 +394,7 @@ impl CouncilSync {
         let mut if_match = held.as_ref().map(|h| h.head.clone());
         let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
         let result = loop {
-            match client.put_context(&id, &body, if_match.as_ref()).await {
+            match link.send(|| link.client.put_context(&id, &body, if_match.as_ref())).await? {
                 Err(e) if e.status() == Some(404) && if_match.is_some() => {
                     if_match = None;
                 }
@@ -368,29 +432,24 @@ impl CouncilSync {
         self.state.lock().specs.retain(|(_, id)| id != spec_id);
     }
 
-    async fn identity(&self, client: &MkClient, server: &str) -> Result<ServerIdentity, PrepareMiss> {
+    async fn identity(&self, link: &Link<'_>) -> Result<ServerIdentity, PrepareMiss> {
+        let server = link.server;
         if let Some(i) = self.state.lock().identities.get(server) {
             return Ok(i.clone());
         }
-        let identity = client.identity().await.map_err(|e| self.failed(server, "identity", e))?;
+        let identity = link.send(|| link.client.identity()).await?.map_err(|e| self.failed(server, "identity", e))?;
         self.state.lock().identities.insert(server.to_string(), identity.clone());
         Ok(identity)
     }
 
-    async fn ensure_spec(
-        &self,
-        client: &MkClient,
-        server: &str,
-        spec: &Spec,
-        spec_id: &SpecId,
-    ) -> Result<(), PrepareMiss> {
+    async fn ensure_spec(&self, link: &Link<'_>, spec: &Spec, spec_id: &SpecId) -> Result<(), PrepareMiss> {
+        let server = link.server;
         let key = (server.to_string(), spec_id.clone());
         if self.state.lock().specs.contains(&key) {
             return Ok(());
         }
-        client
-            .post_spec(spec)
-            .await
+        link.send(|| link.client.post_spec(spec))
+            .await?
             .map_err(|e| self.failed(server, &format!("POST of spec \"{}\"", spec.name), e))?;
         self.state.lock().specs.insert(key);
         Ok(())
@@ -651,6 +710,11 @@ mod tests {
     use super::mock::{Mock, identity_json, reply, serve, snap};
     use super::super::projection::fixtures::{append_dialogue, live_context};
     use super::*;
+
+    /// A deadline no test reaches.
+    fn far() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(30)
+    }
     use crate::Kernel;
     use crate::kj::gate_policy::{CouncilCase, CouncilPoolMethod, CouncilPoolWeights, CouncilSpec};
     use crate::vfs::LocalBackend;
@@ -704,7 +768,7 @@ mod tests {
 
     impl Rig {
         async fn prepare(&self) -> Result<Prepared, PrepareMiss> {
-            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts, None).await
+            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts, None, far(), &SlotWaits::default()).await
         }
 
         fn grow(&self, text: &str) {
@@ -982,12 +1046,12 @@ mod tests {
         let amy = live_context(&r.kernel, "council-amy");
         append_dialogue(&r.kernel, amy, &["keep main green"]);
         let labels = vec!["voice".to_string(), "council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.unwrap();
         assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["voice", "council-amy"]);
         assert_eq!(p.contexts[1].context_id, amy);
 
         let one = vec!["council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None, far(), &SlotWaits::default()).await.unwrap();
         assert_eq!(p.contexts.len(), 1, "a single voice, without [council] contexts");
         assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
     }
@@ -1030,7 +1094,7 @@ mod tests {
     }
 
     async fn prepare_seat(r: &Rig, seat: ContextId) -> Result<Prepared, PrepareMiss> {
-        r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat)).await
+        r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat), far(), &SlotWaits::default()).await
     }
 
     /// The house-rules context is the first `AGENTS.md` found walking up
@@ -1168,10 +1232,10 @@ mod tests {
     async fn more_labels_than_the_server_reads_or_a_repeated_label_is_a_miss() {
         let r = rig().await;
         let labels: Vec<String> = (0..5).map(|i| format!("ctx-{i}")).collect();
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("at most 4"), "{}", miss.0);
         let twice = vec!["voice".to_string(), "voice".to_string()];
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("\"voice\" twice"), "{}", miss.0);
         assert!(r.mock.puts().is_empty());
     }

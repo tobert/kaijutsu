@@ -54,7 +54,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
-use super::sync::{PrepareMiss, Prepared};
+use super::sync::{PrepareMiss, Prepared, no_slot_cause};
+use crate::llm::endpoint::SlotWaits;
 use super::voices::{SkippedVoice, VoiceChain};
 use crate::kj::gate::GateSpec;
 use crate::kj::gate_policy::{
@@ -604,9 +605,19 @@ pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
     }
 }
 
-/// The miss cause for a decision stopped at its deadline during `phase`.
-fn deadline_cause(deadline_ms: u64, phase: &str) -> String {
-    format!("no answer within the {deadline_ms} ms deadline: the deadline passed during {phase}")
+/// The miss cause for a decision stopped at its deadline during `phase`,
+/// naming the slot wait when the deadline passed during one.
+fn deadline_cause(deadline_ms: u64, phase: &str, waits: &SlotWaits) -> String {
+    match waits.open() {
+        Some(wait) => format!("no answer within the {deadline_ms} ms deadline: the deadline passed {wait}"),
+        None => format!("no answer within the {deadline_ms} ms deadline: the deadline passed during {phase}"),
+    }
+}
+
+/// A record's `queue_ms`: the time spent waiting for slots at the council
+/// server's endpoint plus the queue time the server reports, when it does.
+pub(crate) fn queue_ms(waits: &SlotWaits, server_queue_ms: Option<f64>) -> i64 {
+    waits.total().as_millis() as i64 + server_queue_ms.unwrap_or(0.0).round() as i64
 }
 
 /// What a decision's failure says the server no longer holds.
@@ -656,7 +667,7 @@ fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared) {
 
 /// Prepare the server for a decision on `spec_name` over `labels` and, when
 /// given, the house rules of the workspace `seat` works in, stopping at `deadline`. Every failure
-/// is a miss cause.
+/// is a miss cause. Slot waits are added to `waits`.
 pub(crate) async fn prepare_within(
     kernel: &crate::Kernel,
     council: &CouncilConfig,
@@ -664,37 +675,45 @@ pub(crate) async fn prepare_within(
     labels: &[String],
     seat: Option<ContextId>,
     deadline: tokio::time::Instant,
+    waits: &SlotWaits,
 ) -> Result<Prepared, String> {
-    let prepare = kernel.council_sync().prepare_labels(kernel, council, spec_name, labels, seat);
+    let prepare = kernel.council_sync().prepare_labels(kernel, council, spec_name, labels, seat, deadline, waits);
     match tokio::time::timeout_at(deadline, prepare).await {
-        Err(_) => Err(deadline_cause(council.deadline_ms, "prepare")),
+        Err(_) => Err(deadline_cause(council.deadline_ms, "prepare", waits)),
         Ok(Err(PrepareMiss(cause))) => Err(cause),
         Ok(Ok(prepared)) => Ok(prepared),
     }
 }
 
 /// Send `request` and wait for the answer until `deadline`, with the time
-/// left as the call's own timeout. A 404 or 409 forgets what the server no
-/// longer holds ([`to_resend`]). Every failure is a miss cause.
+/// left as the call's own timeout. The call takes a slot at the server's
+/// endpoint first, and a 429 is sent again after its cooldown
+/// (`llm::endpoint::mk_call`); slot waits are added to `waits`. A 404 or 409
+/// forgets what the server no longer holds ([`to_resend`]). Every failure is
+/// a miss cause.
 pub(crate) async fn ask_within(
     kernel: &crate::Kernel,
     prepared: &Prepared,
     request: &DecisionRequest,
     council: &CouncilConfig,
     deadline: tokio::time::Instant,
+    waits: &SlotWaits,
 ) -> Result<DecisionResponse, String> {
     let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
     let traceparent = (!traceparent.is_empty()).then_some(traceparent);
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let answer =
-        tokio::time::timeout_at(deadline, prepared.client.decide_traced(request, left, traceparent.as_deref())).await;
+    let decide = || {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        prepared.client.decide_traced(request, left, traceparent.as_deref())
+    };
+    let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::mk_call(&prepared.endpoint, deadline, waits, decide)).await;
     match answer {
-        Err(_) | Ok(Err(MkError::Timeout)) => Err(deadline_cause(council.deadline_ms, "the decision")),
-        Ok(Err(error)) => {
+        Err(_) | Ok(Ok((_, Err(MkError::Timeout)))) => Err(deadline_cause(council.deadline_ms, "the decision", waits)),
+        Ok(Err(no_slot)) => Err(no_slot_cause(council.deadline_ms, &no_slot)),
+        Ok(Ok((_, Err(error)))) => {
             forget_after(kernel, &error, prepared);
             Err(failure_cause(&error, council.deadline_ms))
         }
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok((_, Ok(response)))) => Ok(response),
     }
 }
 
@@ -1202,6 +1221,8 @@ enum Seen<'a> {
 struct Carried {
     chain: VoiceChain,
     state: Json,
+    /// The decision's slot waits at the council server's endpoint.
+    waits: SlotWaits,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1279,9 +1300,9 @@ fn build_verdict(
                 .flat_map(|s| s.control_text.iter())
                 .map(|hit| CouncilControlText { location: hit.r#where.clone(), token: hit.token.clone() })
                 .collect();
-            (reads, pooled_rows(response), control, response.queue_ms.unwrap_or(0.0).round() as i64)
+            (reads, pooled_rows(response), control, queue_ms(&carried.waits, response.queue_ms))
         }
-        Seen::Prepared(_) | Seen::Nothing => (Vec::new(), Vec::new(), Vec::new(), 0),
+        Seen::Prepared(_) | Seen::Nothing => (Vec::new(), Vec::new(), Vec::new(), queue_ms(&carried.waits, None)),
     };
     let threshold = classification.threshold.as_ref().map(|t| RecordedThreshold {
         allow_at: t.allow_at,
@@ -1484,14 +1505,14 @@ async fn decide_inner(
     let chain = match chain {
         Ok(chain) => chain,
         Err(cause) => {
-            let carried = Carried { chain: VoiceChain::default(), state };
+            let carried = Carried { chain: VoiceChain::default(), state, waits: SlotWaits::default() };
             return build_verdict(caller, &case, council, spec, Seen::Nothing, missed(cause), started.elapsed(), carried);
         }
     };
     let labels = chain.decision_labels(council, spec);
-    let carried = Carried { chain, state };
+    let carried = Carried { chain, state, waits: SlotWaits::default() };
     let seat = caller.context_id.filter(|_| council.house_rules);
-    let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline).await {
+    let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline, &carried.waits).await {
         Ok(prepared) => prepared,
         Err(cause) => {
             span.record("council.prepare_ms", started.elapsed().as_millis() as u64);
@@ -1514,7 +1535,7 @@ async fn decide_inner(
 
     let request = decision_request(&prepared, council, carried.state.clone());
     let asked = Instant::now();
-    let answer = ask_within(kernel, &prepared, &request, council, deadline).await;
+    let answer = ask_within(kernel, &prepared, &request, council, deadline, &carried.waits).await;
     let elapsed = asked.elapsed();
     span.record("council.ms", elapsed.as_millis() as u64);
     let response = match answer {
@@ -1532,9 +1553,7 @@ async fn decide_inner(
     if let Some(ms) = response.ms {
         span.record("council.server_ms", ms);
     }
-    if let Some(ms) = response.queue_ms {
-        span.record("council.queue_ms", ms);
-    }
+    span.record("council.queue_ms", queue_ms(&carried.waits, response.queue_ms));
     if let Some(v) = &classification.verdict {
         for (option, field) in [
             ("allow", "council.p_allow"),
@@ -2186,6 +2205,7 @@ mod tests {
             serde_json::from_str(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json")).unwrap();
         Prepared {
             client: kaijutsu_mk::MkClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
+            endpoint: crate::llm::endpoint::Endpoints::default().get("http://127.0.0.1:1"),
             identity,
             spec_id: kaijutsu_mk::council::canon::spec_id(&spec).unwrap(),
             spec,

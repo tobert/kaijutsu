@@ -211,6 +211,11 @@ pub struct BackendConfig {
     /// the kernel-wide `TimeoutPolicy::llm_idle_timeout`.
     pub idle_timeout_secs: Option<u64>,
 
+    /// The most requests in flight at this backend's endpoint (its base URL's
+    /// origin). Backends that share an endpoint take the smallest limit.
+    /// `None` is unlimited. See `llm::endpoint`.
+    pub max_concurrent: Option<u32>,
+
     /// Per-model metadata keyed by model id. Absent entries — and entries
     /// present with no `context_window` — both resolve to `None` via
     /// [`Self::context_window`], never a guessed default.
@@ -229,6 +234,7 @@ impl BackendConfig {
             key_optional: false,
             request_timeout_secs: None,
             idle_timeout_secs: None,
+            max_concurrent: None,
             models: HashMap::new(),
         }
     }
@@ -340,6 +346,16 @@ impl BackendConfig {
                 "backend '{}': --idle-timeout must be a positive number of seconds",
                 self.name
             ));
+        }
+        if self.max_concurrent == Some(0) {
+            return Err(format!(
+                "backend '{}': --max-concurrent must be at least 1; omit it for no limit",
+                self.name
+            ));
+        }
+        if self.base_url.is_some() {
+            crate::llm::endpoint::endpoint_key(&self.name, self.base_url.as_deref())
+                .map_err(|e| format!("backend '{}': --base-url {e}", self.name))?;
         }
         Ok(())
     }

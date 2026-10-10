@@ -46,6 +46,17 @@ impl Client {
         Self(self.0.with_request_timeout(timeout))
     }
 
+    /// Take a slot from `endpoint` before each request (see
+    /// `openai::Client::with_endpoint`).
+    pub fn with_endpoint(self, endpoint: std::sync::Arc<crate::llm::endpoint::Endpoint>) -> Self {
+        Self(self.0.with_endpoint(endpoint))
+    }
+
+    /// The endpoint this client takes slots from.
+    pub fn endpoint(&self) -> Option<&std::sync::Arc<crate::llm::endpoint::Endpoint>> {
+        self.0.endpoint()
+    }
+
     /// Tool-capable models surfaced by this provider.
     pub fn available_models(&self) -> Vec<&'static str> {
         vec!["deepseek-flash", "deepseek-v4-pro"]

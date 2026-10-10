@@ -156,6 +156,9 @@ pub struct Kernel {
     temp_cleanup: Option<std::sync::Arc<TempDirGuard>>,
     /// What the council server is believed to hold (`council/sync.rs`).
     council_sync: crate::council::sync::CouncilSync,
+    /// Each model endpoint's limit, in-flight slots, and cooldown, shared by
+    /// every provider and council call (`llm/endpoint.rs`).
+    endpoints: crate::llm::endpoint::Endpoints,
     /// Open in-app editor sessions (`vi`/`kj editor`). The registry is
     /// kernel-owned so any peer can drive it and the app renders it. Behind a
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
@@ -437,6 +440,7 @@ impl Kernel {
             beat_ingress: OnceLock::new(),
             temp_cleanup: None,
             council_sync: crate::council::sync::CouncilSync::default(),
+            endpoints: crate::llm::endpoint::Endpoints::default(),
             editor_sessions: parking_lot::Mutex::new(crate::editor::SendSessions(
                 crate::editor::EditorSessions::new(),
             )),
@@ -1479,6 +1483,12 @@ impl Kernel {
     /// There is exactly one instance for the kernel's lifetime.
     pub fn file_cache(&self) -> &Arc<crate::file_tools::FileDocumentCache> {
         &self.file_cache
+    }
+
+    /// Each model endpoint's limit, in-flight slots, and cooldown. Every
+    /// outbound model request takes a slot here first.
+    pub fn endpoints(&self) -> &crate::llm::endpoint::Endpoints {
+        &self.endpoints
     }
 
     /// What the council server is believed to hold for this kernel.

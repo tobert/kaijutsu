@@ -32,6 +32,7 @@ pub mod codex;
 pub mod config;
 pub mod db_config;
 pub mod deepseek;
+pub mod endpoint;
 pub(crate) mod hydrate;
 pub mod image_cache;
 pub mod mailbox;
@@ -820,7 +821,7 @@ pub(crate) const fn http_user_agent() -> &'static str {
 /// 10 minutes comfortably outlasts the 5-minute default above it while
 /// still bounding an indefinite hang, which is what an unset `reqwest`
 /// timeout would otherwise allow.
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// Resolve the per-request HTTP timeout for a backend: the configured
 /// `request_timeout_secs` when set, else [`DEFAULT_REQUEST_TIMEOUT_SECS`].
@@ -843,12 +844,21 @@ impl Provider {
     /// coexist. The backend NAME rides along on the OpenAI-compatible client
     /// (it labels the provider in wire logs), so a local server is finally
     /// nameable as itself.
-    pub fn from_backend(config: &BackendConfig) -> LlmResult<Self> {
+    ///
+    /// Each anthropic, deepseek, openai, and mk client takes a slot from its
+    /// endpoint in `endpoints` before each request (`llm::endpoint`).
+    pub fn from_backend(config: &BackendConfig, endpoints: &endpoint::Endpoints) -> LlmResult<Self> {
+        let endpoint = || {
+            endpoints.for_backend(config).map_err(|e| {
+                LlmError::InvalidRequest(format!("backend '{}' has no endpoint: {e}", config.name))
+            })
+        };
         match config.kind {
             BackendKind::Anthropic => {
                 let api_key = resolve_key_or_placeholder(config, "Anthropic")?;
                 let mut client = claude::Client::new(api_key)
-                    .with_request_timeout(resolve_request_timeout(config));
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?);
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
@@ -857,7 +867,8 @@ impl Provider {
             BackendKind::DeepSeek => {
                 let api_key = resolve_key_or_placeholder(config, "DeepSeek")?;
                 let mut client = deepseek::Client::new(api_key)
-                    .with_request_timeout(resolve_request_timeout(config));
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?);
                 // DeepSeek's endpoint is fixed; a base_url on this kind is
                 // accepted and honored rather than silently discarded, but the
                 // `kj backend set` help says not to bother.
@@ -871,7 +882,8 @@ impl Provider {
             // not an error here.
             BackendKind::OpenAi => {
                 let mut client = openai::Client::new(config.name.clone())
-                    .with_request_timeout(resolve_request_timeout(config));
+                    .with_request_timeout(resolve_request_timeout(config))
+                    .with_endpoint(endpoint()?);
                 if let Some(ref url) = config.base_url {
                     client = client.with_base_url(url);
                 }
@@ -913,12 +925,10 @@ impl Provider {
                     .iter()
                     .filter_map(|(model, info)| info.context_window.map(|w| (model.clone(), w)))
                     .collect();
-                Ok(Self::Mk(mk::Client::new(
-                    config.name.clone(),
-                    base_url,
-                    resolve_request_timeout(config),
-                    windows,
-                )?))
+                Ok(Self::Mk(
+                    mk::Client::new(config.name.clone(), base_url, resolve_request_timeout(config), windows)?
+                        .with_endpoint(endpoint()?),
+                ))
             }
             #[cfg(any(test, feature = "test-mock"))]
             BackendKind::Mock => {
@@ -940,20 +950,6 @@ impl Provider {
         }
     }
 
-    /// Create a Claude provider from `ANTHROPIC_API_KEY`.
-    pub fn anthropic_from_env() -> LlmResult<Self> {
-        let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
-            .with_api_key_env("ANTHROPIC_API_KEY");
-        Self::from_backend(&config)
-    }
-
-    /// Create a DeepSeek provider from `DEEPSEEK_API_KEY`.
-    pub fn deepseek_from_env() -> LlmResult<Self> {
-        let config = BackendConfig::new("deepseek", BackendKind::DeepSeek)
-            .with_api_key_env("DEEPSEEK_API_KEY");
-        Self::from_backend(&config)
-    }
-
     /// Stable identifier for the *kind* of wire this client speaks.
     ///
     /// NOT the backend name — an `OpenAi` client borrows its config-supplied
@@ -972,6 +968,21 @@ impl Provider {
         }
     }
 
+    /// The endpoint this provider takes a slot from before each request.
+    /// `None` for codex-app, which reaches a daemon rather than a model
+    /// endpoint, and for a client built without one.
+    pub fn endpoint(&self) -> Option<&Arc<endpoint::Endpoint>> {
+        match self {
+            Self::Claude(c) => c.endpoint(),
+            Self::DeepSeek(c) => c.endpoint(),
+            Self::OpenAi(c) => c.endpoint(),
+            Self::Mk(c) => c.endpoint(),
+            Self::CodexApp(_) => None,
+            #[cfg(any(test, feature = "test-mock"))]
+            Self::Mock(_) => None,
+        }
+    }
+
     /// One-shot prompt — sends a single user message.
     #[tracing::instrument(skip(self, prompt), fields(llm.model = %model, llm.provider = self.name()))]
     pub async fn prompt(&self, model: &str, prompt: &str) -> LlmResult<String> {
@@ -982,7 +993,10 @@ impl Provider {
     ///
     /// Claude / DeepSeek / OpenAi hit their provider; Mock returns its
     /// canned response (used by `KjDispatcher::summarize` in tests).
-    #[tracing::instrument(skip(self, system, prompt), fields(llm.model = %model, llm.provider = self.name()))]
+    #[tracing::instrument(
+        skip(self, system, prompt),
+        fields(llm.model = %model, llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
+    )]
     pub async fn prompt_with_system(
         &self,
         model: &str,
@@ -1015,7 +1029,10 @@ impl Provider {
     ///
     /// Refuses invalid tool pairing before dispatch, including history
     /// appended during a live turn after the hydration snapshot.
-    #[tracing::instrument(skip(self, opts, messages), fields(llm.provider = self.name()))]
+    #[tracing::instrument(
+        skip(self, opts, messages),
+        fields(llm.provider = self.name(), llm.slot_wait_ms = tracing::field::Empty)
+    )]
     pub async fn stream(
         &self,
         opts: BuildOpts,
@@ -1897,7 +1914,7 @@ mod tests {
             std::env::remove_var("KJ_MOCK_SCRIPT_DIR");
         }
         let config = config::BackendConfig::new("mock", config::BackendKind::Mock);
-        let provider = Provider::from_backend(&config).expect("build mock provider");
+        let provider = Provider::from_backend(&config, &endpoint::Endpoints::default()).expect("build mock provider");
         let mut stream = provider
             .stream(BuildOpts::new("mock-model"), vec![Message::user("go")])
             .await
@@ -1998,7 +2015,7 @@ mod tests {
     fn from_backend_missing_key_is_an_auth_error_mentioning_key() {
         let config = BackendConfig::new("anthropic", BackendKind::Anthropic)
             .with_api_key_env("KAIJUTSU_TEST_DEFINITELY_UNSET_XYZ");
-        let err = Provider::from_backend(&config).unwrap_err();
+        let err = Provider::from_backend(&config, &endpoint::Endpoints::default()).unwrap_err();
         assert!(matches!(err, LlmError::AuthError(_)), "got {err:?}");
         assert!(
             err.to_string().to_lowercase().contains("key"),
@@ -2034,7 +2051,7 @@ mod tests {
         let config = BackendConfig::new("ollama", BackendKind::OpenAi)
             .with_base_url("http://localhost:11434/v1")
             .with_key_optional(true);
-        assert!(Provider::from_backend(&config).is_ok());
+        assert!(Provider::from_backend(&config, &endpoint::Endpoints::default()).is_ok());
     }
 
     /// The name/kind split in one assertion: two differently-NAMED backends
@@ -2048,8 +2065,8 @@ mod tests {
         let zorak = BackendConfig::new("zorak", BackendKind::OpenAi)
             .with_base_url("http://zorak:8080/v1")
             .with_key_optional(true);
-        assert_eq!(Provider::from_backend(&gpt).unwrap().name(), "gpt");
-        assert_eq!(Provider::from_backend(&zorak).unwrap().name(), "zorak");
+        assert_eq!(Provider::from_backend(&gpt, &endpoint::Endpoints::default()).unwrap().name(), "gpt");
+        assert_eq!(Provider::from_backend(&zorak, &endpoint::Endpoints::default()).unwrap().name(), "zorak");
     }
 
     #[test]

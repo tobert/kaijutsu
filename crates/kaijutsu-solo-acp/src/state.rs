@@ -268,6 +268,7 @@ pub fn prepare_rows(
             key_optional: choice.key_optional,
             request_timeout_secs: choice.request_timeout_secs.map(|s| s as i64),
             idle_timeout_secs: choice.idle_timeout_secs.map(|s| s as i64),
+            max_concurrent: None,
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: PrincipalId::system(),
         };

@@ -237,8 +237,10 @@ async fn serve() -> Mock {
                     _ => Reply { status: 500, body: "unexpected".into(), delay: Duration::ZERO },
                 };
                 tokio::time::sleep(reply.delay).await;
+                // The megakernel answers a 429 with `Retry-After: 1` (`docs/mk-admission.md`).
+                let retry_after = if reply.status == 429 { "retry-after: 1\r\n" } else { "" };
                 let out = format!(
-                    "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{retry_after}connection: close\r\n\r\n{}",
                     reply.status,
                     reply.body.len(),
                     reply.body
@@ -829,6 +831,77 @@ async fn a_council_report_asks_and_emits_the_report_event() {
     }
 }
 
+/// Limits the council server's endpoint to one request in flight, as `kj
+/// backend set` does for an mk backend at the same address.
+async fn limit_council_to_one(rig: &Rig) {
+    let argv: Vec<String> = ["backend", "set", "council-mk", "--kind", "mk", "--base-url", rig.mock.base.as_str(), "--max-concurrent", "1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let caller = crate::kj::test_helpers::caller_with_context(rig.ctx.context_id);
+    let result = rig.d.dispatch(&argv, &caller).await;
+    assert!(result.is_ok(), "kj backend set: {result:?}");
+}
+
+/// A decision that cannot get a slot at the council server's endpoint
+/// within its deadline is a miss whose cause names the wait, and its
+/// `queue_ms` is the time it waited. Nothing reaches the server.
+///
+/// Falsified by a decision that ignores the endpoint's limit (the mock
+/// answers allow), or one that records `queue_ms` as 0.
+#[tokio::test]
+async fn a_decision_that_cannot_get_a_slot_is_a_miss_naming_the_wait() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        limit_council_to_one(&rig).await;
+        let endpoint = rig.d.kernel().endpoints().for_url(&rig.mock.base).unwrap();
+        assert_eq!(endpoint.status().limit, Some(1));
+        let held = endpoint.acquire(tokio::time::Instant::now()).await.unwrap();
+        assert_pending(via, rig.submit("touch notes.txt").await);
+        drop(held);
+        let decision = the_decision(&rig, &rig.only_ask());
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Miss, "{via:?}");
+        let cause = decision.decision.miss_cause.clone().unwrap();
+        assert!(cause.contains("for a slot at http://127.0.0.1:"), "{via:?}: {cause}");
+        assert!(cause.contains("700 ms deadline"), "{via:?}: {cause}");
+        let queued = decision.decision.queue_ms;
+        assert!((600..=800).contains(&queued), "{via:?}: queue_ms {queued}");
+        assert_eq!(rig.mock.calls.lock().unwrap().len(), 0, "{via:?}: nothing reaches the server");
+        rig.finish().await;
+    }
+}
+
+/// The council server refuses a request past its limit with 429 before any
+/// work starts (`docs/mk-admission.md`), so the gate sends the same
+/// decision again after `Retry-After`, within its deadline, and records the
+/// wait as `queue_ms`.
+///
+/// Falsified by a 429 that is a miss, or a resend before the cooldown ends.
+#[tokio::test]
+async fn a_busy_council_answer_is_sent_again_after_its_retry_after() {
+    for via in BOTH {
+        let rig = rig(via, Setup { deadline_ms: 3000, ..Setup::default() }).await;
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = sent.clone();
+        rig.mock.set(move |req| {
+            if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let busy = r#"{"error": {"code": 429, "message": "16 requests in progress", "type": "busy"}}"#;
+                Reply { status: 429, body: busy.into(), delay: Duration::ZERO }
+            } else {
+                Reply::ok(answer(req, &ALLOW))
+            }
+        });
+        assert!(rig.submit_gate("touch notes.txt").await.is_ok(), "{via:?}: the resent decision allows");
+        assert_eq!(rig.mock.decisions().len(), 2, "{via:?}");
+        let decisions = rig.decisions();
+        assert_eq!(decisions.len(), 1, "{via:?}");
+        assert_eq!(decisions[0].decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        let queued = decisions[0].decision.queue_ms;
+        assert!(queued >= 900, "{via:?}: queue_ms {queued}");
+        rig.finish().await;
+    }
+}
+
 fn dead_server() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -910,7 +983,8 @@ async fn a_retry_of_a_held_or_open_ask_is_never_council_allowed() {
     for via in BOTH {
         // Answered and held: the approval worker owns the run.
         let rig = rig(via, Setup::default()).await;
-        rig.mock.set(|_| Reply { status: 503, body: "{}".into(), delay: Duration::ZERO });
+        // A 500 misses without cooling the endpoint, so a later decision reaches the server.
+        rig.mock.set(|_| Reply { status: 500, body: "{}".into(), delay: Duration::ZERO });
         assert_pending(via, rig.submit("touch held.txt").await);
         rig.answer_pending(true);
         rig.mock.answers(&ALLOW);
@@ -931,7 +1005,8 @@ async fn a_retry_of_a_held_or_open_ask_is_never_council_allowed() {
 
         // Open: the first ask is unanswered, and answering it later runs it.
         let rig = self::rig(via, Setup::default()).await;
-        rig.mock.set(|_| Reply { status: 503, body: "{}".into(), delay: Duration::ZERO });
+        // A 500 misses without cooling the endpoint, so a later decision reaches the server.
+        rig.mock.set(|_| Reply { status: 500, body: "{}".into(), delay: Duration::ZERO });
         assert_pending(via, rig.submit("touch open.txt").await);
         rig.mock.answers(&ALLOW);
         assert_pending(via, rig.submit("touch open.txt").await);
@@ -954,7 +1029,8 @@ async fn a_retry_while_the_approval_worker_runs_the_command_is_never_council_all
     for via in BOTH {
         let rig = rig(via, Setup::default()).await;
         rig.d.kernel().start_approval_delivery().unwrap();
-        rig.mock.set(|_| Reply { status: 503, body: "{}".into(), delay: Duration::ZERO });
+        // A 500 misses without cooling the endpoint, so a later decision reaches the server.
+        rig.mock.set(|_| Reply { status: 500, body: "{}".into(), delay: Duration::ZERO });
         let command = "sleep 2";
         assert_pending(via, rig.submit(command).await);
         let request = rig.only_ask().request_id;
@@ -1027,7 +1103,8 @@ async fn an_identical_ask_collected_during_the_decision_holds_the_council_allow(
         let allowed = rig.submit(command);
         let race = async {
             reached.await.expect("the first decision reaches the council");
-            rig.mock.set(|_| Reply { status: 503, body: "{}".into(), delay: Duration::ZERO });
+            // A 500 misses without cooling the endpoint, so a later decision reaches the server.
+            rig.mock.set(|_| Reply { status: 500, body: "{}".into(), delay: Duration::ZERO });
             assert_pending(via, rig.submit(command).await);
             let collected = rig.only_ask().request_id;
             rig.answer_pending(true);
@@ -2724,6 +2801,7 @@ fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>
             key_optional: true,
             request_timeout_secs: None,
             idle_timeout_secs: None,
+            max_concurrent: None,
             created_at: 0,
             created_by: PrincipalId::system(),
         })

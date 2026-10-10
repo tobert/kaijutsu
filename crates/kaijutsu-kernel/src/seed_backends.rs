@@ -290,6 +290,7 @@ fn insert_factory_backend(
         key_optional: fb.key_optional,
         request_timeout_secs: None,
         idle_timeout_secs: None,
+        max_concurrent: None,
         created_at: kaijutsu_types::now_millis() as i64,
         created_by,
     })
@@ -476,6 +477,7 @@ mod tests {
             key_optional: true,
             request_timeout_secs: Some(600),
             idle_timeout_secs: None,
+            max_concurrent: None,
             created_at: 0,
             created_by: who,
         })

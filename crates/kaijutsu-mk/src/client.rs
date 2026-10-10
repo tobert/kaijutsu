@@ -88,6 +88,15 @@ impl MkError {
             _ => None,
         }
     }
+
+    /// The `Retry-After` header of an error status, when it held whole
+    /// seconds.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            MkError::Status { retry_after, .. } | MkError::Service { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 impl From<InvalidRequest> for MkError {
@@ -289,4 +298,67 @@ fn header_value(name: &str, value: &str) -> Result<HeaderValue, MkError> {
 
 pub(crate) fn to_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, MkError> {
     serde_json::to_vec(value).map_err(|e| MkError::Request(format!("request does not serialize: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// The service answers an error with `Connection: close` and expects the
+    /// next request on a new connection (`docs/mk-admission.md`). This server
+    /// leaves each socket open after its answer and counts the requests each
+    /// connection carries.
+    ///
+    /// Falsified by a client that keeps the connection alive past the header:
+    /// the second call arrives on the first connection.
+    #[tokio::test]
+    async fn a_busy_answer_with_connection_close_sends_the_next_request_on_a_new_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let per_connection: Arc<std::sync::Mutex<Vec<Arc<AtomicUsize>>>> = Arc::default();
+        let counts = per_connection.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let requests = Arc::new(AtomicUsize::new(0));
+                counts.lock().unwrap().push(requests.clone());
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let mut seen = Vec::new();
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                        while let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                            seen.drain(..i + 4);
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            let body = r#"{"error": {"code": 429, "message": "busy", "type": "busy"}}"#;
+                            let out = format!(
+                                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 1\r\n\
+                                 connection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(out.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        let client = MkClient::new(&base, Duration::from_secs(5)).unwrap();
+        for _ in 0..2 {
+            let error = client.model().await.unwrap_err();
+            assert_eq!(error.status(), Some(429));
+            assert_eq!(error.retry_after(), Some(Duration::from_secs(1)));
+        }
+        let counts: Vec<usize> = per_connection.lock().unwrap().iter().map(|c| c.load(Ordering::SeqCst)).collect();
+        assert_eq!(counts, vec![1, 1], "each request on its own connection");
+    }
 }

@@ -24,10 +24,18 @@ use kaijutsu_mk::model::RenderRequest;
 use kaijutsu_mk::{MkClient, MkError};
 use tokio_util::sync::CancellationToken;
 
+use crate::llm::endpoint::{Endpoint, Slot, SlotWaits};
 use crate::llm::stream::{BuildOpts, StreamEvent};
 use crate::llm::{LlmError, LlmResult, Message};
 
 use reply::{Reply, Timing};
+
+/// The deadline of one prompt or turn, which bounds every slot wait in it,
+/// and the waits so far.
+struct Turn {
+    deadline: tokio::time::Instant,
+    waits: SlotWaits,
+}
 
 /// The output limit asked for by [`Client::prompt`], which has no tunables:
 /// the service's own default.
@@ -44,6 +52,10 @@ pub struct Client {
     windows: HashMap<String, u64>,
     /// The service's `max_context`, read on first use.
     max_context: Arc<tokio::sync::OnceCell<u64>>,
+    /// The endpoint each prompt or turn takes one slot from, held from the
+    /// render through the reply. `None` only for a client built directly
+    /// rather than by `Provider::from_backend`.
+    endpoint: Option<Arc<Endpoint>>,
 }
 
 impl Client {
@@ -51,7 +63,45 @@ impl Client {
     pub fn new(name: impl Into<String>, base_url: &str, timeout: Duration, windows: HashMap<String, u64>) -> LlmResult<Self> {
         let name = name.into();
         let mk = MkClient::new(base_url, timeout).map_err(|e| to_llm(&name, e))?;
-        Ok(Client { name, mk, timeout, windows, max_context: Arc::default() })
+        Ok(Client { name, mk, timeout, windows, max_context: Arc::default(), endpoint: None })
+    }
+
+    /// Take a slot from `endpoint` for each call to the service.
+    pub fn with_endpoint(mut self, endpoint: Arc<Endpoint>) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// The endpoint this client takes slots from.
+    pub fn endpoint(&self) -> Option<&Arc<Endpoint>> {
+        self.endpoint.as_ref()
+    }
+
+    /// One call to the service through this client's endpoint
+    /// ([`crate::llm::endpoint::mk_call`]): a slot first, and the same call
+    /// again after the cooldown when the service answers 429, all within
+    /// `turn`'s deadline. Returns the slot, which a stream holds until it
+    /// ends. With no endpoint, the call goes straight out.
+    async fn call<T, F, Fut>(&self, turn: &Turn, call: F) -> LlmResult<(Option<Slot>, T)>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, MkError>>,
+    {
+        let Some(endpoint) = &self.endpoint else {
+            let mut call = call;
+            return call().await.map(|v| (None, v)).map_err(|e| to_llm(&self.name, e));
+        };
+        let answered = crate::llm::endpoint::mk_call(endpoint, turn.deadline, &turn.waits, call).await;
+        tracing::Span::current().record("llm.slot_wait_ms", turn.waits.total().as_millis() as u64);
+        match answered {
+            Ok((slot, result)) => result.map(|v| (Some(slot), v)).map_err(|e| to_llm(&self.name, e)),
+            Err(no_slot) => Err(LlmError::RateLimited(format!("mk backend '{}': {no_slot}", self.name))),
+        }
+    }
+
+    /// The deadline and slot waits of one prompt or turn.
+    fn turn(&self) -> Turn {
+        Turn { deadline: tokio::time::Instant::now() + self.timeout, waits: SlotWaits::default() }
     }
 
     pub fn provider_name(&self) -> &str {
@@ -67,13 +117,14 @@ impl Client {
         }
         messages.push(MkMessage::user(prompt));
         let thinking = Some(false);
-        let max_tokens = self.admit_messages(model, &messages, &[], thinking, None, PROMPT_MAX_TOKENS).await?;
+        let turn = self.turn();
+        let max_tokens = self.admit_messages(&turn, model, &messages, &[], thinking, None, PROMPT_MAX_TOKENS).await?;
         let request = GenerateRequest {
             thinking,
             max_tokens: Some(max_tokens),
             ..GenerateRequest::messages(messages, Vec::new())
         };
-        let done = self.mk.generate(&request, self.timeout).await.map_err(|e| to_llm(&self.name, e))?;
+        let (_slot, done) = self.call(&turn, || self.mk.generate(&request, self.timeout)).await?;
         match done.finish {
             Finish::Stop => Ok(done.content),
             Finish::Length => Err(LlmError::ApiError(format!(
@@ -93,8 +144,9 @@ impl Client {
         let (thinking, reasoning_effort) = build::effort(opts.effort.as_deref())?;
         let messages = build::messages(opts.system.as_deref(), &history)?;
         let tools = build::tools(&opts.tools)?;
+        let turn = self.turn();
         let max_tokens = self
-            .admit_messages(&opts.model, &messages, &tools, thinking, reasoning_effort, opts.max_tokens)
+            .admit_messages(&turn, &opts.model, &messages, &tools, thinking, reasoning_effort, opts.max_tokens)
             .await?;
         let sample = (opts.temperature.is_some() || opts.top_p.is_some())
             .then(|| Sample { temperature: opts.temperature, top_p: opts.top_p, ..Sample::default() });
@@ -108,7 +160,7 @@ impl Client {
             max_tokens: Some(max_tokens),
         };
         let started = Instant::now();
-        let inner = self.mk.generate_stream(&request, self.timeout).await.map_err(|e| to_llm(&self.name, e))?;
+        let (slot, inner) = self.call(&turn, || self.mk.generate_stream(&request, self.timeout)).await?;
         Ok(Stream {
             name: self.name.clone(),
             inner: Some(inner),
@@ -118,12 +170,15 @@ impl Client {
             finished: false,
             started,
             first_token: None,
+            slot,
         })
     }
 
     /// Renders the request and returns the `max_tokens` it may send.
+    #[allow(clippy::too_many_arguments)]
     async fn admit_messages(
         &self,
+        turn: &Turn,
         model: &str,
         messages: &[MkMessage],
         tools: &[kaijutsu_mk::generate::Tool],
@@ -131,7 +186,7 @@ impl Client {
         reasoning_effort: Option<kaijutsu_mk::generate::ReasoningEffort>,
         asked: u64,
     ) -> LlmResult<u32> {
-        let window = self.window(model).await?;
+        let window = self.window(turn, model).await?;
         let render = RenderRequest {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
@@ -139,19 +194,21 @@ impl Client {
             reasoning_effort,
             generation_prompt: None,
         };
-        let rendered = self.mk.render(&render, self.timeout).await.map_err(|e| to_llm(&self.name, e))?;
+        let (_slot, rendered) = self.call(turn, || self.mk.render(&render, self.timeout)).await?;
         admit(&self.name, u64::from(rendered.n_tokens), window, asked)
     }
 
     /// The window for `model`: the service's `max_context`, or the model
     /// row's `context_window` when that is smaller. A row larger than the
     /// service is a configuration error.
-    async fn window(&self, model: &str) -> LlmResult<u64> {
+    async fn window(&self, turn: &Turn, model: &str) -> LlmResult<u64> {
         let max_context = *self
             .max_context
-            .get_or_try_init(|| async { self.mk.model().await.map(|m| u64::from(m.max_context)) })
-            .await
-            .map_err(|e| to_llm(&self.name, e))?;
+            .get_or_try_init(|| async {
+                let (_slot, model) = self.call(turn, || self.mk.model()).await?;
+                Ok::<_, LlmError>(u64::from(model.max_context))
+            })
+            .await?;
         match self.windows.get(model) {
             Some(&row) if row > max_context => Err(LlmError::InvalidRequest(format!(
                 "mk backend '{}': model {model:?} has context_window {row}, but the service holds at most \
@@ -217,11 +274,16 @@ pub struct Stream {
     finished: bool,
     started: Instant,
     first_token: Option<Duration>,
+    /// Released once the stream finishes.
+    slot: Option<Slot>,
 }
 
 impl Stream {
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {
+            if self.finished {
+                self.slot = None;
+            }
             if let Some(ev) = self.pending.pop_front() {
                 return Some(ev);
             }
@@ -516,5 +578,83 @@ mod tests {
         let messages = build::messages(None, &history).unwrap();
         let sent = serde_json::to_string(&messages[1].tool_calls[0].arguments).unwrap();
         assert_eq!(sent, r#"{"path":"/tmp","all":true}"#);
+    }
+
+    /// A client whose calls take slots at a fresh endpoint for `base`.
+    fn limited(base: &str, timeout: Duration) -> (Client, Arc<Endpoint>) {
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(base).unwrap();
+        let c = Client::new("zorak-mk", base, timeout, HashMap::new()).unwrap().with_endpoint(endpoint.clone());
+        (c, endpoint)
+    }
+
+    fn busy() -> kaijutsu_mk::test_server::Reply {
+        let mut r = http(429, json!({"error": {"code": 429, "message": "16 requests in progress", "type": "busy"}}).to_string());
+        r.headers.push(("retry-after", "1".into()));
+        r
+    }
+
+    /// A streamed turn holds its slot until the stream ends.
+    ///
+    /// Falsified by a stream that drops its slot when it opens, or keeps it
+    /// after its last event.
+    #[tokio::test]
+    async fn a_turn_holds_its_slot_until_its_stream_ends() {
+        let (base, _) = serve(vec![http(200, MODEL), rendered(30), sse(ANSWER)]).await;
+        let (c, endpoint) = limited(&base, Duration::from_secs(5));
+        let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        assert_eq!(endpoint.status().in_flight, 1);
+        drain(&mut stream).await;
+        assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// The service refuses a 429 before any work starts
+    /// (`docs/mk-admission.md`), so the turn sends the same call again after
+    /// `Retry-After`.
+    ///
+    /// Falsified by a 429 that fails the turn, or a resend that ignores the
+    /// cooldown.
+    #[tokio::test]
+    async fn a_busy_answer_is_sent_again_after_its_retry_after() {
+        let (base, seen) = serve(vec![http(200, MODEL), busy(), rendered(30), sse(ANSWER)]).await;
+        let (c, endpoint) = limited(&base, Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1), "resent after {:?}", started.elapsed());
+        let events = drain(&mut stream).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, ["/mk/v1/model", "/mk/v1/render", "/mk/v1/render", "/mk/v1/generate"]);
+        assert_eq!(endpoint.status().cooldown, None);
+    }
+
+    /// A 503 cools the endpoint and fails the turn; it is not sent again.
+    #[tokio::test]
+    async fn a_503_cools_the_endpoint_and_is_not_sent_again() {
+        let (base, seen) = serve(vec![http(200, MODEL), rendered(30), http(503, "{}")]).await;
+        let (c, endpoint) = limited(&base, Duration::from_secs(5));
+        let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let (left, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 503);
+        assert!(left > Duration::from_secs(4), "{left:?}");
+    }
+
+    /// A turn that cannot get a slot within its timeout fails `RateLimited`,
+    /// naming the wait, and sends nothing.
+    #[tokio::test]
+    async fn a_turn_with_no_slot_in_its_timeout_is_rate_limited() {
+        let (base, seen) = serve(vec![]).await;
+        let (c, endpoint) = limited(&base, Duration::from_millis(300));
+        endpoint.acquire(tokio::time::Instant::now()).await.unwrap().answered_with(429, Some(Duration::from_secs(5)));
+        let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        match err {
+            LlmError::RateLimited(why) => {
+                assert!(why.starts_with("mk backend 'zorak-mk': no slot at http://127.0.0.1:"), "{why}");
+                assert!(why.contains("cooling down"), "{why}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

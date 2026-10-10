@@ -23,13 +23,15 @@ pub mod stream;
 pub mod types;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::llm::endpoint::{Endpoint, Slot};
 use crate::llm::stream::{BuildOpts, StreamEvent};
-use crate::llm::{LlmError, LlmResult, Message, http_user_agent};
+use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
 use self::sse::{OpenAiSseEvent, decode_event};
 use self::stream::StateMachine;
@@ -60,6 +62,10 @@ pub struct Client {
     /// via `RequestBuilder::timeout` at each `.send()`, layered below
     /// kaijutsu-server's own total-deadline + idle-timeout.
     request_timeout: Option<std::time::Duration>,
+    /// The endpoint each `/chat/completions` request takes a slot from.
+    /// `None` only for a client built directly rather than by
+    /// `Provider::from_backend`.
+    endpoint: Option<Arc<Endpoint>>,
 }
 
 /// Whether `base_url` points at OpenAI's own hosted API — the ONE
@@ -99,7 +105,25 @@ impl Client {
             provider_name: provider_name.into(),
             reasoning_required: false,
             request_timeout: None,
+            endpoint: None,
         }
+    }
+
+    /// Take a slot from `endpoint` before each `/chat/completions` request.
+    pub fn with_endpoint(mut self, endpoint: Arc<Endpoint>) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// The endpoint this client takes slots from.
+    pub fn endpoint(&self) -> Option<&Arc<Endpoint>> {
+        self.endpoint.as_ref()
+    }
+
+    /// How long a request waits for a slot: its own request timeout.
+    fn slot_wait(&self) -> std::time::Duration {
+        self.request_timeout
+            .unwrap_or(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
     }
 
     /// Set the per-request HTTP timeout (`Provider::from_backend` calls this
@@ -175,6 +199,7 @@ impl Client {
             &self.provider_name,
         );
 
+        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -183,6 +208,7 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
+        crate::llm::endpoint::observe(slot.as_ref(), &response);
 
         let response = self.error_for_status(response).await?;
 
@@ -212,6 +238,7 @@ impl Client {
             &self.provider_name,
         );
 
+        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -221,10 +248,11 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
+        crate::llm::endpoint::observe(slot.as_ref(), &response);
 
         let response = self.error_for_status(response).await?;
 
-        Ok(Stream::from_response(response))
+        Ok(Stream::from_response(response, slot))
     }
 
     /// Map an OpenAI-compatible 4xx/5xx response body into [`LlmError`].
@@ -291,10 +319,12 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
+    /// Released once the stream finishes.
+    slot: Option<Slot>,
 }
 
 impl Stream {
-    fn from_response(response: reqwest::Response) -> Self {
+    fn from_response(response: reqwest::Response, slot: Option<Slot>) -> Self {
         use eventsource_stream::Eventsource;
         let bytes: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>> =
             response.bytes_stream().boxed();
@@ -304,6 +334,7 @@ impl Stream {
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
+            slot,
         }
     }
 
@@ -324,12 +355,16 @@ impl Stream {
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
+            slot: None,
         }
     }
 
     /// Poll for the next event. Returns `None` once exhausted.
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {
+            if self.finished {
+                self.slot = None;
+            }
             if let Some(ev) = self.pending.pop_front() {
                 return Some(ev);
             }
@@ -651,5 +686,44 @@ data: [DONE]
         assert!(!text.is_empty(), "live response must include some answer text");
         assert!(saw_done, "live response must terminate with Done");
         assert!(input_tokens > 0, "usage must be captured from trailing chunk");
+    }
+
+    fn limited(base: &str) -> (Client, Arc<Endpoint>) {
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(base).unwrap();
+        let client = Client::new("local").with_base_url(base).with_endpoint(endpoint.clone());
+        (client, endpoint)
+    }
+
+    /// A streamed reply holds its slot until the stream finishes.
+    #[tokio::test]
+    async fn a_stream_holds_its_slot_until_it_finishes() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, _) = serve(vec![sse(SIMPLE)]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        assert_eq!(endpoint.status().in_flight, 1);
+        while let Some(ev) = stream.next_event().await {
+            if matches!(ev, StreamEvent::Done { .. }) {
+                assert_eq!(endpoint.status().in_flight, 0, "released by the time Done arrives");
+            }
+        }
+        assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A 429 cools the endpoint for its `Retry-After` and fails as
+    /// `RateLimited`.
+    #[tokio::test]
+    async fn a_429_cools_the_endpoint_for_its_retry_after() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let mut busy = reply(429, r#"{"error": {"message": "slow down", "type": "rate_limit"}}"#);
+        busy.headers.push(("retry-after", "3".into()));
+        let (base, _) = serve(vec![busy]).await;
+        let (client, endpoint) = limited(&base);
+        let err = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
+        let (left, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 429);
+        assert!(left > std::time::Duration::from_secs(2) && left <= std::time::Duration::from_secs(3), "{left:?}");
+        assert_eq!(endpoint.status().in_flight, 0);
     }
 }

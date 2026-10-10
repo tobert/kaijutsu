@@ -1014,7 +1014,7 @@ async fn initialize_kernel_models(
 ) -> Option<kaijutsu_kernel::EmbeddingModelConfig> {
     let (registry, embedding) = {
         let db = kernel_db.lock();
-        let registry = match kaijutsu_kernel::build_llm_registry(&db) {
+        let registry = match kaijutsu_kernel::build_llm_registry(&db, kernel.endpoints()) {
             Ok(r) => r,
             Err(e) => {
                 log::error!(
@@ -4972,7 +4972,12 @@ impl kernel::Server for KernelImpl {
                 // name alone no longer implies a kind, so there is nothing
                 // sensible to construct from a bare string, and inventing one
                 // here would let a typo persist onto a context row.
-                let known = kaijutsu_kernel::build_llm_registry(&shared_kernel.kernel_db.lock())
+                // A registry built only to look the name up; its clients
+                // never send, so they need not share the kernel's endpoints.
+                let known = kaijutsu_kernel::build_llm_registry(
+                    &shared_kernel.kernel_db.lock(),
+                    &kaijutsu_kernel::llm::endpoint::Endpoints::default(),
+                )
                     .map(|r| r.backend_config(&provider_name).is_some())
                     .unwrap_or(false);
                 match known {
@@ -5174,7 +5179,7 @@ impl kernel::Server for KernelImpl {
                         results.get().set_error(format!("{e}"));
                         return Ok(());
                     }
-                    kaijutsu_kernel::build_llm_registry(&db)
+                    kaijutsu_kernel::build_llm_registry(&db, kernel_arc.endpoints())
                 };
                 match rebuilt {
                     Ok(reg) => {
@@ -5240,7 +5245,7 @@ impl kernel::Server for KernelImpl {
                         results.get().set_error(format!("{e}"));
                         return Ok(());
                     }
-                    kaijutsu_kernel::build_llm_registry(&db)
+                    kaijutsu_kernel::build_llm_registry(&db, kernel_arc.endpoints())
                 };
                 match rebuilt {
                     Ok(reg) => {

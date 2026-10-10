@@ -41,7 +41,8 @@ enum BackendCommand {
     /// List configured backends.
     #[command(alias = "ls")]
     List,
-    /// Show one backend, its models, and its resolved key source.
+    /// Show one backend: its key source, its endpoint's limit, in-flight
+    /// count, and cooldown, and its models.
     Show {
         /// Backend name
         name: String,
@@ -83,6 +84,13 @@ enum BackendCommand {
         /// box whose prefill takes minutes.
         #[arg(long = "idle-timeout")]
         idle_timeout: Option<u64>,
+        /// The most requests in flight at this backend's endpoint (scheme,
+        /// host, and port of --base-url; a backend with no --base-url is its
+        /// own endpoint). A request past the limit waits for a slot until its
+        /// own deadline. Backends at one endpoint use the smallest limit.
+        /// Unset is unlimited.
+        #[arg(long = "max-concurrent")]
+        max_concurrent: Option<u32>,
     },
     /// Remove a backend. Refused while a cast slot or alias still points at it.
     #[command(alias = "rm")]
@@ -294,6 +302,7 @@ impl KjDispatcher {
                 key_optional,
                 request_timeout,
                 idle_timeout,
+                max_concurrent,
             } => {
                 newly_set_backend = Some(name.clone());
                 self.backend_set(
@@ -305,6 +314,7 @@ impl KjDispatcher {
                     key_optional,
                     request_timeout,
                     idle_timeout,
+                    max_concurrent,
                     caller,
                 )
             }
@@ -450,6 +460,20 @@ impl KjDispatcher {
         if let Some(t) = backend.idle_timeout_secs {
             lines.push(format!("Idle timeout: {t}s"));
         }
+        lines.push(format!(
+            "Max concurrent: {}",
+            backend.max_concurrent.map_or_else(|| "unlimited".to_string(), |n| n.to_string())
+        ));
+        let endpoint = match crate::llm::endpoint::endpoint_key(&backend.name, backend.base_url.as_deref()) {
+            Ok(key) => Some(self.kernel().endpoints().get(&key).status()),
+            Err(e) => {
+                lines.push(format!("Endpoint: none ({e})"));
+                None
+            }
+        };
+        if let Some(status) = &endpoint {
+            lines.extend(endpoint_lines(status));
+        }
         if models.is_empty() {
             lines.push("Models: (none pinned — context windows resolve as unknown)".to_string());
         } else {
@@ -468,6 +492,18 @@ impl KjDispatcher {
             "key_optional": backend.key_optional,
             "request_timeout_secs": backend.request_timeout_secs,
             "idle_timeout_secs": backend.idle_timeout_secs,
+            "max_concurrent": backend.max_concurrent,
+            "endpoint": endpoint.as_ref().map(|e| serde_json::json!({
+                "key": e.key,
+                "limit": e.limit,
+                "backends": e.backends.iter().map(|(name, limit)| serde_json::json!({
+                    "name": name,
+                    "max_concurrent": limit,
+                })).collect::<Vec<_>>(),
+                "in_flight": e.in_flight,
+                "cooldown_ms": e.cooldown.map(|(left, _)| left.as_millis() as u64),
+                "cooldown_status": e.cooldown.map(|(_, status)| status),
+            })),
             "models": models.iter().map(|m| serde_json::json!({
                 "model": m.model_id,
                 "context_window": m.context_window,
@@ -495,6 +531,7 @@ impl KjDispatcher {
         key_optional: bool,
         request_timeout: Option<u64>,
         idle_timeout: Option<u64>,
+        max_concurrent: Option<u32>,
         caller: &KjCaller,
     ) -> KjResult {
         // Unknown kind fails here, naming the closed set — never a silent
@@ -508,6 +545,7 @@ impl KjDispatcher {
         probe.base_url = base_url.clone();
         probe.request_timeout_secs = request_timeout;
         probe.idle_timeout_secs = idle_timeout;
+        probe.max_concurrent = max_concurrent;
         if let Err(msg) = probe.validate() {
             return KjResult::Err(format!("kj backend set: {msg}"));
         }
@@ -523,6 +561,7 @@ impl KjDispatcher {
             key_optional,
             request_timeout_secs: request_timeout.map(|t| t as i64),
             idle_timeout_secs: idle_timeout.map(|t| t as i64),
+            max_concurrent: max_concurrent.map(i64::from),
             created_at: kaijutsu_types::now_millis() as i64,
             created_by: caller.principal_id,
         });
@@ -734,11 +773,42 @@ impl KjDispatcher {
     pub(crate) async fn reload_llm_registry(&self) -> Result<(), String> {
         let registry = {
             let db = self.kernel_db().lock();
-            crate::llm::build_llm_registry(&db).map_err(|e| e.to_string())?
+            crate::llm::build_llm_registry(&db, self.kernel().endpoints()).map_err(|e| e.to_string())?
         };
         *self.kernel().llm().write().await = registry;
         Ok(())
     }
+}
+
+/// The `Endpoint:` block of `kj backend show`: the endpoint's limit, where
+/// it comes from when backends share the endpoint, its in-flight count, and
+/// its cooldown.
+fn endpoint_lines(status: &crate::llm::endpoint::EndpointStatus) -> Vec<String> {
+    let limit = match status.limit {
+        None => "unlimited".to_string(),
+        Some(n) if status.backends.len() > 1 => {
+            let each: Vec<String> = status
+                .backends
+                .iter()
+                .map(|(name, limit)| match limit {
+                    Some(l) => format!("{name} {l}"),
+                    None => format!("{name} unlimited"),
+                })
+                .collect();
+            format!("{n}, the smallest of the backends here ({})", each.join(", "))
+        }
+        Some(n) => n.to_string(),
+    };
+    let cooldown = match status.cooldown {
+        Some((left, code)) => format!("{} ms left after a {code} answer; no new request starts", left.as_millis()),
+        None => "none".to_string(),
+    };
+    vec![
+        format!("Endpoint: {}", status.key),
+        format!("  Limit: {limit}"),
+        format!("  In flight: {}", status.in_flight),
+        format!("  Cooldown: {cooldown}"),
+    ]
 }
 
 // Verb class: kj/effect.rs
@@ -1175,6 +1245,52 @@ mod tests {
         // SAFETY: single-threaded test cleanup.
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_backends_at_one_origin_share_one_limiter_and_show_says_so() {
+        let d = seeded().await;
+        let c = test_caller();
+        for args in [
+            &["backend", "set", "mk-zorak", "--kind", "mk", "--base-url", "http://zorak:8090", "--max-concurrent", "4"][..],
+            &["backend", "set", "tenchi", "--kind", "openai", "--base-url", "http://zorak:8090/v1", "--key-optional",
+              "--max-concurrent", "2"][..],
+        ] {
+            let r = d.dispatch(&argv(args), &c).await;
+            assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+        }
+        {
+            let llm = d.kernel().llm().read().await;
+            let (a, b) = (llm.get("mk-zorak").unwrap(), llm.get("tenchi").unwrap());
+            assert!(std::sync::Arc::ptr_eq(a.endpoint().unwrap(), b.endpoint().unwrap()), "one limiter per origin");
+        }
+        match d.dispatch(&argv(&["backend", "show", "mk-zorak"]), &c).await {
+            KjResult::Ok { message: text, data: Some(data), .. } => {
+                assert!(text.contains("Max concurrent: 4\n"), "{text}");
+                assert!(text.contains("Endpoint: http://zorak:8090\n"), "{text}");
+                assert!(text.contains("  Limit: 2, the smallest of the backends here (mk-zorak 4, tenchi 2)\n"), "{text}");
+                assert!(text.contains("  In flight: 0\n"), "{text}");
+                assert!(text.contains("  Cooldown: none"), "{text}");
+                assert_eq!(data["max_concurrent"], 4);
+                assert_eq!(data["endpoint"]["key"], "http://zorak:8090");
+                assert_eq!(data["endpoint"]["limit"], 2);
+                assert_eq!(data["endpoint"]["in_flight"], 0);
+            }
+            other => panic!("expected show text and data: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_max_concurrent_of_zero() {
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d
+            .dispatch(&argv(&["backend", "set", "mk", "--kind", "mk", "--base-url", "http://zorak:8090", "--max-concurrent", "0"]), &c)
+            .await;
+        match r {
+            KjResult::Err(msg) => assert!(msg.contains("--max-concurrent must be at least 1"), "{msg}"),
+            other => panic!("a limit of 0 must fail: {other:?}"),
         }
     }
 }

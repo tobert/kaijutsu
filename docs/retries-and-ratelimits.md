@@ -1,9 +1,10 @@
 # Retries and rate limits
 
-Status: planned, not built. Amy, 2026-10-10: "we'll do after the current
-work ties up. let's focus on the simple big wins and see if nuance is
-needed later. I suspect a simple concurrency limit + cooldowns will do the
-trick."
+Status: "What we build first" is built (2026-10-10): `llm/endpoint.rs`,
+with the call sites below. "Later, if needed" is not built. Amy,
+2026-10-10: "we'll do after the current work ties up. let's focus on the
+simple big wins and see if nuance is needed later. I suspect a simple
+concurrency limit + cooldowns will do the trick."
 
 The kernel limits how hard it presses each model endpoint. Each endpoint
 gets a concurrency limit and a cooldown, and a caller waits for a slot
@@ -21,16 +22,23 @@ in the kernel limited the burst. Every provider already maps HTTP 429 to
 `LlmError::RateLimited`, and the council client keeps `Retry-After` on 429
 and 503, but nothing acts on either.
 
-The megakernel is adding queue depth and will answer 429 when it is full.
-The kernel's part is to answer that by backing off, and to not send more
-than an endpoint can take in the first place.
+The megakernel now takes at most 16 POST or PUT requests at once and
+answers the next one 429 (`docs/mk-admission.md`). The kernel's part is to
+answer that by backing off, and to not send more than an endpoint can take
+in the first place.
 
 ## What we build first
 
 - **One limiter per endpoint.** An endpoint is a base URL's origin
-  (scheme, host, and port). Two backends that name the same server share one
-  limiter, and so do the gate's `[council] server` and an `mk` backend at the
-  same address. A hosted provider with no base URL is its own endpoint.
+  (scheme, host, and port), written `http://zorak:8090` or
+  `https://api.anthropic.com:443`, with the default port written out. Two
+  backends that name the same server share one limiter, and so do the gate's
+  `[council] server` and an `mk` backend at the same address. A backend with
+  no base URL is its own endpoint, `hosted backend <name>`: two hosted
+  Anthropic backends with different keys do not cool each other down. The
+  kernel owns the limiters (`Kernel::endpoints`), and they outlive registry
+  rebuilds, so a slot taken before a `kj backend set` is released to the
+  same endpoint after it.
 - **A concurrency limit.** At most N requests to the endpoint are in flight.
   A streaming turn holds its slot until the stream ends. The default is
   unlimited until a backend sets one; the megakernel and local inference
@@ -40,22 +48,45 @@ than an endpoint can take in the first place.
   busy answer in a row up to 60 s, and reset by the next success. During a
   cooldown no new request starts; waiting callers keep waiting.
 - **Waiting is bounded by the caller's own deadline.** A council decision
-  waits within its `deadline_ms`, a judge read within its 30 s, and a model
-  turn within its request timeout. A caller that cannot get a slot in time
-  fails the way a timeout fails today: the gate records a miss, the judge
-  records a miss, and a turn fails with `RateLimited`. No new fallback.
-- **Retries stay where they are.** The limiter does not retry a failed
-  request. A bump-only seat already sends again after a miss, a judge read
-  is optional, and a turn that fails is visible to its player.
+  waits within its `deadline_ms`, a judge read within its 30 s, shadow
+  priming within 30 s, and a model turn within its backend's request
+  timeout (600 s when unset). A caller that cannot get a slot in time fails
+  the way a timeout fails today: the gate records a miss whose cause names
+  the wait (`no answer within the 700 ms deadline: the deadline passed
+  waiting 700 ms for a slot at http://zorak:8090 (2 of 2 slots in
+  flight)`), the judge records a miss, and a turn fails with `RateLimited`.
+  No new fallback.
+- **A megakernel 429 is sent again; nothing else is.** The megakernel
+  refuses a POST or PUT past its own limit with 429, `Retry-After: 1`, and
+  body type `busy`, before any work starts (`docs/mk-admission.md`). A 429
+  from an mk endpoint therefore means "did not get a slot": the cooldown
+  starts, and the same caller sends the same call again once it ends, still
+  within its own deadline. This covers the `mk` provider and every council
+  call. A 503, a 429 from another provider, and any failure after a
+  request started are not sent again by the limiter.
+- **Retries stay where they are.** A bump-only seat already sends again
+  after a miss, a judge read is optional, and a turn that fails is visible
+  to its player. A turn's existing startup retry (`runtime/llm_stream.rs`,
+  two retries for a transient error) still applies to `RateLimited`, so a
+  turn that got no slot tries twice more, each waiting for a slot again.
 
 ## Where it applies
 
 Every outbound model request takes a slot first:
 
-1. Model turns, through each provider in `LlmRegistry` (anthropic,
-   deepseek, openai-compatible, mk).
-2. Council calls built in `council/sync.rs`: the gate's decisions, shadow
-   priming, and the judge's reads.
+1. Model turns and one-shot prompts, through each provider in
+   `LlmRegistry` (anthropic, deepseek, openai-compatible, mk).
+   `Provider::from_backend` gives each client its endpoint. Anthropic and
+   the OpenAI-compatible clients take one slot per request; a streamed
+   reply holds it until the stream finishes. The mk client takes a slot
+   for each call it makes (model, render, generate), and a streamed
+   generate holds its slot until the stream ends. `codex-app` takes no
+   slot: it reaches a local daemon, not a model endpoint.
+2. Council calls (`council/sync.rs`, `council/gate.rs`): identity, spec
+   POST, and context PUT while preparing, and the decision itself, for the
+   gate's decisions, observations, shadow priming, and the judge's reads.
+   Each call takes its own slot and releases it when it answers, so no
+   caller holds one slot while it waits for another.
 
 MCP servers keep their own `InstancePolicy.max_concurrency` (`kj policy`).
 Host programs a seat runs, such as `curl`, are outside this design.
@@ -70,26 +101,41 @@ request goes through.
 The limit belongs to the backend, set with `kj backend`:
 
 ```sh
-kj backend set mk-zorak --max-concurrent 2
-kj backend set tenchi --max-concurrent 4
+kj backend set mk-zorak --kind mk --base-url http://zorak:8090 --max-concurrent 2
+kj backend set tenchi --kind openai --base-url http://zorak:8090/v1 --key-optional --max-concurrent 4
 kj backend show mk-zorak
 ```
 
-Two backends at one origin with different limits use the smaller one, and
-`kj backend show` says so. An endpoint no backend names, such as a
-`[council] server` with no matching backend row, is unlimited and has a
-cooldown.
+`kj backend set` declares the whole row, so the other flags are stated
+again. `--max-concurrent` must be at least 1; omitting it is unlimited, the
+default. The limit is the `backends.max_concurrent` column. Two backends at
+one origin with different limits use the smaller one, and `kj backend
+show` says so:
+
+```text
+Max concurrent: 2
+Endpoint: http://zorak:8090
+  Limit: 2, the smallest of the backends here (mk-zorak 2, tenchi 4)
+  In flight: 1
+  Cooldown: none
+```
+
+An endpoint no backend names, such as a `[council] server` with no
+matching backend row, is unlimited and has a cooldown.
 
 ## What we can see
 
-- Council decisions already have a `queue_ms` column, today always 0. It
-  becomes the time the decision waited for a slot, so `kj ledger bumps`
-  and the decision record show a busy endpoint.
-- A turn's span and a judge observation record their wait the same way.
+- A council decision's `queue_ms` is the time it waited for slots, its
+  waits before a 429 resend included, plus the queue time the server
+  reports when it reports one. A miss records the wait it had when the
+  deadline passed. Observations and judge reads fill their own `queue_ms`
+  the same way, and the `council.decide` span carries it as
+  `council.queue_ms`.
+- A provider request's span records its wait as `llm.slot_wait_ms`.
 - A cooldown that starts or ends is one `info` log line naming the
   endpoint, the status, and the duration.
-- `kj backend show` lists each endpoint's limit, its in-flight count, and
-  whether it is cooling down.
+- `kj backend show` lists the backend's endpoint, its limit, its in-flight
+  count, and the cooldown time left.
 
 ## Later, if needed
 
@@ -105,9 +151,23 @@ Each of these waits for a reading that says the simple form is not enough:
 
 ## Tests
 
-- A limit of 1 holds a second request until the first ends.
+- A limit of 1 holds a second request until the first ends
+  (`llm/endpoint.rs`).
 - A 429 with `Retry-After: 2` delays the next request to that endpoint
-  by 2 s, and does not delay another endpoint.
+  by 2 s, and does not delay another endpoint (`llm/endpoint.rs`).
+- Busy answers in a row double the cooldown from 5 s, and a success
+  resets it (`llm/endpoint.rs`).
 - A council decision that cannot get a slot within its deadline is a miss
-  whose cause names the wait, and its `queue_ms` is the time it waited.
-- Two backends at one origin share one limiter.
+  whose cause names the wait, and its `queue_ms` is the time it waited
+  (`council/gate_e2e.rs`).
+- A council 429 is sent again after `Retry-After`, and the decision allows
+  (`council/gate_e2e.rs`).
+- Two backends at one origin share one limiter, and `kj backend show`
+  names the smaller limit (`llm/endpoint.rs`, `kj/backend.rs`).
+- An mk turn holds its slot until its stream ends, sends a 429 again after
+  `Retry-After`, does not send a 503 again, and fails `RateLimited` when it
+  gets no slot in its timeout (`llm/mk/mod.rs`). The anthropic and
+  OpenAI-compatible clients cool their endpoint on 503 and 429
+  (`llm/claude/mod.rs`, `llm/openai/mod.rs`).
+- The megakernel client opens a new connection after an answer that says
+  `Connection: close` (`kaijutsu-mk/src/client.rs`).

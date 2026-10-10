@@ -155,15 +155,17 @@ async fn observe_one(
         ms: 0,
         questions: Vec::new(),
     };
+    let waits = crate::llm::endpoint::SlotWaits::default();
     let miss = |mut row: NewCouncilObservation, cause: String, elapsed: Duration| {
         row.outcome = CouncilObservationOutcome::Miss;
         row.miss_cause = Some(cause);
         row.ms = elapsed.as_millis() as i64;
+        row.queue_ms = super::gate::queue_ms(&waits, None);
         row
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
     let labels = [label.to_string()];
-    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, None, deadline).await {
+    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, None, deadline, &waits).await {
         Ok(prepared) => prepared,
         Err(cause) => return miss(row, cause, started.elapsed()),
     };
@@ -184,7 +186,7 @@ async fn observe_one(
 
     let request = super::gate::decision_request(&prepared, council, state.clone());
     let asked = Instant::now();
-    let answer = super::gate::ask_within(kernel, &prepared, &request, council, deadline).await;
+    let answer = super::gate::ask_within(kernel, &prepared, &request, council, deadline, &waits).await;
     let elapsed = asked.elapsed();
     let response = match answer {
         Ok(response) => response,
@@ -197,7 +199,7 @@ async fn observe_one(
         template: response.identity.template.clone(),
         engine: response.identity.engine.clone(),
     };
-    row.queue_ms = response.queue_ms.unwrap_or(0.0).round() as i64;
+    row.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
     match read_answer(&prepared, &request, &response) {
         Ok((snapshot, questions, choice)) => {
             row.outcome = CouncilObservationOutcome::Answered;

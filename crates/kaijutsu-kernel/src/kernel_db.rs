@@ -1186,6 +1186,7 @@ CREATE TABLE IF NOT EXISTS backends (
     key_optional         INTEGER NOT NULL DEFAULT 0,
     request_timeout_secs INTEGER CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
     idle_timeout_secs    INTEGER CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0),
+    max_concurrent       INTEGER CHECK (max_concurrent IS NULL OR max_concurrent > 0),
     created_at           INTEGER NOT NULL DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by           BLOB NOT NULL
 );
@@ -2740,6 +2741,8 @@ impl KernelDb {
             "ALTER TABLE context_usage ADD COLUMN cache_ttl_secs INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE backends ADD COLUMN idle_timeout_secs INTEGER \
                  CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0)",
+            "ALTER TABLE backends ADD COLUMN max_concurrent INTEGER \
+                 CHECK (max_concurrent IS NULL OR max_concurrent > 0)",
             "ALTER TABLE characters ADD COLUMN handoff_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
             "ALTER TABLE characters ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE characters ADD COLUMN root_ctx BLOB REFERENCES contexts(context_id) ON DELETE SET NULL",
@@ -2971,11 +2974,13 @@ impl KernelDb {
                      CHECK (request_timeout_secs IS NULL OR request_timeout_secs > 0),
                  idle_timeout_secs    INTEGER
                      CHECK (idle_timeout_secs IS NULL OR idle_timeout_secs > 0),
+                 max_concurrent       INTEGER
+                     CHECK (max_concurrent IS NULL OR max_concurrent > 0),
                  created_at           INTEGER NOT NULL
                      DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
                  created_by           BLOB NOT NULL",
                 "backend_id, name, kind, base_url, api_key_env, api_key_file, \
-                 key_optional, request_timeout_secs, idle_timeout_secs, created_at, created_by",
+                 key_optional, request_timeout_secs, idle_timeout_secs, max_concurrent, created_at, created_by",
             )?;
             rebuilt |= Self::rebuild_table_dropping_check(
                 conn,
@@ -7301,6 +7306,7 @@ pub struct BackendRow {
     pub key_optional: bool,
     pub request_timeout_secs: Option<i64>,
     pub idle_timeout_secs: Option<i64>,
+    pub max_concurrent: Option<i64>,
     pub created_at: i64,
     pub created_by: PrincipalId,
 }
@@ -7468,7 +7474,7 @@ fn read_cast_id(row: &rusqlite::Row<'_>, idx: usize) -> SqliteResult<CastId> {
 
 const BACKEND_COLS: &str = "backend_id, name, kind, base_url, api_key_env, api_key_file, \
                             key_optional, request_timeout_secs, idle_timeout_secs, created_at, \
-                            created_by";
+                            created_by, max_concurrent";
 
 fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
     Ok(BackendRow {
@@ -7483,6 +7489,7 @@ fn row_to_backend(row: &rusqlite::Row<'_>) -> SqliteResult<BackendRow> {
         idle_timeout_secs: row.get(8)?,
         created_at: row.get(9)?,
         created_by: read_principal_id(row, 10)?,
+        max_concurrent: row.get(11)?,
     })
 }
 
@@ -7532,8 +7539,8 @@ impl KernelDb {
         self.conn.execute(
             "INSERT INTO backends (backend_id, name, kind, base_url, api_key_env, api_key_file,
                                    key_optional, request_timeout_secs, idle_timeout_secs,
-                                   created_at, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                   created_at, created_by, max_concurrent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(backend_id) DO UPDATE SET
                  name = excluded.name,
                  kind = excluded.kind,
@@ -7542,7 +7549,8 @@ impl KernelDb {
                  api_key_file = excluded.api_key_file,
                  key_optional = excluded.key_optional,
                  request_timeout_secs = excluded.request_timeout_secs,
-                 idle_timeout_secs = excluded.idle_timeout_secs",
+                 idle_timeout_secs = excluded.idle_timeout_secs,
+                 max_concurrent = excluded.max_concurrent",
             params![
                 blob_param(backend_id.as_bytes()),
                 row.name,
@@ -7555,6 +7563,7 @@ impl KernelDb {
                 row.idle_timeout_secs,
                 created_at,
                 blob_param(row.created_by.as_bytes()),
+                row.max_concurrent,
             ],
         )?;
         Ok(BackendRow {
@@ -9295,11 +9304,15 @@ mod tests {
             key_optional: false,
             request_timeout_secs: None,
             idle_timeout_secs: None,
+            max_concurrent: Some(3),
             created_at: now_millis(),
             created_by: PrincipalId::system(),
         };
         db.upsert_backend(&codex).unwrap();
-        assert_eq!(db.get_backend_by_name("codex").unwrap().unwrap().kind, "codex-app");
+        let stored = db.get_backend_by_name("codex").unwrap().unwrap();
+        assert_eq!(stored.kind, "codex-app");
+        // The rebuild carries the column the additive ladder added first.
+        assert_eq!(stored.max_concurrent, Some(3));
     }
 
     /// `rebuild_table_dropping_check` guards on the retired CHECK's own text,

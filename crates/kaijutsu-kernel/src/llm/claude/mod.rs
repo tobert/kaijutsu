@@ -25,8 +25,9 @@ use futures::stream::BoxStream;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::llm::endpoint::{Endpoint, Slot};
 use crate::llm::stream::{BuildOpts, StreamEvent};
-use crate::llm::{LlmError, LlmResult, Message, http_user_agent};
+use crate::llm::{DEFAULT_REQUEST_TIMEOUT_SECS, LlmError, LlmResult, Message, http_user_agent};
 
 use self::models_api::{HttpModelCapabilitySource, ModelCapabilitySource};
 use self::sse::{ClaudeSseEvent, decode_event};
@@ -77,6 +78,10 @@ pub struct Client {
     /// ran long. `None` only in tests that construct a bare `Client::new`
     /// directly instead of going through `Provider::from_backend`.
     request_timeout: Option<std::time::Duration>,
+    /// The endpoint each `/v1/messages` request takes a slot from. `None`
+    /// only for a client built directly rather than by
+    /// `Provider::from_backend`.
+    endpoint: Option<Arc<Endpoint>>,
 }
 
 impl Client {
@@ -117,7 +122,25 @@ impl Client {
             model_window_cache: Arc::new(AsyncRwLock::new(HashMap::new())),
             capability_source,
             request_timeout: None,
+            endpoint: None,
         }
+    }
+
+    /// Take a slot from `endpoint` before each `/v1/messages` request.
+    pub fn with_endpoint(mut self, endpoint: Arc<Endpoint>) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// The endpoint this client takes slots from.
+    pub fn endpoint(&self) -> Option<&Arc<Endpoint>> {
+        self.endpoint.as_ref()
+    }
+
+    /// How long a request waits for a slot: its own request timeout.
+    fn slot_wait(&self) -> std::time::Duration {
+        self.request_timeout
+            .unwrap_or(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
     }
 
     /// Set the per-request HTTP timeout (`Provider::from_backend` calls this
@@ -228,6 +251,7 @@ impl Client {
         }
         let body = build::build_request(&opts, &messages, false);
 
+        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
@@ -237,6 +261,7 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
+        crate::llm::endpoint::observe(slot.as_ref(), &response);
 
         let response = error_for_status(response).await?;
 
@@ -285,6 +310,7 @@ impl Client {
         // `build::apply_thinking`.
         build::apply_thinking(&mut body, &opts)?;
 
+        let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .http
             .post(format!("{}/v1/messages", self.base_url))
@@ -295,10 +321,11 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
+        crate::llm::endpoint::observe(slot.as_ref(), &response);
 
         let response = error_for_status(response).await?;
 
-        Ok(Stream::from_response(response))
+        Ok(Stream::from_response(response, slot))
     }
 }
 
@@ -363,10 +390,12 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
+    /// Released once the stream finishes.
+    slot: Option<Slot>,
 }
 
 impl Stream {
-    fn from_response(response: reqwest::Response) -> Self {
+    fn from_response(response: reqwest::Response, slot: Option<Slot>) -> Self {
         use eventsource_stream::Eventsource;
         let bytes: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>> =
             response.bytes_stream().boxed();
@@ -376,6 +405,7 @@ impl Stream {
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
+            slot,
         }
     }
 
@@ -398,6 +428,7 @@ impl Stream {
             pending: VecDeque::new(),
             cancel: CancellationToken::new(),
             finished: false,
+            slot: None,
         }
     }
 
@@ -407,6 +438,9 @@ impl Stream {
     /// machine's already-emitted events).
     pub async fn next_event(&mut self) -> Option<StreamEvent> {
         loop {
+            if self.finished {
+                self.slot = None;
+            }
             if let Some(ev) = self.pending.pop_front() {
                 return Some(ev);
             }
@@ -887,5 +921,21 @@ data: {\"type\":\"message_stop\"}
             );
             assert_eq!(fake.call_count(), 2, "both hits should come from cache");
         }
+    }
+
+    /// A 503 cools the endpoint for the first backoff step, and a later
+    /// request waits it out.
+    #[tokio::test]
+    async fn a_503_cools_the_endpoint() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let (base, _) = serve(vec![reply(503, r#"{"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}"#)]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        assert!(matches!(err, LlmError::ApiError(_)), "{err:?}");
+        let (left, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 503);
+        assert!(left > std::time::Duration::from_secs(4), "{left:?}");
+        assert_eq!(endpoint.status().in_flight, 0);
     }
 }
