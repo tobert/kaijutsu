@@ -406,9 +406,12 @@ verdict, or after N bumps of one goal, is open.
 
 Amy, 2026-10-09: escalate after N consecutive bumps in N minutes, but
 observe first. Many bumps are often fine: they force a seat to break work
-into smaller, safer steps, at some cost. Bring back a risk read in the
-council queries, watch the bump metrics, and pick the escalation points
-from what we see.
+into smaller, safer steps, at some cost.
+
+Built 2026-10-10: the `undo` read on the shell bump spec, `kj ledger bumps`,
+and `[council] escalate = { bumps, minutes }`, off unless set
+(`docs/council.md`, "Bump-only"). Open: pick N and M from what
+`kj ledger bumps` shows on real seats, then turn it on.
 
 ## Council mass floor misses a decision every read agreed on (2026-10-06)
 

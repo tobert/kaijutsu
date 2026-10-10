@@ -458,8 +458,19 @@ pub(crate) struct CouncilConfig {
     /// `[council] bump_limit`: in bumper mode, the bumps one submission gets
     /// before the next would-be bump is an ordinary ask.
     pub(crate) bump_limit: Option<u64>,
+    /// `[council] escalate`: in a bumper mode, the would-be bump that makes
+    /// `bumps` in a row for one seat within `minutes` is an ordinary ask to
+    /// the seat's reviewer. Off when unset.
+    pub(crate) escalate: Option<CouncilEscalate>,
     pub(crate) specs: Vec<CouncilSpec>,
     pub(crate) thresholds: Vec<CouncilThreshold>,
+}
+
+/// `[council] escalate = { bumps = N, minutes = M }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CouncilEscalate {
+    pub(crate) bumps: u64,
+    pub(crate) minutes: u64,
 }
 
 impl CouncilConfig {
@@ -501,9 +512,18 @@ struct CouncilToml {
     #[serde(default)]
     bump_limit: Option<i64>,
     #[serde(default)]
+    escalate: Option<CouncilEscalateToml>,
+    #[serde(default)]
     spec: Vec<CouncilSpecToml>,
     #[serde(default)]
     threshold: Vec<CouncilThresholdToml>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CouncilEscalateToml {
+    bumps: i64,
+    minutes: i64,
 }
 
 fn default_require_agree() -> bool {
@@ -784,6 +804,21 @@ impl GateConfig {
             (_, Some(limit)) => Some(limit as u64),
             (_, None) => Some(DEFAULT_BUMP_LIMIT),
         };
+        let escalate = match (mode, &raw.escalate) {
+            (_, None) => None,
+            (CouncilMode::Gatekeeper, Some(_)) => {
+                return Err(err(
+                    "[council] escalate: gatekeeper mode asks already; escalate needs mode = \"bumper\" or \"bump-only\"".into(),
+                ))
+            }
+            (_, Some(e)) if e.bumps <= 0 || e.minutes <= 0 => {
+                return Err(err(format!(
+                    "[council] escalate: bumps ({}) and minutes ({}) must be integers greater than 0",
+                    e.bumps, e.minutes
+                )))
+            }
+            (_, Some(e)) => Some(CouncilEscalate { bumps: e.bumps as u64, minutes: e.minutes as u64 }),
+        };
         if raw.spec.is_empty() {
             return Err(err("[council]: declare at least one [[council.spec]]".into()));
         }
@@ -886,6 +921,7 @@ impl GateConfig {
             house_rules_tokens: raw.house_rules_tokens as u64,
             mode,
             bump_limit,
+            escalate,
             specs,
             thresholds,
         })
@@ -2670,6 +2706,23 @@ enabled = false
         assert!(m.contains("bump_limit") && m.contains("bump-only"), "{m}");
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bouncer\""));
         assert!(m.contains("bump-only"), "the error lists every mode: {m}");
+    }
+
+    /// `escalate` opens an ask after N bumps in a row within M minutes. It
+    /// is off unless set, belongs to the bumper modes, and refuses zeros.
+    #[test]
+    fn escalate_parses_in_the_bumper_modes_and_rejects_junk() {
+        assert_eq!(config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"")).council().unwrap().escalate, None);
+        let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bump-only\"\nescalate = { bumps = 4, minutes = 10 }"));
+        assert_eq!(c.council().unwrap().escalate, Some(CouncilEscalate { bumps: 4, minutes: 10 }));
+        let c = config(&council_with("deadline_ms = 700", "deadline_ms = 700\nmode = \"bumper\"\nescalate = { bumps = 2, minutes = 1 }"));
+        assert_eq!(c.council().unwrap().escalate, Some(CouncilEscalate { bumps: 2, minutes: 1 }));
+        let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nescalate = { bumps = 4, minutes = 10 }"));
+        assert!(m.contains("escalate") && m.contains("gatekeeper"), "{m}");
+        for junk in ["{ bumps = 0, minutes = 10 }", "{ bumps = 3, minutes = 0 }", "{ bumps = 3 }", "{ bumps = 3, minutes = 5, extra = 1 }"] {
+            let m = council_err(&council_with("deadline_ms = 700", &format!("deadline_ms = 700\nmode = \"bump-only\"\nescalate = {junk}")));
+            assert!(m.contains("escalate"), "{junk}: {m}");
+        }
     }
 
     #[test]

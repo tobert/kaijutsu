@@ -736,6 +736,9 @@ pub(crate) struct CouncilVerdict {
     /// The flavors of the bumps this submission already got, when it has
     /// reached the bump limit and so asks.
     bump_history: Vec<String>,
+    /// The seat's bump streak that escalated this submission to an ask
+    /// (`[council] escalate`), as the ask shows it.
+    escalation: Option<String>,
     /// The seat's judge, read after the decision commits
     /// (`super::shadow`).
     judge: Option<super::shadow::JudgeRead>,
@@ -888,6 +891,21 @@ impl CouncilVerdict {
         self.bump_history = history;
     }
 
+    /// `[council] escalate`, as this decision read it.
+    pub(crate) fn escalate(&self) -> Option<crate::kj::gate_policy::CouncilEscalate> {
+        self.council.escalate
+    }
+
+    /// The seat has been bumped `streak.count` times in a row within the
+    /// escalation window, so this would-be bump asks the seat's reviewer.
+    pub(crate) fn escalated(&mut self, streak: &approval_ledger::council::BumpStreak, minutes: u64) {
+        self.escalation = Some(format!(
+            "bumped this seat {} times in a row within {minutes} minutes ({})",
+            streak.count,
+            streak.flavors.join("; ")
+        ));
+    }
+
     /// The durable record, linked to the ask it led to when there is one.
     pub(crate) fn record_for(&self, request_id: Option<&str>) -> NewCouncilDecision {
         let mut record = self.record.clone();
@@ -948,6 +966,19 @@ impl CouncilVerdict {
                 verdict: SignalVerdict::Escalate,
             });
         }
+        if let Some(escalation) = &self.escalation {
+            signals.push(NewSignal {
+                source_kind: SignalSourceKind::Council,
+                source_id: Some(self.spec.clone()),
+                model_id: None,
+                weight_hash: None,
+                stmt_seq: None,
+                cmd_seq: None,
+                label: Some(escalation.clone()),
+                score: None,
+                verdict: SignalVerdict::Escalate,
+            });
+        }
         signals
     }
 
@@ -967,6 +998,9 @@ impl CouncilVerdict {
         }
         if !self.bump_history.is_empty() {
             lines.push(format!("The council bumped this submission before it asked: {}.", self.bump_history_text()));
+        }
+        if let Some(escalation) = &self.escalation {
+            lines.push(format!("The council {escalation}, so this one asks."));
         }
         lines.join("\n")
     }
@@ -1331,6 +1365,7 @@ fn build_verdict(
         bump: None,
         reads: String::new(),
         bump_history: Vec::new(),
+        escalation: None,
         judge: None,
     }
 }
@@ -1938,6 +1973,7 @@ mod tests {
             house_rules_tokens: crate::kj::gate_policy::DEFAULT_HOUSE_RULES_TOKENS,
             mode: crate::kj::gate_policy::CouncilMode::Gatekeeper,
             bump_limit: Some(crate::kj::gate_policy::DEFAULT_BUMP_LIMIT),
+            escalate: None,
             specs: vec![CouncilSpec { name: "shell-gate".into(), case: CouncilCase::Shell, contexts: Vec::new(), require_agree: None }],
             thresholds: vec![CouncilThreshold {
                 spec: "shell-gate".into(),

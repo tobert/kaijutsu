@@ -285,6 +285,8 @@ struct Setup {
     no_bump_template: bool,
     /// `mode = "bump-only"`, reading the `shell-bump` spec.
     bump_only: bool,
+    /// `[council] escalate`: bumps in a row, within minutes.
+    escalate: Option<(u64, u64)>,
 }
 
 impl Default for Setup {
@@ -301,6 +303,7 @@ impl Default for Setup {
             bump_limit: None,
             no_bump_template: false,
             bump_only: false,
+            escalate: None,
         }
     }
 }
@@ -340,7 +343,9 @@ enabled = {enabled}
             (true, _) => "mode = \"bump-only\"".to_string(),
             (false, Some(limit)) => format!("mode = \"bumper\"\nbump_limit = {limit}"),
             (false, None) => String::new(),
-        },
+        } + &setup.escalate.map_or_else(String::new, |(bumps, minutes)| {
+            format!("\nescalate = {{ bumps = {bumps}, minutes = {minutes} }}")
+        }),
         shell = if setup.bump_limit.is_some() || setup.bump_only { "shell-bump" } else { "shell-gate" },
         deadline = setup.deadline_ms,
         enabled = setup.enabled,
@@ -2500,6 +2505,73 @@ async fn bump_only_mode_has_no_limit() {
         assert!(last.contains("attempt 5 of ∞"), "{via:?}: {last}");
         assert!(!last.contains("unchanged"), "{via:?}: {last}");
         assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
+        rig.finish().await;
+    }
+}
+
+fn escalating(bumps: u64, minutes: u64) -> Setup {
+    Setup { escalate: Some((bumps, minutes)), ..bump_only() }
+}
+
+/// With `escalate`, the would-be bump that makes N in a row asks the
+/// seat's reviewer instead, and the ask names the streak. The streak is
+/// per seat, across different submissions, and the ask ends it.
+///
+/// Falsified by counting per submission (the three commands differ) or by
+/// leaving bump-only without an ask: the third send is refused.
+#[tokio::test]
+async fn bump_only_escalates_after_n_bumps_in_a_row() {
+    for via in BOTH {
+        let rig = rig(via, escalating(3, 10)).await;
+        rig.mock.set(|req| Reply::ok(bump_answer_with_undo(req, TRY_HARDER, IRREVERSIBLE)));
+        refusal_text(via, rig.submit("touch /work/a").await);
+        rig.mock.bumper_says(DO_LESS);
+        refusal_text(via, rig.submit("touch /work/b").await);
+        assert_pending(via, rig.submit("touch /work/c").await);
+        let ask = rig.only_ask();
+        assert!(
+            ask.description.contains("bumped this seat 2 times in a row within 10 minutes (try_harder; do_less)"),
+            "{via:?}: {}",
+            ask.description
+        );
+        let signals = rig.signals(&ask.request_id);
+        assert!(
+            signals.iter().any(|s| s.label.as_deref().is_some_and(|l| l.contains("2 times in a row"))),
+            "{via:?}: {signals:#?}"
+        );
+        // The escalated decision links its ask, which ends the streak.
+        let again = refusal_text(via, rig.submit("touch /work/d").await);
+        assert!(again.contains("Bumped by the council"), "{via:?}: {again}");
+        rig.finish().await;
+    }
+}
+
+/// A submission that runs ends the streak, and bumps older than the
+/// window do not count.
+#[tokio::test]
+async fn a_pass_or_the_window_ends_a_bump_streak() {
+    for via in BOTH {
+        let rig = rig(via, escalating(2, 10)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        refusal_text(via, rig.submit("touch /work/a").await);
+        rig.mock.bumper_says(PROCEED);
+        rig.submit("echo council-ran").await.unwrap();
+        rig.mock.bumper_says(TRY_HARDER);
+        refusal_text(via, rig.submit("touch /work/b").await);
+        // Age that bump past the window: the next one is first in a row again.
+        {
+            let db = rig.d.kernel_db();
+            let db = db.lock();
+            db.conn_for_ledger()
+                .execute(
+                    "UPDATE council_decisions SET created_at = created_at - 11 * 60 * 1000 WHERE request_id IS NULL",
+                    [],
+                )
+                .unwrap();
+        }
+        refusal_text(via, rig.submit("touch /work/c").await);
+        assert!(rig.asks().iter().all(|a| a.status != ApprovalStatus::Pending), "{via:?}: nothing escalated");
+        assert_pending(via, rig.submit("touch /work/d").await);
         rig.finish().await;
     }
 }

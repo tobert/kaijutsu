@@ -692,6 +692,40 @@ async fn refuse_bump(
         council.at_bump_limit(history);
         return None;
     }
+    if let Some(escalate) = council.escalate() {
+        let filter = approval_ledger::council::SubmissionFilter {
+            context_id: Some(context.as_bytes().to_vec()),
+            since_ms: Some(kaijutsu_types::now_millis() as i64 - escalate.minutes as i64 * 60_000),
+            limit: escalate.bumps as u32,
+        };
+        let streak = {
+            let db = kernel.kernel_db().lock();
+            approval_ledger::council::list_council_submissions(db.conn_for_ledger(), &filter)
+                .map(|rows| approval_ledger::council::bump_streak(&rows))
+        };
+        match streak {
+            Ok(streak) => {
+                let count = streak.as_ref().map_or(0, |s| s.count) as u64;
+                if count + 1 >= escalate.bumps {
+                    let streak = streak.unwrap_or(approval_ledger::council::BumpStreak {
+                        count: 0,
+                        first_at: 0,
+                        last_at: 0,
+                        flavors: Vec::new(),
+                    });
+                    tracing::info!(bumps = count, minutes = escalate.minutes, "the seat's bump streak escalates; it asks");
+                    council.escalated(&streak, escalate.minutes);
+                    return None;
+                }
+            }
+            Err(e) => {
+                return Some(GateOutcome::unavailable_without_row(format!(
+                    "the council could not read this seat's bump streak: {e} \
+                     (fail-closed — a ledger fault, not a decision)"
+                )));
+            }
+        }
+    }
     let attempt = history.len() as u64 + 1;
     let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
     let written = {

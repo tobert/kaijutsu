@@ -837,6 +837,15 @@ do on the more ask/deny side."
   worked around, and it still forces the thinking and intent we want." A
   `bump_limit` with `bump-only` fails the parse. A miss is recorded with
   outcome `miss`, so it does not raise the attempt count.
+- **Escalation after a streak.** `escalate = { bumps = N, minutes = M }`
+  in `[council]` (bumper or bump-only; off when unset) turns the would-be
+  bump that makes N in a row for one seat within M minutes into an ordinary
+  ask to the seat's reviewer. The streak counts across submissions, a
+  submission that ran ends it, and so does the escalated ask, whose
+  decision links it. The ask's description and a council signal name the
+  streak and its flavors. Amy, 2026-10-09: "escalate after N consecutive
+  bumps in N minutes, but observe first"; `kj ledger bumps` is the reading
+  to pick N and M from.
 
 ## Open questions for Amy
 
