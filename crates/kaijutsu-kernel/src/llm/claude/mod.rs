@@ -182,7 +182,8 @@ impl Client {
     /// only after the config path (the backend's configured `context_window`) came up
     /// empty — config is always the override, this is the fallback.
     ///
-    /// A cache hit never touches the network. On a miss, awaits
+    /// A cache hit never touches the network. On a miss, takes a slot at
+    /// the client's endpoint, as every outbound request does, and awaits
     /// `capability_source.max_input_tokens(model)` (the real implementation
     /// hits `GET /v1/models/{id}`, reading the wire's `max_input_tokens`
     /// field — there is no `context_window` field on the API; that name is
@@ -202,7 +203,16 @@ impl Client {
                 return *cached;
             }
         }
-        match self.capability_source.max_input_tokens(model).await {
+        let slot = match crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await {
+            Ok(slot) => slot,
+            Err(e) => {
+                tracing::warn!(model, error = %e, "live context-window lookup got no slot; resolving as unknown (not cached)");
+                return None;
+            }
+        };
+        let looked_up = self.capability_source.max_input_tokens(model).await;
+        drop(slot);
+        match looked_up {
             Ok(window) => {
                 self.model_window_cache
                     .write()
@@ -321,7 +331,7 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
-        crate::llm::endpoint::observe(slot.as_ref(), &response);
+        crate::llm::endpoint::observe_open(slot.as_ref(), &response);
 
         let response = error_for_status(response).await?;
 
@@ -390,7 +400,8 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
-    /// Released once the stream finishes.
+    /// Released once the stream finishes. `message_stop` tells it the reply
+    /// completed.
     slot: Option<Slot>,
 }
 
@@ -473,6 +484,9 @@ impl Stream {
                             Ok(typed) => {
                                 if matches!(&typed, ClaudeSseEvent::MessageStop) {
                                     self.finished = true;
+                                    if let Some(slot) = &self.slot {
+                                        slot.completed();
+                                    }
                                 }
                                 let emitted = self.state.step(typed);
                                 for ev in emitted {
@@ -936,6 +950,65 @@ data: {\"type\":\"message_stop\"}
         let (left, status) = endpoint.status().cooldown.expect("cooling down");
         assert_eq!(status, 503);
         assert!(left > std::time::Duration::from_secs(4), "{left:?}");
+        assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A 429 cools the endpoint for its `Retry-After` and fails as
+    /// `RateLimited`.
+    #[tokio::test]
+    async fn a_429_cools_the_endpoint_for_its_retry_after() {
+        use kaijutsu_mk::test_server::{reply, serve};
+        let mut busy = reply(429, r#"{"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}"#);
+        busy.headers.push(("retry-after", "3".into()));
+        let (base, _) = serve(vec![busy]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let err = client.prompt("m", None, "hi").await.unwrap_err();
+        assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
+        let (left, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 429);
+        assert!(left > std::time::Duration::from_secs(2) && left <= std::time::Duration::from_secs(3), "{left:?}");
+        assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A stream that reaches `message_stop` resets the doubling; opening
+    /// it does not.
+    ///
+    /// Falsified by a stream whose end leaves a busy answer counted.
+    #[tokio::test]
+    async fn a_stream_that_ends_whole_resets_the_doubling() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, _) = serve(vec![sse(SIMPLE_COMPLETION)]).await;
+        let endpoint = crate::llm::endpoint::Endpoints::default().for_url(&base).unwrap();
+        let client = Client::new("k").with_base_url(&base).with_endpoint(endpoint.clone());
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        while stream.next_event().await.is_some() {}
+        assert_eq!(endpoint.busy_in_a_row(), 0);
+    }
+
+    /// The live context-window lookup, `GET /v1/models/{id}`, takes a slot
+    /// at the client's endpoint.
+    ///
+    /// Falsified by a lookup that goes out beside a full endpoint.
+    #[tokio::test]
+    async fn the_context_window_lookup_takes_a_slot() {
+        #[derive(Debug)]
+        struct InFlight(Arc<Endpoint>, std::sync::Mutex<Option<u32>>);
+        #[async_trait::async_trait]
+        impl ModelCapabilitySource for InFlight {
+            async fn max_input_tokens(&self, _model: &str) -> LlmResult<Option<u64>> {
+                *self.1.lock().unwrap() = Some(self.0.status().in_flight);
+                Ok(Some(200_000))
+            }
+        }
+        let endpoint = crate::llm::endpoint::Endpoints::default().get("hosted backend claude");
+        let probe = Arc::new(InFlight(endpoint.clone(), Default::default()));
+        let client = Client::new("k").with_endpoint(endpoint.clone()).with_capability_source(probe.clone());
+        assert_eq!(client.context_window("claude-opus-4-8").await, Some(200_000));
+        assert_eq!(*probe.1.lock().unwrap(), Some(1), "the lookup held a slot");
         assert_eq!(endpoint.status().in_flight, 0);
     }
 }

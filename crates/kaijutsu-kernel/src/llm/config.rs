@@ -347,6 +347,13 @@ impl BackendConfig {
                 self.name
             ));
         }
+        if matches!(self.kind, BackendKind::CodexApp) && self.max_concurrent.is_some() {
+            return Err(format!(
+                "backend '{}': codex-app takes no slot, so --max-concurrent does not apply to it; \
+                 omit --max-concurrent (codex-app reaches a local Codex daemon, not a model endpoint)",
+                self.name
+            ));
+        }
         if self.max_concurrent == Some(0) {
             return Err(format!(
                 "backend '{}': --max-concurrent must be at least 1; omit it for no limit",

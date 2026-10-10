@@ -101,15 +101,17 @@ pub fn load_backends(db: &KernelDb) -> LlmResult<Vec<BackendConfig>> {
 /// every turn.
 ///
 /// Each client takes its slots from `endpoints`, the kernel's one set, whose
-/// limits this rebuild sets from the backend rows.
+/// limits this rebuild sets from the backends that built. A skipped backend
+/// sets no limit.
 pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<LlmRegistry> {
     let backends = load_backends(db)?;
     let mut registry = LlmRegistry::new();
-    endpoints.configure(&backends);
+    let mut built = Vec::new();
 
     for backend in &backends {
         match Provider::from_backend(backend, endpoints) {
             Ok(provider) => {
+                built.push(backend.clone());
                 tracing::info!(
                     backend = %backend.name,
                     kind = %backend.kind.as_str(),
@@ -132,6 +134,7 @@ pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<Llm
         }
     }
 
+    endpoints.configure(&built);
     registry.set_backends(backends);
 
     // ── defaults ────────────────────────────────────────────────────────
@@ -283,6 +286,38 @@ mod tests {
             model: model.into(),
         })
         .unwrap();
+    }
+
+    /// A backend that fails to build sets no limit on its endpoint, so it
+    /// cannot cap the backends beside it that did build.
+    ///
+    /// Falsified by a limit taken from every backend row.
+    #[test]
+    fn a_backend_that_does_not_build_sets_no_limit() {
+        let db = seeded_db();
+        for (name, kind, key_env, max) in [("mk-zorak", "mk", None, None), ("broken", "anthropic", Some("KJ_TEST_NO_SUCH_KEY"), Some(1))] {
+            db.upsert_backend(&crate::kernel_db::BackendRow {
+                backend_id: BackendId::new(),
+                name: name.into(),
+                kind: kind.into(),
+                base_url: Some("http://zorak:8090".into()),
+                api_key_env: key_env.map(str::to_string),
+                api_key_file: None,
+                key_optional: false,
+                request_timeout_secs: None,
+                idle_timeout_secs: None,
+                max_concurrent: max,
+                created_at: 0,
+                created_by: PrincipalId::system(),
+            })
+            .unwrap();
+        }
+        let endpoints = Endpoints::default();
+        let registry = build_llm_registry(&db, &endpoints).unwrap();
+        assert!(registry.get("broken").is_none(), "the anthropic row has no key");
+        let status = endpoints.get("http://zorak:8090").status();
+        assert_eq!(status.limit, None);
+        assert_eq!(status.backends, vec![("mk-zorak".to_string(), None)]);
     }
 
     #[test]

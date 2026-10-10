@@ -248,7 +248,7 @@ impl Client {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(http_error)?;
-        crate::llm::endpoint::observe(slot.as_ref(), &response);
+        crate::llm::endpoint::observe_open(slot.as_ref(), &response);
 
         let response = self.error_for_status(response).await?;
 
@@ -319,7 +319,8 @@ pub struct Stream {
     pending: VecDeque<StreamEvent>,
     cancel: CancellationToken,
     finished: bool,
-    /// Released once the stream finishes.
+    /// Released once the stream finishes. `[DONE]` tells it the reply
+    /// completed.
     slot: Option<Slot>,
 }
 
@@ -395,6 +396,9 @@ impl Stream {
                             Ok(typed) => {
                                 if matches!(&typed, OpenAiSseEvent::Done) {
                                     self.finished = true;
+                                    if let Some(slot) = &self.slot {
+                                        slot.completed();
+                                    }
                                 }
                                 let emitted = self.state.step(typed);
                                 for ev in emitted {
@@ -725,5 +729,22 @@ data: [DONE]
         assert_eq!(status, 429);
         assert!(left > std::time::Duration::from_secs(2) && left <= std::time::Duration::from_secs(3), "{left:?}");
         assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// A stream that reaches `[DONE]` resets the doubling; opening it does
+    /// not.
+    ///
+    /// Falsified by a stream whose end leaves a busy answer counted.
+    #[tokio::test]
+    async fn a_stream_that_ends_whole_resets_the_doubling() {
+        use kaijutsu_mk::test_server::{serve, sse};
+        let (base, _) = serve(vec![sse(SIMPLE)]).await;
+        let (client, endpoint) = limited(&base);
+        let mut stream = client.stream(BuildOpts::new("m"), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(std::time::Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        while stream.next_event().await.is_some() {}
+        assert_eq!(endpoint.busy_in_a_row(), 0);
     }
 }

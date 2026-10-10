@@ -6,14 +6,19 @@
 //! request ends. A streamed reply holds its slot until the stream ends.
 //!
 //! Each endpoint has a concurrency limit, the smallest `max_concurrent` of
-//! the backends that name it, and none when no backend sets one. A 429 or 503
-//! answer starts a cooldown for the whole endpoint: `Retry-After` when the
-//! answer carries one, else [`FIRST_COOLDOWN`] doubled on each busy answer in
-//! a row up to [`MAX_COOLDOWN`]. A 2xx answer resets the doubling. No new
-//! request starts during a cooldown.
+//! the backends that built and name it, and none when none sets one. A 429
+//! or 503 answer, or a stream that fails with one, starts a cooldown for the
+//! whole endpoint: `Retry-After` when the answer carries one, else
+//! [`FIRST_COOLDOWN`] doubled on each cooldown round in a row up to
+//! [`MAX_COOLDOWN`], and never shorter than [`MIN_COOLDOWN`]. Busy answers
+//! during a cooldown step the doubling once. A completed answer resets the
+//! doubling: a non-streamed 2xx, or a stream that reaches its end event.
+//! Opening a stream does not. No new request starts during a cooldown.
 //!
-//! A caller waits for a slot until its own deadline. The limiter never
-//! retries a request. See `docs/retries-and-ratelimits.md`.
+//! A caller waits for a slot until its own deadline: one that finds a free
+//! slot when it asks takes it, and one that has waited gets none at or after
+//! its deadline. The limiter never retries a request, except a megakernel
+//! 429 ([`mk_call`]). See `docs/retries-and-ratelimits.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +35,11 @@ pub const FIRST_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// The longest cooldown a run of busy answers with no `Retry-After` reaches.
 pub const MAX_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The shortest cooldown a busy answer starts, `Retry-After: 0` included, so
+/// a megakernel 429 is sent again at most once a second
+/// (`docs/mk-admission.md`).
+pub const MIN_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// The endpoint a backend's requests go to: its base URL's origin, or
 /// `hosted backend <name>` when it has no base URL.
@@ -80,11 +90,43 @@ pub(crate) async fn take_for_request(endpoint: Option<&Arc<Endpoint>>, wait: Dur
 /// refused before any work starts, so the same call goes out again once the
 /// cooldown it started ends (`docs/mk-admission.md`). Any other answer,
 /// a 503 included, is returned with the slot it was made under. Every wait
-/// ends at `deadline`.
+/// ends at `deadline`, and every cooldown lasts at least [`MIN_COOLDOWN`],
+/// so the call goes out at most once a second and never after a wait that
+/// reached `deadline`.
 pub async fn mk_call<T, F, Fut>(
     endpoint: &Arc<Endpoint>,
     deadline: Instant,
     waits: &SlotWaits,
+    call: F,
+) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, kaijutsu_mk::MkError>>,
+{
+    mk_send(endpoint, deadline, waits, false, call).await
+}
+
+/// [`mk_call`] for a call that opens a stream. An opened stream is not yet a
+/// completed answer, so it leaves the doubling as it was; the stream calls
+/// [`Slot::completed`] or [`Slot::failed_mk`] when it ends.
+pub async fn mk_open<T, F, Fut>(
+    endpoint: &Arc<Endpoint>,
+    deadline: Instant,
+    waits: &SlotWaits,
+    call: F,
+) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, kaijutsu_mk::MkError>>,
+{
+    mk_send(endpoint, deadline, waits, true, call).await
+}
+
+async fn mk_send<T, F, Fut>(
+    endpoint: &Arc<Endpoint>,
+    deadline: Instant,
+    waits: &SlotWaits,
+    opens_stream: bool,
     mut call: F,
 ) -> Result<(Slot, Result<T, kaijutsu_mk::MkError>), NoSlot>
 where
@@ -95,7 +137,11 @@ where
     loop {
         let slot = endpoint.acquire_noting(deadline, waits).await?;
         let result = call().await;
-        slot.answered_mk(&result);
+        match &result {
+            Ok(_) if opens_stream => {}
+            Ok(_) => slot.completed(),
+            Err(e) => slot.failed_mk(e),
+        }
         match &result {
             Err(MkError::Status { status: 429, .. } | MkError::Service { status: 429, .. }) => {
                 tracing::debug!(endpoint = %endpoint.key, "megakernel refused the call with 429; sending it again after the cooldown");
@@ -105,10 +151,19 @@ where
     }
 }
 
-/// Tells `slot`'s endpoint how it answered `response`.
+/// Tells `slot`'s endpoint how it answered `response`, a whole reply.
 pub(crate) fn observe(slot: Option<&Slot>, response: &reqwest::Response) {
     if let Some(slot) = slot {
         slot.answered_with(response.status().as_u16(), retry_after(response.headers()));
+    }
+}
+
+/// Tells `slot`'s endpoint how it answered `response`, which opens a stream
+/// when it succeeds. A 2xx leaves the doubling as it was; the stream calls
+/// [`Slot::completed`] when it reaches its end event.
+pub(crate) fn observe_open(slot: Option<&Slot>, response: &reqwest::Response) {
+    if !response.status().is_success() {
+        observe(slot, response);
     }
 }
 
@@ -283,7 +338,11 @@ impl Endpoint {
         result
     }
 
+    /// A free slot is taken at once on the first look, whatever the
+    /// deadline. After a wait, the deadline is checked before a slot is
+    /// taken, so a caller woken at or after its deadline gets none.
     async fn wait_for_slot(self: &Arc<Self>, started: Instant, deadline: Instant) -> Result<Slot, NoSlot> {
+        let mut first_look = true;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -293,7 +352,9 @@ impl Endpoint {
                 let mut state = self.state.lock();
                 match state.cooling(now) {
                     Some(cooldown) => Some(cooldown.until),
-                    None if state.limit.is_none_or(|limit| state.in_flight < limit) => {
+                    None if (first_look || now < deadline)
+                        && state.limit.is_none_or(|limit| state.in_flight < limit) =>
+                    {
                         state.in_flight += 1;
                         return Ok(Slot { endpoint: self.clone(), waited: now - started });
                     }
@@ -303,6 +364,7 @@ impl Endpoint {
             if now >= deadline {
                 return Err(NoSlot { endpoint: self.key.clone(), waited: now - started, why: self.why_waiting(now) });
             }
+            first_look = false;
             let until = wake.map_or(deadline, |w| w.min(deadline));
             tokio::select! {
                 _ = changed.as_mut() => {}
@@ -347,16 +409,26 @@ impl Endpoint {
         self.changed.notify_waiters();
     }
 
+    #[cfg(test)]
+    pub(crate) fn busy_in_a_row(&self) -> u32 {
+        self.state.lock().busy_in_a_row
+    }
+
     fn answered(&self) {
         self.state.lock().busy_in_a_row = 0;
     }
 
+    /// A busy answer. It steps the doubling only when the endpoint is not
+    /// already cooling down, so answers to requests sent together count as
+    /// one round.
     fn busy(self: &Arc<Self>, status: u16, retry_after: Option<Duration>) {
         let now = Instant::now();
         let cooldown = {
             let mut state = self.state.lock();
-            state.busy_in_a_row = state.busy_in_a_row.saturating_add(1);
-            let length = retry_after.unwrap_or_else(|| backoff(state.busy_in_a_row));
+            if state.cooling(now).is_none() {
+                state.busy_in_a_row = state.busy_in_a_row.saturating_add(1);
+            }
+            let length = retry_after.unwrap_or_else(|| backoff(state.busy_in_a_row)).max(MIN_COOLDOWN);
             let until = now + length;
             if state.cooling(now).is_some_and(|c| c.until >= until) {
                 return;
@@ -422,15 +494,17 @@ impl Slot {
         }
     }
 
-    /// The endpoint answered a megakernel call with `result`.
-    pub fn answered_mk<T>(&self, result: &Result<T, kaijutsu_mk::MkError>) {
-        use kaijutsu_mk::MkError;
-        match result {
-            Ok(_) => self.endpoint.answered(),
-            Err(e @ (MkError::Status { status, .. } | MkError::Service { status, .. })) => {
-                self.answered_with(*status, e.retry_after())
-            }
-            Err(_) => {}
+    /// The reply ended whole: a stream reached its end event. Resets the
+    /// doubling.
+    pub fn completed(&self) {
+        self.endpoint.answered();
+    }
+
+    /// A megakernel call or stream failed with `error`. An error status, or
+    /// an error event in a stream, of 429 or 503 starts a cooldown.
+    pub fn failed_mk(&self, error: &kaijutsu_mk::MkError) {
+        if let Some(status @ (429 | 503)) = error.status() {
+            self.endpoint.busy(status, error.retry_after());
         }
     }
 }
@@ -610,5 +684,133 @@ mod tests {
         endpoints.configure(&[]);
         assert_eq!(ea.status().limit, None);
         assert_eq!(ea.status().in_flight, 2);
+    }
+
+    fn busy_mk(retry_after: Option<Duration>) -> kaijutsu_mk::MkError {
+        kaijutsu_mk::MkError::Service { status: 429, error: None, retry_after, body: String::new() }
+    }
+
+    /// A busy answer that asks for no wait still cools the endpoint for 1 s.
+    ///
+    /// Falsified by a `Retry-After: 0` that starts no cooldown.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_answer_cools_the_endpoint_for_at_least_one_second() {
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        endpoint.acquire(Instant::now()).await.unwrap().answered_with(429, Some(Duration::ZERO));
+        assert_eq!(endpoint.status().cooldown, Some((Duration::from_secs(1), 429)));
+    }
+
+    /// A caller that waited until its deadline gets no slot, even when one
+    /// is free at that instant.
+    ///
+    /// Falsified by a wait that hands out the slot freed by a cooldown that
+    /// ends at the caller's deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_reaches_its_deadline_gets_no_slot_though_one_is_free() {
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        endpoint.acquire(Instant::now()).await.unwrap().answered_with(503, Some(Duration::from_secs(2)));
+        let miss = endpoint.acquire(Instant::now() + Duration::from_secs(2)).await.unwrap_err();
+        assert_eq!(miss.waited, Duration::from_secs(2));
+    }
+
+    /// A megakernel that answers 429 with no wait gets the call again at
+    /// most once a second, and the resends end at the deadline.
+    ///
+    /// Falsified by a resend loop with no floor on its wait (it would send
+    /// until the guard answers), or one that sends past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_with_no_wait_is_sent_again_once_a_second_until_the_deadline() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let calls = AtomicU32::new(0);
+        let deadline = Instant::now() + Duration::from_millis(3500);
+        let answered = mk_call(&endpoint, deadline, &SlotWaits::default(), || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move { if n > 100 { Ok(()) } else { Err(busy_mk(Some(Duration::ZERO))) } }
+        })
+        .await;
+        assert!(answered.is_err(), "the resends end at the deadline with no slot");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "sent at 0, 1, 2, and 3 s");
+    }
+
+    /// A 429 that arrives at the deadline ends the call with no slot, and
+    /// the call is not sent again.
+    ///
+    /// Falsified by a resend after the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_at_the_deadline_is_not_sent_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let calls = AtomicU32::new(0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let answered = mk_call(&endpoint, deadline, &SlotWaits::default(), || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n > 1 {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(busy_mk(Some(Duration::ZERO)))
+            }
+        })
+        .await;
+        let no_slot = answered.unwrap_err();
+        assert!(no_slot.why.contains("cooling down"), "{no_slot}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Busy answers to requests in flight at one time step the doubling
+    /// once, not once each.
+    ///
+    /// Falsified by 16 simultaneous 503s that reach the 60 s cooldown.
+    #[tokio::test(start_paused = true)]
+    async fn simultaneous_busy_answers_step_the_doubling_once() {
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let far = Instant::now() + Duration::from_secs(600);
+        let mut slots = Vec::new();
+        for _ in 0..16 {
+            slots.push(endpoint.acquire(far).await.unwrap());
+        }
+        for slot in &slots {
+            slot.answered_with(503, None);
+        }
+        assert_eq!(endpoint.status().cooldown, Some((FIRST_COOLDOWN, 503)));
+        drop(slots);
+        tokio::time::sleep(FIRST_COOLDOWN).await;
+        endpoint.acquire(far).await.unwrap().answered_with(503, None);
+        assert_eq!(endpoint.status().cooldown, Some((Duration::from_secs(10), 503)));
+    }
+
+    /// Opening a stream leaves the doubling as it was; the stream's
+    /// complete end resets it.
+    ///
+    /// Falsified by an opened stream that resets the doubling.
+    #[tokio::test(start_paused = true)]
+    async fn opening_a_stream_keeps_the_doubling_and_its_end_resets_it() {
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        endpoint.acquire(Instant::now()).await.unwrap().answered_with(503, Some(Duration::from_secs(1)));
+        let far = Instant::now() + Duration::from_secs(600);
+        let (slot, opened) =
+            mk_open(&endpoint, far, &SlotWaits::default(), || async { Ok::<_, kaijutsu_mk::MkError>(()) }).await.unwrap();
+        opened.unwrap();
+        assert_eq!(endpoint.busy_in_a_row(), 1, "an open stream is not yet a success");
+        slot.completed();
+        assert_eq!(endpoint.busy_in_a_row(), 0);
+    }
+
+    /// A stream that fails mid-stream with a 503 error event cools the
+    /// endpoint.
+    ///
+    /// Falsified by a mid-stream 503 that leaves the endpoint open.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_stream_503_cools_the_endpoint() {
+        let endpoint = Endpoints::default().get("http://zorak:8090");
+        let slot = endpoint.acquire(Instant::now()).await.unwrap();
+        slot.failed_mk(&kaijutsu_mk::MkError::Stream(kaijutsu_mk::ServiceError {
+            code: 503,
+            message: "spin".into(),
+            r#type: "pass_timeout_error".into(),
+        }));
+        assert_eq!(endpoint.status().cooldown, Some((FIRST_COOLDOWN, 503)));
     }
 }

@@ -33,7 +33,9 @@ in the first place.
   (scheme, host, and port), written `http://zorak:8090` or
   `https://api.anthropic.com:443`, with the default port written out. Two
   backends that name the same server share one limiter, and so do the gate's
-  `[council] server` and an `mk` backend at the same address. A backend with
+  `[council] server` and an `mk` backend at the same address. The key is the
+  host as written, not its address: `http://zorak:8090` and
+  `http://100.83.138.103:8090` are two endpoints, so name a server one way. A backend with
   no base URL is its own endpoint, `hosted backend <name>`: two hosted
   Anthropic backends with different keys do not cool each other down. The
   kernel owns the limiters (`Kernel::endpoints`), and they outlive registry
@@ -45,12 +47,26 @@ in the first place.
   are the first to set it.
 - **A cooldown.** A 429 or 503 starts a cooldown for the whole endpoint:
   `Retry-After` when the answer carries one, else 5 s, doubled on each
-  busy answer in a row up to 60 s, and reset by the next success. During a
-  cooldown no new request starts; waiting callers keep waiting.
+  cooldown round in a row up to 60 s, and reset by the next completed
+  answer. A cooldown lasts at least 1 s, `Retry-After: 0` included. During
+  a cooldown no new request starts; waiting callers keep waiting.
+- **One step per round.** Busy answers that arrive while the endpoint is
+  already cooling down do not step the doubling again, so 16 requests in
+  flight that all answer 503 start a 5 s cooldown, not a 60 s one.
+- **A completed answer resets the doubling; an open stream does not.** A
+  non-streamed 2xx is a completed answer. A stream that opens with 200 is
+  not one yet: it resets the doubling when it reaches its end event (mk
+  `done`, Anthropic `message_stop`, OpenAI `[DONE]`). A stream that fails
+  with an error event carrying 429 or 503, such as the megakernel's
+  mid-stream 503 `pass_timeout_error`, is a busy answer and starts a
+  cooldown. A server that answers 200 and then fails every stream would
+  otherwise hold the doubling at 5 s.
 - **Waiting is bounded by the caller's own deadline.** A council decision
   waits within its `deadline_ms`, a judge read within its 30 s, shadow
   priming within 30 s, and a model turn within its backend's request
-  timeout (600 s when unset). A caller that cannot get a slot in time fails
+  timeout (600 s when unset). A caller that finds a free slot when it asks
+  takes it; a caller that has waited gets no slot at or after its deadline,
+  even when one is free at that instant. A caller that cannot get a slot in time fails
   the way a timeout fails today: the gate records a miss whose cause names
   the wait (`no answer within the 700 ms deadline: the deadline passed
   waiting 700 ms for a slot at http://zorak:8090 (2 of 2 slots in
@@ -61,8 +77,12 @@ in the first place.
   body type `busy`, before any work starts (`docs/mk-admission.md`). A 429
   from an mk endpoint therefore means "did not get a slot": the cooldown
   starts, and the same caller sends the same call again once it ends, still
-  within its own deadline. This covers the `mk` provider and every council
-  call. A 503, a 429 from another provider, and any failure after a
+  within its own deadline. Each cooldown lasts at least 1 s, so the resends
+  are at most one a second and end at the deadline. The `mk` provider gives
+  each resent call only the time left before its turn's deadline, as the
+  gate does. A streamed generate gets the time left to open, and then its
+  full request timeout for each read. This covers the `mk` provider and
+  every council call. A 503, a 429 from another provider, and any failure after a
   request started are not sent again by the limiter.
 - **Retries stay where they are.** A bump-only seat already sends again
   after a miss, a judge read is optional, and a turn that fails is visible
@@ -78,10 +98,13 @@ Every outbound model request takes a slot first:
    `LlmRegistry` (anthropic, deepseek, openai-compatible, mk).
    `Provider::from_backend` gives each client its endpoint. Anthropic and
    the OpenAI-compatible clients take one slot per request; a streamed
-   reply holds it until the stream finishes. The mk client takes a slot
+   reply holds it until the stream finishes. The Anthropic client's
+   context-window lookup, `GET /v1/models/{id}`, takes a slot too; its
+   answer starts no cooldown. The mk client takes a slot
    for each call it makes (model, render, generate), and a streamed
    generate holds its slot until the stream ends. `codex-app` takes no
-   slot: it reaches a local daemon, not a model endpoint.
+   slot: it reaches a local daemon, not a model endpoint, and `kj backend
+   set` refuses `--max-concurrent` on it.
 2. Council calls (`council/sync.rs`, `council/gate.rs`): identity, spec
    POST, and context PUT while preparing, and the decision itself, for the
    gate's decisions, observations, shadow priming, and the judge's reads.
@@ -110,7 +133,9 @@ kj backend show mk-zorak
 again. `--max-concurrent` must be at least 1; omitting it is unlimited, the
 default. The limit is the `backends.max_concurrent` column. Two backends at
 one origin with different limits use the smaller one, and `kj backend
-show` says so:
+show` says so. Only backends that built set a limit: a backend the registry
+skips (no key, say) does not cap the backends beside it, and `kj backend
+show` reports its limit as `not applied: the backend is not registered`.
 
 ```text
 Max concurrent: 2
@@ -156,7 +181,18 @@ Each of these waits for a reading that says the simple form is not enough:
 - A 429 with `Retry-After: 2` delays the next request to that endpoint
   by 2 s, and does not delay another endpoint (`llm/endpoint.rs`).
 - Busy answers in a row double the cooldown from 5 s, and a success
-  resets it (`llm/endpoint.rs`).
+  resets it; busy answers during one cooldown step it once; every
+  cooldown lasts at least 1 s (`llm/endpoint.rs`).
+- A caller that waited until its deadline gets no slot though one is free;
+  a megakernel 429 with no wait is sent again at most once a second until
+  the deadline; a 429 at the deadline is not sent again
+  (`llm/endpoint.rs`).
+- Opening a stream keeps the doubling, and a stream that ends whole resets
+  it; a mid-stream 503 cools the endpoint (`llm/endpoint.rs`,
+  `llm/mk/mod.rs`, `llm/claude/mod.rs`, `llm/openai/mod.rs`).
+- A backend that does not build sets no limit (`llm/db_config.rs`), `kj
+  backend show` says so, and `kj backend set` refuses `--max-concurrent`
+  on codex-app (`kj/backend.rs`).
 - A council decision that cannot get a slot within its deadline is a miss
   whose cause names the wait, and its `queue_ms` is the time it waited
   (`council/gate_e2e.rs`).
@@ -166,8 +202,10 @@ Each of these waits for a reading that says the simple form is not enough:
   names the smaller limit (`llm/endpoint.rs`, `kj/backend.rs`).
 - An mk turn holds its slot until its stream ends, sends a 429 again after
   `Retry-After`, does not send a 503 again, and fails `RateLimited` when it
-  gets no slot in its timeout (`llm/mk/mod.rs`). The anthropic and
-  OpenAI-compatible clients cool their endpoint on 503 and 429
-  (`llm/claude/mod.rs`, `llm/openai/mod.rs`).
+  gets no slot in its timeout, and gives a resent call only the time left
+  before its deadline (`llm/mk/mod.rs`). The Anthropic client cools its
+  endpoint on 503 and 429 (`llm/claude/mod.rs`), and its context-window
+  lookup takes a slot; the OpenAI-compatible client cools on 429
+  (`llm/openai/mod.rs`).
 - The megakernel client opens a new connection after an answer that says
   `Connection: close` (`kaijutsu-mk/src/client.rs`).

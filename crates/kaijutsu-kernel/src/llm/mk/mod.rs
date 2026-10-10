@@ -80,18 +80,28 @@ impl Client {
     /// One call to the service through this client's endpoint
     /// ([`crate::llm::endpoint::mk_call`]): a slot first, and the same call
     /// again after the cooldown when the service answers 429, all within
-    /// `turn`'s deadline. Returns the slot, which a stream holds until it
-    /// ends. With no endpoint, the call goes straight out.
-    async fn call<T, F, Fut>(&self, turn: &Turn, call: F) -> LlmResult<(Option<Slot>, T)>
+    /// `turn`'s deadline. `call` is given each attempt's timeout, the time
+    /// left before the deadline and no more than the client's timeout, and
+    /// each attempt ends at the deadline. Returns the slot, which a stream
+    /// holds until it ends. With no endpoint, the call goes straight out.
+    async fn call<T, F, Fut>(&self, turn: &Turn, opens_stream: bool, mut call: F) -> LlmResult<(Option<Slot>, T)>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = Result<T, MkError>>,
     {
-        let Some(endpoint) = &self.endpoint else {
-            let mut call = call;
-            return call().await.map(|v| (None, v)).map_err(|e| to_llm(&self.name, e));
+        let mut attempt = || {
+            let left = turn.deadline.saturating_duration_since(tokio::time::Instant::now()).min(self.timeout);
+            let sent = call(left);
+            async move { tokio::time::timeout_at(turn.deadline, sent).await.unwrap_or(Err(MkError::Timeout)) }
         };
-        let answered = crate::llm::endpoint::mk_call(endpoint, turn.deadline, &turn.waits, call).await;
+        let Some(endpoint) = &self.endpoint else {
+            return attempt().await.map(|v| (None, v)).map_err(|e| to_llm(&self.name, e));
+        };
+        let answered = if opens_stream {
+            crate::llm::endpoint::mk_open(endpoint, turn.deadline, &turn.waits, attempt).await
+        } else {
+            crate::llm::endpoint::mk_call(endpoint, turn.deadline, &turn.waits, attempt).await
+        };
         tracing::Span::current().record("llm.slot_wait_ms", turn.waits.total().as_millis() as u64);
         match answered {
             Ok((slot, result)) => result.map(|v| (Some(slot), v)).map_err(|e| to_llm(&self.name, e)),
@@ -124,7 +134,7 @@ impl Client {
             max_tokens: Some(max_tokens),
             ..GenerateRequest::messages(messages, Vec::new())
         };
-        let (_slot, done) = self.call(&turn, || self.mk.generate(&request, self.timeout)).await?;
+        let (_slot, done) = self.call(&turn, false, |left| self.mk.generate(&request, left)).await?;
         match done.finish {
             Finish::Stop => Ok(done.content),
             Finish::Length => Err(LlmError::ApiError(format!(
@@ -160,7 +170,9 @@ impl Client {
             max_tokens: Some(max_tokens),
         };
         let started = Instant::now();
-        let (slot, inner) = self.call(&turn, || self.mk.generate_stream(&request, self.timeout)).await?;
+        // The stream opens within the turn's deadline, and then waits up to
+        // the client's timeout for each read.
+        let (slot, inner) = self.call(&turn, true, |_| self.mk.generate_stream(&request, self.timeout)).await?;
         Ok(Stream {
             name: self.name.clone(),
             inner: Some(inner),
@@ -194,7 +206,7 @@ impl Client {
             reasoning_effort,
             generation_prompt: None,
         };
-        let (_slot, rendered) = self.call(turn, || self.mk.render(&render, self.timeout)).await?;
+        let (_slot, rendered) = self.call(turn, false, |left| self.mk.render(&render, left)).await?;
         admit(&self.name, u64::from(rendered.n_tokens), window, asked)
     }
 
@@ -205,7 +217,7 @@ impl Client {
         let max_context = *self
             .max_context
             .get_or_try_init(|| async {
-                let (_slot, model) = self.call(turn, || self.mk.model()).await?;
+                let (_slot, model) = self.call(turn, false, |_| self.mk.model()).await?;
                 Ok::<_, LlmError>(u64::from(model.max_context))
             })
             .await?;
@@ -274,7 +286,9 @@ pub struct Stream {
     finished: bool,
     started: Instant,
     first_token: Option<Duration>,
-    /// Released once the stream finishes.
+    /// Released once the stream finishes. Told how the stream ended: its
+    /// done event is a completed answer, and an error event with 429 or 503
+    /// is a busy one.
     slot: Option<Slot>,
 }
 
@@ -308,6 +322,9 @@ impl Stream {
                     Some(Ok(GenerateEvent::Done(done))) => {
                         self.finished = true;
                         self.inner = None;
+                        if let Some(slot) = &self.slot {
+                            slot.completed();
+                        }
                         let timing = Timing {
                             first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
                             wall_ms: self.started.elapsed().as_millis() as u64,
@@ -322,6 +339,9 @@ impl Stream {
                     Some(Err(e)) => {
                         self.finished = true;
                         self.inner = None;
+                        if let Some(slot) = &self.slot {
+                            slot.failed_mk(&e);
+                        }
                         return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name)));
                     }
                     None => {
@@ -656,5 +676,57 @@ mod tests {
             other => panic!("expected RateLimited, got {other:?}"),
         }
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// A call sent again after a 429 gets only the time left before the
+    /// turn's deadline, not the whole timeout again.
+    ///
+    /// Falsified by a resend that waits its full timeout: the turn would
+    /// fail about 3 s in, past its 2 s deadline.
+    #[tokio::test]
+    async fn a_resent_call_gets_only_the_time_left_before_the_deadline() {
+        let mut slow = rendered(30);
+        slow.delay = Duration::from_secs(4);
+        let (base, _) = serve(vec![http(200, MODEL), busy(), slow]).await;
+        let (c, _) = limited(&base, Duration::from_secs(2));
+        let started = std::time::Instant::now();
+        let err = c.stream(opts(64), vec![Message::user("hi")]).await.err().unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(2500), "the turn ended after {took:?}: {err:?}");
+    }
+
+    /// A stream that fails with a 503 error event cools the endpoint.
+    ///
+    /// Falsified by a mid-stream 503 that never reaches the limiter.
+    #[tokio::test]
+    async fn a_mid_stream_503_cools_the_endpoint() {
+        let cut = &ANSWER[..ANSWER.find("event: done").unwrap()];
+        let failed = format!(
+            "{cut}event: error\ndata: {}\n\n",
+            r#"{"error":{"code":503,"message":"spin","type":"pass_timeout_error"}}"#
+        );
+        let (base, _) = serve(vec![http(200, MODEL), rendered(10), sse(failed)]).await;
+        let (c, endpoint) = limited(&base, Duration::from_secs(5));
+        let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        let events = drain(&mut stream).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Error(m)) if m.contains("pass_timeout_error")), "{events:?}");
+        let (_, status) = endpoint.status().cooldown.expect("cooling down");
+        assert_eq!(status, 503);
+    }
+
+    /// A stream that reaches its done event resets the doubling.
+    ///
+    /// Falsified by a stream whose end leaves a busy answer counted.
+    #[tokio::test]
+    async fn a_stream_that_ends_whole_resets_the_doubling() {
+        let (base, _) = serve(vec![http(200, MODEL), rendered(30), sse(ANSWER)]).await;
+        let (c, endpoint) = limited(&base, Duration::from_secs(5));
+        let mut stream = c.stream(opts(64), vec![Message::user("hi")]).await.unwrap();
+        let far = tokio::time::Instant::now() + Duration::from_secs(5);
+        endpoint.acquire(far).await.unwrap().answered_with(503, Some(Duration::ZERO));
+        assert_eq!(endpoint.busy_in_a_row(), 1);
+        let events = drain(&mut stream).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
+        assert_eq!(endpoint.busy_in_a_row(), 0);
     }
 }

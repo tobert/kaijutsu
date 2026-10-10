@@ -88,7 +88,7 @@ enum BackendCommand {
         /// host, and port of --base-url; a backend with no --base-url is its
         /// own endpoint). A request past the limit waits for a slot until its
         /// own deadline. Backends at one endpoint use the smallest limit.
-        /// Unset is unlimited.
+        /// Unset is unlimited. Refused for codex-app, which takes no slot.
         #[arg(long = "max-concurrent")]
         max_concurrent: Option<u32>,
     },
@@ -460,12 +460,23 @@ impl KjDispatcher {
         if let Some(t) = backend.idle_timeout_secs {
             lines.push(format!("Idle timeout: {t}s"));
         }
-        lines.push(format!(
-            "Max concurrent: {}",
-            backend.max_concurrent.map_or_else(|| "unlimited".to_string(), |n| n.to_string())
-        ));
-        let endpoint = match crate::llm::endpoint::endpoint_key(&backend.name, backend.base_url.as_deref()) {
-            Ok(key) => Some(self.kernel().endpoints().get(&key).status()),
+        let endpoint = crate::llm::endpoint::endpoint_key(&backend.name, backend.base_url.as_deref())
+            .map(|key| self.kernel().endpoints().get(&key).status());
+        // A limit applies once the registry built the backend; the endpoint
+        // then lists it.
+        let applied = backend.max_concurrent.map(|_| {
+            endpoint.as_ref().is_ok_and(|e| e.backends.iter().any(|(name, _)| *name == backend.name))
+        });
+        lines.push(match (backend.max_concurrent, applied) {
+            (None, _) => "Max concurrent: unlimited".to_string(),
+            (Some(n), Some(false)) => format!(
+                "Max concurrent: {n}, not applied: the backend is not registered, so it sets no limit \
+                 at its endpoint until `kj backend set` fixes what kept it from building"
+            ),
+            (Some(n), _) => format!("Max concurrent: {n}"),
+        });
+        let endpoint = match endpoint {
+            Ok(status) => Some(status),
             Err(e) => {
                 lines.push(format!("Endpoint: none ({e})"));
                 None
@@ -493,6 +504,7 @@ impl KjDispatcher {
             "request_timeout_secs": backend.request_timeout_secs,
             "idle_timeout_secs": backend.idle_timeout_secs,
             "max_concurrent": backend.max_concurrent,
+            "max_concurrent_applied": applied,
             "endpoint": endpoint.as_ref().map(|e| serde_json::json!({
                 "key": e.key,
                 "limit": e.limit,
@@ -1291,6 +1303,41 @@ mod tests {
         match r {
             KjResult::Err(msg) => assert!(msg.contains("--max-concurrent must be at least 1"), "{msg}"),
             other => panic!("a limit of 0 must fail: {other:?}"),
+        }
+    }
+
+    /// `kj backend show` says a backend's limit is not applied when the
+    /// backend did not build.
+    #[tokio::test]
+    async fn show_says_a_limit_is_not_applied_when_its_backend_did_not_build() {
+        let d = seeded().await;
+        let c = test_caller();
+        let args = ["backend", "set", "broken", "--kind", "anthropic", "--base-url", "http://zorak:8090",
+            "--api-key-env", "KJ_TEST_NO_SUCH_KEY", "--max-concurrent", "1"];
+        let r = d.dispatch(&argv(&args), &c).await;
+        assert!(matches!(r, KjResult::Ok { .. }), "{r:?}");
+        match d.dispatch(&argv(&["backend", "show", "broken"]), &c).await {
+            KjResult::Ok { message: text, data: Some(data), .. } => {
+                assert!(text.contains("Max concurrent: 1, not applied: the backend is not registered"), "{text}");
+                assert!(text.contains("  Limit: unlimited\n"), "{text}");
+                assert_eq!(data["max_concurrent_applied"], false);
+            }
+            other => panic!("expected show text and data: {other:?}"),
+        }
+    }
+
+    /// `--max-concurrent` on a codex-app backend is refused: codex-app
+    /// takes no slot.
+    #[tokio::test]
+    async fn set_refuses_a_max_concurrent_on_codex_app() {
+        let d = seeded().await;
+        let c = test_caller();
+        let r = d
+            .dispatch(&argv(&["backend", "set", "codex", "--kind", "codex-app", "--base-url", "ws://127.0.0.1:4500", "--max-concurrent", "2"]), &c)
+            .await;
+        match r {
+            KjResult::Err(msg) => assert!(msg.contains("codex-app takes no slot"), "{msg}"),
+            other => panic!("a limit on codex-app must fail: {other:?}"),
         }
     }
 }
