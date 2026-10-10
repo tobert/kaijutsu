@@ -322,6 +322,27 @@ the model under observation has tried."
   servers and hydrated whole for chat models; kaijutsu manages the server
   cache, no cap yet. Open items are listed in the design.
 
+## A banto's own kj work asks its reviewer for each verb (2026-10-10)
+
+A new `director` seat played by banto on moltar (`banto-shadow`) raised an
+ask to Amy for `kj context create ... --as coder` and again for
+`kj drive <coder> --prompt ...`; every kj verb it runs to do its job comes
+to the human. Amy, 2026-10-10: "there should be fewer asks on a banto
+operating on kaijutsu... but that can be tasks for later." Open: which
+director verbs `gate.toml` or the director rc should allow (create of its
+own children, drive and wait on them), and whether that belongs to the
+type or to the character.
+
+## `kj context create --cwd` accepts a directory no shell can write (2026-10-10)
+
+On moltar, `kj context create shadow-coder-1 --type coder --cwd
+/home/atobey/scratch/...` succeeded although only `$HOME/src` and `/tmp`
+are writable mounts (`docs/mounts.md`). The coder's first `touch` failed,
+and the DeepSeek coder then explored `~/src/bench-work` and other trees
+looking for a writable place, outside its brief. Open: warn or refuse at
+create when a writing seat's cwd is not under a read-write mount, and say
+which mounts are writable in the coder's runtime facts.
+
 ## Council presets per context (Amy, 2026-10-08)
 
 Amy: "bumps should only be enabled on coders and optionally. maybe we come

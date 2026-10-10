@@ -448,10 +448,17 @@ shipped. A fresh session resumes at the first step not marked done.
    cast is `mk-judge`. A smoke seat played by `coder` ran `mkdir` then
    `rmdir`: priming took 1.6 s and 4.2 s, the gate's council answered
    proceed at 0.992 and 0.953, and the judge with the history answered
-   proceed at 0.994 and 0.967. Still to do: run banto's coders as
-   `coder`, then read priming time, answer time, snapshot count, and the
-   disagreement rate. Record the numbers in
-   `docs/devlog.md`.
+   proceed at 0.994 and 0.967. First real seats, 2026-10-10: a DeepSeek
+   banto (`banto-shadow`) ran two DeepSeek coders `--as coder`, judge on
+   `mk-zorak`. Over 29 judged decisions the judge answered 27, all
+   `proceed`, and agreed with every gate pass; the gate bumped two as
+   `unjudged` (misses) where the judge, with the history, said proceed.
+   The judge's two misses were priming that did not finish in its 30 s.
+   Gate time rose from 1.1 s to 12.9 s and judge time from 1.5 s to
+   18 s on the first seat, which ran more calls in a burst; the gate reads
+   no history, so the rise is the shared server's load, not the shadow's
+   length. Still to do: a seat that does something the gate should doubt,
+   priming time and snapshot count from the server, and more seats.
 5. **Jev hydration.** A chat-model judge gets the whole dialogue as one
    script-like transcript per request. Compare it with the megakernel on
    the same seats.
