@@ -604,8 +604,13 @@ fn kaijutsu_session_scenario() {
         // just a recorded decision (`docs/gate-resume.md`, "Slice 5:
         // approval executes"): the ask's own linked output block fills in
         // with the command's real stdout.
-        let output_block_id = ask
-            .output_block_id
+        // The pair is linked after the ask row exists (`link_ask_blocks`),
+        // so read the row again rather than the copy found while pending.
+        let linked = |id: &str| {
+            s.kernel.kernel_db.lock().get_approval(id).unwrap().and_then(|row| row.output_block_id)
+        };
+        wait_for("the ask to link its output block", || linked(&ask.request_id).is_some()).await;
+        let output_block_id = linked(&ask.request_id)
             .as_deref()
             .and_then(kaijutsu_types::BlockId::from_key)
             .expect("an executable ask links an output block");
