@@ -207,8 +207,9 @@ enum ContextCommand {
     /// workspace, env, and cwd, then runs the `create` rc lifecycle.
     /// `ROTATED_FROM` names the predecessor by id. When the successor has a
     /// loadout, it takes the label, the ring seat, and any character's
-    /// `root_ctx` pointer, and the predecessor is archived. The performer
-    /// or the lineage root may rotate.
+    /// `root_ctx` pointer, and the predecessor is archived after its
+    /// `archive` rc lifecycle runs. The performer or the lineage root may
+    /// rotate.
     Rotate {
         /// Context to rotate. Defaults to the current context. Ids and
         /// labels come from `kj context list`.
@@ -250,7 +251,8 @@ enum ContextCommand {
     },
     /// Push a context outward one step on the demote ladder: promoted →
     /// unpromoted, unpromoted/undemoted → demoted, already demoted →
-    /// archived. Not latched; restore with `kj context promote <id>`.
+    /// archived, after its `archive` rc lifecycle runs. Not latched;
+    /// restore with `kj context promote <id>`.
     Demote {
         /// Context to push one step down the ladder. Ids and labels come
         /// from `kj context list`.
@@ -2415,7 +2417,8 @@ impl KjDispatcher {
     /// The `create` rc lifecycle runs next and cannot share a transaction.
     /// Only a successor with a usable loadout takes over: one more
     /// transaction archives the predecessor and moves its label, ring seat,
-    /// and `root_ctx` pointers. Otherwise the predecessor stays live and
+    /// and `root_ctx` pointers, after the predecessor's `archive` rc
+    /// lifecycle runs. Otherwise the predecessor stays live and
     /// the successor stays unlabeled for inspection. The hydration window
     /// is not copied: its marker names a block in the predecessor.
     async fn context_rotate(&self, ctx_ref: Option<&str>, caller: &KjCaller) -> KjResult {
@@ -2522,6 +2525,13 @@ impl KjDispatcher {
             )),
         }
 
+        // The predecessor's archive lifecycle runs while it is still live,
+        // as `kj context archive` runs it; the rotation commits after it.
+        if let Err(e) = self.run_archive_lifecycle(predecessor.context_id, caller).await {
+            return KjResult::Err(format!(
+                "kj context rotate: {name} stays live and the successor {successor_id} is unlabeled: {e}"
+            ));
+        }
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj context rotate: owner cancelled before committing successor {successor_id}; \
@@ -2659,6 +2669,16 @@ impl KjDispatcher {
                 Err(e) => return KjResult::Err(format!("kj context demote: {e}")),
             }
         };
+
+        // The ladder's next step archives an already demoted context; its
+        // archive lifecycle runs first, as `kj context archive` runs it.
+        let archives = matches!(
+            self.kernel_db().lock().get_context(target_id),
+            Ok(Some(row)) if row.demoted_at.is_some() && !row.is_archived()
+        );
+        if archives && let Err(e) = self.run_archive_lifecycle(target_id, caller).await {
+            return KjResult::Err(format!("kj context demote: {} stays live: {e}", target_id.short()));
+        }
 
         let outcome = {
             let db = self.kernel_db().lock();
@@ -3918,6 +3938,36 @@ mod tests {
         assert!(!archived.is_ok() && archived.message().contains("archived"), "{}", archived.message());
     }
 
+    /// Whether `ctx` has a recorded run of the `archive` rc lifecycle.
+    fn archive_lifecycle_ran(d: &crate::kj::KjDispatcher, ctx: ContextId) -> bool {
+        let db = d.kernel_db().lock();
+        approval_ledger::rc_runs::list_runs(db.conn_for_ledger())
+            .unwrap()
+            .into_iter()
+            .any(|r| r.context_id == ctx.as_bytes().to_vec() && r.verb == crate::rc::VERB_ARCHIVE)
+    }
+
+    /// Install an `archive` script for `ctx`'s context type.
+    async fn install_archive_script(d: &crate::kj::KjDispatcher, ctx: ContextId, body: &str) {
+        let context_type = d.kernel_db().lock().get_context(ctx).unwrap().unwrap().context_type;
+        install_rc_script_file(d, &format!("/config/rc/{context_type}/archive/S10-test.kai"), body).await;
+    }
+
+    /// Rotation archives the predecessor through its `archive` lifecycle,
+    /// so its scripts (a coder's judge shadows) run as they do for
+    /// `kj context archive`.
+    ///
+    /// Falsified by archiving the predecessor inside the rotation
+    /// transaction alone: no archive run is recorded for it.
+    async fn rotate_runs_the_predecessor_s_archive_lifecycle_body() {
+        let f = rotation_fixture().await;
+        install_archive_script(&f.d, f.seat, "true").await;
+        let rotated = f.d.dispatch(&[s("context"), s("rotate")], &rotation_caller(f.seat, f.banto)).await;
+        assert!(rotated.is_ok(), "{}", rotated.message());
+        assert!(archive_lifecycle_ran(&f.d, f.seat), "the predecessor's archive lifecycle ran");
+        assert!(f.d.kernel_db().lock().get_context(f.seat).unwrap().unwrap().archived_at.is_some());
+    }
+
     /// A root context rotates too: a parentless successor, and the root
     /// character's pointer moves with it.
     async fn rotate_a_root_context_body() {
@@ -4009,6 +4059,11 @@ mod tests {
     #[test]
     fn rotate_a_root_context() {
         crate::on_rc_thread(rotate_a_root_context_body);
+    }
+
+    #[test]
+    fn rotate_runs_the_predecessor_s_archive_lifecycle() {
+        crate::on_rc_thread(rotate_runs_the_predecessor_s_archive_lifecycle_body);
     }
 
     // Creating through a shell re-enters kaish for rc; use the production rc stack.
@@ -5195,6 +5250,27 @@ mod tests {
             "the Validation message should surface through the verb: {}",
             result.message()
         );
+    }
+
+    /// Demoting past the rim archives through the `archive` lifecycle, as
+    /// `kj context archive` does. Falsified by archiving in the demote
+    /// ladder alone: no archive run is recorded.
+    #[tokio::test]
+    async fn context_demote_past_the_rim_runs_the_archive_lifecycle() {
+        let d = std::sync::Arc::new(test_dispatcher().await);
+        d.set_self_arc();
+        d.kernel().broker().set_kj_dispatcher(&d).await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let target = register_context(&d, Some("outward"), Some(parent), principal);
+        install_archive_script(&d, target, "true").await;
+        let c = confirmed_caller(parent);
+        let demoted = d.dispatch(&[s("context"), s("demote"), s("outward")], &c).await;
+        assert!(demoted.is_ok(), "{}", demoted.message());
+        assert!(!archive_lifecycle_ran(&d, target), "a demote that does not archive runs no archive lifecycle");
+        let archived = d.dispatch(&[s("context"), s("demote"), s("outward")], &c).await;
+        assert!(archived.is_ok() && archived.message().contains("archived"), "{}", archived.message());
+        assert!(archive_lifecycle_ran(&d, target), "the archive lifecycle ran before demote archived it");
     }
 
     #[tokio::test]

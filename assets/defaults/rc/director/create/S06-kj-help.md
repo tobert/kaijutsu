@@ -34,9 +34,9 @@ kj rc list
 See the context types this kernel has and their lifecycle scripts.
 
 kj character list
-Find the character who will perform a new context.
+Find the character who will perform a new context. The `coder` character plays coder contexts; if it is missing, we ask the human.
 
-kj context create fix-login --type coder --as <character>
+kj context create fix-login --type coder --as coder
 Start one piece of work in its own context. Pick the type that fits the work; coder is one type.
 
 kj drive fix-login --prompt "<the work, what it may touch, what done looks like, and how to check it>"

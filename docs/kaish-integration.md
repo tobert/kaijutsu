@@ -44,8 +44,11 @@ lifecycle while the context still admits work, so a script can write a
 summary into it or archive the contexts it owns; `kj character retire` runs
 it for each context the character plays. A failing script is recorded and
 the archive still commits; a cancelled lifecycle, or one that cannot
-settle, leaves the context live. Rotation and demotion archive without it
-for now (`docs/issues.md`, "Archive paths that skip the archive lifecycle").
+settle, leaves the context live. `kj context rotate` runs it on the
+predecessor after the successor's `create` lifecycle and before the
+rotation commits, and `kj context demote` runs it before the step that
+archives; a cancelled or unsettled lifecycle refuses either and leaves the
+context live.
 `kj context archive --children [--type <type>]` archives a context's live
 children, each through its own lifecycle.
 Already accepted commands retain their settlement destination across archive.
