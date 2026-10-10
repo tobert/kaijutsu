@@ -3337,3 +3337,29 @@ The same review retired `shellDryRun`. The Claude Code hook had forwarded
 every Bash call into a dry-run PreCall that recorded an abandoned ask; on
 zorak those were a third of all asks and still arriving, each one a bump
 that clients polled on. The broker's evaluator only enforces now.
+
+## Reading the bumps back (October 10)
+
+Bump-only had no way out but more bumps, and no way to see them: a bump is a
+council decision with no ask, so `kj ledger list` never showed one. Amy's
+rule was "escalate after N consecutive bumps in N minutes, but observe
+first", so the order was the reading, then the mechanism, then the numbers.
+
+The council now reads `undo` beside the rubric. Amy turned down a broad risk
+read: "reversibility and 'situation normal; not reversible but this is a
+normal operation with expected changes' is what we want." The read never
+decides and has no mass floor; it lands in the record and in the bump
+message. `kj ledger bumps` shows each seat's streak, and on moltar the
+first reading already showed banto stopped after three bumps in a row three
+days earlier. `escalate = { bumps, minutes }` reuses the bump-limit path: the
+verdict carries the streak and the gate's ordinary ask follows. It counts
+across submissions, because a seat that keeps rewording is still stuck, and
+the escalated ask ends the streak. It stays off until the readings pick N
+and M.
+
+The same day closed the shadow's loose end: rotate and demote now archive
+through the archive lifecycle, so a rotated coder no longer keeps a live
+judge. A lifecycle that cannot settle refuses the rotation; an orphaned
+shadow is worse than a refused rotation. banto's help names the `coder`
+character, so its seats get the judge from the character's default cast.
+The step-4 numbers wait for the megakernel, which was training that day.
