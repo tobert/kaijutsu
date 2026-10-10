@@ -445,12 +445,20 @@ shipped. A fresh session resumes at the first step not marked done.
    seat's call, a task of its own reads `[council] contexts`, the shell
    spec's own contexts, and the house rules when they are on, then the
    shadow, on the judge's server, under the decision's spec and case,
-   with a 30 s deadline (`shadow::spawn_judge`). Reviewer contexts are not read. The
+   with a 30 s deadline (`shadow::spawn_judge`). The shadow counts toward
+   the server's `contexts_per_decision`: a judge read over the limit is a
+   miss that names the limit and every context, before anything is sent,
+   and the gate's decision on the same contexts is unaffected. A `judge`
+   slot on an `mk` backend with no `base_url` is never primed, and each
+   judge read is a miss that names the backend. Reviewer contexts are not read. The
    answer is a `council_observations` row on the decision, with
    `reviewer_label` `judge-<seat>`, and it is added to the call's outcome
    turn as `; judge: <choice> (p=<pooled p>)`. A call a static rule
    decided is recorded but not judged. The judge never changes the
-   decision. Test: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`.
+   decision. The judge reads on its own slot's server, whatever server
+   the gate decides on. Tests: `a_judge_answers_after_the_decision_and_its_answer_is_recorded`,
+   `a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other`,
+   `a_judge_read_over_the_context_limit_is_a_miss_naming_it`.
    Still open: whether the judge should read the reviewer contexts.
 4. **Measure on moltar.** Wired 2026-10-09: backend `mk-zorak`, cast
    `mk-judge` (one `judge` slot), and a `coder` character whose default
@@ -689,10 +697,14 @@ other server is asked in its place. The slot's `--model` is required by
 `kj cast slot set` and is not read; the server's identity is recorded with
 each decision. The role is `gate`, not `council`, because `council` is a
 context type: a council context playing a cast with a `council` slot
-would take that slot as its chat model. The cast chooses only the server;
+would take that slot as its chat model. `gate` is a reserved role: no
+context resolves its chat model from a `gate` slot, and `kj context
+create` and `kj context set` refuse `--type gate` as a cast role, not a
+context type. The cast chooses only the server;
 whether a type gets the council, `mode`, specs, thresholds, contexts, and
-`deadline_ms` stay in `gate.toml`. The decision and the observing reviewer contexts
-read after it go to the cast's server, under that server's endpoint
+`deadline_ms` stay in `gate.toml`. Every decision on the submission, program
+decisions included, and the observing reviewer contexts read after it go to
+the cast's server, under that server's endpoint
 concurrency limit (`docs/retries-and-ratelimits.md`).
 
 A context type's `contexts` replaces `[council] contexts` for that type.

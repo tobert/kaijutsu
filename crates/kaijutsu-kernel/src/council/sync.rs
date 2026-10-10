@@ -98,7 +98,11 @@ pub(crate) fn no_slot_cause(deadline_ms: u64, no_slot: &NoSlot) -> String {
 /// endpoint, and the deadline that bounds every slot wait.
 struct Link<'a> {
     client: &'a MkClient,
+    /// The server as configured, for messages.
     server: &'a str,
+    /// The server's origin (`llm::endpoint::origin`), which keys what this
+    /// kernel believes it holds, so two spellings of one server share it.
+    key: String,
     endpoint: Arc<Endpoint>,
     deadline: tokio::time::Instant,
     deadline_ms: u64,
@@ -119,9 +123,11 @@ impl Link<'_> {
     }
 }
 
-/// The endpoint `server` addresses.
-fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<Arc<Endpoint>, PrepareMiss> {
-    kernel.endpoints().for_url(server).map_err(|e| PrepareMiss(format!("council server {server}: {e}")))
+/// The endpoint `server` addresses, and its origin.
+fn endpoint_of(kernel: &crate::Kernel, server: &str) -> Result<(Arc<Endpoint>, String), PrepareMiss> {
+    let missed = |e: String| PrepareMiss(format!("council server {server}: {e}"));
+    let key = crate::llm::endpoint::origin(server).map_err(missed)?;
+    Ok((kernel.endpoints().for_url(server).map_err(missed)?, key))
 }
 
 /// Why the council cannot be asked right now, in plain words; the gate
@@ -136,6 +142,7 @@ struct Held {
     head: SnapshotId,
 }
 
+/// Keyed by each server's origin.
 #[derive(Default)]
 struct State {
     identities: HashMap<String, ServerIdentity>,
@@ -238,10 +245,14 @@ impl CouncilSync {
     /// read after the labels. A seat with no `AGENTS.md` above its working
     /// directory adds no context.
     ///
+    /// `added` names the contexts the caller adds to the decision after
+    /// this prepare, such as a judge's shadow. They are not sent here, and
+    /// they count toward the server's limit.
+    ///
     /// A miss, before any context is sent: a spec holding a `text` question
     /// when the server lacks the `describe` capability, a label listed twice,
-    /// and more contexts, the house rules included, than the server's
-    /// `contexts_per_decision`.
+    /// and more contexts, the house rules and `added` included, than the
+    /// server's `contexts_per_decision`.
     ///
     /// Each call waits for a slot no later than `deadline`, adding its wait
     /// to `waits`.
@@ -253,15 +264,16 @@ impl CouncilSync {
         spec_name: &str,
         labels: &[String],
         seat: Option<ContextId>,
+        added: &[String],
         deadline: tokio::time::Instant,
         waits: &SlotWaits,
     ) -> Result<Prepared, PrepareMiss> {
         let _serial = self.serial.lock().await;
         let server = council.server.as_str();
+        let (endpoint, key) = endpoint_of(kernel, server)?;
         let client = MkClient::new(server, Duration::from_millis(council.deadline_ms))
-            .map_err(|e| self.failed(server, "client", e))?;
-        let endpoint = endpoint_of(kernel, server)?;
-        let link = Link { client: &client, server, endpoint: endpoint.clone(), deadline, deadline_ms: council.deadline_ms, waits };
+            .map_err(|e| self.failed(&key, server, "client", e))?;
+        let link = Link { client: &client, server, key, endpoint: endpoint.clone(), deadline, deadline_ms: council.deadline_ms, waits };
 
         let identity = self.identity(&link).await?;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
@@ -291,12 +303,13 @@ impl CouncilSync {
                 }
             }
         };
-        let reads = labels.len() + usize::from(house.is_some());
+        let reads = labels.len() + usize::from(house.is_some()) + added.len();
         if reads as u64 > identity.limits.contexts_per_decision {
             let mut named = labels.to_vec();
             if house.is_some() {
                 named.push("the house-rules context".to_string());
             }
+            named.extend(added.iter().cloned());
             return Err(PrepareMiss(format!(
                 "a decision on spec {spec_name} reads {reads} contexts ({}), and council server {server} \
                  reads at most {} per decision (identity.limits.contexts_per_decision)",
@@ -306,7 +319,7 @@ impl CouncilSync {
         }
         self.ensure_spec(&link, &spec_body, &spec_id).await?;
 
-        let mut contexts = Vec::with_capacity(reads);
+        let mut contexts = Vec::with_capacity(reads - added.len());
         for label in labels {
             let context_id = resolve_label(kernel, label)?;
             let blocks = kernel.blocks().block_snapshots(context_id).map_err(|e| {
@@ -344,9 +357,10 @@ impl CouncilSync {
         waits: &SlotWaits,
     ) -> Result<SnapshotId, PrepareMiss> {
         let _serial = self.shadow_serial.lock().await;
-        let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(server, "client", e))?;
+        let (endpoint, key) = endpoint_of(kernel, server)?;
+        let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
         let deadline_ms = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
-        let link = Link { client: &client, server, endpoint: endpoint_of(kernel, server)?, deadline, deadline_ms, waits };
+        let link = Link { client: &client, server, key, endpoint, deadline, deadline_ms, waits };
         let identity = self.identity(&link).await?;
         let (spec_body, spec_id) = read_spec(kernel, spec_name).await?;
         self.ensure_spec(&link, &spec_body, &spec_id).await?;
@@ -378,7 +392,7 @@ impl CouncilSync {
     ) -> Result<SnapshotId, PrepareMiss> {
         let server = link.server;
         let hash = body_hash(&body)?;
-        let key = (server.to_string(), context_id);
+        let key = (link.key.clone(), context_id);
         let held = self.state.lock().contexts.get(&key).cloned();
         if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
             return Ok(h.head.clone());
@@ -415,7 +429,7 @@ impl CouncilSync {
                     e.head().map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
                 )))
             }
-            Err(e) => Err(self.failed(server, &format!("PUT of context \"{label}\""), e)),
+            Err(e) => Err(self.failed(&link.key, server, &format!("PUT of context \"{label}\""), e)),
         }
     }
 
@@ -433,34 +447,33 @@ impl CouncilSync {
     }
 
     async fn identity(&self, link: &Link<'_>) -> Result<ServerIdentity, PrepareMiss> {
-        let server = link.server;
-        if let Some(i) = self.state.lock().identities.get(server) {
+        if let Some(i) = self.state.lock().identities.get(&link.key) {
             return Ok(i.clone());
         }
-        let identity = link.send(|| link.client.identity()).await?.map_err(|e| self.failed(server, "identity", e))?;
-        self.state.lock().identities.insert(server.to_string(), identity.clone());
+        let identity = link.send(|| link.client.identity()).await?.map_err(|e| self.failed(&link.key, link.server, "identity", e))?;
+        self.state.lock().identities.insert(link.key.clone(), identity.clone());
         Ok(identity)
     }
 
     async fn ensure_spec(&self, link: &Link<'_>, spec: &Spec, spec_id: &SpecId) -> Result<(), PrepareMiss> {
-        let server = link.server;
-        let key = (server.to_string(), spec_id.clone());
+        let key = (link.key.clone(), spec_id.clone());
         if self.state.lock().specs.contains(&key) {
             return Ok(());
         }
         link.send(|| link.client.post_spec(spec))
             .await?
-            .map_err(|e| self.failed(server, &format!("POST of spec \"{}\"", spec.name), e))?;
+            .map_err(|e| self.failed(&link.key, link.server, &format!("POST of spec \"{}\"", spec.name), e))?;
         self.state.lock().specs.insert(key);
         Ok(())
     }
 
-    /// A call to `server` failed: forget its identity and posted specs, so
-    /// the next `prepare_labels` asks again, and name the failure.
-    fn failed(&self, server: &str, what: &str, e: MkError) -> PrepareMiss {
+    /// A call to `server`, whose origin is `key`, failed: forget its
+    /// identity and posted specs, so the next `prepare_labels` asks again,
+    /// and name the failure.
+    fn failed(&self, key: &str, server: &str, what: &str, e: MkError) -> PrepareMiss {
         let mut state = self.state.lock();
-        state.identities.remove(server);
-        state.specs.retain(|(s, _)| s != server);
+        state.identities.remove(key);
+        state.specs.retain(|(s, _)| s != key);
         PrepareMiss(format!("council server {server}: {what} failed: {e}"))
     }
 }
@@ -768,7 +781,7 @@ mod tests {
 
     impl Rig {
         async fn prepare(&self) -> Result<Prepared, PrepareMiss> {
-            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts, None, far(), &SlotWaits::default()).await
+            self.kernel.council_sync().prepare_labels(&self.kernel, &self.council, &self.spec.name, &self.council.contexts, None, &[], far(), &SlotWaits::default()).await
         }
 
         fn grow(&self, text: &str) {
@@ -1046,12 +1059,12 @@ mod tests {
         let amy = live_context(&r.kernel, "council-amy");
         append_dialogue(&r.kernel, amy, &["keep main green"]);
         let labels = vec!["reviewer".to_string(), "council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, &[], far(), &SlotWaits::default()).await.unwrap();
         assert_eq!(p.contexts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["reviewer", "council-amy"]);
         assert_eq!(p.contexts[1].context_id, amy);
 
         let one = vec!["council-amy".to_string()];
-        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None, far(), &SlotWaits::default()).await.unwrap();
+        let p = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &one, None, &[], far(), &SlotWaits::default()).await.unwrap();
         assert_eq!(p.contexts.len(), 1, "a single reviewer, without [council] contexts");
         assert_eq!(r.mock.puts().len(), 2, "each context is sent once");
     }
@@ -1094,7 +1107,7 @@ mod tests {
     }
 
     async fn prepare_seat(r: &Rig, seat: ContextId) -> Result<Prepared, PrepareMiss> {
-        r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat), far(), &SlotWaits::default()).await
+        r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &r.council.contexts, Some(seat), &[], far(), &SlotWaits::default()).await
     }
 
     /// The house-rules context is the first `AGENTS.md` found walking up
@@ -1228,14 +1241,32 @@ mod tests {
         assert!(miss.0.contains("house-rules") && miss.0.contains("contexts_per_decision"), "{}", miss.0);
     }
 
+    /// Two spellings of one server share what this kernel believes it
+    /// holds, as they share its endpoint: a prepare through
+    /// `http://host:port/` after one through `http://host:port` sends
+    /// nothing.
+    ///
+    /// Falsified by keying the identity, spec, or context caches on the raw
+    /// `[council] server` string.
+    #[tokio::test]
+    async fn two_spellings_of_one_server_share_what_it_holds() {
+        let mut r = rig().await;
+        r.prepare().await.unwrap();
+        let sent = r.mock.count();
+        r.council.server = format!("{}/", r.mock.base);
+        let p = r.prepare().await.unwrap();
+        assert_eq!(p.contexts.len(), 1);
+        assert_eq!(r.mock.count(), sent, "the server already holds the identity, the spec, and the context");
+    }
+
     #[tokio::test]
     async fn more_labels_than_the_server_reads_or_a_repeated_label_is_a_miss() {
         let r = rig().await;
         let labels: Vec<String> = (0..5).map(|i| format!("ctx-{i}")).collect();
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, far(), &SlotWaits::default()).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, &[], far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("at most 4"), "{}", miss.0);
         let twice = vec!["reviewer".to_string(), "reviewer".to_string()];
-        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, far(), &SlotWaits::default()).await.err().unwrap();
+        let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, &[], far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("\"reviewer\" twice"), "{}", miss.0);
         assert!(r.mock.puts().is_empty());
     }

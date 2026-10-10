@@ -388,6 +388,17 @@ differs by rubric.
 and `broker_with_vfs_files` (`kaijutsu-kernel/src/mcp/servers/file.rs`) are
 unused. Seen while retiring `shellDryRun`; not caused by it.
 
+## A caller already past its deadline still gets a free slot (2026-10-10)
+
+`Endpoint::acquire` (`llm/endpoint.rs`) gives a free slot on the first
+look whatever the deadline, so a caller whose deadline already passed
+still sends. A strict "deadline before slot" rule would refuse it. About
+a dozen tests take a slot with `acquire(Instant::now())` as a holder
+(`llm/endpoint.rs`, `llm/mk/mod.rs`, `council/gate_e2e.rs`), so the change
+moves each of them to a future deadline; left for its own change, with
+`docs/retries-and-ratelimits.md`, "Waiting is bounded by the caller's own
+deadline".
+
 ## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
 
 The ledger push brings an ask to the TUI sooner than the old poll did, so a

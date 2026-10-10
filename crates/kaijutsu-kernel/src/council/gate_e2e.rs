@@ -82,6 +82,8 @@ struct Mock {
     hold: Arc<Mutex<Option<Hold>>>,
     /// Every context `PUT`: the context id and its body, in arrival order.
     puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>>,
+    /// The identity's `contexts_per_decision`.
+    context_limit: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Mock {
@@ -102,6 +104,12 @@ impl Mock {
         let (go, release) = tokio::sync::oneshot::channel();
         *self.hold.lock().unwrap() = Some(Hold { reached, release });
         (at, go)
+    }
+
+    /// Report `limit` as the identity's `contexts_per_decision`. The kernel
+    /// caches the identity, so set it before the first call.
+    fn limit_contexts(&self, limit: u64) {
+        self.context_limit.store(limit, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn set(&self, behavior: impl Fn(&DecisionRequest) -> Reply + Send + Sync + 'static) {
@@ -143,9 +151,9 @@ impl Mock {
     }
 }
 
-fn server_identity() -> String {
+fn server_identity(context_limit: u64) -> String {
     let mut id = identity();
-    id["limits"] = serde_json::json!({"context_tokens": 100000, "state_bytes": 100000, "contexts_per_decision": 8,
+    id["limits"] = serde_json::json!({"context_tokens": 100000, "state_bytes": 100000, "contexts_per_decision": context_limit,
                                       "choice_options": 8, "default_timeout_ms": 1000});
     id["capabilities"] = serde_json::json!(["leave_one_out"]);
     id.to_string()
@@ -193,19 +201,23 @@ async fn serve() -> Mock {
     let put_delays: Arc<Mutex<VecDeque<Duration>>> = Arc::default();
     let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
     let puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>> = Arc::default();
+    let context_limit = Arc::new(std::sync::atomic::AtomicU64::new(8));
     let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
-    let (holding, bodies) = (hold.clone(), puts.clone());
+    let (holding, bodies, limit) = (hold.clone(), puts.clone(), context_limit.clone());
     tokio::spawn(async move {
         let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
-            let (holding, bodies) = (holding.clone(), bodies.clone());
+            let (holding, bodies, limit) = (holding.clone(), bodies.clone(), limit.clone());
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
                 let reply = match (method.as_str(), path.as_str()) {
-                    ("GET", "/council/v1/identity") => Reply { status: 200, body: server_identity(), delay: Duration::ZERO },
+                    ("GET", "/council/v1/identity") => {
+                        let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
+                        Reply { status: 200, body: server_identity(limit), delay: Duration::ZERO }
+                    },
                     ("POST", "/council/v1/specs") => {
                         let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
                         let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
@@ -250,7 +262,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, put_delays, hold, puts }
+    Mock { base, decisions, behavior, calls, put_delays, hold, puts, context_limit }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3139,4 +3151,140 @@ async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
             rig.finish().await;
         }
     }
+}
+
+/// A seat whose cast names a council server sends every decision on a
+/// submission there, and the reviewer contexts' observing reads after it:
+/// the shell decision, each program decision, and banto's observation.
+///
+/// Falsified by deciding programs, or observing, on `[council] server`
+/// (server A gets a request).
+#[tokio::test]
+async fn a_seat_whose_cast_names_a_council_server_sends_programs_and_observations_there() {
+    for via in BOTH {
+        let rig = rig(via, Setup { programs: true, reviewer_contexts: true, chain: true, ..Setup::default() }).await;
+        let amy = live_context(rig.d.kernel(), "council-amy");
+        append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
+        let banto = live_context(rig.d.kernel(), "council-banto");
+        append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
+        let banto_id = banto.to_string();
+        let server_b = serve().await;
+        let observed = banto_id.clone();
+        server_b.set(move |req| {
+            if Rig::read_ids(req) == [observed.clone()] {
+                Reply::ok(follows_answer(req, [-0.05, -4.0, -5.0]))
+            } else if is_program(req) {
+                Reply::ok(super::gate::test_support::program_answer(req, FIRST, FIRST, [-0.01, -5.0, -6.0]))
+            } else {
+                allow_each(req)
+            }
+        });
+        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "mk", "council-b", "mk", Some(&server_b.base));
+        rig.write("/work/fix.py", "print('fixed')\n").await;
+        rig.submit_gate("python3 /work/fix.py").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
+
+        let ask = rig.only_ask();
+        let (shell, programs) = shell_and_programs(&rig, &ask);
+        assert_eq!(shell.decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        assert_eq!(programs.len(), 1, "{via:?}: one program decision");
+        assert_eq!(programs[0].decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        let rows = rig.observations(&shell.decision_id, 1).await;
+        assert_eq!(rows[0].observation.reviewer_label, "council-banto", "{via:?}");
+        assert_eq!(rows[0].observation.outcome, CouncilObservationOutcome::Answered, "{via:?}: {:?}", rows[0].observation);
+
+        let sent = server_b.decisions();
+        assert_eq!(sent.iter().filter(|r| is_program(r)).count(), 1, "{via:?}: the program decision goes to server B");
+        assert_eq!(
+            sent.iter().filter(|r| Rig::read_ids(r) == [banto_id.clone()]).count(),
+            1,
+            "{via:?}: banto's observation goes to server B"
+        );
+        assert_eq!(sent.len(), 3, "{via:?}: the shell decision, the program decision, and the observation");
+        assert!(rig.mock.decisions().is_empty(), "{via:?}: [council] server is not asked");
+        rig.finish().await;
+    }
+}
+
+/// A judge reads on its own slot's server while the gate decides on
+/// `[council] server`: the shadow is primed and read on the judge's server,
+/// and `[council] server` sees only the gate's decision.
+///
+/// Falsified by reading the judge on `[council] server` (it gets a
+/// three-context read), or priming the shadow there.
+#[tokio::test]
+async fn a_judge_reads_on_its_slot_s_server_and_the_gate_decides_on_the_other() {
+    let rig = rig(Via::Tool, Setup::default()).await;
+    let judge_server = serve().await;
+    judge_server.set(allow_each);
+    rig.mock.set(allow_each);
+    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&judge_server.base));
+    rig.submit("echo two-servers").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    let decision = the_decision(&rig, &rig.only_ask());
+    let rows = rig.observations(&decision.decision_id, 1).await;
+    assert_eq!(rows[0].observation.outcome, CouncilObservationOutcome::Answered, "{:?}", rows[0].observation);
+
+    let shadow = judge_shadows(&rig)[0].context_id;
+    let gate: Vec<Vec<String>> = rig.mock.decisions().iter().map(Rig::read_ids).collect();
+    assert_eq!(gate, [[rig.context_of("reviewer"), rig.context_of("system-rules")]], "only the gate decides on [council] server");
+    assert!(rig.mock.puts_for(shadow).is_empty(), "the shadow is not primed on [council] server");
+    let judged: Vec<Vec<String>> = judge_server.decisions().iter().map(Rig::read_ids).collect();
+    assert_eq!(
+        judged,
+        [[rig.context_of("reviewer"), rig.context_of("system-rules"), shadow.to_string()]],
+        "the judge reads on its slot's server"
+    );
+    assert!(!judge_server.puts_for(shadow).is_empty(), "the shadow is primed on the judge's server");
+    rig.finish().await;
+}
+
+/// A judge read counts the shadow toward the server's
+/// `contexts_per_decision`. A seat whose decision reads the limit decides
+/// as before, and its judge read is a miss that names the limit, with no
+/// request sent.
+///
+/// Falsified by checking the limit before the shadow is added: the judge
+/// sends a request over the limit.
+#[tokio::test]
+async fn a_judge_read_over_the_context_limit_is_a_miss_naming_it() {
+    let rig = rig(Via::Tool, Setup::default()).await;
+    rig.mock.limit_contexts(2);
+    rig.mock.set(allow_each);
+    let base = rig.mock.base.clone();
+    give_judge_cast_on(&rig, "mk-judge", "mk", Some(&base));
+    rig.submit("echo at-limit").await.unwrap_or_else(|e| panic!("a decision at the limit still allows: {e:?}"));
+    let decision = the_decision(&rig, &rig.only_ask());
+    assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+
+    let rows = rig.observations(&decision.decision_id, 1).await;
+    let o = &rows[0].observation;
+    assert_eq!(o.outcome, CouncilObservationOutcome::Miss, "{o:?}");
+    let cause = o.miss_cause.clone().unwrap();
+    assert!(cause.contains("reads 3 contexts"), "{cause}");
+    assert!(cause.contains("judge-council-seat"), "the miss names the shadow: {cause}");
+    assert!(cause.contains("contexts_per_decision"), "{cause}");
+    assert_eq!(rig.mock.decisions().len(), 1, "only the gate's decision is sent");
+    rig.finish().await;
+}
+
+/// A judge slot on an mk backend with no address names no council server:
+/// each judged decision records a judge miss that names the backend, and
+/// the gate's decision stands.
+///
+/// Falsified by dropping the slot silently: no observation is recorded.
+#[tokio::test]
+async fn a_judge_slot_with_no_council_address_records_a_miss_naming_it() {
+    let rig = rig(Via::Tool, Setup::default()).await;
+    rig.mock.set(allow_each);
+    give_judge_cast_on(&rig, "mk-judge", "mk", None);
+    rig.submit("echo no-address").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    let decision = the_decision(&rig, &rig.only_ask());
+    assert_eq!(decision.decision.outcome, CouncilOutcome::Allow);
+    let rows = rig.observations(&decision.decision_id, 1).await;
+    let o = &rows[0].observation;
+    assert_eq!(o.reviewer_label, "judge-council-seat");
+    assert_eq!(o.outcome, CouncilObservationOutcome::Miss, "{o:?}");
+    let cause = o.miss_cause.clone().unwrap();
+    assert!(cause.contains("backend judge-mk") && cause.contains("has no base URL"), "{cause}");
+    assert_eq!(rig.mock.decisions().len(), 1, "only the gate's decision is sent");
+    rig.finish().await;
 }

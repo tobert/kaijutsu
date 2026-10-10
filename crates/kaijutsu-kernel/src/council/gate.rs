@@ -670,18 +670,21 @@ fn forget_after(kernel: &crate::Kernel, error: &MkError, prepared: &Prepared) {
 }
 
 /// Prepare the server for a decision on `spec_name` over `labels` and, when
-/// given, the house rules of the workspace `seat` works in, stopping at `deadline`. Every failure
-/// is a miss cause. Slot waits are added to `waits`.
+/// given, the house rules of the workspace `seat` works in, stopping at `deadline`. `added`
+/// names the contexts the caller adds after it, which count toward the
+/// server's limit. Every failure is a miss cause. Slot waits are added to `waits`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_within(
     kernel: &crate::Kernel,
     council: &CouncilConfig,
     spec_name: &str,
     labels: &[String],
     seat: Option<ContextId>,
+    added: &[String],
     deadline: tokio::time::Instant,
     waits: &SlotWaits,
 ) -> Result<Prepared, String> {
-    let prepare = kernel.council_sync().prepare_labels(kernel, council, spec_name, labels, seat, deadline, waits);
+    let prepare = kernel.council_sync().prepare_labels(kernel, council, spec_name, labels, seat, added, deadline, waits);
     match tokio::time::timeout_at(deadline, prepare).await {
         Err(_) => Err(deadline_cause(council.deadline_ms, "prepare", waits)),
         Ok(Err(PrepareMiss(cause))) => Err(cause),
@@ -1517,7 +1520,7 @@ async fn decide_inner(
     let labels = chain.decision_labels(council, spec);
     let carried = Carried { chain, state, waits: SlotWaits::default() };
     let seat = caller.context_id.filter(|_| council.house_rules);
-    let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, deadline, &carried.waits).await {
+    let prepared = match prepare_within(kernel, council, &spec.name, &labels, seat, &[], deadline, &carried.waits).await {
         Ok(prepared) => prepared,
         Err(cause) => {
             span.record("council.prepare_ms", started.elapsed().as_millis() as u64);

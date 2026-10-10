@@ -445,6 +445,10 @@ impl KjDispatcher {
             return Err(format!("--env requires KEY=VALUE format, got '{env}'"));
         }
 
+        if let Some(context_type) = &cfg.type_spec {
+            crate::model_resolution::refuse_reserved_role(context_type)?;
+        }
+
         if let Some(cwd) = &cfg.cwd_spec {
             self.check_cwd(caller, cwd_check_context, cwd).await.map_err(|e| format!("--cwd {e}"))?;
         }
@@ -4468,6 +4472,34 @@ mod tests {
             !contexts.iter().any(|r| r.label.as_deref() == Some("x")),
             "a refused create must not leave a row"
         );
+    }
+
+    /// `gate` is a cast role, not a context type: creating or setting a
+    /// context of that type is refused with a message that says so, and no
+    /// row changes.
+    ///
+    /// Falsified by accepting `gate` as an ordinary type, or by refusing it
+    /// only as an unknown rc bucket.
+    #[tokio::test]
+    async fn context_create_and_set_refuse_the_reserved_gate_role() {
+        let d = test_dispatcher().await;
+        let principal = PrincipalId::new();
+        let parent = register_context(&d, Some("parent"), None, principal);
+        let c = caller_with_context(parent);
+
+        let created = d.dispatch(&[s("context"), s("create"), s("--type"), s("gate"), s("g")], &c).await;
+        assert!(!created.is_ok(), "expected error, got: {}", created.message());
+        assert!(created.message().contains("is a cast role, not a context type"), "{}", created.message());
+        assert!(
+            !d.kernel_db().lock().list_active_contexts().unwrap().iter().any(|r| r.label.as_deref() == Some("g")),
+            "a refused create must not leave a row"
+        );
+
+        let set = d.dispatch(&[s("context"), s("set"), s("."), s("--type"), s("gate")], &c).await;
+        assert!(!set.is_ok(), "expected error, got: {}", set.message());
+        assert!(set.message().contains("is a cast role, not a context type"), "{}", set.message());
+        let row = d.kernel_db().lock().get_context(parent).unwrap().unwrap();
+        assert_ne!(row.context_type, "gate", "a refused set changes nothing");
     }
 
     #[tokio::test]

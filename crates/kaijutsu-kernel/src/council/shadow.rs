@@ -14,6 +14,8 @@
 //! each call: the shadow is sent whole on a task of its own, warming the
 //! seat's shell spec, so the server holds the dialogue before it is asked
 //! about it. A judge on a chat backend is hydrated whole when it is asked.
+//! A judge on an `mk` backend with no address is never primed, and each
+//! judge read is a miss that names the backend.
 //!
 //! After the council decides a judged seat's call, [`spawn_judge`] reads the
 //! decision's configured contexts and the shadow on the judge's server,
@@ -68,7 +70,8 @@ pub(crate) struct JudgeRead {
     seat_name: String,
     shadow: ContextId,
     call: BlockId,
-    server: String,
+    /// The judge's council server, or why its `mk` backend names none.
+    server: Result<String, String>,
 }
 
 /// A seat's judge shadow and where its model is served.
@@ -78,8 +81,9 @@ struct Judge {
     seat_name: String,
     seat_type: String,
     /// The council server that holds the shadow: the `judge` slot's backend
-    /// address when its kind is `mk`. `None` for a chat backend.
-    server: Option<String>,
+    /// address when its kind is `mk`, or why that backend names none.
+    /// `None` for a chat backend.
+    server: Option<Result<String, String>>,
 }
 
 /// Appends the call `spec` describes to the judge shadow of `seat`, creating
@@ -130,7 +134,7 @@ pub(crate) async fn record_call(
 /// under the seat's shell spec from `gate.toml`; a seat whose type has no
 /// council there is not primed.
 fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLoad) {
-    let Some(server) = judge.server.clone() else { return };
+    let Some(Ok(server)) = judge.server.clone() else { return };
     let spec_name = config
         .as_ref()
         .ok()
@@ -246,21 +250,26 @@ async fn judge_one(
         judged.observation.queue_ms = super::gate::queue_ms(&waits, None);
         judged
     };
+    let server = match &read.server {
+        Ok(server) => server.clone(),
+        Err(why) => return miss(judged, format!("the seat's cast slot `{JUDGE}` names {why}")),
+    };
     let Some(spec) = spec else {
         return miss(judged, "gate.toml declares no council shell spec for the seat's type".into());
     };
-    council.server = read.server.clone();
+    council.server = server.clone();
     council.deadline_ms = JUDGE_DEADLINE.as_millis() as u64;
     let deadline = tokio::time::Instant::now() + JUDGE_DEADLINE;
     let mut labels = council.contexts.clone();
     labels.extend(spec.contexts.iter().cloned());
     let seat = council.house_rules.then_some(read.seat);
-    let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, deadline, &waits).await {
+    let shadow = std::slice::from_ref(&label);
+    let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, shadow, deadline, &waits).await {
         Ok(prepared) => prepared,
         Err(cause) => return miss(judged, cause),
     };
     let primed =
-        kernel.council_sync().prime_shadow(kernel, &read.server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
+        kernel.council_sync().prime_shadow(kernel, &server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
     let head = match tokio::time::timeout_at(deadline, primed).await {
         Ok(Ok(head)) => head,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
@@ -444,7 +453,12 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
         let Some((cast_id, backend)) = super::gate::seat_slot_backend(&db, &seat_row, JUDGE)? else { return Ok(None) };
-        let server = super::gate::council_address(&backend).ok();
+        // A chat backend's judge is not read yet; an `mk` backend with no
+        // address is a miss on each judge read.
+        let server = match backend.kind.as_str() {
+            "mk" => Some(super::gate::council_address(&backend)),
+            _ => None,
+        };
         let mut judge = Judge {
             shadow: seat,
             seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),

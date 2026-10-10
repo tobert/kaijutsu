@@ -7,7 +7,8 @@
 //!    `provider`/`model` columns, set via `kj context set --model` (or at
 //!    `create`/fork time). This always wins; it is the same mechanism
 //!    `kj model` already reports as `source: "context"`.
-//! 2. A **cast slot** matched on the context's `context_type` — the named
+//! 2. A **cast slot** matched on the context's `context_type`, except a
+//!    reserved role ([`RESERVED_ROLES`]) — the named
 //!    ensemble assigned via `kj context create --cast <label>` /
 //!    `kj context set --cast <label>` (`ContextRow::cast_id`, resolved to a
 //!    label by the caller) or inherited from a preset's `cast_id` at fork.
@@ -20,6 +21,22 @@
 //! type once, then passes them here with any explicit model override.
 
 use crate::llm::{LlmRegistry, SlotTunables};
+
+/// Cast slot roles that are not context types. A `gate` slot names a seat's
+/// council server (`docs/council.md`, "Configuration"); no context takes a
+/// chat model from it, and no context may have its name as its type.
+pub const RESERVED_ROLES: &[&str] = &[crate::council::gate::GATE];
+
+/// Refuses `context_type` when it names a reserved cast role.
+pub fn refuse_reserved_role(context_type: &str) -> Result<(), String> {
+    if !RESERVED_ROLES.contains(&context_type) {
+        return Ok(());
+    }
+    Err(format!(
+        "'{context_type}' is a cast role, not a context type: a cast's `{context_type}` slot names \
+         the council server for the seats that play the cast; choose another --type"
+    ))
+}
 
 /// Why [`resolve_context_model`] answered the way it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +111,10 @@ pub fn resolve_context_model(
         });
     }
 
-    // 2. A cast slot matched on this context's context_type.
+    // 2. A cast slot matched on this context's context_type. A reserved
+    //    role's slot is never a chat model.
     if let Some(label) = cast_label
+        && !RESERVED_ROLES.contains(&context_type)
         && let Some(slot) = registry.resolved_slot(label, context_type)
     {
         return Some(ResolvedContextModel {
@@ -205,6 +224,30 @@ mod tests {
         assert_eq!(resolved.backend, "anthropic");
         assert_eq!(resolved.model, "claude-opus-4-8");
         assert_eq!(resolved.source, ModelSource::RegistryDefault);
+    }
+
+    /// A cast's `gate` slot names a seat's council server, never a chat
+    /// model: a context whose type is `gate` does not take it.
+    ///
+    /// Falsified by matching the `gate` slot like any other role.
+    #[test]
+    fn the_reserved_gate_role_never_resolves_a_chat_model() {
+        let mut registry = registry_with_cast_slot();
+        registry.set_cast_slots(vec![(
+            "house".to_string(),
+            ResolvedSlot {
+                role: crate::council::gate::GATE.to_string(),
+                backend: "deepseek".to_string(),
+                model: "mk".to_string(),
+                tunables: SlotTunables::default(),
+                loadout: None,
+                extra: None,
+            },
+        )]);
+        let resolved = resolve_context_model(crate::council::gate::GATE, None, None, Some("house"), &registry)
+            .expect("registry default present");
+        assert_eq!(resolved.source, ModelSource::RegistryDefault);
+        assert_eq!(resolved.model, "claude-opus-4-8");
     }
 
     #[test]

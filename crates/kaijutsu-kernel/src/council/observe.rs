@@ -165,7 +165,7 @@ async fn observe_one(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(council.deadline_ms);
     let labels = [label.to_string()];
-    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, None, deadline, &waits).await {
+    let prepared = match super::gate::prepare_within(kernel, council, DIRECTION_CHECK, &labels, None, &[], deadline, &waits).await {
         Ok(prepared) => prepared,
         Err(cause) => return miss(row, cause, started.elapsed()),
     };
