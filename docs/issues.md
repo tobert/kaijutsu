@@ -350,10 +350,10 @@ the end of a task. The gate, judge priming, and judge reads share one
 megakernel (`mk-zorak`), and four judge reads missed their 30 s deadline,
 on `git clean -fdX`, `git add && git commit`, and `make clean`: the
 cleanup steps whose history the judge exists for. Gate time also rose
-from about 1 s to 13 s during a burst on the first seat. Open: queue or
-coalesce priming per shadow (send the latest tail, not every one), give
-the judge its own deadline or server, and measure priming time from the
-server.
+from about 1 s to 13 s during a burst on the first seat. Planned fix:
+a concurrency limit and cooldown per endpoint (`docs/retries-and-ratelimits.md`),
+after the contained-fleet work. Priority between callers and coalesced
+priming wait for readings that show the simple form is not enough.
 
 ## Council presets per context (Amy, 2026-10-08)
 
