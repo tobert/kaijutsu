@@ -43,7 +43,8 @@ pub const SETTLE: Duration = Duration::from_secs(3);
 pub const MOCK_MODEL: &str = "fleet-mock";
 
 /// The environment variable a live run hands the agent its API key in. The
-/// key never appears on a command line or in the runner's output.
+/// runner never puts the key on a command line or in its output, and
+/// scrubs it from what the agent echoes ([`scrub_outcome`]).
 pub const LIVE_KEY_ENV: &str = "ACP_FLEET_LIVE_API_KEY";
 
 #[derive(Debug, Clone)]
@@ -135,6 +136,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
     let mut stderr_tail = String::new();
     let mut transcript = None;
     let mut notes = Vec::new();
+    let secrets = secrets(scenario);
     let scratch = match Scratch::create(&config.scratch_root, name) {
         Ok(scratch) => Some(scratch),
         Err(error) => {
@@ -143,7 +145,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         }
     };
     if let Some(scratch) = &scratch
-        && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail, &mut transcript, &mut notes)
+        && let Err(error) = drive(scenario, scratch, config, &secrets, &mut failures, &mut stderr_tail, &mut transcript, &mut notes)
     {
         errors.push(format!("{error:#}"));
     }
@@ -177,7 +179,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
     if failures.is_empty() {
         stderr_tail.clear();
     }
-    Outcome {
+    let mut outcome = Outcome {
         name: name.to_string(),
         failures,
         known_gaps,
@@ -186,7 +188,34 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         stderr_tail,
         kept,
         notes,
+    };
+    scrub_outcome(&mut outcome, &secrets);
+    outcome
+}
+
+/// Replace every secret in `outcome`'s text with [`client::SCRUBBED`].
+pub fn scrub_outcome(outcome: &mut Outcome, secrets: &[String]) {
+    if secrets.is_empty() {
+        return;
     }
+    let lines = [&mut outcome.failures, &mut outcome.excused, &mut outcome.known_gaps, &mut outcome.notes];
+    for line in lines.into_iter().flatten() {
+        *line = client::scrub(line, secrets);
+    }
+    outcome.stderr_tail = client::scrub(&outcome.stderr_tail, secrets);
+}
+
+/// The values a run scrubs from what it prints: a `[live]` scenario's API
+/// key. A key that cannot be read scrubs nothing; the run then fails
+/// reading it.
+fn secrets(scenario: &Scenario) -> Vec<String> {
+    scenario
+        .live
+        .as_ref()
+        .and_then(|live| live.key_path().ok())
+        .and_then(|path| read_key(&path).ok())
+        .map(|key| vec![key.trim().to_string()])
+        .unwrap_or_default()
 }
 
 /// The Harbor-shape verdict after [`SHAPE_GAPS`] is applied.
@@ -284,10 +313,12 @@ impl Scratch {
 
 /// Everything between setup and teardown. An `Err` is a run that could not
 /// finish; expectation misses go into `failures` and the run continues.
+#[allow(clippy::too_many_arguments)]
 fn drive(
     scenario: &Scenario,
     scratch: &Scratch,
     config: &RunConfig,
+    secrets: &[String],
     failures: &mut Vec<String>,
     stderr_tail: &mut String,
     transcript: &mut Option<Transcript>,
@@ -307,7 +338,11 @@ fn drive(
     }
 
     if scenario.mode == Mode::Contained {
-        container::preflight()?;
+        let swept = container::preflight()?;
+        if swept.removed > 0 {
+            notes.push(format!("removed {} leftover fleet container(s) a stopped runner left behind", swept.removed));
+        }
+        failures.extend(swept.failed.into_iter().map(|f| format!("a leftover fleet container: {f}")));
     }
     // Lives until this function returns, after the agent has exited.
     let scripted = match scenario.council.as_ref().and_then(|c| c.script()) {
@@ -411,6 +446,7 @@ fn drive(
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
+    agent.set_secrets(secrets.to_vec());
     let result =
         converse(&mut agent, scenario, &session_cwd, scratch, council.as_deref(), scripted.as_ref(), config.timeout, failures, notes)
             .map(|wire| *transcript = Some(wire));
@@ -419,8 +455,10 @@ fn drive(
     let shutdown = agent.shutdown(Duration::from_secs(60));
     *stderr_tail = agent.stderr_tail();
     drop(agent);
-    if scenario.mode == Mode::Contained {
-        container::remove(&scratch.id);
+    if scenario.mode == Mode::Contained
+        && let Err(error) = container::remove(&scratch.id)
+    {
+        failures.push(format!("{error:#}"));
     }
     if let Some(relay) = &relay {
         notes.extend(relay.report());
@@ -604,13 +642,23 @@ fn release_holds(
     agent.pump_until_state(Some(request), &what, timeout, |a| a.held_count(permissions_before) >= holds)?;
     if let Some(OnHold { write, wait_for }) = &prompt.on_hold {
         if let Some(write) = write {
-            let target = workspace_host.join(workspace_relative(write)?);
-            std::fs::write(&target, "").with_context(|| format!("on_hold: write {}", target.display()))?;
+            workspace_relative(write)?;
+            crate::workspace::write_empty(workspace_host, write).with_context(|| format!("on_hold: write {write}"))?;
         }
         if let Some(wait_for) = wait_for {
-            let target = workspace_host.join(workspace_relative(wait_for)?);
+            workspace_relative(wait_for)?;
             let what = format!("on_hold: {wait_for} to exist");
-            agent.pump_until_state(Some(request), &what, timeout, |_| target.exists())?;
+            let mut refused = None;
+            agent.pump_until_state(Some(request), &what, timeout, |_| match crate::workspace::exists(workspace_host, wait_for) {
+                Ok(exists) => exists,
+                Err(error) => {
+                    refused = Some(error);
+                    true
+                }
+            })?;
+            if let Some(error) = refused {
+                return Err(error.context(format!("on_hold: wait for {wait_for}")));
+            }
         }
     }
     for (n, answer) in prompt.release.iter().enumerate() {
@@ -713,8 +761,8 @@ fn cancel_mid_call(
         std::thread::sleep(Duration::from_millis(20));
     }
     if let Some(release) = &cancel.release {
-        let target = workspace_host.join(workspace_relative(release)?);
-        std::fs::write(&target, "").with_context(|| format!("write the release file {}", target.display()))?;
+        workspace_relative(release)?;
+        crate::workspace::write_empty(workspace_host, release).with_context(|| format!("write the release file {release}"))?;
     }
     Ok(())
 }
@@ -868,8 +916,13 @@ pub fn verify_workspace(checks: &[Verify], workspace: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     for check in checks {
         let Some(relative) = &check.path else { continue };
-        let path = workspace.join(relative);
-        let exists = path.exists();
+        let exists = match crate::workspace::exists(workspace, relative) {
+            Ok(exists) => exists,
+            Err(error) => {
+                failures.push(format!("verify {relative}: {error:#}"));
+                continue;
+            }
+        };
         if let Some(want) = check.exists
             && want != exists
         {
@@ -880,10 +933,10 @@ pub fn verify_workspace(checks: &[Verify], workspace: &Path) -> Vec<String> {
         if check.equals.is_none() && check.contains.is_none() {
             continue;
         }
-        let body = match std::fs::read_to_string(&path) {
+        let body = match crate::workspace::read(workspace, relative) {
             Ok(body) => body,
             Err(error) => {
-                failures.push(format!("verify {relative}: cannot read it: {error}"));
+                failures.push(format!("verify {relative}: cannot read it: {error:#}"));
                 continue;
             }
         };
@@ -1079,7 +1132,7 @@ mod tests {
         assert_eq!(judge("model"), "");
         assert!(judge("operation").contains("titled \"shell\", not \"shell_write\""), "{}", judge("operation"));
         assert!(judge("ask-1").contains("never announced"), "{}", judge("ask-1"));
-        let uneven = format!("description = \"d\"\n[[prompt]]\ntext = \"go\"\npermission_tool_calls = [\"shell_write\"]\n");
+        let uneven = "description = \"d\"\n[[prompt]]\ntext = \"go\"\npermission_tool_calls = [\"shell_write\"]\n".to_string();
         let error = format!("{:#}", Scenario::parse(&uneven, "test").unwrap_err());
         assert!(error.contains("`permission_tool_calls` has 1 entries for 0"), "{error}");
     }
@@ -1218,5 +1271,71 @@ exists = false
         assert!(failures[0].contains("beta"));
         assert!(failures[1].contains("missing.txt"));
         assert!(failures[2].contains("exists = false"));
+    }
+
+    #[test]
+    fn a_key_is_scrubbed_from_every_part_of_the_report() {
+        let key = "sk-fleet-test-0123456789abcdef";
+        let mut outcome = Outcome {
+            name: "n".into(),
+            failures: vec![format!("prompt 1: no tool call output contains \"x\"; outputs were [\"cat: {key}\"]")],
+            known_gaps: Vec::new(),
+            excused: vec![format!("excused {key}")],
+            elapsed: Duration::ZERO,
+            stderr_tail: format!("tail {key}"),
+            kept: None,
+            notes: vec![format!("relay to {key}")],
+        };
+        scrub_outcome(&mut outcome, &[key.to_string()]);
+        let all = format!("{:?}", outcome);
+        assert!(!all.contains(key), "{all}");
+        assert_eq!(all.matches(client::SCRUBBED).count(), 4, "{all}");
+    }
+
+    /// A model can plant a link to a host file where a verifier will look,
+    /// as the file itself or as a directory on the way to it.
+    #[test]
+    fn a_verifier_refuses_a_planted_link_and_never_prints_its_target() {
+        let top = PathBuf::from(crate::DEFAULT_SCRATCH).join(format!("unit-verify-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let (workspace, outside) = (top.join("workspace"), top.join("outside"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = "host secret: do not print";
+        std::fs::write(outside.join("secret.txt"), secret).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("hello.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("sub")).unwrap();
+        let checks: Vec<Verify> = Scenario::parse(
+            r#"
+description = "d"
+[[prompt]]
+text = "go"
+[[verify]]
+path = "hello.txt"
+contains = "hello"
+[[verify]]
+path = "sub/secret.txt"
+equals = "x"
+[[verify]]
+path = "hello.txt"
+exists = true
+[[verify]]
+path = "sub/secret.txt"
+exists = false
+"#,
+            "verify",
+        )
+        .unwrap()
+        .verify;
+        let failures = verify_workspace(&checks, &workspace);
+        std::fs::remove_dir_all(&top).unwrap();
+        assert_eq!(failures.len(), 4, "{failures:#?}");
+        for (failure, (path, link)) in
+            failures.iter().zip([("hello.txt", "hello.txt"), ("sub/secret.txt", "sub"), ("hello.txt", "hello.txt"), ("sub/secret.txt", "sub")])
+        {
+            assert!(failure.starts_with(&format!("verify {path}:")), "{failure}");
+            assert!(failure.contains(&format!("{link} is a symbolic link")), "{failure}");
+            assert!(!failure.contains(secret), "the failure leaked the link's target: {failure}");
+        }
     }
 }

@@ -21,6 +21,9 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 kaijutsu-mk.workspace = true
+# openat2 with RESOLVE_NO_SYMLINKS, for host-side workspace access
+# (`src/workspace.rs`).
+rustix = { version = "0.38", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

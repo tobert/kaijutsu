@@ -3557,6 +3557,13 @@ for when it's contained in docker". Open:
   wire is final. An approved call's last update carries only
   `rawOutput.exit_code`, so the client shows the waiting text as its only
   content, though the model read the real output.
+- **Contained mode, after the DeepSeek review** (`docs/acp-fleet.md`,
+  "Limits and hardening"). The key scrub catches only an exact copy; a
+  model that encodes the key gets it into the report, so a live key must
+  be one we can revoke. The relay keeps every upstream connection error
+  with no cap (`crates/kaijutsu-acp-fleet/src/relay.rs`); the pids limit
+  bounds concurrent connections, not their count over a run. The relay
+  also spawns a thread per connection with no limit of its own.
 
 ## Egress: what stays open (2026-09-21)
 

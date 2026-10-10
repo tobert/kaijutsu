@@ -13,6 +13,7 @@
 //! - [`scenario`]: the scenario file format.
 //! - [`run`]: runs one scenario and judges it.
 //! - [`shape`]: the Harbor-shape invariants every transcript is checked for.
+//! - [`workspace`]: host-side access to a workspace, refusing symbolic links.
 
 pub mod client;
 pub mod container;
@@ -21,6 +22,7 @@ pub mod relay;
 pub mod run;
 pub mod scenario;
 pub mod shape;
+pub mod workspace;
 
 /// The host-mode scenarios shipped with this crate.
 pub const FLEET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fleet");

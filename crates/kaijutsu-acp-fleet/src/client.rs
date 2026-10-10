@@ -25,6 +25,19 @@ use serde_json::{Value, json};
 /// How many trailing stderr lines an error message carries.
 const STDERR_TAIL_LINES: usize = 40;
 
+/// What a secret given to [`AcpClient::set_secrets`] reads as in trace
+/// output, the stderr tail, and the runner's report.
+pub const SCRUBBED: &str = "[acp-fleet: key removed]";
+
+/// `text` with every occurrence of each non-empty secret replaced by
+/// [`SCRUBBED`].
+pub fn scrub(text: &str, secrets: &[String]) -> String {
+    secrets.iter().filter(|s| !s.is_empty()).fold(text.to_string(), |text, secret| text.replace(secret.as_str(), SCRUBBED))
+}
+
+/// Where trace lines go.
+pub type TraceSink = Box<dyn Write + Send>;
+
 /// How often [`AcpClient::pump_until_state`] rechecks its condition while no
 /// message arrives.
 pub const POLL: Duration = Duration::from_millis(50);
@@ -178,6 +191,10 @@ pub struct AcpClient {
     held: VecDeque<(Value, usize)>,
     /// Print every message in both directions to stderr.
     trace: bool,
+    /// Where trace lines go instead of stderr.
+    trace_to: Option<TraceSink>,
+    /// Values scrubbed from trace lines and the stderr tail.
+    secrets: Vec<String>,
 }
 
 impl AcpClient {
@@ -237,12 +254,40 @@ impl AcpClient {
             parked: Vec::new(),
             held: VecDeque::new(),
             trace: false,
+            trace_to: None,
+            secrets: Vec::new(),
         })
     }
 
     /// Print every message in both directions to this process's stderr.
     pub fn set_trace(&mut self, trace: bool) {
         self.trace = trace;
+    }
+
+    /// Send trace lines to `sink` instead of this process's stderr.
+    pub fn set_trace_to(&mut self, sink: TraceSink) {
+        self.trace_to = Some(sink);
+    }
+
+    /// Scrub each of `secrets`, such as a model API key the agent holds,
+    /// from trace lines and the stderr tail. The agent can echo a value it
+    /// can read, so the client never prints it.
+    pub fn set_secrets(&mut self, secrets: Vec<String>) {
+        self.secrets = secrets.into_iter().filter(|s| !s.is_empty()).collect();
+    }
+
+    /// Print one trace line, scrubbed.
+    fn trace_line(&mut self, arrow: &str, line: &str) {
+        if !self.trace {
+            return;
+        }
+        let line = format!("acp-fleet {arrow} {}", scrub(line, &self.secrets));
+        match &mut self.trace_to {
+            Some(sink) => {
+                let _ = writeln!(sink, "{line}");
+            }
+            None => eprintln!("{line}"),
+        }
     }
 
     pub fn set_permission_policy(&mut self, policy: PermissionPolicy) {
@@ -259,7 +304,7 @@ impl AcpClient {
         let all = self.stderr();
         let lines: Vec<&str> = all.lines().collect();
         let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
-        lines[start..].join("\n")
+        scrub(&lines[start..].join("\n"), &self.secrets)
     }
 
     /// The agent's process id: the `podman` client's in contained mode.
@@ -288,7 +333,7 @@ impl AcpClient {
                 return Ok(());
             }
             if Instant::now() > deadline {
-                bail!("{needle:?} never appeared on the agent's stderr within {within:?}\n--- agent stderr ---\n{}", self.stderr());
+                bail!("{needle:?} never appeared on the agent's stderr within {within:?}\n--- agent stderr ---\n{}", scrub(&self.stderr(), &self.secrets));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -305,9 +350,7 @@ impl AcpClient {
     }
 
     fn send(&mut self, message: &Value) -> Result<()> {
-        if self.trace {
-            eprintln!("acp-fleet -> {message}");
-        }
+        self.trace_line("->", &message.to_string());
         let stdin = self.stdin.as_mut().context("stdin is already closed")?;
         writeln!(stdin, "{message}").context("write to the agent's stdin")?;
         stdin.flush().context("flush the agent's stdin")
@@ -382,9 +425,7 @@ impl AcpClient {
             match self.lines.recv_timeout(wait) {
                 Ok(line) => {
                     last = Instant::now();
-                    if self.trace {
-                        eprintln!("acp-fleet <- {line}");
-                    }
+                    self.trace_line("<-", &line);
                     let message: Value = serde_json::from_str(&line)
                         .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))?;
                     if response_id(&message).is_some() {
@@ -449,9 +490,7 @@ impl AcpClient {
                     self.stderr_tail()
                 ),
             };
-            if self.trace {
-                eprintln!("acp-fleet <- {line}");
-            }
+            self.trace_line("<-", &line);
             let message: Value = serde_json::from_str(&line)
                 .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))?;
             if response_id(&message).is_some() {
@@ -472,9 +511,7 @@ impl AcpClient {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match self.lines.recv_timeout(remaining) {
             Ok(line) => {
-                if self.trace {
-                    eprintln!("acp-fleet <- {line}");
-                }
+                self.trace_line("<-", &line);
                 serde_json::from_str(&line)
                     .with_context(|| format!("the agent wrote a stdout line that is not JSON: {line:?}"))
             }
@@ -759,6 +796,44 @@ pub fn tool_calls(updates: &[Value]) -> Vec<ToolCallSeen> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trace sink a test reads back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A model can read its API key and echo it in a tool's output; the
+    /// trace and the stderr tail print it scrubbed.
+    #[test]
+    fn a_key_the_agent_echoes_is_printed_scrubbed() {
+        let key = "sk-fleet-test-0123456789abcdef";
+        let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s", "update":
+            {"sessionUpdate": "tool_call", "toolCallId": "a", "title": "shell_write", "status": "completed",
+             "content": [{"type": "content", "content": {"type": "text", "text": format!("key={key}\n")}}]}}});
+        let stub = AgentCommand::new("sh").arg("-c").arg("printf '%s\\n' \"$1\"; echo \"leaked $2\" >&2; sleep 2").arg("stub").arg(line.to_string()).arg(key);
+        let mut client = AcpClient::spawn(&stub, Duration::from_secs(5)).unwrap();
+        let captured = Captured::default();
+        client.set_trace(true);
+        client.set_trace_to(Box::new(captured.clone()));
+        client.set_secrets(vec![key.to_string()]);
+        client.pump_until_quiet(Duration::from_millis(500), Duration::from_secs(5), "the stub's line").unwrap();
+        client.wait_for_stderr("leaked", Duration::from_secs(5)).unwrap();
+        let trace = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(trace.contains(&format!("key={SCRUBBED}")), "{trace}");
+        assert!(!trace.contains(key), "{trace}");
+        let tail = client.stderr_tail();
+        assert!(tail.contains(&format!("leaked {SCRUBBED}")) && !tail.contains(key), "{tail}");
+        let _ = client.shutdown(Duration::from_secs(5));
+    }
 
     fn update(body: Value) -> Value {
         json!({"sessionId": "s", "update": body})

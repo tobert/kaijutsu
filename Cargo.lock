@@ -6559,6 +6559,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kaijutsu-mk",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "toml 0.8.23",

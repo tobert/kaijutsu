@@ -130,7 +130,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `[council]` | A council server for the run, whose address replaces `{council}` in `gate` and `prompt.gate`. Give `verdicts`, or `server`. A gate that names `{council}` with no `[council]`, or a `[council]` no gate names, is refused. See "Council scenarios". |
 | `council.verdicts` | A council the runner serves on 127.0.0.1: one verdict per decision, in order, and the last one repeats. Each is `proceed`, `try_harder`, or `do_less`. |
 | `council.undo` | The `undo` read every scripted decision carries: `reversible`, `normal`, or `irreversible`. Default: none. |
-| `council.server` | A real council server, such as `http://zorak:8090`, instead of `verdicts`. In contained mode, the host must be a name or a 127.0.0.0/8 address. |
+| `council.server` | A real council server, such as `http://zorak:8090`, instead of `verdicts`. In contained mode, the host must be a name or a 127.0.0.0/8 address written as four dotted decimal numbers; a host a resolver reads as a number in another form, such as `2130706433`, `0x7f000001`, or `127.1`, is refused. The container reaches this server; see "The scenario is the network policy". |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events, text first; `events` gives the mock backend's raw events instead. See "Ending a task". |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
@@ -397,6 +397,12 @@ as `prompt 2: scripted council answered 3 decision(s): do_less,
 try_harder, proceed`. `prompt.council_verdicts` restarts the script at a
 prompt, so a live seat's bumps land where the scenario means them to.
 
+A contained agent reaches the scripted council, so the council bounds what
+it keeps. It answers a request body over 8 MiB with 413 and a head over
+64 KiB with 431, without reading either. It holds at most 64 specs. It
+keeps the first 32 errors, each cut to 1024 bytes, and counts the rest.
+Each refusal is recorded as an error, so it fails the scenario.
+
 ## Live scenarios
 
 ```toml
@@ -417,8 +423,9 @@ contains = "hello"
 
 A live scenario starts the agent with `--backend-kind`, `--model`, and
 `--api-key-env ACP_FLEET_LIVE_API_KEY`, with the key from `api_key_file`
-in that variable. The key never appears on a command line, in `podman
-inspect`, in `--trace` output, or in the report. A real model chooses its
+in that variable. The runner never puts the key on a command line, in
+`podman inspect`, in `--trace` output, or in the report, and it scrubs any
+copy the agent echoes; see "The API key". A real model chooses its
 own calls, so a live prompt checks loose expectations: the permission
 requests and their titles, `text_contains`, `tool_output_contains`, and
 `[[verify]]`. An exact `tool_calls` list rarely holds. A live prompt can
@@ -527,14 +534,73 @@ time it out after 30 s and answers the second offer of the same ask.
 
 ## Contained mode
 
-The agent runs as `podman run -i --rm --init --network=none
---pids-limit=512` in the `kaijutsu-fleet` image
-(`contrib/Containerfile.fleet`, Arch with `git` and `socat`). A contained
-agent uses about 70 processes and threads on a 24-core host.
+The agent runs as `podman run -i --rm --init --network=none` in the
+`kaijutsu-fleet` image (`contrib/Containerfile.fleet`, Arch with `git` and
+`socat`), with the limits and hardening in "Limits and hardening".
 It sees three mounts: the host's agent binary at
 `/opt/kaijutsu/kaijutsu-solo-acp` (read-only), the fleet files at `/fleet`
-(read-only), and the workspace at `/work`, its only writable path and the
-session cwd. It has no host home, no host rc, and no `~/.ssh`.
+(read-only), and the workspace at `/work`, the session cwd and its only
+writable path besides tmpfs. It has no host home, no host rc, and no
+`~/.ssh`.
+
+### Limits and hardening
+
+Every fleet container, agent and script verifier, runs with:
+
+| Flag | Why |
+|---|---|
+| `--memory=4g --memory-swap=4g` | A hostile command cannot exhaust host memory. The agent with kaish and git uses a few hundred MB; tmpfs counts against the limit. |
+| `--cpus=4` | A runaway command leaves the host's other cores free. |
+| `--pids-limit=512` | A contained agent uses about 70 processes and threads on a 24-core host. This also bounds the connections `socat` can fork. |
+| `--read-only` | The image cannot be changed. Podman mounts tmpfs at `/tmp`, `/var/tmp`, and `/run`. |
+| `--cap-drop=ALL` | No capability is added back. |
+| `--security-opt=no-new-privileges` | A setuid program gains nothing. |
+| `--label=kaijutsu.acp-fleet.runner=<pid>-<start>` | Names the runner that started it; see below. |
+
+An agent container that reaches an endpoint also gets `--sysctl
+net.ipv4.ip_unprivileged_port_start=0`, so `socat` binds port 443 with no
+capability. The sysctl applies only to the container's own network
+namespace. The contained suite and a live run pass with exactly this set.
+
+Podman runs rootless on moltar (`podman info`: `rootless: true`, cgroups
+v2, runc), so container root is the invoking user. The memory and CPU
+limits are enforced there: `/sys/fs/cgroup/cpu.max` reads `400000 100000`
+in a container, and a command past the memory limit is killed.
+
+The first contained scenario of a run removes every fleet container whose
+runner no longer runs, such as one a killed runner left behind. The label
+value is the runner's pid and process start time, so a reused pid does not
+match, and a runner still running keeps its containers. The report notes
+`removed <n> leftover fleet container(s) a stopped runner left behind`. A
+container it cannot list or remove fails the scenario and names podman's
+reason, as does a failed removal of the run's own container.
+
+### The workspace on the host
+
+The runner reads, writes, and checks workspace paths on the host: the
+declarative `[[verify]]` checks, `on_hold`'s `write` and `wait_for`, and
+`cancel.release`. A contained model can plant a symbolic link anywhere in
+its workspace and aim it at a host file, such as `ln -s ~/.ssh/id_ed25519
+hello.txt`. Each of those accesses refuses a path with a symbolic link in
+any component, the file itself or a directory on the way
+(`crates/kaijutsu-acp-fleet/src/workspace.rs`). It resolves the whole
+path in one `openat2` call with `RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH`, so
+a link swapped in while the agent runs is refused too. A refusal is a
+verify failure that names the path and the link, such as `verify
+hello.txt: refused: hello.txt is a symbolic link ...`, and never reads
+through it. A read also refuses anything but a regular file, so a planted
+FIFO cannot block the runner, and a file over 1 MiB. The runner seeds
+`files` and creates `session_cwd` before the agent starts, when the
+workspace holds only what the runner wrote.
+
+### The scenario is the network policy
+
+A scenario file decides what a contained agent reaches, so scenarios are
+trusted input: review one before running it, as you would a script. A
+`[council] server` on `127.0.0.1:<port>` gives the container that host
+port, whatever listens there. A named server gives it that host's port.
+`api_key_file` is mounted into the container as it is, so the model can
+read whatever file it names.
 
 ### The network in each mode
 
@@ -570,23 +636,30 @@ carried 1 connection(s)`, and each connection the relay could not make.
 A contained live agent reads its key from `api_key_file`, bind-mounted
 read-only at `/run/fleet-key`. The start script reads the file into
 `ACP_FLEET_LIVE_API_KEY` and `exec`s the agent with `--api-key-env
-ACP_FLEET_LIVE_API_KEY`. The key never appears on the `podman` command
-line, in `podman inspect` (which shows the mount's source path and the
-start script, neither of which holds it), in `--trace` output, or in the
-report. A `--env` value from the runner's environment would show in
+ACP_FLEET_LIVE_API_KEY`. The runner never puts the key on the `podman`
+command line, in `podman inspect` (which shows the mount's source path and
+the start script, neither of which holds it), in `--trace` output, or in
+the report. A `--env` value from the runner's environment would show in
 `podman inspect`, and a podman secret would store the key in podman's own
-store, so the fleet uses the mount. A `shell_write` command does not
-inherit the agent's environment, but the model can still read the key at
-`/run/fleet-key` or in the agent's `/proc/<pid>/environ`. The container
-reaches only the endpoints in the table above, so the key can leave only
-toward them.
+store, so the fleet uses the mount.
+
+The model can read the key: a `shell_write` command does not inherit the
+agent's environment, but `/run/fleet-key` and the agent's
+`/proc/<pid>/environ` are readable. A model that echoes it puts it in a
+tool's output, so the runner replaces every copy of the key with
+`[acp-fleet: key removed]` in `--trace` lines, failure texts, the agent's
+stderr tail, and the report. Only an exact copy is caught; a model that
+encodes the key, such as in base64, gets it past the scrub. Treat a key
+used in a live run as scoped to that run: use one you can revoke. The
+container reaches only the endpoints in the table above, so the key can
+leave only toward them.
 
 The yolo posture is a gate with `uncovered = "allow"`: no statement asks, and
 no hook sees a program the tier allows.
 
 A `script` verifier runs with `bash -xeuo pipefail` in a fresh
-`--network=none --pids-limit=512` container over the same workspace, and
-passes on exit 0.
+`--network=none` container with the same limits and hardening, over the
+same workspace, and passes on exit 0.
 Scripts never run on the host; the loader refuses a `script` in host mode.
 
 With no podman, no image, or a stale image, a contained scenario fails and

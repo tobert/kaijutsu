@@ -209,6 +209,18 @@ pub fn answer(request: &DecisionRequest, spec: &Spec, verdict: Verdict, undo: Op
     Ok(body)
 }
 
+/// The largest request body the server reads. A context upload carries a
+/// conversation, so this leaves room for a long one.
+pub const BODY_LIMIT: usize = 8 << 20;
+/// The largest request head the server reads.
+pub const HEAD_LIMIT: usize = 64 << 10;
+/// The most specs the server holds.
+pub const SPEC_LIMIT: usize = 64;
+/// The most errors the server keeps; it counts the rest.
+pub const ERROR_LIMIT: usize = 32;
+/// The most bytes of one error the server keeps.
+pub const ERROR_TEXT_LIMIT: usize = 1024;
+
 /// What the server has seen, shared with its connection threads.
 #[derive(Default)]
 struct Shared {
@@ -219,8 +231,10 @@ struct Shared {
     /// The script answering now, and the number of the decision it answers
     /// first, counted from 0 across the run.
     script: Mutex<Option<(Script, usize)>>,
-    /// Requests it could not serve, each named.
+    /// Requests it could not serve, each named: the first [`ERROR_LIMIT`].
     errors: Mutex<Vec<String>>,
+    /// Errors past [`ERROR_LIMIT`], counted.
+    errors_dropped: AtomicU64,
     puts: AtomicU64,
 }
 
@@ -279,9 +293,15 @@ impl ScriptedCouncil {
         self.shared.answered.lock().map(|a| a.clone()).unwrap_or_default()
     }
 
-    /// Every request the server could not serve.
+    /// Every request the server could not serve, up to [`ERROR_LIMIT`],
+    /// then a line counting the rest.
     pub fn errors(&self) -> Vec<String> {
-        self.shared.errors.lock().map(|e| e.clone()).unwrap_or_default()
+        let mut errors = self.shared.errors.lock().map(|e| e.clone()).unwrap_or_default();
+        let dropped = self.shared.errors_dropped.load(Ordering::SeqCst);
+        if dropped > 0 {
+            errors.push(format!("and {dropped} more error(s)"));
+        }
+        errors
     }
 }
 
@@ -296,7 +316,21 @@ impl Drop for ScriptedCouncil {
     }
 }
 
-/// One HTTP request: method, path, body.
+/// A request the server refuses for its size, with the HTTP status it
+/// answers.
+#[derive(Debug)]
+struct TooLarge(u16, String);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// One HTTP request: method, path, body. A head past [`HEAD_LIMIT`] or a
+/// body past [`BODY_LIMIT`] is refused with [`TooLarge`] before it is read.
 fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -315,7 +349,13 @@ fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
                 Some(v) => v.trim().parse::<usize>().context("content-length")?,
                 None => 0,
             };
+            if len > BODY_LIMIT {
+                return Err(TooLarge(413, format!("a request body of {len} bytes, larger than the {BODY_LIMIT} the scripted council reads")).into());
+            }
             break (i + 4, len);
+        }
+        if buf.len() > HEAD_LIMIT {
+            return Err(TooLarge(431, format!("a request head larger than the {HEAD_LIMIT} bytes the scripted council reads")).into());
         }
     };
     while buf.len() < head_end + len {
@@ -329,7 +369,28 @@ fn read_request(sock: &mut TcpStream) -> Result<(String, String, String)> {
     let mut first = head.lines().next().unwrap_or("").split(' ');
     let method = first.next().unwrap_or("").to_string();
     let path = first.next().unwrap_or("").to_string();
-    Ok((method, path, String::from_utf8_lossy(&buf[head_end..]).to_string()))
+    Ok((method, path, String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string()))
+}
+
+/// Keep `message` among the server's errors: the first [`ERROR_LIMIT`],
+/// each cut to [`ERROR_TEXT_LIMIT`] bytes, and a count of the rest.
+fn record_error(shared: &Shared, message: &str) {
+    let mut message = message.to_string();
+    if message.len() > ERROR_TEXT_LIMIT {
+        let mut cut = ERROR_TEXT_LIMIT;
+        while !message.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        message.truncate(cut);
+        message.push_str("...");
+    }
+    if let Ok(mut errors) = shared.errors.lock() {
+        if errors.len() < ERROR_LIMIT {
+            errors.push(message);
+        } else {
+            shared.errors_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 fn serve_one(mut sock: TcpStream, shared: &Shared) {
@@ -338,11 +399,10 @@ fn serve_one(mut sock: TcpStream, shared: &Shared) {
     let (status, body) = match request.and_then(|(method, path, body)| route(&method, &path, &body, shared)) {
         Ok(body) => (200, body.to_string()),
         Err(error) => {
+            let status = error.downcast_ref::<TooLarge>().map_or(500, |t| t.0);
             let message = format!("{error:#}");
-            if let Ok(mut errors) = shared.errors.lock() {
-                errors.push(message.clone());
-            }
-            (500, json!({"error": {"type": "internal", "message": message}}).to_string())
+            record_error(shared, &message);
+            (status, json!({"error": {"type": "internal", "message": message}}).to_string())
         }
     };
     let out = format!(
@@ -360,7 +420,11 @@ fn route(method: &str, path: &str, body: &str, shared: &Shared) -> Result<Value>
             let spec: Spec = serde_json::from_str(body).context("a posted spec does not decode")?;
             let id = kaijutsu_mk::council::canon::spec_id(&spec).context("a posted spec has no canonical id")?;
             let held = json!({"spec_id": id, "spec": spec, "template": TEMPLATE});
-            shared.specs.lock().map_err(|_| anyhow::anyhow!("the spec table is poisoned"))?.insert(id.to_string(), spec);
+            let mut specs = shared.specs.lock().map_err(|_| anyhow::anyhow!("the spec table is poisoned"))?;
+            if specs.len() >= SPEC_LIMIT && !specs.contains_key(id.as_str()) {
+                bail!("the scripted council holds at most {SPEC_LIMIT} specs");
+            }
+            specs.insert(id.to_string(), spec);
             Ok(held)
         }
         ("PUT", p) if p.starts_with("/council/v1/contexts/") => {
@@ -420,6 +484,77 @@ mod tests {
 
     fn pooled_choice(body: &Value, question: &str) -> String {
         body["answers"][question]["choice"].as_str().unwrap().to_string()
+    }
+
+    /// Send `raw` and return the status and body of the response.
+    fn send_raw(addr: &str, raw: &[u8]) -> (u16, String) {
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let _ = sock.write_all(raw);
+        let mut out = Vec::new();
+        let _ = sock.read_to_end(&mut out);
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let status = out.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (status, out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
+    fn post(addr: &str, path: &str, body: &str) -> (u16, String) {
+        send_raw(addr, format!("POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}", body.len()).as_bytes())
+    }
+
+    fn council() -> ScriptedCouncil {
+        ScriptedCouncil::start(Script { verdicts: vec![Verdict::Proceed], undo: None }).unwrap()
+    }
+
+    #[test]
+    fn a_body_over_the_limit_gets_413_and_is_recorded() {
+        let council = council();
+        let addr = &council.base()["http://".len()..];
+        let head = format!("POST /council/v1/specs HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n", BODY_LIMIT + 1);
+        let (status, _) = send_raw(addr, head.as_bytes());
+        assert_eq!(status, 413);
+        let errors = council.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("larger than"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_head_over_the_limit_is_refused_and_recorded() {
+        let council = council();
+        let addr = &council.base()["http://".len()..];
+        let head = format!("GET /council/v1/identity HTTP/1.1\r\nx-pad: {}", "a".repeat(HEAD_LIMIT + 1));
+        let (status, _) = send_raw(addr, head.as_bytes());
+        assert_eq!(status, 431);
+        assert_eq!(council.errors().len(), 1, "{:?}", council.errors());
+    }
+
+    #[test]
+    fn errors_are_kept_short_and_counted_past_the_limit() {
+        let council = council();
+        let addr = &council.base()["http://".len()..];
+        let long = format!("/council/v1/{}", "x".repeat(ERROR_TEXT_LIMIT * 4));
+        for _ in 0..ERROR_LIMIT + 5 {
+            assert_eq!(post(addr, &long, "").0, 500);
+        }
+        let errors = council.errors();
+        assert_eq!(errors.len(), ERROR_LIMIT + 1, "{errors:?}");
+        assert!(errors[..ERROR_LIMIT].iter().all(|e| e.len() <= ERROR_TEXT_LIMIT + 3), "{errors:?}");
+        assert_eq!(errors[ERROR_LIMIT], "and 5 more error(s)");
+    }
+
+    #[test]
+    fn the_server_holds_at_most_spec_limit_specs() {
+        let council = council();
+        let addr = &council.base()["http://".len()..];
+        for n in 0..SPEC_LIMIT {
+            let mut spec = spec();
+            spec.name = format!("fleet-spec-{n}");
+            let (status, body) = post(addr, "/council/v1/specs", &serde_json::to_string(&spec).unwrap());
+            assert_eq!(status, 200, "{body}");
+        }
+        let mut spec = spec();
+        spec.name = "one-too-many".into();
+        assert_eq!(post(addr, "/council/v1/specs", &serde_json::to_string(&spec).unwrap()).0, 500);
+        assert!(council.errors().iter().any(|e| e.contains("at most")), "{:?}", council.errors());
     }
 
     #[test]
