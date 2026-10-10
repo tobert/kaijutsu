@@ -285,8 +285,6 @@ bump record and limit, and the message template. Still open:
   it does not reach the seat's context as a drift, nor its banto.
 - **Ledger garbage collection.** Bump decisions have no ask and so do not
   fill `kj ledger`, but they accumulate in `council_decisions`.
-- **`kj ledger` does not show bumps.** Bumps are `council_decisions` rows, and
-  `kj ledger` lists asks. Showing council decisions there needs its own design.
 - **Debiasing by reading both option orders.**
 - **The bump count never resets.** It counts every refused bump of a
   submission in a seat context. A bump an hour ago counts after a pass in

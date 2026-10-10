@@ -97,7 +97,7 @@ pub fn format_context_table(
 /// `list_active_contexts`' own ORDER BY and `roster_sources::recent_snapshot`
 /// use. Age answers "is anyone still using this", so last activity is the
 /// question, not birth.
-fn format_age_compact(millis: i64) -> String {
+pub(crate) fn format_age_compact(millis: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_secs((millis / 1000).max(0) as u64);
     let secs = std::time::SystemTime::now()

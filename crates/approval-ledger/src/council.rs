@@ -365,6 +365,128 @@ pub fn list_bump_flavors(conn: &Connection, context_id: &[u8], submission_digest
     Ok(flavors)
 }
 
+/// One submission the council judged for a seat, read from its shell
+/// decision: when, whether the seat got it back as a bump, why, and the
+/// pooled `undo` read when the spec asked it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CouncilSubmission {
+    pub decision_id: Vec<u8>,
+    pub context_id: Vec<u8>,
+    pub created_at: i64,
+    pub submission_digest: String,
+    /// The shell decision's own outcome.
+    pub outcome: CouncilOutcome,
+    /// The seat got the submission back with nothing run and no ask: a
+    /// bump, or in bump-only mode a miss, a control-text hit, or a program
+    /// that did not pass.
+    pub bumped: bool,
+    /// What the bump is called: the shell's flavor, else the first bumping
+    /// program's, else `unjudged`, `control_text`, or `unread` as the gate
+    /// names them. `None` when not bumped.
+    pub flavor: Option<String>,
+    /// The pooled `undo` argmax and its probability.
+    pub undo: Option<(String, f64)>,
+}
+
+/// Bumps in a row: the trailing run of bumped submissions, newest last.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BumpStreak {
+    pub count: usize,
+    pub first_at: i64,
+    pub last_at: i64,
+    /// Each bump's flavor, oldest first.
+    pub flavors: Vec<String>,
+}
+
+/// Which submissions [`list_council_submissions`] returns.
+#[derive(Clone, Debug, Default)]
+pub struct SubmissionFilter {
+    pub context_id: Option<Vec<u8>>,
+    pub since_ms: Option<i64>,
+    pub limit: u32,
+}
+
+/// Shell decisions, newest first. A program's own decision is part of its
+/// submission and is not listed. A submission is bumped when no ask links
+/// to it and it did not pass: the gate records exactly those without an ask
+/// (`kj/gate.rs`, `record_unlinked_council_decision`).
+pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) -> Result<Vec<CouncilSubmission>> {
+    const PROGRAM_UNPASSED: &str = "SELECT p.seq FROM council_programs p
+        LEFT JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+        WHERE p.decision_id = d.decision_id AND (p.unread_cause IS NOT NULL OR pd.outcome != 'allow')";
+    let sql = format!(
+        "SELECT d.decision_id, d.context_id, d.created_at, d.submission_digest, d.outcome,
+                d.request_id IS NULL AND (d.outcome != 'allow' OR EXISTS ({PROGRAM_UNPASSED})),
+                COALESCE(
+                    d.bump_flavor,
+                    (SELECT pd.bump_flavor FROM council_programs p
+                       JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+                      WHERE p.decision_id = d.decision_id AND pd.outcome = 'bump' ORDER BY p.seq LIMIT 1),
+                    CASE d.outcome WHEN 'miss' THEN 'unjudged' WHEN 'ask' THEN 'control_text'
+                                   WHEN 'report' THEN 'control_text' END,
+                    (SELECT CASE WHEN p.unread_cause IS NOT NULL THEN 'unread' ELSE 'unjudged' END
+                       FROM council_programs p
+                       LEFT JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+                      WHERE p.decision_id = d.decision_id AND (p.unread_cause IS NOT NULL OR pd.outcome != 'allow')
+                      ORDER BY p.seq LIMIT 1)),
+                (SELECT option FROM council_pooled
+                  WHERE decision_id = d.decision_id AND question_id = 'undo'
+                  ORDER BY probability DESC, option LIMIT 1),
+                (SELECT MAX(probability) FROM council_pooled
+                  WHERE decision_id = d.decision_id AND question_id = 'undo')
+           FROM council_decisions d
+          WHERE NOT EXISTS (SELECT 1 FROM council_programs p WHERE p.program_decision_id = d.decision_id)
+            AND (?1 IS NULL OR d.context_id = ?1)
+            AND (?2 IS NULL OR d.created_at >= ?2)
+          ORDER BY d.created_at DESC, d.decision_id DESC
+          LIMIT ?3"
+    );
+    let rows = conn
+        .prepare(&sql)?
+        .query_map(params![filter.context_id, filter.since_ms, filter.limit], |row| {
+            let outcome: String = row.get(4)?;
+            let bumped: bool = row.get(5)?;
+            let undo = match (row.get::<_, Option<String>>(7)?, row.get::<_, Option<f64>>(8)?) {
+                (Some(option), Some(p)) => Some((option, p)),
+                _ => None,
+            };
+            Ok((
+                CouncilSubmission {
+                    decision_id: row.get(0)?,
+                    context_id: row.get(1)?,
+                    created_at: row.get(2)?,
+                    submission_digest: row.get(3)?,
+                    outcome: CouncilOutcome::Allow,
+                    bumped,
+                    flavor: if bumped { row.get(6)? } else { None },
+                    undo,
+                },
+                outcome,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(mut submission, outcome)| {
+            submission.outcome = parse_enum::<CouncilOutcome>("outcome", &outcome)?;
+            Ok(submission)
+        })
+        .collect()
+}
+
+/// The trailing bump streak of `submissions` (newest first, as
+/// [`list_council_submissions`] returns them): the bumps before the most
+/// recent submission that was not bumped. `None` when the newest was not.
+pub fn bump_streak(submissions: &[CouncilSubmission]) -> Option<BumpStreak> {
+    let run: Vec<&CouncilSubmission> = submissions.iter().take_while(|s| s.bumped).collect();
+    let (newest, oldest) = (run.first()?, run.last()?);
+    Some(BumpStreak {
+        count: run.len(),
+        first_at: oldest.created_at,
+        last_at: newest.created_at,
+        flavors: run.iter().rev().map(|s| s.flavor.clone().unwrap_or_default()).collect(),
+    })
+}
+
 fn list(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<CouncilDecision>> {
     let heads = conn
         .prepare(sql)?
@@ -899,6 +1021,102 @@ mod tests {
         assert_eq!(list_bump_flavors(&conn, ASKING_CONTEXT, "d2").unwrap(), ["try_harder"]);
         assert_eq!(list_bump_flavors(&conn, &[7, 7], "d1").unwrap(), ["try_harder"]);
         assert!(list_bump_flavors(&conn, ASKING_CONTEXT, "nothing").unwrap().is_empty());
+    }
+
+    /// Submissions are shell decisions, newest first; a submission is
+    /// bumped when no ask links it and it did not pass. Its flavor follows
+    /// the gate's names, and the pooled `undo` argmax rides along.
+    #[test]
+    fn submissions_read_bumps_from_unlinked_shell_decisions() {
+        let conn = open_memory();
+        let insert = |outcome: CouncilOutcome, flavor: Option<&str>, linked: bool, at: i64| {
+            let mut d = decision();
+            d.outcome = outcome;
+            d.bump_flavor = flavor.map(str::to_owned);
+            d.miss_cause = (outcome == CouncilOutcome::Miss).then(|| "low mass".to_string());
+            d.control_text = vec![];
+            if linked {
+                d.request_id = Some(crate::ask::create_ask(&conn, &minimal_ask()).unwrap());
+            }
+            let id = insert_council_decision(&conn, &d).unwrap();
+            conn.execute("UPDATE council_decisions SET created_at = ?1 WHERE decision_id = ?2", params![at, id]).unwrap();
+            id
+        };
+        insert(CouncilOutcome::Allow, None, true, 100);
+        insert(CouncilOutcome::Bump, Some("try_harder"), false, 200);
+        insert(CouncilOutcome::Miss, None, false, 300);
+        insert(CouncilOutcome::Bump, Some("do_less"), true, 400);
+        insert(CouncilOutcome::Bump, Some("do_less"), false, 500);
+        let all = list_council_submissions(&conn, &SubmissionFilter { limit: 10, ..Default::default() }).unwrap();
+        let seen: Vec<(i64, bool, Option<&str>)> = all.iter().map(|s| (s.created_at, s.bumped, s.flavor.as_deref())).collect();
+        assert_eq!(seen, [
+            (500, true, Some("do_less")),
+            (400, false, None),
+            (300, true, Some("unjudged")),
+            (200, true, Some("try_harder")),
+            (100, false, None),
+        ], "an ask-linked bump (at the limit) is not a refused bump");
+        assert_eq!(all[0].undo, Some(("yes".to_string(), 0.8)), "the fixture's pooled undo argmax");
+        let since = list_council_submissions(&conn, &SubmissionFilter { since_ms: Some(300), limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(since.len(), 3);
+        let other = list_council_submissions(&conn, &SubmissionFilter { context_id: Some(vec![7, 7]), limit: 10, ..Default::default() }).unwrap();
+        assert!(other.is_empty());
+    }
+
+    /// A program's own decision is not a submission; a shell decision that
+    /// passed with a program that bumped is a bumped submission named by
+    /// the program's flavor, and an unread program bumps as `unread`.
+    #[test]
+    fn a_program_bump_is_its_submission_s_bump() {
+        let conn = open_memory();
+        let mut program = decision();
+        program.outcome = CouncilOutcome::Bump;
+        program.bump_flavor = Some("originals=changes".into());
+        let program_id = insert_council_decision(&conn, &program).unwrap();
+        let shell_id = insert_council_decision(&conn, &decision()).unwrap();
+        let row = |program_decision_id: Option<Vec<u8>>, unread: Option<&str>| CouncilProgram {
+            statement_idx: 0,
+            command: "python3 x.py".into(),
+            language: "python".into(),
+            path: None,
+            sha256: None,
+            imports_not_shown: vec![],
+            unread_cause: unread.map(str::to_owned),
+            program_decision_id,
+        };
+        insert_council_programs_within(&conn, &shell_id, &[row(Some(program_id), None)]).unwrap();
+        let unread_shell = insert_council_decision(&conn, &decision()).unwrap();
+        insert_council_programs_within(&conn, &unread_shell, &[row(None, Some("missing"))]).unwrap();
+        let all = list_council_submissions(&conn, &SubmissionFilter { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 2, "the program's own decision is not listed: {all:?}");
+        let flavor_of = |id: &[u8]| all.iter().find(|s| s.decision_id == id).unwrap().flavor.clone();
+        assert_eq!(flavor_of(&shell_id).as_deref(), Some("originals=changes"));
+        assert_eq!(flavor_of(&unread_shell).as_deref(), Some("unread"));
+    }
+
+    /// The streak is the trailing run of bumps, oldest flavor first, and a
+    /// pass ends it.
+    #[test]
+    fn the_bump_streak_is_the_trailing_run_of_bumps() {
+        let at = |created_at: i64, bumped: bool, flavor: &str| CouncilSubmission {
+            decision_id: vec![created_at as u8],
+            context_id: ASKING_CONTEXT.to_vec(),
+            created_at,
+            submission_digest: "d".into(),
+            outcome: if bumped { CouncilOutcome::Bump } else { CouncilOutcome::Allow },
+            bumped,
+            flavor: bumped.then(|| flavor.to_string()),
+            undo: None,
+        };
+        let newest_first = [at(50, true, "do_less"), at(40, true, "try_harder"), at(30, false, ""), at(20, true, "x")];
+        assert_eq!(bump_streak(&newest_first), Some(BumpStreak {
+            count: 2,
+            first_at: 40,
+            last_at: 50,
+            flavors: vec!["try_harder".into(), "do_less".into()],
+        }));
+        assert_eq!(bump_streak(&newest_first[2..]), None, "the newest passed");
+        assert_eq!(bump_streak(&[]), None);
     }
 
     #[test]

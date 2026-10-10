@@ -434,6 +434,23 @@ enum LedgerCommand {
         #[arg(long, value_parser = parse_verb_arg)]
         verb: Option<String>,
     },
+    /// List council bumps: for each seat, its streak of bumps in a row,
+    /// their flavors, and the council's `undo` read of the last one. With
+    /// `--context`, that seat's judged submissions, newest first. A bump has
+    /// no ask, so `kj ledger list` does not show it.
+    Bumps {
+        /// Show this context's submissions instead of the per-seat summary.
+        /// Accepts `.` (current), a label, or a hex id prefix.
+        #[arg(long)]
+        context: Option<String>,
+        /// Only submissions judged within this long of now: an integer plus
+        /// m/h/d, e.g. 30m, 2h, 7d.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Read at most this many submissions, newest first.
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
     /// Advisory signals — a rule that almost matched, a classifier's risk
     /// read — attached to an ask but never themselves a gate.
     Signal {
@@ -571,6 +588,7 @@ impl KjDispatcher {
                 Some(id) => self.ledger_run_show(&id),
                 None => self.ledger_runs_list(caller, limit, since.as_deref(), context.as_deref(), verb.as_deref()),
             },
+            LedgerCommand::Bumps { context, since, limit } => self.ledger_bumps(caller, context.as_deref(), &since, limit),
             LedgerCommand::Signal { command } => match command {
                 SignalCommand::Add {
                     statement,
@@ -1315,6 +1333,101 @@ impl KjDispatcher {
         KjResult::ok_with_data(lines.join("\n"), data)
     }
 
+    /// `kj ledger bumps`: each seat's bump streak, or one seat's judged
+    /// submissions with `--context`.
+    fn ledger_bumps(&self, caller: &KjCaller, context: Option<&str>, since: &str, limit: u32) -> KjResult {
+        use approval_ledger::council::{CouncilOutcome, SubmissionFilter, bump_streak, list_council_submissions};
+        let since_ms = match parse_since_duration_ms(since) {
+            Ok(ms) => since_cutoff_ms(ms),
+            Err(e) => return KjResult::Err(e),
+        };
+        let db = self.kernel_db.lock();
+        let context_id = match context {
+            Some(c) => match refs::resolve_context_ref(&refs::parse_context_ref(c), caller, &db) {
+                Ok(id) => Some(id),
+                Err(e) => return KjResult::Err(format!("kj ledger bumps: {e}")),
+            },
+            None => None,
+        };
+        let filter = SubmissionFilter {
+            context_id: context_id.map(|c| c.as_bytes().to_vec()),
+            since_ms: Some(since_ms),
+            limit,
+        };
+        let submissions = match list_council_submissions(db.conn_for_ledger(), &filter) {
+            Ok(rows) => rows,
+            Err(e) => return KjResult::Err(format!("kj ledger bumps: {e}")),
+        };
+        let undo = |u: &Option<(String, f64)>| u.as_ref().map_or_else(|| "-".to_string(), |(o, p)| format!("{o} {p:.2}"));
+        let short = |bytes: &[u8]| ContextId::try_from_slice(bytes).map_or_else(|| "(unparseable)".to_string(), |c| c.short());
+        let label = |bytes: &[u8]| {
+            ContextId::try_from_slice(bytes)
+                .and_then(|c| db.get_context(c).ok().flatten())
+                .and_then(|row| row.label)
+                .unwrap_or_else(|| "-".to_string())
+        };
+        if submissions.is_empty() {
+            return KjResult::ok(format!("(no council submissions in the last {since})"));
+        }
+
+        if context_id.is_some() {
+            let mut lines = vec![format!("  {:<5}  {:<6}  {:<20}  {:<18}  {}", "AGE", "RESULT", "FLAVOR", "UNDO", "SUBMISSION")];
+            for s in &submissions {
+                let result = match (s.bumped, s.outcome) {
+                    (true, _) => "bump",
+                    (false, CouncilOutcome::Allow) => "pass",
+                    (false, other) => other.as_str(),
+                };
+                let digest = s.submission_digest.strip_prefix("sha256:").unwrap_or(&s.submission_digest);
+                lines.push(format!(
+                    "  {:<5}  {:<6}  {:<20}  {:<18}  {}",
+                    super::format::format_age_compact(s.created_at),
+                    result,
+                    s.flavor.as_deref().unwrap_or("-"),
+                    undo(&s.undo),
+                    digest.chars().take(12).collect::<String>(),
+                ));
+            }
+            lines.push(String::new());
+            lines.push("a repeated SUBMISSION is the same text sent again".into());
+            return KjResult::ok(lines.join("\n"));
+        }
+
+        // Group by seat, keeping newest-first order within and across seats.
+        let mut seats: Vec<(Vec<u8>, Vec<approval_ledger::council::CouncilSubmission>)> = Vec::new();
+        for s in submissions {
+            match seats.iter_mut().find(|(c, _)| *c == s.context_id) {
+                Some((_, rows)) => rows.push(s),
+                None => seats.push((s.context_id.clone(), vec![s])),
+            }
+        }
+        let mut lines = vec![format!(
+            "  {:<10}  {:<20}  {:>6}  {:>5}  {:>6}  {:<5}  {:<18}  {}",
+            "CONTEXT", "LABEL", "STREAK", "BUMPS", "PASSES", "LAST", "UNDO", "FLAVORS"
+        )];
+        for (context, rows) in &seats {
+            let streak = bump_streak(rows);
+            let bumps = rows.iter().filter(|s| s.bumped).count();
+            let passes = rows.iter().filter(|s| !s.bumped && s.outcome == CouncilOutcome::Allow).count();
+            let last_bump = rows.iter().find(|s| s.bumped);
+            lines.push(format!(
+                "  {:<10}  {:<20}  {:>6}  {:>5}  {:>6}  {:<5}  {:<18}  {}",
+                short(context),
+                label(context),
+                streak.as_ref().map_or(0, |s| s.count),
+                bumps,
+                passes,
+                super::format::format_age_compact(rows[0].created_at),
+                last_bump.map_or_else(|| "-".to_string(), |s| undo(&s.undo)),
+                streak.map_or_else(|| "-".to_string(), |s| s.flavors.join(", ")),
+            ));
+        }
+        lines.push(String::new());
+        lines.push(format!("STREAK is bumps in a row since the last submission that ran; window {since}."));
+        lines.push("see one seat's submissions with: kj ledger bumps --context <context>".into());
+        KjResult::ok(lines.join("\n"))
+    }
+
     /// Show retained script results and distinguish pending settlement from
     /// running execution. Older records can lack captured output.
     fn ledger_run_show(&self, run_id: &str) -> KjResult {
@@ -1958,6 +2071,7 @@ impl Classify for LedgerCommand {
             | LedgerCommand::Show { .. }
             | LedgerCommand::Rules { .. }
             | LedgerCommand::Runs { .. }
+            | LedgerCommand::Bumps { .. }
             | LedgerCommand::Delegation { command: DelegationCommand::List } => Effect::Read,
             LedgerCommand::Allow { .. }
             | LedgerCommand::Deny { .. }

@@ -806,6 +806,12 @@ action refused with guidance and tries again, with no human in the loop.
   built-in text is used.
 - **The record.** `council.decide` and the info line carry `outcome = bump`,
   `bump_flavor`, and `p_proceed`.
+- **Reading bumps back.** `kj ledger bumps` lists each seat's streak, the
+  bumps in a row since its last submission that ran, with their flavors
+  and the `undo` read of the last one; `--context` lists one seat's judged
+  submissions, newest first, with a digest prefix that shows a resend. A
+  submission is bumped when its shell decision links no ask and did not
+  pass (`approval_ledger::council::list_council_submissions`).
 
 ### Bump-only
 

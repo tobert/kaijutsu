@@ -2254,6 +2254,52 @@ async fn the_undo_read_is_recorded_and_never_decides() {
     }
 }
 
+/// `kj ledger bumps` reads the seat's bumps back: its streak of two with
+/// their flavors and the undo read, ended by the pass that follows, and
+/// the per-submission history with `--context`.
+///
+/// Falsified by a listing that reads asks rather than council decisions:
+/// bumps have no ask, so it shows none.
+#[tokio::test]
+async fn kj_ledger_bumps_shows_each_seat_s_streak_and_history() {
+    let rig = rig(Via::Tool, bumper(5)).await;
+    rig.mock.set(|req| Reply::ok(bump_answer_with_undo(req, TRY_HARDER, IRREVERSIBLE)));
+    refusal_text(Via::Tool, rig.submit("touch /work/a").await);
+    rig.mock.set(|req| Reply::ok(bump_answer_with_undo(req, DO_LESS, IRREVERSIBLE)));
+    refusal_text(Via::Tool, rig.submit("touch /work/b").await);
+    let seat = rig.ctx.context_id.short();
+    let caller = crate::kj::test_helpers::caller_with_context(rig.ctx.context_id);
+    let kj = |args: &[&str]| {
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let d = rig.d.clone();
+        let caller = caller.clone();
+        async move { d.dispatch(&argv, &caller).await }
+    };
+
+    let listed = kj(&["ledger", "bumps"]).await;
+    assert!(listed.is_ok(), "{}", listed.message());
+    let text = listed.message();
+    assert!(text.contains("STREAK"), "{text}");
+    let row = text.lines().find(|l| l.contains(&seat)).unwrap_or_else(|| panic!("the seat is listed: {text}"));
+    assert!(row.contains(" 2 "), "a streak of two: {row}");
+    assert!(row.contains("try_harder, do_less"), "the streak's flavors, oldest first: {row}");
+    assert!(row.contains("irreversible"), "the last bump's undo read: {row}");
+
+    rig.mock.bumper_says(PROCEED);
+    rig.submit("echo council-ran").await.unwrap();
+    let listed = kj(&["ledger", "bumps"]).await;
+    let row = listed.message().lines().find(|l| l.contains(&seat)).map(str::to_string).unwrap_or_default();
+    assert!(row.contains(" 0 "), "a pass ends the streak: {}", listed.message());
+
+    let history = kj(&["ledger", "bumps", "--context", &rig.ctx.context_id.to_hex()]).await;
+    assert!(history.is_ok(), "{}", history.message());
+    let lines: Vec<&str> = history.message().lines().filter(|l| l.contains("bump") || l.contains("pass")).collect();
+    assert!(lines.len() >= 3, "{}", history.message());
+    assert!(lines.iter().any(|l| l.contains("pass")), "{}", history.message());
+    assert!(lines.iter().any(|l| l.contains("do_less") && l.contains("irreversible 0.")), "{}", history.message());
+    rig.finish().await;
+}
+
 /// The same submission sent again after a bump is judged again, and runs
 /// when the council now proceeds.
 ///
