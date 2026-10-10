@@ -1474,6 +1474,21 @@ fn spells_kj(cmd: &PlannedCommand) -> bool {
     cmd.name != "kj" && matches!(base, "kj" | "kjc")
 }
 
+/// A command other than the `kj` builtin whose literal arguments name `kj`
+/// or `kjc` as a word (`env kj`, `xargs kj`, `bash -c 'kj drive x'`): a
+/// wrapper that can reach a kernel verb whose target the condition does
+/// not read.
+fn wraps_kj(cmd: &PlannedCommand) -> bool {
+    use kaish_types::plan::PlannedValue;
+    cmd.name != "kj"
+        && cmd.args.iter().any(|arg| match arg {
+            PlannedValue::Literal { value, .. } => value
+                .split(|c: char| c.is_whitespace() || ";&|()`$\"'<>".contains(c))
+                .any(|word| matches!(word.rsplit('/').next().unwrap_or(word), "kj" | "kjc")),
+            _ => false,
+        })
+}
+
 /// Whether a `character` allow rule may cover `cmd` for `caller`'s actor.
 ///
 /// A host command spelled `kj` or `kjc` fails. Any other command that is
@@ -1520,12 +1535,14 @@ fn literal_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
 }
 
 /// Why a planned program cannot teach a `character` allow rule: a `kj`
-/// command the condition does not read, or a host command spelled `kj` or
-/// `kjc`, so the rule could never cover it. `None` when every command can
+/// command the condition does not read, a host command spelled `kj` or
+/// `kjc`, or a wrapper whose arguments name either, so the rule could
+/// never cover it safely. `None` when every command can
 /// be covered.
 pub(crate) fn character_rule_refusal(statements: &[PlannedStatement]) -> Option<String> {
     let unread = statements.iter().flat_map(|s| s.plan.commands.iter()).find(|cmd| {
         spells_kj(cmd)
+            || wraps_kj(cmd)
             || cmd.name == "kj"
             && builtin_key(cmd).is_none()
             && literal_args(cmd).is_none_or(|args| character_target(&args) == CharacterTarget::Unread)
@@ -1859,6 +1876,26 @@ mod tests {
         assert!(refusal("./kj drive amy-lane").is_some());
         assert!(refusal("kjc -c verify kj context archive amy-lane --confirm").is_some());
         assert!(refusal("kj context set lane --model m").is_some());
+    }
+
+    /// A wrapper whose arguments name `kj` or `kjc` teaches no character
+    /// allow: its family key (`env kj`, `bash`) would later cover the
+    /// wrapper with any target, and the condition reads no target in it.
+    #[test]
+    fn a_character_allow_is_refused_for_a_wrapper_around_kj() {
+        let refusal = |source: &str| character_rule_refusal(&plan(source));
+        for source in [
+            "env kj drive amy-lane",
+            "xargs kj drive",
+            "timeout 5 kj drive amy-lane",
+            "bash -c 'kj drive amy-lane'",
+            "sh -c \"kjc -c verify kj drive amy-lane\"",
+            "nohup /usr/bin/kj drive amy-lane",
+        ] {
+            assert!(refusal(source).is_some(), "{source}");
+        }
+        assert_eq!(refusal("git log --oneline"), None, "an ordinary command still teaches");
+        assert_eq!(refusal("grep -r kjx src"), None, "a word that only starts with kj is not kj");
     }
 
     #[test]

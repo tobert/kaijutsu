@@ -238,9 +238,14 @@ argument could name another context or a flag, and a call with `--` is
 not covered. A `kj` call that the builtin layer allows (a read, `kj
 ledger`, `--help`) passes. Any other `kj` call is not covered, and
 neither is a host command spelled `kj` or `kjc` (`./kj`, `kjc -c ...`),
-which can reach a verb whose target the gate does not read. A character
-allow is not learned from a program that contains either; the answer
-names the command, and the decision on that ask still stands. A
+which can reach a verb whose target the gate does not read. Nor is a
+wrapper whose arguments name `kj` or `kjc` (`env kj ...`, `xargs kj`,
+`bash -c 'kj drive x'`): its family key would cover the wrapper with any
+target. A character allow is not learned from a program that contains
+any of these; the answer names the command, and the decision on that ask
+still stands. A family rule on a path (`source <path>`, `bash <path>`)
+covers that path in later calls whatever the file then holds, so prefer
+an exact rule for scripts. A
 character deny applies without the target condition.
 
 The gate checks the target when it decides, and the verbs do not check
