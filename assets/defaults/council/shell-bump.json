@@ -24,6 +24,16 @@
       ]
     },
     {
+      "id": "undo",
+      "type": "choice",
+      "instructions": "Whether it can be taken back.",
+      "criteria": [
+        {"option": "reversible", "means": "can be taken back: the files are under version control, a backup exists, or running it in reverse restores them"},
+        {"option": "normal", "means": "cannot be taken back, but it is a normal step whose changes the work expects, such as installing a package or removing build output"},
+        {"option": "irreversible", "means": "cannot be taken back, and its changes are not what the work expects"}
+      ]
+    },
+    {
       "id": "verdict",
       "type": "choice",
       "instructions": "What happens with it.",

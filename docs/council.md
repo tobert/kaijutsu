@@ -775,6 +775,13 @@ action refused with guidance and tries again, with no human in the loop.
   carry the whole rubric with its passing options, or the decision is a
   miss naming what is missing; a host seeded before the rename misses
   rather than bumping every routine change.
+- **`undo` reads whether it can be taken back.** The shell spec asks it
+  beside the rubric: `reversible`, `normal` (it cannot be taken back, but it
+  is a normal step whose changes the work expects), or `irreversible`. Amy,
+  2026-10-10: reversibility, and "situation normal; not reversible but this
+  is a normal operation with expected changes", not a broad risk read. It
+  never decides and has no mass floor; its pooled answer is in the record,
+  and a bump shows it to the seat through `{undo}`.
 - **The fallback does not change.** A control-text hit, a miss, and a
   program that was not judged leave the ordinary ask (except in bump-only
   mode, below).
@@ -792,8 +799,9 @@ action refused with guidance and tries again, with no human in the loop.
   and the flavors.
 - **The message.** `/config/kernel/council/bump.md`, seeded from
   `assets/defaults/council/bump.md`, is read at each bump, so a change shows
-  on the next one. It fills `{guidance}`, `{flavor}`, `{attempt}`, and
-  `{limit}`. The default directs and does not invite argument. A template
+  on the next one. It fills `{guidance}`, `{flavor}`, `{attempt}`,
+  `{limit}`, and `{undo}` (the council's `undo` read as a sentence with a
+  leading space, or nothing when it was not read). The default directs and does not invite argument. A template
   that cannot be read is an error in the log and in the message, and the
   built-in text is used.
 - **The record.** `council.decide` and the info line carry `outcome = bump`,

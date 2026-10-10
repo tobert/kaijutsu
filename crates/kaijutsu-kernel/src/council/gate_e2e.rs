@@ -2188,6 +2188,72 @@ async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
     }
 }
 
+const UNDO_OPTIONS: [&str; 3] = ["reversible", "normal", "irreversible"];
+const IRREVERSIBLE: [f64; 3] = [-5.0, -3.0, -0.06];
+
+/// Every read answers the verdict and the `undo` read.
+fn bump_answer_with_undo(request: &DecisionRequest, verdict: [f64; 3], undo: [f64; 3]) -> serde_json::Value {
+    let n = request.contexts.as_ref().map(Vec::len).unwrap_or(0);
+    super::gate::test_support::answer_choices(
+        request,
+        &[("verdict", BUMP_OPTIONS, &vec![verdict; n]), ("undo", UNDO_OPTIONS, &vec![undo; n])],
+    )
+}
+
+/// A bump carries the council's `undo` read to the seat, with what that
+/// option means and its pooled probability.
+///
+/// Falsified by a template or renderer that leaves the read out: the
+/// refusal says nothing about taking it back.
+#[tokio::test]
+async fn a_bump_tells_the_seat_how_reversible_the_council_reads_it() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.mock.set(|req| Reply::ok(bump_answer_with_undo(req, TRY_HARDER, IRREVERSIBLE)));
+        let text = refusal_text(via, rig.submit("touch /work/marker").await);
+        assert!(text.contains("reads it as irreversible"), "{via:?}: {text}");
+        assert!(text.contains("cannot be taken back, and"), "{via:?}: the option's meaning: {text}");
+        assert!(!text.contains("{undo}"), "{via:?}: {text}");
+        rig.finish().await;
+    }
+}
+
+/// A bump with no `undo` read renders no placeholder.
+#[tokio::test]
+async fn a_bump_without_an_undo_read_leaves_no_placeholder() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        rig.mock.bumper_says(TRY_HARDER);
+        let text = refusal_text(via, rig.submit("touch /work/marker").await);
+        assert!(!text.contains("{undo}") && !text.contains("reads it as"), "{via:?}: {text}");
+        rig.finish().await;
+    }
+}
+
+/// The `undo` read is recorded and never decides: an irreversible read
+/// with a thin mass beside a confident proceed still runs.
+///
+/// Falsified by adding `undo` to the questions the gate decides by or
+/// floors: the submission bumps or misses.
+#[tokio::test]
+async fn the_undo_read_is_recorded_and_never_decides() {
+    for via in BOTH {
+        let rig = rig(via, bumper(3)).await;
+        let thin_irreversible = [-40.0, -40.0, -30.0];
+        rig.mock.set(move |req| Reply::ok(bump_answer_with_undo(req, PROCEED, thin_irreversible)));
+        rig.submit("echo council-ran").await.unwrap_or_else(|e| panic!("{via:?}: undo does not decide: {e:?}"));
+        let ask = rig.only_ask();
+        let decision = the_decision(&rig, &ask);
+        assert_eq!(decision.decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        assert!(
+            decision.decision.pooled.iter().any(|p| p.question_id == "undo" && p.option == "irreversible"),
+            "{via:?}: the undo read is in the record: {:?}",
+            decision.decision.pooled
+        );
+        rig.finish().await;
+    }
+}
+
 /// The same submission sent again after a bump is judged again, and runs
 /// when the council now proceeds.
 ///

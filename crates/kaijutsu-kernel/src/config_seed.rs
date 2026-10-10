@@ -401,10 +401,15 @@ mod tests {
         let ids: Vec<&str> = spec.questions.iter().map(|q| q.id()).collect();
         assert_eq!(
             ids,
-            ["originals", "network", "verdict"],
-            "the program rubric decides, then the verdict names a bump; no text question"
+            ["originals", "network", "undo", "verdict"],
+            "the program rubric decides, undo is read for the record, then the verdict names a bump; no text question"
         );
-        let kaijutsu_mk::council::wire::SpecQuestion::Choice(verdict) = &spec.questions[2] else {
+        let kaijutsu_mk::council::wire::SpecQuestion::Choice(undo) = &spec.questions[2] else {
+            panic!("undo is a choice")
+        };
+        let options: Vec<&str> = undo.criteria.iter().map(|c| c.option.as_str()).collect();
+        assert_eq!(options, ["reversible", "normal", "irreversible"], "Amy: situation normal sits between the two");
+        let kaijutsu_mk::council::wire::SpecQuestion::Choice(verdict) = &spec.questions[3] else {
             panic!("the verdict is a choice")
         };
         let options: Vec<&str> = verdict.criteria.iter().map(|c| c.option.as_str()).collect();
@@ -442,7 +447,7 @@ mod tests {
 
     #[test]
     fn the_bump_message_template_directs_and_names_its_placeholders() {
-        for placeholder in ["{guidance}", "{attempt}", "{limit}"] {
+        for placeholder in ["{guidance}", "{attempt}", "{limit}", "{undo}"] {
             assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains(placeholder), "the default lacks {placeholder}");
         }
         assert!(DEFAULT_COUNCIL_BUMP_MESSAGE.contains("Try harder, a different approach"));

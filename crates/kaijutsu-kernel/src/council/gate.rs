@@ -66,6 +66,9 @@ use crate::kj::KjCaller;
 /// The spec question whose answer the gate acts on: a `choice` over
 /// `allow`, `ask` and `report`.
 pub(crate) const VERDICT: &str = "verdict";
+/// The question that reads whether a statement can be taken back. It is
+/// recorded and shown in a bump; it never decides.
+pub(crate) const UNDO: &str = "undo";
 
 /// The option of [`VERDICT`] that lets a submission run: `allow` for a
 /// gatekeeper, and `proceed` for a bumper's shell spec. A program spec keeps
@@ -536,13 +539,15 @@ fn bump_flavor(
 /// The file a bump's message is rendered from, read at each bump.
 pub(crate) const BUMP_TEMPLATE_PATH: &str = "council/bump.md";
 
-/// Fill `template`: `{attempt}`, `{limit}`, `{flavor}`, then `{guidance}`
-/// last, so guidance text is never read as a placeholder.
+/// Fill `template`: `{attempt}`, `{limit}`, `{flavor}`, `{undo}` (a leading
+/// space and the sentence, or nothing), then `{guidance}` last, so guidance
+/// text is never read as a placeholder.
 pub(crate) fn render_bump_template(template: &str, bump: &BumpReason, attempt: u64, limit: Option<u64>) -> String {
     template
         .replace("{attempt}", &attempt.to_string())
         .replace("{limit}", &limit.map_or_else(|| "∞".to_string(), |l| l.to_string()))
         .replace("{flavor}", &bump.flavor)
+        .replace("{undo}", &bump.undo.as_ref().map(|u| format!(" {u}")).unwrap_or_default())
         .replace("{guidance}", &bump.guidance)
 }
 
@@ -741,6 +746,9 @@ pub(crate) struct CouncilVerdict {
 pub(crate) struct BumpReason {
     pub(crate) flavor: String,
     pub(crate) guidance: String,
+    /// The council's pooled `undo` read, as a sentence for the seat, when
+    /// the spec asks it.
+    pub(crate) undo: Option<String>,
 }
 
 /// One program a submission runs, as the gate judged it.
@@ -837,10 +845,12 @@ impl CouncilVerdict {
                     } else {
                         "the council could not judge it: send it again, or write it more plainly.".into()
                     },
+                    undo: None,
                 }),
                 Outcome::Ask | Outcome::Report => Some(BumpReason {
                     flavor: "control_text".into(),
                     guidance: "it spells a model's control token: write the command plainly.".into(),
+                    undo: None,
                 }),
             }
         }
@@ -855,6 +865,7 @@ impl CouncilVerdict {
                     "the council could not read the program {} runs ({why}): run a file the command names, or show the program's text in the command.",
                     p.name()
                 ),
+                undo: None,
             }),
         })
     }
@@ -1514,7 +1525,11 @@ async fn decide_inner(
     }
     let bump = match &classification.outcome {
         Outcome::Bump(flavor) => {
-            Some(BumpReason { flavor: flavor.clone(), guidance: bump_guidance(&prepared.spec, flavor) })
+            Some(BumpReason {
+                flavor: flavor.clone(),
+                guidance: bump_guidance(&prepared.spec, flavor),
+                undo: undo_sentence(&prepared.spec, &response),
+            })
         }
         _ => None,
     };
@@ -1596,6 +1611,20 @@ fn bump_guidance(spec: &kaijutsu_mk::council::wire::Spec, flavor: &str) -> Strin
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The pooled `undo` read as a sentence: the option, its probability, and
+/// what the spec says it means. `None` when the spec or the answer has no
+/// `undo` choice.
+fn undo_sentence(spec: &kaijutsu_mk::council::wire::Spec, response: &DecisionResponse) -> Option<String> {
+    use kaijutsu_mk::council::wire::SpecQuestion;
+    let PooledAnswer::Choice(pooled) = response.answers.get(UNDO)? else { return None };
+    let p = pooled.probabilities.get(&pooled.choice).copied().unwrap_or(0.0);
+    let means = spec.questions.iter().find_map(|q| match q {
+        SpecQuestion::Choice(c) if c.id == UNDO => c.criteria.iter().find(|o| o.option == pooled.choice).map(|o| o.means.clone()),
+        _ => None,
+    })?;
+    Some(format!("The council reads it as {} (p {p:.2}): it {means}.", pooled.choice))
 }
 
 /// Why a program spec cannot decide, when it cannot: the gate decides a
