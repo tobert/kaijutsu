@@ -259,6 +259,10 @@ pub enum RuleScope {
     Session,
     /// Any context/principal presenting the same `statement_digest` + label.
     Always,
+    /// The `actor_id` the rule recorded, in any context it performs in. An
+    /// allow also needs the condition the kernel checks for that actor
+    /// (`rules::RuleMatch::character_allows`).
+    Character,
 }
 
 impl RuleScope {
@@ -266,6 +270,7 @@ impl RuleScope {
         match self {
             Self::Session => "session",
             Self::Always => "always",
+            Self::Character => "character",
         }
     }
 }
@@ -698,6 +703,9 @@ pub struct RuleRow {
     pub created_by: Option<Vec<u8>>,
     pub learned_from: Option<String>,
     pub revoked_at: Option<i64>,
+    /// The performer of the ask the rule was learned from; what a
+    /// `character` rule matches.
+    pub actor_id: Option<Vec<u8>>,
 }
 
 /// One `approval_rule_families` row: a rule keyed on a command family
@@ -714,6 +722,9 @@ pub struct FamilyRuleRow {
     pub created_by: Option<Vec<u8>>,
     pub learned_from: Option<String>,
     pub revoked_at: Option<i64>,
+    /// The performer of the ask the rule was learned from; what a
+    /// `character` rule matches.
+    pub actor_id: Option<Vec<u8>>,
 }
 
 /// One statement's coverage result within `rules::redeem` — guarantee 4

@@ -93,13 +93,14 @@ pub fn learn_from_approval(
     // spends it too). One human decision, one use; the rule covers later
     // calls. A forget that lands before delivery leaves that one use in
     // place. See `docs/gate-resume.md`.
+    require_actor_for_character(&approval, scope)?;
     let rule_id = uuid::Uuid::now_v7().to_string();
     let now = now_millis();
     conn.execute(
         "INSERT INTO approval_rules (
             rule_id, statement_digest, authorized_label, context_id, principal_id,
-            scope, allow, created_at, created_by, learned_from
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            scope, allow, created_at, created_by, learned_from, actor_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             rule_id,
             statement_digest,
@@ -111,11 +112,51 @@ pub fn learn_from_approval(
             now,
             created_by,
             request_id,
+            approval.actor_id,
         ],
     )?;
 
     get_rule(conn, &rule_id)?.ok_or_else(|| LedgerError::RuleNotFound(rule_id.clone()))
 }
+
+/// A `character` rule binds the ask's performer, so an ask with none
+/// recorded cannot teach one.
+fn require_actor_for_character(approval: &crate::types::ApprovalRow, scope: RuleScope) -> Result<()> {
+    if scope == RuleScope::Character && approval.actor_id.is_none() {
+        return Err(LedgerError::NoActorRecorded(approval.request_id.clone()));
+    }
+    Ok(())
+}
+
+/// Who presents a statement, for matching rules of each scope: a
+/// `session` rule matches its recorded context and principal, a
+/// `character` rule its recorded actor.
+///
+/// `character_allows` is the condition a `character` allow rule carries,
+/// which only the kernel can evaluate (whether the call's target is a
+/// context that character directs). When it is false, a character allow
+/// covers nothing; a character deny still denies, since a standing deny
+/// only makes the gate more conservative.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuleMatch<'a> {
+    pub context_id: Option<&'a [u8]>,
+    pub principal_id: Option<&'a [u8]>,
+    pub actor_id: Option<&'a [u8]>,
+    pub character_allows: bool,
+}
+
+impl<'a> RuleMatch<'a> {
+    /// The session and always scopes only; no character rule matches.
+    pub fn session(context_id: Option<&'a [u8]>, principal_id: Option<&'a [u8]>) -> Self {
+        Self { context_id, principal_id, actor_id: None, character_allows: false }
+    }
+}
+
+/// The scope clause both rule tables share, over `?2` context, `?3`
+/// principal, `?4` actor and `?5` the character condition.
+const IN_SCOPE: &str = "(scope = 'always'
+      OR (scope = 'session' AND context_id = ?2 AND principal_id = ?3)
+      OR (scope = 'character' AND actor_id = ?4 AND (allow = 0 OR ?5)))";
 
 /// Check a set of statement digests (an ask's ordered statement list, or
 /// any other set a caller wants to probe) against active rules for
@@ -136,14 +177,15 @@ pub fn redeem(
     context_id: Option<&[u8]>,
     principal_id: Option<&[u8]>,
 ) -> Result<AskCoverage> {
+    let scope = RuleMatch::session(context_id, principal_id);
     let mut per_statement = Vec::with_capacity(statement_digests.len());
     for digest in statement_digests {
-        per_statement.push(redeem_one(conn, digest, presented_label, context_id, principal_id)?);
+        per_statement.push(redeem_statement(conn, digest, presented_label, &scope)?);
     }
     Ok(AskCoverage { per_statement })
 }
 
-/// One statement's worth of [`redeem`] — three distinguishable outcomes
+/// One statement's worth of [`redeem`], for any scope — three distinguishable outcomes
 /// (guarantee 4):
 /// - `Uncovered` — no rule at all covers this statement+scope. A clean
 ///   cache-miss; ask a human.
@@ -151,23 +193,27 @@ pub fn redeem(
 ///   matches `presented_label`.
 /// - `Err(LabelMismatch)` — a rule covers this statement+scope but
 ///   authorizes a *different* label than what's being presented now.
-fn redeem_one(
+///
+/// One statement at a time, because a character rule's condition is a fact
+/// about each statement's own target.
+pub fn redeem_statement(
     conn: &Connection,
     statement_digest: &str,
     presented_label: &str,
-    context_id: Option<&[u8]>,
-    principal_id: Option<&[u8]>,
+    scope: &RuleMatch<'_>,
 ) -> Result<StatementVerdict> {
-    let mut stmt = conn.prepare(
-        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
-                scope, allow, created_at, created_by, learned_from, revoked_at
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RULE_COLUMNS}
          FROM approval_rules
          WHERE statement_digest = ?1 AND revoked_at IS NULL
-           AND (scope = 'always' OR (scope = 'session' AND context_id = ?2 AND principal_id = ?3))
-         ORDER BY created_at DESC",
-    )?;
+           AND {IN_SCOPE}
+         ORDER BY created_at DESC"
+    ))?;
     let in_scope: Vec<RuleRow> = stmt
-        .query_map(params![statement_digest, context_id, principal_id], row_to_rule)?
+        .query_map(
+            params![statement_digest, scope.context_id, scope.principal_id, scope.actor_id, scope.character_allows],
+            row_to_rule,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     if let Some(matching) = in_scope.iter().find(|r| r.authorized_label == presented_label) {
@@ -250,6 +296,8 @@ pub fn learn_family_from_approval(
         return Err(LedgerError::NoFamilyKey(request_id.to_string()));
     }
 
+    require_actor_for_character(&approval, scope)?;
+
     let now = now_millis();
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
@@ -257,8 +305,8 @@ pub fn learn_family_from_approval(
         conn.execute(
             "INSERT INTO approval_rule_families (
                 rule_id, family_key, allow, scope, context_id, principal_id,
-                created_at, created_by, learned_from
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                created_at, created_by, learned_from, actor_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 rule_id,
                 key,
@@ -269,6 +317,7 @@ pub fn learn_family_from_approval(
                 now,
                 created_by,
                 request_id,
+                approval.actor_id,
             ],
         )?;
         out.push(get_family_rule(conn, &rule_id)?.ok_or_else(|| LedgerError::RuleNotFound(rule_id.clone()))?);
@@ -286,18 +335,29 @@ pub fn family_coverage(
     context_id: Option<&[u8]>,
     principal_id: Option<&[u8]>,
 ) -> Result<Vec<Option<FamilyRuleRow>>> {
-    let mut stmt = conn.prepare(
-        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
-                created_at, created_by, learned_from, revoked_at
+    family_coverage_scoped(conn, family_keys, &RuleMatch::session(context_id, principal_id))
+}
+
+/// [`family_coverage`] for any scope, character rules included.
+pub fn family_coverage_scoped(
+    conn: &Connection,
+    family_keys: &[&str],
+    scope: &RuleMatch<'_>,
+) -> Result<Vec<Option<FamilyRuleRow>>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {FAMILY_RULE_COLUMNS}
          FROM approval_rule_families
          WHERE family_key = ?1 AND revoked_at IS NULL
-           AND (scope = 'always' OR (scope = 'session' AND context_id = ?2 AND principal_id = ?3))
-         ORDER BY allow ASC, created_at DESC",
-    )?;
+           AND {IN_SCOPE}
+         ORDER BY allow ASC, created_at DESC"
+    ))?;
     let mut out = Vec::with_capacity(family_keys.len());
     for key in family_keys {
         let first: Option<FamilyRuleRow> = stmt
-            .query_map(params![key, context_id, principal_id], row_to_family_rule)?
+            .query_map(
+                params![key, scope.context_id, scope.principal_id, scope.actor_id, scope.character_allows],
+                row_to_family_rule,
+            )?
             .next()
             .transpose()?;
         out.push(first);
@@ -307,9 +367,7 @@ pub fn family_coverage(
 
 pub fn get_family_rule(conn: &Connection, rule_id: &str) -> Result<Option<FamilyRuleRow>> {
     conn.query_row(
-        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
-                created_at, created_by, learned_from, revoked_at
-         FROM approval_rule_families WHERE rule_id = ?1",
+        &format!("SELECT {FAMILY_RULE_COLUMNS} FROM approval_rule_families WHERE rule_id = ?1"),
         params![rule_id],
         row_to_family_rule,
     )
@@ -335,8 +393,7 @@ pub fn list_family_rules_filtered(conn: &Connection, filter: &RuleListFilter) ->
         conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
 
     let select_sql = format!(
-        "SELECT rule_id, family_key, allow, scope, context_id, principal_id,
-                created_at, created_by, learned_from, revoked_at
+        "SELECT {FAMILY_RULE_COLUMNS}
          FROM approval_rule_families {where_clause} ORDER BY created_at DESC LIMIT ?"
     );
     let mut select_params = params;
@@ -347,6 +404,10 @@ pub fn list_family_rules_filtered(conn: &Connection, filter: &RuleListFilter) ->
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((rows, total))
 }
+
+/// Every `approval_rule_families` column [`row_to_family_rule`] reads, in its order.
+const FAMILY_RULE_COLUMNS: &str = "rule_id, family_key, allow, scope, context_id, principal_id,
+    created_at, created_by, learned_from, revoked_at, actor_id";
 
 fn row_to_family_rule(row: &rusqlite::Row) -> rusqlite::Result<FamilyRuleRow> {
     let allow: i64 = row.get(2)?;
@@ -365,14 +426,13 @@ fn row_to_family_rule(row: &rusqlite::Row) -> rusqlite::Result<FamilyRuleRow> {
         created_by: row.get(7)?,
         learned_from: row.get(8)?,
         revoked_at: row.get(9)?,
+        actor_id: row.get(10)?,
     })
 }
 
 pub fn get_rule(conn: &Connection, rule_id: &str) -> Result<Option<RuleRow>> {
     conn.query_row(
-        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
-                scope, allow, created_at, created_by, learned_from, revoked_at
-         FROM approval_rules WHERE rule_id = ?1",
+        &format!("SELECT {RULE_COLUMNS} FROM approval_rules WHERE rule_id = ?1"),
         params![rule_id],
         row_to_rule,
     )
@@ -413,8 +473,7 @@ pub fn list_rules_filtered(conn: &Connection, filter: &RuleListFilter) -> Result
         conn.query_row(&count_sql, rusqlite::params_from_iter(params.iter().cloned()), |row| row.get(0))?;
 
     let select_sql = format!(
-        "SELECT rule_id, statement_digest, authorized_label, context_id, principal_id,
-                scope, allow, created_at, created_by, learned_from, revoked_at
+        "SELECT {RULE_COLUMNS}
          FROM approval_rules {where_clause} ORDER BY created_at DESC LIMIT ?"
     );
     let mut select_params = params;
@@ -425,6 +484,10 @@ pub fn list_rules_filtered(conn: &Connection, filter: &RuleListFilter) -> Result
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok((rows, total))
 }
+
+/// Every `approval_rules` column [`row_to_rule`] reads, in its order.
+const RULE_COLUMNS: &str = "rule_id, statement_digest, authorized_label, context_id, principal_id,
+    scope, allow, created_at, created_by, learned_from, revoked_at, actor_id";
 
 fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
     let scope_raw: String = row.get(5)?;
@@ -444,6 +507,7 @@ fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<RuleRow> {
         created_by: row.get(8)?,
         learned_from: row.get(9)?,
         revoked_at: row.get(10)?,
+        actor_id: row.get(11)?,
     })
 }
 
@@ -603,6 +667,88 @@ mod tests {
             assert!(!crate::decide::redeem_ask(&conn, &request_id).unwrap(), "family={family}");
             assert!(!is_undelivered(&conn, &request_id), "family={family}");
         }
+    }
+
+    // ── character rules ─────────────────────────────────────────────
+
+    /// A character rule matches the performer it was learned from, in any
+    /// context, and its allow covers a call only when the kernel says the
+    /// call meets the character condition; its deny applies regardless.
+    ///
+    /// Falsified by matching `scope = 'character'` without `actor_id`, or
+    /// by ignoring `character_allows` on an allow.
+    #[test]
+    fn a_character_rule_matches_its_performer_anywhere_and_its_allow_needs_the_condition() {
+        for family in [false, true] {
+            let conn = open_memory();
+            let mut ask = ask_with_statement("digest-char", VarBinding::Bound, "rm target");
+            ask.actor_id = b"banto".to_vec();
+            let request_id = create_ask(&conn, &ask).unwrap();
+            decided_allowed(&conn, &request_id);
+            if family {
+                learn_family_from_approval(&conn, &request_id, &["rm"], RuleScope::Character, true, Some(RULE_CREATOR)).unwrap();
+            } else {
+                learn_from_approval(&conn, &request_id, 0, RuleScope::Character, true, Some(RULE_CREATOR)).unwrap();
+            }
+            let covered = |actor: &[u8], character_allows: bool| {
+                let scope = RuleMatch {
+                    context_id: Some(b"elsewhere".as_slice()),
+                    principal_id: Some(b"someone".as_slice()),
+                    actor_id: Some(actor),
+                    character_allows,
+                };
+                if family {
+                    family_coverage_scoped(&conn, &["rm"], &scope).unwrap()[0].is_some()
+                } else {
+                    matches!(redeem_statement(&conn, "digest-char", "rm target", &scope).unwrap(), StatementVerdict::Allow(_))
+                }
+            };
+            assert!(covered(b"banto", true), "family={family}: banto, condition met, another context");
+            assert!(!covered(b"banto", false), "family={family}: the allow needs the condition");
+            assert!(!covered(b"kei", true), "family={family}: another character is not covered");
+            let session_only = RuleMatch::session(Some(ask.context_id.as_slice()), Some(ask.principal_id.as_slice()));
+            let session_hit = if family {
+                family_coverage_scoped(&conn, &["rm"], &session_only).unwrap()[0].is_some()
+            } else {
+                !matches!(redeem_statement(&conn, "digest-char", "rm target", &session_only).unwrap(), StatementVerdict::Uncovered)
+            };
+            assert!(!session_hit, "family={family}: a character rule is not a session rule for the asking context");
+        }
+    }
+
+    /// A character deny applies to its performer whether or not the
+    /// condition holds.
+    #[test]
+    fn a_character_deny_ignores_the_condition() {
+        let conn = open_memory();
+        let mut ask = ask_with_statement("digest-char-deny", VarBinding::Bound, "rm target");
+        ask.actor_id = b"banto".to_vec();
+        let request_id = create_ask(&conn, &ask).unwrap();
+        decided_denied(&conn, &request_id);
+        learn_family_from_approval(&conn, &request_id, &["rm"], RuleScope::Character, false, Some(RULE_CREATOR)).unwrap();
+        let scope = RuleMatch { actor_id: Some(b"banto".as_slice()), ..RuleMatch::default() };
+        let row = family_coverage_scoped(&conn, &["rm"], &scope).unwrap()[0].clone().expect("the deny covers banto");
+        assert!(!row.allow);
+        assert_eq!(row.scope, RuleScope::Character);
+        assert_eq!(row.actor_id.as_deref(), Some(b"banto".as_slice()));
+    }
+
+    /// An ask with no recorded performer cannot teach a character rule of
+    /// either kind, and nothing is written.
+    #[test]
+    fn a_character_rule_needs_a_recorded_performer() {
+        let conn = open_memory();
+        let request_id = create_ask(&conn, &ask_with_statement("digest-no-actor", VarBinding::Bound, "rm target")).unwrap();
+        decided_allowed(&conn, &request_id);
+        conn.execute("UPDATE approvals SET actor_id = NULL WHERE request_id = ?1", [&request_id]).unwrap();
+        let exact = learn_from_approval(&conn, &request_id, 0, RuleScope::Character, true, Some(RULE_CREATOR)).unwrap_err();
+        assert!(matches!(exact, LedgerError::NoActorRecorded(ref id) if *id == request_id), "{exact:?}");
+        let family = learn_family_from_approval(&conn, &request_id, &["rm"], RuleScope::Character, true, Some(RULE_CREATOR)).unwrap_err();
+        assert!(matches!(family, LedgerError::NoActorRecorded(_)), "{family:?}");
+        let rows: i64 = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM approval_rules) + (SELECT COUNT(*) FROM approval_rule_families)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     // ── family rules ────────────────────────────────────────────────

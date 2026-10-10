@@ -10,7 +10,10 @@
 //!    Beneath them in the same layer, **family rules** —
 //!    `approval_rule_families`, keyed on a command family (`kj handoff
 //!    note`, `git push`), learned with `kj ledger allow --remember
-//!    <scope> --family`. The exact statement beats the family.
+//!    <scope> --family`. The exact statement beats the family. A rule of
+//!    scope `character` matches the actor it was learned from, wherever
+//!    it performs; its allow covers a `kj` command only under the
+//!    character condition ([`serves_character`]).
 //! 2. **context_type config** — `[context_type.<type>]` in
 //!    `/config/kernel/gate.toml`, for the calling context's type.
 //! 3. **Global config** — `[global]` in the same file.
@@ -69,10 +72,11 @@
 
 use std::collections::BTreeMap;
 
+use approval_ledger::rules::RuleMatch;
 use approval_ledger::types::{AskVerdict, FamilyRuleRow, Origin, RuleRow, StatementVerdict};
+use kaijutsu_types::{ContextId, PrincipalId};
 use kaish_kernel::PlannedStatement;
 use kaish_types::plan::PlannedCommand;
-use rusqlite::Connection;
 use serde::Deserialize;
 
 use super::gate::{statement_digest, GateSpec, GatedStatement};
@@ -1183,35 +1187,64 @@ pub(crate) fn evaluate_planned(
     }
 }
 
+/// Who presents a submission, for matching learned rules of each scope:
+/// a `session` rule binds the context and principal, a `character` rule
+/// the actor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuleCaller {
+    pub context_id: Option<ContextId>,
+    pub principal_id: PrincipalId,
+    pub actor_id: PrincipalId,
+}
+
+impl RuleCaller {
+    pub(crate) fn of(caller: &super::KjCaller) -> Self {
+        Self { context_id: caller.context_id, principal_id: caller.principal_id, actor_id: caller.actor_id }
+    }
+
+    /// The ledger's match keys, with the character condition this call
+    /// meets. A caller with no context matches no session rule.
+    fn rule_match<'a>(&'a self, context: &'a [u8], character_allows: bool) -> RuleMatch<'a> {
+        RuleMatch {
+            context_id: Some(context),
+            principal_id: Some(self.principal_id.as_bytes().as_slice()),
+            actor_id: Some(self.actor_id.as_bytes().as_slice()),
+            character_allows,
+        }
+    }
+}
+
 /// Every layer, for one gate ask: exact-statement rules over the ask's
 /// statement digests, then family rules over the planned program's
 /// command keys, then layers 2–4 over the same program. Fails only when
 /// the ledger cannot be read.
 pub(crate) fn evaluate(
-    conn: &Connection,
+    db: &KernelDb,
     spec: &GateSpec,
-    context_id: Option<&[u8]>,
-    principal_id: Option<&[u8]>,
+    caller: RuleCaller,
     layers: Layers<'_>,
 ) -> approval_ledger::Result<PolicyEvaluation> {
-    let digests: Vec<String> = spec
-        .statements
-        .iter()
-        .map(|s| statement_digest(spec.origin, &s.rendered))
-        .collect();
-    let digest_refs: Vec<&str> = digests.iter().map(String::as_str).collect();
-    let coverage = approval_ledger::rules::redeem(
-        conn,
-        &digest_refs,
-        &spec.authorized_label,
-        context_id,
-        principal_id,
-    )?;
+    let conn = db.conn_for_ledger();
+    let context = caller.context_id.map(|c| c.as_bytes().to_vec()).unwrap_or_default();
+    let groups = planned_groups(spec);
+    let mut exact = Vec::with_capacity(spec.statements.len());
+    for (i, statement) in spec.statements.iter().enumerate() {
+        // An exact character rule meets the same condition as a family
+        // one: every command of the statement it covers must serve.
+        let serves = groups.as_ref().is_some_and(|groups| {
+            groups[i].iter().flat_map(|s| s.plan.commands.iter()).all(|cmd| serves_character(db, cmd, &caller))
+        });
+        exact.push(approval_ledger::rules::redeem_statement(
+            conn,
+            &statement_digest(spec.origin, &statement.rendered),
+            &spec.authorized_label,
+            &caller.rule_match(&context, serves),
+        )?);
+    }
 
-    let family = family_layer_per_gated_statement(conn, spec, context_id, principal_id)?;
+    let family = family_layer_per_gated_statement(db, spec, &caller, &context)?;
     let lower = lower_layers_per_gated_statement(spec, layers);
-    let per_statement = coverage
-        .per_statement
+    let per_statement = exact
         .iter()
         .zip(family)
         .zip(lower)
@@ -1233,12 +1266,34 @@ pub(crate) fn evaluate(
     Ok(PolicyEvaluation { per_statement })
 }
 
+/// `character ` for a character rule, so an auto-decision's reason says
+/// the rule is bound to its performer.
+fn scope_word(scope: approval_ledger::types::RuleScope) -> &'static str {
+    match scope {
+        approval_ledger::types::RuleScope::Character => "character ",
+        _ => "",
+    }
+}
+
 fn rule_key(row: &RuleRow) -> String {
-    format!("the exact statement (rule {})", row.rule_id)
+    format!("the exact statement ({}rule {})", scope_word(row.scope), row.rule_id)
 }
 
 fn family_rule_key(row: &FamilyRuleRow) -> String {
-    format!("{} (rule {})", row.family_key, row.rule_id)
+    format!("{} ({}rule {})", row.family_key, scope_word(row.scope), row.rule_id)
+}
+
+/// The planned statements each of `spec.statements` stands for, aligned
+/// by index, or `None` when the spec carries no plan that aligns.
+fn planned_groups(spec: &GateSpec) -> Option<Vec<&[PlannedStatement]>> {
+    let n = spec.statements.len();
+    match spec.origin {
+        Origin::ShellGate if spec.planned.len() == n && n > 0 => {
+            Some(spec.planned.iter().map(std::slice::from_ref).collect())
+        }
+        Origin::Hook if n == 1 && !spec.planned.is_empty() => Some(vec![spec.planned.as_slice()]),
+        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => None,
+    }
 }
 
 /// The family-rule verdict for each of `spec.statements`, aligned by
@@ -1247,52 +1302,36 @@ fn family_rule_key(row: &FamilyRuleRow) -> String {
 /// structure; a family allow needs every command allowed and structurally
 /// plain; anything else is `Uncovered` for the lower layers to decide.
 fn family_layer_per_gated_statement(
-    conn: &Connection,
+    db: &KernelDb,
     spec: &GateSpec,
-    context_id: Option<&[u8]>,
-    principal_id: Option<&[u8]>,
+    caller: &RuleCaller,
+    context: &[u8],
 ) -> approval_ledger::Result<Vec<PolicyVerdict>> {
     let n = spec.statements.len();
-    // The planned statements each gated statement stands for.
-    let groups: Vec<&[PlannedStatement]> = match spec.origin {
-        Origin::ShellGate if spec.planned.len() == n && n > 0 => {
-            spec.planned.iter().map(std::slice::from_ref).collect()
-        }
-        Origin::Hook if n == 1 && !spec.planned.is_empty() => vec![spec.planned.as_slice()],
-        Origin::ShellGate | Origin::Hook | Origin::HookResult | Origin::KjVerb => return Ok(vec![PolicyVerdict::Uncovered; n]),
+    let Some(groups) = planned_groups(spec) else {
+        return Ok(vec![PolicyVerdict::Uncovered; n]);
     };
     let mut out = Vec::with_capacity(n);
     for group in groups {
-        let commands: Vec<Option<CommandKeys>> = group
-            .iter()
-            .flat_map(|s| s.plan.commands.iter())
-            .map(command_keys)
-            .collect();
-        let mut wanted: Vec<&str> = Vec::new();
-        for keys in commands.iter().flatten() {
-            for k in &keys.candidates {
-                if !wanted.contains(&k.as_str()) {
-                    wanted.push(k);
-                }
-            }
-        }
-        if wanted.is_empty() {
+        let planned: Vec<&PlannedCommand> = group.iter().flat_map(|s| s.plan.commands.iter()).collect();
+        if planned.iter().all(|cmd| command_keys(cmd).is_none()) {
             out.push(PolicyVerdict::Uncovered);
             continue;
         }
-        let rows = approval_ledger::rules::family_coverage(conn, &wanted, context_id, principal_id)?;
-        let rule_for = |key: &str| -> Option<&FamilyRuleRow> {
-            wanted.iter().position(|w| *w == key).and_then(|i| rows[i].as_ref())
-        };
         let mut decisions: Vec<Decision> = Vec::new();
-        let mut all_allowed = !commands.is_empty();
+        let mut all_allowed = !planned.is_empty();
         let mut deny: Option<Decision> = None;
-        for keys in &commands {
-            let Some(keys) = keys else {
+        for cmd in planned {
+            let Some(keys) = command_keys(cmd) else {
                 all_allowed = false;
                 continue;
             };
-            let hit = keys.candidates.iter().find_map(|k| rule_for(k));
+            // One lookup per command: the character condition is a fact
+            // about this command's own target.
+            let wanted: Vec<&str> = keys.candidates.iter().map(String::as_str).collect();
+            let scope = caller.rule_match(context, serves_character(db, cmd, caller));
+            let rows = approval_ledger::rules::family_coverage_scoped(db.conn_for_ledger(), &wanted, &scope)?;
+            let hit: Option<&FamilyRuleRow> = rows.iter().find_map(Option::as_ref);
             match hit {
                 Some(row) if !row.allow => {
                     deny.get_or_insert(Decision { layer: Layer::UserFamily, key: family_rule_key(row) });
@@ -1361,6 +1400,136 @@ pub(crate) fn family_keys_for_program(statements: &[PlannedStatement]) -> Result
         return Err(FamilyRefusal("the program has no command".to_string()));
     }
     Ok(keys)
+}
+
+// ── The character condition ─────────────────────────────────────────────
+
+/// The context a `kj` call acts on, as far as a `character` allow rule is
+/// concerned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CharacterTarget {
+    /// The call acts on this context reference; `None` is the caller's
+    /// current context, which the verb resolves the same way.
+    Context(Option<String>),
+    /// `kj context create` under the caller's current context: the new
+    /// context is a child the caller directs from birth.
+    NewChild,
+    /// A verb the condition does not read, or a form of one that acts on
+    /// more than one context (`--children`) or outside the caller's
+    /// lineage position (`--top`).
+    Unread,
+}
+
+/// The verbs a `character` allow rule can cover, and the argument each
+/// names its target with. The ids are the clap field names in `drive.rs`,
+/// `interrupt.rs` and `context.rs`.
+fn character_target(args: &[String]) -> CharacterTarget {
+    use CharacterTarget::*;
+    // After `--` a token such as `--json` is a word, which `strip_flag`
+    // would drop: the target read here could then differ from the verb's.
+    if args.iter().any(|a| a == "--") {
+        return Unread;
+    }
+    let mut args = args.to_vec();
+    super::parse::strip_flag(&mut args, &["--confirm", "--json"]);
+    let Ok(matches) = super::effect::cached_kj_args_command().try_get_matches_from(&args) else {
+        return Unread;
+    };
+    // A renamed field reads as an error here, never as "no target given".
+    let value = |m: &clap::ArgMatches, id: &str| m.try_get_one::<String>(id).map(|v| v.cloned());
+    let flag = |m: &clap::ArgMatches, id: &str| m.try_get_one::<bool>(id).map(|v| v.copied().unwrap_or(false));
+    let target = match matches.subcommand() {
+        Some(("drive", m)) => value(m, "target").map(Context),
+        Some(("interrupt", m)) => value(m, "target").map(Context),
+        Some(("context", m)) => match m.subcommand() {
+            Some(("archive", m)) => match flag(m, "children") {
+                Ok(false) => value(m, "context").map(Context),
+                Ok(true) => Ok(Unread),
+                Err(e) => Err(e),
+            },
+            Some(("create", m)) => match flag(m, "top") {
+                Ok(false) => value(m, "parent").map(|p| p.map_or(NewChild, |p| Context(Some(p)))),
+                Ok(true) => Ok(Unread),
+                Err(e) => Err(e),
+            },
+            _ => Ok(Unread),
+        },
+        _ => Ok(Unread),
+    };
+    target.unwrap_or(Unread)
+}
+
+/// A host command spelled like the `kj` builtin (`./kj`, `/usr/bin/kj`) or
+/// the `kjc` client: either can reach a kernel verb whose target this
+/// condition does not read.
+fn spells_kj(cmd: &PlannedCommand) -> bool {
+    let base = cmd.name.rsplit('/').next().unwrap_or(&cmd.name);
+    cmd.name != "kj" && matches!(base, "kj" | "kjc")
+}
+
+/// Whether a `character` allow rule may cover `cmd` for `caller`'s actor.
+///
+/// A host command spelled `kj` or `kjc` fails. Any other command that is
+/// not the `kj` builtin passes: the gate reads no context target in it. A `kj` call the builtin layer allows passes, since it only reads.
+/// `kj drive`, `kj interrupt`, `kj context archive` and `kj context create
+/// --parent` pass only when the actor directs the target (its
+/// `director_id`), resolved as the verb resolves it; a bare `kj context
+/// create` passes, since its new context is the caller's to direct. Every
+/// other `kj` call fails, as does one with an argument that is not a
+/// literal word (an expansion could name another target, or a flag) or
+/// whose target does not resolve.
+pub(crate) fn serves_character(db: &KernelDb, cmd: &PlannedCommand, caller: &RuleCaller) -> bool {
+    if spells_kj(cmd) {
+        return false;
+    }
+    if cmd.name != "kj" || builtin_key(cmd).is_some() {
+        return true;
+    }
+    let Some(args) = literal_args(cmd) else {
+        return false;
+    };
+    match character_target(&args) {
+        CharacterTarget::NewChild => true,
+        CharacterTarget::Unread => false,
+        CharacterTarget::Context(target) => {
+            super::refs::resolve_context_arg_from(target.as_deref(), caller.context_id, db)
+                .ok()
+                .and_then(|id| db.get_context(id).ok().flatten())
+                .is_some_and(|row| row.director_id == Some(caller.actor_id))
+        }
+    }
+}
+
+/// Every argument's word, when each is known before the command runs.
+fn literal_args(cmd: &PlannedCommand) -> Option<Vec<String>> {
+    use kaish_types::plan::PlannedValue;
+    cmd.args
+        .iter()
+        .map(|arg| match arg {
+            PlannedValue::Literal { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Why a planned program cannot teach a `character` allow rule: a `kj`
+/// command the condition does not read, or a host command spelled `kj` or
+/// `kjc`, so the rule could never cover it. `None` when every command can
+/// be covered.
+pub(crate) fn character_rule_refusal(statements: &[PlannedStatement]) -> Option<String> {
+    let unread = statements.iter().flat_map(|s| s.plan.commands.iter()).find(|cmd| {
+        spells_kj(cmd)
+            || cmd.name == "kj"
+            && builtin_key(cmd).is_none()
+            && literal_args(cmd).is_none_or(|args| character_target(&args) == CharacterTarget::Unread)
+    })?;
+    Some(format!(
+        "`{}` is not a kj call a character rule can cover; a character allow covers kj drive, \
+         kj interrupt, kj context archive (without --children) and kj context create (without \
+         --top) on contexts the character directs, with literal arguments, and commands other \
+         than kj",
+        command_clause(unread)
+    ))
 }
 
 /// Layers 2–4 for each of `spec.statements`, aligned by index.
@@ -1645,6 +1814,46 @@ mod tests {
 
     /// A context env argument (`--env KEY=VALUE`) is plain text and must
     /// not drop a tier-allowed `kj context create` to Uncovered.
+    /// The verbs a character allow can cover each name their target by a
+    /// clap field id. A renamed field must read as `Unread`, never as the
+    /// current context, so this pins every id the table reads.
+    #[test]
+    fn character_target_reads_each_covered_verb_by_its_field() {
+        use CharacterTarget::*;
+        let target = |line: &str| {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            character_target(&args)
+        };
+        assert_eq!(target("drive lane --prompt go"), Context(Some("lane".into())));
+        assert_eq!(target("drive"), Context(None));
+        assert_eq!(target("interrupt lane --immediate"), Context(Some("lane".into())));
+        assert_eq!(target("context archive lane"), Context(Some("lane".into())));
+        assert_eq!(target("--confirm context archive"), Context(None));
+        assert_eq!(target("context archive --children lane"), Unread);
+        assert_eq!(target("context create child --type coder --as coder"), NewChild);
+        assert_eq!(target("context create child --parent lane"), Context(Some("lane".into())));
+        assert_eq!(target("context create child --top"), Unread);
+        assert_eq!(target("context set lane --model m"), Unread);
+        assert_eq!(target("fork"), Unread);
+        assert_eq!(target("drive --no-such-flag"), Unread);
+        assert_eq!(target("ctx archive lane"), Context(Some("lane".into())), "the alias reads as its canonical verb");
+        assert_eq!(target("drive -- --json"), Unread, "after `--` the gate cannot strip a flag safely");
+    }
+
+    /// A program teaches no character allow when a kj target is not a
+    /// literal word, or when a host command is spelled `kj` or `kjc`.
+    #[test]
+    fn a_character_allow_is_refused_where_the_target_cannot_be_read() {
+        let refusal = |source: &str| character_rule_refusal(&plan(source));
+        assert_eq!(refusal("kj drive lane --prompt go && git log"), None);
+        assert_eq!(refusal("kj context create child --type coder --as coder"), None);
+        assert!(refusal("for x in lane-a; do kj drive $x; done").is_some(), "a loop variable is not a literal target");
+        assert!(refusal("kj drive ${LANE}").is_some());
+        assert!(refusal("./kj drive amy-lane").is_some());
+        assert!(refusal("kjc -c verify kj context archive amy-lane --confirm").is_some());
+        assert!(refusal("kj context set lane --model m").is_some());
+    }
+
     #[test]
     fn env_argument_keeps_the_context_type_allow() {
         let cfg = config("[context_type.mcp]\nallow = [\"kj context create\"]\n");
@@ -1835,6 +2044,7 @@ mod tests {
             created_by: None,
             learned_from: None,
             revoked_at: None,
+            actor_id: None,
         };
         let d = || Decision { layer: Layer::Builtin, key: "k".into() };
         let allow = || PolicyVerdict::Allow(vec![d()]);

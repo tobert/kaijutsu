@@ -120,6 +120,11 @@ pub enum LedgerError {
         presented_label: String,
     },
 
+    /// A `character` rule binds the performer of the ask it is learned
+    /// from, and this ask recorded none.
+    #[error("cannot learn a character rule from request {0}: it has no recorded performer")]
+    NoActorRecorded(String),
+
     /// No approval_rules row exists with this `rule_id`.
     #[error("rule {0} not found")]
     RuleNotFound(String),

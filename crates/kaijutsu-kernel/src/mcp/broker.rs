@@ -3030,10 +3030,13 @@ impl Broker {
         };
         let spec = crate::kj::shell_gate::build_shell_gate_spec_with_stdin(command, None)
             .map_err(|e| e.to_string())?;
-        let context = ctx.context_id.as_bytes().to_vec();
-        let principal = ctx.principal_id.as_bytes().to_vec();
+        let caller = crate::kj::gate_policy::RuleCaller {
+            context_id: Some(ctx.context_id),
+            principal_id: ctx.principal_id,
+            actor_id: ctx.actor_id,
+        };
         let db = dispatcher.kernel_db().lock();
-        crate::kj::gate_policy::evaluate(db.conn_for_ledger(), &spec, Some(&context), Some(&principal), layers)
+        crate::kj::gate_policy::evaluate(&db, &spec, caller, layers)
             .map_err(|e| format!("gate policy could not read its rules: {e} (fail-closed — a ledger fault, not a decision)"))
     }
 

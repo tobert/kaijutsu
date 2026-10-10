@@ -557,7 +557,8 @@ CREATE TABLE IF NOT EXISTS approval_rules (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by       BLOB,
     learned_from     TEXT    REFERENCES approvals(request_id),
-    revoked_at       INTEGER
+    revoked_at       INTEGER,
+    actor_id         BLOB
 );
 -- The redemption fast-path: "is there a live rule for this statement's
 -- digest+label?" Partial (WHERE revoked_at IS NULL) so a revoked rule
@@ -725,6 +726,11 @@ END;
 -- No CHECK on `scope`: an enum column's CHECK has to be dropped by a
 -- table rebuild when the enum grows (`drop_legacy_value_enum_checks`
 -- below), so new enum-shaped columns leave it to Rust.
+--
+-- `actor_id`, here and on `approval_rules`, is the performer of the ask a
+-- rule was learned from. A `character` rule matches it wherever that
+-- character performs; an allow also needs the kernel's condition for the
+-- call (`rules::RuleMatch`). Other scopes record it and do not read it.
 CREATE TABLE IF NOT EXISTS approval_rule_families (
     rule_id      TEXT    NOT NULL PRIMARY KEY,
     family_key   TEXT    NOT NULL,
@@ -736,7 +742,8 @@ CREATE TABLE IF NOT EXISTS approval_rule_families (
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     created_by   BLOB,
     learned_from TEXT    REFERENCES approvals(request_id),
-    revoked_at   INTEGER
+    revoked_at   INTEGER,
+    actor_id     BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_approval_rule_families_active
     ON approval_rule_families(family_key) WHERE revoked_at IS NULL;
@@ -1072,6 +1079,8 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     // that copy runs or the SELECT names a column that is not there.
     add_columns_if_missing(conn, "approvals", APPROVALS_ADDED_COLUMNS)?;
     add_columns_if_missing(conn, "approval_events", &[("from_reviewer", "BLOB"), ("to_reviewer", "BLOB")])?;
+    add_columns_if_missing(conn, "approval_rules", &[("actor_id", "BLOB")])?;
+    add_columns_if_missing(conn, "approval_rule_families", &[("actor_id", "BLOB")])?;
     rename_columns_if_present(
         conn,
         &[
@@ -1413,9 +1422,10 @@ const VALUE_ENUM_REBUILD_SPECS: &[ValueEnumRebuildSpec] = &[
                 DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
             created_by       BLOB,
             learned_from     TEXT    REFERENCES approvals(request_id),
-            revoked_at       INTEGER",
+            revoked_at       INTEGER,
+            actor_id         BLOB",
         columns: "rule_id, statement_digest, authorized_label, context_id, principal_id, scope, allow, \
-            created_at, created_by, learned_from, revoked_at",
+            created_at, created_by, learned_from, revoked_at, actor_id",
     },
 ];
 

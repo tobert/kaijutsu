@@ -209,6 +209,67 @@ assigned reviewer, the ask is a self-confirmation: that actor answers it,
 cancels it, or reassigns it to a different character. Human status is not
 inferred from a client type.
 
+## Standing rules for a character
+
+```sh
+kj ledger allow <request-id> --remember character --family
+kj ledger rules
+kj ledger forget <rule-id>
+```
+
+A `character` rule applies to the character that performed the ask, in
+every context it performs in, and to no other character. Scope `session`
+covers the asking context and requester; scope `always` covers everyone.
+
+A character allow covers a `kj` call that acts on a context only when the
+character directs the target, that is, the target's `director_id` is the
+character. It covers these verbs:
+
+| Verb | Target | Not covered |
+|---|---|---|
+| `kj drive [<target>]` | the target, default the current context | |
+| `kj interrupt <target>` | the target | |
+| `kj context archive [<context>]` | the context, default the current context | `--children` |
+| `kj context create [--parent <p>]` | `--parent`; without it, the new child is the caller's to direct | `--top` |
+
+The gate resolves the target the way the verb does (label, id, `.`,
+`.parent`). Every argument must be a literal word, because an expanded
+argument could name another context or a flag, and a call with `--` is
+not covered. A `kj` call that the builtin layer allows (a read, `kj
+ledger`, `--help`) passes. Any other `kj` call is not covered, and
+neither is a host command spelled `kj` or `kjc` (`./kj`, `kjc -c ...`),
+which can reach a verb whose target the gate does not read. A character
+allow is not learned from a program that contains either; the answer
+names the command, and the decision on that ask still stands. A
+character deny applies without the target condition.
+
+The gate checks the target when it decides, and the verbs do not check
+it again. A director change that lands between the decision and the run
+is not seen by that call.
+
+For example, Amy answers banto's ask for `kj drive lane-1 --prompt ...`
+with `--remember character --family`. Banto then drives any lane it
+directs with no ask. It still asks to drive a context Amy directs,
+including its own seat, and the rule does not reach another character.
+An exact rule (`--remember character` without `--family`) checks the
+target too, so the same statement asks again after its target gets
+another director.
+
+Commands other than `kj` carry no target that the gate reads. A
+character family rule for them applies wherever the character performs,
+by family key: `cd /tmp/x && git log` teaches `cd /tmp/x` and `git log`,
+and `python3 -m unittest` teaches bare `python3`, because its first
+argument is a flag. The answer names the keys it learned. Prefer an exact
+rule when a family key is wider than intended.
+
+The rule binds the character, not the context type: another seat of the
+same type is not covered. The reviewer who answers the ask makes the rule
+and alone can forget it, and the rule applies even where another
+character reviews this character's work. `kj ledger rules` shows the
+scope as `character <name>`. Grants that need no first ask, through
+character rc, are planned (`docs/character.md`, "Current
+implementation").
+
 ## Persistence and replay
 
 A caller's retry redeems an answer only when the requester, performer,
@@ -356,6 +417,13 @@ superseded request need explicit linkage so rotation does not duplicate work.
   An exhausted walk self-confirms only for a live root character
   (`CharacterRow::root`) and refuses for anyone else. The
   performer-cannot-approve rule holds for every other ask.
+- Character rules: `approval_rules` and `approval_rule_families` record
+  the ask's `actor_id`, and scope `character` matches it. The kernel
+  decides the target condition per command
+  (`kj::gate_policy::serves_character`) and passes it to the ledger's
+  match (`approval_ledger::rules::RuleMatch`); `kj ledger allow` refuses
+  a character allow over a `kj` call the condition does not read
+  (`gate_policy::character_rule_refusal`).
 - Authority: `KernelDb::lineage_root` finds the root character at the top
   of a context's `forked_from` chain. It gates `kj context set --reviewer`,
   `--director`, and `--clear-reviewer`, and `kj ledger escalate` by someone

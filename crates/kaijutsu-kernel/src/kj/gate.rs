@@ -872,10 +872,9 @@ async fn run_gate_once(
     let policy = {
         let db = db.lock();
         let mut policy = match super::gate_policy::evaluate(
-            db.conn_for_ledger(),
+            &db,
             &spec,
-            Some(context.as_slice()),
-            Some(principal.as_slice()),
+            super::gate_policy::RuleCaller::of(caller),
             layers,
         ) {
             Ok(policy) => policy,

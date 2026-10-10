@@ -371,13 +371,23 @@ arguments at all — `kj handoff note ${ANYTHING}` is allowed because
 for.
 
 **Guarantee 4 does not apply to family rules either, for the same reason.**
-The label-mismatch loud error (`rules::redeem_one`,
-`approval-ledger/src/rules.rs:186`) fires when a digest rule covers a
+The label-mismatch loud error (`rules::redeem_statement`,
+`approval-ledger/src/rules.rs:199`) fires when a digest rule covers a
 statement but authorized different *text* than what is presented. A family
 rule matches by key, never by label — `kj handoff note 'first'` and
 `kj handoff note 'second'` share a key and differ in label by design. Both
 carve-outs are documented at `learn_family_from_approval` and pinned by
 tests, not discovered later.
+
+**Character rules.** Scope `character` binds a rule, exact or family, to
+the performer of the ask it was learned from, in every context that
+character performs in. Its allow covers a context-targeting `kj` verb
+only when that character directs the resolved target
+(`gate_policy::serves_character`); the ledger matches the actor and takes
+the kernel's answer as `RuleMatch::character_allows`, so a failed
+condition leaves the call to the layers below and a character deny still
+denies. See `docs/approval-identity.md`, "Standing rules for a
+character".
 
 **Integration seam.** `StatementVerdict` carries a `RuleRow` whose
 `statement_digest` is NOT NULL (`approval-ledger/src/types.rs:618`) — a

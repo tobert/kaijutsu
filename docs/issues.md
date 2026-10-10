@@ -324,14 +324,28 @@ the model under observation has tried."
 
 ## A banto's own kj work asks its reviewer for each verb (2026-10-10)
 
-A new `director` seat played by banto on moltar (`banto-shadow`) raised an
-ask to Amy for `kj context create ... --as coder` and again for
-`kj drive <coder> --prompt ...`; every kj verb it runs to do its job comes
-to the human. Amy, 2026-10-10: "there should be fewer asks on a banto
-operating on kaijutsu... but that can be tasks for later." Open: which
-director verbs `gate.toml` or the director rc should allow (create of its
-own children, drive and wait on them), and whether that belongs to the
-type or to the character.
+A `director` seat played by banto on moltar (`banto-shadow`) raised about
+17 asks to Amy in two small tasks: `kj context create ... --as coder`,
+`kj drive <child>`, `kj context archive <child> --confirm`, and read-only
+checks such as `cd /tmp/x && git log` and `python3 -m unittest`. Amy,
+2026-10-10: "there should be fewer asks on a banto operating on
+kaijutsu", and she chose a standing rule in the ledger first.
+
+Shipped: `kj ledger allow <id> --remember character [--family]`, a rule
+bound to the performer that covers the context-targeting verbs only on
+contexts that character directs (`docs/approval-identity.md`, "Standing
+rules for a character"). Open:
+
+- Character rc (option b) for what can be granted statically, without a
+  first ask; it waits on character rc composition (`docs/character.md`).
+- `cd <dir>` keys on its directory, so each new workspace path asks once
+  more even under a family rule. Whether `cd` belongs in `[global] allow`
+  is undecided.
+- The shipped `[context_type.director]` allow in `assets/defaults/gate.toml`
+  covers `kj drive` on any target, which is wider than a character rule.
+  Moltar's host `gate.toml` has no director section, which is why
+  banto-shadow asked. Decide whether to narrow the default to the
+  character rule or keep both.
 
 ## The judge shadow misses under a burst of calls (2026-10-10)
 

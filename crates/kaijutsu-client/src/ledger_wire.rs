@@ -188,6 +188,7 @@ pub(crate) fn set_remember(mut builder: wire::remember::Builder<'_>, remember: R
     builder.set_scope(match remember.scope {
         RememberScope::Session => wire::RememberScope::Session,
         RememberScope::Always => wire::RememberScope::Always,
+        RememberScope::Character => wire::RememberScope::Character,
     });
     builder.set_family(remember.family);
 }

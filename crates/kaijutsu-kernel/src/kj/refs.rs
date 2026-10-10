@@ -45,14 +45,19 @@ pub fn resolve_context_ref(
     caller: &KjCaller,
     db: &KernelDb,
 ) -> Result<ContextId, String> {
+    resolve_context_ref_from(ctx_ref, caller.context_id, db)
+}
+
+/// Resolve a context reference against `current`, the context `.` names.
+pub fn resolve_context_ref_from(
+    ctx_ref: &ContextRef,
+    current: Option<ContextId>,
+    db: &KernelDb,
+) -> Result<ContextId, String> {
     match ctx_ref {
-        ContextRef::Current => caller
-            .context_id
-            .ok_or_else(|| "no active context joined".to_string()),
+        ContextRef::Current => current.ok_or_else(|| "no active context joined".to_string()),
         ContextRef::Parent(depth) => {
-            let mut current = caller
-                .context_id
-                .ok_or_else(|| "no active context joined".to_string())?;
+            let mut current = current.ok_or_else(|| "no active context joined".to_string())?;
             for i in 0..*depth {
                 let row = db
                     .get_context(current)
@@ -82,11 +87,20 @@ pub fn resolve_context_arg(
     caller: &KjCaller,
     db: &KernelDb,
 ) -> Result<ContextId, String> {
+    resolve_context_arg_from(arg, caller.context_id, db)
+}
+
+/// [`resolve_context_arg`] against `current`, the context `.` names.
+pub fn resolve_context_arg_from(
+    arg: Option<&str>,
+    current: Option<ContextId>,
+    db: &KernelDb,
+) -> Result<ContextId, String> {
     let ctx_ref = match arg {
         Some(s) if !s.is_empty() => parse_context_ref(s),
         _ => ContextRef::Current,
     };
-    resolve_context_ref(&ctx_ref, caller, db)
+    resolve_context_ref_from(&ctx_ref, current, db)
 }
 
 #[cfg(test)]

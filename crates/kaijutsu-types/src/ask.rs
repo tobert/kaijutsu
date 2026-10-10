@@ -185,6 +185,10 @@ pub enum RememberScope {
     Session,
     /// Any context or principal presenting the same statement and label.
     Always,
+    /// The character that performed the ask, in any context it performs
+    /// in. An allow covers a context-targeting `kj` verb only when that
+    /// character directs the target.
+    Character,
 }
 
 /// A standing rule an answer asked for.

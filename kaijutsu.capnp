@@ -574,6 +574,10 @@ enum RememberScope {
   session @0;
   # Any context or principal presenting the same statement and label.
   always @1;
+  # The character that performed the ask, in any context it performs in.
+  # An allow covers a context-targeting kj verb only when that character
+  # directs the target.
+  character @2;
 }
 
 # A standing rule an answer asks for.

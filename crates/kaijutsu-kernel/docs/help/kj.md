@@ -130,9 +130,12 @@ kaish           primer — composed kaish agent-onboarding guidance (kaish-help)
                 printed on request; no rc seeds it
 ledger          list, show, allow, deny, rules, forget, runs — answer pending
                 approval-ledger asks left by gated verbs (e.g. `kj cc send`);
-                allow/deny take `--remember <session|always>` to generalize
-                the decision into a standing rule (refused for `allow` when
-                a statement has a free variable), `--remember … --family`
+                allow/deny take `--remember <session|always|character>` to
+                generalize the decision into a standing rule (refused for
+                `allow` when a statement has a free variable; `character`
+                covers the performer anywhere, and its kj drive, interrupt,
+                context archive and create only on contexts it directs),
+                `--remember … --family`
                 to remember the command family (`kj handoff note`, `git
                 push`) whatever the arguments; `rules` lists the rules in
                 force for this context with the layer deciding each

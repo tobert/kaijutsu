@@ -185,6 +185,7 @@ pub(crate) fn read_remember(reader: remember::Reader<'_>) -> capnp::Result<kaiju
         scope: match reader.get_scope()? {
             RememberScope::Session => kaijutsu_types::RememberScope::Session,
             RememberScope::Always => kaijutsu_types::RememberScope::Always,
+            RememberScope::Character => kaijutsu_types::RememberScope::Character,
         },
         family: reader.get_family(),
     })

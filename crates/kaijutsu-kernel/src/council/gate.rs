@@ -1749,9 +1749,7 @@ pub(crate) async fn consult(
             return Ok(None);
         }
         let layers = Layers { config, context_type: context_type.as_deref() };
-        let context = context_id.as_bytes().to_vec();
-        let principal = caller.principal_id.as_bytes().to_vec();
-        let policy = crate::kj::gate_policy::evaluate(db.conn_for_ledger(), spec, Some(&context), Some(&principal), layers)
+        let policy = crate::kj::gate_policy::evaluate(&db, spec, crate::kj::gate_policy::RuleCaller::of(caller), layers)
             .map_err(|e| format!("the council could not read the gate rules: {e} (fail-closed — a ledger fault, not a decision)"))?;
         let undecided = policy
             .per_statement

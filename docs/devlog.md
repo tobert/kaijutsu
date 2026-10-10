@@ -3363,3 +3363,13 @@ judge. A lifecycle that cannot settle refuses the rotation; an orphaned
 shadow is worse than a refused rotation. banto's help names the `coder`
 character, so its seats get the judge from the character's default cast.
 The step-4 numbers wait for the megakernel, which was training that day.
+
+banto's first shadow tasks asked Amy about every verb it ran. She chose a
+standing rule in the ledger before character rc, so `--remember character`
+binds a rule to the performer. A rule that matched `kj drive` text alone
+would let banto drive Amy's seats, so the allow holds only when banto
+directs the resolved target. The gate checks the target per command and
+gives the ledger a yes or no, rather than adding a second rule store.
+Every argument must be literal, because an expansion could name another
+target or a flag. A `kj` verb the check cannot read is refused at learn
+time, so the rule cannot read as remembered while covering nothing.

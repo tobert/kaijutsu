@@ -22,6 +22,7 @@ an instruction to use nonexistent features.
 | Review assignment | Explicit context override, then explicit director-wide delegation, then the walk up `forked_from`. There is no configured default. An exhausted walk is a self-confirmation for a live root character and an error for anyone else. The lineage root, the root character at the top of a context's `forked_from` chain, controls its reviewer and director overrides; any live root grants and revokes delegation. Fork records the forking actor as director and preserves the reviewer override. See `docs/approval-identity.md` |
 | Model invocation | Resolve live, distinct performer/reviewer characters before starting the turn, and refuse a `root` performer. Provider output and tool calls carry the performer; the requester stays separate |
 | Approval | Asks snapshot performer and reviewer. Only that reviewer may decide; the performer cannot approve from any context, except the self-confirmation whose reviewer IS its performer. See `docs/approval-identity.md` |
+| Standing rules | `kj ledger allow <id> --remember character [--family]` learns a rule bound to the ask's performer that applies wherever it performs. An allow covers `kj drive`, `kj interrupt`, `kj context archive`, and `kj context create` only on contexts that character directs. See `docs/approval-identity.md`, "Standing rules for a character" |
 | Retirement | Concludes and archives live contexts linked by `played_by`; existing block authors stay unchanged. A retired character responsible for an ancestor context refuses reviewer resolution below it, by name |
 | Handoff | Ordinary context referenced by `handoff_ctx`, created on the first note; `tail` never creates it. `note --for` keeps the caller as author |
 | Rc | One context-type directory per lifecycle. Coder, mcp, and director include shared handoff injection; director names the performer from context metadata |
@@ -42,7 +43,8 @@ metadata instead. Existing contexts that used the bridge remain unassigned:
 set `--as banto` on the seat, or create a successor with `--as banto`, then
 `kj context rotate` it. See `docs/prompts.md`, "Rotating a context".
 
-Still planned: character rc composition (slice 5), roster grouping and character drift addressing (slices 6–7), and
+Still planned: character rc composition (slice 5), which would also grant
+statically what a character rule now learns from a first ask, roster grouping and character drift addressing (slices 6–7), and
 scheduled janitor/proctor work (slice 8). The sheet still has no
 `rc_dir` or `memory_root` fields. The handoff
 is a context, not a transport track. Requester and performer remain separate;

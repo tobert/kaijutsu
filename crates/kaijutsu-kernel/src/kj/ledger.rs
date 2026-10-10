@@ -60,16 +60,19 @@ pub(crate) struct LedgerArgs {
     command: LedgerCommand,
 }
 
-/// `--remember <scope>` on `allow`/`deny` — a clap `ValueEnum` so a typo
-/// (`--remember forever`) fails at parse time with clap's own "possible
-/// values are..." message, rather than surfacing as a ledger error deep
-/// inside `ledger_decide`.
+// `--remember <scope>` on `allow`/`deny`: a clap `ValueEnum`, so a typo
+// (`--remember forever`) fails at parse time with clap's own "possible
+// values" message rather than as a ledger error inside `ledger_decide`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum RememberScopeArg {
-    /// Only within the context/principal that asked.
+    /// Only within the context and requester that asked.
     Session,
-    /// Any context/principal presenting the same statement + label.
+    /// Any context and requester presenting the same statement and label.
     Always,
+    /// The character that performed the ask, in any context it performs
+    /// in. An allow covers kj drive, kj interrupt, kj context archive and
+    /// kj context create only on contexts that character directs.
+    Character,
 }
 
 impl RememberScopeArg {
@@ -77,6 +80,7 @@ impl RememberScopeArg {
         match self {
             Self::Session => RememberScope::Session,
             Self::Always => RememberScope::Always,
+            Self::Character => RememberScope::Character,
         }
     }
 }
@@ -334,10 +338,12 @@ enum LedgerCommand {
         request_id: String,
         // Why an `allow` rule is refused over a free variable, and why the
         // ask's own decision survives that refusal: `docs/gate-policy-tuning.md`.
-        /// Remember this decision as a standing rule, so future identical
+        /// Remember this decision as a standing rule, so future matching
         /// asks decide without asking anyone. Refused when any covered
-        /// statement has a free variable; the decision on THIS ask still
-        /// stands either way. Off by default. Undo with `kj ledger forget`.
+        /// statement has a free variable, and for `character` when a kj
+        /// command is not one that scope covers; the decision on THIS ask
+        /// still stands either way. Off by default. Undo with `kj ledger
+        /// forget`.
         #[arg(long)]
         remember: Option<RememberScopeArg>,
         /// With --remember: remember the command family instead of the
@@ -406,7 +412,7 @@ enum LedgerCommand {
         command: DelegationCommand,
     },
     /// Forget a standing rule so its statement escalates to a human again.
-    /// Only the principal that made the rule can forget it.
+    /// Only the character that made the rule can forget it.
     Forget {
         /// The rule to forget. Rule ids come from `kj ledger rules`.
         rule_id: String,
@@ -1140,7 +1146,7 @@ impl KjDispatcher {
         };
         let filter = approval_ledger::rules::RuleListFilter { since_ms, limit: limit as i64 };
         let gate_config = crate::kj::gate_policy::load_config(self.kernel.vfs()).await;
-        let (context_type, digest_rules, family_rules, total) = {
+        let (context_type, digest_rules, family_rules, total, names) = {
             let db = self.kernel_db.lock();
             let context_type = crate::kj::gate_policy::context_type_of(&db, caller.context_id);
             let conn = db.conn_for_ledger();
@@ -1152,7 +1158,19 @@ impl KjDispatcher {
                 Ok(r) => r,
                 Err(e) => return KjResult::Err(format!("kj ledger rules: {e}")),
             };
-            (context_type, digest, family, t1 + t2)
+            // A character rule names its character beside the scope.
+            let mut names: std::collections::HashMap<Vec<u8>, String> = std::collections::HashMap::new();
+            for (scope, actor) in digest.iter().map(|r| (r.scope, &r.actor_id)).chain(family.iter().map(|r| (r.scope, &r.actor_id))) {
+                if scope == RuleScope::Character && let Some(actor) = actor {
+                    names.entry(actor.clone()).or_insert_with(|| character_name(&db, Some(actor)));
+                }
+            }
+            (context_type, digest, family, t1 + t2, names)
+        };
+        let scope_text = |scope: RuleScope, actor: &Option<Vec<u8>>| match (scope, actor) {
+            (RuleScope::Character, Some(actor)) => format!("character {}", names[actor]),
+            (RuleScope::Character, None) => "character (none recorded)".to_string(),
+            (scope, _) => scope.as_str().to_string(),
         };
 
         // One list, newest first, cut to `--limit` across both kinds.
@@ -1163,7 +1181,7 @@ impl KjDispatcher {
                 (
                     r.authorized_label.clone(),
                     if r.allow { "allow" } else { "deny" },
-                    format!("user rule ({}, rule {})", r.scope.as_str(), r.rule_id),
+                    format!("user rule ({}, rule {})", scope_text(r.scope, &r.actor_id), r.rule_id),
                     r.created_at,
                     r.rule_id.clone(),
                 )
@@ -1172,7 +1190,7 @@ impl KjDispatcher {
                 (
                     r.family_key.clone(),
                     if r.allow { "allow" } else { "deny" },
-                    format!("user family rule ({}, rule {})", r.scope.as_str(), r.rule_id),
+                    format!("user family rule ({}, rule {})", scope_text(r.scope, &r.actor_id), r.rule_id),
                     r.created_at,
                     r.rule_id.clone(),
                 )
@@ -1774,7 +1792,20 @@ pub fn decide_ask(
         match decided {
             Ok(row) => {
                 tracing::info!(decision.status = %row.status, "approval ask decided");
-                let remembered = remember.map(|r| learn_for_answer(conn, request_id, r, allow, principal));
+                let remembered = remember.map(|r| {
+                    let mut result = learn_for_answer(conn, request_id, r, allow, principal);
+                    if result.learned && r.scope == RememberScope::Character {
+                        let name = character_name(&db, row.actor_id.as_deref());
+                        result.note.push_str(&if allow {
+                            format!(" for {name}, in any context it performs in; kj drive, kj interrupt, \
+                                     kj context archive and kj context create are covered only on \
+                                     contexts {name} directs")
+                        } else {
+                            format!(" for {name}, in any context it performs in")
+                        });
+                    }
+                    result
+                });
                 crate::ledger_view::summary(&db, &row)
                     .map(|summary| AskAnswered { summary, remembered })
                     .map_err(|e| failure(AskAnswerFailureKind::Refused, format!(
@@ -1803,7 +1834,13 @@ fn learn_for_answer(conn: &Connection, request_id: &str, remember: Remember, all
     let rule_scope = match remember.scope {
         RememberScope::Session => RuleScope::Session,
         RememberScope::Always => RuleScope::Always,
+        RememberScope::Character => RuleScope::Character,
     };
+    if rule_scope == RuleScope::Character && allow
+        && let Err(why) = character_allow_learnable(conn, request_id)
+    {
+        return RememberResult { learned: false, note: format!("NOT remembered: {why} — the {verb} on THIS ask still stands") };
+    }
     let learned = if remember.family {
         learn_family_for_ask(conn, request_id, rule_scope, allow, principal)
             .map(|keys| format!("remembered as a standing {scope} family rule for {}", keys.join(", ")))
@@ -1962,6 +1999,40 @@ fn remember_scope_str(scope: RememberScope) -> &'static str {
     match scope {
         RememberScope::Session => "session",
         RememberScope::Always => "always",
+        RememberScope::Character => "character",
+    }
+}
+
+/// A character's name for a ledger message, or its short id when it has
+/// no sheet.
+fn character_name(db: &crate::kernel_db::KernelDb, id: Option<&[u8]>) -> String {
+    let Some(id) = id.and_then(PrincipalId::try_from_slice) else {
+        return "an unrecorded performer".to_string();
+    };
+    match db.get_character(id) {
+        Ok(Some(character)) => character.name,
+        _ => id.short(),
+    }
+}
+
+/// A `character` allow covers a call only under the condition the gate
+/// checks on each command (`gate_policy::serves_character`), so it is
+/// learned only from an ask whose shell program the gate can read and
+/// whose every `kj` command that condition can cover.
+fn character_allow_learnable(conn: &Connection, request_id: &str) -> Result<(), String> {
+    let row = approval_ledger::ask::get_approval(conn, request_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no such ask {request_id}"))?;
+    let Some(source) = row.exec_source.as_deref() else {
+        return Err("a character allow needs the ask's shell program to check each call's target, and this ask carries none".to_string());
+    };
+    let planned = kaish_kernel::plan_program(source).map_err(|errors| {
+        let msg = errors.iter().map(|e| e.format(source)).collect::<Vec<_>>().join("\n");
+        format!("the ask's program does not plan: {msg}")
+    })?;
+    match crate::kj::gate_policy::character_rule_refusal(&planned) {
+        Some(why) => Err(why),
+        None => Ok(()),
     }
 }
 
@@ -3230,6 +3301,199 @@ mod tests {
         );
         let ask3 = third.ask.expect("an auto-decided ask still gets a durable row");
         assert_eq!(ask3.status, kaijutsu_types::AskStatus::Allowed);
+    }
+
+    /// A banto-shaped house: amy's root context; banto's seat under it,
+    /// performed by banto and directed by amy; two lanes banto directs;
+    /// a context amy directs; and kei's seat with a lane kei directs.
+    struct CharacterHouse {
+        banto: crate::kj::KjCaller,
+        kei: crate::kj::KjCaller,
+        lane_a: kaijutsu_types::ContextId,
+    }
+
+    fn character_house(d: &crate::kj::KjDispatcher) -> CharacterHouse {
+        use crate::kj::test_helpers::{register_root_context, test_reviewer_principal};
+        let amy = test_reviewer_principal();
+        let root = register_root_context(d);
+        let character = |name: &str| {
+            let id = PrincipalId::new();
+            d.kernel_db().lock().insert_character(&crate::kernel_db::CharacterRow {
+                principal_id: id, name: name.into(), created_at: 0, retired_at: None,
+                handoff_ctx: None, root_ctx: None, root: false,
+            }).unwrap();
+            id
+        };
+        let banto = character("banto");
+        let kei = character("kei");
+        let context = |label: &str, parent, played_by, director| {
+            let id = register_context(d, Some(label), Some(parent), amy);
+            d.kernel_db().lock().update_context_review_assignment(id, played_by, None, Some(director)).unwrap();
+            id
+        };
+        let banto_seat = context("banto-seat", root, Some(banto), amy);
+        let lane_a = context("lane-a", banto_seat, None, banto);
+        context("lane-b", banto_seat, None, banto);
+        context("amy-lane", root, None, amy);
+        let kei_seat = context("kei-seat", root, Some(kei), amy);
+        context("kei-lane", kei_seat, None, kei);
+        let seat = |actor, context| crate::kj::KjCaller {
+            principal_id: amy,
+            actor_id: actor,
+            reviewer_id: None,
+            context_id: Some(context),
+            privileged: false,
+            ..test_caller()
+        };
+        CharacterHouse { banto: seat(banto, banto_seat), kei: seat(kei, kei_seat), lane_a }
+    }
+
+    /// A character rule lets banto's seat drive a lane banto directs with
+    /// no ask, still asks for a context banto does not direct (amy's, and
+    /// banto's own seat), does not apply to another character, is listed
+    /// with its character, and stops covering once forgotten.
+    ///
+    /// Falsified by dropping the target check from
+    /// `gate_policy::serves_character` (amy-lane comes back `Allowed`), or
+    /// by matching character rules on scope alone (kei comes back
+    /// `Allowed`).
+    #[tokio::test]
+    async fn a_character_rule_covers_the_lanes_its_character_directs_and_nothing_else() {
+        use crate::kj::gate::GateVerdict::{Allowed, Pending};
+        let d = test_dispatcher().await;
+        let house = character_house(&d);
+        let drive = |caller: &crate::kj::KjCaller, source: &str| {
+            let caller = caller.clone();
+            let spec = planned_shell_spec(source);
+            let d = &d;
+            async move { gate_once(d, &caller, spec).await }
+        };
+
+        let first = drive(&house.banto, "kj drive lane-a --prompt 'start the work'").await;
+        assert_eq!(first.verdict, Pending, "{}", first.reason);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+
+        let learned = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("character"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(learned.is_ok(), "{learned:?}");
+        assert!(
+            learned.message().contains("standing character family rule for kj drive")
+                && learned.message().contains("only on contexts banto directs"),
+            "{}",
+            learned.message()
+        );
+
+        let lane_b = drive(&house.banto, "kj drive lane-b --prompt 'other work'").await;
+        assert_eq!(lane_b.verdict, Allowed, "banto directs lane-b: {}", lane_b.reason);
+        assert!(lane_b.reason.contains("user family rule allows kj drive"), "{}", lane_b.reason);
+
+        let amy_lane = drive(&house.banto, "kj drive amy-lane --prompt 'not yours'").await;
+        assert_eq!(amy_lane.verdict, Pending, "banto does not direct amy-lane: {}", amy_lane.reason);
+        let own_seat = drive(&house.banto, "kj drive").await;
+        assert_eq!(own_seat.verdict, Pending, "amy directs banto's own seat: {}", own_seat.reason);
+        let expanded = drive(&house.banto, "kj drive $LANE --prompt 'which lane?'").await;
+        assert_eq!(expanded.verdict, Pending, "an expanding target cannot be checked: {}", expanded.reason);
+
+        let kei = drive(&house.kei, "kj drive kei-lane --prompt 'kei work'").await;
+        assert_eq!(kei.verdict, Pending, "banto's rule is not kei's: {}", kei.reason);
+
+        let rules = d.dispatch(&[s("ledger"), s("rules")], &answering_seat()).await;
+        assert!(rules.message().contains("user family rule (character banto, rule "), "{}", rules.message());
+        let rule_id = match &rules {
+            KjResult::Ok { data: Some(data), .. } => data.as_array().unwrap()[0].as_str().unwrap().to_string(),
+            other => panic!("{other:?}"),
+        };
+        let forgot = d.dispatch(&[s("ledger"), s("forget"), s(&rule_id)], &answering_seat()).await;
+        assert!(forgot.is_ok(), "{forgot:?}");
+
+        let after = drive(&house.banto, "kj drive lane-b --prompt 'other work'").await;
+        assert_eq!(after.verdict, Pending, "a forgotten rule covers nothing: {}", after.reason);
+    }
+
+    /// A character family rule for `kj context create` covers a bare create
+    /// (the new child is the caller's to direct) and `--parent` naming a
+    /// lane the character directs, and still asks for `--parent` elsewhere
+    /// and for `--top`.
+    #[tokio::test]
+    async fn a_character_create_rule_covers_children_of_what_it_directs() {
+        use crate::kj::gate::GateVerdict::{Allowed, Pending};
+        let d = test_dispatcher().await;
+        let house = character_house(&d);
+        let first = gate_once(&d, &house.banto, planned_shell_spec("kj context create c1 --type coder --as coder")).await;
+        assert_eq!(first.verdict, Pending, "{}", first.reason);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+        let learned = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("character"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(learned.message().contains("character family rule for kj context create"), "{}", learned.message());
+        assert!(d.kernel_db().lock().redeem_ask(&request_id).unwrap());
+
+        for (source, expected) in [
+            ("kj context create c2 --type coder --as coder", Allowed),
+            ("kj context create c3 --parent lane-b", Allowed),
+            ("kj context create c4 --parent amy-lane", Pending),
+            ("kj context create c5 --top", Pending),
+        ] {
+            let outcome = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
+            assert_eq!(outcome.verdict, expected, "{source}: {}", outcome.reason);
+            if expected == Allowed {
+                assert!(outcome.reason.contains("(character rule "), "{source}: {}", outcome.reason);
+            }
+        }
+    }
+
+    /// An exact character rule checks the target too: the same statement
+    /// asks again once its target is no longer banto's to direct. A program
+    /// with a kj verb the condition does not read teaches no character
+    /// allow, and the answer still stands.
+    #[tokio::test]
+    async fn an_exact_character_rule_rechecks_the_target_and_an_unread_verb_teaches_nothing() {
+        use crate::kj::gate::GateVerdict::{Allowed, Pending};
+        let d = test_dispatcher().await;
+        let house = character_house(&d);
+        let source = "kj context archive lane-a --confirm";
+
+        let first = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
+        assert_eq!(first.verdict, Pending, "{}", first.reason);
+        let request_id = first.ask.expect("an escalated ask has a row").request_id;
+        let learned = d
+            .dispatch(&[s("ledger"), s("allow"), s(&request_id), s("--remember"), s("character")], &answering_seat())
+            .await;
+        assert!(learned.message().contains("standing character rule (1 statement)"), "{}", learned.message());
+        // The approval worker runs the answered command once; the rule
+        // covers what follows.
+        assert!(d.kernel_db().lock().redeem_ask(&request_id).unwrap());
+        let covered = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
+        assert_eq!(covered.verdict, Allowed, "{}", covered.reason);
+        assert!(covered.reason.contains("user rule"), "{}", covered.reason);
+
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        d.kernel_db().lock().update_context_review_assignment(house.lane_a, None, None, Some(amy)).unwrap();
+        let moved = gate_once(&d, &house.banto, planned_shell_spec(source)).await;
+        assert_eq!(moved.verdict, Pending, "lane-a is amy's now: {}", moved.reason);
+
+        let unread = gate_once(&d, &house.banto, planned_shell_spec("kj context set lane-b --model m")).await;
+        assert_eq!(unread.verdict, Pending, "{}", unread.reason);
+        let unread_id = unread.ask.expect("an escalated ask has a row").request_id;
+        let refused = d
+            .dispatch(
+                &[s("ledger"), s("allow"), s(&unread_id), s("--remember"), s("character"), s("--family")],
+                &answering_seat(),
+            )
+            .await;
+        assert!(refused.is_ok(), "the allow itself stands: {refused:?}");
+        assert!(
+            refused.message().contains("NOT remembered") && refused.message().contains("kj context set lane-b"),
+            "{}",
+            refused.message()
+        );
     }
 
     fn planned_shell_spec(source: &str) -> GateSpec {
