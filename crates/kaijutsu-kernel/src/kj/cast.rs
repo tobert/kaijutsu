@@ -5,6 +5,9 @@
 //! and may override any of the `llm_defaults` tunables; a NULL knob falls back
 //! to that floor at resolution time (see `llm::SlotTunables::over`).
 //!
+//! The `gate` role is not a context type: it names the council server a
+//! seat's gate decisions run on (`docs/council.md`, "Configuration").
+//!
 //! Roles are free-form TEXT with **no FK**: context types are an open set
 //! defined by the rc tree, and a cast that names a role nobody has created yet
 //! is a legitimate forward declaration, not an error.
@@ -79,7 +82,8 @@ enum CastSlotCommand {
     Set {
         /// Cast label
         cast: String,
-        /// Role — a context_type (coder, musician, mcp, …)
+        /// Role — a context_type (coder, musician, mcp, …), or `gate` for the
+        /// council server (an mk backend) the gate decides a seat's calls on
         role: String,
         /// Backend name
         #[arg(long)]

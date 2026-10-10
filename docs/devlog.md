@@ -3373,3 +3373,13 @@ gives the ledger a yes or no, rather than adding a second rule store.
 Every argument must be literal, because an expansion could name another
 target or a flag. A `kj` verb the check cannot read is refused at learn
 time, so the rule cannot read as remembered while covering nothing.
+
+The council presets became casts (Amy: "yes cast slot"). A cast's `gate`
+slot names the council server a seat's gate decisions run on, resolved the
+way the judge resolves: the seat's cast, else its performer's default. The
+role is not `council`, because `council` is already a context type whose
+contexts take their chat model from a slot of that name. A slot on a
+backend that is not a council server is a miss naming it, never a quiet
+fall back to `[council] server`. Enablement, mode, and thresholds stay in
+`gate.toml`; whether a threshold should name the server it was fit for is
+open in `docs/issues.md`.

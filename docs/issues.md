@@ -365,17 +365,22 @@ simple form is not enough.
 
 Amy: "bumps should only be enabled on coders and optionally. maybe we come
 up with some kind of preset for contexts with bumps, then we can likely put
-in like, mk bumps, lfm2d bumps, and Jev! bumps." Council is enabled per
-context type in `gate.toml` today; moltar dropped the director's council on
-2026-10-08 because Amy watches the director herself. Open: whether a named
-council profile belongs on `kj preset` (which already assigns a cast at
-fork) or as a named section in `gate.toml`, and what distinguishes the mk,
-lfm2d, and Jev! flavors (judge model, rubric, or both).
+in like, mk bumps, lfm2d bumps, and Jev! bumps." Built 2026-10-10 (Amy:
+"yes cast slot"): a cast's `gate` slot names the council server a seat's
+gate decisions run on, and its `judge` slot names the judge
+(`docs/council.md`, "Configuration" and "Shadow voice"). Enablement and
+mode stay per context type in `gate.toml`.
 
-Proposed 2026-10-09: the flavors are casts whose `shadow` slot names the
-judge (`docs/council.md`, "Shadow voice"). Whether the voting council's
-judge also moves onto the cast is open; today `[council] server` in
-`gate.toml` names one server for every decision.
+Open: one spec has one threshold for every server. A threshold is fit to
+one server's distribution, so an lfm2d cast reads under the megakernel's
+`allow_at`. Proposed, not built: an optional `server` on
+`[[council.threshold]]`, compared as an endpoint origin
+(`llm/endpoint.rs`), so `spec` and `server` select a threshold and the
+spec's threshold with no `server` covers the rest. The key is the
+operator's address, not the identity hashes that were dropped on
+2026-10-05 because they moved with every engine change. Also open: Jev
+bumps need a council port to a chat backend, and whether a flavor also
+differs by rubric.
 
 ## Dead test helpers in `mcp/servers/file.rs` (2026-10-08)
 

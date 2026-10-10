@@ -70,6 +70,10 @@ pub(crate) const VERDICT: &str = "verdict";
 /// The question that reads whether a statement can be taken back. It is
 /// recorded and shown in a bump; it never decides.
 pub(crate) const UNDO: &str = "undo";
+/// The cast slot role that names the council server a seat's gate decisions
+/// run on. It is not a context type, so no context resolves its own model
+/// from it.
+pub(crate) const GATE: &str = "gate";
 
 /// The option of [`VERDICT`] that lets a submission run: `allow` for a
 /// gatekeeper, and `proceed` for a bumper's shell spec. A program spec keeps
@@ -1414,8 +1418,9 @@ fn other_word(outcome: &Outcome) -> &'static str {
 }
 
 /// Ask the council once about `submission` and return its verdict. Every
-/// failure is a verdict too: a miss with its cause, including a reviewer
-/// chain that could not be walked (`chain`). With `[council] house_rules` on, the
+/// failure is a verdict too: a miss with its cause, including a cause
+/// found before any server is asked (`chain`: a reviewer chain that could
+/// not be walked, or a cast slot that names no council server). With `[council] house_rules` on, the
 /// decision also reads the house rules of the caller's workspace. Runs with no database
 /// lock held; `deadline_ms` bounds preparing the server and the decision
 /// call together.
@@ -1723,6 +1728,45 @@ pub(crate) fn shell_spec(council: &CouncilConfig) -> Option<&CouncilSpec> {
     council.specs.iter().find(|s| s.case == CouncilCase::Shell)
 }
 
+/// The backend of the `role` slot in the cast `seat` resolves through (its
+/// own, else its performer's default), with that cast's id. `None` when the
+/// seat resolves no cast or the cast has no `role` slot.
+pub(crate) fn seat_slot_backend(
+    db: &crate::kernel_db::KernelDb,
+    seat: &crate::kernel_db::ContextRow,
+    role: &str,
+) -> crate::kernel_db::KernelDbResult<Option<(kaijutsu_types::CastId, crate::kernel_db::BackendRow)>> {
+    let Some(cast) = db.effective_cast(seat)? else { return Ok(None) };
+    let Some(slot) = db.get_cast_slot(cast.cast_id, role)? else { return Ok(None) };
+    let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id).ok_or_else(|| {
+        crate::kernel_db::KernelDbError::Validation(format!("cast {} slot {role} names a backend that does not exist", cast.label))
+    })?;
+    Ok(Some((cast.cast_id, backend)))
+}
+
+/// The council server address a backend names: its `base_url` when its kind
+/// is `mk`. `Err` says why it names none.
+pub(crate) fn council_address(backend: &crate::kernel_db::BackendRow) -> Result<String, String> {
+    match (backend.kind.as_str(), &backend.base_url) {
+        ("mk", Some(url)) => Ok(url.clone()),
+        ("mk", None) => Err(format!("backend {} has no base URL, so it names no council server", backend.name)),
+        (kind, _) => Err(format!("backend {} is kind {kind}, not mk, so it is not a council server", backend.name)),
+    }
+}
+
+/// The council server for `seat`'s gate decisions when the cast it resolves
+/// through has a [`GATE`] slot. `None` when it has no such slot, so
+/// `[council] server` decides. `Some(Err)` is a miss cause: the slot's
+/// backend is not a council server, and no other server stands in.
+fn cast_council_server(
+    db: &crate::kernel_db::KernelDb,
+    seat: ContextId,
+) -> crate::kernel_db::KernelDbResult<Option<Result<String, String>>> {
+    let Some(row) = db.get_context(seat)? else { return Ok(None) };
+    let Some((_, backend)) = seat_slot_backend(db, &row, GATE)? else { return Ok(None) };
+    Ok(Some(council_address(&backend).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
+}
+
 /// Consult the council for one gate ask, or return `None` and leave the gate
 /// as it is without one. `Err` is a fault reading the gate's own state, and
 /// the caller refuses the submission as gate unavailable.
@@ -1785,7 +1829,24 @@ pub(crate) async fn consult(
     };
     let Some(council) = config.council_for(context_type.as_deref()) else { return Ok(None) };
     let Some(shell) = shell_spec(council) else { return Ok(None) };
-    let chain = super::voices::voice_chain(&kernel.kernel_db().lock(), council, context_id, caller.actor_id);
+    let (cast_server, chain) = {
+        let db = kernel.kernel_db().lock();
+        let cast_server = cast_council_server(&db, context_id)
+            .map_err(|e| format!("the council could not read the seat's cast: {e} (fail-closed — a database fault, not a decision)"))?;
+        (cast_server, super::voices::voice_chain(&db, council, context_id, caller.actor_id))
+    };
+    // A seat's cast may name the council server; a slot that names none is
+    // a miss for every decision on this submission, before any server is
+    // asked.
+    let routed;
+    let (council, chain) = match cast_server {
+        None => (council, chain),
+        Some(Ok(server)) => {
+            routed = CouncilConfig { server, ..council.clone() };
+            (&routed, chain)
+        }
+        Some(Err(cause)) => (council, Err(cause)),
+    };
     let submission = Submission {
         command,
         planned: &spec.planned,

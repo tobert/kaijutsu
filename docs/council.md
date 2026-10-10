@@ -622,6 +622,12 @@ does, so the council reads the file too (`council/programs.rs`).
   what tuning by chat does. We record the context heads and the server
   identity with every decision, so the effect of a change is measured, not
   assumed, and a refit can read which server produced each number.
+- **A threshold is fit to one server.** Two servers read the same case
+  with different distributions, so a threshold fit on the megakernel's
+  decisions says little about lfm2d's. One spec has one threshold today,
+  whichever server a seat's cast chooses; each decision records the
+  server identity it was read under, so a refit can select its own
+  server's decisions.
 - **The starting threshold is a guess.** `allow_at = 0.98` with a mass
   floor is where we start; the recorded decisions are what we fit the next
   one from.
@@ -671,6 +677,24 @@ enabled = true
 contexts = ["council-amy", "council-banto"]
 ```
 
+`kj cast slot set mk-bumps gate --backend mk-zorak --model mk` sends the
+gate decisions of every seat that resolves through cast `mk-bumps` to the
+council server at backend `mk-zorak`'s `base_url`. A seat resolves its cast
+the way the judge does: its own cast, else its performer's default cast
+(`kj character set coder --cast mk-bumps`). A seat whose cast has no `gate`
+slot, or that resolves no cast, decides on `[council] server`. The slot's
+backend must have kind `mk` and a `base_url`; any other backend makes
+every decision on the submission a miss that names the backend, and no
+other server is asked in its place. The slot's `--model` is required by
+`kj cast slot set` and is not read; the server's identity is recorded with
+each decision. The role is `gate`, not `council`, because `council` is a
+context type: a council context playing a cast with a `council` slot
+would take that slot as its chat model. The cast chooses only the server;
+whether a type gets the council, `mode`, specs, thresholds, contexts, and
+`deadline_ms` stay in `gate.toml`. The decision and the observing voices
+read after it go to the cast's server, under that server's endpoint
+concurrency limit (`docs/retries-and-ratelimits.md`).
+
 A context type's `contexts` replaces `[council] contexts` for that type.
 Omitting it keeps the shared list. The replacement must hold at least one
 distinct, non-empty label and cannot repeat a spec's own context. Specs,
@@ -714,6 +738,10 @@ again; a 404 naming a context sends that context again.
   Long runs against it on zorak take the heavy lock
   (`flock -w 900 ~/.cache/zorak-heavy.lock`).
 - **lfm2d second,** behind the same port once it serves `/council/v1/`.
+- **A seat's cast can choose the server.** A `gate` slot whose backend
+  has kind `mk` names the server for that seat's decisions ("mk bumps",
+  "lfm2d bumps"); see "Configuration". A `gate` slot on a backend of any
+  other kind, such as Jev through OpenRouter, is a miss.
 - **Jev through OpenRouter, for comparison only.** It speaks the Decisions
   API, which our contract includes, but it holds no contexts, so a
   comparison renders each context into `state` and pays for it per request.

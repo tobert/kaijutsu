@@ -47,7 +47,8 @@
 # thresholds for one spec. See docs/council.md, "Configuration".
 #
 #   [council]
-#   server = "http://zorak:8090"            # http:// or https:// URL
+#   server = "http://zorak:8090"            # http:// or https:// URL; a seat whose cast has a `gate` slot
+#                                           # decides on that slot's mk backend instead
 #   contexts = ["council-system"]           # distinct context labels, at least one
 #   pool = { method = "loglinear", weights = "mass" }   # linear|loglinear, uniform|mass
 #   deadline_ms = 700                       # integer > 0; bounds the whole decision, preparing the server included; sent as timeout_ms

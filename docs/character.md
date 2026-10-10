@@ -104,7 +104,8 @@ Two things follow, and they are the ones to check a change against:
   `kj context create --cast` pins another. One cast covers every type a
   character plays, since a cast holds one slot per role; a `judge` slot
   gives the seats it plays a judge shadow (`docs/council.md`, "Shadow
-  voice").
+  voice"), and a `gate` slot names the council server their gate
+  decisions run on (`docs/council.md`, "Configuration").
 - **Accountability replaces any group concept.** Every model character
   answers to a character above it; a human is a root. No party. Superseded
   in shape by "Roots and rotation": the relation is between contexts, not

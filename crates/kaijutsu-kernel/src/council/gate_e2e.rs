@@ -464,8 +464,13 @@ impl Rig {
     /// Submit `command` the way this rig's path does. `Ok` means it ran (the
     /// tool) or may run (the RPC path's `Proceed`).
     async fn submit(&self, command: &str) -> Result<(), McpError> {
+        self.submit_in(&self.ctx, command).await
+    }
+
+    /// [`Self::submit`] from the seat `ctx` names.
+    async fn submit_in(&self, ctx: &CallContext, command: &str) -> Result<(), McpError> {
         match self.via {
-            Via::Rpc => match self.broker.shell_pre_call_hooks(command, &self.ctx, &CancellationToken::new()).await {
+            Via::Rpc => match self.broker.shell_pre_call_hooks(command, ctx, &CancellationToken::new()).await {
                 ShellHookVerdict::Proceed(_) => Ok(()),
                 ShellHookVerdict::Denied(error) => Err(error),
                 other => panic!("unexpected verdict {other:?}"),
@@ -476,7 +481,7 @@ impl Rig {
                     tool: ShellServer::TOOL_WRITE.to_string(),
                     arguments: serde_json::json!({ "command": command }),
                 };
-                let result = self.broker.call_tool(params, &self.ctx, CancellationToken::new()).await?;
+                let result = self.broker.call_tool(params, ctx, CancellationToken::new()).await?;
                 assert!(!result.is_error, "{:?}: {result:?}", self.via);
                 Ok(())
             }
@@ -497,6 +502,20 @@ impl Rig {
                 self.broker.call_tool(params, &self.ctx, CancellationToken::new()).await.map(|_| ())
             }
         }
+    }
+
+    /// A second seat of the default type, labeled `label`, with its own
+    /// performer and the rig seat's reviewer.
+    async fn other_seat(&self, label: &str) -> CallContext {
+        let actor = PrincipalId::new();
+        let reviewer = self.ctx.reviewer_id;
+        let context_id = crate::kj::test_helpers::register_context(&self.d, Some(label), None, actor);
+        self.d.block_store().create_document(context_id, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        self.d.kernel_db().lock().update_context_review(context_id, Some(actor), reviewer).unwrap();
+        let mut binding = ContextToolBinding::new();
+        binding.grant(Capability::Facade("shell_write".into()));
+        self.broker.set_binding(context_id, binding).await.unwrap();
+        CallContext::new(actor, context_id, SessionId::new(), self.d.kernel_id()).with_actor(actor, reviewer)
     }
 
     /// Write a file under the rig's `/work` mount.
@@ -2778,22 +2797,36 @@ fn give_judge_cast(rig: &Rig, model: &str) {
 
 /// [`give_judge_cast`] on a backend of `kind`, at `base_url` when given.
 fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>) {
+    give_cast_slot(rig, rig.ctx.context_id, super::shadow::JUDGE, model, &format!("judge-{kind}"), kind, base_url);
+}
+
+/// Gives `seat` a new cast with one `role` slot naming `model` on the
+/// backend `backend` of `kind`, at `base_url` when given.
+fn give_cast_slot(
+    rig: &Rig,
+    seat: kaijutsu_types::ContextId,
+    role: &str,
+    model: &str,
+    backend: &str,
+    kind: &str,
+    base_url: Option<&str>,
+) {
     use crate::kernel_db::{CastRow, CastSlotRow};
     let db = rig.d.kernel_db();
     let db = db.lock();
     let cast_id = kaijutsu_types::CastId::new();
     db.insert_cast(&CastRow {
         cast_id,
-        label: format!("judged-{model}"),
+        label: format!("{role}-{model}-{}", seat.short()),
         description: None,
         created_at: 0,
         created_by: PrincipalId::system(),
     })
     .unwrap();
-    let backend = db
+    let backend_row = db
         .upsert_backend(&crate::kernel_db::BackendRow {
             backend_id: kaijutsu_types::BackendId::new(),
-            name: format!("judge-{kind}"),
+            name: backend.into(),
             kind: kind.into(),
             base_url: base_url.map(str::to_owned),
             api_key_env: None,
@@ -2808,8 +2841,8 @@ fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>
         .unwrap();
     db.set_cast_slot(&CastSlotRow {
         cast_id,
-        role: super::shadow::JUDGE.into(),
-        backend_id: backend.backend_id,
+        role: role.into(),
+        backend_id: backend_row.backend_id,
         model: model.into(),
         max_tokens: None,
         temperature: None,
@@ -2821,7 +2854,7 @@ fn give_judge_cast_on(rig: &Rig, model: &str, kind: &str, base_url: Option<&str>
         extra: None,
     })
     .unwrap();
-    db.update_cast(rig.ctx.context_id, Some(cast_id)).unwrap();
+    db.update_cast(seat, Some(cast_id)).unwrap();
 }
 
 /// The seat's judge shadows: its live structural children of type `judge`.
@@ -3033,4 +3066,77 @@ async fn a_shadow_without_its_stance_is_not_primed() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(rig.mock.puts_for(shadow).is_empty(), "no PUT without the stance");
     rig.finish().await;
+}
+
+/// The council decisions recorded for the seat `ctx` names, newest first.
+fn decisions_in(rig: &Rig, ctx: &CallContext) -> Vec<CouncilDecision> {
+    let db = rig.d.kernel_db();
+    let db = db.lock();
+    let context = ctx.context_id.as_bytes().to_vec();
+    approval_ledger::council::list_council_decisions_for_context(db.conn_for_ledger(), &context, 10).unwrap()
+}
+
+/// A seat whose cast has a `gate` slot on a council server decides there,
+/// while a seat with no such slot decides on `[council] server`. Each
+/// decision is recorded on the seat that made it.
+///
+/// Falsified by reading `[council] server` for every seat (server B gets no
+/// decision), or by letting one seat's cast move another seat's decisions.
+#[tokio::test]
+async fn a_seat_whose_cast_names_a_council_server_decides_there() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        let server_b = serve().await;
+        rig.mock.answers(&ALLOW);
+        server_b.answers(&ALLOW);
+        let base_b = server_b.base.clone();
+        give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "mk", "council-b", "mk", Some(&base_b));
+        let plain = rig.other_seat("plain-seat").await;
+
+        rig.submit("touch /work/cast").await.unwrap_or_else(|e| panic!("{via:?}: server B allows: {e:?}"));
+        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the cast's server decides the cast seat's call");
+        assert!(rig.mock.decisions().is_empty(), "{via:?}: [council] server is not asked for the cast seat");
+
+        rig.submit_in(&plain, "touch /work/plain").await.unwrap_or_else(|e| panic!("{via:?}: server A allows: {e:?}"));
+        assert_eq!(rig.mock.decisions().len(), 1, "{via:?}: a seat with no gate slot decides on [council] server");
+        assert_eq!(server_b.decisions().len(), 1, "{via:?}: the other seat's cast does not move this seat");
+
+        let cast_seat = decisions_in(&rig, &rig.ctx);
+        assert_eq!(cast_seat.len(), 1, "{via:?}");
+        assert_eq!(cast_seat[0].decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        let plain_seat = decisions_in(&rig, &plain);
+        assert_eq!(plain_seat.len(), 1, "{via:?}");
+        assert_eq!(plain_seat[0].decision.outcome, CouncilOutcome::Allow, "{via:?}");
+        rig.finish().await;
+    }
+}
+
+/// A `gate` slot whose backend is not a council server, or names none, is a
+/// miss that names the backend: the submission asks, and no server is asked
+/// in its place.
+///
+/// Falsified by falling back to `[council] server` (server A gets a
+/// decision and allows), or by a miss cause that does not name the backend.
+#[tokio::test]
+async fn a_gate_slot_that_names_no_council_server_is_a_miss_naming_it() {
+    let cases: [(&str, &str, Option<&str>, &str); 2] = [
+        ("chat-backend", "anthropic", Some("http://127.0.0.1:1"), "kind anthropic, not mk"),
+        ("no-address", "mk", None, "has no base URL"),
+    ];
+    for (backend, kind, base_url, cause) in cases {
+        for via in BOTH {
+            let rig = rig(via, Setup::default()).await;
+            rig.mock.answers(&ALLOW);
+            give_cast_slot(&rig, rig.ctx.context_id, super::gate::GATE, "some-model", backend, kind, base_url);
+            assert_pending(via, rig.submit("touch /work/slot").await);
+            assert!(rig.mock.decisions().is_empty(), "{backend} {via:?}: [council] server is never asked instead");
+            let ask = rig.only_ask();
+            let decision = the_decision(&rig, &ask);
+            assert_eq!(decision.decision.outcome, CouncilOutcome::Miss, "{backend} {via:?}");
+            let recorded = decision.decision.miss_cause.clone().unwrap();
+            assert!(recorded.contains(&format!("backend {backend}")), "{backend} {via:?}: {recorded}");
+            assert!(recorded.contains(cause), "{backend} {via:?}: {recorded}");
+            rig.finish().await;
+        }
+    }
 }

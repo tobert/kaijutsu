@@ -443,10 +443,8 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
-        let Some(cast_id) = db.effective_cast(&seat_row)?.map(|c| c.cast_id) else { return Ok(None) };
-        let Some(slot) = db.get_cast_slot(cast_id, JUDGE)? else { return Ok(None) };
-        let backend = db.list_backends()?.into_iter().find(|b| b.backend_id == slot.backend_id);
-        let server = backend.filter(|b| b.kind == "mk").and_then(|b| b.base_url);
+        let Some((cast_id, backend)) = super::gate::seat_slot_backend(&db, &seat_row, JUDGE)? else { return Ok(None) };
+        let server = super::gate::council_address(&backend).ok();
         let mut judge = Judge {
             shadow: seat,
             seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),
