@@ -29,6 +29,12 @@ A recursive walk from `/` enters the host root and the read-write
 directories and stops at `/config`, `/run`, `/v`, `/r`, and `/dev`; see
 "Where a walk stops" below.
 
+A context's cwd is where its relative paths resolve, and nothing more. It
+may be read-only: a seat started in a directory it should only read is
+told where to write. `kj context create --cwd` does not check that the
+directory is writable. Amy, 2026-10-10: "cwd is just cwd, it's where the
+model's paths return to."
+
 `--rw-mount <DIR>` adds a host directory to that set, read-write, at the same
 path inside the kernel: host `/app` is kernel `/app`. It is repeatable and
 position-independent, and it is how a model gets write access to a workspace

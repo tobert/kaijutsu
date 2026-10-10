@@ -333,16 +333,6 @@ director verbs `gate.toml` or the director rc should allow (create of its
 own children, drive and wait on them), and whether that belongs to the
 type or to the character.
 
-## `kj context create --cwd` accepts a directory no shell can write (2026-10-10)
-
-On moltar, `kj context create shadow-coder-1 --type coder --cwd
-/home/atobey/scratch/...` succeeded although only `$HOME/src` and `/tmp`
-are writable mounts (`docs/mounts.md`). The coder's first `touch` failed,
-and the DeepSeek coder then explored `~/src/bench-work` and other trees
-looking for a writable place, outside its brief. Open: warn or refuse at
-create when a writing seat's cwd is not under a read-write mount, and say
-which mounts are writable in the coder's runtime facts.
-
 ## The judge shadow misses under a burst of calls (2026-10-10)
 
 On moltar, `shadow-coder-2` sent about ten shell calls in two minutes at
