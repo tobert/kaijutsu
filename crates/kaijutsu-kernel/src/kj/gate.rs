@@ -661,9 +661,12 @@ pub(crate) async fn run_gate_recorded(
 /// Bumper mode: refuse a submission the council bumped, with no ask. The
 /// bump is recorded as an unlinked decision, so the same submission sent
 /// again is decided again; nothing here closes it the way a durable denial
-/// does. Returns the refusal, or `None` to go on: the verdict is no bump, or
+/// does. Returns the refusal, or `None` to go on: the verdict is no bump;
 /// the submission has been bumped `bump_limit` times and asks, carrying the
-/// bumps' flavors (`CouncilVerdict::at_bump_limit`).
+/// bumps' flavors (`CouncilVerdict::at_bump_limit`); or this bump would
+/// make `[council] escalate`'s streak and asks, carrying the streak
+/// (`CouncilVerdict::escalated`). A refused bump is recorded as
+/// `seat_bump`, which is what the streak counts.
 async fn refuse_bump(
     kernel: &Arc<crate::Kernel>,
     caller: &KjCaller,
@@ -728,6 +731,7 @@ async fn refuse_bump(
     }
     let attempt = history.len() as u64 + 1;
     let message = crate::council::gate::bump_message(kernel, &bump, attempt, limit).await;
+    council.refused_as(&bump.flavor);
     let written = {
         let db = kernel.kernel_db().lock();
         require_live_context_for_gate(&db, context)

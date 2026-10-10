@@ -2529,19 +2529,21 @@ impl KjDispatcher {
         // as `kj context archive` runs it; the rotation commits after it.
         if let Err(e) = self.run_archive_lifecycle(predecessor.context_id, caller).await {
             return KjResult::Err(format!(
-                "kj context rotate: {name} stays live and the successor {successor_id} is unlabeled: {e}"
+                "kj context rotate: {name} stays live and the successor {successor_id} is unlabeled: {e}. \
+                 Scripts its archive lifecycle already ran keep their effects, and a retry runs it again"
             ));
         }
         if caller.cancel.is_cancelled() {
             return KjResult::Err(format!(
                 "kj context rotate: owner cancelled before committing successor {successor_id}; \
-                 {name} stays live"
+                 {name} stays live, and its archive lifecycle already ran"
             ));
         }
         let moved = match self.kernel_db().lock().commit_rotation(predecessor.context_id, successor_id) {
             Ok(moved) => moved,
             Err(e) => return KjResult::Err(format!(
-                "kj context rotate: {e}; {name} stays live and the successor {successor_id} is unlabeled"
+                "kj context rotate: {e}; the successor {successor_id} is unlabeled, and {name}'s \
+                 archive lifecycle already ran"
             )),
         };
         {

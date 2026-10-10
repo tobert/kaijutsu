@@ -2223,6 +2223,23 @@ async fn a_bump_tells_the_seat_how_reversible_the_council_reads_it() {
     }
 }
 
+/// A bump-only miss that still carried an `undo` read shows it: the seat is
+/// told the council could not judge it, and how reversible it read.
+///
+/// Falsified by filling the read only for a classified bump.
+#[tokio::test]
+async fn a_bump_only_miss_still_shows_the_undo_read() {
+    for via in BOTH {
+        let rig = rig(via, bump_only()).await;
+        let thin = [-1.0, -3.0, -4.0];
+        rig.mock.set(move |req| Reply::ok(bump_answer_with_undo(req, thin, IRREVERSIBLE)));
+        let text = refusal_text(via, rig.submit("touch /work/marker").await);
+        assert!(text.contains("could not judge it"), "{via:?}: a miss: {text}");
+        assert!(text.contains("reads it as irreversible"), "{via:?}: {text}");
+        rig.finish().await;
+    }
+}
+
 /// A bump with no `undo` read renders no placeholder.
 #[tokio::test]
 async fn a_bump_without_an_undo_read_leaves_no_placeholder() {
@@ -2283,6 +2300,9 @@ async fn kj_ledger_bumps_shows_each_seat_s_streak_and_history() {
 
     let listed = kj(&["ledger", "bumps"]).await;
     assert!(listed.is_ok(), "{}", listed.message());
+    let crate::kj::KjResult::Ok { data: Some(data), .. } = &listed else { panic!("bumps carry data: {listed:?}") };
+    let bumped = data.as_array().unwrap().iter().filter(|row| row["bumped"] == true).count();
+    assert_eq!(bumped, 2, "{data}");
     let text = listed.message();
     assert!(text.contains("STREAK"), "{text}");
     let row = text.lines().find(|l| l.contains(&seat)).unwrap_or_else(|| panic!("the seat is listed: {text}"));

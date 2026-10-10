@@ -1366,9 +1366,27 @@ impl KjDispatcher {
                 .and_then(|row| row.label)
                 .unwrap_or_else(|| "-".to_string())
         };
+        let data = serde_json::Value::Array(
+            submissions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "context_id": ContextId::try_from_slice(&s.context_id).map(|c| c.to_hex()),
+                        "created_at": s.created_at,
+                        "outcome": s.outcome.as_str(),
+                        "bumped": s.bumped,
+                        "flavor": s.flavor,
+                        "undo": s.undo.as_ref().map(|(o, p)| serde_json::json!({"option": o, "probability": p})),
+                        "submission_digest": s.submission_digest,
+                    })
+                })
+                .collect(),
+        );
         if submissions.is_empty() {
-            return KjResult::ok(format!("(no council submissions in the last {since})"));
+            return KjResult::ok_with_data(format!("(no council submissions in the last {since})"), data);
         }
+        let limit_notice = (submissions.len() as u32 >= limit)
+            .then(|| format!("read the newest {limit} submissions only; raise --limit to read more"));
 
         if context_id.is_some() {
             let mut lines = vec![format!("  {:<5}  {:<6}  {:<20}  {:<18}  {}", "AGE", "RESULT", "FLAVOR", "UNDO", "SUBMISSION")];
@@ -1389,8 +1407,9 @@ impl KjDispatcher {
                 ));
             }
             lines.push(String::new());
+            lines.extend(limit_notice);
             lines.push("a repeated SUBMISSION is the same text sent again".into());
-            return KjResult::ok(lines.join("\n"));
+            return KjResult::ok_with_data(lines.join("\n"), data);
         }
 
         // Group by seat, keeping newest-first order within and across seats.
@@ -1423,9 +1442,12 @@ impl KjDispatcher {
             ));
         }
         lines.push(String::new());
-        lines.push(format!("STREAK is bumps in a row since the last submission that ran; window {since}."));
+        lines.extend(limit_notice);
+        lines.push(format!(
+            "STREAK is bumps in a row since the seat's last submission that was not bumped (it ran or asked); window {since}."
+        ));
         lines.push("see one seat's submissions with: kj ledger bumps --context <context>".into());
-        KjResult::ok(lines.join("\n"))
+        KjResult::ok_with_data(lines.join("\n"), data)
     }
 
     /// Show retained script results and distinguish pending settlement from

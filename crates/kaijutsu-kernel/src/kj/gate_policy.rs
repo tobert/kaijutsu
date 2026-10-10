@@ -390,9 +390,9 @@ pub(crate) enum CouncilMode {
     /// Proceed runs the submission; anything else refuses it with guidance
     /// and no ask, until the bump limit.
     Bumper,
-    /// Bumper with no ask at all: a miss, a control-text hit, or a program
-    /// the council could not read bumps too, each saying why, and there is
-    /// no bump limit.
+    /// Bumper with no ask but an escalation: a miss, a control-text hit,
+    /// or a program the council could not read bumps too, each saying why,
+    /// and there is no bump limit.
     BumpOnly,
 }
 
@@ -811,9 +811,9 @@ impl GateConfig {
                     "[council] escalate: gatekeeper mode asks already; escalate needs mode = \"bumper\" or \"bump-only\"".into(),
                 ))
             }
-            (_, Some(e)) if e.bumps <= 0 || e.minutes <= 0 => {
+            (_, Some(e)) if !(1..=1000).contains(&e.bumps) || !(1..=10080).contains(&e.minutes) => {
                 return Err(err(format!(
-                    "[council] escalate: bumps ({}) and minutes ({}) must be integers greater than 0",
+                    "[council] escalate: bumps ({}) must be 1 to 1000 and minutes ({}) 1 to 10080",
                     e.bumps, e.minutes
                 )))
             }
@@ -2719,7 +2719,7 @@ enabled = false
         assert_eq!(c.council().unwrap().escalate, Some(CouncilEscalate { bumps: 2, minutes: 1 }));
         let m = council_err(&council_with("deadline_ms = 700", "deadline_ms = 700\nescalate = { bumps = 4, minutes = 10 }"));
         assert!(m.contains("escalate") && m.contains("gatekeeper"), "{m}");
-        for junk in ["{ bumps = 0, minutes = 10 }", "{ bumps = 3, minutes = 0 }", "{ bumps = 3 }", "{ bumps = 3, minutes = 5, extra = 1 }"] {
+        for junk in ["{ bumps = 0, minutes = 10 }", "{ bumps = 3, minutes = 0 }", "{ bumps = 5000000000, minutes = 10 }", "{ bumps = 3 }", "{ bumps = 3, minutes = 5, extra = 1 }"] {
             let m = council_err(&council_with("deadline_ms = 700", &format!("deadline_ms = 700\nmode = \"bump-only\"\nescalate = {junk}")));
             assert!(m.contains("escalate"), "{junk}: {m}");
         }

@@ -841,7 +841,9 @@ CREATE TABLE IF NOT EXISTS script_bodies (
 -- the count of `council_control_text` rows; `bump_flavor` names a bump's
 -- flavor and is set for a `bump` outcome only (the insert function holds
 -- that rule; a refused bump has no `request_id`); `insert_council_decision`
--- writes both from the same list.
+-- writes both from the same list. `seat_bump` is the flavor the gate
+-- refused the seat with when it refused the submission as a bump, set on
+-- an unlinked shell decision only.
 CREATE TABLE IF NOT EXISTS council_decisions (
     decision_id       BLOB    NOT NULL PRIMARY KEY,
     request_id        TEXT    REFERENCES approvals(request_id),
@@ -870,6 +872,7 @@ CREATE TABLE IF NOT EXISTS council_decisions (
     ms                INTEGER NOT NULL,
     house_rules_head  TEXT,
     bump_flavor       TEXT,
+    seat_bump         TEXT,
     created_at        INTEGER NOT NULL
         DEFAULT (CAST((unixepoch('subsec') * 1000) AS INTEGER)),
     CHECK ((outcome = 'miss') = (miss_cause IS NOT NULL)),
@@ -1078,6 +1081,7 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         ],
     )?;
     add_columns_if_missing(conn, "council_decisions", &[("house_rules_head", "TEXT"), ("bump_flavor", "TEXT")])?;
+    add_seat_bump_column_if_missing(conn)?;
     add_rc_runs_script_count_column_if_missing(conn)?;
     add_rc_runs_intended_outcome_column_if_missing(conn)?;
     add_rc_run_script_settlement_columns_if_missing(conn)?;
@@ -1162,6 +1166,38 @@ fn rename_columns_if_present(conn: &Connection, renames: &[(&str, &str, &str)]) 
 
 /// Adds each of `columns` (name, type) that `table` lacks, with
 /// `ALTER TABLE ... ADD COLUMN`. Existing rows read the new column as NULL.
+/// Add `council_decisions.seat_bump` and fill it for the rows written
+/// before it, once. Those rows read as bumps when no ask links a shell
+/// decision that did not pass, named as the gate named them; a gate fault
+/// among them reads as a bump, which the column now prevents.
+fn add_seat_bump_column_if_missing(conn: &Connection) -> SqliteResult<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('council_decisions') WHERE name = 'seat_bump')",
+        [],
+        |row| row.get(0),
+    )?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE council_decisions ADD COLUMN seat_bump TEXT;
+         UPDATE council_decisions AS d SET seat_bump = COALESCE(
+             d.bump_flavor,
+             (SELECT pd.bump_flavor FROM council_programs p
+                JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+               WHERE p.decision_id = d.decision_id AND pd.outcome = 'bump' ORDER BY p.seq LIMIT 1),
+             CASE d.outcome WHEN 'miss' THEN 'unjudged' WHEN 'ask' THEN 'control_text'
+                            WHEN 'report' THEN 'control_text' END,
+             (SELECT CASE WHEN p.unread_cause IS NOT NULL THEN 'unread' ELSE 'unjudged' END
+                FROM council_programs p
+                LEFT JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
+               WHERE p.decision_id = d.decision_id AND (p.unread_cause IS NOT NULL OR pd.outcome != 'allow')
+               ORDER BY p.seq LIMIT 1))
+          WHERE d.request_id IS NULL
+            AND NOT EXISTS (SELECT 1 FROM council_programs p WHERE p.program_decision_id = d.decision_id);",
+    )
+}
+
 fn add_columns_if_missing(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> SqliteResult<()> {
     let existing: Vec<String> = conn
         .prepare(&format!("PRAGMA table_info({table})"))?
@@ -1702,6 +1738,39 @@ mod tests {
         let head: Option<String> =
             conn.query_row("SELECT house_rules_head FROM council_decisions", [], |row| row.get(0)).unwrap();
         assert_eq!(head, None);
+    }
+
+    /// A database whose `council_decisions` predates `seat_bump` gains it,
+    /// filled once for the rows it holds: an unlinked bump reads as its
+    /// flavor, an unlinked miss as `unjudged`, and a linked row stays
+    /// unset. A second `migrate` changes nothing.
+    #[test]
+    fn migrate_backfills_seat_bump_for_council_decisions_created_without_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        let ddl = DDL.replace("    seat_bump         TEXT,\n", "");
+        assert_ne!(ddl, DDL, "the fixture removes seat_bump from the shipped DDL");
+        conn.execute_batch(&ddl).unwrap();
+        let row = |id: &str, outcome: &str, cause: &str, flavor: &str| {
+            format!(
+                "INSERT INTO council_decisions (decision_id, context_id, principal_id, submission_digest, spec_id,
+                    spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
+                    deadline_ms, outcome, miss_cause, control_text_hits, queue_ms, ms, bump_flavor)
+                 VALUES (X'{id}', X'02', X'03', 'd', 's', 'n', 'm', 'w', 't', 'tp', 'e', 'linear', 'uniform', 700,
+                    '{outcome}', {cause}, 0, 0, 0, {flavor});"
+            )
+        };
+        conn.execute_batch(&row("01", "bump", "NULL", "'try_harder'")).unwrap();
+        conn.execute_batch(&row("02", "miss", "'down'", "NULL")).unwrap();
+        conn.execute_batch(&row("03", "allow", "NULL", "NULL")).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute("UPDATE council_decisions SET seat_bump = 'kept' WHERE decision_id = X'03'", []).unwrap();
+        migrate(&conn).unwrap();
+        let read = |id: u8| -> Option<String> {
+            conn.query_row("SELECT seat_bump FROM council_decisions WHERE decision_id = ?1", [vec![id]], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(read(1).as_deref(), Some("try_harder"));
+        assert_eq!(read(2).as_deref(), Some("unjudged"));
+        assert_eq!(read(3).as_deref(), Some("kept"), "the second migrate does not fill again");
     }
 
     /// A database built when the column was `seat_head` and the observation

@@ -413,6 +413,14 @@ and `[council] escalate = { bumps, minutes }`, off unless set
 (`docs/council.md`, "Bump-only"). Open: pick N and M from what
 `kj ledger bumps` shows on real seats, then turn it on.
 
+Found by a kaibo DeepSeek review, 2026-10-10: `refuse_bump` reads the bump
+count and the streak under one lock and writes the bump or the ask later,
+so two submissions one seat sends at once can both bump past `bump_limit`
+or both escalate. The same window exists in `kj context rotate` and
+`kj context demote`, which run the archive lifecycle between reading the
+row and committing. No per-context lock spans a decision today; a seat
+runs one tool call at a time, so it has not been seen.
+
 ## Council mass floor misses a decision every read agreed on (2026-10-06)
 
 `kj db backup … && kj context archive partb-1 --confirm` missed on moltar:

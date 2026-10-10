@@ -143,6 +143,13 @@ pub struct NewCouncilDecision {
     /// `Bump` and for nothing else.
     #[serde(default)]
     pub bump_flavor: Option<String>,
+    /// The flavor the gate refused the seat with when it refused this
+    /// submission as a bump: in bump-only mode a miss is refused as
+    /// `unjudged` too. Set on a shell decision only, and never on one an
+    /// ask links. A decision recorded without an ask for any other reason,
+    /// such as a gate fault, leaves it unset.
+    #[serde(default)]
+    pub seat_bump: Option<String>,
     pub reads: Vec<CouncilRead>,
     pub pooled: Vec<CouncilPooled>,
     pub control_text: Vec<CouncilControlText>,
@@ -170,6 +177,11 @@ fn check_outcome_and_cause(d: &NewCouncilDecision) -> Result<()> {
         (outcome, Some(_)) => {
             return Err(invalid(format!("only a bump carries a flavor, this outcome is {}", outcome.as_str())));
         }
+    }
+    match (d.seat_bump.as_deref(), &d.request_id) {
+        (Some(""), _) => return Err(invalid("a seat bump flavor must not be empty")),
+        (Some(_), Some(_)) => return Err(invalid("a decision an ask links was not refused as a bump")),
+        _ => {}
     }
     match (d.outcome, d.miss_cause.as_deref()) {
         (CouncilOutcome::Miss, None) => Err(invalid("a miss must carry its cause")),
@@ -218,9 +230,9 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             decision_id, request_id, context_id, principal_id, submission_digest, spec_id, spec_name,
             server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights,
             allow_at, mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread,
-            control_text_hits, queue_ms, ms, created_at, house_rules_head, bump_flavor
+            control_text_hits, queue_ms, ms, created_at, house_rules_head, bump_flavor, seat_bump
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                   ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         params![
             decision_id,
             d.request_id,
@@ -250,6 +262,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
             crate::time::now_millis(),
             d.house_rules_head,
             d.bump_flavor,
+            d.seat_bump,
         ],
     )?;
     for (read_idx, read) in d.reads.iter().enumerate() {
@@ -298,7 +311,7 @@ fn insert_rows(tx: &Connection, decision_id: &[u8], d: &NewCouncilDecision) -> R
 const DECISION_COLUMNS: &str = "decision_id, request_id, context_id, principal_id, submission_digest, spec_id, \
     spec_name, server_model, weight_hash, tokenizer_hash, template, engine, pool_method, pool_weights, allow_at, \
     mass_floor, require_agree, deadline_ms, outcome, miss_cause, agree, spread, control_text_hits, queue_ms, ms, \
-    created_at, house_rules_head, bump_flavor";
+    created_at, house_rules_head, bump_flavor, seat_bump";
 
 /// Load one decision with its reads, pooled probabilities, and control-text
 /// hits. `None` when no decision has this id.
@@ -376,13 +389,9 @@ pub struct CouncilSubmission {
     pub submission_digest: String,
     /// The shell decision's own outcome.
     pub outcome: CouncilOutcome,
-    /// The seat got the submission back with nothing run and no ask: a
-    /// bump, or in bump-only mode a miss, a control-text hit, or a program
-    /// that did not pass.
+    /// The gate refused the submission as a bump (`seat_bump` is set).
     pub bumped: bool,
-    /// What the bump is called: the shell's flavor, else the first bumping
-    /// program's, else `unjudged`, `control_text`, or `unread` as the gate
-    /// names them. `None` when not bumped.
+    /// The flavor the seat was refused with. `None` when not bumped.
     pub flavor: Option<String>,
     /// The pooled `undo` argmax and its probability.
     pub undo: Option<(String, f64)>,
@@ -407,28 +416,12 @@ pub struct SubmissionFilter {
 }
 
 /// Shell decisions, newest first. A program's own decision is part of its
-/// submission and is not listed. A submission is bumped when no ask links
-/// to it and it did not pass: the gate records exactly those without an ask
-/// (`kj/gate.rs`, `record_unlinked_council_decision`).
+/// submission and is not listed. A submission is bumped when the gate
+/// refused it as a bump, which it records as `seat_bump`; a decision left
+/// without an ask by a gate fault is not a bump.
 pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) -> Result<Vec<CouncilSubmission>> {
-    const PROGRAM_UNPASSED: &str = "SELECT p.seq FROM council_programs p
-        LEFT JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
-        WHERE p.decision_id = d.decision_id AND (p.unread_cause IS NOT NULL OR pd.outcome != 'allow')";
-    let sql = format!(
-        "SELECT d.decision_id, d.context_id, d.created_at, d.submission_digest, d.outcome,
-                d.request_id IS NULL AND (d.outcome != 'allow' OR EXISTS ({PROGRAM_UNPASSED})),
-                COALESCE(
-                    d.bump_flavor,
-                    (SELECT pd.bump_flavor FROM council_programs p
-                       JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
-                      WHERE p.decision_id = d.decision_id AND pd.outcome = 'bump' ORDER BY p.seq LIMIT 1),
-                    CASE d.outcome WHEN 'miss' THEN 'unjudged' WHEN 'ask' THEN 'control_text'
-                                   WHEN 'report' THEN 'control_text' END,
-                    (SELECT CASE WHEN p.unread_cause IS NOT NULL THEN 'unread' ELSE 'unjudged' END
-                       FROM council_programs p
-                       LEFT JOIN council_decisions pd ON pd.decision_id = p.program_decision_id
-                      WHERE p.decision_id = d.decision_id AND (p.unread_cause IS NOT NULL OR pd.outcome != 'allow')
-                      ORDER BY p.seq LIMIT 1)),
+    let sql = "SELECT d.decision_id, d.context_id, d.created_at, d.submission_digest, d.outcome,
+                d.seat_bump IS NOT NULL, d.seat_bump,
                 (SELECT option FROM council_pooled
                   WHERE decision_id = d.decision_id AND question_id = 'undo'
                   ORDER BY probability DESC, option LIMIT 1),
@@ -439,10 +432,9 @@ pub fn list_council_submissions(conn: &Connection, filter: &SubmissionFilter) ->
             AND (?1 IS NULL OR d.context_id = ?1)
             AND (?2 IS NULL OR d.created_at >= ?2)
           ORDER BY d.created_at DESC, d.decision_id DESC
-          LIMIT ?3"
-    );
+          LIMIT ?3";
     let rows = conn
-        .prepare(&sql)?
+        .prepare(sql)?
         .query_map(params![filter.context_id, filter.since_ms, filter.limit], |row| {
             let outcome: String = row.get(4)?;
             let bumped: bool = row.get(5)?;
@@ -552,6 +544,7 @@ fn decode_decision(row: &Row<'_>) -> rusqlite::Result<DecisionHead> {
             ms: row.get("ms")?,
             house_rules_head: row.get("house_rules_head")?,
             bump_flavor: row.get("bump_flavor")?,
+            seat_bump: row.get("seat_bump")?,
             reads: Vec::new(),
             pooled: Vec::new(),
             control_text: Vec::new(),
@@ -787,6 +780,7 @@ mod tests {
             ms: 41,
             house_rules_head: Some("snap:rules".into()),
             bump_flavor: None,
+            seat_bump: None,
             reads: vec![read(Some(&[1, 1]), "a"), read(None, "b")],
             pooled: vec![
                 CouncilPooled { question_id: "undo".into(), option: "yes".into(), probability: 0.8 },
@@ -1023,16 +1017,21 @@ mod tests {
         assert!(list_bump_flavors(&conn, ASKING_CONTEXT, "nothing").unwrap().is_empty());
     }
 
-    /// Submissions are shell decisions, newest first; a submission is
-    /// bumped when no ask links it and it did not pass. Its flavor follows
-    /// the gate's names, and the pooled `undo` argmax rides along.
+    /// Submissions are shell decisions, newest first. A submission is
+    /// bumped when the gate recorded it as refused (`seat_bump`); a
+    /// decision left without an ask by a gate fault is not a bump. The
+    /// pooled `undo` argmax rides along.
+    ///
+    /// Falsified by reading bumps from "no ask and did not pass": the
+    /// faulted miss at 300 reads as a bump.
     #[test]
-    fn submissions_read_bumps_from_unlinked_shell_decisions() {
+    fn submissions_read_bumps_from_what_the_gate_refused() {
         let conn = open_memory();
-        let insert = |outcome: CouncilOutcome, flavor: Option<&str>, linked: bool, at: i64| {
+        let insert = |outcome: CouncilOutcome, flavor: Option<&str>, refused: Option<&str>, linked: bool, at: i64| {
             let mut d = decision();
             d.outcome = outcome;
             d.bump_flavor = flavor.map(str::to_owned);
+            d.seat_bump = refused.map(str::to_owned);
             d.miss_cause = (outcome == CouncilOutcome::Miss).then(|| "low mass".to_string());
             d.control_text = vec![];
             if linked {
@@ -1042,56 +1041,67 @@ mod tests {
             conn.execute("UPDATE council_decisions SET created_at = ?1 WHERE decision_id = ?2", params![at, id]).unwrap();
             id
         };
-        insert(CouncilOutcome::Allow, None, true, 100);
-        insert(CouncilOutcome::Bump, Some("try_harder"), false, 200);
-        insert(CouncilOutcome::Miss, None, false, 300);
-        insert(CouncilOutcome::Bump, Some("do_less"), true, 400);
-        insert(CouncilOutcome::Bump, Some("do_less"), false, 500);
+        insert(CouncilOutcome::Allow, None, None, true, 100);
+        insert(CouncilOutcome::Bump, Some("try_harder"), Some("try_harder"), false, 200);
+        insert(CouncilOutcome::Miss, None, None, false, 300);
+        insert(CouncilOutcome::Miss, None, Some("unjudged"), false, 350);
+        insert(CouncilOutcome::Bump, Some("do_less"), None, true, 400);
+        insert(CouncilOutcome::Bump, Some("do_less"), Some("do_less"), false, 500);
         let all = list_council_submissions(&conn, &SubmissionFilter { limit: 10, ..Default::default() }).unwrap();
         let seen: Vec<(i64, bool, Option<&str>)> = all.iter().map(|s| (s.created_at, s.bumped, s.flavor.as_deref())).collect();
         assert_eq!(seen, [
             (500, true, Some("do_less")),
             (400, false, None),
-            (300, true, Some("unjudged")),
+            (350, true, Some("unjudged")),
+            (300, false, None),
             (200, true, Some("try_harder")),
             (100, false, None),
-        ], "an ask-linked bump (at the limit) is not a refused bump");
+        ], "a faulted miss and an ask-linked bump (at the limit) are not refused bumps");
         assert_eq!(all[0].undo, Some(("yes".to_string(), 0.8)), "the fixture's pooled undo argmax");
-        let since = list_council_submissions(&conn, &SubmissionFilter { since_ms: Some(300), limit: 10, ..Default::default() }).unwrap();
+        let since = list_council_submissions(&conn, &SubmissionFilter { since_ms: Some(350), limit: 10, ..Default::default() }).unwrap();
         assert_eq!(since.len(), 3);
         let other = list_council_submissions(&conn, &SubmissionFilter { context_id: Some(vec![7, 7]), limit: 10, ..Default::default() }).unwrap();
         assert!(other.is_empty());
     }
 
-    /// A program's own decision is not a submission; a shell decision that
-    /// passed with a program that bumped is a bumped submission named by
-    /// the program's flavor, and an unread program bumps as `unread`.
+    /// A program's own decision is not a submission.
     #[test]
-    fn a_program_bump_is_its_submission_s_bump() {
+    fn a_program_decision_is_not_a_submission() {
         let conn = open_memory();
         let mut program = decision();
         program.outcome = CouncilOutcome::Bump;
         program.bump_flavor = Some("originals=changes".into());
         let program_id = insert_council_decision(&conn, &program).unwrap();
-        let shell_id = insert_council_decision(&conn, &decision()).unwrap();
-        let row = |program_decision_id: Option<Vec<u8>>, unread: Option<&str>| CouncilProgram {
+        let mut shell = decision();
+        shell.seat_bump = Some("originals=changes".into());
+        let shell_id = insert_council_decision(&conn, &shell).unwrap();
+        insert_council_programs_within(&conn, &shell_id, &[CouncilProgram {
             statement_idx: 0,
             command: "python3 x.py".into(),
             language: "python".into(),
             path: None,
             sha256: None,
             imports_not_shown: vec![],
-            unread_cause: unread.map(str::to_owned),
-            program_decision_id,
-        };
-        insert_council_programs_within(&conn, &shell_id, &[row(Some(program_id), None)]).unwrap();
-        let unread_shell = insert_council_decision(&conn, &decision()).unwrap();
-        insert_council_programs_within(&conn, &unread_shell, &[row(None, Some("missing"))]).unwrap();
+            unread_cause: None,
+            program_decision_id: Some(program_id),
+        }])
+        .unwrap();
         let all = list_council_submissions(&conn, &SubmissionFilter { limit: 10, ..Default::default() }).unwrap();
-        assert_eq!(all.len(), 2, "the program's own decision is not listed: {all:?}");
-        let flavor_of = |id: &[u8]| all.iter().find(|s| s.decision_id == id).unwrap().flavor.clone();
-        assert_eq!(flavor_of(&shell_id).as_deref(), Some("originals=changes"));
-        assert_eq!(flavor_of(&unread_shell).as_deref(), Some("unread"));
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].flavor.as_deref(), Some("originals=changes"));
+    }
+
+    /// `seat_bump` is a refusal: never on a decision an ask links, never empty.
+    #[test]
+    fn a_seat_bump_is_never_linked_or_empty() {
+        let conn = open_memory();
+        let mut linked = decision();
+        linked.request_id = Some(crate::ask::create_ask(&conn, &minimal_ask()).unwrap());
+        linked.seat_bump = Some("try_harder".into());
+        assert!(insert_council_decision(&conn, &linked).is_err());
+        let mut empty = decision();
+        empty.seat_bump = Some(String::new());
+        assert!(insert_council_decision(&conn, &empty).is_err());
     }
 
     /// The streak is the trailing run of bumps, oldest flavor first, and a

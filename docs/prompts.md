@@ -285,7 +285,8 @@ copies the type, cast, performer, director, reviewer override, model, system
 prompt, workspace, env, and cwd, sets `ROTATED_FROM` to the
 predecessor's id, and runs the `create` lifecycle. The hydration window is not
 copied; a musician's create lifecycle sets its own. When the successor has a
-usable loadout, one transaction archives the predecessor and gives the
+usable loadout, the predecessor's `archive` lifecycle runs, then one
+transaction archives the predecessor and gives the
 successor its label, ring seat, and any character's `root_ctx` pointer. When
 it has none, the predecessor stays live, and the error names the unlabeled
 successor so you can read its Error blocks and remove it. The character that

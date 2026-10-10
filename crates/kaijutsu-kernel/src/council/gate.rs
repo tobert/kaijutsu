@@ -736,6 +736,9 @@ pub(crate) struct CouncilVerdict {
     /// The flavors of the bumps this submission already got, when it has
     /// reached the bump limit and so asks.
     bump_history: Vec<String>,
+    /// The pooled `undo` read as a sentence for the seat, when the answer
+    /// carried one; a bump of any flavor shows it.
+    undo: Option<String>,
     /// The seat's bump streak that escalated this submission to an ask
     /// (`[council] escalate`), as the ask shows it.
     escalation: Option<String>,
@@ -832,10 +835,10 @@ impl CouncilVerdict {
     }
 
     /// Bump-only mode: the first decision that did not pass, the shell
-    /// decision first, as a bump that says why. In a bumper mode an ask can
-    /// only come from a control-text hit.
+    /// decision first, as a bump that says why. In bump-only mode an ask
+    /// comes only from an escalation (`[council] escalate`).
     fn first_unpassed(&self) -> Option<BumpReason> {
-        fn unpassed(outcome: &Outcome, bump: Option<&BumpReason>) -> Option<BumpReason> {
+        fn unpassed(outcome: &Outcome, bump: Option<&BumpReason>, undo: &Option<String>) -> Option<BumpReason> {
             match outcome {
                 Outcome::Allow => None,
                 Outcome::Bump(_) => bump.cloned(),
@@ -848,20 +851,20 @@ impl CouncilVerdict {
                     } else {
                         "the council could not judge it: send it again, or write it more plainly.".into()
                     },
-                    undo: None,
+                    undo: undo.clone(),
                 }),
                 Outcome::Ask | Outcome::Report => Some(BumpReason {
                     flavor: "control_text".into(),
                     guidance: "it spells a model's control token: write the command plainly.".into(),
-                    undo: None,
+                    undo: undo.clone(),
                 }),
             }
         }
-        if let Some(reason) = unpassed(&self.outcome, self.bump.as_ref()) {
+        if let Some(reason) = unpassed(&self.outcome, self.bump.as_ref(), &self.undo) {
             return Some(reason);
         }
         self.programs.iter().find_map(|p| match &p.decision {
-            Ok(decision) => unpassed(&decision.outcome, decision.bump.as_ref()),
+            Ok(decision) => unpassed(&decision.outcome, decision.bump.as_ref(), &decision.undo),
             Err(why) => Some(BumpReason {
                 flavor: "unread".into(),
                 guidance: format!(
@@ -891,6 +894,12 @@ impl CouncilVerdict {
         self.bump_history = history;
     }
 
+    /// The gate refuses this submission as a bump with `flavor`: the shell
+    /// decision's record says so, and the seat's bump streak counts it.
+    pub(crate) fn refused_as(&mut self, flavor: &str) {
+        self.record.seat_bump = Some(flavor.to_string());
+    }
+
     /// `[council] escalate`, as this decision read it.
     pub(crate) fn escalate(&self) -> Option<crate::kj::gate_policy::CouncilEscalate> {
         self.council.escalate
@@ -900,8 +909,9 @@ impl CouncilVerdict {
     /// escalation window, so this would-be bump asks the seat's reviewer.
     pub(crate) fn escalated(&mut self, streak: &approval_ledger::council::BumpStreak, minutes: u64) {
         self.escalation = Some(format!(
-            "bumped this seat {} times in a row within {minutes} minutes ({})",
+            "bumped this seat {} time{} in a row within {minutes} minutes ({})",
             streak.count,
+            if streak.count == 1 { "" } else { "s" },
             streak.flavors.join("; ")
         ));
     }
@@ -1311,6 +1321,7 @@ fn build_verdict(
             Seen::Nothing => None,
         },
         bump_flavor,
+        seat_bump: None,
         reads,
         pooled,
         control_text,
@@ -1366,6 +1377,7 @@ fn build_verdict(
         reads: String::new(),
         bump_history: Vec::new(),
         escalation: None,
+        undo: None,
         judge: None,
     }
 }
@@ -1572,6 +1584,7 @@ async fn decide_inner(
     let mut verdict =
         build_verdict(caller, &case, council, spec, Seen::Answered(&prepared, &response), classification, elapsed, carried);
     verdict.report = reported;
+    verdict.undo = undo_sentence(&prepared.spec, &response);
     verdict.bump = bump;
     verdict.reads = reads;
     verdict

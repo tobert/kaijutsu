@@ -405,6 +405,7 @@ mod tests {
                 pooled: vec![],
                 house_rules_head: None,
                 bump_flavor: None,
+                seat_bump: None,
                 control_text: vec![],
             },
         )

@@ -807,7 +807,8 @@ action refused with guidance and tries again, with no human in the loop.
 - **The record.** `council.decide` and the info line carry `outcome = bump`,
   `bump_flavor`, and `p_proceed`.
 - **Reading bumps back.** `kj ledger bumps` lists each seat's streak, the
-  bumps in a row since its last submission that ran, with their flavors
+  bumps in a row since its last submission the gate did not refuse as a
+  bump (one that ran or asked), with their flavors
   and the `undo` read of the last one; `--context` lists one seat's judged
   submissions, newest first, with a digest prefix that shows a resend. A
   submission is bumped when its shell decision links no ask and did not
@@ -815,7 +816,8 @@ action refused with guidance and tries again, with no human in the loop.
 
 ### Bump-only
 
-`[council] mode = "bump-only"` is bumper mode with no ask at all. The
+`[council] mode = "bump-only"` is bumper mode with no ask, except an
+escalation when `escalate` is set (below). The
 benchmarks run it while the ask side is tuned. Amy, 2026-10-05: "I was
 intending to run the benchmarks with bump only, we have a lot of tuning to
 do on the more ask/deny side."
@@ -840,10 +842,15 @@ do on the more ask/deny side."
 - **Escalation after a streak.** `escalate = { bumps = N, minutes = M }`
   in `[council]` (bumper or bump-only; off when unset) turns the would-be
   bump that makes N in a row for one seat within M minutes into an ordinary
-  ask to the seat's reviewer. The streak counts across submissions, a
-  submission that ran ends it, and so does the escalated ask, whose
-  decision links it. The ask's description and a council signal name the
-  streak and its flavors. Amy, 2026-10-09: "escalate after N consecutive
+  ask to the seat's reviewer. The streak counts the submissions the gate
+  refused as bumps (`seat_bump` in the record), across submissions; any
+  submission that was not refused ends it, whether it ran or asked, and so
+  does the escalated ask. A gate fault after the council decided is not a
+  bump. In bumper mode the bump limit asks first for one submission sent
+  again, so a streak longer than `bump_limit` needs different submissions.
+  The ask's description and a council signal name the streak and its
+  flavors. Two submissions decided at once can both read the same streak;
+  see `docs/issues.md`. Amy, 2026-10-09: "escalate after N consecutive
   bumps in N minutes, but observe first"; `kj ledger bumps` is the reading
   to pick N and M from.
 
