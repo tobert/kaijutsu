@@ -1,6 +1,6 @@
 description = "Property (a), path B: a config deny refuses a read-only shell call with no ask and leaves a denied ledger row."
 
-known_gap = { finding = "F8", fails = ["prompt 2: expected tool calls"] }
+known_gap = { finding = "F8", fails = ["(no decided asks)"] }
 
 gate = """
 [global]
@@ -15,6 +15,7 @@ deny = ["cat"]
 # The shipped coder holds one shell, the writable one. This scenario tests the
 # read-only shell other seats hold, so it grants it here.
 kj binding allow "facade:shell"
+kj binding allow "house"
 """
 
 [[model]]

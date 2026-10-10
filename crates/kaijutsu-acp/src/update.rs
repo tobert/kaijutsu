@@ -580,14 +580,37 @@ impl UpdateMapper {
     /// message widget and the tail lands after the window closed — a
     /// truncated final report (first live hit 2026-08-05, toad). The prompt
     /// handler polls this against the kernel's current snapshot before
-    /// responding; message-lane kinds only, since those are what a client
-    /// renders inside the prompt's lifetime.
+    /// responding. Message blocks and tool calls with their results gate
+    /// it, since those are what a client renders inside the prompt's
+    /// lifetime.
     pub fn caught_up_with(&self, blocks: &[BlockSnapshot]) -> bool {
-        blocks.iter().all(|b| match b.kind {
+        self.first_undelivered(blocks).is_none()
+    }
+
+    /// The first block [`Self::caught_up_with`] still waits on.
+    pub fn first_undelivered<'a>(&self, blocks: &'a [BlockSnapshot]) -> Option<&'a BlockSnapshot> {
+        let tail_delivered =
+            |b: &BlockSnapshot| self.emitted.get(&b.id).map(|m| m.len).unwrap_or(0) >= b.content.chars().count();
+        blocks.iter().find(|b| !match b.kind {
             BlockKind::Text | BlockKind::Thinking | BlockKind::Notification | BlockKind::Drift => {
-                self.suppressed.contains(&b.id)
-                    || self.emitted.get(&b.id).map(|m| m.len).unwrap_or(0)
-                        >= b.content.chars().count()
+                self.suppressed.contains(&b.id) || tail_delivered(b)
+            }
+            // A call settles when announced; its result when its body and
+            // status reached the client. The turn's end rides another lane
+            // than its blocks, so without these the response can beat the
+            // last call (docs/issues.md, H4).
+            BlockKind::ToolCall => self.announced.contains(&b.id),
+            // A result still running (a background job) settles once
+            // announced: the response does not wait on the job.
+            BlockKind::ToolResult => {
+                let status = if b.is_error { ToolCallStatus::Failed } else { acp_tool_status(b.status) };
+                let target = b.tool_call_id.unwrap_or(b.id);
+                match status {
+                    ToolCallStatus::Completed | ToolCallStatus::Failed => {
+                        tail_delivered(b) && self.tool_status.get(&target) == Some(&status)
+                    }
+                    _ => self.announced.contains(&target),
+                }
             }
             _ => true,
         })
@@ -1635,7 +1658,8 @@ mod tests {
 
     /// The turn-end settle check: fully-emitted and suppressed message
     /// blocks count as caught up; a block with an undelivered tail does
-    /// not; non-message kinds never gate it. This is what `run_turn` polls
+    /// not; tool calls and results gate until delivered; other kinds never
+    /// gate it. This is what `run_turn` polls
     /// before answering `session/prompt`, so `TurnCompleted` beating the
     /// last text chunks across lanes can no longer truncate the final
     /// answer at the client.
@@ -1654,9 +1678,37 @@ mod tests {
         m.suppress(prompt.id);
         assert!(m.caught_up_with(&[prompt]));
 
-        // Non-message kinds never gate the settle.
-        let call = block(BlockKind::ToolCall, Role::Model, "unobserved", 3);
-        assert!(m.caught_up_with(&[call]));
+        // A tool call gates until it is announced, and its result until the
+        // result's body and status are delivered: a prompt response that
+        // beats them leaves Harbor a call that never settles (H4).
+        let call = block(BlockKind::ToolCall, Role::Model, "{}", 3);
+        assert!(!m.caught_up_with(std::slice::from_ref(&call)), "an unannounced call must gate");
+        m.observe(&call);
+        assert!(m.caught_up_with(std::slice::from_ref(&call)), "announced");
+        let mut result = block(BlockKind::ToolResult, Role::Tool, "done", 4);
+        result.tool_call_id = Some(call.id);
+        assert!(!m.caught_up_with(&[call.clone(), result.clone()]), "an undelivered result must gate");
+        m.observe(&result);
+        assert!(m.caught_up_with(&[call.clone(), result.clone()]), "result delivered");
+        result.content.push_str(" and more");
+        assert!(!m.caught_up_with(&[call.clone(), result]), "an undelivered result tail must gate");
+
+        // A result still running settles once announced: a background job
+        // does not hold the response.
+        let job = block(BlockKind::ToolCall, Role::Model, "{}", 6);
+        let mut running = block(BlockKind::ToolResult, Role::Tool, "", 7);
+        running.tool_call_id = Some(job.id);
+        running.status = kaijutsu_types::Status::Running;
+        assert!(!m.caught_up_with(std::slice::from_ref(&running)), "a running result of an unannounced call gates");
+        m.observe(&job);
+        m.observe(&running);
+        assert!(m.caught_up_with(std::slice::from_ref(&running)), "an empty running result is settled");
+        running.content.push_str("still going");
+        assert!(m.caught_up_with(&[running]), "a running result does not wait for its tail");
+
+        // Other non-message kinds never gate the settle.
+        let task = block(BlockKind::Task, Role::Model, "unobserved", 5);
+        assert!(m.caught_up_with(&[task]));
     }
 
     #[test]

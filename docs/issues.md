@@ -379,22 +379,10 @@ the line to be sent or cleared, not only for a pause in typing.
   The outbox keeps that cost off the key path, but a long burst still
   drains at that rate.
 
-## acp-fleet host scenarios out of step with earlier commits (2026-10-08)
+## acp-fleet contained scenarios not run since the typed ledger (2026-10-08)
 
-Found while moving the fleet onto the typed ledger; neither failure comes
-from that change.
-
-- `approval/f-model-cannot-forget-human-rule`, prompt 2: `kj ledger forget`
-  now gets "not part of this seat's work" because 13fff761 took `house`
-  from the coder seat, so the scenario never reaches the rule check it was
-  written for. Grant `house` in its rc overlay, as `permission-allow-deny`
-  does, or change the expectation.
-- `harbor-truncated-tool-call` expects "were not valid JSON"; the kernel says
-  "its arguments did not parse" since 33156e27/6eb7603d.
-- The F8 `known_gap` in `approval/a-config-deny-shell*.toml` matches the broad
-  substring "prompt 2: expected tool calls" and now excuses a different
-  failure (the `house` refusal of `kj ledger list`). Narrow the match.
-- Contained scenarios (`fleet/contained`, podman) were not run.
+`fleet/contained` needs podman and the fleet image; it was not run when
+the host scenarios were brought up to date on 2026-10-10.
 
 ## Council bump-only has no way to hand an action to Amy (2026-10-06)
 
@@ -3478,30 +3466,6 @@ for when it's contained in docker". Open:
     job's own `shell` call is still `in_progress` then. The planned opt-in
     flag above closes it. `harbor-background-after-response.toml`,
     `contained/background.toml`.
-  - **H4: the prompt response can precede the final `done` call
-    (2026-10-10).** `settle_delivery` in `crates/kaijutsu-acp/src/session.rs`
-    waits until `caught_up_with` holds, and `caught_up_with`
-    (`update.rs`) checks only text, thinking, notification, and drift
-    blocks; a `ToolCall` or `ToolResult` block always counts as delivered.
-    `TurnCompleted` reaches the bridge apart from the block events, so the
-    response can go out before the last call is announced or settled, and
-    Harbor never sees that `done`. Contributing factor seen: a coder whose
-    create rc runs `kj context create` makes it frequent. A mock scenario
-    whose rc made a second context failed `tool-call-settles` and
-    `run-ends-at-response` in 5 of 12 runs, and 9 of 20 with a council;
-    `fleet/permission-allow-deny.toml` and `write-file.toml` failed 0 of 20
-    each. The live DeepSeek council run saw the whole `done` call arrive
-    after the response. `fleet/council-escalates.toml` labels the seat
-    itself (`kj context rename`) and held 0 of 15 run alone. It is not
-    particular to the council: on `c5de3dbe`, with no fleet change,
-    `cargo test --test acp_fleet` failed `chat`, `harbor-usage-cost`,
-    `remember-refused`, and `b-learned-allow-beats-config-deny` this way,
-    and `harbor-truncated-tool-call` with its tool outputs missing at the
-    response. The same run failed `f-model-cannot-forget-human-rule`
-    another way: prompt 2's `shell_write` output is `kj ledger: not part of
-    this seat's work`, not "ask the reviewer who made it". The likely fix is to
-    fence tool blocks in `caught_up_with` the way
-    `delivered_tool_result` does for command prompts.
   - **H3: no cost is reported.** `usage_update` carries only the context
     fill, and only when the model's window is known (none for the mock),
     and the prompt response has no `usage`. The kernel keeps no price

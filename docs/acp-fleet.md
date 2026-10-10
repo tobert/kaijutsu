@@ -366,9 +366,7 @@ seeds the `shell-bump` spec and the bump message under
 `/config/kernel/council/`. `[council] contexts` must name a live context,
 or every decision is a miss, so the rc overlay labels the session's own
 context `fleet-seat` when it is created, and the council reads the seat's
-conversation. A second context made in that create script would also
-serve, but it makes the prompt response race the final `done` call; see
-`docs/issues.md`, "ACP fleet: what stays open", H4. Only a coder seat consults the council,
+conversation. Only a coder seat consults the council,
 through `[context_type.coder.council]`. Bump-only mode turns every
 decision into a pass or a bump, and `escalate` turns the bump that makes 3
 in a row into an ask, which arrives as a permission request.

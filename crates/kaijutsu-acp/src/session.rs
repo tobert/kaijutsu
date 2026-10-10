@@ -674,11 +674,13 @@ pub(crate) async fn settle_delivery(
 ) {
     const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     const SETTLE_MAX_POLLS: u32 = 20; // 2s ceiling
+    let mut waiting_on = None;
     for _ in 0..SETTLE_MAX_POLLS {
         match bridge.actor().get_all_blocks(context_id).await {
             Ok(blocks) => {
-                if session.mapper.lock().caught_up_with(&blocks) {
-                    return;
+                match session.mapper.lock().first_undelivered(&blocks) {
+                    None => return,
+                    Some(b) => waiting_on = Some(format!("{:?} {:?} {}", b.kind, b.status, b.id)),
                 }
             }
             Err(e) => {
@@ -694,6 +696,7 @@ pub(crate) async fn settle_delivery(
     }
     tracing::warn!(
         context = %context_id.short(),
+        waiting_on = waiting_on.as_deref().unwrap_or("-"),
         "prompt response sent before delivery fully settled (2s ceiling); \
          the pump will still deliver the remainder as it drains the feed"
     );

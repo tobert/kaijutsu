@@ -6,6 +6,14 @@ gate = """
 allow = ["jq"]
 """
 
+# The shipped coder does not hold `house`, which `kj ledger` needs; the
+# model reads the ledger here, so this scenario grants it.
+[rc]
+"coder/create/S11-house.kai" = """
+kj binding allow "house"
+"""
+
+
 [[model]]
 tool_calls = [{ name = "shell_write", input = { command = "mkdir forbidden" } }]
 [[model]]

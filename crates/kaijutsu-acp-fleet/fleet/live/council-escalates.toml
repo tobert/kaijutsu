@@ -1,10 +1,5 @@
 description = "Live DeepSeek coder under bump-only with escalate after 3: it is bumped twice, its third shell_write raises one permission request, and the allowed command makes the file."
 
-# Both live runs on 2026-10-10 got the prompt response before the final
-# `done` call (docs/issues.md, H4). If a run shows the gap gone, it may be
-# timing: run it again before removing this.
-known_gap = { finding = "H4", fails = ["harbor shape run-ends-at-response", "harbor shape tool-call-settles"] }
-
 gate = """
 [council]
 server = "{council}"

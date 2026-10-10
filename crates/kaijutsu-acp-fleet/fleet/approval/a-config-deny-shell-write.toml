@@ -1,11 +1,19 @@
 description = "Property (a), path A: a config deny refuses a shell_write with no ask and leaves a denied ledger row."
 
-known_gap = { finding = "F8", fails = ["prompt 2: expected tool calls"] }
+known_gap = { finding = "F8", fails = ["(no decided asks)"] }
 
 gate = """
 [global]
 deny = ["dd"]
 """
+
+# The shipped coder does not hold `house`, which `kj ledger` needs; the
+# model reads the ledger here, so this scenario grants it.
+[rc]
+"coder/create/S11-house.kai" = """
+kj binding allow "house"
+"""
+
 
 [files]
 "seed.txt" = "seed\n"
