@@ -30,13 +30,26 @@ const STDERR_TAIL_LINES: usize = 40;
 pub const POLL: Duration = Duration::from_millis(50);
 
 /// The command that starts an ACP agent: a program, its arguments, extra
-/// environment, and the directory it is launched in.
-#[derive(Debug, Clone)]
+/// environment, and the directory it is launched in. Its `Debug` names the
+/// environment variables and leaves out their values, which may hold a key.
+#[derive(Clone)]
 pub struct AgentCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
     pub cwd: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for AgentCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: Vec<_> = self.env.iter().map(|(key, _)| key).collect();
+        f.debug_struct("AgentCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &env)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 impl AgentCommand {

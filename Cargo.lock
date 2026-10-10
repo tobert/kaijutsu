@@ -6558,6 +6558,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kaijutsu-mk",
  "serde",
  "serde_json",
  "toml 0.8.23",

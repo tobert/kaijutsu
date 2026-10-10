@@ -7,9 +7,10 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use kaijutsu_acp_fleet::run::{RunConfig, run_file};
-use kaijutsu_acp_fleet::{DEFAULT_SCRATCH, FLEET_DIR, scenario};
+use kaijutsu_acp_fleet::{DEFAULT_SCRATCH, FLEET_DIR, LIVE_DIR, scenario};
 
-/// Run ACP scenarios against an agent driven by a scripted model.
+/// Run ACP scenarios against an agent driven by a scripted model, or by a
+/// real model API for a `[live]` scenario.
 #[derive(Parser)]
 #[command(name = "acp-fleet")]
 struct Cli {
@@ -23,8 +24,14 @@ enum Command {
     Run {
         /// Scenario files, or directories whose *.toml files are scenarios.
         /// Default: the host scenarios shipped with this crate; contained ones
-        /// are in its fleet/contained directory.
+        /// are in its fleet/contained directory, and live ones in fleet/live.
+        /// A live scenario named here runs without --live.
         scenarios: Vec<PathBuf>,
+        /// Also run the live scenarios in fleet/live, which talk to a real
+        /// model API and spend money. With no scenarios named, they are
+        /// skipped and the run says so.
+        #[arg(long)]
+        live: bool,
         /// The agent binary: kaijutsu-solo-acp built with --features test-mock.
         /// Default: kaijutsu-solo-acp next to this binary.
         #[arg(long)]
@@ -56,15 +63,27 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<bool> {
-    let Command::Run { scenarios, agent, scratch, keep, timeout, trace } = Cli::parse().command;
+    let Command::Run { scenarios, live, agent, scratch, keep, timeout, trace } = Cli::parse().command;
     let agent = match agent {
         Some(agent) => agent,
         None => sibling_agent()?,
     };
-    let paths = if scenarios.is_empty() { vec![PathBuf::from(FLEET_DIR)] } else { scenarios };
+    let named = !scenarios.is_empty();
+    let paths = match (named, live) {
+        (true, true) => [scenarios, vec![PathBuf::from(LIVE_DIR)]].concat(),
+        (true, false) => scenarios,
+        (false, true) => vec![PathBuf::from(FLEET_DIR), PathBuf::from(LIVE_DIR)],
+        (false, false) => vec![PathBuf::from(FLEET_DIR)],
+    };
     let files = scenario::discover(&paths)?;
     if files.is_empty() {
         bail!("no scenario files found in {paths:?}");
+    }
+    if !named && !live {
+        let skipped = scenario::discover(&[PathBuf::from(LIVE_DIR)])?;
+        if !skipped.is_empty() {
+            println!("SKIP {} live scenario(s) in {LIVE_DIR}; they spend money, so pass --live or name one", skipped.len());
+        }
     }
 
     let mut config = RunConfig::new(agent, scratch);
@@ -94,6 +113,9 @@ fn real_main() -> Result<bool> {
             if !outcome.stderr_tail.is_empty() {
                 println!("  agent stderr (tail):\n    {}", outcome.stderr_tail.replace('\n', "\n    "));
             }
+        }
+        for note in &outcome.notes {
+            println!("  {note}");
         }
         if let Some(kept) = &outcome.kept {
             println!("  kept {}", kept.display());

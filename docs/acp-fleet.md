@@ -13,6 +13,10 @@ cargo run -j 4 -p kaijutsu-acp-fleet -- run crates/kaijutsu-acp-fleet/fleet/cont
 # the same scenarios as cargo tests; --ignored adds the contained ones
 cargo test -j 4 -p kaijutsu-solo-acp --features test-mock --test acp_fleet
 cargo test -j 4 -p kaijutsu-solo-acp --features test-mock --test acp_fleet -- --ignored
+
+# live scenarios talk to a real model API and spend money: only by request
+cargo run -j 4 -p kaijutsu-acp-fleet -- run --live
+cargo run -j 4 -p kaijutsu-acp-fleet -- run crates/kaijutsu-acp-fleet/fleet/live/council-escalates.toml
 ```
 
 The fleet drives an ACP agent the way an ACP client does and checks what it
@@ -20,8 +24,8 @@ leaves behind. Each scenario is one TOML file: the prompts a client sends,
 the replies a scripted model gives, the answers to permission requests, what
 the ACP update stream must show, and what the workspace must hold afterward.
 The shape follows Harbor's task: an instruction, an environment, and a
-verifier. Every scenario uses the scripted mock model, so a run spends
-nothing.
+verifier. Every scenario outside `fleet/live/` uses the scripted mock
+model, so a run spends nothing.
 
 Scenarios run in one of two modes:
 
@@ -32,6 +36,12 @@ Scenarios run in one of two modes:
   network and no host home, under a gate that allows everything. The model
   runs real host programs with no asks, and a verifier may run a script in
   another container.
+
+Live scenarios (`fleet/live/`) are host scenarios that talk to a real model
+API instead of the mock; see "Live scenarios". `acp-fleet run` with no
+scenario named skips them and prints `SKIP` with their count; `--live` adds
+them, and naming a file or directory runs it. No cargo test runs them; the
+cargo test only checks that each one loads.
 
 `acp-fleet run` prints `PASS` or `FAIL` per scenario, with every expectation
 that did not hold and the agent's stderr tail. It exits 0 when all pass, 1
@@ -104,6 +114,14 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `rc` | A table of rc-tree-relative path to contents, installed with `--rc-overlay`. Each file's directory must already exist in the seeded tree. See "Hook scenarios". |
 | `files` | A table of workspace-relative path to contents, written before the agent starts. |
 | `session_cwd` | A workspace-relative directory `session/new` names as the session cwd. The agent still launches in the workspace root. Default: the workspace root. |
+| `[live]` | `{ backend_kind, model, api_key_file }`: talk to a real model API instead of the mock. Refused with `[[model]]` and in contained mode. See "Live scenarios". |
+| `live.backend_kind` | The agent's `--backend-kind`, such as `deepseek`. |
+| `live.model` | The agent's `--model`, such as `deepseek-flash`. |
+| `live.api_key_file` | A file holding the API key; a leading `~/` is the home directory. The runner reads it and passes the key in an environment variable named with `--api-key-env`. |
+| `[council]` | A council server for the run, whose address replaces `{council}` in `gate` and `prompt.gate`. Give `verdicts`, or `server`. A gate that names `{council}` with no `[council]`, or a `[council]` no gate names, is refused. Host mode only. See "Council scenarios". |
+| `council.verdicts` | A council the runner serves on 127.0.0.1: one verdict per decision, in order, and the last one repeats. Each is `proceed`, `try_harder`, or `do_less`. |
+| `council.undo` | The `undo` read every scripted decision carries: `reversible`, `normal`, or `irreversible`. Default: none. |
+| `council.server` | A real council server, such as `http://zorak:8090`, instead of `verdicts`. |
 | `[[model]]` | One scripted model reply, consumed in order across all prompts. `text` and `tool_calls` expand to stream events, text first; `events` gives the mock backend's raw events instead. See "Ending a task". |
 | `[[prompt]]` | One `session/prompt`. Required, at least one. |
 | `prompt.permissions` | Answers to this prompt's permission requests, in order: `allow`, `allow_always`, `deny`, `deny_always`, `cancel`, or `hold`. The prompt must raise exactly this many. Each selects the offered option of that ACP kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `hold` sends no response until this prompt's `release`, or never. |
@@ -115,6 +133,7 @@ test "$(git log --format=%s)" = "fleet: first commit"
 | `prompt.stop_reason` | The `stopReason` the prompt must end with. Default `end_turn`. |
 | `prompt.text_contains` | Substrings of the agent's message text, including any that arrive during the quiet wait. |
 | `prompt.tool_calls` | When present, the tool calls the prompt must show, exactly and in order, by `title`, and optionally last `status`, ACP `kind` (an omitted kind reads as `other`), and `output_contains` (one substring, or a list that must all appear). |
+| `prompt.tool_output_contains` | Substrings that must each appear in the output of at least one of this prompt's tool calls, whatever the calls are. A live scenario uses it instead of `tool_calls`. |
 | `prompt.reports_cost` | `true`: the last `usage_update` before the response must carry `cost` in USD. See "Harbor shape". |
 | `prompt.cancel` | `{ after_tool_call = "<title>", release = "<file>" }`: send `session/cancel` once that tool call is `in_progress`, then write the workspace file `release`. See "Cancel scenarios". |
 | `[[verify]]` | After the agent exits: a `path` with `exists`, `equals`, or `contains`; or, contained only, a `script`. |
@@ -294,6 +313,97 @@ answered "always deny", and the second is allowed after the rule exists.
 
 Path B has no rule scenarios, and the RPC shells (path C) and
 kaijutsu-mcp (path D) have no ACP entry.
+
+## Council scenarios
+
+```toml
+gate = """
+[council]
+server = "{council}"
+contexts = ["fleet-seat"]
+mode = "bump-only"
+escalate = { bumps = 3, minutes = 10 }
+pool = { method = "loglinear", weights = "mass" }
+deadline_ms = 5000
+
+[[council.spec]]
+name = "shell-bump"
+case = "shell"
+
+[[council.threshold]]
+spec = "shell-bump"
+allow_at = 0.98
+mass_floor = -0.05
+
+[context_type.coder.council]
+enabled = true
+"""
+
+[rc]
+"coder/create/S50-fleet-council.kai" = """
+kj context rename fleet-seat
+"""
+
+[council]
+verdicts = ["try_harder", "do_less", "try_harder", "proceed"]
+undo = "irreversible"
+```
+
+A scenario with `[council] verdicts` gets a scripted council for the run
+(`crates/kaijutsu-acp-fleet/src/council.rs`). It serves the council
+contract on 127.0.0.1: it reports an identity, holds the specs and
+contexts the kernel sends, and answers each decision with the next
+verdict. It answers only `verdict`, and `undo` when the scenario gives one,
+so a spec that also asks the rubric decides by the verdict
+(`docs/council.md`, "Bumper mode"). Its numbers pass `math::verify`, so the
+kernel reads them as a real council's. After the run the report lists the
+answers it gave, such as `scripted council answered 3 decision(s):
+try_harder, do_less, try_harder`, and any request it could not serve fails
+the scenario.
+
+The gate above is the smallest one a council decision needs. The kernel
+seeds the `shell-bump` spec and the bump message under
+`/config/kernel/council/`. `[council] contexts` must name a live context,
+or every decision is a miss, so the rc overlay labels the session's own
+context `fleet-seat` when it is created, and the council reads the seat's
+conversation. A second context made in that create script would also
+serve, but it makes the prompt response race the final `done` call; see
+`docs/issues.md`, "ACP fleet: what stays open", H4. Only a coder seat consults the council,
+through `[context_type.coder.council]`. Bump-only mode turns every
+decision into a pass or a bump, and `escalate` turns the bump that makes 3
+in a row into an ask, which arrives as a permission request.
+`fleet/council-escalates.toml` checks this with the mock model: two bumped
+`shell_write` calls whose output carries the guidance and the `undo` read,
+then one permission request titled with the streak.
+
+`server = "http://zorak:8090"` uses a real council server instead.
+
+## Live scenarios
+
+```toml
+[live]
+backend_kind = "deepseek"
+model = "deepseek-flash"
+api_key_file = "~/.deepseek-key.txt"
+
+[[prompt]]
+text = "Create hello.txt with shell_write ..."
+permissions = ["allow"]
+tool_output_contains = ["needs more care first", "reaches past what the task needs"]
+
+[[verify]]
+path = "hello.txt"
+contains = "hello"
+```
+
+A live scenario starts the agent with `--backend-kind`, `--model`, and
+`--api-key-env ACP_FLEET_LIVE_API_KEY`, with the key from `api_key_file`
+in that variable. The key never appears on a command line, in `--trace`
+output, or in the report. A real model chooses its own calls, so a live
+prompt checks loose expectations: the permission requests and their
+titles, `text_contains`, `tool_output_contains`, and `[[verify]]`. An exact
+`tool_calls` list rarely holds. `fleet/live/council-escalates.toml` runs a
+DeepSeek coder against the scripted council above.
 
 ## Cancel scenarios
 

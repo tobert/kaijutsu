@@ -5,6 +5,9 @@
 //! ACP update stream must show, and what the workspace must hold afterward
 //! (`[[verify]]`). Unknown keys are refused, so a misspelled expectation fails
 //! the load instead of checking nothing.
+//!
+//! A `[live]` scenario talks to a real model API instead of the scripted one,
+//! and a `[council]` scenario gets a council server for the run.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +17,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::client::PermissionAnswer;
+use crate::council::{Script, Undo, Verdict};
+
+/// The text a scenario's `gate` uses for the council server's address. The
+/// runner replaces it with the `[council]` server.
+pub const COUNCIL_PLACEHOLDER: &str = "{council}";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +53,12 @@ pub struct Scenario {
     /// The scripted model's replies, consumed in order across all prompts.
     #[serde(default)]
     pub model: Vec<ModelTurn>,
+    /// Talk to a real model API instead of the scripted model.
+    #[serde(default)]
+    pub live: Option<Live>,
+    /// A council server for the gate: scripted for this run, or a real one.
+    #[serde(default)]
+    pub council: Option<Council>,
     /// The prompts the client sends, in order, each with its expectations.
     pub prompt: Vec<Prompt>,
     /// Checks on the workspace after the agent exits.
@@ -54,6 +68,56 @@ pub struct Scenario {
     /// must then fail, and only in the ways `fails` names.
     #[serde(default)]
     pub known_gap: Option<KnownGap>,
+}
+
+/// A real model API the agent talks to. A live run spends money.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Live {
+    /// The agent's `--backend-kind`, such as `deepseek`.
+    pub backend_kind: String,
+    /// The agent's `--model`, such as `deepseek-flash`.
+    pub model: String,
+    /// A file holding the API key; a leading `~/` is the home directory. The
+    /// runner reads it and hands the key to the agent in an environment
+    /// variable it names with `--api-key-env`.
+    pub api_key_file: String,
+}
+
+impl Live {
+    /// `api_key_file` with a leading `~/` expanded from `$HOME`.
+    pub fn key_path(&self) -> Result<PathBuf> {
+        match self.api_key_file.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var_os("HOME").context("`api_key_file` starts with ~/, and HOME is not set")?;
+                Ok(PathBuf::from(home).join(rest))
+            }
+            None => Ok(PathBuf::from(&self.api_key_file)),
+        }
+    }
+}
+
+/// The council a scenario's gate reads: `verdicts` for a council the runner
+/// serves on 127.0.0.1, or `server` for a real one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Council {
+    /// One verdict per decision, in order; the last one repeats.
+    #[serde(default)]
+    pub verdicts: Vec<Verdict>,
+    /// The `undo` read every scripted decision carries.
+    #[serde(default)]
+    pub undo: Option<Undo>,
+    /// A real council server, such as `http://zorak:8090`.
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+impl Council {
+    /// The script for a council the runner serves, or `None` for a real one.
+    pub fn script(&self) -> Option<Script> {
+        (self.server.is_none()).then(|| Script { verdicts: self.verdicts.clone(), undo: self.undo })
+    }
 }
 
 /// A recorded finding (`docs/issues.md`) the scenario fails on today.
@@ -122,6 +186,11 @@ pub struct Prompt {
     /// When present, the tool calls this prompt must show, exactly and in order.
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallExpect>>,
+    /// Substrings that must each appear in the output of at least one tool
+    /// call this prompt shows, whatever the calls are. A live scenario
+    /// checks this instead of an exact `tool_calls`.
+    #[serde(default)]
+    pub tool_output_contains: Vec<String>,
     /// The last `usage_update` before the prompt's response must carry a
     /// cost in USD, which is where Harbor reads a run's cost from.
     #[serde(default)]
@@ -283,6 +352,49 @@ impl Scenario {
     fn check(&self) -> Result<()> {
         if self.prompt.is_empty() {
             bail!("a scenario needs at least one [[prompt]]");
+        }
+        if let Some(live) = &self.live {
+            if !self.model.is_empty() {
+                bail!("[live] talks to a real model, so [[model]] replies would never be read; remove one or the other");
+            }
+            if self.mode != Mode::Host {
+                bail!("[live] needs the network, and contained scenarios have none; use mode = \"host\"");
+            }
+            for (key, value) in [("backend_kind", &live.backend_kind), ("model", &live.model), ("api_key_file", &live.api_key_file)] {
+                if value.trim().is_empty() {
+                    bail!("[live] `{key}` is empty");
+                }
+            }
+        }
+        let placeholder = self
+            .gate
+            .iter()
+            .chain(self.prompt.iter().filter_map(|p| p.gate.as_ref()))
+            .any(|g| g.contains(COUNCIL_PLACEHOLDER));
+        match &self.council {
+            Some(council) => {
+                if self.mode != Mode::Host {
+                    bail!("[council] serves on 127.0.0.1, which a contained agent cannot reach; use mode = \"host\"");
+                }
+                match (&council.server, council.verdicts.is_empty()) {
+                    (Some(_), false) => bail!("[council] give `verdicts` for a scripted council or `server` for a real one, not both"),
+                    (None, true) => bail!("[council] needs `verdicts`, at least one, or a `server`"),
+                    (Some(server), true) if council.undo.is_some() => {
+                        bail!("[council] `undo` scripts the scripted council's answers; the server {server} answers for itself")
+                    }
+                    (Some(server), true) if !server.starts_with("http://") && !server.starts_with("https://") => {
+                        bail!("[council] `server` {server:?} must start with http:// or https://")
+                    }
+                    _ => {}
+                }
+                if !placeholder {
+                    bail!("[council] is set, but no `gate` names it: write `server = \"{COUNCIL_PLACEHOLDER}\"` under the gate's [council]");
+                }
+            }
+            None if placeholder => {
+                bail!("a `gate` names {COUNCIL_PLACEHOLDER}, but the scenario has no [council] to put there")
+            }
+            None => {}
         }
         for path in self.files.keys() {
             workspace_relative(path)?;
@@ -592,6 +704,80 @@ text = "go"
     #[test]
     fn a_scenario_with_no_prompt_is_refused() {
         assert!(refusal("description = \"d\"\nprompt = []\n").contains("at least one"));
+    }
+
+    const LIVE: &str = r#"
+description = "d"
+[live]
+backend_kind = "deepseek"
+model = "deepseek-flash"
+api_key_file = "~/.deepseek-key.txt"
+[[prompt]]
+text = "go"
+permissions = ["allow"]
+tool_output_contains = ["Bumped by the council"]
+[[verify]]
+path = "made.txt"
+exists = true
+"#;
+
+    #[test]
+    fn a_live_scenario_names_its_model_and_key_file() {
+        let scenario = Scenario::parse(LIVE, "live").unwrap();
+        let live = scenario.live.as_ref().unwrap();
+        assert_eq!((live.backend_kind.as_str(), live.model.as_str()), ("deepseek", "deepseek-flash"));
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(live.key_path().unwrap(), PathBuf::from(home).join(".deepseek-key.txt"));
+        assert!(scenario.prompt[0].tool_calls.is_none(), "a live prompt needs no exact tool call list");
+        assert_eq!(scenario.prompt[0].tool_output_contains, ["Bumped by the council"]);
+        let absolute = LIVE.replace("~/.deepseek-key.txt", "/keys/k");
+        assert_eq!(Scenario::parse(&absolute, "abs").unwrap().live.unwrap().key_path().unwrap(), PathBuf::from("/keys/k"));
+    }
+
+    #[test]
+    fn a_live_scenario_refuses_scripted_replies_containers_and_stray_keys() {
+        let scripted = format!("{LIVE}\n[[model]]\ntext = \"hi\"\n");
+        assert!(refusal(&scripted).contains("[[model]] replies would never be read"), "{}", refusal(&scripted));
+        let contained = format!("mode = \"contained\"\n{LIVE}");
+        assert!(refusal(&contained).contains("needs the network"), "{}", refusal(&contained));
+        let stray = LIVE.replace("model = \"deepseek-flash\"", "model = \"deepseek-flash\"\napi_key = \"sk-x\"");
+        assert!(refusal(&stray).contains("api_key"), "{}", refusal(&stray));
+        let empty = LIVE.replace("deepseek-flash", " ");
+        assert!(refusal(&empty).contains("`model` is empty"), "{}", refusal(&empty));
+    }
+
+    fn with_council(council: &str, gate: &str) -> String {
+        format!("gate = {gate:?}\n{MINIMAL}\n[council]\n{council}\n")
+    }
+
+    const COUNCIL_GATE: &str = "[council]\nserver = \"{council}\"\n";
+
+    #[test]
+    fn a_scripted_council_reads_its_verdicts_in_order() {
+        let text = with_council("verdicts = [\"try_harder\", \"do_less\", \"proceed\"]\nundo = \"irreversible\"", COUNCIL_GATE);
+        let script = Scenario::parse(&text, "council").unwrap().council.unwrap().script().unwrap();
+        assert_eq!(script.verdicts, [Verdict::TryHarder, Verdict::DoLess, Verdict::Proceed]);
+        assert_eq!(script.undo, Some(Undo::Irreversible));
+        let real = with_council("server = \"http://zorak:8090\"", COUNCIL_GATE);
+        assert!(Scenario::parse(&real, "real").unwrap().council.unwrap().script().is_none(), "a real server is not scripted");
+    }
+
+    #[test]
+    fn a_council_needs_exactly_one_source_and_a_gate_that_names_it() {
+        let both = with_council("verdicts = [\"proceed\"]\nserver = \"http://zorak:8090\"", COUNCIL_GATE);
+        assert!(refusal(&both).contains("not both"), "{}", refusal(&both));
+        let neither = with_council("", COUNCIL_GATE);
+        assert!(refusal(&neither).contains("needs `verdicts`"), "{}", refusal(&neither));
+        let unknown = with_council("verdicts = [\"maybe\"]", COUNCIL_GATE);
+        assert!(refusal(&unknown).contains("maybe"), "{}", refusal(&unknown));
+        let unnamed = with_council("verdicts = [\"proceed\"]", "[global]\n");
+        assert!(refusal(&unnamed).contains("no `gate` names it"), "{}", refusal(&unnamed));
+        let undo_on_real = with_council("server = \"http://zorak:8090\"\nundo = \"normal\"", COUNCIL_GATE);
+        assert!(refusal(&undo_on_real).contains("answers for itself"), "{}", refusal(&undo_on_real));
+        let contained = format!("mode = \"contained\"\n{}", with_council("verdicts = [\"proceed\"]", COUNCIL_GATE));
+        assert!(refusal(&contained).contains("cannot reach"), "{}", refusal(&contained));
+        let orphan = format!("gate = {COUNCIL_GATE:?}\n{MINIMAL}");
+        assert!(refusal(&orphan).contains("no [council]"), "{}", refusal(&orphan));
     }
 
     #[test]

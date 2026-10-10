@@ -4,7 +4,8 @@
 //! cwd and the agent's launch directory), the fleet files the agent reads (the
 //! mock model script, the gate policy, and any rc overlay), and, in host mode,
 //! the agent's `TMPDIR`. The agent is a fresh process per scenario, so no state
-//! crosses between scenarios.
+//! crosses between scenarios. A `[council]` scenario also gets a scripted
+//! council server for the run, and a `[live]` one talks to a real model API.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ use serde_json::Value;
 
 use crate::client::{self, AcpClient, AgentCommand, PermissionAnswer, PermissionPolicy, PermissionRecord};
 use crate::container;
-use crate::scenario::{Answer, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative};
+use crate::council::ScriptedCouncil;
+use crate::scenario::{
+    Answer, COUNCIL_PLACEHOLDER, Cancel, KnownGap, Mode, OnHold, Prompt, Scenario, Verify, workspace_relative,
+};
 use crate::shape::{self, PromptWire, Transcript};
 
 /// Harbor-shape invariants the agent breaks wherever they apply, each with
@@ -34,6 +38,10 @@ pub const SETTLE: Duration = Duration::from_secs(3);
 
 /// The model name the agent is started with, and so the mock script's file stem.
 pub const MOCK_MODEL: &str = "fleet-mock";
+
+/// The environment variable a live run hands the agent its API key in. The
+/// key never appears on a command line or in the runner's output.
+pub const LIVE_KEY_ENV: &str = "ACP_FLEET_LIVE_API_KEY";
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -80,6 +88,9 @@ pub struct Outcome {
     pub stderr_tail: String,
     /// The scratch directory, when it was kept.
     pub kept: Option<PathBuf>,
+    /// What the run observed beyond its verdict, such as the scripted
+    /// council's answers.
+    pub notes: Vec<String>,
 }
 
 impl Outcome {
@@ -108,6 +119,7 @@ pub fn run_file(path: &Path, config: &RunConfig) -> Outcome {
             elapsed: started.elapsed(),
             stderr_tail: String::new(),
             kept: None,
+            notes: Vec::new(),
         },
     }
 }
@@ -119,6 +131,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
     let mut errors = Vec::new();
     let mut stderr_tail = String::new();
     let mut transcript = None;
+    let mut notes = Vec::new();
     let scratch = match Scratch::create(&config.scratch_root, name) {
         Ok(scratch) => Some(scratch),
         Err(error) => {
@@ -127,7 +140,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         }
     };
     if let Some(scratch) = &scratch
-        && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail, &mut transcript)
+        && let Err(error) = drive(scenario, scratch, config, &mut failures, &mut stderr_tail, &mut transcript, &mut notes)
     {
         errors.push(format!("{error:#}"));
     }
@@ -169,6 +182,7 @@ pub fn run_scenario(name: &str, scenario: &Scenario, config: &RunConfig) -> Outc
         elapsed: started.elapsed(),
         stderr_tail,
         kept,
+        notes,
     }
 }
 
@@ -274,6 +288,7 @@ fn drive(
     failures: &mut Vec<String>,
     stderr_tail: &mut String,
     transcript: &mut Option<Transcript>,
+    notes: &mut Vec<String>,
 ) -> Result<()> {
     for (path, body) in &scenario.files {
         let target = scratch.workspace.join(workspace_relative(path)?);
@@ -282,14 +297,26 @@ fn drive(
         }
         std::fs::write(&target, body).with_context(|| format!("seed {}", target.display()))?;
     }
-    let script = serde_json::to_string_pretty(&scenario.mock_script()?)?;
-    std::fs::write(scratch.fleet.join("mock").join(format!("{MOCK_MODEL}.json")), script)
-        .context("write the mock script")?;
+    if scenario.live.is_none() {
+        let script = serde_json::to_string_pretty(&scenario.mock_script()?)?;
+        std::fs::write(scratch.fleet.join("mock").join(format!("{MOCK_MODEL}.json")), script)
+            .context("write the mock script")?;
+    }
 
     if scenario.mode == Mode::Contained {
         container::preflight()?;
     }
-    std::fs::write(scratch.fleet.join("gate.toml"), gate_policy(scenario)).context("write the gate policy")?;
+    // Lives until this function returns, after the agent has exited.
+    let scripted = match scenario.council.as_ref().and_then(|c| c.script()) {
+        Some(script) => Some(ScriptedCouncil::start(script)?),
+        None => None,
+    };
+    let council = match (&scripted, scenario.council.as_ref().and_then(|c| c.server.as_deref())) {
+        (Some(scripted), _) => Some(scripted.base().to_string()),
+        (None, server) => server.map(str::to_string),
+    };
+    std::fs::write(scratch.fleet.join("gate.toml"), gate_policy(scenario, council.as_deref()))
+        .context("write the gate policy")?;
     let overlay = &scenario.rc;
     for (path, body) in overlay {
         let target = scratch.fleet.join("rc").join(workspace_relative(path)?);
@@ -301,14 +328,35 @@ fn drive(
 
     let (command, session_cwd) = match scenario.mode {
         Mode::Host => {
-            let mut command = AgentCommand::new(&config.agent)
-                .arg("--backend-kind")
-                .arg("mock")
-                .arg("--model")
-                .arg(MOCK_MODEL)
+            let mut command = AgentCommand::new(&config.agent);
+            command = match &scenario.live {
+                Some(live) => {
+                    let path = live.key_path()?;
+                    let key = std::fs::read_to_string(&path)
+                        .with_context(|| format!("[live] read the API key file {}", path.display()))?;
+                    let key = key.trim();
+                    if key.is_empty() {
+                        bail!("[live] the API key file {} is empty", path.display());
+                    }
+                    command
+                        .arg("--backend-kind")
+                        .arg(&live.backend_kind)
+                        .arg("--model")
+                        .arg(&live.model)
+                        .arg("--api-key-env")
+                        .arg(LIVE_KEY_ENV)
+                        .env(LIVE_KEY_ENV, key)
+                }
+                None => command
+                    .arg("--backend-kind")
+                    .arg("mock")
+                    .arg("--model")
+                    .arg(MOCK_MODEL)
+                    .env("KJ_MOCK_SCRIPT_DIR", scratch.fleet.join("mock")),
+            };
+            command = command
                 .arg("--gate-config")
                 .arg(scratch.fleet.join("gate.toml"))
-                .env("KJ_MOCK_SCRIPT_DIR", scratch.fleet.join("mock"))
                 .env("TMPDIR", &scratch.tmp)
                 .env("RUST_LOG", "info")
                 .cwd(&scratch.workspace);
@@ -344,7 +392,7 @@ fn drive(
 
     let mut agent = AcpClient::spawn(&command, config.timeout)?;
     agent.set_trace(config.trace);
-    let result = converse(&mut agent, scenario, &session_cwd, scratch, config.timeout, failures)
+    let result = converse(&mut agent, scenario, &session_cwd, scratch, council.as_deref(), config.timeout, failures)
         .map(|wire| *transcript = Some(wire));
     // Close stdin even after a failed run so the agent removes its own
     // temporary state; the scratch directory is removed after this.
@@ -353,6 +401,11 @@ fn drive(
     drop(agent);
     if scenario.mode == Mode::Contained {
         container::remove(&scratch.id);
+    }
+    if let Some(scripted) = &scripted {
+        let answered = scripted.answered();
+        notes.push(format!("scripted council answered {} decision(s): {}", answered.len(), answered.join(", ")));
+        failures.extend(scripted.errors().into_iter().map(|e| format!("the scripted council could not serve a request: {e}")));
     }
     result?;
     match shutdown {
@@ -386,12 +439,23 @@ pub const YOLO_GATE: &str = "\
 uncovered = \"allow\"
 ";
 
-/// The gate policy for a run: the scenario's, or the mode's default.
-fn gate_policy(scenario: &Scenario) -> String {
+/// The gate policy for a run: the scenario's, or the mode's default, with
+/// the council server's address in place of [`COUNCIL_PLACEHOLDER`].
+fn gate_policy(scenario: &Scenario, council: Option<&str>) -> String {
     match (&scenario.gate, scenario.mode) {
-        (Some(gate), _) => gate.clone(),
+        (Some(gate), _) => with_council(gate, council),
         (None, Mode::Host) => SHIPPED_GATE.to_string(),
         (None, Mode::Contained) => YOLO_GATE.to_string(),
+    }
+}
+
+/// `gate` with the council server's address in place of
+/// [`COUNCIL_PLACEHOLDER`]. The loader refuses a placeholder with no
+/// `[council]`, so `None` leaves nothing to replace.
+fn with_council(gate: &str, council: Option<&str>) -> String {
+    match council {
+        Some(base) => gate.replace(COUNCIL_PLACEHOLDER, base),
+        None => gate.to_string(),
     }
 }
 
@@ -401,6 +465,7 @@ fn converse(
     scenario: &Scenario,
     workspace: &Path,
     scratch: &Scratch,
+    council: Option<&str>,
     timeout: Duration,
     failures: &mut Vec<String>,
 ) -> Result<Transcript> {
@@ -420,7 +485,8 @@ fn converse(
         let permissions_before = sent.permissions;
         if let Some(gate) = &prompt.gate {
             let path = scratch.state.join("config").join("kernel").join("gate.toml");
-            std::fs::write(&path, gate).with_context(|| format!("{label}: replace {}", path.display()))?;
+            std::fs::write(&path, with_council(gate, council))
+                .with_context(|| format!("{label}: replace {}", path.display()))?;
         }
         let id = agent.start_prompt(&session, &prompt.text).with_context(|| label.clone())?;
         if let Some(cancel) = &prompt.cancel {
@@ -654,6 +720,16 @@ pub fn check_prompt(label: &str, prompt: &Prompt, seen: &Seen<'_>) -> Vec<String
                 .collect();
             let outputs: Vec<&str> = calls.iter().map(|c| c.output.as_str()).collect();
             failures.push(format!("{label}: expected tool calls {want:?}, got {got:?} with outputs {outputs:?}"));
+        }
+    }
+
+    if !prompt.tool_output_contains.is_empty() {
+        let calls = client::tool_calls(seen.updates);
+        for needle in &prompt.tool_output_contains {
+            if !calls.iter().any(|c| c.output.contains(needle.as_str())) {
+                let outputs: Vec<String> = calls.iter().map(|c| format!("{}: {:?}", c.title, c.output)).collect();
+                failures.push(format!("{label}: no tool call output contains {needle:?}; outputs were {outputs:?}"));
+            }
         }
     }
 
@@ -947,11 +1023,33 @@ mod tests {
 
     #[test]
     fn each_mode_has_its_own_default_gate() {
-        assert_eq!(gate_policy(&scenario("")), SHIPPED_GATE);
-        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\"")).parse().unwrap();
+        assert_eq!(gate_policy(&scenario(""), None), SHIPPED_GATE);
+        let contained: toml::Table = gate_policy(&scenario("mode = \"contained\""), None).parse().unwrap();
         assert_eq!(contained["global"]["uncovered"].as_str(), Some("allow"));
         let own = scenario("gate = \"[global]\\nallow = [\\\"mkdir\\\"]\\n\"");
-        assert_eq!(gate_policy(&own), "[global]\nallow = [\"mkdir\"]\n");
+        assert_eq!(gate_policy(&own, None), "[global]\nallow = [\"mkdir\"]\n");
+    }
+
+    #[test]
+    fn the_gate_gets_the_council_servers_address() {
+        let council = scenario("gate = \"[council]\\nserver = \\\"{council}\\\"\\n\"\n[council]\nverdicts = [\"proceed\"]");
+        assert_eq!(gate_policy(&council, Some("http://127.0.0.1:9")), "[council]\nserver = \"http://127.0.0.1:9\"\n");
+    }
+
+    #[test]
+    fn tool_output_contains_needs_each_substring_in_some_call() {
+        let p = prompt("tool_output_contains = [\"needs more care\", \"reaches past\"]");
+        let response = json!({"stopReason": "end_turn"});
+        let output = |id: &str, text: &str| json!({"update": {"sessionUpdate": "tool_call", "toolCallId": id, "title": "shell_write",
+            "content": [{"type": "content", "content": {"type": "text", "text": text}}]}});
+        let both = [output("a", "Bumped: it needs more care first"), output("b", "Bumped: it reaches past the task")];
+        let seen = Seen { response: &response, updates: &both, answered: both.len(), permissions: &[] };
+        assert_eq!(check_prompt("p", &p, &seen), Vec::<String>::new());
+        let one = [output("a", "Bumped: it needs more care first")];
+        let seen = Seen { response: &response, updates: &one, answered: one.len(), permissions: &[] };
+        let failures = check_prompt("p", &p, &seen);
+        assert_eq!(failures.len(), 1, "{failures:#?}");
+        assert!(failures[0].contains("\"reaches past\""), "{failures:#?}");
     }
 
     #[test]

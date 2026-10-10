@@ -16,13 +16,17 @@
 //! marks a known gap must fail in the ways it names, and fails the test when
 //! the gap no longer reproduces.
 //!
+//! Live scenarios live in its `live/` directory. They talk to a real model
+//! API and spend money, so no test here runs them; this target only checks
+//! that each one loads. Run them by hand with `acp-fleet run --live`.
+//!
 //! `acp-fleet run` runs the same scenarios by hand, one report line each.
 
 use std::path::PathBuf;
 
 use kaijutsu_acp_fleet::run::{RunConfig, run_file};
 use kaijutsu_acp_fleet::scenario::{Mode, Scenario};
-use kaijutsu_acp_fleet::{APPROVAL_DIR, CONTAINED_DIR, DEFAULT_SCRATCH, FLEET_DIR, scenario};
+use kaijutsu_acp_fleet::{APPROVAL_DIR, CONTAINED_DIR, DEFAULT_SCRATCH, FLEET_DIR, LIVE_DIR, scenario};
 
 /// Run every scenario in `dir`, each of which must declare `mode`.
 fn run_all(dir: &str, mode: Mode) {
@@ -32,11 +36,15 @@ fn run_all(dir: &str, mode: Mode) {
     let config = RunConfig::new(env!("CARGO_BIN_EXE_kaijutsu-solo-acp"), DEFAULT_SCRATCH);
     let mut report = Vec::new();
     for file in &files {
-        let declared = Scenario::load(file).map(|s| s.mode);
-        if let Ok(declared) = declared
+        let loaded = Scenario::load(file);
+        if let Ok(declared) = loaded.as_ref().map(|s| s.mode)
             && declared != mode
         {
             report.push(format!("MISPLACED {}: mode {declared:?} in the {mode:?} directory {dir}", file.display()));
+            continue;
+        }
+        if loaded.as_ref().is_ok_and(|s| s.live.is_some()) {
+            report.push(format!("MISPLACED {}: a [live] scenario spends money; move it to {LIVE_DIR}", file.display()));
             continue;
         }
         let outcome = run_file(file, &config);
@@ -60,6 +68,18 @@ fn every_fleet_scenario_passes() {
 #[test]
 fn every_approval_scenario_holds() {
     run_all(APPROVAL_DIR, Mode::Host);
+}
+
+/// Live scenarios are never run here, but a typo in one should not wait for
+/// someone to spend money to show up.
+#[test]
+fn every_live_scenario_loads() {
+    let files = scenario::discover(&[PathBuf::from(LIVE_DIR)]).expect("list the live fleet");
+    assert!(!files.is_empty(), "no scenarios in {LIVE_DIR}");
+    for file in &files {
+        let loaded = Scenario::load(file).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(loaded.live.is_some(), "{} is in {LIVE_DIR} with no [live]", file.display());
+    }
 }
 
 #[test]

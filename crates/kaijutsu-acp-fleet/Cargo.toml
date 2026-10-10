@@ -14,10 +14,13 @@ path = "src/main.rs"
 workspace = true
 
 # A plain ACP client: std threads and newline-delimited JSON-RPC, with no
-# kaijutsu crate underneath, so it can drive any ACP agent command.
+# kaijutsu crate underneath, so it can drive any ACP agent command. The
+# scripted council (`src/council.rs`) uses kaijutsu-mk's wire types and
+# math, so its answers carry the numbers a kernel recomputes.
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+kaijutsu-mk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
