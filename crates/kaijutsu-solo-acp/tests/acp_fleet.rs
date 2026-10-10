@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use kaijutsu_acp_fleet::run::{RunConfig, run_file};
 use kaijutsu_acp_fleet::scenario::{Mode, Scenario};
-use kaijutsu_acp_fleet::{APPROVAL_DIR, CONTAINED_DIR, CONTAINED_LIVE_DIR, DEFAULT_SCRATCH, FLEET_DIR, LIVE_DIR, scenario};
+use kaijutsu_acp_fleet::{APPROVAL_DIR, CONTAINED_DIR, CONTAINED_LIVE_DIR, DEFAULT_SCRATCH, FLEET_DIR, scenario};
 
 /// Run every scenario in `dir`, each of which must declare `mode`.
 fn run_all(dir: &str, mode: Mode) {
@@ -46,7 +46,7 @@ fn run_all(dir: &str, mode: Mode) {
         }
         if loaded.as_ref().is_ok_and(|s| s.live.is_some()) {
             report.push(format!(
-                "MISPLACED {}: a [live] scenario spends money; move it to {LIVE_DIR} or {CONTAINED_LIVE_DIR}",
+                "MISPLACED {}: a [live] scenario spends money; move it to {CONTAINED_LIVE_DIR}",
                 file.display()
             ));
             continue;
@@ -78,7 +78,7 @@ fn every_approval_scenario_holds() {
 /// someone to spend money to show up.
 #[test]
 fn every_live_scenario_loads() {
-    for (dir, mode) in [(LIVE_DIR, Mode::Host), (CONTAINED_LIVE_DIR, Mode::Contained)] {
+    for (dir, mode) in [(CONTAINED_LIVE_DIR, Mode::Contained)] {
         let files = scenario::discover(&[PathBuf::from(dir)]).expect("list the live fleet");
         assert!(!files.is_empty(), "no scenarios in {dir}");
         for file in &files {

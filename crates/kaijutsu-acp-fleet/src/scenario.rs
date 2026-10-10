@@ -393,6 +393,12 @@ impl Scenario {
                     bail!("[live] `{key}` is empty");
                 }
             }
+            if self.mode != Mode::Contained {
+                bail!(
+                    "[live] a live model runs only in a container, where it reaches nothing but its council and \
+                     its model API: set mode = \"contained\" and put the scenario in fleet/contained/live/"
+                );
+            }
         }
         let placeholder = self
             .gate
@@ -570,6 +576,9 @@ pub fn discover(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             bail!("{} is neither a scenario file nor a directory of them", path.display());
         }
     }
+    // A file named and also inside a named directory runs once.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     Ok(found)
 }
 
@@ -752,16 +761,37 @@ path = "made.txt"
 exists = true
 "#;
 
+    /// A file named and also inside a named directory is discovered once.
+    #[test]
+    fn a_file_named_twice_is_discovered_once() {
+        let dir = std::env::temp_dir().join(format!("fleet-discover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.toml");
+        std::fs::write(&file, "").unwrap();
+        let found = discover(&[file.clone(), dir.clone()]).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, [file]);
+    }
+
+    /// A live model runs only in a container. Amy, 2026-10-10: "let's wait
+    /// on more tests if they're not contained in a container yet."
+    #[test]
+    fn a_live_scenario_runs_only_in_a_container() {
+        assert!(refusal(LIVE).contains("runs only in a container"), "{}", refusal(LIVE));
+        let host = format!("mode = \"host\"\n{LIVE}");
+        assert!(refusal(&host).contains("runs only in a container"), "{}", refusal(&host));
+    }
+
     #[test]
     fn a_live_scenario_names_its_model_and_key_file() {
-        let scenario = Scenario::parse(LIVE, "live").unwrap();
+        let scenario = Scenario::parse(&format!("mode = \"contained\"\n{LIVE}"), "live").unwrap();
         let live = scenario.live.as_ref().unwrap();
         assert_eq!((live.backend_kind.as_str(), live.model.as_str()), ("deepseek", "deepseek-flash"));
         let home = std::env::var("HOME").unwrap();
         assert_eq!(live.key_path().unwrap(), PathBuf::from(home).join(".deepseek-key.txt"));
         assert!(scenario.prompt[0].tool_calls.is_none(), "a live prompt needs no exact tool call list");
         assert_eq!(scenario.prompt[0].tool_output_contains, ["Bumped by the council"]);
-        let absolute = LIVE.replace("~/.deepseek-key.txt", "/keys/k");
+        let absolute = format!("mode = \"contained\"\n{}", LIVE.replace("~/.deepseek-key.txt", "/keys/k"));
         assert_eq!(Scenario::parse(&absolute, "abs").unwrap().live.unwrap().key_path().unwrap(), PathBuf::from("/keys/k"));
     }
 
@@ -771,7 +801,6 @@ exists = true
         assert_eq!(contained.live.unwrap().api_endpoint(), Some(Endpoint { host: "api.deepseek.com".into(), port: 443 }));
         let unknown = format!("mode = \"contained\"\n{}", LIVE.replace("\"deepseek\"", "\"local\""));
         assert!(refusal(&unknown).contains("knows none for \"local\""), "{}", refusal(&unknown));
-        Scenario::parse(&LIVE.replace("\"deepseek\"", "\"local\""), "host").unwrap();
     }
 
     #[test]
