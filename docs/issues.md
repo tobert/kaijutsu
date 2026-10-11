@@ -422,6 +422,16 @@ operator and motion) closes the gap. Scrolls other than page and half page
   go to the first line; a settled window height would need a session-level
   size from the client.
 
+## Context verbs read a lineage-root fault as "not the root" (2026-10-11)
+
+`kj/context.rs` checks review and egress authority with
+`matches!(db.lineage_root(target), Ok(root) if root == caller)`, so a
+broken `forked_from` chain or a database fault refuses the caller as if it
+were not the root, with no error. The ledger now uses
+`KernelDb::live_lineage_root`, which separates "no live root" (`None`) from a
+fault (`Err`); move these callers to it and propagate the fault. The other
+`lineage_root` callers in the same file need the same check.
+
 ## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
 
 The ledger push brings an ask to the TUI sooner than the old poll did, so a

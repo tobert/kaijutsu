@@ -3396,3 +3396,38 @@ and the old key fails the parse naming the new one. The module is
 join), with `council_voice_skips` now `council_reviewer_skips`. The
 migration renames in place, so recorded rows survive. The shadow voice is
 now the shadow context.
+
+## The app catches up (October 11)
+
+Amy asked to bring the Bevy app up to the tui, finish the vi work in it,
+and move to Bevy 0.20. We ran the day from zorak with lanes in parallel:
+Haiku for toil, Sonnet for coding, Opus for the compose rewrite, and a
+kaibo DeepSeek review on every lane before it landed.
+
+Bevy 0.20 removed naga_oil, so six material shaders became WESL. A shader
+fails only at runtime, so a test composes every shader through Bevy's own
+`ShaderCache` and naga-validates it. Without a display, `contrib/headless-app.sh`
+runs the app on a headless labwc against a throwaway kernel, with BRP for
+keys and screenshots. That harness verified each app lane, and it found
+the one bug a unit test had missed.
+
+The tui's draft and editor outboxes moved into `kaijutsu-client`, and the
+app now types through them. Review found that flush-then-submit lets a late
+edit become a new draft after the submit, so submit and read queue in
+order with the edits. A dropped writer lands its queued calls as failures.
+The app's compose runs on `EditorCore`, which retired its second vi. In
+the harness, a refused submit's reloaded draft opened in normal mode and
+replayed the held keys as vi commands. Review then found that keys held
+during a load replayed into whichever surface was active, so a Ctrl+Z
+mid-load ran a shell line. Held keys now replay into the chat draft only.
+
+Asks gained `toolCallBlockId`, `lineageRoot` and `hasExecSource`, and
+`AskSummary` predicates decide which of `c`/`C`/`e`/`t` a client offers.
+Moving the call id off `AskDetail` changed a field's meaning, so the wire
+version is 4. Amy's other choices: Enter submits chat from normal mode
+only, and a shell `kj` line routes as the tui's does.
+
+Lesson for splitting one tree into per-lane commits: a zero-context patch
+(`-U0`) can place a pure insertion at the wrong spot. Stage with at least
+one line of context, and build the staged index on its own in a scratch
+worktree before committing.
