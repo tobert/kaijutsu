@@ -293,6 +293,42 @@ writes the active id back via `set_last_context` on change.
 
 ---
 
+## Checking the app without a display
+
+`contrib/headless-app.sh` runs the app on a headless labwc compositor against
+a throwaway kernel, so a change can be checked without a person at a display.
+`contrib/kaijutsu-runner.sh` is the other route and needs Amy's Wayland
+session.
+
+```sh
+contrib/headless-app.sh start [--size 1920x1080] [--build]
+contrib/headless-app.sh shot NAME [DIR]    # BRP screenshot to DIR/NAME.png
+contrib/headless-app.sh keys ControlLeft KeyA   # all keys held at once
+contrib/headless-app.sh text 'alpha-notes'
+contrib/headless-app.sh stop
+```
+
+`start` boots a second `kaijutsu-server` on port 22724 with its own XDG trees
+and keys, and never touches the kernel on 2222. The app connects with
+`--key-file` as the root character `headless-director`. The script seeds
+three contexts with text, thinking, markdown, and ABC blocks through
+`kaijutsu-mcp`, and leaves one pending `git push` ask for the ledger. BRP
+listens on 15712.
+
+Things to know when driving it:
+
+- `send_keys` holds its keys together, so a prefix chord is two calls:
+  `keys ControlLeft KeyA`, then `keys KeyW`.
+- The app starts with no context joined. Join one through the well (`Ctrl+A w`,
+  arrows, `Enter`); the `Ctrl+A '` prompt does not run a command until a
+  context is joined.
+- `docs/issues.md`, "BRP-injected input lands one request late": take a second
+  request after a key before reading the screen.
+- App log: `/tmp/kj-headless/logs/app.log`. Shader and pipeline failures
+  appear there as `ERROR` lines.
+- A `kaijutsu-mcp` built before the ledger push callback cannot keep a
+  connection while an ask is pending, so seeding raises the ask last.
+
 ## Smells (not fixed — see [issues](../issues.md))
 
 - **`BlockScene` misnomer** — `view/block_render.rs`'s `BlockScene` doc
