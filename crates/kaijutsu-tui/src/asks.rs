@@ -53,9 +53,73 @@ pub fn route_under_card(key: KeyEvent, keys: &mut Keys) -> CardRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskDecision {
     AllowOnce,
+    /// `A`: allow and remember the exact text for anyone, in any context.
     AllowAlways,
+    /// `c`: allow and remember the exact text for the performing character.
+    AllowForCharacter,
+    /// `C`: allow and remember the command family for the performing
+    /// character.
+    AllowForCharacterFamily,
     Deny,
     ViewLedger,
+    /// `e`: hand the ask to the next reviewer above.
+    Escalate,
+    /// `t`: take the ask for yourself.
+    TakeOver,
+}
+
+/// Which keys a viewer may use on one ask, each from the shared
+/// [`kaijutsu_types::AskSummary`] predicate of the same name; the client
+/// derives no authorization of its own. The kernel stays authoritative if
+/// the ask changes while a control is on screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Offer {
+    /// `a` `A` `d`: the viewer is the assigned reviewer.
+    pub review: bool,
+    /// `c` `C`: a standing rule for the performer can be learned.
+    pub remember: bool,
+    /// `e`: the viewer may hand the ask on.
+    pub escalate: bool,
+    /// `t`: the viewer may take the ask.
+    pub take_over: bool,
+}
+
+impl Offer {
+    /// The keys `me` has on `summary`; none when the viewer is unknown.
+    pub fn of(summary: &kaijutsu_types::AskSummary, me: Option<PrincipalId>) -> Self {
+        let Some(me) = me else { return Self::default() };
+        Self {
+            review: summary.answerable_by(me),
+            remember: summary.can_remember_for_character(me),
+            escalate: summary.can_escalate(me),
+            take_over: summary.can_take_over(me),
+        }
+    }
+
+    /// The status-line notice for a key the viewer does not have on this
+    /// ask, or `None` when `decision` is theirs to use.
+    pub fn refusal(&self, decision: AskDecision, request_id: &str) -> Option<String> {
+        let id = short_ask(request_id);
+        match decision {
+            AskDecision::ViewLedger => None,
+            AskDecision::AllowOnce | AskDecision::AllowAlways | AskDecision::Deny if !self.review => {
+                Some(awaits_reviewer(request_id))
+            }
+            AskDecision::AllowForCharacter | AskDecision::AllowForCharacterFamily if !self.review => {
+                Some(awaits_reviewer(request_id))
+            }
+            AskDecision::AllowForCharacter | AskDecision::AllowForCharacterFamily if !self.remember => {
+                Some(format!("ask {id} carries no shell program to remember for its performer"))
+            }
+            AskDecision::Escalate if !self.escalate => {
+                Some(format!("ask {id} cannot be escalated by you; only its pending reviewer may"))
+            }
+            AskDecision::TakeOver if !self.take_over => {
+                Some(format!("ask {id} cannot be taken over by you; only the lineage root may take a pending ask"))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// What one key does on a live ask card: decide the ask, or put the card
@@ -80,7 +144,7 @@ pub fn ask_card_key(key: KeyEvent) -> Option<AskCardKey> {
     (key.code == KeyCode::Esc && key.modifiers.is_empty()).then_some(AskCardKey::Aside)
 }
 
-/// `a`/`A`/`d`/`v` on a live ask card (`docs/tui.md`'s Asks figure). `None`
+/// `a`/`A`/`c`/`C`/`d`/`e`/`t`/`v` on a live ask card (`docs/tui.md`'s Asks figure). `None`
 /// for anything else, including a key-release event — a card key is never
 /// swallowed by acting on both edges of one press.
 pub fn ask_key_to_decision(key: KeyEvent) -> Option<AskDecision> {
@@ -93,7 +157,11 @@ pub fn ask_key_to_decision(key: KeyEvent) -> Option<AskDecision> {
     match key.code {
         KeyCode::Char('a') => Some(AskDecision::AllowOnce),
         KeyCode::Char('A') => Some(AskDecision::AllowAlways),
+        KeyCode::Char('c') => Some(AskDecision::AllowForCharacter),
+        KeyCode::Char('C') => Some(AskDecision::AllowForCharacterFamily),
         KeyCode::Char('d') => Some(AskDecision::Deny),
+        KeyCode::Char('e') => Some(AskDecision::Escalate),
+        KeyCode::Char('t') => Some(AskDecision::TakeOver),
         KeyCode::Char('v') => Some(AskDecision::ViewLedger),
         _ => None,
     }
@@ -112,7 +180,8 @@ pub struct AskCard<'a> {
     pub statement: &'a str,
     pub asker: Option<&'a str>,
     pub reviewer: Option<&'a str>,
-    pub can_review: bool,
+    /// The keys the viewer has on this ask.
+    pub offer: Offer,
     /// Whether the card's keys act yet. A disarmed card shows no keys; its
     /// key line says keys still go to the draft.
     pub armed: bool,
@@ -123,7 +192,9 @@ pub struct AskCard<'a> {
 pub const ARMING_KEY_LINE: &str = "  arming… keys still go to the draft";
 
 /// `⚠ ask <id>  <hook>  from <context> (<type>)`, the statement flush-left,
-/// then the key line — `docs/tui.md`'s Asks figure, verbatim.
+/// then the key lines — `docs/tui.md`'s Asks figure. The key lines wrap by
+/// width, and a disarmed card keeps the armed card's line count so arming
+/// never moves the transcript.
 pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     let mut lines = Vec::new();
@@ -142,15 +213,63 @@ pub fn render_ask_card(card: &AskCard<'_>, width: u16, palette: &Palette) -> Vec
     for row in wrap_plain(card.statement, width.saturating_sub(2)) {
         lines.push(Line::from(Span::styled(format!("  {row}"), palette.status())));
     }
-    let keys = if !card.armed {
-        ARMING_KEY_LINE
-    } else if card.can_review {
-        "  [a]llow once  [A]llow always (global)  [d]eny  [v]iew ledger  Esc aside"
-    } else {
-        "  awaiting assigned reviewer — use kj ledger cancel or escalate  [v]iew ledger  Esc aside"
-    };
-    lines.push(Line::from(Span::styled(keys.to_string(), palette.divider())));
+    let mut key_rows = wrap_items(&card_key_items(card), width.saturating_sub(2));
+    if !card.armed {
+        let held = key_rows.len();
+        key_rows = vec![ARMING_KEY_LINE.trim_start().to_string()];
+        key_rows.resize(held.max(1), String::new());
+    }
+    for row in key_rows {
+        lines.push(Line::from(Span::styled(format!("  {row}"), palette.divider())));
+    }
     lines
+}
+
+/// The card's keys for this viewer, one item per key.
+fn card_key_items(card: &AskCard<'_>) -> Vec<String> {
+    let offer = card.offer;
+    let mut items = Vec::new();
+    if offer.review {
+        let who = card.asker.unwrap_or("the performer");
+        items.push("[a]llow once".to_string());
+        items.push("[A]llow always (global)".to_string());
+        if offer.remember {
+            items.push(format!("[c] always for {who}"));
+            items.push(format!("[C] {who}, command family"));
+        }
+        items.push("[d]eny".to_string());
+        if offer.escalate {
+            items.push("[e]scalate".to_string());
+        }
+    } else {
+        items.push(format!("waiting for reviewer {}", card.reviewer.unwrap_or("(unassigned)")));
+        if offer.take_over {
+            items.push("[t]ake over".to_string());
+        }
+    }
+    items.push("[v]iew ledger".to_string());
+    items.push("Esc aside".to_string());
+    items
+}
+
+/// Items joined by two spaces, wrapped between items at `width`.
+fn wrap_items(items: &[String], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for item in items {
+        if current.is_empty() {
+            current.push_str(item);
+        } else if current.chars().count() + 2 + item.chars().count() <= width {
+            current.push_str("  ");
+            current.push_str(item);
+        } else {
+            rows.push(std::mem::take(&mut current));
+            current.push_str(item);
+        }
+    }
+    rows.push(current);
+    rows
 }
 
 /// One row of the ledger view's PENDING section.
@@ -164,7 +283,8 @@ pub struct PendingRow {
     pub hook: String,
     pub asker: Option<String>,
     pub reviewer: Option<String>,
-    pub reviewable: bool,
+    /// The keys the viewer has on this ask.
+    pub offer: Offer,
     pub statement: String,
 }
 
@@ -227,8 +347,12 @@ impl LedgerRow {
         }
     }
 
-    pub fn reviewable(&self) -> bool {
-        matches!(self, Self::Pending(row) if row.reviewable)
+    /// The keys the viewer has on this row; none on an answered row.
+    pub fn offer(&self) -> Offer {
+        match self {
+            Self::Pending(row) => row.offer,
+            Self::Answered(_) => Offer::default(),
+        }
     }
 
     /// Substring match across every column a filter might target — the id,
@@ -336,13 +460,45 @@ pub fn render_ledger(
         )));
     }
 
-    let hints = "a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back";
-    let short_hints = "a allow once  A global  d deny  Enter  j/k  /  Esc back";
-    lines.push(Line::from(Span::styled(
-        if hints.len() <= width_usize { hints } else { short_hints }.to_string(),
-        palette.divider(),
-    )));
+    let hints = ledger_hints(visible.get(selected).copied(), width_usize);
+    lines.push(Line::from(Span::styled(hints, palette.divider())));
     lines
+}
+
+/// The ledger's key line: the selected pending row's own keys (none on
+/// nothing or an answered row), then navigation. The long wording when it fits `width`, else the short one,
+/// cut to `width` if even that is wider.
+fn ledger_hints(selected: Option<&LedgerRow>, width: usize) -> String {
+    let mut items: Vec<(String, String)> = Vec::new();
+    let mut add = |full: &str, short: &str| items.push((full.to_string(), short.to_string()));
+    if let Some(LedgerRow::Pending(row)) = selected {
+        let who = row.asker.as_deref().unwrap_or("the performer");
+        if row.offer.review {
+            add("a allow once", "a allow once");
+            add("A allow always (global)", "A global");
+            if row.offer.remember {
+                add(&format!("c always for {who}"), &format!("c {who}"));
+                add(&format!("C {who}, command family"), &format!("C {who} family"));
+            }
+            add("d deny", "d deny");
+        }
+        if row.offer.escalate {
+            add("e escalate", "e escalate");
+        }
+        if row.offer.take_over {
+            add("t take over", "t take over");
+        }
+    }
+    add("Enter show", "Enter");
+    add("j/k move", "j/k");
+    add("/ filter", "/");
+    add("Esc back", "Esc back");
+    let full = items.iter().map(|(full, _)| full.as_str()).collect::<Vec<_>>().join("  ");
+    if full.chars().count() <= width {
+        return full;
+    }
+    let short = items.iter().map(|(_, short)| short.as_str()).collect::<Vec<_>>().join("  ");
+    truncate_plain(&short, width)
 }
 
 /// What one key does inside the ledger view (`Ctrl+A l`). Mode-dependent:
@@ -352,7 +508,11 @@ pub fn render_ledger(
 pub enum LedgerAction {
     AllowOnce,
     AllowAlways,
+    AllowForCharacter,
+    AllowForCharacterFamily,
     Deny,
+    Escalate,
+    TakeOver,
     Show,
     Up,
     Down,
@@ -387,7 +547,11 @@ pub fn ledger_key_to_action(key: KeyEvent, filtering: bool) -> LedgerAction {
     match key.code {
         KeyCode::Char('a') => LedgerAction::AllowOnce,
         KeyCode::Char('A') => LedgerAction::AllowAlways,
+        KeyCode::Char('c') => LedgerAction::AllowForCharacter,
+        KeyCode::Char('C') => LedgerAction::AllowForCharacterFamily,
         KeyCode::Char('d') => LedgerAction::Deny,
+        KeyCode::Char('e') => LedgerAction::Escalate,
+        KeyCode::Char('t') => LedgerAction::TakeOver,
         KeyCode::Enter => LedgerAction::Show,
         KeyCode::Char('j') | KeyCode::Down => LedgerAction::Down,
         KeyCode::Char('k') | KeyCode::Up => LedgerAction::Up,
@@ -543,6 +707,8 @@ pub struct AskCardState {
     pub request_id: String,
     pub context_id: ContextId,
     pub detail: AskDetail,
+    /// A reassignment (`e` or `t`) is in flight and has not landed.
+    pub reassigning: bool,
 }
 
 /// The ask card's arming, kept beside the card for the ask it was started
@@ -649,7 +815,7 @@ pub fn active_view_lines(app: &crate::app::App, width: u16) -> Option<Vec<Line<'
             statement,
             asker: summary.performer.as_ref().map(|who| who.name.as_str()),
             reviewer: summary.reviewer.as_ref().map(|who| who.name.as_str()),
-            can_review: app.principal.is_some_and(|principal| summary.answerable_by(principal)),
+            offer: Offer::of(summary, app.principal),
             armed: app.ask_card_armed(),
         };
         return Some(render_ask_card(&view, width, &app.palette));
@@ -753,7 +919,7 @@ pub fn fold_ledger(app: &mut App, state: &LedgerState) -> Option<LedgerFold> {
 /// and whose last card read did not miss. A card is never raised for a seat
 /// you are not looking at.
 pub fn card_candidate(app: &App) -> Option<String> {
-    if app.ask_card.is_some() {
+    if app.ask_card.is_some() || app.ledger_view.is_some() {
         return None;
     }
     let current = app.current?;
@@ -778,7 +944,7 @@ pub fn open_card(app: &mut App, mut detail: AskDetail) -> bool {
         return false;
     };
     detail.summary = summary.clone();
-    app.ask_card = Some(AskCardState { request_id, context_id, detail });
+    app.ask_card = Some(AskCardState { request_id, context_id, detail, reassigning: false });
     true
 }
 
@@ -811,6 +977,9 @@ pub enum AskWork {
     Show(String),
     /// Answer one ask.
     Decide { request_id: String, verdict: AskVerdict, remember: Option<Remember> },
+    /// Reassign one ask: `to: None` goes to the next reviewer above, and
+    /// naming yourself takes it over.
+    Escalate { request_id: String, to: Option<PrincipalId> },
 }
 
 /// How many answered asks the ledger view lists, newest first.
@@ -825,16 +994,22 @@ pub fn request_ledger(app: &mut App) {
     app.ask_work.push(AskWork::OpenLedger { open });
 }
 
-/// The verdict and standing rule a decision key asks for. `None` for `v`,
-/// which answers nothing.
+/// The verdict and standing rule a decision key asks for. `None` for the
+/// keys that answer nothing: `v`, `e` and `t`.
 pub fn verdict_for(decision: AskDecision) -> Option<(AskVerdict, Option<Remember>)> {
     match decision {
         AskDecision::AllowOnce => Some((AskVerdict::Allow, None)),
         AskDecision::AllowAlways => {
             Some((AskVerdict::Allow, Some(Remember { scope: RememberScope::Always, family: false })))
         }
+        AskDecision::AllowForCharacter => {
+            Some((AskVerdict::Allow, Some(Remember { scope: RememberScope::Character, family: false })))
+        }
+        AskDecision::AllowForCharacterFamily => {
+            Some((AskVerdict::Allow, Some(Remember { scope: RememberScope::Character, family: true })))
+        }
         AskDecision::Deny => Some((AskVerdict::Deny, None)),
-        AskDecision::ViewLedger => None,
+        AskDecision::ViewLedger | AskDecision::Escalate | AskDecision::TakeOver => None,
     }
 }
 
@@ -850,27 +1025,66 @@ fn awaits_reviewer(request_id: &str) -> String {
 /// sets its ask aside, so [`card_candidate`] does not raise it again while
 /// it stays open; a failed answer clears that ([`land_decision`]).
 pub fn card_key(app: &mut App, key: AskCardKey) {
-    let Some(card) = app.ask_card.take() else { return };
     let decision = match key {
         AskCardKey::Aside => {
+            let Some(card) = app.ask_card.take() else { return };
             app.note(format!("ask {} set aside, still pending (Ctrl+A l)", short_ask(&card.request_id)));
             app.asks_set_aside.insert(card.request_id);
             return;
         }
         AskCardKey::Decide(decision) => decision,
     };
-    let Some((verdict, remember)) = verdict_for(decision) else {
-        app.asks_set_aside.insert(card.request_id);
+    let Some(card) = app.ask_card.as_ref() else { return };
+    let request_id = card.request_id.clone();
+    let offer = Offer::of(&card.detail.summary, app.principal);
+    if decision == AskDecision::ViewLedger {
+        app.ask_card = None;
+        app.asks_set_aside.insert(request_id);
         request_ledger(app);
         return;
-    };
-    if !app.principal.is_some_and(|principal| card.detail.summary.answerable_by(principal)) {
-        app.note(awaits_reviewer(&card.request_id));
-        app.ask_card = Some(card);
+    }
+    if let Some(notice) = offer.refusal(decision, &request_id) {
+        app.note(notice);
         return;
     }
-    app.asks_set_aside.insert(card.request_id.clone());
-    app.ask_work.push(AskWork::Decide { request_id: card.request_id, verdict, remember });
+    // A reassignment leaves the card up: the push shows the new reviewer on
+    // it. One is in flight at a time, so a double tap cannot append a second
+    // `escalated` event.
+    if matches!(decision, AskDecision::Escalate | AskDecision::TakeOver) {
+        if card.reassigning {
+            app.note(format!("ask {} is already being reassigned", short_ask(&request_id)));
+            return;
+        }
+        if let Some(card) = app.ask_card.as_mut() {
+            card.reassigning = true;
+        }
+    }
+    if dispatch(app, decision, request_id.clone()) {
+        return;
+    }
+    app.ask_card = None;
+    app.asks_set_aside.insert(request_id);
+}
+
+/// Record the kernel work a permitted key asks for. True when it was a
+/// reassignment, whose ask is not set aside.
+fn dispatch(app: &mut App, decision: AskDecision, request_id: String) -> bool {
+    match decision {
+        AskDecision::Escalate => {
+            app.ask_work.push(AskWork::Escalate { request_id, to: None });
+            true
+        }
+        AskDecision::TakeOver => {
+            let me = app.principal.expect("a permitted take over has a principal");
+            app.ask_work.push(AskWork::Escalate { request_id, to: Some(me) });
+            true
+        }
+        _ => {
+            let (verdict, remember) = verdict_for(decision).expect("an answer key carries a verdict");
+            app.ask_work.push(AskWork::Decide { request_id, verdict, remember });
+            false
+        }
+    }
 }
 
 /// Clamp the ledger view's cursor into the rows its filter admits.
@@ -878,8 +1092,8 @@ fn clamp_selected(view: &mut LedgerViewState) {
     view.selected = view.selected.min(view.visible_len().saturating_sub(1));
 }
 
-/// One key inside the ledger view: navigate, filter, show, or answer the
-/// selected row. An answer closes the view; the ledger push updates the
+/// One key inside the ledger view: navigate, filter, show, answer or
+/// reassign the selected row. An answer or reassignment closes the view; the ledger push updates the
 /// seat flags and the pending count.
 pub fn ledger_key(app: &mut App, key: KeyEvent) {
     if app.ledger_view.as_ref().is_some_and(|view| view.detail.is_some()) {
@@ -932,19 +1146,23 @@ pub fn ledger_key(app: &mut App, key: KeyEvent) {
         }
         LedgerAction::AllowOnce => AskDecision::AllowOnce,
         LedgerAction::AllowAlways => AskDecision::AllowAlways,
+        LedgerAction::AllowForCharacter => AskDecision::AllowForCharacter,
+        LedgerAction::AllowForCharacterFamily => AskDecision::AllowForCharacterFamily,
         LedgerAction::Deny => AskDecision::Deny,
+        LedgerAction::Escalate => AskDecision::Escalate,
+        LedgerAction::TakeOver => AskDecision::TakeOver,
         LedgerAction::Ignored => return,
     };
     let Some(request_id) = view.selected_request_id() else { return };
-    let reviewable = filtered_rows(&view.rows, &view.filter).get(view.selected).is_some_and(|row| row.reviewable());
-    if !reviewable {
-        app.note(awaits_reviewer(&request_id));
+    let offer = filtered_rows(&view.rows, &view.filter).get(view.selected).map(|row| row.offer()).unwrap_or_default();
+    if let Some(notice) = offer.refusal(decision, &request_id) {
+        app.note(notice);
         return;
     }
-    let (verdict, remember) = verdict_for(decision).expect("a decision key carries a verdict");
     app.ledger_view = None;
-    app.asks_set_aside.insert(request_id.clone());
-    app.ask_work.push(AskWork::Decide { request_id, verdict, remember });
+    if !dispatch(app, decision, request_id.clone()) {
+        app.asks_set_aside.insert(request_id);
+    }
 }
 
 /// Land one answer: say what the ledger did with it. An answer that did
@@ -969,9 +1187,10 @@ pub fn decision_notice(request_id: &str, answer: Result<kaijutsu_client::AskAnsw
     match answer {
         Ok(Ok(answered)) => {
             let verb = answered.summary.status.as_str();
+            // The kernel's note says which: `remembered as a standing …` or
+            // `NOT remembered: …`.
             match answered.remembered {
-                Some(rule) if rule.learned => format!("ask {id} {verb}; remembered: {}", rule.note),
-                Some(rule) => format!("ask {id} {verb}; not remembered: {}", rule.note),
+                Some(rule) => format!("ask {id} {verb}; {}", rule.note),
                 None => format!("ask {id} {verb}"),
             }
         }
@@ -980,6 +1199,30 @@ pub fn decision_notice(request_id: &str, answer: Result<kaijutsu_client::AskAnsw
         }
         Ok(Err(failure)) => format!("ask {id} not answered: {}", failure.message),
         Err(error) => format!("cannot answer ask {id}: {error}"),
+    }
+}
+
+/// Land one reassignment: say who reviews the ask now, or why it did not
+/// move. The ask stays open either way; the push carries the new reviewer.
+pub fn land_escalation(app: &mut App, request_id: &str, answer: Result<kaijutsu_client::AskAnswer, CallError>, took: bool) {
+    if let Some(card) = app.ask_card.as_mut().filter(|card| card.request_id == request_id) {
+        card.reassigning = false;
+    }
+    app.note(escalation_notice(request_id, answer, took));
+}
+
+/// The notice [`land_escalation`] posts.
+pub fn escalation_notice(request_id: &str, answer: Result<kaijutsu_client::AskAnswer, CallError>, took: bool) -> String {
+    let id = short_ask(request_id);
+    match answer {
+        Ok(Ok(moved)) => {
+            let name = moved.summary.reviewer.as_ref().map_or("(unassigned)", |who| who.name.as_str());
+            format!("ask {id} now reviewed by {name}")
+        }
+        Ok(Err(failure)) => {
+            format!("ask {id} not {}: {}", if took { "taken over" } else { "escalated" }, failure.message)
+        }
+        Err(error) => format!("cannot {} ask {id}: {error}", if took { "take over" } else { "escalate" }),
     }
 }
 
@@ -1027,6 +1270,11 @@ pub fn land_ledger(app: &mut App, reads: Result<LedgerReads, CallError>, now_ms:
         }
     }
     rows.sort_by_key(|row| !matches!(row, LedgerRow::Pending(_)));
+    // The ledger takes the keys, so it takes the screen: a card up under it
+    // would be drawn over rows the keys now answer.
+    if let Some(card) = app.ask_card.take() {
+        app.asks_set_aside.insert(card.request_id);
+    }
     app.ledger_view = Some(LedgerViewState { rows, filter: String::new(), selected: 0, filtering: false, detail: None });
 }
 
@@ -1048,7 +1296,7 @@ fn pending_row(app: &App, detail: &AskDetail, now_ms: u64) -> PendingRow {
         hook: detail.tool.clone().unwrap_or_else(|| "-".to_string()),
         asker: summary.performer.as_ref().map(|who| who.name.clone()),
         reviewer: summary.reviewer.as_ref().map(|who| who.name.clone()),
-        reviewable: app.principal.is_some_and(|principal| summary.answerable_by(principal)),
+        offer: Offer::of(summary, app.principal),
         statement: summary.statements.first().cloned().unwrap_or_else(|| summary.description.clone()),
     }
 }
@@ -1157,7 +1405,7 @@ pub(crate) mod fixtures {
     }
 
     pub fn card(request_id: &str, ctx: ContextId, statement: &str) -> AskCardState {
-        AskCardState { request_id: request_id.to_string(), context_id: ctx, detail: detail(request_id, ctx, statement) }
+        AskCardState { request_id: request_id.to_string(), context_id: ctx, detail: detail(request_id, ctx, statement), reassigning: false }
     }
 }
 
@@ -1283,6 +1531,8 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
 
+    const REVIEWER: Offer = Offer { review: true, remember: false, escalate: false, take_over: false };
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1293,14 +1543,22 @@ mod tests {
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('A'))), Some(AskDecision::AllowAlways));
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('d'))), Some(AskDecision::Deny));
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('v'))), Some(AskDecision::ViewLedger));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('c'))), Some(AskDecision::AllowForCharacter));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('C'))), Some(AskDecision::AllowForCharacterFamily));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('e'))), Some(AskDecision::Escalate));
+        assert_eq!(ask_key_to_decision(press(KeyCode::Char('t'))), Some(AskDecision::TakeOver));
         assert_eq!(ask_key_to_decision(press(KeyCode::Char('x'))), None);
+        for c in ['c', 'C', 'e', 't'] {
+            let chord = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            assert_eq!(ask_key_to_decision(chord), None, "Ctrl+{c} is never a card key");
+        }
     }
 
     /// `Ctrl+A` is the prefix and `Ctrl+D` is a vi scroll; neither answers
     /// the selected ask.
     #[test]
     fn a_ctrl_chord_is_never_a_ledger_decision() {
-        for c in ['a', 'd', 'A'] {
+        for c in ['a', 'd', 'A', 'c', 'C', 'e', 't'] {
             let chord = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             assert_eq!(ledger_key_to_action(chord, false), LedgerAction::Ignored);
             let alt = KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
@@ -1335,7 +1593,7 @@ mod tests {
             statement: "rm -rf ~/src/wt/kaish-arith",
             asker: Some("coder"),
             reviewer: Some("amy"),
-            can_review: true,
+            offer: REVIEWER,
             armed: true,
         };
         let lines = render_ask_card(&card, 80, &Palette::builtin());
@@ -1353,10 +1611,10 @@ mod tests {
         for can_review in [true, false] {
             let card = AskCard {
                 request_id: "01a04eb6", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
-                statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, can_review, armed: false,
+                statement: "rm -rf ~/src/wt/kaish-arith", asker: None, reviewer: None, offer: if can_review { REVIEWER } else { Offer::default() }, armed: false,
             };
             let text: Vec<String> = render_ask_card(&card, 80, &Palette::builtin()).iter().map(line_text).collect();
-            assert_eq!(text.last().map(String::as_str), Some(ARMING_KEY_LINE));
+            assert!(text.iter().any(|line| line == ARMING_KEY_LINE), "{text:?}");
             assert!(!text.iter().any(|line| line.contains("llow")), "{text:?}");
             let armed = AskCard { armed: true, ..card };
             assert_eq!(render_ask_card(&armed, 80, &Palette::builtin()).len(), text.len());
@@ -1373,7 +1631,7 @@ mod tests {
             statement: "one two three four five six seven eight nine ten",
             asker: None,
             reviewer: None,
-            can_review: true,
+            offer: REVIEWER,
             armed: true,
         };
         let lines = render_ask_card(&card, 24, &Palette::builtin());
@@ -1381,16 +1639,51 @@ mod tests {
         assert!(lines.len() > 3, "expected the statement to wrap: {lines:?}");
     }
 
-    #[test]
-    fn an_ask_the_viewer_cannot_review_offers_cancel_or_escalation_not_approval() {
+    fn key_rows(offer: Offer, width: u16, armed: bool) -> Vec<String> {
         let card = AskCard {
             request_id: "id", hook: "shell_write", context_label: "kaijutsu", context_type: "coder",
-            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), can_review: false, armed: true,
+            statement: "rm -rf", asker: Some("coder"), reviewer: Some("lead"), offer, armed,
         };
-        let text: Vec<String> = render_ask_card(&card, 120, &Palette::builtin())
-            .iter().map(line_text).collect();
-        assert!(text.last().unwrap().contains("awaiting assigned reviewer"));
-        assert!(!text.last().unwrap().contains("allow once"));
+        render_ask_card(&card, width, &Palette::builtin()).iter().map(line_text).skip(2).collect()
+    }
+
+    /// Each viewer's card shows exactly the keys they have, in the words
+    /// the design gives them.
+    #[test]
+    fn the_card_renders_each_viewers_keys() {
+        let all = Offer { review: true, remember: true, escalate: true, take_over: false };
+        assert_eq!(
+            key_rows(all, 200, true),
+            vec!["  [a]llow once  [A]llow always (global)  [c] always for coder  [C] coder, command family  [d]eny  [e]scalate  [v]iew ledger  Esc aside"]
+        );
+        let no_program = Offer { remember: false, ..all };
+        assert_eq!(
+            key_rows(no_program, 200, true),
+            vec!["  [a]llow once  [A]llow always (global)  [d]eny  [e]scalate  [v]iew ledger  Esc aside"]
+        );
+        let claimed = Offer { escalate: false, ..all };
+        assert!(!key_rows(claimed, 200, true)[0].contains("[e]"));
+        let root = Offer { take_over: true, ..Offer::default() };
+        assert_eq!(key_rows(root, 200, true), vec!["  waiting for reviewer lead  [t]ake over  [v]iew ledger  Esc aside"]);
+        assert_eq!(
+            key_rows(Offer::default(), 200, true),
+            vec!["  waiting for reviewer lead  [v]iew ledger  Esc aside"]
+        );
+    }
+
+    /// The reviewer's key line wraps by width, between keys; a disarmed
+    /// card keeps the same number of rows.
+    #[test]
+    fn the_key_line_wraps_between_keys_and_arming_keeps_the_row_count() {
+        let all = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let rows = key_rows(all, 50, true);
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows.iter().all(|row| row.chars().count() <= 50), "{rows:?}");
+        let joined = rows.iter().map(|row| row.trim()).collect::<Vec<_>>().join("  ");
+        assert!(joined.contains("[C] coder, command family  [d]eny"), "{joined:?}");
+        let disarmed = key_rows(all, 50, false);
+        assert_eq!(disarmed.len(), rows.len());
+        assert_eq!(disarmed[0], ARMING_KEY_LINE);
     }
 
     /// The ask card wraps by width: a narrow screen renders more rows than
@@ -1406,7 +1699,7 @@ mod tests {
             statement: "one two three four five six seven eight nine ten eleven twelve",
             asker: None,
             reviewer: None,
-            can_review: true,
+            offer: REVIEWER,
             armed: true,
         };
         let narrow_rendered = render_ask_card(&card, 16, &Palette::builtin()).len();
@@ -1440,7 +1733,7 @@ mod tests {
             hook: "shell_write".to_string(),
             asker: Some("coder".to_string()),
             reviewer: Some("amy".to_string()),
-            reviewable: true,
+            offer: REVIEWER,
             statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
         })
     }
@@ -1607,13 +1900,25 @@ mod card_route_tests {
 
     /// The card's own keys decide or set aside; a typed letter is held.
     #[test]
-    fn the_card_owns_its_five_keys_and_holds_text() {
+    fn the_card_owns_its_keys_and_holds_text() {
         let mut keys = Keys::new();
         assert_eq!(
             route_under_card(press(KeyCode::Char('a')), &mut keys),
             CardRoute::Card(AskCardKey::Decide(AskDecision::AllowOnce))
         );
         assert_eq!(route_under_card(press(KeyCode::Esc), &mut keys), CardRoute::Card(AskCardKey::Aside));
+        for (c, decision) in [
+            ('c', AskDecision::AllowForCharacter),
+            ('C', AskDecision::AllowForCharacterFamily),
+            ('e', AskDecision::Escalate),
+            ('t', AskDecision::TakeOver),
+        ] {
+            assert_eq!(
+                route_under_card(press(KeyCode::Char(c)), &mut keys),
+                CardRoute::Card(AskCardKey::Decide(decision)),
+                "{c}"
+            );
+        }
         assert_eq!(route_under_card(press(KeyCode::Char('x')), &mut keys), CardRoute::Held);
         assert_eq!(route_under_card(press(KeyCode::Tab), &mut keys), CardRoute::Held);
     }
@@ -1854,11 +2159,14 @@ mod ledger_tests {
         assert_eq!(decision_notice("01a04eb6-77", Ok(Ok(answered))), "ask 01a04eb6 allowed");
         let learned = AskAnswered {
             summary: allowed,
-            remembered: Some(RememberResult { learned: false, note: "no family for this command".into() }),
+            remembered: Some(RememberResult {
+                learned: false,
+                note: "NOT remembered: no family for this command — the allow on THIS ask still stands".into(),
+            }),
         };
         assert_eq!(
             decision_notice("01a04eb6-77", Ok(Ok(learned))),
-            "ask 01a04eb6 allowed; not remembered: no family for this command"
+            "ask 01a04eb6 allowed; NOT remembered: no family for this command — the allow on THIS ask still stands"
         );
         let raced = AskAnswerFailure { kind: AskAnswerFailureKind::AlreadyAnswered, message: "claimed".into() };
         assert_eq!(decision_notice("01a04eb6-77", Ok(Err(raced))), "ask 01a04eb6 was already answered");
@@ -1984,7 +2292,7 @@ mod ledger_tests {
                         hook: "shell_write".into(),
                         asker: None,
                         reviewer: None,
-                        reviewable: true,
+                        offer: Offer { review: true, ..Default::default() },
                         statement: format!("echo {id}"),
                     })
                 })
@@ -2058,5 +2366,264 @@ mod ledger_tests {
         expired.summary.status = kaijutsu_types::AskStatus::Expired;
         assert_eq!(answered_notice(None, "01a04eb6-77", Some(&expired)), "ask 01a04eb6 expired");
         assert_eq!(answered_notice(None, "01a04eb6-77", None), "ask 01a04eb6 no longer pending");
+    }
+
+    fn row_with(id: &str, offer: Offer) -> LedgerRow {
+        LedgerRow::Pending(PendingRow {
+            request_id: id.to_string(),
+            age: None,
+            context_label: "kaijutsu".into(),
+            context_type: "coder".into(),
+            hook: "shell_write".into(),
+            asker: Some("coder".into()),
+            reviewer: Some("amy".into()),
+            offer,
+            statement: format!("echo {id}"),
+        })
+    }
+
+    fn ledger_of(offer: Offer) -> App {
+        let mut app = App::new("amy");
+        app.ledger_view = Some(LedgerViewState { rows: vec![row_with("p-1", offer)], ..Default::default() });
+        app
+    }
+
+    /// An ask the viewer reviews, with the shell program a rule needs.
+    fn app_with_program_card(configure: impl Fn(&mut AskSummary, PrincipalId)) -> (App, PrincipalId) {
+        let ctx = ContextId::new();
+        let me = PrincipalId::new();
+        let mut app = App::new("amy");
+        app.current = Some(ctx);
+        app.principal = Some(me);
+        let mut ask = reviewed_by(me, "a-1", ctx);
+        ask.has_exec_source = true;
+        configure(&mut ask, me);
+        fold_ledger(&mut app, &state(&[ask]));
+        assert!(open_card(&mut app, detail("a-1", ctx, "rm")));
+        (app, me)
+    }
+
+    #[test]
+    fn the_character_keys_ask_for_a_rule_for_the_performer() {
+        use kaijutsu_types::{Remember, RememberScope};
+        assert_eq!(
+            verdict_for(AskDecision::AllowForCharacter),
+            Some((AskVerdict::Allow, Some(Remember { scope: RememberScope::Character, family: false })))
+        );
+        assert_eq!(
+            verdict_for(AskDecision::AllowForCharacterFamily),
+            Some((AskVerdict::Allow, Some(Remember { scope: RememberScope::Character, family: true })))
+        );
+        assert_eq!(verdict_for(AskDecision::Escalate), None);
+        assert_eq!(verdict_for(AskDecision::TakeOver), None);
+    }
+
+    #[test]
+    fn character_keys_work_only_when_the_ask_carries_its_program() {
+        let (mut app, _) = app_with_program_card(|_, _| {});
+        card_key(&mut app, AskCardKey::Decide(AskDecision::AllowForCharacterFamily));
+        let (verdict, remember) = verdict_for(AskDecision::AllowForCharacterFamily).unwrap();
+        assert_eq!(app.ask_work, vec![AskWork::Decide { request_id: "a-1".into(), verdict, remember }]);
+
+        let (mut app, _) = app_with_program_card(|ask, _| ask.has_exec_source = false);
+        card_key(&mut app, AskCardKey::Decide(AskDecision::AllowForCharacter));
+        assert!(app.ask_work.is_empty(), "no program, no rule: {:?}", app.ask_work);
+        assert!(app.ask_card.is_some(), "the card stays up");
+        assert_eq!(app.notice(), Some("ask a carries no shell program to remember for its performer"));
+        card_key(&mut app, AskCardKey::Decide(AskDecision::AllowOnce));
+        assert_eq!(app.ask_work.len(), 1, "the plain answer still works");
+    }
+
+    #[test]
+    fn escalate_goes_up_and_leaves_the_card_to_follow_the_push() {
+        let (mut app, _) = app_with_program_card(|_, _| {});
+        card_key(&mut app, AskCardKey::Decide(AskDecision::Escalate));
+        assert_eq!(app.ask_work, vec![AskWork::Escalate { request_id: "a-1".into(), to: None }]);
+        assert!(app.ask_card.is_some());
+        assert!(!app.asks_set_aside.contains("a-1"));
+
+        let (mut app, _) = app_with_program_card(|ask, _| ask.status = kaijutsu_types::AskStatus::Claimed);
+        card_key(&mut app, AskCardKey::Decide(AskDecision::Escalate));
+        assert!(app.ask_work.is_empty(), "the kernel refuses a claimed ask");
+        assert_eq!(app.notice(), Some("ask a cannot be escalated by you; only its pending reviewer may"));
+    }
+
+    #[test]
+    fn take_over_is_the_lineage_roots_and_names_itself() {
+        let (mut app, me) = app_with_program_card(|ask, me| {
+            ask.reviewer = reviewer(PrincipalId::new(), "lead");
+            ask.lineage_root = reviewer(me, "amy");
+        });
+        card_key(&mut app, AskCardKey::Decide(AskDecision::TakeOver));
+        assert_eq!(app.ask_work, vec![AskWork::Escalate { request_id: "a-1".into(), to: Some(me) }]);
+        card_key(&mut app, AskCardKey::Decide(AskDecision::AllowOnce));
+        assert_eq!(app.ask_work.len(), 1, "a root that is not the reviewer cannot answer");
+        assert!(app.notice().is_some_and(|n| n.contains("awaits its assigned reviewer")));
+
+        // The reviewer who is not the root cannot take; nor can a stranger.
+        let (mut app, _) = app_with_program_card(|_, _| {});
+        card_key(&mut app, AskCardKey::Decide(AskDecision::TakeOver));
+        assert!(app.ask_work.is_empty());
+        let (mut app, _) = app_with_program_card(|ask, _| ask.lineage_root = reviewer(PrincipalId::new(), "root"));
+        card_key(&mut app, AskCardKey::Decide(AskDecision::TakeOver));
+        assert!(app.ask_work.is_empty());
+    }
+
+    #[test]
+    fn the_card_in_the_overlay_reads_the_viewers_offer_from_the_summary() {
+        let (app, _) = app_with_program_card(|ask, me| {
+            ask.reviewer = reviewer(PrincipalId::new(), "lead");
+            ask.lineage_root = reviewer(me, "amy");
+        });
+        let mut app = app;
+        let t0 = std::time::Instant::now();
+        app.tick_ask_arming(t0);
+        assert!(app.tick_ask_arming(t0 + std::time::Duration::from_millis(500)));
+        let lines = active_view_lines(&app, 200).expect("a card");
+        let last = line_text(lines.last().unwrap());
+        assert_eq!(last, "  waiting for reviewer lead  [t]ake over  [v]iew ledger  Esc aside");
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn ledger_keys_follow_the_selected_rows_offer() {
+        use kaijutsu_types::{Remember, RememberScope};
+        let full = Offer { review: true, remember: true, escalate: true, take_over: false };
+        let mut app = ledger_of(full);
+        ledger_key(&mut app, key(KeyCode::Char('C')));
+        assert!(app.ledger_view.is_none());
+        assert_eq!(
+            app.ask_work,
+            vec![AskWork::Decide {
+                request_id: "p-1".into(),
+                verdict: AskVerdict::Allow,
+                remember: Some(Remember { scope: RememberScope::Character, family: true }),
+            }]
+        );
+
+        let mut app = ledger_of(full);
+        ledger_key(&mut app, key(KeyCode::Char('e')));
+        assert_eq!(app.ask_work, vec![AskWork::Escalate { request_id: "p-1".into(), to: None }]);
+
+        let root = Offer { take_over: true, ..Offer::default() };
+        let mut app = ledger_of(root);
+        ledger_key(&mut app, key(KeyCode::Char('c')));
+        ledger_key(&mut app, key(KeyCode::Char('e')));
+        ledger_key(&mut app, key(KeyCode::Char('a')));
+        assert!(app.ask_work.is_empty(), "a root that is not the reviewer holds only t: {:?}", app.ask_work);
+        assert!(app.ledger_view.is_some(), "a refused key leaves the view up");
+        // `t` names the viewer, who the ledger view does not know by itself.
+        app.principal = Some(PrincipalId::new());
+        let me = app.principal;
+        ledger_key(&mut app, key(KeyCode::Char('t')));
+        assert_eq!(app.ask_work, vec![AskWork::Escalate { request_id: "p-1".into(), to: me }]);
+
+        let program_less = Offer { remember: false, ..full };
+        let mut app = ledger_of(program_less);
+        ledger_key(&mut app, key(KeyCode::Char('c')));
+        assert!(app.ask_work.is_empty());
+    }
+
+    #[test]
+    fn the_ledger_key_line_lists_the_selected_rows_keys() {
+        let line = |offer: Offer, width: u16| {
+            let rows = vec![row_with("p-1", offer)];
+            line_text(render_ledger(&rows, "", 0, width, &Palette::builtin()).last().unwrap())
+        };
+        let full = Offer { review: true, remember: true, escalate: true, take_over: false };
+        assert_eq!(
+            line(full, 200),
+            "a allow once  A allow always (global)  c always for coder  C coder, command family  d deny  e escalate  Enter show  j/k move  / filter  Esc back"
+        );
+        let root = Offer { take_over: true, ..Offer::default() };
+        assert_eq!(line(root, 200), "t take over  Enter show  j/k move  / filter  Esc back");
+        assert!(line(full, 60).chars().count() <= 60);
+        assert!(line(full, 100).contains("c coder"), "{:?}", line(full, 100));
+    }
+
+    #[test]
+    fn a_remembered_rule_and_a_refused_rule_are_told_apart() {
+        use kaijutsu_types::{AskAnswered, AskStatus, RememberResult};
+        let ctx = ContextId::new();
+        let mut allowed = summary("01a04eb6-77", ctx, "rm");
+        allowed.status = AskStatus::Allowed;
+        let said = |learned: bool, note: &str| {
+            let answered = AskAnswered {
+                summary: allowed.clone(),
+                remembered: Some(RememberResult { learned, note: note.into() }),
+            };
+            decision_notice("01a04eb6-77", Ok(Ok(answered)))
+        };
+        // The kernel's own note shapes (`kj/ledger.rs`, `learn_for_answer`).
+        let learned = "remembered as a standing character rule (1 statement)";
+        assert_eq!(said(true, learned), format!("ask 01a04eb6 allowed; {learned}"));
+        let refused = "NOT remembered: no family — the allow on THIS ask still stands";
+        assert_eq!(said(false, refused), format!("ask 01a04eb6 allowed; {refused}"));
+    }
+
+    #[test]
+    fn escalation_notices_name_the_new_reviewer_or_the_kernels_refusal() {
+        use kaijutsu_types::{AskAnswered, AskAnswerFailure, AskAnswerFailureKind};
+        let ctx = ContextId::new();
+        let mut moved = summary("01a04eb6-77", ctx, "rm");
+        moved.reviewer = reviewer(PrincipalId::new(), "lead");
+        let answered = AskAnswered { summary: moved, remembered: None };
+        assert_eq!(escalation_notice("01a04eb6-77", Ok(Ok(answered)), false), "ask 01a04eb6 now reviewed by lead");
+        let refused = AskAnswerFailure { kind: AskAnswerFailureKind::Refused, message: "ask is claimed".into() };
+        assert_eq!(escalation_notice("01a04eb6-77", Ok(Err(refused.clone())), false), "ask 01a04eb6 not escalated: ask is claimed");
+        assert_eq!(escalation_notice("01a04eb6-77", Ok(Err(refused)), true), "ask 01a04eb6 not taken over: ask is claimed");
+        assert_eq!(
+            escalation_notice("01a04eb6-77", Err(CallError::PermanentlyFailed("pipe closed".into())), false),
+            "cannot escalate ask 01a04eb6: permanently failed: pipe closed"
+        );
+    }
+
+    #[test]
+    fn the_ledger_key_line_offers_no_answer_on_an_answered_or_empty_selection() {
+        let hints = |rows: &[LedgerRow]| line_text(render_ledger(rows, "", 0, 200, &Palette::builtin()).last().unwrap());
+        for line in [hints(&[]), hints(&[answered_row("a-1")])] {
+            assert_eq!(line, "Enter show  j/k move  / filter  Esc back");
+        }
+    }
+
+    fn answered_row(id: &str) -> LedgerRow {
+        LedgerRow::Answered(AnsweredRow {
+            request_id: id.into(),
+            time: None,
+            context_label: "kaijutsu".into(),
+            decision: None,
+            principal: None,
+            redeemed: RedeemedMark::Never,
+            statement: "rm".into(),
+        })
+    }
+
+    /// Visible equals keyed: opening the ledger takes the card down and
+    /// sets its ask aside, and no card comes up under an open ledger.
+    #[test]
+    fn opening_the_ledger_takes_the_card_down() {
+        let (mut app, _) = app_with_program_card(|_, _| {});
+        let reads = vec![("a-1".to_string(), Ok(Some(detail("a-1", ContextId::new(), "rm"))))];
+        land_ledger(&mut app, Ok(reads), 0);
+        assert!(app.ledger_view.is_some());
+        assert!(app.ask_card.is_none(), "the card is not drawn under the ledger");
+        assert!(app.asks_set_aside.contains("a-1"));
+        app.asks_set_aside.clear();
+        assert_eq!(card_candidate(&app), None, "no card rises under an open ledger");
+    }
+
+    #[test]
+    fn a_reassignment_in_flight_blocks_a_second_one_until_it_lands() {
+        let (mut app, _) = app_with_program_card(|_, _| {});
+        card_key(&mut app, AskCardKey::Decide(AskDecision::Escalate));
+        card_key(&mut app, AskCardKey::Decide(AskDecision::Escalate));
+        assert_eq!(app.ask_work.len(), 1, "a double tap sends one: {:?}", app.ask_work);
+        assert_eq!(app.notice(), Some("ask a is already being reassigned"));
+        land_escalation(&mut app, "a-1", Err(CallError::PermanentlyFailed("x".into())), false);
+        card_key(&mut app, AskCardKey::Decide(AskDecision::Escalate));
+        assert_eq!(app.ask_work.len(), 2, "after it lands the key works again");
     }
 }

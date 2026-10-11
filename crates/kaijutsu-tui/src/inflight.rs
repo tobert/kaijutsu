@@ -7,9 +7,10 @@
 //! in-flight strip"). Pure: entries come from blocks and a clock, the line
 //! from entries and a width.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use kaijutsu_types::{BlockId, BlockKind, BlockSnapshot, Status};
+use kaijutsu_types::{AskSummary, BlockId, BlockKind, BlockSnapshot, Status};
 use ratatui::text::{Line, Span};
 
 use crate::present::Palette;
@@ -47,11 +48,32 @@ pub fn takes_from_stream(block: &BlockSnapshot) -> bool {
     }
 }
 
+/// The open asks keyed by the tool-call block that raised them, each to its
+/// request id. The strip names an ask through this join, never through the
+/// gate's result text. An ask raised by no tool call is absent; of two asks
+/// on one call the older is kept.
+pub fn ask_index(open: &BTreeMap<String, AskSummary>) -> BTreeMap<BlockId, String> {
+    let mut by_age: Vec<&AskSummary> = open.values().filter(|ask| ask.tool_call_block_id.is_some()).collect();
+    by_age.sort_by(|a, b| (a.created_at_ms, &a.request_id).cmp(&(b.created_at_ms, &b.request_id)));
+    let mut index = BTreeMap::new();
+    for ask in by_age {
+        if let Some(call) = ask.tool_call_block_id {
+            index.entry(call).or_insert_with(|| ask.request_id.clone());
+        }
+    }
+    index
+}
+
 /// The strip's entries from a context's unsettled blocks, in document
 /// order. A waiting result refines its call's entry through `tool_call_id`;
 /// a waiting result whose call already settled (or was never seen) is an
-/// entry of its own.
-pub fn entries<'a>(blocks: impl Iterator<Item = &'a BlockSnapshot>, now_millis: u64) -> Vec<Entry> {
+/// entry of its own. `asks` joins a call's block id to its open ask
+/// ([`ask_index`]).
+pub fn entries<'a>(
+    blocks: impl Iterator<Item = &'a BlockSnapshot>,
+    now_millis: u64,
+    asks: &BTreeMap<BlockId, String>,
+) -> Vec<Entry> {
     let mut out: Vec<(Option<BlockId>, Entry)> = Vec::new();
     for block in blocks {
         if !takes_from_stream(block) {
@@ -69,7 +91,7 @@ pub fn entries<'a>(blocks: impl Iterator<Item = &'a BlockSnapshot>, now_millis: 
                 },
             )),
             BlockKind::ToolResult => {
-                let doing = Doing::Waiting { ask: ask_id(&block.content) };
+                let doing = Doing::Waiting { ask: block.tool_call_id.and_then(|call| asks.get(&call).cloned()) };
                 match block.tool_call_id.and_then(|call| out.iter_mut().find(|(id, _)| *id == Some(call))) {
                     Some((_, entry)) => entry.doing = doing,
                     None => out.push((
@@ -216,22 +238,6 @@ fn short_arg(input: &str) -> String {
     }
 }
 
-/// The ask id a gate's result text names (`ask <uuid>`), or `None`.
-fn ask_id(text: &str) -> Option<String> {
-    let mut rest = text;
-    while let Some(i) = rest.find("ask ") {
-        let cand: String = rest[i + 4..]
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-            .collect();
-        if cand.len() >= 8 {
-            return Some(cand);
-        }
-        rest = &rest[i + 4..];
-    }
-    None
-}
-
 /// The first segment of a uuid, the same eight characters `kj ledger list`
 /// keys on.
 fn short_ask(ask: &str) -> &str {
@@ -242,6 +248,10 @@ fn short_ask(ask: &str) -> &str {
 mod tests {
     use super::*;
     use kaijutsu_types::{BlockSnapshotBuilder, ContextId, PrincipalId, Role};
+
+    use std::collections::BTreeMap;
+
+    type NoAsks = BTreeMap<BlockId, String>;
 
     fn call(ctx: ContextId, seq: u64, status: Status, tool: &str, input: &str, at: u64) -> BlockSnapshot {
         BlockSnapshotBuilder::new(BlockId::new(ctx, PrincipalId::new(), seq), BlockKind::ToolCall)
@@ -272,7 +282,7 @@ mod tests {
     fn a_running_call_is_one_entry_with_its_command_and_age() {
         let ctx = ContextId::new();
         let c = call(ctx, 1, Status::Running, "builtin.shell.shell", r#"{"command":"cargo test -p kaijutsu-kernel"}"#, 10_000);
-        let entries = entries([&c].into_iter(), 14_000);
+        let entries = entries([&c].into_iter(), 14_000, &NoAsks::new());
         assert_eq!(
             entries,
             vec![Entry {
@@ -289,25 +299,90 @@ mod tests {
     }
 
     /// A gate's result refines its call's entry: `waiting on ask <id>`,
-    /// not a second entry.
+    /// not a second entry. The ask comes from the ledger's join on the
+    /// call's block id, never from the result's text.
     #[test]
-    fn a_waiting_result_names_its_ask_on_the_calls_entry() {
+    fn a_waiting_result_names_its_ask_by_the_calls_block_id() {
         let ctx = ContextId::new();
         let c = call(ctx, 7, Status::Waiting, "shell_write", r#"{"command":"cargo test"}"#, 0);
-        let r = result(
-            ctx,
-            8,
-            Status::Waiting,
-            c.id,
-            "gate for risk-advisory is waiting on a human: ask 01a0686d-895e-7b31-aa17-e497ed849f67 (pending) — nothing was run.",
-            0,
-        );
-        let entries = entries([&c, &r].into_iter(), 3_600_000);
+        let r = result(ctx, 8, Status::Waiting, c.id, "gate for risk-advisory is waiting on a human — nothing was run.", 0);
+        let asks = BTreeMap::from([(c.id, "01a0686d-895e-7b31-aa17-e497ed849f67".to_string())]);
+        let entries = entries([&c, &r].into_iter(), 3_600_000, &asks);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].doing, Doing::Waiting { ask: Some("01a0686d-895e-7b31-aa17-e497ed849f67".to_string()) });
         let line = text(&strip_line(&entries, 80, &Palette::builtin(), 2));
         assert!(line.contains("⏳ shell_write cargo test · waiting on ask 01a0686d · 1h00m"), "{line:?}");
         assert!(!animating(&entries), "a held ask has nothing to animate");
+    }
+
+    /// Text that merely says `ask <uuid>` names nothing: a decoy in the
+    /// result is ignored, and a result whose call has no ask waits unnamed.
+    #[test]
+    fn gate_text_naming_an_ask_is_ignored() {
+        let ctx = ContextId::new();
+        // A decoy minted first sorts first (principal ids are time-ordered):
+        // a first-value lookup would take it.
+        let other = BlockId::new(ctx, PrincipalId::new(), 0);
+        std::thread::sleep(Duration::from_millis(3));
+        let c = call(ctx, 7, Status::Waiting, "shell_write", r#"{"command":"cargo test"}"#, 0);
+        assert!(other < c.id);
+        let decoy = "waiting on a human: ask 99999999-aaaa-bbbb-cccc-dddddddddddd (pending)";
+        let r = result(ctx, 8, Status::Waiting, c.id, decoy, 0);
+        let unnamed = entries([&c, &r].into_iter(), 0, &NoAsks::new());
+        assert_eq!(unnamed[0].doing, Doing::Waiting { ask: None }, "the text is not the join");
+        let asks = BTreeMap::from([
+            (c.id, "01a0686d-895e-7b31-aa17-e497ed849f67".to_string()),
+            (other, "deadbeef-0000".to_string()),
+        ]);
+        let named = entries([&c, &r].into_iter(), 0, &asks);
+        assert_eq!(named[0].doing, Doing::Waiting { ask: Some("01a0686d-895e-7b31-aa17-e497ed849f67".to_string()) });
+    }
+
+    /// A held result whose call is not in the strip is an entry of its
+    /// own; its `tool_call_id` still joins the ask.
+    #[test]
+    fn an_orphan_held_result_joins_its_ask_through_its_call_id() {
+        let ctx = ContextId::new();
+        let gone = BlockId::new(ctx, PrincipalId::new(), 3);
+        let r = result(ctx, 8, Status::Waiting, gone, "gate …", 0);
+        let asks = BTreeMap::from([(gone, "01a0686d-895e".to_string())]);
+        let entries = entries([&r].into_iter(), 0, &asks);
+        assert_eq!(entries[0].doing, Doing::Waiting { ask: Some("01a0686d-895e".to_string()) });
+    }
+
+    /// The index keys open asks by the call that raised them; an ask no
+    /// call raised is absent, and the older of two asks on one call wins.
+    #[test]
+    fn the_ask_index_joins_calls_to_their_oldest_open_ask() {
+        let ctx = ContextId::new();
+        let call_id = BlockId::new(ctx, PrincipalId::new(), 1);
+        let mut old = crate::asks::fixtures::summary("old-1", ctx, "rm");
+        old.tool_call_block_id = Some(call_id);
+        old.created_at_ms = 1;
+        let mut new = crate::asks::fixtures::summary("new-2", ctx, "rm");
+        new.tool_call_block_id = Some(call_id);
+        new.created_at_ms = 2;
+        let none = crate::asks::fixtures::summary("none-3", ctx, "rm");
+        let open: BTreeMap<String, AskSummary> =
+            [old, new, none].into_iter().map(|ask| (ask.request_id.clone(), ask)).collect();
+        assert_eq!(ask_index(&open), BTreeMap::from([(call_id, "old-1".to_string())]));
+    }
+
+    /// Each held call gets its own ask, not the first one in the index.
+    #[test]
+    fn each_held_call_joins_its_own_ask() {
+        let ctx = ContextId::new();
+        let a = call(ctx, 1, Status::Waiting, "shell_write", "{}", 0);
+        let b = call(ctx, 2, Status::Waiting, "shell_write", "{}", 0);
+        let ra = result(ctx, 3, Status::Waiting, a.id, "gate", 0);
+        let rb = result(ctx, 4, Status::Waiting, b.id, "gate", 0);
+        let asks = BTreeMap::from([(a.id, "aaaa-1".to_string()), (b.id, "bbbb-2".to_string())]);
+        let got = entries([&a, &b, &ra, &rb].into_iter(), 0, &asks);
+        let named: Vec<_> = got.iter().map(|e| e.doing.clone()).collect();
+        assert_eq!(
+            named,
+            vec![Doing::Waiting { ask: Some("aaaa-1".into()) }, Doing::Waiting { ask: Some("bbbb-2".into()) }]
+        );
     }
 
     /// A `Running` result is the tool's output streaming in; it stays in
@@ -331,7 +406,7 @@ mod tests {
         let ctx = ContextId::new();
         let a = call(ctx, 1, Status::Running, "shell", r#"{"command":"cargo build"}"#, 0);
         let b = call(ctx, 2, Status::Running, "grep", r#"{"pattern":"fn main"}"#, 0);
-        let entries = entries([&a, &b].into_iter(), 1000);
+        let entries = entries([&a, &b].into_iter(), 1000, &NoAsks::new());
         assert_eq!(entries.len(), 2);
         for width in [12u16, 30, 80] {
             let line = strip_line(&entries, width, &Palette::builtin(), 0);
@@ -349,7 +424,7 @@ mod tests {
     fn a_running_entry_animates_with_the_phase() {
         let ctx = ContextId::new();
         let c = call(ctx, 1, Status::Running, "shell", "{}", 0);
-        let entries = entries([&c].into_iter(), 1000);
+        let entries = entries([&c].into_iter(), 1000, &NoAsks::new());
         assert!(animating(&entries));
         let frames: Vec<Line<'static>> = (0..PHASES).map(|p| strip_line(&entries, 40, &Palette::builtin(), p)).collect();
         let glyphs: Vec<char> = frames.iter().map(|l| text(l).trim_start().chars().next().unwrap()).collect();
@@ -375,14 +450,5 @@ mod tests {
         assert_eq!(one_line_arg(r#"{"n":3}"#), None);
         assert_eq!(one_line_arg("not json"), None);
         assert_eq!(one_line_arg(r#"{"command":"   "}"#), None);
-    }
-
-    #[test]
-    fn ask_ids_are_read_from_gate_text() {
-        assert_eq!(
-            ask_id("waiting on a human: ask 01a0686d-895e-7b31-aa17-e497ed849f67 (pending)").as_deref(),
-            Some("01a0686d-895e-7b31-aa17-e497ed849f67")
-        );
-        assert_eq!(ask_id("please ask the human"), None);
     }
 }

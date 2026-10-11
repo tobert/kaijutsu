@@ -68,7 +68,7 @@ pub fn strip_animating(app: &App) -> bool {
     let Some(view) = app.current_view() else {
         return false;
     };
-    crate::inflight::animating(&crate::inflight::entries(view.mirror.blocks().iter(), 0))
+    crate::inflight::animating(&crate::inflight::entries(view.mirror.blocks().iter(), 0, &Default::default()))
 }
 
 /// The turn's latest `Thinking` block, in document order, whatever its
@@ -461,7 +461,7 @@ pub fn band_frame(app: &mut App, width: u16, now_millis: u64, armed: bool) -> Ba
     // The in-flight strip: one row, always, so the band never resizes for a
     // tool call coming or going — only the row's text changes.
     let strip = match app.current_view() {
-        Some(view) => crate::inflight::entries(view.mirror.blocks().iter(), now_millis),
+        Some(view) => crate::inflight::entries(view.mirror.blocks().iter(), now_millis, &crate::inflight::ask_index(&app.open_asks)),
         None => Vec::new(),
     };
     lines.push(crate::inflight::strip_line(
@@ -1492,7 +1492,7 @@ mod tests {
                         hook: "shell_write".to_string(),
                         asker: None,
                         reviewer: None,
-                        reviewable: true,
+                        offer: crate::asks::Offer { review: true, ..Default::default() },
                         statement: "git worktree remove --force ~/src/wt/kaish-arith".to_string(),
                     })
                 })

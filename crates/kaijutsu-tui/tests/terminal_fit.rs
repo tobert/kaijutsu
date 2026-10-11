@@ -314,8 +314,8 @@ fn the_picker_opens_as_an_overlay_and_leaves_the_transcript_intact() {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The ledger view gets the same grown-viewport treatment as the picker
-/// (`docs/tui.md`, "The ledger"): its key-hints line — `a allow once ...
-/// Esc back`, the only way to answer a pending ask — must be on screen,
+/// (`docs/tui.md`, "The ledger"): its key-hints line — `Enter show ...
+/// Esc back`, the way to move and leave — must be on screen,
 /// never truncated off the bottom the way a long ask or a crowded ledger
 /// used to lose it (kaibo review, 2026-09-03).
 #[test]
@@ -332,7 +332,7 @@ fn the_ledger_view_keeps_its_key_hints_line_on_screen() {
 
     let rows = session.screen_text();
     assert!(
-        rows.iter().any(|l| l.contains("a allow once") && l.contains("Esc back")),
+        rows.iter().any(|l| l.contains("Enter show") && l.contains("Esc back")),
         "the ledger's key-hints line is not on screen:\n{}",
         session.dump("ledger open")
     );

@@ -860,6 +860,7 @@ async fn event_loop(
                     AskLanded::Ledger(reads) => asks::land_ledger(app, reads, kaijutsu_types::now_millis()),
                     AskLanded::Shown { request_id, result } => asks::land_show(app, &request_id, result),
                     AskLanded::Decided { request_id, answer } => asks::land_decision(app, &request_id, answer),
+                    AskLanded::Escalated { request_id, answer, took } => asks::land_escalation(app, &request_id, answer, took),
                 }
                 // The candidate may have moved on, or a failed answer put
                 // its ask back; this reads the one to show now.
@@ -2159,6 +2160,11 @@ enum AskLanded {
         request_id: String,
         answer: std::result::Result<kaijutsu_client::AskAnswer, kaijutsu_client::actor::CallError>,
     },
+    Escalated {
+        request_id: String,
+        took: bool,
+        answer: std::result::Result<kaijutsu_client::AskAnswer, kaijutsu_client::actor::CallError>,
+    },
 }
 
 /// Read one ask's record on its own task and land it on the loop's
@@ -2194,6 +2200,11 @@ fn spawn_ask_work(bridge: &KernelBridge, app: &mut App, tx: &mpsc::UnboundedSend
                 asks::AskWork::Decide { request_id, verdict, remember } => {
                     let answer = actor.decide_ask(request_id.clone(), verdict, remember).await;
                     AskLanded::Decided { request_id, answer }
+                }
+                asks::AskWork::Escalate { request_id, to } => {
+                    let took = to.is_some();
+                    let answer = actor.escalate_ask(request_id.clone(), to).await;
+                    AskLanded::Escalated { request_id, took, answer }
                 }
             };
             // The loop is gone when this fails; nothing is left to show it.
@@ -3739,6 +3750,7 @@ mod tests {
             "get_ask(",
             "list_asks(",
             "decide_ask(",
+            "escalate_ask(",
             "rehydrate_context(",
             "hydrate_context(",
         ] {

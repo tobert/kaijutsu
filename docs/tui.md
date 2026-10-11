@@ -646,8 +646,11 @@ Rules the figure carries:
   watch it. Bodies print to scrollback when they settle, as before.
 - **The entry is the call's**; its result refines it through
   `tool_call_id`. A held result whose call is gone is an entry on its own.
-  The ask id is read from the gate's own text (`ask <uuid>`); the seat's
-  `!` and the ask card carry the rest.
+  The ask id comes from the ledger, not from the gate's text: the strip
+  joins each call's block id to the open ask whose `tool_call_block_id`
+  names it (`inflight::ask_index`, built from `App::open_asks`). A call with
+  no such ask reads `waiting`; the seat's `!` and the ask card carry the
+  rest.
 - Entries are clipped with `…` to the width, never wrapped: the row is one
   row at any width.
 - **A running entry moves.** Its spinner turns (`◐ ◓ ◑ ◒`) and its ground
@@ -964,10 +967,41 @@ needs rather than being cropped into a fixed region.
 ```text
   ⚠ ask 01a04eb6  shell_write  from kaijutsu (coder)  asker coder  reviewer amy
     rm -rf ~/src/wt/kaish-arith
-    [a]llow once  [A]llow always  [d]eny  [v]iew ledger  Esc aside
+    [a]llow once  [A]llow always (global)  [c] always for coder  [C] coder, command family  [d]eny  [e]scalate  [v]iew ledger  Esc aside
 ```
 
 **A new card arms late.** It is drawn disarmed, its key line reading
+The key line is the viewer's own, wrapped by width between keys. The
+reviewer sees the line above; `[c]` and `[C]` appear only when the ask
+carries its shell program (`AskSummary::can_remember_for_character`), and
+`[e]` only while the ask is pending (`can_escalate`). The lineage root
+who is not the reviewer sees `waiting for reviewer <name>  [t]ake over
+[v]iew ledger  Esc aside`; anyone else sees the same without `[t]`. The
+card and ledger ask the `AskSummary` predicates (`asks::Offer::of`) and
+derive nothing themselves. A disarmed card keeps the armed card's line
+count.
+
+| Key | Does |
+|---|---|
+| `a` | allow once |
+| `A` | allow and remember the exact text for anyone (`RememberScope::Always`) |
+| `c` | allow and remember the exact text for the performer (`RememberScope::Character`) |
+| `C` | allow and remember the command family for the performer (`Character`, `family`) |
+| `d` | deny |
+| `e` | escalate to the next reviewer above (`escalate_ask(id, None)`) |
+| `t` | take over: reassign to yourself (`escalate_ask(id, Some(me))`) |
+
+An answer that asked for a rule reports the kernel's note verbatim after
+the status: `ask 01a04eb6 allowed; remembered as a standing character
+rule (1 statement)`, or, when the kernel refuses the rule and the allow
+stands, `ask 01a04eb6 allowed; NOT remembered: <why> — the allow on THIS
+ask still stands`. A reassignment reports `ask 01a04eb6 now reviewed by
+<name>`, or `ask 01a04eb6 not escalated: <kernel message>` (`not taken over`
+for `t`). One reassignment per card is in flight at a time: `e` or `t`
+again before it lands reports `already being reassigned`. The card stays up; the push
+shows the new reviewer on it. A key the viewer does not have posts a notice
+and changes nothing.
+
 `arming… keys still go to the draft`, and every key goes where it would
 with no card up: a letter typed as the card appears lands in the draft,
 and `Esc` stays vi's. The card arms 100 ms after it first draws; each key
@@ -979,7 +1013,7 @@ are `kaijutsu_client::ask_arming`'s, shared with the app. The kernel sees
 none of this: the ask is pending throughout. The ledger (`Ctrl+A l`)
 opens at your request, with its keys live.
 
-While the card is armed, `a`/`A`/`d`/`v` answer it and typed text is held:
+While the card is armed, `a`/`A`/`c`/`C`/`d`/`e`/`t`/`v` act on it and typed text is held:
 the draft never changes under an armed card, so a decision key and a
 typed letter are never confused. A `Ctrl+A` chord, `Ctrl+C` and `Ctrl+Z` act
 exactly as they do with no card up — `Ctrl+A 4` still switches seats, and
@@ -1027,8 +1061,8 @@ context, unless it is the assigned reviewer too — a self-confirmation,
 which shows its approval keys to that actor (`docs/approval-identity.md`).
 The reviewer can approve it in the work context, including the context that
 raised it. A card for another player shows its asker and
-reviewer and offers cancellation or escalation guidance instead of approval
-keys; `AskSummary::answerable_by` decides which.
+reviewer and offers `[t]ake over` to the lineage root instead of approval
+keys; `AskSummary::answerable_by` and `can_take_over` decide which.
 
 The card's line count is measured at the terminal's own width — the
 statement wraps by width, so a wider count would say fewer lines than a
@@ -1060,7 +1094,7 @@ admits.
     01a04eaa  13:58   kaijutsu   allow once     amy   redeemed 13:58   git worktree remove …
     01a04e91  11:20   exo        deny           amy   —                cat /config/kernel/backends.toml
     01a04e77  09:02   kaish      allow always   amy   redeemed ×3      cargo test -p kaish-kernel
-  a allow once  A allow always  d deny  Enter show  j/k move  / filter  Esc back
+  a allow once  A allow always (global)  d deny  Enter show  j/k move  / filter  Esc back
 ```
 
 Rules the figure carries:
@@ -1069,6 +1103,12 @@ Rules the figure carries:
   ask in a context you are not looking at is visible from anywhere; the seat
   it belongs to carries `!`.
 - `Enter` shows one ask in full (`get_ask`), including the hook that
+- The key line follows the selected pending row: `a` `A` `d` when the
+  viewer reviews it, plus `c` `C` when the row carries its program, `e`
+  when the viewer may escalate, and `t` when the viewer is the lineage
+  root. An answered row or an empty ledger offers navigation only. Opening
+  the ledger sets a card that is up aside, so the keys act on what is drawn. The keys mean what they mean
+  on the ask card. A reassignment closes the view like an answer.
   raised it and the statement as the gate saw it.
 - Answered rows keep the answering principal and redemption. Redemption means
   the answer was consumed; it does not prove execution. An invocation retired
