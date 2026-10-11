@@ -9,9 +9,9 @@ maintains a multi-context document mirror, and renders conversation blocks
 through the conversation surface (`view::surface`) — an entity-free,
 GPU-buffer renderer, not a Bevy UI node per block.
 
-**Bevy 0.19.** `crates/kaijutsu-app/Cargo.toml`: `bevy = { version = "0.19",
+**Bevy 0.20.** `crates/kaijutsu-app/Cargo.toml`: `bevy = { version = "0.20",
 features = ["default", "bevy_ui_debug"] }`. `Cargo.lock:878`: `name = "bevy"`,
-`version = "0.19.0"`. Check `Cargo.lock` yourself before trusting a version
+`version = "0.20.0"`. Check `Cargo.lock` yourself before trusting a version
 claim anywhere else — see CLAUDE.md "Bevy Quick Reference".
 
 ---
@@ -37,7 +37,7 @@ ConversationSurface → BlockRender → Peers → ShaderFx → Actor → ShareDi
 Dj → MidiIn → MidiPresence → MidiExchange → AppScreen → Screen → Commands →
 Tiling → TilingReconciler → Dock → RosterFeed → QuickContext → Drift →
 PeerRoster → Room → TimeWell → Editor → DiffView →
-Timeline → Tweening`. Two ordering invariants called out in comments there:
+Timeline`. Two ordering invariants called out in comments there:
 `ConversationSurfacePlugin` must follow `CellPlugin` (its `Update` sets
 anchor `.after()` two systems `CellPlugin` registers); `RoomPlugin` must
 precede every zoomable station's plugin (`well_keyboard` clears

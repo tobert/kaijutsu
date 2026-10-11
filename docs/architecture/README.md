@@ -20,7 +20,7 @@ say so (see [Stale docs & surprises](#stale-docs--surprises)).
   RPC surface, LLM streaming, the beat scheduler, auth.
 - **[client.md](client.md)** — `kaijutsu-client`: the `Send+Sync` actor bridge and
   the client-side context mirror.
-- **[app.md](app.md)** — `kaijutsu-app`: the Bevy 0.19 GUI and its render pipeline.
+- **[app.md](app.md)** — `kaijutsu-app`: the Bevy 0.20 GUI and its render pipeline.
 - **[supporting.md](supporting.md)** — `kaijutsu-mcp`, `-cas`, `-index`,
   `-hyoushigi`, `-abc`, `-viz`, `-telemetry`, `-agent-tools`.
 

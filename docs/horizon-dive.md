@@ -77,7 +77,7 @@ and a place that holds still.
 5. **Cards, not stars.** Every context is a `WellCardMaterial` quad with an
    MSDF face — the well's own visual language, reused wholesale rather than
    re-invented. The selection ring, the lineage ring, and the drift sheen in
-   `well_card.wgsl` all already exist; the dive borrows them.
+   `well_card.wesl` all already exist; the dive borrows them.
 
 ## Where the cards sit: the accretion stream
 
@@ -394,7 +394,7 @@ contexts, driven over BRP. Screenshots in the session scratchpad
   across the stream to a cross-family drift partner tells a story that a
   hairball never could. Capping at 24 never triggered on real data.
 - **Reusing `WellCardMaterial` was the right call.** Selection ring, lineage
-  ring and drift sheen all already existed in `well_card.wgsl`; the dive maps
+  ring and drift sheen all already existed in `well_card.wesl`; the dive maps
   its edge kinds onto them and needed no new shader at all.
 - **The grab-based query line worked exactly as `docs/input.md` promised.** No
   "am I typing?" check exists anywhere in a domain handler — the mode is

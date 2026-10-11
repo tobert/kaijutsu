@@ -276,7 +276,7 @@ the destination they were always heading for:
   0, plus half of `room::TRACE_Y` — the floor plane is crowded, and the disc
   takes the layer between `RoomFloor` at y=0 and the gold `ConsoleRingInlay`
   and circuit routes at `TRACE_Y`): an accretion disc lying flat, encircling the table
-  plinth the rings hover over. Its `well_rings.wgsl` visuals — spiral core,
+  plinth the rings hover over. Its `well_rings.wesl` visuals — spiral core,
   ripples, throat glow — already read as accretion; nothing about the shader
   changed, only where the disc lives. The component followed the meaning:
   `WellRingsDeck` → `EventHorizonDeck`. The "+N" count re-anchored onto the
@@ -776,8 +776,8 @@ Rendering notes (validated against Bevy 0.18):
   varies free while batched. Billboarding is a manual `looking_at` system.
 - **Card material: MSDF text + SDF decor, not vello RTT.** Vello RTT was the
   first-cut expedient but blurs under the focus dolly; the split is
-  `block_fx.wgsl`'s own — texture = text content, shader
-  (`WellCardMaterial`/`well_card.wgsl`) = border/glow/rings/pulse, because
+  `block_fx.wesl`'s own — texture = text content, shader
+  (`WellCardMaterial`/`well_card.wesl`) = border/glow/rings/pulse, because
   baked pixels can't animate cheaply and shader uniforms can. Slice 1 (the
   material) shipped; migrating card *text* onto MSDF glyphs is unfinished
   (glyphs are atlas-async — decor-only for a frame or two is fine).
@@ -817,8 +817,8 @@ screen lands.
 
 - **Scales: our own** (~200 lines; band-invert is a bisect, time-`nice` a few
   extra lines). No maintained d3-scale crate worth a dependency. **Tweening:
-  `bevy_math::curve`**, no crate (`bevy_tweening 0.15` is the fallback if
-  declarative sequences are ever wanted).
+  our own**, no crate: the scene eases with exponential smoothing
+  (`view/time_well/scene.rs`).
 - **`fjadra` 0.2.1 — adopt *if* force ever lands**, don't reimplement
   (`Simulation` in a `Resource`, `step()` per frame, never `iter()` in a frame
   loop). The well is deterministic geometry; this may never be needed. Borrowed
