@@ -2,7 +2,7 @@
 //! in the surface's own pass.
 //!
 //! The legacy path draws every one of these with a per-block
-//! `BlockFxMaterial` (`shaders::sync_block_fx` + `assets/shaders/block_fx.wgsl`),
+//! `BlockFxMaterial` (`shaders::sync_block_fx` + `assets/shaders/block_fx.wesl`),
 //! which means one UI node, one material asset and one full-screen-ish
 //! fragment pass **per block**. The surface path has no per-block node to hang
 //! a material on, so the same SDF math moves into
@@ -28,7 +28,7 @@
 //!
 //! # Draw order (the finding)
 //!
-//! `block_fx.wgsl` composites the border stroke *and* the glow **behind** the
+//! `block_fx.wesl` composites the border stroke *and* the glow **behind** the
 //! text — both are masked by `1.0 - result.a`, where `result` already holds
 //! the block's glyphs. The only things it draws in front are the cursor beam
 //! and the selection wash, and the conversation surface has neither (the
@@ -354,7 +354,7 @@ pub fn sync_block_chrome(
 // ============================================================================
 
 /// Border kind, as the shader's `BK_*` constants. Same numbering as
-/// `block_fx.wgsl` so the two shaders can be read side by side.
+/// `block_fx.wesl` so the two shaders can be read side by side.
 // The shader's `BK_NONE`: a block with no border never reaches the instance
 // buffer at all, so nothing on this side emits it. It stays for parity with
 // `surface_chrome.wgsl`'s constant block — a gap in the numbering would make
@@ -368,7 +368,7 @@ pub const CHROME_KIND_OPEN_BOTTOM: u32 = 4;
 pub const CHROME_KIND_OPEN_TOP: u32 = 5;
 pub const CHROME_KIND_CENTER_LINE: u32 = 6;
 
-/// Animation mode, as `block_fx.wgsl`'s `anim_mode`.
+/// Animation mode, as `block_fx.wesl`'s `anim_mode`.
 pub const CHROME_ANIM_NONE: f32 = 0.0;
 pub const CHROME_ANIM_BREATHE: f32 = 1.0;
 pub const CHROME_ANIM_PULSE: f32 = 2.0;
@@ -381,7 +381,7 @@ pub const CHROME_ANIM_CHASE: f32 = 3.0;
 /// pinned by a test. `#[repr(C)]` with no padding
 /// (16+16+16+8+8+4+4 = 72 bytes).
 ///
-/// There is deliberately **no fill color**: `block_fx.wgsl` paints no block
+/// There is deliberately **no fill color**: `block_fx.wesl` paints no block
 /// background (the block texture's transparent pixels show the pane behind),
 /// so a fill here would be a visual the legacy path never had.
 #[repr(C)]
@@ -394,7 +394,7 @@ pub struct ChromeInstance {
     pub params: [f32; 4],
     /// Stroke-suppressed gaps in **rect-local** logical px:
     /// `[top_x0, top_x1, bottom_x0, bottom_x1]`. All zero = no gap. Same
-    /// packing as `block_fx.wgsl`'s `label_gaps` uniform, so the two shaders
+    /// packing as `block_fx.wesl`'s `label_gaps` uniform, so the two shaders
     /// read alike.
     ///
     /// `CENTER_LINE` uses only `xy` — a rule through the vertical center has

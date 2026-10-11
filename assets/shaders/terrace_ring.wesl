@@ -29,8 +29,8 @@
 // params = [inner_radius_frac, outer_radius_frac, spin_rate, spin_dir]
 // color  = glyph color, linear rgb in .xyz (HDR-scaled below), .w = alpha/intensity
 
-#import bevy_pbr::forward_io::VertexOutput
-#import bevy_pbr::mesh_view_bindings::globals
+import bevy_pbr::render::forward_io::VertexOutput;
+import bevy_pbr::render::mesh_view_bindings::globals;
 
 const TAU: f32 = 6.28318530;
 
@@ -79,12 +79,12 @@ fn wrap_half(x: f32) -> f32 {
     return fract(x + 0.5) - 0.5;
 }
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> color: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var<uniform> color: vec4<f32>;
 // [ring_index, ring_count, 0, 0] — ring identity (variant pick + hash seeds).
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> glyph: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var<uniform> glyph: vec4<f32>;
 // Accent (the room's gold, palette::GOLD_HUE) — the centerpiece's second tone.
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> accent: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var<uniform> accent: vec4<f32>;
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -94,7 +94,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let spin_dir = params.w;
 
     // Centered coords in [-1, 1], +y up (uv.y runs top-down, flip it) — same
-    // convention as `well_rings.wgsl` so this ring's angle reads consistent
+    // convention as `well_rings.wesl` so this ring's angle reads consistent
     // with the deck's.
     let p = vec2<f32>(in.uv.x - 0.5, 0.5 - in.uv.y) * 2.0;
     let r = length(p);

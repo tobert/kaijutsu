@@ -529,12 +529,14 @@ impl ConversationSurfaceRenderer {
                 shader: shader.clone(),
                 entry_point: Some("vertex".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 buffers: vec![Self::instance_layout()],
             },
             fragment: Some(FragmentState {
                 shader,
                 entry_point: Some("fragment".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 targets: vec![Some(ColorTargetState {
                     // Premultiplied-alpha over, matching msdf_block: the
                     // fragment shader emits premultiplied RGB.
@@ -588,12 +590,14 @@ impl ConversationSurfaceRenderer {
                 shader: chrome_shader.clone(),
                 entry_point: Some("vertex".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 buffers: vec![Self::chrome_instance_layout()],
             },
             fragment: Some(FragmentState {
                 shader: chrome_shader,
                 entry_point: Some("fragment".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 targets: vec![Some(ColorTargetState {
                     format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState {
@@ -644,12 +648,14 @@ impl ConversationSurfaceRenderer {
                 shader: geometry_shader.clone(),
                 entry_point: Some("vertex".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 buffers: vec![Self::geometry_vertex_layout()],
             },
             fragment: Some(FragmentState {
                 shader: geometry_shader,
                 entry_point: Some("fragment".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 targets: vec![Some(premultiplied_target())],
             }),
             primitive: PrimitiveState {
@@ -687,12 +693,14 @@ impl ConversationSurfaceRenderer {
                 shader: quad_shader.clone(),
                 entry_point: Some("vertex".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 buffers: vec![Self::quad_instance_layout()],
             },
             fragment: Some(FragmentState {
                 shader: quad_shader,
                 entry_point: Some("fragment".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 targets: vec![Some(premultiplied_target())],
             }),
             primitive: PrimitiveState {
@@ -728,7 +736,7 @@ impl ConversationSurfaceRenderer {
     /// than leave the previous frame's text standing.
     ///
     /// **Draw order: chrome → geometry → rasters → glyphs.** Chrome first
-    /// because `block_fx.wgsl` composites both the border stroke and its glow
+    /// because `block_fx.wesl` composites both the border stroke and its glow
     /// behind the block's text (see `view::surface::chrome`); geometry next
     /// because that is the order the legacy path composites it in
     /// (`render_msdf_block_textures` runs `MusicGeometryRenderer` before the
@@ -1439,7 +1447,7 @@ mod tests {
             "the border kind is an integer on both sides",
         );
         // The four label-gap floats travel as one attribute, matching
-        // `block_fx.wgsl`'s `label_gaps: vec4` — top pair then bottom pair.
+        // `block_fx.wesl`'s `label_gaps: vec4` — top pair then bottom pair.
         assert_eq!(layout.attributes[2].format, VertexFormat::Float32x4);
     }
 

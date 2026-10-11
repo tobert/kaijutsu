@@ -5,7 +5,7 @@
 //! [`MsdfBlockGlyphs`]; the existing (generic) block MSDF render pass clears the
 //! card texture and renders the glyphs text-on-transparent
 //! (`BlockRenderMethod::Msdf`). The card **body** — accent rounded-rect,
-//! selection/lineage rings — is drawn by `well_card.wgsl` (SDF), driven by the
+//! selection/lineage rings — is drawn by `well_card.wesl` (SDF), driven by the
 //! `WellCardMaterial` uniforms this module keeps in sync from `Card`. So vello no
 //! longer touches card textures at all (it stays for SVG elsewhere).
 //!

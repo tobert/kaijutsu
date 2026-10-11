@@ -30,4 +30,4 @@ logos = "0.16"
 
 # Version-locked to the `bevy` the app depends on: `register_type` only
 # accepts a registration built by the same bevy_reflect.
-bevy_reflect = { version = "0.19", optional = true }
+bevy_reflect = { version = "0.20", optional = true }

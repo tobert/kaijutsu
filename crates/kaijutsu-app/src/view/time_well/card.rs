@@ -302,7 +302,7 @@ pub const GATE_ANGLE: f32 = std::f32::consts::PI;
 /// floored at [`SPIRAL_R_THROAT`]); depth steps clearly lower per band
 /// ([`RING_DEPTH_STEP`], `Active` at depth 0). Single source of ring geometry
 /// for both card seating ([`ring_seat`]) and the magic-circle ring visual
-/// (`terrace_ring_material`/`terrace_ring.wgsl`).
+/// (`terrace_ring_material`/`terrace_ring.wesl`).
 pub fn band_ring(band: Band) -> (f32, f32) {
     let i = band.index() as i32;
     let radius = (SPIRAL_R_MOUTH * RING_RADIUS_STEP.powi(i)).max(SPIRAL_R_THROAT);

@@ -11,16 +11,16 @@
 // `params = [selected, in_lineage, status, _]`; `status`: 0/1 pending → 0,
 // running → 1, done → 2, error → 3. Animation reads `globals.time` directly.
 
-#import bevy_pbr::forward_io::VertexOutput
-#import bevy_pbr::mesh_view_bindings::globals
+import bevy_pbr::render::forward_io::VertexOutput;
+import bevy_pbr::render::mesh_view_bindings::globals;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var card_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var card_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> accent: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
-@group(#{MATERIAL_BIND_GROUP}) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
-@group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, chatter, beat, _] — focus dim ×, live chatter glow, beat envelope
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var card_texture: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var card_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var<uniform> accent: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var<uniform> params: vec4<f32>; // [selected, in_lineage, status, drifting]
+@group(constants::MATERIAL_BIND_GROUP) @binding(4) var<uniform> shape: vec4<f32>;  // [aspect, corner_radius, ring_width, inset]
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var<uniform> border: vec4<f32>; // [r, g, b, strength] — steady outline (HUD); cards leave strength 0
+@group(constants::MATERIAL_BIND_GROUP) @binding(6) var<uniform> dim: vec4<f32>;    // [brightness, chatter, beat, _] — focus dim ×, live chatter glow, beat envelope
 
 // Signed distance to a rounded box centered at origin, half-size `b`, radius `r`.
 fn sd_round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {

@@ -75,7 +75,7 @@ impl TerraceRingMaterial {
 
 impl Material for TerraceRingMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/terrace_ring.wgsl".into()
+        "shaders/terrace_ring.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

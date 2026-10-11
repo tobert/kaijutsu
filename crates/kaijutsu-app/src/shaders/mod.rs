@@ -11,6 +11,9 @@ pub mod track_ray_material;
 pub mod well_card_material;
 pub mod well_rings_material;
 
+#[cfg(test)]
+mod shader_assets_test;
+
 use bevy::prelude::*;
 
 pub use block_fx_material::BlockFxMaterial;

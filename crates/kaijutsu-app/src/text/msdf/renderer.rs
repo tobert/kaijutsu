@@ -171,12 +171,14 @@ impl MsdfBlockRenderer {
                 shader: shader.clone(),
                 entry_point: Some("vertex".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 buffers: vec![vertex_layout],
             },
             fragment: Some(FragmentState {
                 shader,
                 entry_point: Some("fragment".into()),
                 shader_defs: vec![],
+                constants: vec![],
                 targets: vec![Some(ColorTargetState {
                     format: TextureFormat::Rgba8Unorm,
                     blend: Some(BlendState {

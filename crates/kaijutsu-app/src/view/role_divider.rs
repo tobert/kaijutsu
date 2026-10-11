@@ -3,7 +3,7 @@
 //! The USER/ASSISTANT/SYSTEM/TOOL/ASSET divider drawn at every role
 //! transition is a single shader-drawn horizontal rule
 //! (`BorderKind::CenterLine` in `cell::block_border` + `BK_CENTER_LINE` in
-//! `assets/shaders/block_fx.wgsl`) with an MSDF-rendered label straddling a
+//! `assets/shaders/block_fx.wesl`) with an MSDF-rendered label straddling a
 //! gap in the middle of the line — the same `BlockFxMaterial` +
 //! `collect_msdf_glyphs` machinery every other block's border label uses.
 //! See `view::surface::chrome` for how the surface path draws it.

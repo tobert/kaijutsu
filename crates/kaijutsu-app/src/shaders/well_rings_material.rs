@@ -34,7 +34,7 @@ pub struct WellRingsMaterial {
 
     /// Live ripples: each `[cos(angle), sin(angle), age_norm (0..1), intensity]`.
     /// Unused slots carry `intensity = 0`. Length must match [`MAX_RIPPLES`] and
-    /// the array in `well_rings.wgsl`.
+    /// the array in `well_rings.wesl`.
     #[uniform(3)]
     pub ripples: [Vec4; MAX_RIPPLES],
 }
@@ -53,7 +53,7 @@ impl WellRingsMaterial {
 
 impl Material for WellRingsMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/well_rings.wgsl".into()
+        "shaders/well_rings.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

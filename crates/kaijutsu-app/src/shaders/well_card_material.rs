@@ -55,7 +55,7 @@ pub struct WellCardMaterial {
 
     /// `.x` = focus dimming (1.0 = full/focused, `<1.0` recedes the card so the
     /// *focused* ring's cards pop). Applied as a **color multiply** in
-    /// `well_card.wgsl` — this material is `AlphaMode::Mask(0.5)`, so dimming
+    /// `well_card.wesl` — this material is `AlphaMode::Mask(0.5)`, so dimming
     /// the alpha instead would push the body under the cutoff and clip the whole
     /// card rather than fade it. Written per-frame by `scene::dim_nonfocused_rings`
     /// (rim cards only; the focus card + the transient legend stay 1.0).
@@ -70,7 +70,7 @@ pub struct WellCardMaterial {
 
 impl Material for WellCardMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/well_card.wgsl".into()
+        "shaders/well_card.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

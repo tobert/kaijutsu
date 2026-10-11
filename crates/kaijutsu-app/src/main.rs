@@ -314,8 +314,6 @@ fn main() {
         .add_plugins(view::diff_view::DiffViewPlugin)
         // Timeline navigation - temporal scrubbing through history
         .add_plugins(ui::timeline::TimelinePlugin)
-        // Animation tweening for smooth mode transitions
-        .add_plugins(bevy_tweening::TweeningPlugin)
         // Resources - theme loaded from ~/.config/kaijutsu/theme.toml
         .insert_resource(theme)
         .register_type::<ui::theme::Theme>()
@@ -382,7 +380,7 @@ fn setup_camera(
         Hdr,
         // Thresholded additive bloom: only HDR (>1.0) pixels bloom, so the LDR card
         // bodies stay crisp and the well's HDR "bling" (selection rim, status
-        // pulse — see `well_card.wgsl`) reads as a deliberate glow signal rather
+        // pulse — see `well_card.wesl`) reads as a deliberate glow signal rather
         // than an all-over wash. (`OLD_SCHOOL` is already additive + thresholded;
         // we raise the threshold above the body brightness.) The low-frequency
         // shelf is pulled way down from the preset's 0.7/0.95: that shelf is the

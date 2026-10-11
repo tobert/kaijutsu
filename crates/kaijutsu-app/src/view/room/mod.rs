@@ -59,7 +59,7 @@
 //! (> 1.0) blooms through the app camera's threshold-1.0 bloom
 //! (`main::setup_camera`). The circuit-board traces, terminal pads, the
 //! inscribed gold ring, and the wall trim instead carry
-//! [`crate::shaders::TraceGlowMaterial`] (`assets/shaders/trace_glow.wgsl`)
+//! [`crate::shaders::TraceGlowMaterial`] (`assets/shaders/trace_glow.wesl`)
 //! — a small GPU-animated shader, the one exception to the charter's
 //! procedural-first budget rule, needed because a faint MOVING glow can't be
 //! baked into a static `base_color` or vertex colour. No image assets, no

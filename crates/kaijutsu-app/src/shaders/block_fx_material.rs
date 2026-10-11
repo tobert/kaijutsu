@@ -119,12 +119,12 @@ impl Default for BlockFxMaterial {
 
 impl UiMaterial for BlockFxMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/block_fx.wgsl".into()
+        "shaders/block_fx.wesl".into()
     }
 
     fn specialize(descriptor: &mut RenderPipelineDescriptor, _key: UiMaterialKey<Self>) {
         // The MSDF pass renders glyphs into the block texture with
-        // premultiplied alpha, and block_fx.wgsl keeps every composite
+        // premultiplied alpha, and block_fx.wesl keeps every composite
         // (glow, border, cursor) premultiplied through to its return value.
         // Bevy's stock UiMaterial pipeline blends with ALPHA_BLENDING
         // (straight alpha, src_factor = SrcAlpha), which multiplies our

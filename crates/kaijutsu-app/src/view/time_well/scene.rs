@@ -58,7 +58,7 @@ pub struct CardParams {
     /// this context. The data tick mutates this without ever relaying out.
     pub status: Option<kaijutsu_types::Status>,
     /// Whether this card is the current selection. Drives the selection ring
-    /// (`well_card.wgsl`, driven by `WellCardMaterial.params`); flipped by
+    /// (`well_card.wesl`, driven by `WellCardMaterial.params`); flipped by
     /// [`highlight_selection`] only when it actually changes.
     pub selected: bool,
     /// Whether this card is a fork-ancestor of the current selection. Drives the
@@ -104,7 +104,7 @@ pub struct ReadingCard;
 /// 2026-08-01, when it stopped being a "throat floor" hanging below a
 /// four-ring funnel and became the accretion disc encircling the table plinth
 /// — the place demoted, concluded and overflow contexts fall past. Its
-/// `well_rings.wgsl` visuals were already accretion-shaped; only its depth
+/// `well_rings.wesl` visuals were already accretion-shaped; only its depth
 /// and its name changed. Driven by [`crate::shaders::WellRingsMaterial`]
 /// uniforms from [`sync_deck_material`]. Despawned on exit alongside the root.
 #[derive(Component, Default, Clone)]
@@ -351,7 +351,7 @@ const LABEL_DIM: f32 = 0.85;
 /// so the shader's spiral core — drawn at the disc's center — is occluded,
 /// and only the 145..275 annulus is visible. That is the intended read
 /// ("accretion around the table's foot"), but if the core turns out to be
-/// missed, this size and `well_rings.wgsl`'s core radius are the two knobs.
+/// missed, this size and `well_rings.wesl`'s core radius are the two knobs.
 pub(super) const RING_DECK_SIZE: f32 = 1100.0;
 
 /// The room floor, in funnel-local depth. With the rings laid parallel to the
@@ -364,7 +364,7 @@ const HORIZON_FLOOR_DEPTH: f32 = -320.0;
 
 /// Depth (along the funnel's local −Z) of the ring deck — **the event
 /// horizon: the accretion disc lying on the room floor**, encircling the
-/// table plinth the rings hang over. Its `well_rings.wgsl` visuals (spiral
+/// table plinth the rings hang over. Its `well_rings.wesl` visuals (spiral
 /// core, ripples, throat glow) already read as an accretion disc; nothing
 /// about the shader changed, only where the disc lives. It was −850 (world y
 /// −265, buried under the floor) while it was playing "throat floor" for a
@@ -384,7 +384,7 @@ const HORIZON_FLOOR_DEPTH: f32 = -320.0;
 /// So the disc takes the layer **between** them: `TRACE_Y × 0.5`, converted
 /// into funnel-local units by [`STATION_CENTER_SCALE`]. The accretion glow
 /// reads as coming up *through* the room's etched circuitry rather than
-/// pasted over it — and `well_rings.wgsl` is alpha-blended and mostly
+/// pasted over it — and `well_rings.wesl` is alpha-blended and mostly
 /// transparent, so the floor's own gradient still reads through the disc.
 /// `the_event_horizon_deck_lies_between_the_floor_and_the_rooms_trace_layer`
 /// pins the sandwich.
@@ -681,7 +681,7 @@ pub(crate) fn spawn_well_furniture(
     // room's shared gold) + indigo-violet neon rings (`ScenePalette::neon` —
     // was `[0.35, 0.62, 1.0]`, a saturated cyan-blue). Room-palette re-skin,
     // 2026-07-11: HDR-on-activity behavior (`energy`/ripples in
-    // `well_rings.wgsl`) is untouched — only these RESTING identity hues moved.
+    // `well_rings.wesl`) is untouched — only these RESTING identity hues moved.
     let deck_material = ring_materials.add(crate::shaders::WellRingsMaterial::new(
         Vec4::new(palette.gold.red, palette.gold.green, palette.gold.blue, 1.0),
         ScenePalette::vec3(palette.neon).extend(1.0),
@@ -751,17 +751,16 @@ pub(crate) fn spawn_well_furniture(
     let mut root_entity = commands.spawn_scene(bsn! {
         #TimeWellPlacement
         TimeWellRoot
-        template_value(root_transform)
+        root_transform
         Visibility::Inherited
         Children [
-            (
-                #EventHorizonDeck
-                EventHorizonDeck
-                Mesh3d({deck_mesh})
-                MeshMaterial3d<crate::shaders::WellRingsMaterial>({deck_material})
-                Transform { translation: {deck_pos}, rotation: {tilt} }
-                Visibility::Inherited
-            ),
+            #EventHorizonDeck
+            EventHorizonDeck
+            Mesh3d({deck_mesh})
+            MeshMaterial3d<crate::shaders::WellRingsMaterial>({deck_material})
+            Transform { translation: {deck_pos}, rotation: {tilt} }
+            Visibility::Inherited
+            --
             {rings}
         ]
     });
@@ -1364,7 +1363,7 @@ mod tests {
         }
 
         // Every rim vertex must lie *on* that rounded rect's boundary — the same
-        // SDF `well_card.wgsl` evaluates, so mesh and shader describe one shape.
+        // SDF `well_card.wesl` evaluates, so mesh and shader describe one shape.
         // (The two fan centres are the only interior vertices.)
         let sd_round_box = |p: Vec2, b: Vec2, r: f32| {
             let q = p.abs() - b + Vec2::splat(r);
@@ -1438,7 +1437,7 @@ mod tests {
         assert!(checked > 20, "expected a real mesh, checked {checked} triangles");
     }
 
-    /// Side faces must carry the sentinel UV `well_card.wgsl` keys the cut-edge
+    /// Side faces must carry the sentinel UV `well_card.wesl` keys the cut-edge
     /// colour off (`uv.x < -0.5`), and the two large faces must stay inside the
     /// 0..1 texture range so the MSDF panel lands on them. A regression here
     /// paints text slivers down the card edge, or the edge colour across a face.
@@ -2507,7 +2506,7 @@ const CARD_CORNER_SEGMENTS: usize = 6;
 /// side, so it renders too under default back-face culling. No double-siding
 /// needed.
 ///
-/// **Why a prism and not a `Cuboid` (2026-08-12).** `well_card.wgsl` draws a
+/// **Why a prism and not a `Cuboid` (2026-08-12).** `well_card.wesl` draws a
 /// *rounded* box and discards outside it, so a square slab disagreed with its
 /// own face: the silhouette overhung the rounded body at every corner, the
 /// square side strips framed a rounded tile, and the leftover corner wedges
@@ -2523,7 +2522,7 @@ const CARD_CORNER_SEGMENTS: usize = 6;
 /// `corner_radius + inset`. Scaling by [`CARD_HEIGHT`] puts it in world units.
 /// This keeps the card's outer bounds *exactly* what the cuboid had — no
 /// layout, seat, or occlusion change — and preserves the even `inset`-wide
-/// margin the ring band's outer half glows into (`well_card.wgsl` lets alpha
+/// margin the ring band's outer half glows into (`well_card.wesl` lets alpha
 /// survive past `d = 0` on purpose so bloom spills past the rounded edge).
 ///
 /// UV convention: the MSDF panel texture is built for [`Rectangle`] — uv (0,0)
@@ -2535,7 +2534,7 @@ const CARD_CORNER_SEGMENTS: usize = 6;
 /// version indexed into by hand — a latent trap across engine upgrades.
 ///
 /// The side faces get **sentinel UVs** (−1): a squeezed texture sliver on an
-/// 8-unit edge read as noise, so `well_card.wgsl` detects the sentinel and
+/// 8-unit edge read as noise, so `well_card.wesl` detects the sentinel and
 /// paints them as the card's *cut edge* — the border/accent color, the slab
 /// edge as the card's border by design (Amy, 2026-07-06). They now wrap the
 /// rounded profile instead of forming a square box around it.

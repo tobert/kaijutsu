@@ -15,16 +15,16 @@
 //            throat glow breathes on it (the well's heartbeat).
 // ripples  = [cos(angle), sin(angle), age_norm (0..1), intensity] × MAX_RIPPLES
 
-#import bevy_pbr::forward_io::VertexOutput
-#import bevy_pbr::mesh_view_bindings::globals
+import bevy_pbr::render::forward_io::VertexOutput;
+import bevy_pbr::render::mesh_view_bindings::globals;
 
 const MAX_RIPPLES: u32 = 8u;
 const PI: f32 = 3.14159265;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> energy_v: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> core_color: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> ring_color: vec4<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> ripples: array<vec4<f32>, 8>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> energy_v: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var<uniform> core_color: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var<uniform> ring_color: vec4<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(3) var<uniform> ripples: array<vec4<f32>, 8>;
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {

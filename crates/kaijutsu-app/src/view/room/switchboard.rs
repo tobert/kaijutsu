@@ -21,7 +21,7 @@
 //! [`super::set_glow`] (the well's settled-material discipline) so an idle
 //! lamp population stops touching `Assets<StandardMaterial>` once its
 //! recency curve has flattened and no flash is in flight. `Running`'s
-//! "breathing" is still `trace_glow.wgsl`'s mode-1 sine formula
+//! "breathing" is still `trace_glow.wesl`'s mode-1 sine formula
 //! ([`breathing_multiplier`]) — just evaluated on the CPU against
 //! `Time::elapsed_secs()` instead of `globals.time`, so it can be summed with
 //! the other per-frame state before one material write.
@@ -86,7 +86,7 @@ const ERROR_BRIGHTNESS: f32 = 1.35;
 const ASK_BRIGHTNESS: f32 = 1.15;
 
 /// `Running`'s breathing modulation — the same sine shape as
-/// `assets/shaders/trace_glow.wgsl`'s mode 1, evaluated on the CPU
+/// `assets/shaders/trace_glow.wesl`'s mode 1, evaluated on the CPU
 /// ([`breathing_multiplier`]'s own doc has why).
 const BREATH_RATE: f32 = 1.4;
 const BREATH_TROUGH: f32 = 0.62;
@@ -138,7 +138,7 @@ pub fn recency_brightness(age_secs: f32) -> f32 {
     RECENCY_FLOOR + (1.0 - RECENCY_FLOOR) * (-age / RECENCY_TAU_SECS).exp()
 }
 
-/// `trace_glow.wgsl`'s mode-1 breathing formula, evaluated on the CPU: a
+/// `trace_glow.wesl`'s mode-1 breathing formula, evaluated on the CPU: a
 /// uniform sine between [`BREATH_TROUGH`] and 1.0. `t` is elapsed seconds
 /// (`Time::elapsed_secs()`), `phase` a per-lamp offset (`bearing::hash01`)
 /// so a full lamp wall doesn't breathe in lockstep.

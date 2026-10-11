@@ -6,7 +6,7 @@
 // uniforms, same pass. See view/surface/chrome.rs.
 //
 // ─── PORT NOTE ──────────────────────────────────────────────────────────────
-// The SDF math below is ported from assets/shaders/block_fx.wgsl, which draws
+// The SDF math below is ported from assets/shaders/block_fx.wesl, which draws
 // the same chrome on the legacy path as a per-block UiMaterial. Ported
 // verbatim: sd_rounded_box, perimeter_param, border_stroke_alpha (every
 // BK_* kind), the breathe/pulse/chase animation modes, and the edge glow.
@@ -58,7 +58,7 @@ struct InstanceInput {
     @location(1) params: vec4<f32>,
     // Stroke-suppressed gaps, rect-local logical px:
     // [top_x0, top_x1, bottom_x0, bottom_x1]. All zero = none. CENTER_LINE
-    // uses only .xy. Same packing as block_fx.wgsl's label_gaps uniform.
+    // uses only .xy. Same packing as block_fx.wesl's label_gaps uniform.
     @location(2) label_gap: vec4<f32>,
     // Fieldset insets [top, bottom]: how far the stroke moves inward so a
     // label can straddle it. 0 = the default 1px AA inset.
@@ -82,7 +82,7 @@ struct VertexOutput {
     @location(7) insets: vec2<f32>,
 }
 
-// Border kinds — the same numbering as block_fx.wgsl's BK_* and
+// Border kinds — the same numbering as block_fx.wesl's BK_* and
 // chrome::CHROME_KIND_*.
 const BK_NONE: u32 = 0u;
 const BK_FULL: u32 = 1u;
@@ -150,7 +150,7 @@ fn vertex(@builtin(vertex_index) vertex_index: u32, inst: InstanceInput) -> Vert
 }
 
 // ============================================================================
-// SDF UTILITIES (ported verbatim from block_fx.wgsl)
+// SDF UTILITIES (ported verbatim from block_fx.wesl)
 // ============================================================================
 
 // Rounded box SDF: negative inside, zero on edge, positive outside.
@@ -325,7 +325,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var stroke_a = border_stroke_alpha(p, half_size, in.insets, thickness, corner_r, in.kind) * anim;
 
     // Label gaps: the stroke stops where a caption sits. Ported from
-    // block_fx.wgsl's gap block, including the near_top/near_bottom bands that
+    // block_fx.wesl's gap block, including the near_top/near_bottom bands that
     // keep a top caption from punching a hole in the bottom edge underneath it.
     let px_x = p.x + half_size.x;
     if in.kind == BK_CENTER_LINE {

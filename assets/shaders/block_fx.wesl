@@ -23,8 +23,8 @@
 //     One selection is many rects — see `shaders::selection` for why, and for
 //     the coalescing that keeps a contiguous selection down to three.
 
-#import bevy_ui::ui_vertex_output::UiVertexOutput
-#import bevy_render::globals::Globals
+import bevy_ui_render::ui_vertex_output::UiVertexOutput;
+import bevy_render::globals::Globals;
 
 @group(0) @binding(1) var<uniform> globals: Globals;
 

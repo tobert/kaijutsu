@@ -250,7 +250,7 @@ pub fn tonemapper_by_name(name: &str) -> Option<Tonemapping> {
         "reinhard" => Tonemapping::Reinhard,
         "reinhard_luminance" => Tonemapping::ReinhardLuminance,
         "somewhat_boring" => Tonemapping::SomewhatBoringDisplayTransform,
-        "none" => Tonemapping::None,
+        "none" => Tonemapping::Linear,
         _ => return None,
     })
 }
@@ -355,7 +355,7 @@ mod tests {
             tonemapper_by_name("blender_filmic"),
             Some(Tonemapping::BlenderFilmic)
         );
-        assert_eq!(tonemapper_by_name("none"), Some(Tonemapping::None));
+        assert_eq!(tonemapper_by_name("none"), Some(Tonemapping::Linear));
         assert_eq!(tonemapper_by_name("vhs"), None);
         let mut scene = SceneData::default();
         scene.post.tonemapper = "vhs".into();

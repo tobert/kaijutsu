@@ -42,11 +42,10 @@ logos = "0.16"
 # anymore, so there's nothing left to decode WAV *through bevy*. Dropping
 # bevy_audio from the build entirely (full feature enumeration instead of
 # "default") is deliberate follow-up hygiene, NOT this lane (docs/pcm.md R5).
-bevy = { version = "0.19", features = ["default", "bevy_ui_debug"] }
+bevy = { version = "0.20", features = ["default", "bevy_ui_debug"] }
 bevy_brp_extras.workspace = true
 bevy_mesh.workspace = true
 bevy_remote.workspace = true
-bevy_tweening = "0.16"
 
 # Text rendering (Parley shaping + MSDF): we own the shaping + MSDF glyph
 # atlas + scene→texture primitive. `vello` itself is GONE (retired
@@ -119,3 +118,6 @@ toml = { workspace = true }
 image = "0.25"
 tempfile = "3"
 pollster = "0.4"
+# Validates composed shader assets (src/shaders/shader_assets_test.rs); the
+# version matches the naga that wgpu 30 links.
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }

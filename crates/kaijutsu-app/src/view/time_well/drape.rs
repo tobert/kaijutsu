@@ -296,7 +296,7 @@ const DRAPE_BREATH_RATE: f32 = 0.35;
 /// ([`TimeWellState::lineage_drape_material`]), reused by every drape entity
 /// (they're all the same hue/intensity; only their mesh geometry differs).
 /// Gold, matching the existing per-card lineage ring's hue
-/// (`well_card.wgsl`'s amber `params.y` ring) so the new bowl-wall drapes
+/// (`well_card.wesl`'s amber `params.y` ring) so the new bowl-wall drapes
 /// read as the same concept the card face already taught, rather than
 /// introducing a second "lineage color."
 fn lineage_drape_material(palette: &ScenePalette) -> TraceGlowMaterial {

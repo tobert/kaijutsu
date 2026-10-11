@@ -30,7 +30,7 @@
 //! It decays recorded heartbeats over time and exposes:
 //!
 //! - a smoothed global **energy** level (drives the ring brightness + flow speed
-//!   + core spin in `well_rings.wgsl`),
+//!   + core spin in `well_rings.wesl`),
 //! - a bounded set of live **ripples**, each fired at the *angle* of the context
 //!   that produced the event — so a busy conversation throws a wavefront out from
 //!   its direction on the ring (the "localize to context angle" behavior), and
@@ -46,7 +46,7 @@ use bevy::prelude::Resource;
 use kaijutsu_types::ContextId;
 
 /// Max simultaneous ripples the shader renders (must match the array length in
-/// `WellRingsMaterial`/`well_rings.wgsl`). A busy system keeps the freshest.
+/// `WellRingsMaterial`/`well_rings.wesl`). A busy system keeps the freshest.
 pub const MAX_RIPPLES: usize = 8;
 
 /// Energy a unit-weight event injects (scaled by the event's weight).

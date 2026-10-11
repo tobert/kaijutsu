@@ -1,7 +1,7 @@
 //! Shader-drawn block borders (fieldset/legend style).
 //!
 //! `BlockBorderStyle` is pure data — an SDF border description consumed by
-//! `shaders::sync_block_fx` and rasterized by `assets/shaders/block_fx.wgsl`
+//! `shaders::sync_block_fx` and rasterized by `assets/shaders/block_fx.wesl`
 //! against the block's MSDF-rendered content texture. No vello scene, no
 //! child entities: the border lives entirely in `MaterialNode<BlockFxMaterial>`
 //! uniforms on the surface's own entity.
@@ -122,7 +122,7 @@ pub enum BorderAnimation {
 
 /// Per-block excluded state, propagated to ECS for shader-driven gutter indicator.
 ///
-/// The `block_fx.wgsl` shader draws a small SDF circle in the right gutter zone:
+/// The `block_fx.wesl` shader draws a small SDF circle in the right gutter zone:
 /// filled dot when included, hollow ring + strikethrough when excluded.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Reflect, Default)]
 #[reflect(Component)]

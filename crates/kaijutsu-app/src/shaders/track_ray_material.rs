@@ -44,7 +44,7 @@ impl TrackRayMaterial {
 
 impl Material for TrackRayMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/track_ray.wgsl".into()
+        "shaders/track_ray.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {

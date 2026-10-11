@@ -149,7 +149,7 @@ fn spiral_normal(t: f32) -> Vec3 {
 /// Build the shared spiral ribbon's raw vertex buffers, baked at bearing
 /// angle 0 (see [`spiral_point`]): `(positions, normals, uvs, indices)`.
 /// `uv.x` is cumulative 3D arclength, 0 at the throat end → 1 at the mouth
-/// end — `track_ray.wgsl`'s contract, so the beat pulse rides at uniform
+/// end — `track_ray.wesl`'s contract, so the beat pulse rides at uniform
 /// speed along the curve, not sample density; `uv.y` is 0..1 across the
 /// ribbon's [`RAY_WIDTH`]. Every ray shares this ONE mesh; per-ray placement
 /// is a pure rotation ([`ray_transform`]).

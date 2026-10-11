@@ -59,7 +59,7 @@ pub struct TraceGlowMaterial {
 
 impl Material for TraceGlowMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/trace_glow.wgsl".into()
+        "shaders/trace_glow.wesl".into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
