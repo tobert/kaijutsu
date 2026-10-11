@@ -473,6 +473,16 @@ were not the root, with no error. The ledger now uses
 fault (`Err`); move these callers to it and propagate the fault. The other
 `lineage_root` callers in the same file need the same check.
 
+## The turn path's futures sit near the 2 MB stack (2026-10-11)
+
+`kj::context::tests::a_root_cwd_is_accepted_with_a_warning` overflowed a 2 MB test-thread
+stack when `BuildOpts` grew by about 80 bytes (the request trace, now behind an `Arc`;
+`llm/request_dump.rs` pins it pointer-sized). `BuildOpts` rides by value through every
+provider stream and prompt future, so small growth multiplies. The server's tokio workers run
+on default stacks too. Measure the turn future (`size_of_val` on the provider stream and
+`run_llm_stream` futures) and box the largest inner future, so a field added later cannot
+crash a live turn. Running tests with `RUST_MIN_STACK` hides this; isolation runs should not.
+
 ## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
 
 The ledger push brings an ask to the TUI sooner than the old poll did, so a

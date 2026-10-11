@@ -198,7 +198,6 @@ impl Client {
             is_hosted_openai(&self.base_url),
             &self.provider_name,
         );
-
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
@@ -207,6 +206,9 @@ impl Client {
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
+        crate::llm::request_dump::record(
+            None, &self.provider_name, model, &self.base_url, system, &messages, &body,
+        );
         let response = request.send().await.map_err(http_error)?;
         crate::llm::endpoint::observe(slot.as_ref(), &response);
 
@@ -237,7 +239,6 @@ impl Client {
             is_hosted_openai(&self.base_url),
             &self.provider_name,
         );
-
         let slot = crate::llm::endpoint::take_for_request(self.endpoint.as_ref(), self.slot_wait()).await?;
         let mut request = self
             .auth(self.http.post(format!("{}/chat/completions", self.base_url)))
@@ -247,6 +248,10 @@ impl Client {
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
+        crate::llm::request_dump::record(
+            opts.trace.as_deref(), &self.provider_name, &opts.model, &self.base_url,
+            opts.system.as_deref(), &messages, &body,
+        );
         let response = request.send().await.map_err(http_error)?;
         crate::llm::endpoint::observe_open(slot.as_ref(), &response);
 
@@ -690,6 +695,58 @@ data: [DONE]
         assert!(!text.is_empty(), "live response must include some answer text");
         assert!(saw_done, "live response must terminate with Done");
         assert!(input_tokens > 0, "usage must be captured from trailing chunk");
+    }
+
+    /// With a dump directory on the turn's trace, the stream path writes the
+    /// body it put on the wire: the file's `body` equals what the server
+    /// received, and the header names the request.
+    #[tokio::test]
+    async fn a_stream_dumps_the_body_the_server_received() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_mk::test_server::{serve, sse};
+        use kaijutsu_types::{ContextId, TurnId};
+        let (base, seen) = serve(vec![sse(SIMPLE)]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 2, Some(tmp.path().to_path_buf()));
+        let opts = BuildOpts::new("qwen3.8-flash").with_system("be brief").with_trace(trace);
+        let _stream = Client::new("alibaba")
+            .with_base_url(&base)
+            .stream(opts, vec![Message::user("let's do a thing")])
+            .await
+            .unwrap();
+        let files = wait_for_files(tmp.path(), 1).await;
+        assert_eq!(files.len(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(v["body"], wire);
+        assert_eq!(v["header"]["provider"], "alibaba");
+        assert_eq!(v["header"]["step"], 2);
+        assert_eq!(v["header"]["attempt"], 1);
+        assert_eq!(v["body"]["model"], "qwen3.8-flash");
+    }
+
+    /// A request that gets no slot is never sent and leaves no dump.
+    #[tokio::test]
+    async fn a_request_with_no_slot_leaves_no_dump() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_types::{ContextId, TurnId};
+        let mut busy = reply(429, r#"{"error": {"message": "slow down", "type": "rate_limit"}}"#);
+        busy.headers.push(("retry-after", "30".into()));
+        let (base, _) = serve(vec![busy]).await;
+        let (client, _endpoint) = limited(&base);
+        let client = client.with_request_timeout(std::time::Duration::from_millis(100));
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()));
+        let opts = || BuildOpts::new("m").with_trace(trace.clone());
+        // The first request is sent (and cools the endpoint): one dump.
+        assert!(client.stream(opts(), vec![Message::user("a")]).await.is_err());
+        wait_for_files(tmp.path(), 1).await;
+        // The second waits for a slot that does not come: no new dump.
+        let err = client.stream(opts(), vec![Message::user("b")]).await.err().unwrap();
+        assert!(matches!(err, LlmError::RateLimited(_)), "{err:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     fn limited(base: &str) -> (Client, Arc<Endpoint>) {

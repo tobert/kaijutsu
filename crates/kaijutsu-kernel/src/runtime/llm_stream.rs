@@ -2442,6 +2442,12 @@ async fn run_llm_stream(
 
     // Counts inferences this turn, for logging only.
     let mut iteration: u32 = 0;
+    // Request sensors: the summary line always, the body dump when
+    // `KJ_LLM_REQUEST_DUMP` names a directory. One trace per turn, so a write
+    // failure warns once.
+    let request_trace = crate::llm::request_dump::RequestTrace::new(
+        context_id, turn_id, 0, crate::llm::request_dump::dump_dir_from_env(),
+    );
     // Output-ceiling continuations spent by this turn, against
     // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
     let mut ceiling_continuations: u32 = 0;
@@ -2556,7 +2562,10 @@ async fn run_llm_stream(
                             stop_reason_out = TurnStopReason::Cancelled { immediate: true };
                             break 'agentic;
                         }
-                        result = provider.stream(build_opts.clone(), messages.clone()) => result,
+                        result = provider.stream(
+                            build_opts.clone().with_trace(request_trace.at_step(iteration).at_attempt(attempt)),
+                            messages.clone(),
+                        ) => result,
                     },
                     Err(error) => Err(LlmError::InvalidRequest(format!(
                         "Could not record inference request: {error}"

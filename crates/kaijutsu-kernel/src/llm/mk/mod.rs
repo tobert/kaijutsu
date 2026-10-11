@@ -134,6 +134,9 @@ impl Client {
             max_tokens: Some(max_tokens),
             ..GenerateRequest::messages(messages, Vec::new())
         };
+        crate::llm::request_dump::record(
+            None, &self.name, model, "", system, &[Message::user(prompt)], &serde_json::Value::Null,
+        );
         let (_slot, done) = self.call(&turn, false, |left| self.mk.generate(&request, left)).await?;
         match done.finish {
             Finish::Stop => Ok(done.content),
@@ -169,6 +172,13 @@ impl Client {
             sample,
             max_tokens: Some(max_tokens),
         };
+        // The megakernel request is not a JSON body, so only the summary line.
+        // One line per call: the endpoint's 429 resend inside `call` is the
+        // same request again and is not logged twice.
+        crate::llm::request_dump::record(
+            opts.trace.as_deref().map(|t| t.summary_only()).as_ref(),
+            &self.name, &opts.model, "", opts.system.as_deref(), &history, &serde_json::Value::Null,
+        );
         let started = Instant::now();
         // The stream opens within the turn's deadline, and then waits up to
         // the client's timeout for each read.
@@ -388,6 +398,7 @@ mod tests {
             thinking_style: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
+            trace: None,
         }
     }
 

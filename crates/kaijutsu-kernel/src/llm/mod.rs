@@ -38,6 +38,7 @@ pub mod image_cache;
 pub mod mailbox;
 pub mod mk;
 pub mod openai;
+pub mod request_dump;
 pub(crate) mod splice;
 pub mod stream;
 pub mod system_prompt;

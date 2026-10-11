@@ -31,6 +31,7 @@ Standard OTel env vars are respected:
 | `OTEL_TRACES_EXPORTER` | Exporter type (`otlp`, `none`) |
 | `OTEL_SERVICE_NAME` | Overrides the default service name |
 | `KAIJUTSU_OTEL_FILE_DIR` | Directory for OTLP JSON-lines files (enables export; see "File export") |
+| `KJ_LLM_REQUEST_DUMP` | Directory for provider request dumps (see "Provider request dump") |
 | `OTEL_SDK_DISABLED=true` | Force-disable even when the endpoint or file directory is set |
 
 ## What Gets Traced
@@ -206,6 +207,72 @@ not spans — see Metrics below.
 | `prompt_with_system()` | `llm.model`, `llm.provider` |
 | `stream()` | `llm.provider` |
 | `models()` | — |
+
+## Provider request dump
+
+When a model says its prompt was cut off, compare what the kernel stored with
+what it sent. Each send attempt logs one `info` line, and an opt-in dump
+writes the body.
+
+The line, target `kaijutsu_kernel::llm::request_dump`, message `llm request`:
+
+```
+INFO llm request context="9c1f02aa" turn="b37e5d10" step=1 attempt=1 provider="alibaba"
+  model="qwen3.8-flash" messages=3 total_chars=4121 last_user_chars=27 last_user_hash="3fa9c2d1"
+```
+
+`step` counts model calls in the turn. `attempt` counts tries at one step: the
+turn's startup retry loop sends the request again after a transient failure,
+and each try logs its own line and writes its own file. `last_user_*` describe
+the last user message that carries text. `total_chars` counts text only
+(system prompt, message text, tool input and output; images count 0). The line
+holds counts and a hash, never text. To compare: `kj block read <id>` the user
+block, count its characters and take the first 8 hex digits of the SHA-256 of
+its text. A match means the kernel sent the whole message.
+
+The line and the file are written after the request holds its endpoint slot,
+just before the send. A request that times out waiting for a slot leaves
+neither.
+
+To capture bodies, start the server with `KJ_LLM_REQUEST_DUMP=<dir>`. The
+kernel creates the directory (mode 0700) and writes one file per attempt
+(mode 0600):
+
+```
+20261011T142501.337Z-9c1f02aa-b37e5d10-s001-a1-alibaba.json
+```
+
+The name is UTC time, context short id, turn short id, step, attempt,
+provider. The file holds `{"header": {context, turn, step, attempt, provider,
+model, endpoint_host, summary}, "body": <the request>}`. The body is the same
+JSON value the provider put on the wire, serialized a second time (pretty
+printed) inside the header envelope, so it is not byte-identical to the wire.
+The one difference is images: each base64 payload (an Anthropic
+`source.data`, or a `data:` URL) is replaced by
+`<image elided: media_type=... base64_chars=N sha256_8=...>`. The wire is
+unchanged. The header never holds request headers or API keys.
+
+The file is written by a background task, to a temporary file and then renamed,
+so the request never waits for the disk and a full disk leaves no truncated
+file under the final name. A write error logs one warning per turn and the
+request proceeds.
+
+Dumps hold system prompts, messages, tool results and tool output verbatim.
+Treat the directory as secret. There is no retention: delete the files when
+done.
+
+Coverage:
+
+- Dumped and logged: OpenAI-compatible providers (including DeepSeek) and
+  Anthropic, on the turn's streaming path.
+- Logged only: one-shot `prompt` calls of those providers (no turn trace); the
+  `mk` provider, streaming and `prompt` (its request is not a JSON body; a
+  `429` resend inside one call is the same request and is not logged again;
+  `provider` is the backend's name, so two mk backends differ); council
+  decisions (`provider="council"`, with the count of held contexts, because a
+  decision sends context ids, not messages).
+- Not covered: the Codex provider, embeddings, the Anthropic models `GET`, and
+  council context puts.
 
 ## Sampling
 

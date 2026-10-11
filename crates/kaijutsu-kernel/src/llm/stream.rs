@@ -222,6 +222,11 @@ pub struct BuildOpts {
     /// Cache breakpoint policy for Claude prompt caching. Empty = no
     /// `cache_control` applied. See [`CacheTarget`].
     pub cache_breakpoints: Vec<CacheTarget>,
+    /// Which inference this request is, for the request sensors
+    /// ([`crate::llm::request_dump`]). `None` for requests outside a turn.
+    /// Boxed behind an `Arc` so `BuildOpts` stays small: it sits by value in
+    /// every provider stream future.
+    pub trace: Option<std::sync::Arc<crate::llm::request_dump::RequestTrace>>,
 }
 
 impl BuildOpts {
@@ -237,7 +242,13 @@ impl BuildOpts {
             thinking_style: None,
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
+            trace: None,
         }
+    }
+
+    pub fn with_trace(mut self, trace: crate::llm::request_dump::RequestTrace) -> Self {
+        self.trace = Some(std::sync::Arc::new(trace));
+        self
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {

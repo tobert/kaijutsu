@@ -270,6 +270,9 @@ impl Client {
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
+        crate::llm::request_dump::record(
+            None, "anthropic", model, &self.base_url, system, &messages, &body,
+        );
         let response = request.send().await.map_err(http_error)?;
         crate::llm::endpoint::observe(slot.as_ref(), &response);
 
@@ -330,6 +333,10 @@ impl Client {
         if let Some(timeout) = self.request_timeout {
             request = request.timeout(timeout);
         }
+        crate::llm::request_dump::record(
+            opts.trace.as_deref(), "anthropic", &opts.model, &self.base_url,
+            opts.system.as_deref(), &messages, &body,
+        );
         let response = request.send().await.map_err(http_error)?;
         crate::llm::endpoint::observe_open(slot.as_ref(), &response);
 
@@ -951,6 +958,24 @@ data: {\"type\":\"message_stop\"}
         assert_eq!(status, 503);
         assert!(left > std::time::Duration::from_secs(4), "{left:?}");
         assert_eq!(endpoint.status().in_flight, 0);
+    }
+
+    /// The Anthropic stream path dumps the body the server received.
+    #[tokio::test]
+    async fn a_stream_dumps_the_body_the_server_received() {
+        use crate::llm::request_dump::{RequestTrace, wait_for_files};
+        use kaijutsu_mk::test_server::{reply, serve};
+        use kaijutsu_types::{ContextId, TurnId};
+        let (base, seen) = serve(vec![reply(500, r#"{"type": "error", "error": {"type": "api_error", "message": "x"}}"#)]).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = RequestTrace::new(ContextId::new(), TurnId::new(), 1, Some(tmp.path().to_path_buf()));
+        let opts = BuildOpts::new("claude-sonnet-4-6").with_system("sys").with_trace(trace);
+        let _ = Client::new("k").with_base_url(&base).stream(opts, vec![Message::user("let's do a thing")]).await;
+        let files = wait_for_files(tmp.path(), 1).await;
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
+        assert_eq!(v["body"], wire);
+        assert_eq!(v["header"]["provider"], "anthropic");
     }
 
     /// A 429 cools the endpoint for its `Retry-After` and fails as

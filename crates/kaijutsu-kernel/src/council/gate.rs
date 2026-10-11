@@ -708,6 +708,13 @@ pub(crate) async fn ask_within(
 ) -> Result<DecisionResponse, String> {
     let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
     let traceparent = (!traceparent.is_empty()).then_some(traceparent);
+    // A council decision sends context ids, not a message list, so the line
+    // has no text counts. One line per decision; the endpoint's 429 resend is
+    // the same request again.
+    tracing::info!(
+        provider = "council", server = %council.server, contexts = prepared.contexts.len(),
+        "llm request"
+    );
     let decide = || {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         prepared.client.decide_traced(request, left, traceparent.as_deref())
