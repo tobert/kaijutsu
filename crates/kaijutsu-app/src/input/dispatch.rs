@@ -1,12 +1,15 @@
 //! Input dispatcher — the ONE system that reads raw input and emits actions.
 //!
-//! `dispatch_input` is the only reader of Bevy's raw `KeyboardInput` stream
-//! (docs/input.md "As built"). Per pressed key:
+//! `dispatch_input` is the only system that resolves Bevy's raw `KeyboardInput`
+//! stream to actions (docs/input.md "As built"). Two others read the raw
+//! presses without resolving them: `ui::ask_sheet::arm_ask_sheet` (times the
+//! sheet's hold) and `ui::ledger_ribbon::type_ledger_filter` (types the
+//! ribbon's filter, skipping a pending `Ctrl+A` chord). Per pressed key:
 //! 1. Check a direct binding match (active contexts, source + modifiers).
 //!    While a [`KeyboardGrab`] is active only Global bindings are matchable,
 //!    so F1/F12/tiling work everywhere without leaking keys into text.
-//! 2. Unmatched keys under a grab are routed to the grab owner (compose
-//!    VimMachine, vi editor session) as [`GrabbedKey`] messages.
+//! 2. Unmatched keys under a grab are routed to the grab owner (compose,
+//!    the vi editor session, the diff viewer) as [`GrabbedKey`] messages.
 //!
 //! Mouse wheel → ScrollDelta action.
 //! Gamepad buttons → direct binding match.

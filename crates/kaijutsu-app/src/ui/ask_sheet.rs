@@ -49,8 +49,8 @@ use kaijutsu_client::AskArming;
 use kaijutsu_types::{AskDetail, AskSummary, ContextId, PrincipalId, PrincipalRef};
 
 use crate::connection::ledger::{
-    short_request_id, AskDecisionRequested, AskDecisionSettled, AskLeft, Decision,
-    DecisionOutcome, LedgerMirror,
+    short_request_id, AskDecisionRequested, AskDecisionSettled, AskLeft, AskReassignRequested,
+    AskReassignSettled, Decision, DecisionOutcome, LedgerMirror, Reassign, ReassignOutcome,
 };
 use crate::input::events::ActionFired;
 use crate::input::{Action, InputContext};
@@ -89,6 +89,10 @@ const PLAN_INDENT: usize = 5;
 pub struct AskNotice {
     text: Option<String>,
     set_at: f64,
+    /// The ask whose standing-rule note is on the line. Its closing notice
+    /// ("allow once by you") must not replace the note that says what the
+    /// kernel learned.
+    rule_note_for: Option<String>,
 }
 
 impl AskNotice {
@@ -97,6 +101,24 @@ impl AskNotice {
     pub fn say(&mut self, text: impl Into<String>, now: f64) {
         self.text = Some(text.into());
         self.set_at = now;
+        self.rule_note_for = None;
+    }
+
+    /// Say what the kernel did with a standing rule for `request_id`. A later
+    /// closing notice for the same ask does not replace it
+    /// ([`Self::say_closing`]).
+    pub fn say_rule_note(&mut self, request_id: &str, text: impl Into<String>, now: f64) {
+        self.say(text, now);
+        self.rule_note_for = Some(request_id.to_string());
+    }
+
+    /// Say that `request_id` closed, unless its rule note is still showing:
+    /// the note carries the same answer and more.
+    pub fn say_closing(&mut self, request_id: &str, text: impl Into<String>, now: f64) {
+        if self.rule_note_for.as_deref() == Some(request_id) && self.current(now).is_some() {
+            return;
+        }
+        self.say(text, now);
     }
 
     /// What to show, or `None` once it has aged out.
@@ -132,6 +154,9 @@ pub struct AskSheetState {
     arming: Option<AskArming<Duration>>,
     /// Whether the sheet's keys are live — set on a frame that draws them.
     armed: bool,
+    /// The ask on screen was opened from the ribbon's answered rows. It is
+    /// closed, so the open set neither keeps it up nor takes it down.
+    closed_view: bool,
 }
 
 impl AskSheetState {
@@ -153,6 +178,7 @@ impl AskSheetState {
     pub fn raise(&mut self, next: Option<String>, now: Duration) {
         self.arming = next.as_ref().map(|_| AskArming::shown(now));
         self.armed = false;
+        self.closed_view = false;
         self.showing = next;
         self.scroll = 0;
     }
@@ -163,8 +189,21 @@ impl AskSheetState {
         self.aside.remove(&id);
         self.arming = None;
         self.armed = true;
+        self.closed_view = false;
         self.showing = Some(id);
         self.scroll = 0;
+    }
+
+    /// Open a closed ask at the player's own request (the ribbon's Enter on
+    /// an answered row). It stays up until Esc.
+    pub fn open_closed(&mut self, id: String) {
+        self.open(id);
+        self.closed_view = true;
+    }
+
+    /// Whether the sheet shows a closed ask the player asked for.
+    pub fn viewing_closed(&self) -> bool {
+        self.showing.is_some() && self.closed_view
     }
 }
 
@@ -298,21 +337,48 @@ pub fn departure_unread_notice(request_id: &str) -> String {
 
 /// The notice for a finished decision, or `None` when the ask closing says
 /// it already.
+///
+/// A decision that asked for a standing rule always says what the kernel did
+/// with it, learned or not: the closing notice names only who decided.
 pub fn settled_notice(request_id: &str, decision: Decision, outcome: &DecisionOutcome) -> Option<String> {
     let id = short_request_id(request_id);
     match outcome {
         // Taken: the ask leaving the open set says so, with the decider's
         // name attached. A second notice here would only race it.
-        DecisionOutcome::Accepted { unlearned: None } => None,
-        // The answer stands, but the rule the player asked for does not.
-        DecisionOutcome::Accepted { unlearned: Some(note) } => {
-            Some(format!("ask {id} {}, but no rule was learned: {note}", decision.label()))
+        DecisionOutcome::Accepted { remembered: None } => None,
+        // The kernel's note already says which: `remembered as a standing
+        // ...` or `NOT remembered: ...`. It is shown verbatim.
+        DecisionOutcome::Accepted { remembered: Some(rule) } => {
+            Some(format!("ask {id} allowed; {}", rule.note))
         }
         DecisionOutcome::AlreadyDecided => {
             Some(format!("ask {id} was already answered \u{2014} {} lost the race", decision.label()))
         }
         DecisionOutcome::Failed(detail) => {
             Some(format!("ask {id} {} failed: {detail}", decision.label()))
+        }
+        DecisionOutcome::AlreadySent => Some(already_sent_notice(request_id)),
+    }
+}
+
+/// The notice for a key pressed again while its answer is still on the way.
+pub fn already_sent_notice(request_id: &str) -> String {
+    format!("ask {}: already sent, waiting for the kernel", short_request_id(request_id))
+}
+
+/// The notice for a finished reassignment. Both outcomes are said: the
+/// ledger push moves the reviewer, but nothing else tells the player that
+/// the key did something.
+pub fn reassign_notice(request_id: &str, reassign: Reassign, outcome: &ReassignOutcome) -> String {
+    let id = short_request_id(request_id);
+    match (outcome, reassign) {
+        (ReassignOutcome::AlreadySent, _) => already_sent_notice(request_id),
+        (ReassignOutcome::Accepted { reviewer }, _) => format!("ask {id} now reviewed by {reviewer}"),
+        (ReassignOutcome::Failed(message), Reassign::Escalate) => {
+            format!("ask {id} not escalated: {message}")
+        }
+        (ReassignOutcome::Failed(message), Reassign::TakeOver(_)) => {
+            format!("ask {id} not taken over: {message}")
         }
     }
 }
@@ -323,6 +389,128 @@ pub fn not_yours_notice(ask: &AskSummary) -> String {
         Some(reviewer) => format!("not yours to answer: reviewer {}", name_of(reviewer)),
         None => "not yours to answer: this ask names no reviewer".to_string(),
     }
+}
+
+/// What an ask key sends to the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskRequest {
+    Decide(Decision),
+    Reassign(Reassign),
+}
+
+/// Whether `action` is one of the keys that answers or reassigns an ask.
+pub fn is_ask_key(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::AskAllowOnce
+            | Action::AskAllowAlways
+            | Action::AskDeny
+            | Action::AskAllowCharacter
+            | Action::AskAllowCharacterFamily
+            | Action::AskEscalate
+            | Action::AskTakeOver
+    )
+}
+
+/// The one gate for an ask key, shared by the sheet and the ribbon: what the
+/// key sends, or the notice that says why it sends nothing.
+///
+/// Authorization is `AskSummary`'s own predicates and nothing derived here
+/// (`can_remember_for_character`, `can_escalate`, `can_take_over`); the
+/// kernel stays authoritative when the assignment changes under an open
+/// control. `None` when `action` is not an ask key.
+pub fn request_for(
+    action: &Action,
+    ask: &AskSummary,
+    me: Option<PrincipalId>,
+) -> Option<Result<AskRequest, String>> {
+    let answerable = me.is_some_and(|me| ask.answerable_by(me));
+    let decision = match action {
+        Action::AskAllowOnce => Decision::AllowOnce,
+        Action::AskAllowAlways => Decision::AllowAlways,
+        Action::AskDeny => Decision::Deny,
+        Action::AskAllowCharacter => Decision::AllowCharacter,
+        Action::AskAllowCharacterFamily => Decision::AllowCharacterFamily,
+        Action::AskEscalate => {
+            return Some(if me.is_some_and(|me| ask.can_escalate(me)) {
+                Ok(AskRequest::Reassign(Reassign::Escalate))
+            } else {
+                Err("only the assigned reviewer can escalate a pending ask".to_string())
+            });
+        }
+        Action::AskTakeOver => {
+            return Some(match me {
+                Some(me) if ask.can_take_over(me) => Ok(AskRequest::Reassign(Reassign::TakeOver(me))),
+                _ => Err("only the lineage root can take over this ask".to_string()),
+            });
+        }
+        _ => return None,
+    };
+    Some(if !answerable {
+        Err(not_yours_notice(ask))
+    } else if matches!(decision, Decision::AllowCharacter | Decision::AllowCharacterFamily)
+        && !me.is_some_and(|me| ask.can_remember_for_character(me))
+    {
+        Err("this ask carries no program to remember for the performer".to_string())
+    } else {
+        Ok(AskRequest::Decide(decision))
+    })
+}
+
+/// The labels of the keys `me` has on this ask, in key-line order. Every key
+/// here is one [`request_for`] would send; a key it would refuse is not
+/// offered (`docs/tui.md`, "Asks").
+///
+/// `bracketed` is the sheet's style (`[a]llow once`); the ribbon's three
+/// older keys are plain (`a allow once`).
+pub fn answer_key_labels(ask: &AskSummary, me: Option<PrincipalId>, bracketed: bool) -> Vec<String> {
+    let sent = |action: Action| matches!(request_for(&action, ask, me), Some(Ok(_)));
+    let performer = who(&ask.performer);
+    let mut labels = Vec::new();
+    let (once, always, deny) = if bracketed {
+        ("[a]llow once", "[A]llow always (global)", "[d]eny")
+    } else {
+        ("a allow once", "A allow always (global)", "d deny")
+    };
+    if sent(Action::AskAllowOnce) {
+        labels.push(once.to_string());
+        labels.push(always.to_string());
+    }
+    if sent(Action::AskAllowCharacter) {
+        labels.push(format!("[c] always for {performer}"));
+    }
+    if sent(Action::AskAllowCharacterFamily) {
+        labels.push(format!("[C] {performer}, command family"));
+    }
+    if sent(Action::AskDeny) {
+        labels.push(deny.to_string());
+    }
+    if sent(Action::AskEscalate) {
+        labels.push("[e]scalate".to_string());
+    }
+    if sent(Action::AskTakeOver) {
+        labels.push("[t]ake over".to_string());
+    }
+    labels
+}
+
+/// What a player can do about an ask that is not theirs to answer: who can
+/// answer or hand it on, who can withdraw it, and the key if they can take
+/// it. Every verb named is one `docs/approval-identity.md` lists.
+pub fn not_yours_guidance(ask: &AskSummary, me: Option<PrincipalId>) -> String {
+    let id = short_request_id(&ask.request_id);
+    let reviewer = match &ask.reviewer {
+        Some(reviewer) => format!("reviewer {}", name_of(reviewer)),
+        None => "no reviewer".to_string(),
+    };
+    let mut text = format!(
+        "not yours to answer \u{2014} {reviewer} runs kj ledger allow {id}, deny {id} or escalate {id}; \
+         its requester or performer can run kj ledger cancel {id}"
+    );
+    if me.is_some_and(|me| ask.can_take_over(me)) {
+        text.push_str("; as the lineage root you can [t]ake it over");
+    }
+    text
 }
 
 // ============================================================================
@@ -363,10 +551,17 @@ pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: u
     if let Some(tool) = ask.tool.as_deref().filter(|t| !t.is_empty()) {
         header.push_str(&format!("  {tool}"));
     }
-    header.push_str(&format!(
-        "  waiting {}",
-        format_age(now_ms.saturating_sub(summary.created_at_ms))
-    ));
+    if summary.status.is_open() {
+        header.push_str(&format!(
+            "  waiting {}",
+            format_age(now_ms.saturating_sub(summary.created_at_ms))
+        ));
+    } else {
+        header.push_str(&format!("  {}", summary.status));
+        if let Some(at) = summary.decided_at_ms {
+            header.push_str(&format!(" {} ago", format_age(now_ms.saturating_sub(at))));
+        }
+    }
     rows.push(PanelLine {
         text: truncate(&header, cols),
         tone: LineTone::Head,
@@ -404,16 +599,37 @@ pub fn sheet_head(ask: &AskDetail, me: Option<PrincipalId>, now_ms: i64, cols: u
         tone: LineTone::Row,
     });
 
-    // Someone else's ask: say so, and say who would run what.
-    if !can_review {
-        for text in wrap(
-            &format!(
-                "not yours to answer \u{2014} the reviewer runs: kj ledger allow {}",
-                short_request_id(&summary.request_id)
-            ),
-            cols,
-            2,
-        ) {
+    if !summary.status.is_open() {
+        // A closed ask: what became of it, not what to do about it.
+        rows.push(PanelLine {
+            text: truncate(&departure_notice(ask, me), cols),
+            tone: LineTone::Row,
+        });
+        if let Some(at) = ask.redeemed_at_ms {
+            rows.push(PanelLine {
+                text: truncate(
+                    &format!("redeemed {} ago", format_age(now_ms.saturating_sub(at))),
+                    cols,
+                ),
+                tone: LineTone::Dim,
+            });
+        }
+        if let Some(reason) = &ask.publication_abandoned {
+            for text in wrap(&format!("publication abandoned: {reason}"), cols, 2) {
+                rows.push(PanelLine { text, tone: LineTone::Warn });
+            }
+        }
+        for change in &ask.reassignments {
+            let line = if change.by.id == change.to.id {
+                format!("taken over by {}", name_of(&change.to))
+            } else {
+                format!("reassigned to {} by {}", name_of(&change.to), name_of(&change.by))
+            };
+            rows.push(PanelLine { text: truncate(&line, cols), tone: LineTone::Dim });
+        }
+    } else if !can_review {
+        // Someone else's ask: say so, and say what each player can do.
+        for text in wrap(&not_yours_guidance(summary, me), cols, 2) {
             rows.push(PanelLine {
                 text,
                 tone: LineTone::Warn,
@@ -524,15 +740,24 @@ pub fn sheet_body(ask: &AskDetail, gap: Option<&str>, cols: usize) -> Vec<PanelL
 /// the keys, so the panel keeps its height when they arm.
 pub const SHEET_ARMING_LINE: &str = "arming… keys still go where you were typing";
 
-/// The key line, always the last row in the panel.
+/// The sheet's unsynced notice: the open set on screen is the last one this
+/// app read, not the kernel's current one.
+pub const UNSYNCED_LINE: &str =
+    "ledger not synced \u{2014} showing the last asks this app read; keys act on what the kernel holds";
+
+/// The key line, always the last rows in the panel.
 ///
-/// An ask this player may not answer offers no approval keys — the sheet is
+/// An ask this player may not answer offers no approval keys \u{2014} the sheet is
 /// then a window onto someone else's decision, and a key that would be
-/// refused has no business being advertised (`docs/tui.md`, "Asks").
-pub fn sheet_keys(can_review: bool, pending_total: usize) -> String {
-    let mut keys = String::new();
-    if can_review {
-        keys.push_str("[a]llow once  [A]llow always  [d]eny  ");
+/// refused has no business being advertised (`docs/tui.md`, "Asks"). A
+/// closed ask offers only the way back.
+pub fn sheet_keys(ask: &AskSummary, me: Option<PrincipalId>, pending_total: usize) -> String {
+    if !ask.status.is_open() {
+        return "[v]iew ledger  Esc back".to_string();
+    }
+    let mut keys = answer_key_labels(ask, me, true).join("  ");
+    if !keys.is_empty() {
+        keys.push_str("  ");
     }
     keys.push_str("[v]iew ledger  Esc aside");
     if pending_total > 1 {
@@ -553,30 +778,46 @@ pub fn sheet_rows(
     me: Option<PrincipalId>,
     now_ms: i64,
     pending_total: usize,
+    synced: bool,
     cols: usize,
     rows: usize,
     scroll: usize,
     armed: bool,
 ) -> Vec<PanelLine> {
-    let head = sheet_head(ask, me, now_ms, cols);
+    let head = sheet_fixed_rows(ask, me, now_ms, synced, cols);
     let body = sheet_body(ask, gap, cols);
-    let keys = if armed {
-        let can_review = me.is_some_and(|me| ask.summary.answerable_by(me));
-        PanelLine {
-            text: truncate(&sheet_keys(can_review, pending_total), cols),
-            tone: LineTone::Head,
-        }
+    let keys: Vec<PanelLine> = if armed {
+        wrap(&sheet_keys(&ask.summary, me, pending_total), cols, 2)
+            .into_iter()
+            .map(|text| PanelLine { text, tone: LineTone::Head })
+            .collect()
     } else {
-        PanelLine { text: truncate(SHEET_ARMING_LINE, cols), tone: LineTone::Dim }
+        vec![PanelLine { text: truncate(SHEET_ARMING_LINE, cols), tone: LineTone::Dim }]
     };
 
-    // The head and the key line are never scrolled away; whatever is left
+    // The head and the key lines are never scrolled away; whatever is left
     // over is the plan's window, and at minimum it is one row.
-    let body_rows = rows.saturating_sub(head.len() + 1).max(1);
+    let body_rows = rows.saturating_sub(head.len() + keys.len()).max(1);
     let mut out = head;
     out.extend(scroll_window(&body, scroll, body_rows));
-    out.push(keys);
+    out.extend(keys);
     out
+}
+
+/// The rows above the scrolling body: the head, and the unsynced notice when
+/// the mirror is not synced.
+fn sheet_fixed_rows(
+    ask: &AskDetail,
+    me: Option<PrincipalId>,
+    now_ms: i64,
+    synced: bool,
+    cols: usize,
+) -> Vec<PanelLine> {
+    let mut head = sheet_head(ask, me, now_ms, cols);
+    if !synced {
+        head.push(PanelLine { text: truncate(UNSYNCED_LINE, cols), tone: LineTone::Warn });
+    }
+    head
 }
 
 /// How far `j` may scroll the plan for a panel of this shape.
@@ -585,11 +826,14 @@ pub fn sheet_max_scroll(
     gap: Option<&str>,
     me: Option<PrincipalId>,
     now_ms: i64,
+    synced: bool,
     cols: usize,
     rows: usize,
+    pending_total: usize,
 ) -> usize {
-    let head_len = sheet_head(ask, me, now_ms, cols).len();
-    let body_rows = rows.saturating_sub(head_len + 1).max(1);
+    let head_len = sheet_fixed_rows(ask, me, now_ms, synced, cols).len();
+    let key_rows = wrap(&sheet_keys(&ask.summary, me, pending_total), cols, 2).len();
+    let body_rows = rows.saturating_sub(head_len + key_rows).max(1);
     max_scroll(sheet_body(ask, gap, cols).len(), body_rows)
 }
 
@@ -622,9 +866,17 @@ pub fn sync_ask_sheet(
         .map(|ask| ask.request_id.as_str())
         .collect();
 
+    // A closed ask the player opened from the ribbon is theirs until Esc: the
+    // open set neither keeps it up nor takes it down. Only a vi surface or
+    // a context switch puts it away.
+    if state.viewing_closed() && screen_allows_sheet(*screen.get()) && !context_changed {
+        return;
+    }
+
     // An ask that was on screen and is no longer open is waiting for its
     // closing notice.
     if let Some(showing) = state.showing.as_deref()
+        && !state.viewing_closed()
         && !open_ids.contains(&showing)
         && !state.left.contains(showing)
     {
@@ -702,6 +954,7 @@ pub fn handle_ask_sheet_actions(
     mut state: ResMut<AskSheetState>,
     mut notice: ResMut<AskNotice>,
     mut decisions: MessageWriter<AskDecisionRequested>,
+    mut reassignments: MessageWriter<AskReassignRequested>,
     mut ribbon: ResMut<super::ledger_ribbon::LedgerRibbonState>,
 ) {
     for ActionFired { action, context } in actions.read() {
@@ -713,12 +966,7 @@ pub fn handle_ask_sheet_actions(
         };
 
         match action {
-            Action::AskAllowOnce | Action::AskAllowAlways | Action::AskDeny => {
-                let decision = match action {
-                    Action::AskAllowOnce => Decision::AllowOnce,
-                    Action::AskAllowAlways => Decision::AllowAlways,
-                    _ => Decision::Deny,
-                };
+            action if is_ask_key(action) => {
                 // The ask may have left the open set between the frame
                 // that drew the key line and this one.
                 let Some(ask) = mirror.summary(&showing) else {
@@ -728,19 +976,31 @@ pub fn handle_ask_sheet_actions(
                     );
                     continue;
                 };
-                if !session.0.is_some_and(|me| ask.answerable_by(me)) {
-                    notice.say(not_yours_notice(ask), time.elapsed_secs_f64());
-                    continue;
+                match request_for(action, ask, session.0) {
+                    Some(Ok(AskRequest::Decide(decision))) => {
+                        decisions.write(AskDecisionRequested {
+                            request_id: showing.clone(),
+                            decision,
+                        });
+                    }
+                    Some(Ok(AskRequest::Reassign(reassign))) => {
+                        reassignments.write(AskReassignRequested {
+                            request_id: showing.clone(),
+                            reassign,
+                        });
+                    }
+                    Some(Err(why)) => notice.say(why, time.elapsed_secs_f64()),
+                    None => {}
                 }
-                decisions.write(AskDecisionRequested {
-                    request_id: showing.clone(),
-                    decision,
-                });
             }
 
             // `v` — the ledger over the sheet. The ask stays open and the
             // sheet stays raised behind it.
             Action::OpenLedger => ribbon.open = true,
+
+            // A closed ask is read-only and its key line offers no stepping;
+            // `]`/`[` walk the open set and would leave it silently.
+            Action::AskNext | Action::AskPrev if state.viewing_closed() => {}
 
             Action::AskNext | Action::AskPrev => {
                 let ids: Vec<&str> = mirror
@@ -753,6 +1013,7 @@ pub fn handle_ask_sheet_actions(
                 if next != state.showing {
                     state.showing = next;
                     state.scroll = 0;
+                    state.closed_view = false;
                 }
             }
 
@@ -764,6 +1025,7 @@ pub fn handle_ask_sheet_actions(
                 state.aside.insert(showing);
                 state.showing = None;
                 state.scroll = 0;
+                state.closed_view = false;
             }
 
             _ => {}
@@ -784,9 +1046,25 @@ pub fn note_ask_decisions(
         outcome,
     } in settled.read()
     {
-        if let Some(text) = settled_notice(request_id, *decision, outcome) {
+        let Some(text) = settled_notice(request_id, *decision, outcome) else {
+            continue;
+        };
+        if let DecisionOutcome::Accepted { remembered: Some(_) } = outcome {
+            notice.say_rule_note(request_id, text, time.elapsed_secs_f64());
+        } else {
             notice.say(text, time.elapsed_secs_f64());
         }
+    }
+}
+
+/// Turn a finished reassignment into a notice, accepted or not.
+pub fn note_ask_reassignments(
+    mut settled: MessageReader<AskReassignSettled>,
+    time: Res<Time>,
+    mut notice: ResMut<AskNotice>,
+) {
+    for AskReassignSettled { request_id, reassign, outcome } in settled.read() {
+        notice.say(reassign_notice(request_id, *reassign, outcome), time.elapsed_secs_f64());
     }
 }
 
@@ -809,7 +1087,7 @@ pub fn note_ask_departures(
             Some(record) => departure_notice(record, session.0),
             None => departure_unread_notice(request_id),
         };
-        notice.say(text, time.elapsed_secs_f64());
+        notice.say_closing(request_id, text, time.elapsed_secs_f64());
     }
 }
 
@@ -923,6 +1201,7 @@ pub fn render_ask_sheet(
         session.0,
         kaijutsu_types::now_millis() as i64,
         mirror.pending_count(),
+        mirror.synced,
         cols,
         rows,
         state.scroll,
@@ -974,8 +1253,10 @@ pub fn clamp_ask_sheet_scroll(
         mirror.record_gap(&showing).as_deref(),
         session.0,
         kaijutsu_types::now_millis() as i64,
+        mirror.synced,
         cols,
         rows,
+        mirror.pending_count(),
     );
     if state.scroll > limit {
         state.scroll = limit;
@@ -1010,6 +1291,7 @@ impl Plugin for AskSheetPlugin {
                 (
                     handle_ask_sheet_actions,
                     note_ask_decisions,
+                    note_ask_reassignments,
                     note_ask_departures,
                     expire_notice,
                     clamp_ask_sheet_scroll,
@@ -1242,8 +1524,8 @@ mod tests {
     fn a_disarmed_sheet_says_so_instead_of_offering_keys() {
         let me = principal(1);
         let a = ask("01a04eb6", Some(ctx(1)), me);
-        let disarmed = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, false);
-        let armed = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, true);
+        let disarmed = sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, 0, false);
+        let armed = sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, 0, true);
         let last = disarmed.last().expect("rows");
         assert_eq!(last.text, SHEET_ARMING_LINE);
         assert_eq!(last.tone, LineTone::Dim);
@@ -1490,7 +1772,7 @@ mod tests {
             settled_notice(
                 &full_id("01a04eb6"),
                 Decision::AllowOnce,
-                &DecisionOutcome::Accepted { unlearned: None }
+                &DecisionOutcome::Accepted { remembered: None }
             ),
             None,
             "the ask leaving the open set already says this"
@@ -1513,20 +1795,66 @@ mod tests {
         assert!(failed.contains("no live connection"), "{failed}");
     }
 
-    /// `A` asked for a standing rule. When none was learned the answer
-    /// stands, but the player must not believe the rule exists.
+    /// A standing rule asked for is a standing rule reported: learned or
+    /// not, the player hears the kernel's note.
     #[test]
-    fn an_allow_always_that_learned_nothing_says_so() {
-        let text = settled_notice(
-            &full_id("01a04eb6"),
-            Decision::AllowAlways,
-            &DecisionOutcome::Accepted { unlearned: Some("compound statement".into()) },
-        )
-        .expect("a missing rule is reported");
-        assert_eq!(
-            text,
-            "ask 01a04eb6 allow always, but no rule was learned: compound statement"
+    fn a_remembered_answer_reports_the_kernels_note() {
+        let note = |learned, note: &str| DecisionOutcome::Accepted {
+            remembered: Some(kaijutsu_types::RememberResult { learned, note: note.into() }),
+        };
+        let learned = note(
+            true,
+            "remembered as a standing character rule (1 statement)",
         );
+        assert_eq!(
+            settled_notice(&full_id("01a04eb6"), Decision::AllowCharacter, &learned).as_deref(),
+            Some("ask 01a04eb6 allowed; remembered as a standing character rule (1 statement)")
+        );
+        let refused = note(
+            false,
+            "NOT remembered: compound statement \u{2014} the allow on THIS ask still stands",
+        );
+        assert_eq!(
+            settled_notice(&full_id("01a04eb6"), Decision::AllowAlways, &refused).as_deref(),
+            Some("ask 01a04eb6 allowed; NOT remembered: compound statement \u{2014} the allow on THIS ask still stands")
+        );
+    }
+
+    #[test]
+    fn a_reassignment_is_reported_either_way() {
+        assert_eq!(
+            reassign_notice(&full_id("01a04eb6"), Reassign::Escalate, &ReassignOutcome::Accepted { reviewer: "banto".into() }),
+            "ask 01a04eb6 now reviewed by banto"
+        );
+        assert_eq!(
+            reassign_notice(&full_id("01a04eb6"), Reassign::Escalate, &ReassignOutcome::Failed("a performer cannot review".into())),
+            "ask 01a04eb6 not escalated: a performer cannot review"
+        );
+        assert_eq!(
+            reassign_notice(
+                &full_id("01a04eb6"),
+                Reassign::TakeOver(principal(1)),
+                &ReassignOutcome::Failed("already claimed".into())
+            ),
+            "ask 01a04eb6 not taken over: already claimed"
+        );
+    }
+
+    /// The closing notice ("allow once by you") arrives after the rule note
+    /// and must not wipe it.
+    #[test]
+    fn a_closing_notice_does_not_replace_the_rule_note_for_the_same_ask() {
+        let mut notice = AskNotice::default();
+        notice.say_rule_note(&full_id("01a04eb6"), "ask 01a04eb6 allowed; remembered: x", 0.0);
+        notice.say_closing(&full_id("01a04eb6"), "ask 01a04eb6 allow once by you", 1.0);
+        assert_eq!(notice.current(1.0), Some("ask 01a04eb6 allowed; remembered: x"));
+        // Another ask's closing is its own news.
+        notice.say_closing(&full_id("02b15fc7"), "ask 02b15fc7 deny by amy", 1.0);
+        assert_eq!(notice.current(1.0), Some("ask 02b15fc7 deny by amy"));
+        // And once the note has aged out, the ask's closing may speak.
+        notice.say_rule_note(&full_id("01a04eb6"), "note", 0.0);
+        notice.say_closing(&full_id("01a04eb6"), "closed", NOTICE_TTL + 1.0);
+        assert_eq!(notice.current(NOTICE_TTL + 1.0), Some("closed"));
     }
 
     #[test]
@@ -1602,19 +1930,185 @@ mod tests {
         assert!(all.contains("kj ledger allow 01a04eb6"), "{all}");
         assert!(rows.iter().any(|r| r.tone == LineTone::Warn));
 
-        let keys = sheet_keys(false, 1);
+        let keys = sheet_keys(&other.summary, Some(me), 1);
         assert!(!keys.contains("[a]llow"), "{keys}");
         assert!(!keys.contains("[d]eny"), "{keys}");
         assert!(keys.contains("Esc aside"), "{keys}");
     }
 
+    /// The guidance for an ask that is not yours names every way out the
+    /// ledger offers (`docs/approval-identity.md`), not only the reviewer's
+    /// `allow`.
+    #[test]
+    fn someone_elses_ask_names_cancel_and_escalate_not_only_allow() {
+        let me = principal(1);
+        let other = ask("01a04eb6", Some(ctx(1)), principal(3)).summary;
+        let guidance = not_yours_guidance(&other, Some(me));
+        assert!(guidance.contains("reviewer amy"), "{guidance}");
+        assert!(guidance.contains("kj ledger allow 01a04eb6"), "{guidance}");
+        assert!(guidance.contains("escalate 01a04eb6"), "{guidance}");
+        assert!(guidance.contains("kj ledger cancel 01a04eb6"), "{guidance}");
+        assert!(!guidance.contains("take"), "not the lineage root: {guidance}");
+    }
+
+    #[test]
+    fn the_lineage_root_is_told_it_can_take_the_ask() {
+        let me = principal(1);
+        let mut other = ask("01a04eb6", Some(ctx(1)), principal(3)).summary;
+        other.lineage_root = Some(named(me, "amy"));
+        let guidance = not_yours_guidance(&other, Some(me));
+        assert!(guidance.contains("[t]ake"), "{guidance}");
+        let keys = sheet_keys(&other, Some(me), 1);
+        assert!(keys.contains("[t]ake over"), "{keys}");
+        assert!(!keys.contains("[a]llow"), "{keys}");
+    }
+
+    /// An ask with a program, reviewed by me, performed by `coder`, whose
+    /// lineage root is amy (principal 2) \u{2014} so every key is on offer.
+    fn keyed(me: PrincipalId) -> AskSummary {
+        let mut a = ask("01a04eb6", Some(ctx(1)), me).summary;
+        a.has_exec_source = true;
+        a
+    }
+
+    #[test]
+    fn the_reviewer_of_an_ask_with_a_program_is_offered_the_character_keys() {
+        let me = principal(1);
+        let keys = sheet_keys(&keyed(me), Some(me), 1);
+        assert!(keys.contains("[a]llow once"), "{keys}");
+        assert!(keys.contains("[A]llow always (global)"), "A is global: {keys}");
+        assert!(keys.contains("[c] always for coder"), "{keys}");
+        assert!(keys.contains("[C] coder, command family"), "{keys}");
+        assert!(keys.contains("[e]scalate"), "{keys}");
+        assert!(!keys.contains("[t]ake over"), "the reviewer is not taking over: {keys}");
+    }
+
+    #[test]
+    fn an_ask_without_a_program_offers_no_rule_for_the_character() {
+        let me = principal(1);
+        let mut a = keyed(me);
+        a.has_exec_source = false;
+        let keys = sheet_keys(&a, Some(me), 1);
+        assert!(!keys.contains("[c]"), "{keys}");
+        assert!(!keys.contains("[C]"), "{keys}");
+        assert!(keys.contains("[a]llow once"), "{keys}");
+    }
+
+    /// Every key is gated on `AskSummary`'s own predicate and refuses with a
+    /// notice, never silently.
+    #[test]
+    fn each_ask_key_is_sent_only_when_its_predicate_holds() {
+        let me = principal(1);
+        let other = principal(3);
+        let root = |a: &mut AskSummary| a.lineage_root = Some(named(me, "amy"));
+
+        // Reviewer with a program: decisions and escalate go; take over does not.
+        let mine = keyed(me);
+        assert_eq!(
+            request_for(&Action::AskAllowCharacter, &mine, Some(me)),
+            Some(Ok(AskRequest::Decide(Decision::AllowCharacter)))
+        );
+        assert_eq!(
+            request_for(&Action::AskAllowCharacterFamily, &mine, Some(me)),
+            Some(Ok(AskRequest::Decide(Decision::AllowCharacterFamily)))
+        );
+        assert_eq!(
+            request_for(&Action::AskEscalate, &mine, Some(me)),
+            Some(Ok(AskRequest::Reassign(Reassign::Escalate)))
+        );
+        assert!(matches!(request_for(&Action::AskTakeOver, &mine, Some(me)), Some(Err(_))));
+
+        // No program: c and C refuse, a still goes.
+        let mut bare = keyed(me);
+        bare.has_exec_source = false;
+        assert!(matches!(request_for(&Action::AskAllowCharacter, &bare, Some(me)), Some(Err(_))));
+        assert!(matches!(request_for(&Action::AskAllowCharacterFamily, &bare, Some(me)), Some(Err(_))));
+        assert!(matches!(request_for(&Action::AskAllowOnce, &bare, Some(me)), Some(Ok(_))));
+
+        // Someone else's ask, and I am its lineage root: only take over goes.
+        let mut theirs = keyed(other);
+        root(&mut theirs);
+        for action in [
+            Action::AskAllowOnce,
+            Action::AskAllowAlways,
+            Action::AskDeny,
+            Action::AskAllowCharacter,
+            Action::AskAllowCharacterFamily,
+            Action::AskEscalate,
+        ] {
+            assert!(
+                matches!(request_for(&action, &theirs, Some(me)), Some(Err(_))),
+                "{action:?} must refuse"
+            );
+        }
+        assert_eq!(
+            request_for(&Action::AskTakeOver, &theirs, Some(me)),
+            Some(Ok(AskRequest::Reassign(Reassign::TakeOver(me))))
+        );
+
+        // A closed ask answers nothing and hands nothing on.
+        let mut closed = keyed(me);
+        closed.status = AskStatus::Allowed;
+        for action in [Action::AskAllowOnce, Action::AskAllowCharacter, Action::AskEscalate] {
+            assert!(matches!(request_for(&action, &closed, Some(me)), Some(Err(_))), "{action:?}");
+        }
+
+        // No identity: nothing goes. And a non-ask key is none of this gate's.
+        assert!(matches!(request_for(&Action::AskAllowOnce, &mine, None), Some(Err(_))));
+        assert_eq!(request_for(&Action::StepNext, &mine, Some(me)), None);
+    }
+
+    /// A closed ask opened from the ribbon offers the way back and nothing
+    /// that answers.
+    #[test]
+    fn a_closed_ask_on_the_sheet_offers_only_the_way_back() {
+        let me = principal(1);
+        let mut a = keyed(me);
+        a.status = AskStatus::Allowed;
+        let keys = sheet_keys(&a, Some(me), 3);
+        assert_eq!(keys, "[v]iew ledger  Esc back");
+    }
+
+    #[test]
+    fn a_closed_ask_says_what_became_of_it() {
+        let me = principal(1);
+        let mut a = decided(ask("01a04eb6", Some(ctx(1)), me), "allow_once", Some(named(me, "amy")));
+        a.summary.decided_at_ms = Some(0);
+        a.redeemed_at_ms = Some(0);
+        a.publication_abandoned = Some("Caller stopped. Source did not run.".into());
+        let rows = sheet_head(&a, Some(me), 5_000, 120);
+        let all = text(&rows);
+        assert!(all.contains("ask 01a04eb6 allow once by you"), "{all}");
+        assert!(all.contains("redeemed 5s ago"), "{all}");
+        assert!(all.contains("publication abandoned"), "{all}");
+        assert!(!all.contains("not yours to answer"), "{all}");
+        assert!(!all.contains("waiting"), "{all}");
+    }
+
+    /// While the ledger is not synced the sheet says its asks may be stale.
+    #[test]
+    fn an_unsynced_ledger_says_so_on_the_sheet() {
+        let me = principal(1);
+        let a = ask("01a04eb6", Some(ctx(1)), me);
+        let synced = sheet_rows(&a, None, Some(me), 0, 1, true, 100, 20, 0, true);
+        let unsynced = sheet_rows(&a, None, Some(me), 0, 1, false, 100, 20, 0, true);
+        assert!(!text(&synced).contains("not synced"), "{}", text(&synced));
+        assert!(text(&unsynced).contains("not synced"), "{}", text(&unsynced));
+        assert!(unsynced.iter().any(|r| r.tone == LineTone::Warn && r.text.contains("not synced")));
+    }
+
     #[test]
     fn the_key_line_offers_stepping_only_when_there_is_somewhere_to_step() {
-        assert!(!sheet_keys(true, 1).contains("] next"));
-        let many = sheet_keys(true, 3);
+        let me = principal(1);
+        let mine = ask("01a04eb6", Some(ctx(1)), me).summary;
+        assert!(!sheet_keys(&mine, Some(me), 1).contains("] next"));
+        let many = sheet_keys(&mine, Some(me), 3);
         assert!(many.contains("] next"), "{many}");
         assert!(many.contains("[ prev"), "{many}");
-        assert!(many.starts_with("[a]llow once  [A]llow always  [d]eny"), "{many}");
+        assert!(
+            many.starts_with("[a]llow once  [A]llow always (global)  [d]eny"),
+            "{many}"
+        );
     }
 
     #[test]
@@ -1689,12 +2183,14 @@ mod tests {
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
         a.summary.statements = (0..60).map(|i| format!("statement number {i}")).collect();
         for rows in [8usize, 14, 40] {
-            let out = sheet_rows(&a, None, Some(me), 0, 1, 100, rows, 0, true);
-            assert!(
-                out.last().expect("rows").text.starts_with("[a]llow once"),
-                "rows={rows} got {:?}",
-                out.last()
-            );
+            let out = sheet_rows(&a, None, Some(me), 0, 1, true, 100, rows, 0, true);
+            let tail = out[out.len().saturating_sub(2)..]
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(tail.contains("Esc aside"), "rows={rows} got {tail:?}");
+            assert_eq!(out.last().expect("rows").tone, LineTone::Head);
         }
     }
 
@@ -1705,20 +2201,20 @@ mod tests {
         let me = principal(1);
         let mut a = ask("01a04eb6", Some(ctx(1)), me);
         a.summary.statements = (0..60).map(|i| format!("statement number {i}")).collect();
-        let top = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 0, true);
+        let top = sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, 0, true);
         let joined = text(&top);
         assert!(joined.contains("\u{2191}0 \u{2193}"), "{joined}");
 
-        let scrolled = sheet_rows(&a, None, Some(me), 0, 1, 100, 14, 5, true);
+        let scrolled = sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, 5, true);
         assert!(text(&scrolled).contains("\u{2191}5 \u{2193}"), "{}", text(&scrolled));
         assert_ne!(text(&top), text(&scrolled), "j moved the plan");
 
         // And `j` stops: the limit is what the panel can actually show.
-        let limit = sheet_max_scroll(&a, None, Some(me), 0, 100, 14);
+        let limit = sheet_max_scroll(&a, None, Some(me), 0, true, 100, 14, 1);
         assert!(limit > 0);
         assert_eq!(
-            text(&sheet_rows(&a, None, Some(me), 0, 1, 100, 14, limit, true)),
-            text(&sheet_rows(&a, None, Some(me), 0, 1, 100, 14, limit + 50, true)),
+            text(&sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, limit, true)),
+            text(&sheet_rows(&a, None, Some(me), 0, 1, true, 100, 14, limit + 50, true)),
             "scrolling past the end shows the end"
         );
     }
@@ -1733,7 +2229,7 @@ mod tests {
         a.summary.statements = vec!["/very/long/path/".repeat(40)];
         a.cwd = Some("/another/very/long/path/".repeat(20));
         for cols in [24usize, 40, 80] {
-            for row in sheet_rows(&a, None, Some(me), 0, 4, cols, 30, 0, true) {
+            for row in sheet_rows(&a, None, Some(me), 0, 4, true, cols, 30, 0, true) {
                 assert!(
                     row.text.chars().count() <= cols,
                     "cols={cols} overflowed with {:?}",
@@ -1814,7 +2310,7 @@ mod tests {
         set_open(&mut app, &[theirs.clone()], 1);
         app.update();
         assert_eq!(showing(&app), Some(full_id("01a04eb6")));
-        assert!(!sheet_keys(theirs.summary.answerable_by(me), 1).contains("[a]llow"));
+        assert!(!sheet_keys(&theirs.summary, Some(me), 1).contains("[a]llow"));
     }
 
     /// An ask that closed while it was not on screen is not announced; the
@@ -1869,5 +2365,108 @@ mod tests {
         app.update();
         assert_eq!(notice(&app).as_deref(), Some("ask bbbbbbbb closed"));
         assert!(app.world().resource::<AskSheetState>().left.is_empty(), "nothing waits forever");
+    }
+
+    // ── the handler ───────────────────────────────────────────────────────
+
+    fn handler_app(me: PrincipalId) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<LedgerMirror>()
+            .init_resource::<AskSheetState>()
+            .init_resource::<AskNotice>()
+            .init_resource::<crate::ui::ledger_ribbon::LedgerRibbonState>()
+            .insert_resource(crate::cell::SessionPrincipal(Some(me)))
+            .add_message::<ActionFired>()
+            .add_message::<AskDecisionRequested>()
+            .add_message::<AskReassignRequested>()
+            .add_systems(Update, handle_ask_sheet_actions);
+        app
+    }
+
+    fn press(app: &mut App, action: Action) {
+        app.world_mut().write_message(ActionFired { action, context: InputContext::AskSheet });
+        app.update();
+    }
+
+    fn sent_decisions(app: &App) -> Vec<(String, Decision)> {
+        app.world()
+            .resource::<Messages<AskDecisionRequested>>()
+            .iter_current_update_messages()
+            .map(|m| (m.request_id.clone(), m.decision))
+            .collect()
+    }
+
+    fn sent_reassignments(app: &App) -> Vec<(String, Reassign)> {
+        app.world()
+            .resource::<Messages<AskReassignRequested>>()
+            .iter_current_update_messages()
+            .map(|m| (m.request_id.clone(), m.reassign))
+            .collect()
+    }
+
+    #[test]
+    fn a_key_on_the_sheet_sends_the_request_its_predicate_allows() {
+        let me = principal(1);
+        let mut app = handler_app(me);
+        let mut a = ask("01a04eb6", Some(ctx(1)), me);
+        a.summary.has_exec_source = true;
+        set_open_on(&mut app, &[a.clone()]);
+        app.world_mut().resource_mut::<AskSheetState>().open(a.summary.request_id.clone());
+
+        press(&mut app, Action::AskAllowCharacter);
+        assert_eq!(sent_decisions(&app), vec![(a.summary.request_id.clone(), Decision::AllowCharacter)]);
+        press(&mut app, Action::AskEscalate);
+        assert_eq!(sent_reassignments(&app), vec![(a.summary.request_id.clone(), Reassign::Escalate)]);
+        // Take over is not this player's key here: refused with a notice, nothing sent.
+        press(&mut app, Action::AskTakeOver);
+        assert!(sent_reassignments(&app).is_empty());
+        assert!(app.world().resource::<AskNotice>().current(0.0).is_some());
+    }
+
+    #[test]
+    fn a_key_on_an_ask_that_left_is_refused_with_a_notice() {
+        let me = principal(1);
+        let mut app = handler_app(me);
+        // The sheet shows an ask the mirror no longer holds.
+        app.world_mut().resource_mut::<AskSheetState>().open(full_id("01a04eb6"));
+        press(&mut app, Action::AskAllowOnce);
+        assert!(sent_decisions(&app).is_empty());
+        let notice = app.world().resource::<AskNotice>().current(0.0).map(str::to_string);
+        assert_eq!(notice.as_deref(), Some("ask 01a04eb6 is no longer open"));
+    }
+
+    #[test]
+    fn someone_elses_ask_refuses_every_answer_key_on_the_sheet() {
+        let me = principal(1);
+        let mut app = handler_app(me);
+        let theirs = ask("01a04eb6", Some(ctx(1)), principal(3));
+        set_open_on(&mut app, &[theirs.clone()]);
+        app.world_mut().resource_mut::<AskSheetState>().open(theirs.summary.request_id.clone());
+        for action in [Action::AskAllowOnce, Action::AskDeny, Action::AskEscalate] {
+            press(&mut app, action);
+            assert!(sent_decisions(&app).is_empty() && sent_reassignments(&app).is_empty());
+        }
+    }
+
+    /// `]`/`[` on a closed ask opened from the ribbon do nothing: the key
+    /// line does not offer them, and they would silently walk the open set.
+    #[test]
+    fn stepping_is_off_while_a_closed_ask_is_up() {
+        let me = principal(1);
+        let mut app = handler_app(me);
+        let open_ask = ask("01a04eb6", Some(ctx(1)), me);
+        set_open_on(&mut app, &[open_ask]);
+        let closed_id = full_id("02b15fc7");
+        app.world_mut().resource_mut::<AskSheetState>().open_closed(closed_id.clone());
+        press(&mut app, Action::AskNext);
+        let state = app.world().resource::<AskSheetState>();
+        assert_eq!(state.showing.as_deref(), Some(closed_id.as_str()));
+        assert!(state.viewing_closed());
+    }
+
+    fn set_open_on(app: &mut App, asks: &[AskDetail]) {
+        let state = kaijutsu_client::LedgerState::from_listing(1, open(asks));
+        app.world_mut().resource_mut::<LedgerMirror>().apply_state(&state);
     }
 }

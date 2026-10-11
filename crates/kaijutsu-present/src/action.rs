@@ -259,6 +259,20 @@ pub enum Action {
     OpenLedger,
     /// Esc on the ledger ribbon — close it, and only it.
     CloseLedger,
+    /// `c` on an ask — allow it and remember the exact text for the
+    /// performing character.
+    AskAllowCharacter,
+    /// `C` on an ask — allow it and remember the command family for the
+    /// performing character.
+    AskAllowCharacterFamily,
+    /// `e` on an ask — hand it to the next reviewer (`kj ledger escalate
+    /// <id>` without `--to`).
+    AskEscalate,
+    /// `t` on an ask — take it for yourself, as the lineage root (`kj ledger
+    /// escalate <id> --to <you>`).
+    AskTakeOver,
+    /// `/` on the ledger ribbon — type a filter over its rows.
+    LedgerFilter,
 
     // ========================================================================
     // Context Interrupt (Ctrl+C in TextInput/Navigation)

@@ -28,6 +28,7 @@ kaijutsu-kernel.workspace = true
 # own reflected types; the crate itself stays Bevy-free by default.
 kaijutsu-present = { workspace = true, features = ["bevy"] }
 crossbeam-channel = "0.5"
+unicode-width = { workspace = true }
 kaijutsu-types.workspace = true
 kaijutsu-viz.workspace = true
 kaijutsu-telemetry.workspace = true

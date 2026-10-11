@@ -444,6 +444,11 @@ fn action_to_str(a: &Action) -> String {
         Action::AskPrev => "AskPrev".into(),
         Action::OpenLedger => "OpenLedger".into(),
         Action::CloseLedger => "CloseLedger".into(),
+        Action::AskAllowCharacter => "AskAllowCharacter".into(),
+        Action::AskAllowCharacterFamily => "AskAllowCharacterFamily".into(),
+        Action::AskEscalate => "AskEscalate".into(),
+        Action::AskTakeOver => "AskTakeOver".into(),
+        Action::LedgerFilter => "LedgerFilter".into(),
     }
 }
 
@@ -530,6 +535,11 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "AskPrev" => Ok(Action::AskPrev),
         "OpenLedger" => Ok(Action::OpenLedger),
         "CloseLedger" => Ok(Action::CloseLedger),
+        "AskAllowCharacter" => Ok(Action::AskAllowCharacter),
+        "AskAllowCharacterFamily" => Ok(Action::AskAllowCharacterFamily),
+        "AskEscalate" => Ok(Action::AskEscalate),
+        "AskTakeOver" => Ok(Action::AskTakeOver),
+        "LedgerFilter" => Ok(Action::LedgerFilter),
         "SwitchToActiveSeat" => Ok(Action::SwitchToActiveSeat(0)),
         "ActiveSeatStep" => Ok(Action::ActiveSeatStep(1)),
         // Payloaded variants without an explicit payload default to a
@@ -685,6 +695,20 @@ mod tests {
     use super::*;
 
     const ALL_ACTIONS: &[&str] = &[
+        "OpenDiffViewer",
+        "AskAllowOnce",
+        "AskAllowAlways",
+        "AskDeny",
+        "AskAside",
+        "AskNext",
+        "AskPrev",
+        "OpenLedger",
+        "CloseLedger",
+        "AskAllowCharacter",
+        "AskAllowCharacterFamily",
+        "AskEscalate",
+        "AskTakeOver",
+        "LedgerFilter",
         "CycleFocusForward",
         "CycleFocusBackward",
         "FocusCompose",
@@ -848,7 +872,90 @@ mod tests {
         "RightThumb",
     ];
 
-    const ALL_CONTEXTS: &[&str] = &["Global", "Navigation", "TextInput", "Dialog"];
+    const ALL_CONTEXTS: &[&str] = &[
+        "Global",
+        "Navigation",
+        "TextInput",
+        "Dialog",
+        "RoomNav",
+        "WellZoomed",
+        "StationZoomed",
+        "QuickContext",
+        "AskSheet",
+        "LedgerRibbon",
+    ];
+
+    /// The variant names of `pub enum <name>` in `source`, with the payloaded
+    /// ones (`Name(..)`, `Name {..}`) separated out. Read from the source so
+    /// a variant added to the enum fails the lists below until it is listed.
+    fn enum_variants(source: &str, name: &str) -> (Vec<String>, Vec<String>) {
+        let start = source
+            .find(&format!("pub enum {name} {{"))
+            .unwrap_or_else(|| panic!("no `pub enum {name}` in source"));
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("enum ends");
+        let (mut plain, mut payloaded) = (Vec::new(), Vec::new());
+        for line in body[..end].lines().skip(1) {
+            // Variants sit at one indent; doc comments, attributes and
+            // payload continuation lines do not match.
+            let Some(rest) = line.strip_prefix("    ") else { continue };
+            let Some(first) = rest.chars().next() else { continue };
+            if !first.is_ascii_uppercase() {
+                continue;
+            }
+            let ident: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            match rest[ident.len()..].chars().next() {
+                Some('(') | Some('{') => payloaded.push(ident),
+                _ => plain.push(ident),
+            }
+        }
+        (plain, payloaded)
+    }
+
+    #[test]
+    fn all_actions_names_every_plain_action_variant() {
+        let (plain, payloaded) =
+            enum_variants(include_str!("../../../kaijutsu-present/src/action.rs"), "Action");
+        assert!(plain.len() > 50, "the source reader found only {plain:?}");
+        let missing: Vec<&String> = plain.iter().filter(|v| !ALL_ACTIONS.contains(&v.as_str())).collect();
+        assert!(missing.is_empty(), "ALL_ACTIONS lacks {missing:?}");
+        let stale: Vec<&&str> = ALL_ACTIONS
+            .iter()
+            .filter(|a| !plain.iter().any(|v| v == *a) && !payloaded.iter().any(|v| v == *a))
+            .collect();
+        assert!(stale.is_empty(), "ALL_ACTIONS names variants that are gone: {stale:?}");
+        // A payloaded variant is written `Name:payload`; the parser must
+        // know its name (a garbage payload fails on the payload, never with
+        // "does not take a payload").
+        for name in &payloaded {
+            let err = parse_action_with_payload(name, "~garbage~").unwrap_err();
+            assert!(!err.contains("does not take a payload"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn all_contexts_names_every_context_variant() {
+        let (plain, payloaded) = enum_variants(include_str!("context.rs"), "InputContext");
+        assert!(payloaded.is_empty(), "{payloaded:?}");
+        let missing: Vec<&String> = plain.iter().filter(|v| !ALL_CONTEXTS.contains(&v.as_str())).collect();
+        assert!(missing.is_empty(), "ALL_CONTEXTS lacks {missing:?}");
+        let stale: Vec<&&str> = ALL_CONTEXTS.iter().filter(|c| !plain.iter().any(|v| v == *c)).collect();
+        assert!(stale.is_empty(), "ALL_CONTEXTS names variants that are gone: {stale:?}");
+    }
+
+    #[test]
+    fn every_action_and_context_round_trips_through_its_name() {
+        for s in ALL_ACTIONS {
+            let action = parse_action(s).unwrap();
+            // A payloaded action writes its payload after the name.
+            let written = action_to_str(&action);
+            assert_eq!(written.split(':').next(), Some(*s), "{s}");
+        }
+        for s in ALL_CONTEXTS {
+            let ctx = parse_context(s).unwrap();
+            assert_eq!(context_to_str(ctx), *s);
+        }
+    }
 
     #[test]
     fn test_parse_action_all_variants() {

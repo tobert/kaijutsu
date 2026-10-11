@@ -61,6 +61,7 @@ use crate::cell::block_border::{
 use crate::cell::{ConversationScrollState, EditorEntities};
 use crate::connection::RpcConnectionState;
 use crate::connection::drift::DriftState;
+use crate::connection::ledger::{LedgerMirror, short_request_id};
 use crate::text::TextMetrics;
 use crate::text::components::color_to_rgba8;
 use crate::ui::theme::Theme;
@@ -257,6 +258,7 @@ pub fn sync_block_chrome(
     conn_state: Res<RpcConnectionState>,
     drift_state: Res<DriftState>,
     doc_cache: Res<DocumentCache>,
+    ledger: Res<LedgerMirror>,
     mut cache: ResMut<BlockChromeCache>,
 ) {
     let Some(main_ent) = entities.main_cell else {
@@ -317,6 +319,7 @@ pub fn sync_block_chrome(
             .and_then(|ctx_id| drift_state.contexts.iter().find(|c| c.id == ctx_id))
             .map(|c| c.model.clone())
             .unwrap_or_default(),
+        waiting_on: waiting_on_asks(ledger.open()),
     };
 
     cache.container_width = container_width;
@@ -347,6 +350,28 @@ pub fn sync_block_chrome(
         );
         cache.blocks.insert(id, BlockChrome { style, layout });
     }
+}
+
+/// The open asks that hold a tool call: the call's block id to the ask's
+/// short id. An ask raised by no tool call (`tool_call_block_id` is `None`)
+/// holds no block, and a closed ask holds nothing.
+pub fn waiting_on_asks(open: &[kaijutsu_types::AskSummary]) -> std::collections::HashMap<BlockId, String> {
+    // Several asks can hold one call; the oldest is the one it waits on
+    // (the TUI's `ask_index` picks the same).
+    let mut held: std::collections::HashMap<BlockId, (&kaijutsu_types::AskSummary, String)> =
+        std::collections::HashMap::new();
+    for ask in open.iter().filter(|ask| ask.status.is_open()) {
+        let Some(block) = ask.tool_call_block_id else {
+            continue;
+        };
+        let older = held.get(&block).is_none_or(|(have, _)| {
+            (ask.created_at_ms, &ask.request_id) < (have.created_at_ms, &have.request_id)
+        });
+        if older {
+            held.insert(block, (ask, short_request_id(&ask.request_id).to_string()));
+        }
+    }
+    held.into_iter().map(|(block, (_, short))| (block, short)).collect()
 }
 
 // ============================================================================
@@ -743,6 +768,51 @@ pub fn collect_chrome_instances(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_open_ask_with_a_tool_call_holds_a_block() {
+        use kaijutsu_types::{AskOrigin, AskStatus, AskSummary};
+        let call = BlockId::new(
+            kaijutsu_types::ContextId::from_bytes([1; 16]),
+            kaijutsu_types::PrincipalId::from_bytes([2; 16]),
+            7,
+        );
+        let ask = |id: &str, status, block| AskSummary {
+            request_id: format!("{id}-aaaa-bbbb-cccc-000000000001"),
+            status,
+            origin: AskOrigin::ShellGate,
+            context_id: None,
+            description: String::new(),
+            statements: Vec::new(),
+            requester: None,
+            performer: None,
+            reviewer: None,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            tool_call_block_id: block,
+            lineage_root: None,
+            has_exec_source: false,
+        };
+        let joined = waiting_on_asks(&[
+            ask("01a04eb6", AskStatus::Pending, Some(call)),
+            ask("01a04eb7", AskStatus::Pending, None),
+        ]);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined.get(&call).map(String::as_str), Some("01a04eb6"));
+        assert!(waiting_on_asks(&[ask("01a04eb8", AskStatus::Allowed, Some(call))]).is_empty());
+
+        // Two asks on one call: the oldest, whichever order they arrive in.
+        let mut older = ask("01a04ec1", AskStatus::Pending, Some(call));
+        older.created_at_ms = 5;
+        let mut newer = ask("01a04ec2", AskStatus::Pending, Some(call));
+        newer.created_at_ms = 9;
+        for order in [[older.clone(), newer.clone()], [newer, older]] {
+            assert_eq!(
+                waiting_on_asks(&order).get(&call).map(String::as_str),
+                Some("01a04ec1")
+            );
+        }
+    }
+
     use super::*;
     use kaijutsu_types::{BlockKind, ContextId, ErrorCategory, ErrorSeverity, PrincipalId, Status};
 
@@ -1319,6 +1389,7 @@ mod tests {
         app.init_resource::<TextMetrics>();
         app.init_resource::<RpcConnectionState>();
         app.init_resource::<DriftState>();
+        app.init_resource::<LedgerMirror>();
         app.init_resource::<DocumentCache>();
         app.init_resource::<BlockContentCache>();
         app.init_resource::<BlockChromeCache>();

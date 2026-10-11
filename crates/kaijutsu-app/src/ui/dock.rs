@@ -1169,7 +1169,7 @@ mod tests {
     use super::{
         classify_connection_error, count_block_activity, format_background_activity,
         format_block_activity, format_context_usage, format_elapsed_ms, format_global_error_badge,
-        format_presence, format_token_count, hints_with_asks, hints_with_notice, hud_detached,
+        clip_to_width, format_presence, format_token_count, hints_with_asks, hints_with_notice, hud_detached,
         room_slot_label,
         BackgroundActivityLevel, PRESENCE_MAX_AGE,
     };
@@ -1193,6 +1193,37 @@ mod tests {
     /// An approval notice sits behind the count and ahead of the keys — the
     /// count says how many are waiting, the notice says what just happened,
     /// the keys say what to press.
+    #[test]
+    fn clipping_counts_display_columns_and_never_splits_a_character() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(clip_to_width("short", 100), "short");
+        let exact = "n".repeat(100);
+        assert_eq!(clip_to_width(&exact, 100), exact, "exactly the bound is not clipped");
+        let over = "n".repeat(101);
+        let clipped = clip_to_width(&over, 100);
+        assert_eq!(clipped.width(), 100);
+        assert!(clipped.ends_with('\u{2026}'));
+        // CJK: two columns each. 60 characters are 120 columns.
+        let cjk = "\u{627f}".repeat(60);
+        let clipped = clip_to_width(&cjk, 100);
+        assert!(clipped.width() <= 100, "{}", clipped.width());
+        assert_eq!(clipped.width(), 99, "49 wide characters and the ellipsis");
+        assert_eq!(clipped.chars().count(), 50);
+        // 50 CJK characters are exactly 100 columns and stay whole.
+        let fits = "\u{627f}".repeat(50);
+        assert_eq!(clip_to_width(&fits, 100), fits);
+    }
+
+    #[test]
+    fn a_long_notice_is_clipped_to_the_hints_line() {
+        let long = "n".repeat(300);
+        let line = hints_with_notice("i: chat", 0, Some(&long));
+        assert!(line.contains('\u{2026}'), "{line}");
+        assert!(line.chars().count() < 120, "{}", line.chars().count());
+        let short = hints_with_notice("i: chat", 0, Some("ask 01a04eb6 expired"));
+        assert!(short.contains("ask 01a04eb6 expired") && !short.contains('\u{2026}'));
+    }
+
     #[test]
     fn an_approval_notice_rides_the_hints_line_behind_the_count() {
         assert_eq!(
@@ -1961,6 +1992,34 @@ pub(crate) fn hints_with_asks(hints: &str, pending_asks: usize) -> String {
     format!("!{pending_asks} \u{2502} {hints}")
 }
 
+/// The widest approval notice the hints line carries, in terminal columns
+/// (a CJK character is two).
+const NOTICE_MAX_COLS: usize = 100;
+
+/// `text` cut to at most `cols` display columns, ending in `\u{2026}` when
+/// anything was cut. Never splits a character.
+pub(crate) fn clip_to_width(text: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let total: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= cols {
+        return text.to_string();
+    }
+    // One column is the ellipsis.
+    let budget = cols.saturating_sub(1);
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// The hints line with an approval notice in the middle: what became of an
 /// ask, or why a decision key did not take (`ui::ask_sheet::AskNotice`).
 ///
@@ -1974,6 +2033,10 @@ pub(crate) fn hints_with_notice(hints: &str, pending_asks: usize, notice: Option
     let Some(notice) = notice.filter(|n| !n.is_empty()) else {
         return line;
     };
+    // A kernel note can run past the width of the line, and the line grows
+    // leftward over the context strip. The line is a status, not the record.
+    let clipped = clip_to_width(notice, NOTICE_MAX_COLS);
+    let notice = clipped.as_str();
     if pending_asks == 0 {
         if line.is_empty() {
             return notice.to_string();

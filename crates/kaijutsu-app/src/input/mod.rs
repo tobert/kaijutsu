@@ -12,7 +12,9 @@
 //! sync_input_context    — derives InputContexts + KeyboardGrab from
 //!     │                    FocusArea + Screen + RoomState
 //!     ▼
-//! dispatch_input        — the ONLY raw-keyboard reader
+//! dispatch_input        — the only reader that resolves keys to actions
+//!     │                    (`arm_ask_sheet` and `type_ledger_filter` also read
+//!     │                    raw presses, to time the sheet and to type a filter)
 //!     │                    matches bindings in active contexts
 //!     │                    (Global only while a grab is held)
 //!     ├──────────┬───────────────┐

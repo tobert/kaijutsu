@@ -137,6 +137,22 @@ pub struct BlockExcludedState(pub bool);
 pub struct BorderContext {
     pub username: String,
     pub model: String,
+    /// The open ask each waiting tool call is held on: the call's block id
+    /// to the ask's short id (`connection::ledger::short_request_id`).
+    pub waiting_on: std::collections::HashMap<BlockId, String>,
+}
+
+impl BorderContext {
+    /// The caption for a block in `Status::Waiting`. A call held on a known
+    /// ask names it; any other waiting block keeps the bare word. `call` is
+    /// the tool call's block id: the block itself for a call, the paired
+    /// call for a result.
+    fn waiting_label(&self, call: BlockId) -> String {
+        match self.waiting_on.get(&call) {
+            Some(ask) => format!("waiting on ask {ask}"),
+            None => "waiting".to_string(),
+        }
+    }
 }
 
 /// Everything [`compute_border_style`] reads out of a block.
@@ -260,7 +276,7 @@ pub fn compute_border_style(
                     Status::Pending => Some("pending".to_string()),
                     Status::Done => Some("done".to_string()),
                     Status::Error => Some("error".to_string()),
-                    Status::Waiting => Some("waiting".to_string()),
+                    Status::Waiting => Some(ctx.waiting_label(block.id)),
                     // A draft is what you are typing; labelling it "draft"
                     // would narrate the compose box back at you.
                     Status::Draft => None,
@@ -318,7 +334,7 @@ pub fn compute_border_style(
                 Status::Pending => Some("pending".to_string()),
                 Status::Done => None,
                 Status::Error => Some("error".to_string()),
-                Status::Waiting => Some("waiting".to_string()),
+                Status::Waiting => Some(ctx.waiting_label(block.tool_call_id.unwrap_or(block.id))),
                 // As above: a draft is the thing being typed, not a state to
                 // report back.
                 Status::Draft => None,
@@ -539,5 +555,66 @@ mod tests {
         assert_eq!(apply_focus_style(Some(styled.clone()), false, &theme), Some(styled));
         assert_eq!(apply_focus_style(None, false, &theme), None);
     }
-}
 
+    fn call_inputs(id: BlockId, status: Status) -> BorderInputs {
+        BorderInputs {
+            id,
+            kind: BlockKind::ToolCall,
+            role: Role::Model,
+            status,
+            tool_kind: None,
+            tool_call_id: None,
+            content_empty: false,
+            has_output: false,
+            is_error: false,
+            collapsed: false,
+            excluded: false,
+            drift_kind: None,
+            error: None,
+        }
+    }
+
+    fn block_id(seq: u64) -> BlockId {
+        BlockId::new(
+            kaijutsu_types::ContextId::from_bytes([1; 16]),
+            kaijutsu_types::PrincipalId::from_bytes([2; 16]),
+            seq,
+        )
+    }
+
+    fn bottom(inputs: &BorderInputs, ctx: &BorderContext, has_result: bool) -> Option<String> {
+        compute_border_style(inputs, &Theme::default(), ctx, has_result, 14.0)
+            .and_then(|s| s.bottom_label)
+    }
+
+    /// A call held on an ask names the ask; one with no known ask keeps the
+    /// bare word, and a different call's ask is not borrowed.
+    #[test]
+    fn a_waiting_call_names_the_ask_that_holds_it() {
+        let call = block_id(1);
+        let mut ctx = BorderContext::default();
+        ctx.waiting_on.insert(call, "01a04eb6".to_string());
+        let held = call_inputs(call, Status::Waiting);
+        assert_eq!(bottom(&held, &ctx, false).as_deref(), Some("waiting on ask 01a04eb6"));
+        let other = call_inputs(block_id(2), Status::Waiting);
+        assert_eq!(bottom(&other, &ctx, false).as_deref(), Some("waiting"));
+        assert_eq!(bottom(&held, &BorderContext::default(), false).as_deref(), Some("waiting"));
+        // The ask is only named while the call waits.
+        let done = call_inputs(call, Status::Done);
+        assert_eq!(bottom(&done, &ctx, false).as_deref(), Some("done"));
+    }
+
+    /// With a result below it the status moves to the result, which finds
+    /// its ask through the call it pairs with.
+    #[test]
+    fn a_waiting_result_names_the_ask_of_its_call() {
+        let call = block_id(1);
+        let mut ctx = BorderContext::default();
+        ctx.waiting_on.insert(call, "01a04eb6".to_string());
+        let mut result = call_inputs(block_id(2), Status::Waiting);
+        result.kind = BlockKind::ToolResult;
+        result.tool_call_id = Some(call);
+        result.content_empty = false;
+        assert_eq!(bottom(&result, &ctx, true).as_deref(), Some("waiting on ask 01a04eb6"));
+    }
+}

@@ -579,6 +579,31 @@ pub fn default_bindings() -> Vec<Binding> {
         "Deny",
     ));
     b.push(Binding::key(
+        KeyCode::KeyC,
+        InputContext::AskSheet,
+        Action::AskAllowCharacter,
+        "Allow and remember for the performer",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::KeyC,
+        Modifiers::SHIFT,
+        InputContext::AskSheet,
+        Action::AskAllowCharacterFamily,
+        "Allow and remember the command family for the performer",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyE,
+        InputContext::AskSheet,
+        Action::AskEscalate,
+        "Escalate to the next reviewer",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyT,
+        InputContext::AskSheet,
+        Action::AskTakeOver,
+        "Take over this ask",
+    ));
+    b.push(Binding::key(
         KeyCode::KeyV,
         InputContext::AskSheet,
         Action::OpenLedger,
@@ -646,6 +671,37 @@ pub fn default_bindings() -> Vec<Binding> {
         InputContext::LedgerRibbon,
         Action::AskDeny,
         "Deny the selected ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyC,
+        InputContext::LedgerRibbon,
+        Action::AskAllowCharacter,
+        "Allow and remember for the performer",
+    ));
+    b.push(Binding::key_mod(
+        KeyCode::KeyC,
+        Modifiers::SHIFT,
+        InputContext::LedgerRibbon,
+        Action::AskAllowCharacterFamily,
+        "Allow and remember the command family for the performer",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyE,
+        InputContext::LedgerRibbon,
+        Action::AskEscalate,
+        "Escalate to the next reviewer",
+    ));
+    b.push(Binding::key(
+        KeyCode::KeyT,
+        InputContext::LedgerRibbon,
+        Action::AskTakeOver,
+        "Take over this ask",
+    ));
+    b.push(Binding::key(
+        KeyCode::Slash,
+        InputContext::LedgerRibbon,
+        Action::LedgerFilter,
+        "Filter the ledger rows",
     ));
     b.push(Binding::key(
         KeyCode::KeyJ,
@@ -889,5 +945,41 @@ mod tests {
         assert_eq!(bound.len(), 1, "exactly one binding opens the horizon");
         assert_eq!(bound[0].source, InputSource::Key(KeyCode::KeyH));
         assert_eq!(bound[0].modifiers, Modifiers::NONE);
+    }
+
+    /// The ask sheet and the ledger ribbon share their answer keys; a clash
+    /// inside either context kills one of the two quietly, as in the well.
+    #[test]
+    fn no_two_approval_bindings_claim_the_same_key() {
+        for ctx in [InputContext::AskSheet, InputContext::LedgerRibbon] {
+            let mut seen: Vec<(InputSource, Modifiers)> = Vec::new();
+            for b in default_bindings().into_iter().filter(|b| b.context == ctx) {
+                let key = (b.source, b.modifiers);
+                assert!(
+                    !seen.contains(&key),
+                    "two {ctx:?} bindings claim {key:?} \u{2014} one of them is dead"
+                );
+                seen.push(key);
+            }
+        }
+    }
+
+    /// Amy's decision: `c C e t` mean the same on the sheet and the ribbon.
+    #[test]
+    fn the_sheet_and_the_ribbon_answer_on_the_same_keys() {
+        let want = [
+            (KeyCode::KeyC, Modifiers::NONE, Action::AskAllowCharacter),
+            (KeyCode::KeyC, Modifiers::SHIFT, Action::AskAllowCharacterFamily),
+            (KeyCode::KeyE, Modifiers::NONE, Action::AskEscalate),
+            (KeyCode::KeyT, Modifiers::NONE, Action::AskTakeOver),
+        ];
+        for ctx in [InputContext::AskSheet, InputContext::LedgerRibbon] {
+            for (key, mods, action) in want.iter().cloned() {
+                let hit = default_bindings().into_iter().find(|b| {
+                    b.context == ctx && b.source == InputSource::Key(key) && b.modifiers == mods
+                });
+                assert_eq!(hit.map(|b| b.action), Some(action), "{ctx:?} {key:?} {mods:?}");
+            }
+        }
     }
 }

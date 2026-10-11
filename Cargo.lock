@@ -6768,6 +6768,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "ttf-parser 0.18.1",
+ "unicode-width 0.2.2",
  "usvg 0.47.0",
  "uuid",
  "whoami",

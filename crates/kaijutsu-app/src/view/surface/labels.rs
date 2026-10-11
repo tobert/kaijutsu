@@ -331,6 +331,9 @@ impl BlockLabels {
     }
 }
 
+/// The most label runs the cache holds before it starts over.
+pub const MAX_RUNS: usize = 512;
+
 /// Shaped label runs, keyed by `(text, color)`.
 ///
 /// **Why color is in the key rather than recolored at placement time.** A
@@ -339,13 +342,15 @@ impl BlockLabels {
 /// Baking it means one run per distinct caption *and shade*, which is still a
 /// tiny set shared across every block that says the same thing.
 ///
-/// **Why the map is never pruned by use.** The key space is closed: the
-/// captions come from a fixed table in `compute_border_style` (plus one model
-/// name and one username per session), the colors from the theme palette, and
-/// the whole map is dropped when either epoch moves ([`Self::sync_epochs`]).
-/// A hundred entries is the pessimistic ceiling, and each is a handful of
-/// glyphs. If that ever stops being true — a label that interpolates block
-/// content, say — this needs an LRU, not a bigger comment.
+/// **Why the map is never pruned by use.** The key space is nearly closed:
+/// the captions come from a fixed table in `compute_border_style` (plus one
+/// model name, one username per session, and `waiting on ask <short>` for
+/// each ask that holds a call), the colors from the theme palette, and the
+/// whole map is dropped when either epoch moves ([`Self::sync_epochs`]).
+/// The one open-ended caption, the ask id, is why the map is also bounded:
+/// at [`MAX_RUNS`] it is cleared before the next run is stored, and the runs
+/// still on screen reshape on the next frame. A label that interpolates
+/// block content would need an LRU.
 ///
 /// **Nested by color, then text** rather than keyed on a `(String, [u8; 4])`
 /// tuple, because the lookup runs for every band block every frame and a tuple
@@ -447,11 +452,16 @@ impl LabelRunCache {
             height,
             ascent,
         };
-        self.runs
-            .entry(color_to_rgba8(spec.color))
-            .or_default()
-            .insert(spec.text.to_string(), run.clone());
+        self.store(color_to_rgba8(spec.color), spec.text.to_string(), run.clone());
         Some(run)
+    }
+
+    /// Hold `run`, starting the cache over first when it is full.
+    fn store(&mut self, color: [u8; 4], text: String, run: LabelRun) {
+        if self.len() >= MAX_RUNS {
+            self.runs.clear();
+        }
+        self.runs.entry(color).or_default().insert(text, run);
     }
 
     /// Shape every label a block draws.
@@ -480,10 +490,7 @@ impl LabelRunCache {
     /// [`super::shape_cache::ShapedBlockCache::insert_for_test`].
     #[cfg(test)]
     pub(crate) fn insert_for_test(&mut self, spec: &LabelSpec<'_>, run: LabelRun) {
-        self.runs
-            .entry(color_to_rgba8(spec.color))
-            .or_default()
-            .insert(spec.text.to_string(), run);
+        self.store(color_to_rgba8(spec.color), spec.text.to_string(), run);
     }
 }
 
@@ -532,6 +539,7 @@ mod tests {
         BorderContext {
             username: "amy".into(),
             model: "anthropic/claude-fable-5".into(),
+            ..Default::default()
         }
     }
 
@@ -813,6 +821,19 @@ mod tests {
                 })
                 .is_none()
         );
+    }
+
+    /// A caption that carries an ask id is open-ended; the cache must not
+    /// grow with every ask the session ever sees.
+    #[test]
+    fn the_cache_starts_over_instead_of_growing_without_bound() {
+        let mut cache = LabelRunCache::default();
+        for i in 0..(MAX_RUNS * 3) {
+            let text = format!("waiting on ask {i:08x}");
+            cache.insert_for_test(&LabelSpec { text: &text, color: Color::WHITE }, run(40.0, 9.0));
+            assert!(cache.len() <= MAX_RUNS, "grew to {} at {i}", cache.len());
+        }
+        assert!(!cache.is_empty());
     }
 
     /// Either epoch moving drops the lot — advance widths after a font-size

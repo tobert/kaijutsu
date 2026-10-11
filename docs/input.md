@@ -134,7 +134,7 @@ list.
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
-| `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last few decisions (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
+| `Ctrl+A l` | Open the ledger ribbon — every pending approval ask across every context, plus the last 20 answered asks (`docs/tui.md`, "The ledger"); again closes it. Conversation and Room only; elsewhere it says so on the hints line | (new) |
 | *(armed)* | The footer hint line shows the whole chord table while a prefix is pending — the legend appears exactly when you need it, so there is no separate `?` overlay | help |
 
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
@@ -221,8 +221,8 @@ releases the hold instead.
 | WellZoomed | `0–9` seat of *focused* ring · `←/→/Tab` spin · `↑/↓` ring (Up at the top ring → hero pose) · `Enter` focus/commit · `p d c z a` verbs · `h` horizon dive (stub) · `?` legend · `Esc` pop |
 | StationZoomed (plain) | `↑/Esc` pop |
 | QuickContext (overlay held) | `Esc` release the hold — the only binding it carries; layered over whichever surface is underneath |
-| AskSheet (an ask waiting on you) | `a` allow once · `A` allow always · `d` deny · `v` ledger · `]`/`[` next/previous pending ask, across every context · `j/k` scroll the plan · `Esc` aside |
-| LedgerRibbon (`Ctrl+A l`) | `a`/`A`/`d` answer the selected row · `j/k` (and `↑/↓`) move · `Enter` open the sheet on it · `Esc` close |
+| AskSheet (an ask waiting on you) | `a` allow once · `A` allow always (global) · `c`/`C` allow and remember the exact text/command family for the performer (only when the ask carries a program) · `d` deny · `e` escalate to the next reviewer · `t` take over (lineage root) · `v` ledger · `]`/`[` next/previous pending ask, across every context · `j/k` scroll the plan · `Esc` aside |
+| LedgerRibbon (`Ctrl+A l`) | `a`/`A`/`c`/`C`/`d`/`e`/`t` answer the selected pending row (same keys as the sheet; each shows only when the ask's predicates allow it) · `j/k` (and `↑/↓`) move · `/` filter (typing edits the filter; `Enter` keeps it, `Esc` stops typing) · `Enter` open the sheet on any row, answered ones read-only · `Esc` close |
 
 `Screen::Diff` has no `InputContext` of its own on purpose: it is a *grab*,
 so its keys never reach the binding table. `v` in Navigation opens it; inside,
@@ -236,7 +236,8 @@ folds · `V` visual-line · `y` yank to clipboard · `R` reload a stale view ·
 |---|---|---|
 | `Ctrl+C` | Interrupt ladder (soft → hard → hard+clear) | never copy |
 | `Ctrl+V` | Paste CLIPBOARD into compose | compose only — in the editor it forwards to vi (visual block) |
-| middle-click | Paste PRIMARY | |
+| `Ctrl+Shift+V` | Paste CLIPBOARD into the vi editor through `editor_insert` | editor; refused with a notice while the `:` line is open |
+| middle-click | Paste PRIMARY | in the editor through `editor_insert`, refused while the `:` line is open |
 | selection | Auto-copies to PRIMARY (mouse or vi visual) | |
 | `Ctrl+Z` | Chat↔shell toggle; in the editor: suspend to shell | unix suspend metaphor |
 | `Ctrl+D/U` | Half-page scroll | unchanged |

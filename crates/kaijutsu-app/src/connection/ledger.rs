@@ -39,16 +39,17 @@ use bevy::prelude::*;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use kaijutsu_client::LedgerState;
 use kaijutsu_types::{
-    AskAnswerFailureKind, AskDetail, AskSummary, AskVerdict, ContextId, Remember, RememberScope,
+    AskAnswerFailureKind, AskDetail, AskSummary, AskVerdict, ContextId, PrincipalId, Remember,
+    RememberResult, RememberScope,
 };
 use tokio::sync::watch;
 
 use super::actor_plugin::{RpcActor, RpcConnectionState};
 
-/// How many closed asks the mirror keeps behind the open set. Enough for a
-/// renderer to show what just happened; the ledger itself is the history
-/// (`kj ledger list --history`).
-pub const RECENT_CAP: usize = 3;
+/// How many closed asks the mirror keeps behind the open set: the same last
+/// 20 the TUI's ledger lists (`kaijutsu-tui` `asks::LEDGER_HISTORY_LIMIT`).
+/// The ledger itself is the full history (`kj ledger list --history`).
+pub const RECENT_CAP: usize = 20;
 
 // ============================================================================
 // The mirror
@@ -79,6 +80,15 @@ pub struct LedgerMirror {
     /// Asks that left the open set, most recent decision first, capped at
     /// [`RECENT_CAP`].
     recent: Vec<AskDetail>,
+    /// Whether the history listing is owed on the live connection: set by a
+    /// new connection, taken once the open set is synced.
+    history_wanted: bool,
+    /// Why the history listing could not be read. `recent` then holds only
+    /// what departed while this app watched.
+    history_gap: Option<String>,
+    /// Whether any listing has landed on any connection, so a later arrival
+    /// is news and the first listing is not.
+    ever_synced: bool,
 }
 
 /// What one watch value changed: the request ids that arrived in the open
@@ -89,9 +99,24 @@ pub struct LedgerDiff {
     pub arrived: Vec<String>,
     /// Ids no longer open, in the order the mirror held them.
     pub departed: Vec<String>,
+    /// Whether `arrived` is news: false for the first listing this app reads
+    /// (and for none at all), so asks already open at startup do not ask for
+    /// the player's attention.
+    pub announce: bool,
 }
 
 impl LedgerDiff {
+    /// The arrivals worth the player's attention: all of `arrived` when the
+    /// diff is news, none for the first listing this app reads. A reconnect
+    /// relist announces only the ids that were not already held.
+    pub fn announced(&self) -> &[String] {
+        if self.announce {
+            &self.arrived
+        } else {
+            &[]
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.arrived.is_empty() && self.departed.is_empty()
     }
@@ -194,6 +219,7 @@ impl LedgerMirror {
 
         let held: HashSet<&str> = self.open.iter().map(|a| a.request_id.as_str()).collect();
         let diff = LedgerDiff {
+            announce: self.ever_synced,
             arrived: next
                 .iter()
                 .filter(|a| !held.contains(a.request_id.as_str()))
@@ -213,6 +239,7 @@ impl LedgerMirror {
         self.open = next;
         self.generation = state.generation;
         self.synced = true;
+        self.ever_synced = true;
         diff
     }
 
@@ -264,12 +291,49 @@ impl LedgerMirror {
         self.recent.truncate(RECENT_CAP);
     }
 
+    /// Whether the history listing should be read now: it is owed on this
+    /// connection and the open set is synced. Taking it clears the debt, so
+    /// one connection lists the history once; a failed listing asks again
+    /// through [`Self::on_history_failed`].
+    pub fn take_history_read(&mut self) -> bool {
+        if self.history_wanted && self.synced {
+            self.history_wanted = false;
+            return true;
+        }
+        false
+    }
+
+    /// One closed ask from the history listing landed. It joins `recent`
+    /// like a departure and clears a recorded gap.
+    pub fn on_history(&mut self, record: AskDetail) {
+        self.history_gap = None;
+        // An ask open now is not history: a stale listing must not show it
+        // twice.
+        if self.summary(&record.summary.request_id).is_some() {
+            return;
+        }
+        self.on_departed(record);
+    }
+
+    /// The history listing failed; the next ledger change asks again.
+    pub fn on_history_failed(&mut self, error: String) {
+        self.history_gap = Some(error);
+        self.history_wanted = true;
+    }
+
+    /// Why the answered rows may be missing, or `None` when the history was
+    /// read.
+    pub fn history_gap(&self) -> Option<&str> {
+        self.history_gap.as_deref()
+    }
+
     /// The connection was replaced: reads still running belong to it and
     /// are discarded by the drain, so none count as running now. The open
     /// set stays until the new connection's listing replaces it.
     pub fn on_connection_changed(&mut self) {
         self.reading.clear();
         self.synced = false;
+        self.history_wanted = true;
     }
 }
 
@@ -305,6 +369,12 @@ pub enum Decision {
     AllowAlways,
     /// `d` — deny.
     Deny,
+    /// `c` — allow, and remember the exact text for the performing
+    /// character.
+    AllowCharacter,
+    /// `C` — allow, and remember the command family for the performing
+    /// character.
+    AllowCharacterFamily,
 }
 
 impl Decision {
@@ -315,6 +385,8 @@ impl Decision {
             Self::AllowOnce => "allow once",
             Self::AllowAlways => "allow always",
             Self::Deny => "deny",
+            Self::AllowCharacter => "allow for the performer",
+            Self::AllowCharacterFamily => "allow the family for the performer",
         }
     }
 
@@ -330,6 +402,20 @@ impl Decision {
                 }),
             ),
             Self::Deny => (AskVerdict::Deny, None),
+            Self::AllowCharacter => (
+                AskVerdict::Allow,
+                Some(Remember {
+                    scope: RememberScope::Character,
+                    family: false,
+                }),
+            ),
+            Self::AllowCharacterFamily => (
+                AskVerdict::Allow,
+                Some(Remember {
+                    scope: RememberScope::Character,
+                    family: true,
+                }),
+            ),
         }
     }
 }
@@ -347,16 +433,19 @@ pub struct AskDecisionRequested {
 /// a refused write is never a silent nothing (`docs/tui.md`, "Asks").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecisionOutcome {
-    /// The ledger took it; the push that closes the ask follows. `unlearned`
-    /// says why a requested standing rule was not written — the answer
-    /// stands either way.
-    Accepted { unlearned: Option<String> },
+    /// The ledger took it; the push that closes the ask follows. `remembered`
+    /// is what the kernel said of a requested standing rule, learned or not
+    /// — the answer stands either way. `None` when no rule was requested.
+    Accepted { remembered: Option<RememberResult> },
     /// Another answer, an expiry, or a cancellation got there first — a race
     /// lost to another surface, which the ledger's claim makes normal rather
     /// than exceptional.
     AlreadyDecided,
     /// The ledger declined, or the call could not be made at all.
     Failed(String),
+    /// A second key on an ask whose first answer is still on its way. Nothing
+    /// was sent.
+    AlreadySent,
 }
 
 /// The asks this app has sent a decision for and not yet heard back about.
@@ -382,6 +471,83 @@ impl DecisionsInFlight {
     pub fn contains(&self, request_id: &str) -> bool {
         self.0.contains(request_id)
     }
+
+    /// A new connection owns no answers in flight: the old one's replies
+    /// will not clear their entries, and a held entry would swallow every
+    /// later key on that ask.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Who a reassignment hands an ask to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reassign {
+    /// `e` — the next reviewer in the kernel's escalation walk.
+    Escalate,
+    /// `t` — the player itself.
+    TakeOver(PrincipalId),
+}
+
+impl Reassign {
+    /// The target `escalate_ask` takes: `None` is the kernel's walk.
+    pub fn target(self) -> Option<PrincipalId> {
+        match self {
+            Self::Escalate => None,
+            Self::TakeOver(me) => Some(me),
+        }
+    }
+}
+
+/// A surface asks the kernel to hand an ask to another reviewer. Like
+/// [`AskDecisionRequested`], the surface changes nothing itself: the ledger
+/// push carries the new reviewer.
+#[derive(Message, Debug, Clone)]
+pub struct AskReassignRequested {
+    pub request_id: String,
+    pub reassign: Reassign,
+}
+
+/// How the kernel answered a reassignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReassignOutcome {
+    /// The ledger took it; `reviewer` is the name it now records.
+    Accepted { reviewer: String },
+    /// The ledger declined (a claimed ask, an archived context, a performer
+    /// as target), or the call could not be made. The kernel's words.
+    Failed(String),
+    /// A second key on an ask whose first answer is still on its way.
+    AlreadySent,
+}
+
+/// One finished reassignment, for a surface to turn into a notice.
+#[derive(Message, Debug, Clone)]
+pub struct AskReassignSettled {
+    pub request_id: String,
+    pub reassign: Reassign,
+    pub outcome: ReassignOutcome,
+}
+
+/// Read one `escalate_ask` reply into an outcome. A lost race and every
+/// other refusal carry the kernel's message.
+pub fn classify_reassign(reply: Result<kaijutsu_client::AskAnswer, String>) -> ReassignOutcome {
+    match reply {
+        Ok(Ok(answered)) => ReassignOutcome::Accepted {
+            reviewer: answered
+                .summary
+                .reviewer
+                .map(|who| {
+                    if who.name.is_empty() {
+                        who.id.short()
+                    } else {
+                        who.name
+                    }
+                })
+                .unwrap_or_else(|| "nobody".to_string()),
+        },
+        Ok(Err(failure)) => ReassignOutcome::Failed(failure.message),
+        Err(error) => ReassignOutcome::Failed(error),
+    }
 }
 
 /// One finished decision, for a surface to turn into a notice.
@@ -397,10 +563,7 @@ pub struct AskDecisionSettled {
 pub fn classify_answer(reply: Result<kaijutsu_client::AskAnswer, String>) -> DecisionOutcome {
     match reply {
         Ok(Ok(answered)) => DecisionOutcome::Accepted {
-            unlearned: answered
-                .remembered
-                .filter(|result| !result.learned)
-                .map(|result| result.note),
+            remembered: answered.remembered,
         },
         Ok(Err(failure)) if failure.kind == AskAnswerFailureKind::AlreadyAnswered => {
             DecisionOutcome::AlreadyDecided
@@ -435,6 +598,10 @@ enum ReadKind {
     Open,
     /// An ask that left it.
     Departed,
+    /// A closed ask from the history listing.
+    History,
+    /// The history listing itself failed; `request_id` is empty.
+    HistoryFailed,
 }
 
 /// One finished record read, tagged with the connection it ran on.
@@ -485,6 +652,34 @@ impl DecisionChannel {
     }
 }
 
+/// One finished reassignment on its way back from the task that made it.
+struct ReassignResult {
+    request_id: String,
+    reassign: Reassign,
+    outcome: ReassignOutcome,
+}
+
+/// Drain-once channel for finished reassignments.
+#[derive(Resource)]
+struct ReassignChannel {
+    tx: crossbeam_channel::Sender<ReassignResult>,
+    rx: crossbeam_channel::Receiver<ReassignResult>,
+}
+
+impl ReassignChannel {
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Self { tx, rx }
+    }
+}
+
+/// A new ask landed in the open set while this app was already watching it.
+/// The window asks for attention on it (`request_window_attention`).
+#[derive(Message, Debug, Clone)]
+pub struct AskArrived {
+    pub request_id: String,
+}
+
 /// The ledger mirror, the decision write path, and the systems that keep
 /// them current. Add after `ActorPlugin`: these systems read `RpcActor`, and
 /// every renderer that reads [`LedgerMirror`] needs the resource to exist.
@@ -495,9 +690,14 @@ impl Plugin for LedgerMirrorPlugin {
         app.init_resource::<LedgerMirror>()
             .insert_resource(LedgerReadChannel::new())
             .insert_resource(DecisionChannel::new())
+            .insert_resource(ReassignChannel::new())
             .init_resource::<DecisionsInFlight>()
             .add_message::<AskDecisionRequested>()
             .add_message::<AskDecisionSettled>()
+            .add_message::<AskReassignRequested>()
+            .add_message::<AskReassignSettled>()
+            .add_message::<AskArrived>()
+            .add_message::<WindowAttentionWanted>()
             .add_message::<AskLeft>()
             .add_systems(
                 Update,
@@ -506,6 +706,10 @@ impl Plugin for LedgerMirrorPlugin {
                     drain_ledger_reads,
                     start_ask_decisions,
                     drain_ask_decisions,
+                    start_ask_reassignments,
+                    drain_ask_reassignments,
+                    gate_window_attention,
+                    flash_window,
                 )
                     .chain()
                     // Before the surfaces derive their state, so an ask that
@@ -537,11 +741,11 @@ fn start_ask_decisions(
     } in requests.read()
     {
         if in_flight.contains(request_id) {
-            log::debug!(
-                "ignoring {} on ask {}: a decision is already in flight",
-                decision.label(),
-                short_request_id(request_id)
-            );
+            settled.write(AskDecisionSettled {
+                request_id: request_id.clone(),
+                decision: *decision,
+                outcome: DecisionOutcome::AlreadySent,
+            });
             continue;
         }
         let Some(actor) = actor.as_ref().filter(|_| conn.connected) else {
@@ -604,6 +808,148 @@ fn drain_ask_decisions(
     }
 }
 
+/// Carry each requested reassignment to the kernel. Shares
+/// [`DecisionsInFlight`] with decisions: an ask being answered is not also
+/// being handed on.
+fn start_ask_reassignments(
+    actor: Option<Res<RpcActor>>,
+    conn: Res<RpcConnectionState>,
+    channel: Res<ReassignChannel>,
+    mut in_flight: ResMut<DecisionsInFlight>,
+    mut requests: MessageReader<AskReassignRequested>,
+    mut settled: MessageWriter<AskReassignSettled>,
+) {
+    for AskReassignRequested {
+        request_id,
+        reassign,
+    } in requests.read()
+    {
+        if in_flight.contains(request_id) {
+            settled.write(AskReassignSettled {
+                request_id: request_id.clone(),
+                reassign: *reassign,
+                outcome: ReassignOutcome::AlreadySent,
+            });
+            continue;
+        }
+        let Some(actor) = actor.as_ref().filter(|_| conn.connected) else {
+            settled.write(AskReassignSettled {
+                request_id: request_id.clone(),
+                reassign: *reassign,
+                outcome: ReassignOutcome::Failed("no live connection".to_string()),
+            });
+            continue;
+        };
+        in_flight.begin(request_id);
+        let handle = actor.handle.clone();
+        let tx = channel.tx.clone();
+        let request_id = request_id.clone();
+        let reassign = *reassign;
+        let target = reassign.target();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                let reply = handle
+                    .escalate_ask(request_id.clone(), target)
+                    .await
+                    .map_err(|e| format!("{e}"));
+                let _ = tx.send(ReassignResult {
+                    request_id,
+                    reassign,
+                    outcome: classify_reassign(reply),
+                });
+            })
+            .detach();
+    }
+}
+
+/// Publish finished reassignments, and free each ask for another key.
+fn drain_ask_reassignments(
+    channel: Res<ReassignChannel>,
+    mut in_flight: ResMut<DecisionsInFlight>,
+    mut settled: MessageWriter<AskReassignSettled>,
+    event_loop_proxy: Option<Res<EventLoopProxyWrapper>>,
+) {
+    let mut any = false;
+    for result in channel.rx.try_iter() {
+        any = true;
+        in_flight.end(&result.request_id);
+        if let ReassignOutcome::Failed(detail) = &result.outcome {
+            log::warn!(
+                "reassigning ask {} failed: {detail}",
+                short_request_id(&result.request_id)
+            );
+        }
+        settled.write(AskReassignSettled {
+            request_id: result.request_id,
+            reassign: result.reassign,
+            outcome: result.outcome,
+        });
+    }
+    if any && let Some(proxy) = event_loop_proxy {
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
+    }
+}
+
+/// Whether an arrival should pull the window's attention: only while the
+/// window is not focused. An ask that lands in front of the player is
+/// already seen.
+pub fn wants_attention(arrivals: usize, focused: bool) -> bool {
+    arrivals > 0 && !focused
+}
+
+/// The window should ask the window manager for attention: an ask arrived
+/// while it is unfocused.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct WindowAttentionWanted(pub Entity);
+
+/// Decide whether arrivals pull the window's attention. Pure of winit, so
+/// the gate is testable without a window system.
+fn gate_window_attention(
+    mut arrived: MessageReader<AskArrived>,
+    windows: Query<(Entity, &Window), With<bevy::window::PrimaryWindow>>,
+    mut wanted: MessageWriter<WindowAttentionWanted>,
+) {
+    let mut arrivals = 0;
+    for AskArrived { request_id } in arrived.read() {
+        log::debug!("ask {} arrived", short_request_id(request_id));
+        arrivals += 1;
+    }
+    for (entity, window) in windows.iter() {
+        if wants_attention(arrivals, window.focused) {
+            wanted.write(WindowAttentionWanted(entity));
+        }
+    }
+}
+
+/// Ask the window manager to flag the window — the app's counterpart of the
+/// TUI's desktop notification.
+///
+/// Bevy's `Window` has no attention request, so this reaches the winit window
+/// through `WINIT_WINDOWS`, which is main-thread data (`NonSendMarker`). A
+/// window the table does not hold (a headless or test app) or a table that is
+/// borrowed is skipped, never a panic.
+fn flash_window(
+    mut wanted: MessageReader<WindowAttentionWanted>,
+    _main_thread: bevy::ecs::system::NonSendMarker,
+) {
+    for WindowAttentionWanted(entity) in wanted.read() {
+        let _ = bevy::winit::WINIT_WINDOWS.try_with(|cell| {
+            let Ok(winit_windows) = cell.try_borrow() else {
+                return;
+            };
+            let Some(winit_window) = winit_windows
+                .entity_to_winit
+                .get(entity)
+                .and_then(|id| winit_windows.windows.get(id))
+            else {
+                return;
+            };
+            // `None` would clear a request; `Default` is `Informational`.
+            winit_window.request_user_attention(Some(Default::default()));
+        });
+    }
+}
+
 /// Follow the actor's ledger watch: fold each new value into the mirror and
 /// start the record reads it calls for.
 ///
@@ -615,11 +961,14 @@ fn follow_ledger(
     channel: Res<LedgerReadChannel>,
     mut mirror: ResMut<LedgerMirror>,
     mut receiver: Local<Option<watch::Receiver<LedgerState>>>,
+    mut arrived: MessageWriter<AskArrived>,
+    mut in_flight: ResMut<DecisionsInFlight>,
     event_loop_proxy: Res<EventLoopProxyWrapper>,
 ) {
     let Some(actor) = actor else { return };
 
     if actor.is_changed() {
+        in_flight.clear();
         let mut rx = actor.handle.ledger();
         // The value already in the watch has not been folded in yet.
         rx.mark_changed();
@@ -640,6 +989,12 @@ fn follow_ledger(
     let state = rx.borrow_and_update().clone();
     let diff = mirror.apply_state(&state);
     let reads = mirror.take_reads();
+    let seed_history = mirror.take_history_read();
+    for id in diff.announced() {
+        arrived.write(AskArrived {
+            request_id: id.clone(),
+        });
+    }
 
     let generation = actor.generation;
     let connection_epoch = actor.handle.connection_epoch();
@@ -667,6 +1022,42 @@ fn follow_ledger(
     }
     for id in reads {
         spawn_read(ReadKind::Open, id);
+    }
+    if seed_history {
+        let handle = actor.handle.clone();
+        let tx = channel.tx.clone();
+        let send = move |kind: ReadKind, request_id: String, result| {
+            let _ = tx.send(LedgerRead {
+                generation,
+                connection_epoch,
+                kind,
+                request_id,
+                result,
+            });
+        };
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                let filter = kaijutsu_types::AskFilter {
+                    view: kaijutsu_types::AskView::History,
+                    limit: Some(RECENT_CAP as u32),
+                    ..Default::default()
+                };
+                let listing = match handle.list_asks(filter).await {
+                    Ok(listing) => listing,
+                    Err(e) => {
+                        send(ReadKind::HistoryFailed, String::new(), Err(format!("{e}")));
+                        return;
+                    }
+                };
+                for ask in listing.asks {
+                    let result = handle
+                        .get_ask(ask.request_id.clone())
+                        .await
+                        .map_err(|e| format!("{e}"));
+                    send(ReadKind::History, ask.request_id, result);
+                }
+            })
+            .detach();
     }
     if !diff.is_empty() {
         let _ = event_loop_proxy.send_event(WinitUserEvent::WakeUp);
@@ -717,6 +1108,19 @@ fn drain_ledger_reads(
                     log::warn!("reading ask {short} failed: {error}");
                 }
                 mirror.on_record(&read.request_id, read.result);
+            }
+            ReadKind::History => match read.result {
+                Ok(Some(record)) => mirror.on_history(record),
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!("reading history ask {short} failed: {error}");
+                    mirror.on_history_failed(format!("ask {short}: {error}"));
+                }
+            },
+            ReadKind::HistoryFailed => {
+                let error = read.result.err().unwrap_or_default();
+                log::warn!("listing ledger history failed: {error}");
+                mirror.on_history_failed(error);
             }
             ReadKind::Departed => {
                 let record = match read.result {
@@ -946,11 +1350,13 @@ mod tests {
     #[test]
     fn recent_is_capped_and_keeps_the_newest() {
         let mut mirror = LedgerMirror::default();
-        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
-            mirror.on_departed(closed(id, Some(i as i64)));
+        for i in 0..25 {
+            mirror.on_departed(closed(&format!("ask{i:02}"), Some(i)));
         }
-        assert_eq!(recent_ids(&mirror), ids(&["d", "c", "b"]));
         assert_eq!(mirror.recent().len(), RECENT_CAP);
+        assert_eq!(RECENT_CAP, 20, "the TUI lists the last 20 answered asks");
+        assert_eq!(recent_ids(&mirror)[0], "ask24");
+        assert_eq!(recent_ids(&mirror)[19], "ask05");
     }
 
     // ── reads ──
@@ -1004,12 +1410,18 @@ mod tests {
     fn an_answer_the_ledger_took_is_accepted() {
         assert_eq!(
             classify_answer(Ok(answered(None))),
-            DecisionOutcome::Accepted { unlearned: None }
+            DecisionOutcome::Accepted { remembered: None }
         );
-        let learned = RememberResult { learned: true, note: "learned".into() };
+    }
+
+    /// The kernel's note on a rule it learned is the player's proof of what
+    /// was written; dropping it leaves `c` answering in silence.
+    #[test]
+    fn a_learned_rule_keeps_the_kernels_note() {
+        let learned = RememberResult { learned: true, note: "git push origin main".into() };
         assert_eq!(
-            classify_answer(Ok(answered(Some(learned)))),
-            DecisionOutcome::Accepted { unlearned: None }
+            classify_answer(Ok(answered(Some(learned.clone())))),
+            DecisionOutcome::Accepted { remembered: Some(learned) }
         );
     }
 
@@ -1020,7 +1432,9 @@ mod tests {
         let unlearned = RememberResult { learned: false, note: "compound statement".into() };
         assert_eq!(
             classify_answer(Ok(answered(Some(unlearned)))),
-            DecisionOutcome::Accepted { unlearned: Some("compound statement".into()) }
+            DecisionOutcome::Accepted {
+                remembered: Some(RememberResult { learned: false, note: "compound statement".into() })
+            }
         );
     }
 
@@ -1064,7 +1478,185 @@ mod tests {
     }
 
     #[test]
-    fn allow_always_is_the_only_option_that_remembers() {
+    fn the_character_keys_remember_for_the_performer_not_everywhere() {
+        assert_eq!(
+            Decision::AllowCharacter.answer(),
+            (
+                AskVerdict::Allow,
+                Some(Remember { scope: RememberScope::Character, family: false })
+            )
+        );
+        assert_eq!(
+            Decision::AllowCharacterFamily.answer(),
+            (
+                AskVerdict::Allow,
+                Some(Remember { scope: RememberScope::Character, family: true })
+            )
+        );
+    }
+
+    #[test]
+    fn a_takeover_names_the_player_and_an_escalation_names_nobody() {
+        let me = PrincipalId::from_bytes([7; 16]);
+        assert_eq!(Reassign::TakeOver(me).target(), Some(me));
+        assert_eq!(Reassign::Escalate.target(), None);
+    }
+
+    #[test]
+    fn an_accepted_reassignment_names_the_new_reviewer() {
+        let mut summary = ask("a", None, 1);
+        summary.reviewer = Some(PrincipalRef { id: PrincipalId::from_bytes([3; 16]), name: "banto".into() });
+        let reply: kaijutsu_client::AskAnswer = Ok(AskAnswered { summary, remembered: None });
+        assert_eq!(
+            classify_reassign(Ok(reply)),
+            ReassignOutcome::Accepted { reviewer: "banto".into() }
+        );
+        assert_eq!(
+            classify_reassign(Ok(refused(AskAnswerFailureKind::Refused, "performer cannot review"))),
+            ReassignOutcome::Failed("performer cannot review".into())
+        );
+        assert_eq!(
+            classify_reassign(Err("no link".into())),
+            ReassignOutcome::Failed("no link".into())
+        );
+    }
+
+    // ── history and arrivals ──
+
+    #[test]
+    fn history_is_read_once_per_connection_after_the_open_set_syncs() {
+        let mut mirror = LedgerMirror::default();
+        mirror.on_connection_changed();
+        assert!(!mirror.take_history_read(), "not before the open set is synced");
+        mirror.apply_state(&state(&[], 1));
+        assert!(mirror.take_history_read());
+        assert!(!mirror.take_history_read(), "once per connection");
+        mirror.on_connection_changed();
+        mirror.apply_state(&state(&[], 2));
+        assert!(mirror.take_history_read(), "a new connection lists again");
+    }
+
+    #[test]
+    fn a_failed_history_listing_is_named_and_asked_for_again() {
+        let mut mirror = LedgerMirror::default();
+        mirror.on_connection_changed();
+        mirror.apply_state(&state(&[], 1));
+        assert!(mirror.take_history_read());
+        mirror.on_history_failed("timed out".into());
+        assert_eq!(mirror.history_gap(), Some("timed out"));
+        assert!(mirror.take_history_read());
+        mirror.on_history(closed("a", Some(1)));
+        assert_eq!(mirror.history_gap(), None);
+    }
+
+    #[test]
+    fn history_rows_join_recent_without_doubling_a_departure() {
+        let mut mirror = LedgerMirror::default();
+        mirror.on_departed(closed("a", Some(10)));
+        mirror.on_history(closed("a", Some(10)));
+        mirror.on_history(closed("b", Some(20)));
+        assert_eq!(recent_ids(&mirror), ids(&["b", "a"]));
+    }
+
+    #[test]
+    fn a_listing_still_open_is_not_history() {
+        let mut mirror = LedgerMirror::default();
+        mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        mirror.on_history(closed("a", Some(10)));
+        assert!(mirror.recent().is_empty());
+    }
+
+    /// The first listing is not news; an ask arriving after it is.
+    #[test]
+    fn only_arrivals_after_the_first_listing_are_announced() {
+        let mut mirror = LedgerMirror::default();
+        let first = mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert!(!first.announce);
+        assert_eq!(first.arrived, ids(&["a"]));
+        let next = mirror.apply_state(&state(&[ask("a", None, 1), ask("b", None, 2)], 2));
+        assert!(next.announce);
+        assert_eq!(next.arrived, ids(&["b"]));
+    }
+
+    /// A reconnect relists the whole open set; only ids this app had not
+    /// held are news.
+    #[test]
+    fn a_reconnect_announces_only_the_ids_it_had_not_held() {
+        let mut mirror = LedgerMirror::default();
+        let first = mirror.apply_state(&state(&[ask("a", None, 1)], 1));
+        assert!(first.announced().is_empty(), "the first listing is silent");
+        mirror.on_connection_changed();
+        let relist = mirror.apply_state(&state(&[ask("a", None, 1), ask("c", None, 3)], 5));
+        assert_eq!(relist.announced(), ids(&["c"]).as_slice());
+        let quiet = mirror.apply_state(&state(&[ask("a", None, 1), ask("c", None, 3)], 6));
+        assert!(quiet.announced().is_empty());
+    }
+
+    /// The gate system: an arrival flags the primary window only while it is
+    /// not focused.
+    #[test]
+    fn an_arrival_flags_only_an_unfocused_window() {
+        for (focused, flags) in [(false, 1usize), (true, 0)] {
+            let mut app = App::new();
+            app.add_message::<AskArrived>()
+                .add_message::<WindowAttentionWanted>()
+                .add_systems(Update, gate_window_attention);
+            let window = app
+                .world_mut()
+                .spawn((Window { focused, ..Default::default() }, bevy::window::PrimaryWindow))
+                .id();
+            app.world_mut().write_message(AskArrived { request_id: "a-b".into() });
+            app.update();
+            let wanted: Vec<Entity> = app
+                .world()
+                .resource::<Messages<WindowAttentionWanted>>()
+                .iter_current_update_messages()
+                .map(|w| w.0)
+                .collect();
+            assert_eq!(wanted.len(), flags, "focused={focused}");
+            if flags == 1 {
+                assert_eq!(wanted[0], window);
+            }
+        }
+        // No arrival, no flag, even unfocused.
+        let mut app = App::new();
+        app.add_message::<AskArrived>()
+            .add_message::<WindowAttentionWanted>()
+            .add_systems(Update, gate_window_attention);
+        app.world_mut()
+            .spawn((Window { focused: false, ..Default::default() }, bevy::window::PrimaryWindow));
+        app.update();
+        assert!(app.world().resource::<Messages<WindowAttentionWanted>>().is_empty());
+    }
+
+    /// With no winit window in the table, flashing is a quiet no-op.
+    #[test]
+    fn flashing_a_window_the_table_does_not_hold_does_not_panic() {
+        let mut app = App::new();
+        app.add_message::<WindowAttentionWanted>().add_systems(Update, flash_window);
+        let e = app.world_mut().spawn_empty().id();
+        app.world_mut().write_message(WindowAttentionWanted(e));
+        app.update();
+    }
+
+    #[test]
+    fn a_new_connection_frees_every_ask_held_in_flight() {
+        let mut in_flight = DecisionsInFlight::default();
+        assert!(in_flight.begin("a"));
+        in_flight.clear();
+        assert!(!in_flight.contains("a"));
+        assert!(in_flight.begin("a"));
+    }
+
+    #[test]
+    fn attention_is_wanted_only_for_an_arrival_while_unfocused() {
+        assert!(wants_attention(1, false));
+        assert!(!wants_attention(1, true));
+        assert!(!wants_attention(0, false));
+    }
+
+    #[test]
+    fn allow_always_is_the_only_global_option() {
         assert_eq!(Decision::AllowOnce.answer(), (AskVerdict::Allow, None));
         assert_eq!(Decision::Deny.answer(), (AskVerdict::Deny, None));
         assert_eq!(
@@ -1132,8 +1724,11 @@ mod tests {
         app.update();
         assert_eq!(
             settled(&mut app),
-            vec![("b".to_string(), DecisionOutcome::Failed("no live connection".into()))],
-            "the in-flight ask is ignored; another is still answered"
+            vec![
+                ("a".to_string(), DecisionOutcome::AlreadySent),
+                ("b".to_string(), DecisionOutcome::Failed("no live connection".into())),
+            ],
+            "the in-flight ask is refused with a notice; another is still answered"
         );
     }
 
