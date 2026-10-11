@@ -141,7 +141,19 @@ The contract everything else is tested against:
 
 - `apply_keys(&str) -> Vec<EditOp>` — feed a key sequence in modalkit/vim
   notation (`"idata<Esc>"`, `"2dd"`); returns the `(char_offset, insert,
-  delete)` edit-ops the keystrokes produced.
+  delete)` edit-ops the keystrokes produced. Named keys: `<Esc>`, `<CR>`,
+  `<BS>`, `<Tab>`, `<Space>`, `<Del>` (or `<Delete>`), `<Left>`, `<Right>`,
+  `<Up>`, `<Down>`, `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, and `<C-x>`
+  chords, case-insensitive. A literal `<` is `<lt>` (`<lt><lt>` is `<<`). A bare
+  `<` opens a token that runs to the next `>`. An unknown `<foo>` is skipped.
+  An unterminated `<` runs to the end of the input, so the rest of the batch
+  is dropped, including a closing `<Esc>`. `<PageUp>`/`<PageDown>` (and `<C-b>`/`<C-f>` in
+  normal and visual mode, `<C-u>`/`<C-d>` for half a page) move the cursor 24
+  lines (12 for half a page), multiplied by a count. A page key keeps the column,
+  clamped to the last character, or to the end of the line in insert mode. It
+  extends a visual selection. After an operator it cancels the operator, as in
+  vim. In insert mode `<C-d>` and `<C-u>` are not scrolls. The core has no
+  window, so `H`, `M` and `L` see an empty one.
 - `apply_remote_text(new_text) -> bool` — reconcile the buffer to the block's
   *merged* truth and transform the local cursor against the single-region diff
   (edit-before shifts, edit-after leaves, straddle lands at the replacement

@@ -286,12 +286,13 @@ fn strip_line(state: &EditorState, palette: &Palette) -> (Line<'static>, Option<
 /// Translate one crossterm key into the kernel's vi notation, or `None` for a
 /// key the notation cannot express.
 ///
-/// The vocabulary is `kaijutsu-editor`'s `parse_keys`: a literal char, `<Esc>`,
-/// `<CR>`, `<BS>`, `<Tab>`, a bare space, and `<C-x>` chords. An arrow or a
+/// The vocabulary is `kaijutsu-editor`'s `parse_keys`: a literal char, `<lt>`
+/// for `<`, `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<Del>`, the arrows, `<Home>`,
+/// `<End>`, `<PageUp>`, `<PageDown>`, a bare space, and `<C-x>` chords. A
 /// function key has no token, and `parse_keys` silently drops an unknown one,
-/// so it is refused here instead of being sent and swallowed. A literal `<`
-/// would open a token, and `parse_keys` has no `<lt>` escape, so it is refused
-/// too rather than corrupting the buffer.
+/// so it is refused here instead of being sent and swallowed. So is a
+/// navigation key with Ctrl, Alt or Shift held: the bare token would be a
+/// different key.
 pub fn key_notation(key: &KeyEvent) -> Option<String> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let named = match key.code {
@@ -304,6 +305,22 @@ pub fn key_notation(key: &KeyEvent) -> Option<String> {
     if let Some(n) = named {
         return Some(n.to_string());
     }
+    let navigation = match key.code {
+        KeyCode::Left => Some("<Left>"),
+        KeyCode::Right => Some("<Right>"),
+        KeyCode::Up => Some("<Up>"),
+        KeyCode::Down => Some("<Down>"),
+        KeyCode::Home => Some("<Home>"),
+        KeyCode::End => Some("<End>"),
+        KeyCode::PageUp => Some("<PageUp>"),
+        KeyCode::PageDown => Some("<PageDown>"),
+        KeyCode::Delete => Some("<Del>"),
+        _ => None,
+    };
+    if let Some(n) = navigation {
+        let held = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+        return (!key.modifiers.intersects(held)).then(|| n.to_string());
+    }
     let KeyCode::Char(c) = key.code else {
         return None;
     };
@@ -311,7 +328,7 @@ pub fn key_notation(key: &KeyEvent) -> Option<String> {
         return Some(format!("<C-{}>", c.to_ascii_lowercase()));
     }
     if c == '<' {
-        return None;
+        return Some("<lt>".to_string());
     }
     Some(c.to_string())
 }
@@ -779,13 +796,34 @@ mod tests {
         assert_eq!(key_notation(&key).as_deref(), Some("<C-w>"));
     }
 
+    #[test]
+    fn navigation_keys_and_less_than_have_tokens() {
+        for (code, want) in [
+            (KeyCode::Left, "<Left>"),
+            (KeyCode::Right, "<Right>"),
+            (KeyCode::Up, "<Up>"),
+            (KeyCode::Down, "<Down>"),
+            (KeyCode::Home, "<Home>"),
+            (KeyCode::End, "<End>"),
+            (KeyCode::PageUp, "<PageUp>"),
+            (KeyCode::PageDown, "<PageDown>"),
+            (KeyCode::Delete, "<Del>"),
+            (KeyCode::Char('<'), "<lt>"),
+        ] {
+            assert_eq!(key_notation(&press(code)).as_deref(), Some(want));
+        }
+    }
+
     /// `parse_keys` drops an unknown `<...>` token silently, so a key with no
     /// token is refused here rather than sent and swallowed.
     #[test]
     fn keys_the_notation_cannot_express_are_refused() {
-        assert_eq!(key_notation(&press(KeyCode::Left)), None);
         assert_eq!(key_notation(&press(KeyCode::F(3))), None);
-        assert_eq!(key_notation(&press(KeyCode::Char('<'))), None);
+        assert_eq!(key_notation(&press(KeyCode::Insert)), None);
+        // A modified navigation key is a different key in vim (`<C-Left>`).
+        for mods in [KeyModifiers::CONTROL, KeyModifiers::ALT, KeyModifiers::SHIFT] {
+            assert_eq!(key_notation(&KeyEvent::new(KeyCode::Left, mods)), None);
+        }
     }
 
     // ── session-lost verdict ────────────────────────────────────────────────

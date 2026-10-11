@@ -451,8 +451,7 @@ Rules the figure carries:
   is `edit_input`'s `(pos, insert, delete)` addressing exactly, so one
   keystroke is one `edit_input` and nothing translates between the two. Keys
   reach it as `crossterm::event::KeyEvent` through
-  `EditorCore::apply_key_event` — the vim-notation string cannot carry a
-  literal `<`.
+  `EditorCore::apply_key_event`.
 - **The key path never waits on the kernel.** The screen draws the local
   buffer as soon as the loop has read every key waiting, not on the next
   80 ms tick. Each `edit_input` goes on the draft outbox
@@ -521,9 +520,9 @@ Rules the figure carries:
   newline inside it is a newline in the draft, never an Enter that submits
   the first line. The `:` bar takes it flattened onto one line. An open
   editor session takes it as one `editorInsert` call at the cursor, leaving
-  the session's mode untouched — the editor's `editor_keys` notation cannot
-  carry a literal `<`, so a paste there rides its own wire method instead
-  of forwarding as keys. While the editor's own `:` line is open the tui
+  the session's mode untouched — a paste there rides its own wire method
+  (`editorInsert`) instead of forwarding as keys, so arbitrary text lands
+  without being read as notation. While the editor's own `:` line is open the tui
   refuses with a notice, since the strip draws that line in preference to
   the kernel's refusal message. The picker, the ledger, an armed ask card
   and a frozen diff refuse it with a notice — none of them is wired for one. Line
@@ -1187,10 +1186,11 @@ it was opened in and shows the target as it was left; returning restores it.
 A parked editor session still takes its state pushes, and one closed while
 parked leaves the conversation. A terminal connection loss drops every
 parked surface. The
-notation `kaijutsu-editor`'s `parse_keys` accepts is a literal char, `<Esc>`,
-`<CR>`, `<BS>`, `<Tab>`, a space, and `<C-x>`; an arrow, a function key and a
-literal `<` have no token, and are refused rather than sent and silently
-dropped.
+notation `kaijutsu-editor`'s `parse_keys` accepts is a literal char, `<lt>`
+(a literal `<`), `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<Del>`, `<Left>`,
+`<Right>`, `<Up>`, `<Down>`, `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, a
+space, and `<C-x>`; a function key, and a navigation key held with Ctrl, Alt
+or Shift, have no token and are refused rather than sent and silently dropped.
 
 **Keys never wait on the kernel.** They go on the editor outbox
 (`crate::editor_outbox`): one writer keeps one call in flight, and the keys

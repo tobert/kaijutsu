@@ -18,7 +18,8 @@
 use editor_types::application::EmptyInfo;
 use editor_types::context::EditContext;
 use editor_types::prelude::{
-    CloseFlags, EditTarget, RepeatType, SearchType, TargetShape, ViewportContext,
+    CloseFlags, EditTarget, MoveDir2D, RepeatType, ScrollSize, ScrollStyle, SearchType, TargetShape,
+    ViewportContext,
 };
 use editor_types::{
     Action, CommandBarAction, CursorAction, EditorAction, PromptAction, WindowAction,
@@ -360,8 +361,8 @@ impl EditorCore {
     }
 
     /// Feed one already-decoded terminal key — the seam a crossterm client
-    /// uses instead of [`apply_keys`](Self::apply_keys)'s vim-notation string,
-    /// which cannot carry a literal `<`. `KeyEvent` here is
+    /// uses instead of [`apply_keys`](Self::apply_keys)'s vim-notation string
+    /// (which spells a literal `<` as `<lt>`). `KeyEvent` here is
     /// `modalkit::crossterm::event::KeyEvent`, so a crossterm frontend passes
     /// its own event through unchanged.
     ///
@@ -486,6 +487,12 @@ impl EditorCore {
                         CloseRequest::Discard
                     });
                 }
+                // `<PageUp>`/`<PageDown>` (and `<C-b>`/`<C-f>`/`<C-u>`/`<C-d>`):
+                // no window scrolls here, so the cursor moves by the same
+                // number of lines.
+                Action::Scroll(ScrollStyle::Direction2D(dir, size, _)) if !self.cmdline_active => {
+                    self.scroll_cursor(dir, size, &ctx);
+                }
                 _ => {}
             }
         }
@@ -499,6 +506,34 @@ impl EditorCore {
             ops.push(op);
         }
         ops
+    }
+
+    /// Move the cursor a page or half page up or down, keeping the column
+    /// where the target line is long enough. Other scrolls do nothing: the
+    /// editor has no window to scroll.
+    fn scroll_cursor(&mut self, dir: MoveDir2D, size: ScrollSize, ctx: &EditContext) {
+        let page = SCROLL_PAGE_LINES;
+        let lines = match size {
+            ScrollSize::Page => page,
+            ScrollSize::HalfPage => page.div_ceil(2),
+            _ => return,
+        } * ctx.get_count().unwrap_or(1);
+        let text = self.text();
+        let last = text.split('\n').count().saturating_sub(1);
+        let (line, col) = line_col(&text, self.cursor());
+        let target = match dir {
+            MoveDir2D::Down => line.saturating_add(lines).min(last),
+            MoveDir2D::Up => line.saturating_sub(lines),
+            _ => return,
+        };
+        let width = text.split('\n').nth(target).map_or(0, |l| l.chars().count());
+        // Insert and replace may rest on the end of the line; other modes stop
+        // on the last character.
+        let past_end = self
+            .mode()
+            .is_some_and(|m| m.contains("INSERT") || m.contains("REPLACE"));
+        let max_col = if past_end { width } else { width.saturating_sub(1) };
+        self.buffer.set_leader(self.group, Cursor::new(target, col.min(max_col)));
     }
 
     /// Copy modalkit's current edit sequence into `last_change`, unless it is
@@ -931,6 +966,11 @@ fn selection_spans(
     }
 }
 
+/// Lines in one page for `<PageUp>`/`<PageDown>` and the scroll keys. The core
+/// has no window, so the viewport handed to modalkit stays zero-sized (`H`,
+/// `M`, `L` and `z<CR>` see no window); only `scroll_cursor` uses this.
+const SCROLL_PAGE_LINES: usize = 24;
+
 /// Convert a char offset into a `(line, column)` pair over `text` — the form
 /// modalkit's [`Cursor::new`] wants. Clamps implicitly by stopping at the end.
 fn line_col(text: &str, char_off: usize) -> (usize, usize) {
@@ -949,7 +989,11 @@ fn line_col(text: &str, char_off: usize) -> (usize, usize) {
 
 /// Parse vim key notation into `TerminalKey`s. Literal chars map to themselves;
 /// `<...>` is a named/chorded key (`<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<Space>`,
-/// `<C-x>`). Unknown `<...>` tokens are skipped.
+/// `<C-x>`, `<lt>` for a literal `<`, `<Left>`/`<Right>`/`<Up>`/`<Down>`,
+/// `<Home>`/`<End>`, `<PageUp>`/`<PageDown>`, `<Del>`). A bare `<` always opens
+/// a token that runs to the next `>`. An unknown token is skipped; an
+/// unterminated one runs to the end of the input, so the rest of the batch is
+/// dropped.
 fn parse_keys(s: &str) -> Vec<TerminalKey> {
     let mut keys = Vec::new();
     let mut chars = s.chars().peekable();
@@ -983,6 +1027,16 @@ fn named_key(token: &str) -> Option<TerminalKey> {
         "bs" | "backspace" => (KeyCode::Backspace, KeyModifiers::NONE),
         "tab" => (KeyCode::Tab, KeyModifiers::NONE),
         "space" => (KeyCode::Char(' '), KeyModifiers::NONE),
+        "lt" => (KeyCode::Char('<'), KeyModifiers::NONE),
+        "left" => (KeyCode::Left, KeyModifiers::NONE),
+        "right" => (KeyCode::Right, KeyModifiers::NONE),
+        "up" => (KeyCode::Up, KeyModifiers::NONE),
+        "down" => (KeyCode::Down, KeyModifiers::NONE),
+        "home" => (KeyCode::Home, KeyModifiers::NONE),
+        "end" => (KeyCode::End, KeyModifiers::NONE),
+        "pageup" => (KeyCode::PageUp, KeyModifiers::NONE),
+        "pagedown" => (KeyCode::PageDown, KeyModifiers::NONE),
+        "del" | "delete" => (KeyCode::Delete, KeyModifiers::NONE),
         other => {
             // <C-x> control chord.
             if let Some(rest) = other.strip_prefix("c-") {
@@ -1963,13 +2017,225 @@ baz");
         assert_eq!(ed.text(), "a < b");
     }
 
-    /// Why the seam exists: the vim-notation string reads `<` as the start
-    /// of a `<Esc>`-style token and eats everything up to the next `>`.
+    /// A bare `<` opens a token, so the notation spells a literal one `<lt>`.
     #[test]
-    fn apply_keys_cannot_carry_a_literal_less_than() {
+    fn apply_keys_types_a_literal_less_than_with_lt() {
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("ia <lt> b<Esc>");
+        assert_eq!(ed.text(), "a < b");
+    }
+
+    /// `<lt>` is case-insensitive like every other key name.
+    #[test]
+    fn lt_token_is_case_insensitive() {
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("i<LT><Lt><Esc>");
+        assert_eq!(ed.text(), "<<");
+    }
+
+    /// The `<` operator needs the literal key: `<lt><lt>` is the two-key
+    /// `<<` sequence. (modalkit 0.0.25 stubs the indent edit itself, so the
+    /// buffer does not change; see docs/issues.md.)
+    #[test]
+    fn lt_lt_parses_as_two_less_than_keys() {
+        assert_eq!(parse_keys("<lt><lt>"), vec![plain_key('<'), plain_key('<')]);
+    }
+
+    /// A bare `<` still opens a token: an unterminated one swallows the rest
+    /// and an unknown `<foo>` is skipped, as before.
+    #[test]
+    fn bare_less_than_still_opens_a_token() {
         let mut ed = EditorCore::new("");
         ed.apply_keys("ia < b");
         assert_ne!(ed.text(), "a < b");
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("ia<foo>b<Esc>");
+        assert_eq!(ed.text(), "ab", "an unknown token is skipped");
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("ia<Left");
+        assert_eq!(ed.text(), "a", "an unterminated token is dropped");
+    }
+
+    fn numbered_lines(n: usize) -> String {
+        (0..n).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Insert mode may rest on the end of the line, so a page move keeps that
+    /// column; normal mode clamps to the last character.
+    #[test]
+    fn page_move_in_insert_mode_keeps_the_end_of_line_column() {
+        let text = vec!["abc"; 40].join("\n");
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("A<PageDown>");
+        assert_eq!(line_col(&text, ed.cursor()), (24, 3), "column 3 is the end of \"abc\"");
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("$<PageDown>");
+        assert_eq!(line_col(&text, ed.cursor()), (24, 2), "normal mode stops on the last char");
+    }
+
+    #[test]
+    fn page_down_on_the_last_line_in_insert_mode_stays_put() {
+        let mut ed = EditorCore::new("abc");
+        ed.apply_keys("A<PageDown>");
+        assert_eq!(ed.cursor(), 3, "still at the end of the line");
+    }
+
+    /// Insert mode binds <C-d> to something other than a scroll (modalkit
+    /// leaves insert); only the page keys scroll there.
+    #[test]
+    fn ctrl_d_in_insert_mode_is_not_a_scroll() {
+        let text = numbered_lines(100);
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("A<C-d>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 0);
+    }
+
+    /// vim does not take a scroll key as a motion: `d<C-f>` cancels the
+    /// operator, deletes nothing, and leaves nothing pending.
+    #[test]
+    fn a_scroll_key_cancels_a_pending_operator() {
+        let text = numbered_lines(100);
+        for keys in ["d<C-f>", "d<PageDown>", "y<C-d>", "c<PageDown>"] {
+            let mut ed = EditorCore::new(&text);
+            let ops = ed.apply_keys(keys);
+            assert!(ops.is_empty(), "{keys}: no edit");
+            assert_eq!(ed.text(), text, "{keys}: buffer unchanged");
+            assert_eq!(ed.cursor(), 0, "{keys}: cursor unchanged");
+            assert_eq!(ed.mode(), None, "{keys}: back in normal mode");
+            // The next key is an ordinary command, not an operator's motion.
+            ed.apply_keys("x");
+            assert_eq!(ed.text(), text[1..], "{keys}: x deletes one char");
+        }
+    }
+
+    #[test]
+    fn a_count_multiplies_the_page() {
+        let text = numbered_lines(100);
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("3<C-d>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 36, "3 half pages");
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("3<PageDown>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 72, "3 pages");
+    }
+
+    #[test]
+    fn page_move_in_visual_mode_extends_the_selection() {
+        let text = numbered_lines(100);
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("v<PageDown>");
+        assert_eq!(ed.mode().as_deref(), Some("-- VISUAL --"));
+        let sel = ed.selection().expect("the selection survives the move");
+        let cursor = ed.cursor();
+        assert_eq!(line_col(&text, cursor).0, 24);
+        assert_eq!(sel.spans, vec![0..cursor + 1], "from the anchor to the cursor");
+        ed.apply_keys("<C-u>");
+        let sel = ed.selection().expect("still selecting");
+        assert_eq!(sel.spans, vec![0..ed.cursor() + 1], "the selection follows back up");
+        ed.apply_keys("<PageDown>");
+        let end = ed.cursor();
+        ed.apply_keys("d");
+        assert_eq!(ed.text(), text[end + 1..], "d deletes the whole selected span");
+    }
+
+    #[test]
+    fn page_control_keys_move_the_cursor() {
+        let text = numbered_lines(100);
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("<C-f>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 24, "<C-f> is a page down");
+        ed.apply_keys("<C-b>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 0, "<C-b> is a page up");
+        ed.apply_keys("<C-d><C-d><C-u>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 12, "<C-u> is half a page up");
+    }
+
+    /// An unterminated `<` swallows the rest of the batch, including the
+    /// `<Esc>` that would leave insert mode.
+    #[test]
+    fn an_unterminated_less_than_drops_the_rest_of_the_batch() {
+        let mut ed = EditorCore::new("");
+        ed.apply_keys("i<Left b<Esc>");
+        assert_eq!(ed.text(), "", "the `b` after the `<` never arrives");
+        assert_eq!(ed.mode().as_deref(), Some("-- INSERT --"), "the `<Esc>` is dropped too");
+    }
+
+    /// The scroll page is private to the page keys: modalkit sees no window,
+    /// so `L` does not jump a window's height.
+    #[test]
+    fn window_relative_motions_see_no_window() {
+        let text = numbered_lines(100);
+        for keys in ["L", "H", "M"] {
+            let mut ed = EditorCore::new(&text);
+            ed.apply_keys(keys);
+            assert_eq!(line_col(&text, ed.cursor()).0, 0, "{keys}");
+        }
+    }
+
+    #[test]
+    fn arrow_tokens_move_the_cursor() {
+        let mut ed = EditorCore::new("abc\ndef");
+        ed.apply_keys("<Right><Right>");
+        assert_eq!(ed.cursor(), 2);
+        ed.apply_keys("<Down>");
+        assert_eq!(ed.cursor(), 6);
+        ed.apply_keys("<Left>");
+        assert_eq!(ed.cursor(), 5);
+        ed.apply_keys("<Up>");
+        assert_eq!(ed.cursor(), 1);
+    }
+
+    #[test]
+    fn arrow_tokens_move_in_insert_mode() {
+        let mut ed = EditorCore::new("ac");
+        ed.apply_keys("A<Left>b<Esc>");
+        assert_eq!(ed.text(), "abc");
+    }
+
+    #[test]
+    fn home_and_end_in_insert_mode() {
+        let mut ed = EditorCore::new("bc");
+        ed.apply_keys("i<End>d<Home>a<Esc>");
+        assert_eq!(ed.text(), "abcd");
+    }
+
+    #[test]
+    fn home_and_end_in_normal_mode() {
+        let mut ed = EditorCore::new("abc");
+        ed.apply_keys("<End>");
+        assert_eq!(ed.cursor(), 2, "End lands on the last char in normal mode");
+        ed.apply_keys("<Home>");
+        assert_eq!(ed.cursor(), 0);
+    }
+
+    #[test]
+    fn page_tokens_move_by_pages() {
+        let text = (0..200).map(|n| format!("l{n}")).collect::<Vec<_>>().join("\n");
+        let mut ed = EditorCore::new(&text);
+        ed.apply_keys("<PageDown>");
+        let down = ed.cursor();
+        assert_eq!(line_col(&text, down).0, 24, "a page is 24 lines");
+        ed.apply_keys("<PageUp>");
+        assert_eq!(ed.cursor(), 0, "PageUp returns to the top");
+        ed.apply_keys("<C-d>");
+        assert_eq!(line_col(&text, ed.cursor()).0, 12, "<C-d> is half a page");
+    }
+
+    #[test]
+    fn del_deletes_under_the_cursor_in_normal_mode() {
+        let mut ed = EditorCore::new("abc");
+        ed.apply_keys("<Del>");
+        assert_eq!(ed.text(), "bc");
+    }
+
+    #[test]
+    fn del_deletes_under_the_cursor_in_insert_mode() {
+        let mut ed = EditorCore::new("abc");
+        ed.apply_keys("i<Del>X<Esc>");
+        assert_eq!(ed.text(), "Xbc");
+        let mut ed = EditorCore::new("abc");
+        ed.apply_keys("i<Delete>X<Esc>");
+        assert_eq!(ed.text(), "Xbc", "<Delete> is an alias");
     }
 
     /// Uppercase arrives from crossterm with SHIFT set; `TerminalKey` folds

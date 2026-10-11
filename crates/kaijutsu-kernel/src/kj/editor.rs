@@ -3,8 +3,8 @@
 //! The programmatic face of the in-app editor (`docs/vi.md`): `open` resolves a
 //! path to its owning kernel block and starts a session; `keys` feeds vim input
 //! and mirrors the edits onto the block; `insert` splices text at the cursor
-//! without touching the vim mode — the paste path, for text `keys`' vim
-//! notation cannot carry (a literal `<`); `state` reads the buffer; `save`/`quit`
+//! without touching the vim mode — the paste path, for text that should not
+//! be read as key notation; `state` reads the buffer; `save`/`quit`
 //! are `ZZ`/`ZQ`. The Bevy app renders these same kernel sessions, and a model
 //! drives them through here — one surface, many hands.
 
@@ -34,18 +34,22 @@ enum EditorCommand {
         /// File or rc/config path to edit (e.g. /config/rc/coder/create/S00-stance.kai).
         path: String,
     },
-    /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). A batch
+    /// Feed vim keys to a session (e.g. "iX<Esc>", "dw", "<C-w>"). Named keys
+    /// are `<Esc> <CR> <BS> <Tab> <Space> <Del> <Left> <Right> <Up> <Down>
+    /// <Home> <End> <PageUp> <PageDown>` and `<C-x>` chords; write a literal
+    /// `<` as `<lt>`. An unknown `<...>` is skipped; an unterminated `<` drops the
+    /// rest of the batch. A batch
     /// that submits a write (`:w`, `:w!`, `:wq`, `:x`, `ZZ`, …) needs the
     /// `editor` capability; plain edits and navigation don't.
     Keys {
         /// Session handle from `kj editor open`.
         session: u64,
-        /// Key sequence in vim notation.
+        /// Key sequence in vim notation; a literal `<` is `<lt>`.
         keys: String,
     },
     /// Splice text at the session's live cursor without touching the vim
-    /// mode — the paste path: `keys`' vim notation cannot carry a literal
-    /// `<`, so this is how a driver lands arbitrary text. Insert stays
+    /// mode — the paste path: this lands arbitrary text without reading it
+    /// as key notation. Insert stays
     /// insert, normal stays normal. Refused, with the buffer unchanged and
     /// the reason on the state's message (not an error), while the `:`
     /// command line is open. No capability is needed: a paste carries no

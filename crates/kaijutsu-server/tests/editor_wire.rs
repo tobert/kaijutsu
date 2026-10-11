@@ -153,6 +153,32 @@ fn editor_open_keys_state_push_and_rollback_over_the_wire() {
 }
 
 #[test]
+fn lt_and_navigation_tokens_travel_over_the_wire() {
+    run_local(async {
+        let addr = start_server().await;
+        let client = connect_client(addr).await;
+        let (kernel, _) = client.bind_kernel().await.unwrap();
+
+        let opened = kernel.editor_open(RC_PATH).await.unwrap();
+        let session = opened.session;
+        let original = opened.text.clone();
+
+        // `<lt>` types a literal `<`. `<End>` moves off it, `<Home>` comes back,
+        // and `<Del>` removes the `<` under the cursor.
+        let typed = kernel.editor_keys(session, "i<lt><Esc>").await.unwrap();
+        assert_eq!(typed.text, format!("<{original}"));
+        let end = kernel.editor_keys(session, "<End>").await.unwrap();
+        assert!(end.cursor > 0, "<End> moved off the start of the line");
+        let home = kernel.editor_keys(session, "<Home>").await.unwrap();
+        assert_eq!(home.cursor, 0, "<Home> returned to the start");
+        let deleted = kernel.editor_keys(session, "<Del>").await.unwrap();
+        assert_eq!(deleted.text, original, "<Del> removed the typed `<`");
+
+        kernel.editor_quit(session).await.unwrap();
+    });
+}
+
+#[test]
 #[allow(clippy::single_range_in_vec_init)] // a span list holding one `Range` is the intended value
 fn visual_selection_travels_over_the_wire() {
     // The renderers draw a visual-mode highlight from `EditorState.selection`

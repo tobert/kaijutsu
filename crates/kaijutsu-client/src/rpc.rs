@@ -1377,7 +1377,7 @@ impl KernelHandle {
     }
 
     /// Insert `text` at the session's cursor — a paste, not keystrokes
-    /// (`editor_keys`' vim notation cannot carry a literal `<`). Leaves the
+    /// (`editor_keys` reads `<` as the start of a key token). Leaves the
     /// session's mode untouched; refuses with the state unchanged while the
     /// `:` command line is open (`docs/vi.md`).
     #[tracing::instrument(skip(self), name = "rpc_client.editor_insert")]

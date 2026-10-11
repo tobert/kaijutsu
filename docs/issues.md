@@ -399,6 +399,29 @@ moves each of them to a future deadline; left for its own change, with
 `docs/retries-and-ratelimits.md`, "Waiting is bounded by the caller's own
 deadline".
 
+## The editor's `<<`, `>>` and visual `<`/`>` change nothing
+
+modalkit 0.0.25 stubs the indent edit (`EditAction::Indent` in
+`editing/buffer/edit.rs` returns without editing), so the shift operators parse
+and then do nothing, whether sent as `<lt><lt>` or `>>`. Implementing them in
+`kaijutsu-editor` (a line-prefix shift by a fixed width, with a test per
+operator and motion) closes the gap. Scrolls other than page and half page
+(`zt`, `zz`, `<C-e>`) are also dropped; they have no window to act on.
+
+## Editor key notation gaps
+
+- `<C-Left>` parses as `<C-l>`: the chord parser takes the first character
+  after `c-` and ignores the rest of the name.
+- The TUI turns Ctrl+`>` into a typed `>`, because the control branch only
+  lowercases letters.
+- The TUI sends Alt+char, Ctrl+Backspace, Alt+Enter and Shift+Tab as the bare
+  token, dropping the modifier.
+- The TUI's refusal mask for navigation keys covers Ctrl, Alt and Shift, not
+  Super or Meta.
+- `H`, `M` and `L` see a zero-sized window (the core has no window), so they
+  go to the first line; a settled window height would need a session-level
+  size from the client.
+
 ## A card that arms mid-line takes a typed letter as an answer (2026-10-08)
 
 The ledger push brings an ask to the TUI sooner than the old poll did, so a

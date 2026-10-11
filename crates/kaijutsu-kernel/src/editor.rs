@@ -721,8 +721,8 @@ impl EditorSessions {
     }
 
     /// Insert `text` at the session's *live* cursor — a paste, not
-    /// keystrokes (`docs/vi.md`: `editor_keys`' vim notation cannot carry a
-    /// literal `<`). Unlike [`insert_text`](Self::insert_text) (which the
+    /// keystrokes (`docs/vi.md`: `editor_keys` reads `<` as the start of a
+    /// key token). Unlike [`insert_text`](Self::insert_text) (which the
     /// `:r` async fetch path uses with an offset captured at submit time,
     /// because the cursor can move during the await), a paste is
     /// synchronous — nothing runs between the caller reading the cursor and
