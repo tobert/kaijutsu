@@ -273,18 +273,14 @@ pub fn default_bindings() -> Vec<Binding> {
     ));
 
     // ====================================================================
-    // TextInput (compose area — owned by VimMachine)
+    // TextInput (compose area — a keyboard grab)
     // ====================================================================
-    // All TextInput keyboard bindings are handled by the VimMachine
-    // (vim_dispatch_compose system). Ctrl+C for interrupt is handled
-    // directly in that system before keys reach the VimMachine.
-    //
-    // No flat bindings needed here — the VimMachine handles:
-    //   Insert mode: character typing, Backspace, Delete, arrow keys
-    //   Normal mode: motions (hjkl, w/b/e, etc.), operators (d, c, y)
-    //   Submit: Enter (via submit_on_enter)
-    //   Mode ring: Tab (via custom binding, Phase 2+)
-    //   Escape: Normal mode ↔ Insert mode, or dismiss compose
+    // Compose holds the keyboard grab, so no TextInput binding is matched
+    // while it is up: `input::compose::systems::compose_dispatch_keys` hands
+    // every key to the surface's `EditorCore`. Ctrl+C, Ctrl+Z and Ctrl+V
+    // are taken there before the vi engine sees them. Enter submits chat
+    // from normal mode and runs the shell line in any mode; Esc Esc in
+    // normal mode dismisses.
 
     // ====================================================================
     // Dialog (modal dialog open)

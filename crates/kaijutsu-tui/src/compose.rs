@@ -19,6 +19,7 @@
 
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use kaijutsu_client::draft_ledger::DraftLedger;
 use kaijutsu_editor::{EditOp, EditorCore};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -51,13 +52,6 @@ pub struct ComposeAction {
     /// `run.rs` (`cmdline::parse`) decides what it means and runs it
     /// (`docs/tui.md`, "The `:` line").
     pub command: Option<String>,
-}
-
-impl ComposeAction {
-    /// Whether this keystroke asked for nothing at all.
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty() && !self.submit && self.command.is_none()
-    }
 }
 
 /// Local `:` line history — modalkit's command bar surfaces no history hook
@@ -146,18 +140,11 @@ impl CursorShape {
 /// The compose surface.
 pub struct Compose {
     editor: EditorCore,
-    /// The highest context version this client's own `edit_input` calls have
-    /// acknowledged. A mirror older than this does not yet carry our
-    /// keystrokes, and reconciling against it would delete them.
-    acked: u64,
-    /// Which draft this is: [`Self::load_draft`] starts a new one, so an
-    /// edit sent for the last draft cannot settle this one.
-    generation: u64,
-    /// Our edits sent for this draft and not yet landed.
-    in_flight: usize,
-    /// The newest mirror refused while edits were in flight, as text and
-    /// context version. Checked again when the last one lands.
-    held: Option<(String, u64)>,
+    /// Our edits to this draft and their acks: whether a mirror of the
+    /// kernel's copy may be applied yet (`kaijutsu_client::draft_ledger`).
+    /// [`Self::load_draft`] starts a new draft, so an edit sent for the last
+    /// draft cannot settle this one.
+    ledger: DraftLedger,
     /// The `:` line's local history — a session fact, not a per-draft one,
     /// so it survives [`Self::reset`] and [`Self::load_draft`] (both go
     /// through the same path) rather than being wiped every submit or
@@ -185,10 +172,7 @@ impl Compose {
     pub fn over(text: &str) -> Self {
         let mut compose = Self {
             editor: EditorCore::new(""),
-            acked: 0,
-            generation: 0,
-            in_flight: 0,
-            held: None,
+            ledger: DraftLedger::default(),
             colon_history: ColonHistory::default(),
         };
         compose.load_draft(text);
@@ -204,10 +188,7 @@ impl Compose {
         // the last character, so `a` resumes a draft where it left off.
         editor.apply_keys("G$");
         self.editor = editor;
-        self.acked = 0;
-        self.generation += 1;
-        self.in_flight = 0;
-        self.held = None;
+        self.ledger.restart();
     }
 
     /// The draft's text.
@@ -302,14 +283,13 @@ impl Compose {
 
     /// Edits sent for this draft and not yet landed.
     pub fn edits_in_flight(&self) -> usize {
-        self.in_flight
+        self.ledger.in_flight()
     }
 
     /// Count one edit as sent for this draft. Returns the draft generation
     /// to hand back to [`Self::landed`].
     pub fn sent(&mut self) -> u64 {
-        self.in_flight += 1;
-        self.generation
+        self.ledger.sent()
     }
 
     /// One of our edits came back: `Some(version)` when the kernel
@@ -317,19 +297,9 @@ impl Compose {
     /// is ignored. When the last edit in flight lands, a mirror held for it
     /// is reconciled; returns whether the buffer moved.
     pub fn landed(&mut self, generation: u64, version: Option<u64>) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.in_flight = self.in_flight.checked_sub(1).expect("an edit landed that was never sent");
-        if let Some(version) = version {
-            self.acked = self.acked.max(version);
-        }
-        match self.held.take() {
-            Some((text, version)) if self.in_flight == 0 => self.reconcile(&text, version),
-            held => {
-                self.held = held;
-                false
-            }
+        match self.ledger.landed(generation, version) {
+            Some(text) => self.editor.apply_remote_text(&text),
+            None => false,
         }
     }
 
@@ -342,16 +312,7 @@ impl Compose {
     /// flight no mirror can be known to carry them, so the newest one is
     /// held for [`Self::landed`]. Returns whether the buffer moved.
     pub fn reconcile(&mut self, kernel_text: &str, version: u64) -> bool {
-        if self.in_flight > 0 {
-            if self.held.as_ref().is_none_or(|(_, held)| version >= *held) {
-                self.held = Some((kernel_text.to_string(), version));
-            }
-            return false;
-        }
-        if version < self.acked {
-            return false;
-        }
-        self.editor.apply_remote_text(kernel_text)
+        self.ledger.offer(kernel_text, version) && self.editor.apply_remote_text(kernel_text)
     }
 
     /// Start over on an empty draft — what `submit_input` leaves behind, since

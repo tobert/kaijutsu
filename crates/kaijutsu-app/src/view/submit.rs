@@ -1,22 +1,19 @@
-//! Submit error handling (flash + restore).
+//! Submit error handling: restore a failed shell line, flash the chat
+//! overlay.
 
 use bevy::prelude::*;
 
 use crate::cell::block_border::BlockBorderStyle;
-use crate::cell::{
-    ComposeError, InputOverlay, InputOverlayMarker, MsdfOverlayText, PendingSubmitRecoveries,
-    SubmitFailed,
-};
-use crate::view::shell_dock::ShellDockMarker;
+use crate::cell::{ComposeError, InputOverlayMarker, MsdfOverlayText, PendingSubmitRecoveries, SubmitFailed};
+use crate::input::compose::{ComposeBuffer, ComposeState};
 
-/// Restore a failed submission only into an empty overlay. A newer draft
-/// keeps the failed text queued for its original principal and context.
-fn restore_failed_submission(overlay: &mut InputOverlay, text: &str) -> bool {
-    if !overlay.text.is_empty() {
+/// Restore a failed shell line only into an empty shell surface. A newer
+/// line keeps the failed text queued for its original principal and context.
+fn restore_failed_submission(shell: &mut ComposeBuffer, text: &str) -> bool {
+    if !shell.text().is_empty() {
         return false;
     }
-    overlay.text = text.to_string();
-    overlay.cursor = overlay.text.len();
+    *shell = ComposeBuffer::over(text);
     true
 }
 
@@ -29,51 +26,27 @@ fn can_restore_failed_submission(
 }
 use crate::ui::theme::Theme;
 
-/// Restore overlay text and flash error border when submit fails.
+/// Restore a failed shell line once its context and principal are on
+/// screen again. Shell text typed under a principal that has since been
+/// replaced is kept the same way, so the new principal cannot run it.
 pub fn handle_submit_failed(
-    mut commands: Commands,
     mut fail_events: MessageReader<SubmitFailed>,
-    mut overlay: Query<(Entity, &mut InputOverlay), With<InputOverlayMarker>>,
-    mut shell_overlay: Query<
-        (Entity, &mut InputOverlay),
-        (With<ShellDockMarker>, Without<InputOverlayMarker>),
-    >,
+    mut compose: ResMut<ComposeState>,
     doc_cache: Res<crate::cell::DocumentCache>,
     session_principal: Res<crate::cell::SessionPrincipal>,
     mut pending: ResMut<PendingSubmitRecoveries>,
     mut identity_transition: ResMut<crate::cell::PendingIdentityTransition>,
 ) {
-    if let Some((previous_principal, _)) = identity_transition.0.take() {
-        if let Ok((_, mut chat)) = overlay.single_mut()
-            && !chat.text.is_empty()
-            && let Some(context_id) = chat.target_context.or(doc_cache.active_id())
-        {
-            pending.0.push(SubmitFailed {
-                text: std::mem::take(&mut chat.text),
-                reason: "authenticated identity changed before this text was submitted".into(),
-                is_shell: false,
-                context_id,
-                principal_id: previous_principal,
-            });
-            chat.cursor = 0;
-            chat.selection_anchor = None;
-            chat.target_context = None;
-        }
-        if let Ok((_, mut shell)) = shell_overlay.single_mut()
-            && !shell.text.is_empty()
-            && let Some(context_id) = shell.target_context.or(doc_cache.active_id())
-        {
-            pending.0.push(SubmitFailed {
-                text: std::mem::take(&mut shell.text),
-                reason: "authenticated identity changed before this text was submitted".into(),
-                is_shell: true,
-                context_id,
-                principal_id: previous_principal,
-            });
-            shell.cursor = 0;
-            shell.selection_anchor = None;
-            shell.target_context = None;
-        }
+    if let Some((previous_principal, _)) = identity_transition.0.take()
+        && !compose.shell.text().is_empty()
+        && let Some(context_id) = doc_cache.active_id()
+    {
+        pending.0.push(SubmitFailed {
+            text: std::mem::take(&mut compose.shell).text(),
+            reason: "authenticated identity changed before this text was submitted".into(),
+            context_id,
+            principal_id: previous_principal,
+        });
     }
     for failed in fail_events.read() {
         warn!("Submit failed: {}", failed.reason);
@@ -81,25 +54,12 @@ pub fn handle_submit_failed(
     }
     let mut remaining = Vec::new();
     for failed in pending.0.drain(..) {
-        if !can_restore_failed_submission(doc_cache.active_id(), session_principal.0, &failed) {
-            remaining.push(failed);
+        if can_restore_failed_submission(doc_cache.active_id(), session_principal.0, &failed)
+            && restore_failed_submission(&mut compose.shell, &failed.text)
+        {
             continue;
         }
-        let target = if failed.is_shell {
-            shell_overlay.single_mut()
-        } else {
-            overlay.single_mut()
-        };
-        if let Ok((entity, mut overlay)) = target
-            && restore_failed_submission(&mut overlay, &failed.text)
-        {
-            commands.entity(entity).insert(ComposeError {
-                started: std::time::Instant::now(),
-            });
-            overlay.target_context = Some(failed.context_id);
-        } else {
-            remaining.push(failed);
-        }
+        remaining.push(failed);
     }
     pending.0 = remaining;
 }
@@ -109,15 +69,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn failed_submission_restores_text_only_when_the_overlay_is_still_empty() {
-        let mut overlay = InputOverlay::default();
-        assert!(restore_failed_submission(&mut overlay, "write release notes"));
-        assert_eq!(overlay.text, "write release notes");
+    fn failed_submission_restores_text_only_when_the_shell_is_still_empty() {
+        let mut shell = ComposeBuffer::default();
+        assert!(restore_failed_submission(&mut shell, "write release notes"));
+        assert_eq!(shell.text(), "write release notes");
 
-        overlay.text = "newer text".into();
-        overlay.cursor = overlay.text.len();
-        assert!(!restore_failed_submission(&mut overlay, "older text"));
-        assert_eq!(overlay.text, "newer text");
+        shell = ComposeBuffer::over("newer text");
+        assert!(!restore_failed_submission(&mut shell, "older text"));
+        assert_eq!(shell.text(), "newer text");
     }
 
     #[test]
@@ -128,7 +87,6 @@ mod tests {
         let failed = SubmitFailed {
             text: "old command".into(),
             reason: "connection reset".into(),
-            is_shell: true,
             context_id: context_a,
             principal_id: amy,
         };
@@ -138,75 +96,69 @@ mod tests {
         assert!(!can_restore_failed_submission(Some(context_a), None, &failed));
     }
 
+    fn submit_app(principal: kaijutsu_types::PrincipalId) -> App {
+        let mut app = App::new();
+        app.add_message::<SubmitFailed>()
+            .init_resource::<crate::cell::DocumentCache>()
+            .insert_resource(crate::cell::SessionPrincipal(Some(principal)))
+            .init_resource::<PendingSubmitRecoveries>()
+            .init_resource::<crate::cell::PendingIdentityTransition>()
+            .init_resource::<ComposeState>()
+            .add_systems(Update, handle_submit_failed);
+        app
+    }
+
+    fn shell_text(app: &App) -> String {
+        app.world().resource::<ComposeState>().shell.text()
+    }
+
     #[test]
     fn delayed_failure_waits_for_its_context_then_restores_the_saved_text() {
         let context_a = kaijutsu_types::ContextId::new();
         let context_b = kaijutsu_types::ContextId::new();
         let amy = kaijutsu_types::PrincipalId::new();
-        let mut app = App::new();
-        app.add_message::<SubmitFailed>()
-            .init_resource::<crate::cell::DocumentCache>()
-            .insert_resource(crate::cell::SessionPrincipal(Some(amy)))
-            .init_resource::<PendingSubmitRecoveries>()
-            .init_resource::<crate::cell::PendingIdentityTransition>()
-            .add_systems(Update, handle_submit_failed);
-        let overlay = app
-            .world_mut()
-            .spawn((InputOverlayMarker, InputOverlay::default()))
-            .id();
+        let mut app = submit_app(amy);
 
         app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_b);
         app.world_mut().write_message(SubmitFailed {
             text: "old command".into(),
             reason: "connection reset".into(),
-            is_shell: false,
             context_id: context_a,
             principal_id: amy,
         });
         app.update();
-        assert_eq!(app.world().get::<InputOverlay>(overlay).unwrap().text, "");
+        assert_eq!(shell_text(&app), "");
         assert_eq!(app.world().resource::<PendingSubmitRecoveries>().0.len(), 1);
 
         app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_a);
         app.update();
-        assert_eq!(app.world().get::<InputOverlay>(overlay).unwrap().text, "old command");
+        assert_eq!(shell_text(&app), "old command");
         assert!(app.world().resource::<PendingSubmitRecoveries>().0.is_empty());
     }
 
     #[test]
-    fn identity_change_holds_text_for_its_original_context_and_principal() {
+    fn identity_change_holds_shell_text_for_its_original_context_and_principal() {
         let context_a = kaijutsu_types::ContextId::new();
         let context_b = kaijutsu_types::ContextId::new();
         let amy = kaijutsu_types::PrincipalId::new();
         let banto = kaijutsu_types::PrincipalId::new();
-        let mut app = App::new();
-        app.add_message::<SubmitFailed>()
-            .init_resource::<crate::cell::DocumentCache>()
-            .insert_resource(crate::cell::SessionPrincipal(Some(banto)))
-            .init_resource::<PendingSubmitRecoveries>()
-            .insert_resource(crate::cell::PendingIdentityTransition(Some((amy, Some(banto)))))
-            .add_systems(Update, handle_submit_failed);
-        let overlay = app
-            .world_mut()
-            .spawn((
-                InputOverlayMarker,
-                InputOverlay {
-                    text: "Amy's draft".into(),
-                    target_context: Some(context_a),
-                    ..Default::default()
-                },
-            ))
-            .id();
+        let mut app = submit_app(banto);
+        app.insert_resource(crate::cell::PendingIdentityTransition(Some((amy, Some(banto)))));
+        app.world_mut().resource_mut::<ComposeState>().shell = ComposeBuffer::over("Amy's line");
+        app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_a);
 
-        app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_b);
         app.update();
-        assert_eq!(app.world().get::<InputOverlay>(overlay).unwrap().text, "");
+        assert_eq!(shell_text(&app), "", "banto cannot run Amy's line");
         assert_eq!(app.world().resource::<PendingSubmitRecoveries>().0.len(), 1);
 
-        app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_a);
+        app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_b);
         app.world_mut().resource_mut::<crate::cell::SessionPrincipal>().0 = Some(amy);
         app.update();
-        assert_eq!(app.world().get::<InputOverlay>(overlay).unwrap().text, "Amy's draft");
+        assert_eq!(shell_text(&app), "", "the line waits for its own context");
+
+        app.world_mut().resource_mut::<crate::cell::DocumentCache>().set_active(context_a);
+        app.update();
+        assert_eq!(shell_text(&app), "Amy's line");
         assert!(app.world().resource::<PendingSubmitRecoveries>().0.is_empty());
     }
 }

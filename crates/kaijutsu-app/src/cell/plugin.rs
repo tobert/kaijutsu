@@ -121,6 +121,7 @@ impl Plugin for CellPlugin {
                 view_sync::drain_context_hydrations.after(view_sync::handle_block_events),
                 view_sync::handle_context_switch.after(view_sync::handle_block_events),
                 view_sync::handle_server_context_switch.before(view_sync::handle_context_switch),
+                view_sync::follow_kj_results.before(view_sync::handle_context_switch),
                 // Drains each followed context's change feed — the
                 // docs/change-feed.md steady-state + recovery driver that
                 // replaced `check_cache_staleness`. Must run before
@@ -141,7 +142,7 @@ impl Plugin for CellPlugin {
             Update,
             view_submit::handle_submit_failed
                 .in_set(CellPhase::Input)
-                .before(crate::input::systems::handle_compose_input),
+                .before(crate::input::compose::systems::project_compose_overlays),
         );
 
         // ====================================================================

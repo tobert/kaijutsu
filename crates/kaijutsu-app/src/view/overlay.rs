@@ -363,14 +363,14 @@ pub fn build_overlay_glyphs(
             let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte_offset;
             let new_kind = crate::input::vim::mode_kind(overlay.vim_mode.as_deref());
             let kind_changed = cursor_geom.kind != new_kind;
-            let new_anchor = overlay.selection_anchor;
-            let anchor_changed = cursor_geom.last_selection_anchor != new_anchor;
+            let new_selection = overlay.selection;
+            let selection_changed = cursor_geom.last_selection != new_selection;
 
             if !text_changed
                 && !width_changed
                 && !cursor_changed
                 && !kind_changed
-                && !anchor_changed
+                && !selection_changed
             {
                 continue;
             }
@@ -407,42 +407,32 @@ pub fn build_overlay_glyphs(
                 &mut font_data_map,
             );
             cursor_geom.kind = new_kind;
-            cursor_geom.last_selection_anchor = new_anchor;
-            // The cursor's own geometry, reconstructed from what
-            // `sync_compose_text_glyphs` just derived it from — same
-            // `text_offset` + `cursor_byte_offset`, so this is exactly the
-            // `geom` it computed internally, not a fresh (possibly
-            // divergent) recomputation.
-            let geom_x0 = cursor_geom.x - text_offset.0;
-            let geom_y0 = cursor_geom.y - text_offset.1;
-            let geom_y1 = geom_y0 + cursor_geom.height;
+            cursor_geom.last_selection = new_selection;
 
-            // Selection geometry — only when in Visual mode with a selection.
-            // Single-line scope only: multi-line selections fall back to no
-            // rect (and rely on the cursor itself to indicate position).
-            let visual_with_selection = matches!(
-                new_kind,
-                crate::input::vim::CursorKind::Hidden,
-            ) && new_anchor.is_some();
+            // Selection geometry: the selection's first span, in Visual mode.
+            // Single-line scope only: a span that crosses a line falls back
+            // to no rect (and the cursor shows the position).
+            let visual_selection = new_selection.filter(|_| {
+                matches!(new_kind, crate::input::vim::CursorKind::Hidden)
+            });
 
-            if visual_with_selection {
-                let anchor_byte = new_anchor.unwrap();
-                let anchor_cursor = parley::editing::Cursor::from_byte_index(
-                    &layout,
-                    anchor_byte,
-                    parley::layout::Affinity::Upstream,
-                );
-                let anchor_geom = anchor_cursor.geometry(&layout, 2.0);
+            if let Some((start, end)) = visual_selection {
+                // The start sits before its char and the end after the last
+                // selected one, each on the line it belongs to.
+                let edge = |byte: usize, affinity: parley::layout::Affinity| {
+                    parley::editing::Cursor::from_byte_index(&layout, byte, affinity)
+                        .geometry(&layout, 2.0)
+                };
+                let left = edge(start, parley::layout::Affinity::Downstream);
+                let right = edge(end, parley::layout::Affinity::Upstream);
 
                 // Same line if y-extents align (within 0.5 px).
-                let same_line = (anchor_geom.y0 - geom_y0).abs() < 0.5;
+                let same_line = (left.y0 - right.y0).abs() < 0.5;
                 if same_line {
-                    let x_left = anchor_geom.x0.min(geom_x0);
-                    let x_right = anchor_geom.x0.max(geom_x0);
-                    cursor_geom.selection_x = text_offset.0 + x_left;
-                    cursor_geom.selection_y = text_offset.1 + geom_y0;
-                    cursor_geom.selection_width = (x_right - x_left).max(0.0);
-                    cursor_geom.selection_height = geom_y1 - geom_y0;
+                    cursor_geom.selection_x = text_offset.0 + left.x0;
+                    cursor_geom.selection_y = text_offset.1 + left.y0;
+                    cursor_geom.selection_width = (right.x0 - left.x0).max(0.0);
+                    cursor_geom.selection_height = left.y1 - left.y0;
                 } else {
                     log::trace!(
                         "vim: visual selection spans lines; multi-line highlight not yet rendered"

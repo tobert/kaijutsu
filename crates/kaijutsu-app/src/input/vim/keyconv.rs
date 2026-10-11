@@ -1,4 +1,6 @@
-//! Convert Bevy keyboard events to modalkit's TerminalKey.
+//! Convert Bevy keyboard events to crossterm key events, as modalkit
+//! reads them: [`bevy_to_key_event`] for `EditorCore` (compose), and
+//! [`bevy_to_terminal_key`] for a modalkit machine (the diff viewer).
 //!
 //! Maps Bevy's layout-aware `logical_key` to crossterm's `KeyCode`,
 //! and Bevy modifier state to crossterm's `KeyModifiers`.
@@ -9,7 +11,7 @@ use bevy::prelude::*;
 use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
 use modalkit::key::TerminalKey;
 
-/// Convert a Bevy KeyboardInput event to a modalkit TerminalKey.
+/// Convert a Bevy KeyboardInput event to a crossterm `KeyEvent`.
 ///
 /// Prefers the layout-aware `logical_key` (so AZERTY users get the right
 /// chars for `KeyA`) and falls back to `key_code` for synthetic events
@@ -17,18 +19,21 @@ use modalkit::key::TerminalKey;
 /// non-character keys this way, and it's a reasonable fallback for any
 /// embedded UI sending KeyboardInput without setting both fields.
 ///
-/// Returns `None` for keys we can't map (media keys, dead keys with no
-/// resolution, etc.).
+/// Returns `None` for keys we can't map (modifiers on their own, media
+/// keys, dead keys with no resolution, etc.).
+pub fn bevy_to_key_event(event: &KeyboardInput, keys: &ButtonInput<KeyCode>) -> Option<KeyEvent> {
+    let code = logical_key_to_crossterm(&event.logical_key)
+        .or_else(|| key_code_to_crossterm(event.key_code))?;
+    Some(KeyEvent::new(code, bevy_modifiers(keys)))
+}
+
+/// [`bevy_to_key_event`] as a modalkit `TerminalKey`.
 pub fn bevy_to_terminal_key(
     event: &KeyboardInput,
     keys: &ButtonInput<KeyCode>,
 ) -> Option<TerminalKey> {
-    let code = logical_key_to_crossterm(&event.logical_key)
-        .or_else(|| key_code_to_crossterm(event.key_code))?;
-    let modifiers = bevy_modifiers(keys);
-
     // TerminalKey::new() is pub(crate), so construct via From<KeyEvent>
-    Some(TerminalKey::from(KeyEvent::new(code, modifiers)))
+    bevy_to_key_event(event, keys).map(TerminalKey::from)
 }
 
 /// Fallback: map Bevy `KeyCode` (physical key) directly to a crossterm
@@ -116,8 +121,8 @@ fn logical_key_to_crossterm(key: &Key) -> Option<CtKeyCode> {
             }
             // Synthetic senders (bevy_brp_extras send_keys/type_text) ship
             // Enter as a printable Character("\n"). A lone newline char in a
-            // key event IS the Enter key — map it so submit_on_enter sees
-            // <Enter> instead of inserting a stray newline into the buffer.
+            // key event IS the Enter key — map it so a vi surface sees
+            // Enter and decides what it means.
             match c {
                 '\n' | '\r' => Some(CtKeyCode::Enter),
                 _ => Some(CtKeyCode::Char(c)),
@@ -207,7 +212,7 @@ mod tests {
     fn char_newline_maps_to_enter() {
         // bevy_brp_extras ships Enter as a printable Character("\n") (and a
         // terminal-style sender may use "\r"). Both must land as the Enter
-        // key so submit_on_enter fires — not as a literal newline insert.
+        // key, not as a literal newline char.
         for lk in ["\n", "\r"] {
             let event = make_event(KeyCode::Enter, Key::Character(lk.into()));
             let result = bevy_to_terminal_key(&event, &no_modifiers()).unwrap();

@@ -14,11 +14,6 @@ pub fn in_conversation(focus: Res<FocusArea>) -> bool {
     matches!(*focus, FocusArea::Conversation)
 }
 
-/// System run condition: FocusArea is Compose.
-pub fn in_compose(focus: Res<FocusArea>) -> bool {
-    matches!(*focus, FocusArea::Compose)
-}
-
 /// System run condition: FocusArea allows conversation scrolling.
 pub fn scroll_context_active(focus: Res<FocusArea>) -> bool {
     matches!(*focus, FocusArea::Conversation | FocusArea::Compose)

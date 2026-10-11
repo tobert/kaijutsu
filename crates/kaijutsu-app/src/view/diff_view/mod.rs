@@ -103,7 +103,7 @@ pub struct ActiveDiffView {
     pub session: Option<DiffViewSession>,
 }
 
-// SAFETY: mirrors `input::vim::VimMachineResource`, and for the same reason.
+// SAFETY: mirrors `input::compose::ComposeState`, and for the same reason.
 // `DiffCore` holds a modalkit `ModalMachine`, whose only non-Send/Sync member
 // is an internal `Box<dyn Dialog>` for TUI command-line dialogs — a feature
 // this viewer does not use and cannot reach: the box is private to modalkit

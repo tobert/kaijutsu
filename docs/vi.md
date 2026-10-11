@@ -99,21 +99,25 @@ runner-verify and `:e <path>`.
 
 ---
 
-## The core idea: the editor is the input-doc surface, generalized
+## The core idea: one vi engine, two placements
 
-The compose box is already a **kernel-owned editable buffer**: `input_doc.rs`,
-fronted by the `editInput`/`submitInput` RPC methods that the app and tui
-compose paths drive. The Bevy app merely *renders* it; the GUI is one view
-onto it.
+The compose draft is a **kernel-owned block**: the per-principal `Status::Draft`
+block (`BlockStore::edit_draft`), written through the `editInput`/`submitInput`
+RPC methods. Both clients run compose on a local `EditorCore`, the same
+engine the kernel's editor sessions run. Each `EditOp` it emits is one
+`editInput` call, queued in typed order on the shared draft outbox
+(`kaijutsu_client::draft_outbox`); the draft block on the change feed comes
+back through `kaijutsu_client::draft_ledger`, which decides when a mirror may
+replace the local buffer. See `docs/tui.md`, "Compose".
 
-The pattern is shared; the target is not. The draft is the player's alone:
-it never gets a VFS path, a `kj` verb, or an editor session, because the
-safety assumptions around who submits a turn rest on it (`docs/issues.md`,
-"The compose draft is the player's alone").
+For the draft the engine runs in the client. The draft is the player's
+alone: it never gets a VFS path, a `kj` verb, or an editor session, because
+the safety assumptions around who submits a turn rest on it
+(`docs/issues.md`, "The compose draft is the player's alone").
 
-The vi editor is that **exact pattern pointed at a file/config block** instead
-of the input doc. So the testability win isn't scaffolding we throw away — it
-is the editor's real spine:
+The vi editor runs the same engine kernel-side, pointed at a file/config
+block. So the testability win isn't scaffolding we throw away — it is the
+editor's real spine:
 
 - **Thin client, smart kernel.** Editing state and semantics live in the
   kernel; the 3D viewer is a *view onto* a kernel session, not the owner of it.
@@ -132,8 +136,8 @@ concrete for editing.
 ### 1. `kaijutsu-editor` crate — `EditorCore` (pure)
 
 The vim *engine* as pure logic — **no Bevy, no kernel, no RPC**. Built on
-modalkit's `VimMachine` + `TerminalKey` (also used by the app's compose
-surface). `EditorCore` owns one editor's session-local state: the text buffer
+modalkit's `VimMachine` + `TerminalKey`. Compose in the app and the tui runs
+it too, client-side, over the draft. `EditorCore` owns one editor's session-local state: the text buffer
 (modalkit's rope), cursor + selection, mode (normal/insert/visual/replace +
 operator-pending + command-line), and the rollback checkpoint.
 
@@ -214,9 +218,7 @@ to every open renderer.
 
 ### 3. App renderer — `Screen::Editor` + MSDF panel
 
-The app is a **renderer + key forwarder** (its compose-surface VimMachine is
-untouched; unifying compose onto `EditorCore` is a later possibility, out of
-scope):
+The app is a **renderer + key forwarder** for the editor:
 
 - `view::editor` (`EditorPlugin`): the `open_editor` peer signal (carrying the
   initial `EditorState` — no fetch, no race) lands as `EditorOpenRequested`;
@@ -314,8 +316,11 @@ The same surface a test drives is what a model plays.
 6. **Mode lives kernel-side, period.** The app forwards every key, including
    `:`. `ZZ`/`ZQ` and command mode are recognized in `EditorCore`; an app-side
    input surface would race the mode push and split input ownership.
-7. **Enter inserts a newline.** Compose uses `submit_on_enter()`; the editor
-   runs a separate `VimBindings` set inside `EditorCore`.
+7. **Enter inserts a newline.** `EditorCore` runs plain `VimBindings`.
+   Compose takes Enter before the engine sees it only in normal mode, where
+   it submits the draft; in insert mode it is the engine's newline. The
+   shell line (the app's shell surface, the tui's `:` bar) runs on Enter in
+   any mode.
 8. **No generic `edit_block` RPC.** The app sends *keys*; the kernel writes via
    `block_store.edit_text`. A generic block-edit RPC is off the editor's
    critical path — don't build it for vi.
@@ -521,6 +526,8 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Wire e2e | `kaijutsu-server/tests/editor_wire.rs` |
 | App renderer | `kaijutsu-app/src/view/editor/` (`mod.rs`, `render.rs`, `keys.rs`); screen FSM `ui/screen.rs` |
 | Editor surface renderer | `kaijutsu-app/src/view/editor/render.rs` (`EditorSurface`, `build_editor_surface`, `editor_selection_rects`, `sync_editor_cursor`) |
-| Precedent: input-doc surface | `kaijutsu-kernel/src/input_doc.rs` |
-| Compose vim (untouched) | `kaijutsu-app/src/input/vim/` (`mod.rs`, `dispatch.rs`) |
+| Compose draft block | `kaijutsu-kernel/src/block_store.rs` (`get_or_create_draft`, `edit_draft`) |
+| Compose (app) | `kaijutsu-app/src/input/compose/` (`mod.rs` `ComposeState`, `systems.rs`, `outbox.rs`) |
+| Compose (tui) | `kaijutsu-tui/src/compose.rs` (`Compose`) |
+| Draft outbox and ledger | `kaijutsu-client/src/draft_outbox.rs`, `draft_ledger.rs` |
 | File doc cache | `kaijutsu-kernel/src/file_tools/cache.rs` (`get_or_load`, `try_get_or_load`) |

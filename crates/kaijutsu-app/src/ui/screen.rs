@@ -73,9 +73,9 @@ impl Plugin for ScreenPlugin {
         // chrome via the OnEnter(Conversation) systems above.
         //
         // Move focus off Compose: the editor forwards raw keystrokes itself
-        // (`view::editor::editor_dispatch_keys`), and `vim_dispatch_compose` is
-        // gated purely on `FocusArea::Compose` — leaving it there would
-        // double-apply every keystroke to the hidden chat overlay.
+        // (`view::editor::editor_dispatch_keys`). The editor screen holds its
+        // own grab, but a focus left on Compose would bring the chat overlay
+        // back the moment the editor closes.
         app.add_systems(
             OnEnter(Screen::Editor),
             (hide_conversation_root, set_focus_conversation),

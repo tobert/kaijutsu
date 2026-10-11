@@ -103,6 +103,8 @@ pub fn resolve_chord(key: KeyCode, ctrl: bool, shift: bool) -> Option<Action> {
         // n / p — walk ring-0 seats.
         KeyCode::KeyN => Some(Action::ActiveSeatStep(1)),
         KeyCode::KeyP => Some(Action::ActiveSeatStep(-1)),
+        // r — prefilled `kj context rotate `; the app follows the successor.
+        KeyCode::KeyR => Some(Action::PromptContextRotate),
         // d — detach to the conversation view from any scene/editor.
         KeyCode::KeyD => Some(Action::DetachToConversation),
         // h — hold (hud) the quick-context overlay. The overlay is already
@@ -144,6 +146,15 @@ mod tests {
         assert_eq!(
             resolve_chord(KeyCode::KeyA, false, false),
             Some(Action::SendLiteralPrefix)
+        );
+    }
+
+    /// `r` opens the shell prefilled with `kj context rotate `.
+    #[test]
+    fn r_rotates_the_context() {
+        assert_eq!(
+            resolve_chord(KeyCode::KeyR, false, false),
+            Some(Action::PromptContextRotate)
         );
     }
 

@@ -1158,9 +1158,6 @@ The seven-slice bootstrap redesign shipped 2026-09-16 and 2026-09-17
   in downtime; keep it simple.
 - A model rotating its own seat from inside a live turn archives the
   context that turn is still writing to. Untested.
-- `Ctrl+A r` (rotate by prefilled prompt, client follows the successor) is
-  TUI only. The app has the prefilled-`kj` pattern but no rotate chord and no
-  follow on a rotate result (`docs/input.md`, "The prefix table").
 - A pinned structured `kj context switch` still runs the builtin's
   `switch_context`: it validates and saves the addressed context's cwd in a
   throwaway shell, so a context whose cwd has gone missing refuses a switch
@@ -2562,22 +2559,45 @@ sampling rows, and `get_info`, `interrupt` and `complete` are no longer called
 uninstrumented. The rest of the method inventory and its counts have not been
 compared with `kaijutsu.capnp` and the `extract_rpc_trace` call sites.
 
-## App draft edits need an ordered submission contract (2026-09-12)
+## The app sends no edge with a chat submit
 
-`input/systems.rs::handle_compose_input` spawns each `edit_input` separately,
-logs edit failures, and submits the server draft with another task. Local
-overlay text can therefore differ from the draft submitted after a failed or
-late edit. Visible submit failures do not repair that earlier divergence.
-Design batching, acknowledgement, and recovery with the TUI input work;
-Amy asked to discuss text input design before changing that contract.
+`input/compose/systems.rs::submit_chat` sends `edge: None`: the app does not
+record which block it last drew, and the edge is "the newest block a client
+had shown" (`InputEdge`, `docs/prompts.md`, "The submit verb"), so the
+mirror's newest block would be a guess while the player is scrolled up. The
+tui records it from its drawn window (`render::record_edge`). The app can
+derive it from `ConversationGeometry` and `ConversationScrollState`: the last
+block row inside the viewport, with `shown` set only when that row is drawn
+whole.
 
-Kaibo's review also found two recovery UX edges. A retained failed submission
-can reappear after newer text is submitted and the overlay becomes empty;
-it does not overwrite text or submit itself, but needs an explicit recovery
-affordance. Text typed with no active or target context has no context to
-retain under an identity transition. Define ownership for that unassigned
-text alongside the draft-edit contract. Do not solve either case by silently
-dropping saved text.
+## The draft ledger's ack floor is 0 after a draft read (both clients)
+
+`kaijutsu_client::draft_ledger::DraftLedger::restart` sets the ack floor to
+0, and a draft read (a seat switch, the app's reload after a refused submit)
+carries no context version. A change-feed mirror older than the read can
+therefore still be applied over the text just read, until a newer mirror or
+our own ack corrects it. `get_input_state` already returns
+`documents.version(context)`, but the server reads it after the draft text,
+not with it, so seeding the floor from it could refuse a sibling's edit that
+landed between the two reads. Fix: read the version with the draft, return
+it through `DraftSink::read`, and seed the floor from it.
+
+The tui's `:kj` line reports the first stdout line and ignores a nonzero exit,
+so a refused `kj context rotate` reads as "done" on its status row
+(`kaijutsu-tui`'s `run::handle_colon_line`); the app shows the stderr.
+
+## App compose: recovery edges left after the shared draft outbox (2026-09-12)
+
+The app's chat compose runs on the shared draft outbox (`input/compose/`), so
+edits, submits and draft reads reach the kernel in order and a failed chat
+submit reads the kernel's draft back. Two edges remain. A failed shell line
+retained in `PendingSubmitRecoveries` can reappear after newer text is run
+and the shell line becomes empty; it does not overwrite text or run itself,
+but needs an explicit recovery affordance. Chat text typed while no context
+is attached stays on screen with a "not saved" toast and is replaced when a
+context's draft loads. Do not solve either case by silently dropping text.
+The shell dock has no error flash: `animate_compose_error` reads the chat
+overlay only, so a failed shell line shows as a toast alone.
 
 ## App bootstrap results need consistent connection scoping (2026-09-12)
 
@@ -2705,7 +2725,8 @@ did not boot) or `attach` should retire from `RC_VERBS`.
 
 Amy: *"sometimes when I hit ctrl-z it goes to conversation input... usually
 first time is fine, second time goes to the other input."* No fix found in
-the app (`ToggleSurface` still the same shape, `input/systems.rs:105`). Queued
+the app (`ToggleSurface` still the same shape,
+`input/compose/systems.rs::handle_toggle_surface`). Queued
 for the app/UI session — start at `ActiveSurface`/`FocusArea` duplication
 (128 references across `kaijutsu-app/src/`, still two pieces of state that
 must agree and are set in different places).
@@ -2846,9 +2867,10 @@ Re-verified against the tree the same day:
   migration.
 - **Provider cache expiry is not a hydrate boundary** — a long-idle session
   carries messages the provider no longer has cached; nothing observes it.
-- **`ActiveSurface`/`FocusArea`/paired overlay queries** are threaded as
-  separate params through compose/interrupt/toggle systems (128 references) —
-  a bundle component or resolver would collapse them.
+- **`ActiveSurface` and `FocusArea` are two pieces of state that must agree**
+  and are set in different places. Compose's systems now take them through
+  one `ComposeIo` parameter (`input/compose/systems.rs`); the rest of the app
+  still threads them separately.
 
 ## File buffers: reduce the MCP file tools to kaish (low priority)
 
@@ -3028,19 +3050,6 @@ as improved, not re-certified. And: `test_task_status_lww_tiebreak_order`
 still pinning `TaskStatus` LWW order — decide whether that order needs
 pinning at all now that concurrent merge into a kernel document is
 structurally impossible.
-
-## vi input editor stopped repainting after a small in-place edit (found 2026-08-16, live on moltar)
-
-Amy was editing a typo ("rost" → "rest") in the compose-block vi input.
-`i e <Esc>` (insert `e`, leave insert mode) changed the buffer but the
-on-screen render did not update; `dw` + retype (a full replace) rendered
-correctly. Not root-caused; likely a missed redraw/dirty flag on the
-insert-then-escape path rather than a buffer-state bug. Vi input handling
-lives in `crates/kaijutsu-app/src/input/vim/` (`mod.rs`, `dispatch.rs`) —
-no dirty/repaint marker found there by name, so check whatever marks the
-input view dirty against the insert-mode commit path.
-
----
 
 ## The roster index has no kernel-now reference, so client-rendered ages mix two clocks (2026-08-16)
 

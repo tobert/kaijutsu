@@ -1671,7 +1671,7 @@ fn paste_text(app: &mut App, text: String) {
 /// **Every path that changes the context on screen goes through here**: the
 /// prefix chords, `Ctrl+A Ctrl+A`, and the picker. A path that watched and
 /// switched on its own got the switch without the draft, and
-/// `Compose::acked` then kept the change feed from correcting it.
+/// the draft ledger's ack floor then kept the change feed from correcting it.
 ///
 /// A switch never fails silently and never tears the loop down: a context
 /// that cannot be watched leaves the screen where it was with a notice, and
@@ -3060,7 +3060,7 @@ mod tests {
     /// calls `App::switch_to` itself gets the switch without one of those
     /// three, and the miss is invisible on the frame it happens — the
     /// picker's own switch kept the previous context's draft on the compose
-    /// line, and `Compose::acked` then refused the feed's correction.
+    /// line, and the draft ledger's ack floor then refused the feed's correction.
     ///
     /// `run()`'s startup attach is the one sanctioned direct call: there is
     /// no seat to switch from, and it loads its own draft.

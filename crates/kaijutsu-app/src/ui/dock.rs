@@ -207,7 +207,7 @@ impl Default for DockState {
                 font_size: 13.0,
             },
             hints: DockText {
-                text: "Enter: submit │ Shift+Enter: newline │ Esc: normal".into(),
+                text: "Esc Enter: submit │ Ctrl+Z: shell │ Esc Esc: dismiss".into(),
                 color: Color::WHITE,
                 font_size: 13.0,
             },
@@ -987,12 +987,17 @@ pub fn update_mode(
     room: Res<crate::view::room::RoomState>,
     theme: Res<Theme>,
     mut dock: ResMut<DockState>,
+    surface: Res<crate::input::focus::ActiveSurface>,
     overlay_q: Query<&crate::view::components::InputOverlay>,
 ) {
     use crate::ui::screen::Screen;
 
-    // Resolve vim mode from the active overlay (if any).
-    let vim_mode = overlay_q.iter().next().and_then(|o| o.vim_mode.clone());
+    // The vim mode of the surface being typed into: chat and shell each
+    // keep their own.
+    let vim_mode = overlay_q
+        .iter()
+        .find(|o| o.is_shell() == surface.is_shell())
+        .and_then(|o| o.vim_mode.clone());
 
     let (color, label): (Color, &str) = match screen.get() {
         Screen::Conversation => match focus_area.as_ref() {
@@ -2031,7 +2036,7 @@ pub fn update_hints(
     let hints = match screen.get() {
         Screen::Conversation => match focus_area.as_ref() {
             FocusArea::Compose => {
-                "Enter: submit \u{2502} Shift+Enter: newline \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
+                "Esc Enter: submit \u{2502} Ctrl+Z: shell \u{2502} Esc Esc: dismiss"
             }
             FocusArea::Conversation => {
                 "i: chat \u{2502} Ctrl+Z: shell \u{2502} j/k: navigate \u{2502} Alt+hjkl: pane"

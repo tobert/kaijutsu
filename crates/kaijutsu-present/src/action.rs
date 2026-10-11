@@ -212,6 +212,10 @@ pub enum Action {
     PromptContextRename,
     /// `Ctrl+A '` — same pattern, `kj context switch ` (switch-by-prompt).
     PromptContextSwitch,
+    /// `Ctrl+A r` — same pattern, `kj context rotate `: Enter rotates the
+    /// context on screen, or the seat a typed label names. The app follows
+    /// the successor its result names.
+    PromptContextRotate,
     /// `Ctrl+A h` — hold (pin) the quick-context overlay up after the prefix
     /// clears, and promote it from the translucent peek to a solid panel.
     /// Firing it again releases the hold. The overlay itself needs no chord

@@ -32,19 +32,12 @@ impl ActionFired {
     }
 }
 
-/// Raw text that should be inserted into the focused text field.
-///
-/// Emitted by the dispatcher when input occurs in TextInput context
-/// and no binding matches — the characters are plain text for the editor.
-#[derive(Message, Clone, Debug, Reflect)]
-pub struct TextInputReceived(pub String);
-
 /// A pressed keyboard event routed to the active keyboard grab.
 ///
 /// `dispatch_input` is the ONLY reader of Bevy's raw `KeyboardInput` stream.
 /// While a [`super::context::KeyboardGrab`] is active, pressed keys that
 /// don't match a Global binding are re-emitted as `GrabbedKey` for the grab
-/// owner (compose VimMachine, vi editor session) to consume. This replaces
+/// owner (compose, the vi editor session, the diff viewer) to consume. This replaces
 /// the old pattern of multiple systems reading `KeyboardInput` in parallel
 /// and relying on run-conditions to avoid double-handling.
 #[derive(Message, Clone, Debug)]
@@ -54,9 +47,9 @@ pub struct GrabbedKey(pub bevy::input::keyboard::KeyboardInput);
 ///
 /// A synthetic `GrabbedKey` can't carry it: both grab owners read live
 /// modifier state from `ButtonInput` (Ctrl is long released by the time the
-/// chord resolves), so the literal travels as its own message. The compose
-/// VimMachine feeds it as a Ctrl+A TerminalKey; the editor pushes `<C-a>`
-/// into the key pipe. With no vi surface focused it goes nowhere, by design.
+/// chord resolves), so the literal travels as its own message. Compose
+/// feeds it to its `EditorCore` as a Ctrl+A key; the editor queues `<C-a>`
+/// on its outbox. With no vi surface focused it goes nowhere, by design.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct LiteralPrefix;
 

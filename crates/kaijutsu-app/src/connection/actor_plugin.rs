@@ -169,7 +169,7 @@ pub struct RpcResultChannel {
 }
 
 impl RpcResultChannel {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             tx,
@@ -297,14 +297,28 @@ pub enum RpcResultMessage {
         connection_epoch: u64,
         identity: Identity,
     },
-    /// A compose or shell submission failed after its overlay was cleared.
-    /// The UI restores the saved text through its ordinary failure message.
+    /// A shell submission failed after its line was cleared. The UI restores
+    /// the saved text through its ordinary failure message. A chat draft
+    /// needs no copy: the kernel keeps a draft whose submit failed.
     SubmitFailed {
         text: String,
         reason: String,
-        is_shell: bool,
         context_id: ContextId,
         principal_id: kaijutsu_types::PrincipalId,
+    },
+    /// The chat draft of `context_id` as the kernel held it, read through
+    /// the draft outbox behind every edit queued before it. `read` is the
+    /// token `input::compose::ComposeState::begin_load` returned.
+    DraftRead {
+        context_id: ContextId,
+        read: u64,
+        result: Result<String, String>,
+    },
+    /// A chat submit through the draft outbox was answered: the block the
+    /// draft became, or why it was refused.
+    DraftSubmitted {
+        context_id: ContextId,
+        result: Result<kaijutsu_types::BlockId, String>,
     },
     /// Context joined — membership info only. The change-feed hydration
     /// (docs/change-feed.md rules 21-26: subscribe, then `getBlocks`, then
@@ -369,6 +383,13 @@ pub enum RpcResultMessage {
     /// longer reads a host theme file — slice 2). Parsed and applied to the
     /// `Theme` resource by `apply_theme_from_rpc`.
     ThemeReceived(String),
+    /// A plain `kj` line from the shell surface ran through `execute_kj`
+    /// against `from`. Its data may name a context to follow (`kj context
+    /// rotate`'s successor); `view::sync::follow_kj_results` reads it.
+    KjLineFinished {
+        from: ContextId,
+        result: kaijutsu_client::rpc::KjExecutionResult,
+    },
     /// Generic RPC error (for toast/notification).
     RpcError { operation: String, error: String },
     /// A followed context's change feed ended and does not resume
@@ -1583,7 +1604,6 @@ fn update_connection_state(
             RpcResultMessage::SubmitFailed {
                 text,
                 reason,
-                is_shell,
                 context_id,
                 principal_id,
             } => {
@@ -1591,7 +1611,6 @@ fn update_connection_state(
                 submit_failures.write(crate::cell::SubmitFailed {
                     text: text.clone(),
                     reason: reason.clone(),
-                    is_shell: *is_shell,
                     context_id: *context_id,
                     principal_id: *principal_id,
                 });

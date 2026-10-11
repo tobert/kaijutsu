@@ -17,7 +17,7 @@ conflicts, and complete gamepad support (dpad, triggers, analog sticks,
 face buttons). Compose is a sub-regime: the modalkit VimMachine owns all
 keys while compose is focused, with hardcoded bypasses for Ctrl+C
 (interrupt) and Ctrl+Z (surface toggle), plus vim-mode-aware double-Esc
-dismiss (`vim/dismiss.rs`).
+dismiss (`vim/dismiss.rs`, since deleted).
 
 **Regime 2 — five raw-key readers** that grew during the scene work and see
 none of the above: `room_keyboard` (the octagon carousel,
@@ -46,8 +46,8 @@ Raw input
 Ctrl+A prefix machine        — sees every key first, on every surface
   │ (unclaimed keys fall through)
   ▼
-Keyboard grab?               — vi editor session, compose VimMachine
-  │ yes → whole stream to the grab owner (vi notation / modalkit)
+Keyboard grab?               — vi editor session, compose, diff viewer
+  │ yes → whole stream to the grab owner (vi notation / EditorCore / DiffCore)
   │ no ↓
   ▼
 dispatch_input               — ONE binding table, contexts per surface
@@ -64,11 +64,12 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    and the `.after` ordering contracts die; that also fixes the old
    double-fire class structurally.
 2. **Keyboard grabs are explicit.** The vi editor is the one sanctioned raw
-   consumer — a declared exclusive grab, not a suppression side effect. The
-   compose VimMachine becomes the second grab, which retires the
-   `vim_owns_keyboard` skip-dance inside `dispatch_input`. The diff viewer
+   consumer — a declared exclusive grab, not a suppression side effect.
+   Compose is the second grab (`KeyboardGrab::ComposeVim`): its chat and
+   shell surfaces each run a local `kaijutsu_editor::EditorCore`
+   (`input/compose/`, "Compose keys" below). The diff viewer
    (`KeyboardGrab::DiffView`, 2026-08-02) is the third and follows the same
-   rule: an app-local modalkit machine behind the grab, derived from the
+   rule: an app-local vi engine behind the grab, derived from the
    *screen* rather than from focus, so `q` and Esc are the surface's calls and
    not the dispatcher's.
 3. **The Ctrl+A prefix machine** (`input/prefix.rs`) sits in front of
@@ -97,7 +98,7 @@ ActionFired → domain handlers (scenes consume actions, never raw keys)
    `ui/ledger_ribbon.rs`, 2026-09-12). A pending ask in the context on
    screen raises the **ask sheet**; `Ctrl+A l` opens the **ledger ribbon**.
    While either is up, `derive_contexts` returns *only* its own context
-   beside `Global` and `KeyboardGrab::None` — the compose VimMachine is
+   beside `Global` and `KeyboardGrab::None` — the compose grab is
    suspended, which is what holds typed text, so `a` is an allow and never
    an `a` in the draft. A sheet that raises itself arms late: it shows
    `arming… keys still go where you were typing` and does not claim the
@@ -129,7 +130,7 @@ list.
 | `Ctrl+A w` | Synonym for `"` — the well | — |
 | `Ctrl+A '` | Switch-by-prompt: prefilled-`kj` prompt, `kj context switch ` (see pattern below) | select |
 | `Ctrl+A A` | Rename current context: prefilled-`kj` prompt, `kj context rename ` (verb added 2026-07-16; label-stealing stays `retag`'s latched job) | title |
-| `Ctrl+A r` | Rotate the current context: prefilled-`kj` prompt, `kj context rotate `; `Enter` rotates the context on screen, or type a label first. The client follows the successor. No handoff note is written and no model turn starts (`docs/prompts.md`, "Rotating a context"). TUI only; the app port is open in `docs/issues.md` | (repurposed; screen's wrap) |
+| `Ctrl+A r` | Rotate a context: prefilled-`kj` prompt, `kj context rotate `; `Enter` rotates the context on screen, or type a label first. The client follows the successor when the seat that rotated is still on screen; a failure shows on the hints line. No handoff note is written and no model turn starts (`docs/prompts.md`, "Rotating a context") | (repurposed; screen's wrap) |
 | `Ctrl+A n` / `p` | Next / previous ring-0 seat | next/prev |
 | `Ctrl+A d` | Detach to Conversation view from any scene/editor | detach |
 | `Ctrl+A h` | Hold the quick-context overlay (it is already peeking — arming the prefix put it there); again releases it | (new) |
@@ -139,8 +140,48 @@ list.
 **The prefilled-`kj` prompt pattern** (Amy, 2026-07-16: "pop a kj so the
 user can type and hit enter — we might use that pattern elsewhere"): summon
 the shell surface with a command line already typed up to the argument,
-cursor at end; Enter runs it, Esc abandons it. `Ctrl+A A`, `Ctrl+A '`, and
-`Ctrl+A r` use it; any verb that needs one free-text argument can ride it.
+cursor at end, in insert mode; Enter runs it, Esc Esc abandons it. `Ctrl+A
+A`, `Ctrl+A '`, and `Ctrl+A r` use it; any verb that needs one free-text
+argument can ride it. A shell line whose first word is `kj` runs through
+`executeKj`, its argv split on whitespace with no shell quoting, as the
+tui's `:kj` line does. Its result data names a context to follow:
+`switched_to`, or `rotated_from` with the successor's `context_id`. The app
+follows it only while the context the line ran against is still on screen,
+and the hints line shows the latch message or the first stdout line. Any
+other line runs in the shell and returns no data; a context switch there
+follows the kernel's `ContextSwitched` push instead.
+
+## Compose keys
+
+Compose's chat and shell surfaces each run a local `EditorCore`, the vi
+engine the kernel's editor sessions run (`docs/vi.md`). Every vi key acts on
+the surface: motions, operators, counts, visual mode, `u` and `Ctrl-r`,
+`/`·`?` with `n`/`N`, and `.`. The chat surface is the context's kernel
+draft: each edit is one `editInput`, queued in typed order on the draft
+outbox, so a submit always takes exactly what was typed before it
+(`docs/tui.md`, "Compose").
+
+| Key | Does |
+|---|---|
+| `Enter` | Chat: submit from normal mode; in insert mode, a newline (`Esc Enter` submits). Shell: run the line in any mode. On the `/`·`?` bar it searches |
+| `Esc Esc` | Leave compose, when the second Esc lands in normal mode within 500 ms |
+| `Ctrl+C` | The interrupt ladder; the third press clears the surface |
+| `Ctrl+Z` | Toggle chat and shell; each keeps its own text |
+| `Ctrl+V` / middle click | Paste CLIPBOARD / PRIMARY at the cursor as one edit |
+| `Ctrl+A a` | A literal `Ctrl+A` for the vi engine |
+
+Enter follows the tui (`docs/tui.md`, "Compose"): the chat draft is
+multi-line, so Enter in insert mode is a newline; the shell line is the
+tui's `:` bar. A surface opens in insert mode when it is empty and in normal
+mode when it holds text. Switching context, or a refused submit, reads the
+draft back through the outbox; keys pressed before the read lands wait and
+then apply to it in the mode the waiting box showed, so typing into an
+insert-mode box lands as text after the loaded draft. Held keys always go
+to the chat draft they were typed for, even after `Ctrl+Z`; a second switch
+before the first draft loads drops them, and an error toast says how many. A `:` line is
+refused with a notice: compose runs no ex commands, and the shell is
+`Ctrl+Z`. A failed edit or submit shows as an error toast; a failed chat
+submit reads the kernel's draft back, since the kernel keeps it.
 
 ## Escape — two meanings total
 
@@ -151,7 +192,7 @@ exactly one action.
 |---|---|
 | Vi editor (`Screen::Editor`) | Forwarded to kernel vi, never stolen |
 | Diff viewer (`Screen::Diff`) | To the app-local `DiffCore` (visual → normal). **Never closes the screen** — that is `q`/`ZQ`/`:q` (`docs/diff.md` slice 5) |
-| Compose overlay | To the VimMachine (mode switch); double-Esc in Normal mode dismisses (kept — works in practice) |
+| Compose overlay | To the surface's `EditorCore` (mode switch, closes the `/`·`?`·`:` bar); a second Esc within 500 ms that lands in normal mode dismisses (`PopLevel`) |
 | Quick-context overlay, **held** | Releases the hold, and nothing else — the level underneath stays put |
 | Ask sheet | `AskAside` — puts the ask **aside**, still pending, and nothing else |
 | Ledger ribbon | `CloseLedger` — closes the ribbon, returning to the sheet behind it if one was raised |
@@ -229,7 +270,8 @@ The scene should be fully navigable by pad once the contexts land.
   explicit grabs + per-surface contexts.
 - Three separate 500ms double-tap machines (`interrupt.rs`,
   `vim/dismiss.rs`, the dead `nav.rs::DoubleTap`) — consolidated on one
-  helper.
+  helper, `input/tap.rs`. Compose's double-Esc now lives in
+  `input/compose/`.
 
 ## Seeds parked elsewhere
 

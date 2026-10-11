@@ -20,6 +20,7 @@ kaijutsu-audio.workspace = true
 kaijutsu-cas.workspace = true
 kaijutsu-client = { workspace = true, features = ["cli"] }
 kaijutsu-diff = { workspace = true, features = ["viewer"] }
+kaijutsu-editor.workspace = true
 kaijutsu-kernel.workspace = true
 # The shared presentation layer (block → text, markdown spans, kaish syntax,
 # the Action vocabulary, beat phasors). The `bevy` feature only adds

@@ -10,7 +10,7 @@
 //! resulting state back to the renderer.
 //!
 //! This is deliberately distinct from `input::vim::keyconv` (which builds a
-//! modalkit `TerminalKey` for the *local* compose VimMachine): here the target
+//! crossterm key event for compose's local `EditorCore`): here the target
 //! is the kernel's text notation, parsed by `kaijutsu-editor`.
 
 use bevy::input::keyboard::{Key, KeyboardInput};

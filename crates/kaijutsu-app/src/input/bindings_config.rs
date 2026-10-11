@@ -433,6 +433,7 @@ fn action_to_str(a: &Action) -> String {
         Action::SendLiteralPrefix => "SendLiteralPrefix".into(),
         Action::PromptContextRename => "PromptContextRename".into(),
         Action::PromptContextSwitch => "PromptContextSwitch".into(),
+        Action::PromptContextRotate => "PromptContextRotate".into(),
         Action::HoldQuickContext => "HoldQuickContext".into(),
         Action::UnpinQuickContext => "UnpinQuickContext".into(),
         Action::AskAllowOnce => "AskAllowOnce".into(),
@@ -518,6 +519,7 @@ fn parse_action(s: &str) -> Result<Action, String> {
         "SendLiteralPrefix" => Ok(Action::SendLiteralPrefix),
         "PromptContextRename" => Ok(Action::PromptContextRename),
         "PromptContextSwitch" => Ok(Action::PromptContextSwitch),
+        "PromptContextRotate" => Ok(Action::PromptContextRotate),
         "HoldQuickContext" => Ok(Action::HoldQuickContext),
         "UnpinQuickContext" => Ok(Action::UnpinQuickContext),
         "AskAllowOnce" => Ok(Action::AskAllowOnce),
@@ -750,6 +752,7 @@ mod tests {
         "SendLiteralPrefix",
         "PromptContextRename",
         "PromptContextSwitch",
+        "PromptContextRotate",
         "HoldQuickContext",
         "UnpinQuickContext",
     ];

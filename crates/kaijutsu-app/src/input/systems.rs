@@ -1,18 +1,13 @@
 //! Input action handlers — systems that consume ActionFired messages.
 //!
-//! All domain input handlers live here. They read `ActionFired` or
-//! `TextInputReceived` messages instead of raw keyboard events.
+//! Domain input handlers live here; compose's own are in `input/compose/`.
+//! They read `ActionFired` messages instead of raw keyboard events.
 
 use bevy::prelude::*;
-use tracing::Instrument;
 
 use super::Action;
 use super::events::ActionFired;
 use super::focus::FocusArea;
-
-fn submission_needs_restore(error: &kaijutsu_client::CallError) -> bool {
-    !matches!(error, kaijutsu_client::CallError::Refused(refusal) if refusal.is_pending())
-}
 
 // ============================================================================
 // FOCUS CYCLING — Tab/Shift+Tab
@@ -44,205 +39,6 @@ pub fn handle_focus_cycle(mut actions: MessageReader<ActionFired>, mut focus: Re
     }
 }
 
-// ============================================================================
-// FOCUS COMPOSE / UNFOCUS — direct focus management
-// ============================================================================
-
-/// Handle FocusCompose action (i/Space in Navigation → jump to compose).
-///
-/// Only handles chat surface summoning. Shell surface is activated via
-/// `handle_toggle_surface` (Ctrl+Z).
-pub fn handle_focus_compose(
-    mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
-    mut surface: ResMut<super::focus::ActiveSurface>,
-    mut overlay: Query<&mut crate::cell::InputOverlay, With<crate::cell::InputOverlayMarker>>,
-    doc_cache: Res<crate::cell::DocumentCache>,
-    session_principal: Res<crate::cell::SessionPrincipal>,
-    mut vim: ResMut<crate::input::vim::VimMachineResource>,
-) {
-    for ActionFired { action, .. } in actions.read() {
-        if !matches!(action, Action::FocusCompose | Action::SummonChat) {
-            continue;
-        }
-        *focus = FocusArea::Compose;
-        *surface = super::focus::ActiveSurface::Chat;
-
-        // Set the overlay mode and restore draft text from the mirror if available
-        if let Ok(mut overlay) = overlay.single_mut() {
-            overlay.mode = crate::cell::InputMode::Chat;
-            // Restore draft from the mirror if the overlay is empty. The
-            // draft is an ordinary block now (Lane C slice 3) — nothing
-            // concurrent to merge, so no pending-clear suppression: the
-            // mirror is version-ordered and has nothing stale to arrive late.
-            if overlay.text.is_empty()
-                && let Some(ctx_id) = doc_cache.active_id()
-                && let Some(cached) = doc_cache.get(ctx_id)
-                && let Some(principal_id) = session_principal.0
-                && let Some(draft_text) = cached.draft_text(principal_id)
-                && !draft_text.is_empty()
-            {
-                overlay.text = draft_text.to_string();
-                overlay.cursor = overlay.text.len();
-                overlay.target_context = Some(ctx_id);
-            }
-
-            // Always reset vim state to Normal first — clears any stale
-            // operator-pending or visual state from a previous focus session.
-            use modalkit::keybindings::BindingMachine;
-            vim.machine.reset_mode();
-            // Drain actions queued by mode transition (enter-hook fires
-            // CursorClose + motion-back + Checkpoint when leaving Insert).
-            while vim.machine.pop().is_some() {}
-
-            // Vim mode transition:
-            // - Empty overlay: enter Insert mode (ready to type immediately)
-            // - Draft text: stay in Normal mode (user reviews before editing)
-            if overlay.text.is_empty() {
-                // Synthesize 'i' keypress to enter Insert mode
-                use modalkit::crossterm::event::KeyCode;
-                vim.machine.input_key(KeyCode::Char('i').into());
-                while vim.machine.pop().is_some() {}
-            }
-            overlay.vim_mode = vim.machine.show_mode();
-        }
-    }
-}
-
-/// Handle ToggleSurface action (Ctrl+Z — symmetric chat ↔ shell toggle).
-///
-/// Toggles ActiveSurface and sets FocusArea::Compose to summon the
-/// appropriate surface. Each surface maintains its own draft text.
-pub fn handle_toggle_surface(
-    mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
-    mut surface: ResMut<super::focus::ActiveSurface>,
-    mut vim: ResMut<crate::input::vim::VimMachineResource>,
-    mut chat_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        With<crate::cell::InputOverlayMarker>,
-    >,
-    mut shell_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        (
-            With<crate::view::shell_dock::ShellDockMarker>,
-            Without<crate::cell::InputOverlayMarker>,
-        ),
-    >,
-) {
-    for ActionFired { action, .. } in actions.read() {
-        if !matches!(action, Action::ToggleSurface) {
-            continue;
-        }
-
-        surface.toggle();
-        *focus = FocusArea::Compose;
-
-        // Reset vim state for the newly active surface.
-        use modalkit::keybindings::BindingMachine;
-        vim.machine.reset_mode();
-        while vim.machine.pop().is_some() {}
-
-        // Get the overlay for the newly active surface
-        let overlay = if surface.is_shell() {
-            shell_overlay.single_mut().ok()
-        } else {
-            chat_overlay.single_mut().ok()
-        };
-
-        if let Some(mut overlay) = overlay {
-            // Enter Insert mode if overlay is empty
-            if overlay.text.is_empty() {
-                use modalkit::crossterm::event::KeyCode;
-                vim.machine.input_key(KeyCode::Char('i').into());
-                while vim.machine.pop().is_some() {}
-            }
-            overlay.vim_mode = vim.machine.show_mode();
-        }
-    }
-}
-
-/// Handle PopLevel action for the conversation screen (Escape — "go up").
-///
-/// Scene consumers (room, well, patch bay, fsn) handle PopLevel for their
-/// own levels; this system owns the conversation-side transitions:
-/// 1. FocusArea::Dialog → ignored (dialog systems own their Escape)
-/// 2. FocusArea::Compose → FocusArea::Conversation
-pub fn handle_pop_level(
-    mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
-    mut surface: ResMut<super::focus::ActiveSurface>,
-    mut vim: ResMut<crate::input::vim::VimMachineResource>,
-) {
-    for ActionFired { action, .. } in actions.read() {
-        if !matches!(action, Action::PopLevel) {
-            continue;
-        }
-
-        // 1. Dialogs handle their own Escape/PopLevel.
-        if matches!(*focus, FocusArea::Dialog) {
-            continue;
-        }
-
-        // 2. Normal focus transitions
-        if matches!(focus.as_ref(), FocusArea::Compose) {
-            // Reset vim to Normal mode when leaving compose
-            use modalkit::keybindings::BindingMachine;
-            vim.machine.reset_mode();
-            *focus = FocusArea::Conversation;
-
-            // If escaping from shell surface, return to chat as default
-            if surface.is_shell() {
-                *surface = super::focus::ActiveSurface::Chat;
-            }
-        }
-    }
-}
-
-/// The prefilled-`kj` prompt pattern (docs/input.md; Amy 2026-07-16: "pop a
-/// kj so the user can type and hit enter — we might use that pattern
-/// elsewhere"): summon the SHELL surface with a command line already typed,
-/// cursor at the end, in Insert mode. Enter runs it; Esc-Esc abandons it.
-/// The shell surface is local-only (no dual-write to the kernel), so the
-/// prefill is a plain overlay write.
-pub fn handle_prompt_prefill(
-    mut actions: MessageReader<ActionFired>,
-    mut focus: ResMut<FocusArea>,
-    mut surface: ResMut<super::focus::ActiveSurface>,
-    mut vim: ResMut<crate::input::vim::VimMachineResource>,
-    mut shell_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        With<crate::view::shell_dock::ShellDockMarker>,
-    >,
-) {
-    for ActionFired { action, .. } in actions.read() {
-        let prefill = match action {
-            Action::PromptContextRename => "kj context rename ",
-            Action::PromptContextSwitch => "kj context switch ",
-            _ => continue,
-        };
-
-        *surface = super::focus::ActiveSurface::Shell;
-        *focus = FocusArea::Compose;
-
-        let Ok(mut overlay) = shell_overlay.single_mut() else {
-            continue;
-        };
-        overlay.text = prefill.to_string();
-        overlay.cursor = overlay.text.len();
-        overlay.selection_anchor = None;
-
-        // Fresh vim state, straight into Insert at the end of the line.
-        use modalkit::keybindings::BindingMachine;
-        vim.machine.reset_mode();
-        while vim.machine.pop().is_some() {}
-        vim.machine
-            .input_key(modalkit::crossterm::event::KeyCode::Char('i').into());
-        while vim.machine.pop().is_some() {}
-        overlay.vim_mode = vim.machine.show_mode();
-    }
-}
-
 /// Handle DetachToConversation (`Ctrl+A d`) — back to the Conversation view
 /// from any scene or the editor. The editor session stays alive kernel-side
 /// (same suspend semantics as its Ctrl+Z intercept); scene teardown rides
@@ -267,32 +63,20 @@ pub fn handle_detach(
 /// Press count determines escalation:
 /// - 1st press: soft interrupt (stop agentic loop after current tool turn)
 /// - 2nd press: hard interrupt (abort LLM stream + kill kaish jobs)
-/// - 3rd press: hard interrupt + clear compose buffer
+/// - 3rd press: hard interrupt + clear the compose surface
 ///
-/// Does NOT change focus — that's handle_unfocus's job (Escape key).
+/// Does NOT change focus — that is Escape's job.
 pub fn handle_interrupt(
     mut actions: MessageReader<ActionFired>,
     mut interrupt_state: ResMut<crate::input::interrupt::InterruptState>,
-    mut chat_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        With<crate::cell::InputOverlayMarker>,
-    >,
-    mut shell_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        (
-            With<crate::view::shell_dock::ShellDockMarker>,
-            Without<crate::cell::InputOverlayMarker>,
-        ),
-    >,
-    surface: Res<super::focus::ActiveSurface>,
     doc_cache: Res<crate::cell::DocumentCache>,
     actor: Option<Res<crate::connection::RpcActor>>,
+    mut compose: crate::input::compose::systems::ComposeIo,
 ) {
     for ActionFired { action, .. } in actions.read() {
-        let _immediate = match action {
-            Action::InterruptContext { immediate } => *immediate,
-            _ => continue,
-        };
+        if !matches!(action, Action::InterruptContext { .. }) {
+            continue;
+        }
 
         let count = interrupt_state.press();
 
@@ -321,31 +105,8 @@ pub fn handle_interrupt(
                 .detach();
         }
 
-        // 3rd press: clear compose buffer + tell kernel to clear input doc
         if count >= 3 {
-            let ov = if surface.is_shell() {
-                shell_overlay.single_mut().ok()
-            } else {
-                chat_overlay.single_mut().ok()
-            };
-            if let Some(mut ov) = ov {
-                ov.text.clear();
-                ov.cursor = 0;
-                ov.selection_anchor = None;
-            }
-            if let Some(ctx_id) = doc_cache.active_id() {
-                // Tell the kernel to clear the draft block.
-                if let Some(ref actor) = actor {
-                    let handle = actor.handle.clone();
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.clear_input(ctx_id).await {
-                                log::warn!("clear_input failed: {e}");
-                            }
-                        })
-                        .detach();
-                }
-            }
+            crate::input::compose::systems::clear_compose(&mut compose);
             interrupt_state.reset();
         }
     }
@@ -849,343 +610,8 @@ pub fn handle_tiling(mut actions: MessageReader<ActionFired>, mut tree: ResMut<T
 }
 
 // ============================================================================
-// TEXT INPUT (COMPOSE + INLINE BLOCK EDITING)
+// CLIPBOARD
 // ============================================================================
-
-/// Handle text input in the input overlay (Compose area).
-///
-/// Consumes TextInputReceived for character insertion and ActionFired for
-/// editing actions (Submit, Backspace, Delete, cursor movement).
-/// Uses `ActiveSurface` to determine shell vs chat routing on Submit.
-///
-/// Writes to the server-side draft block via `edit_input` RPC for
-/// persistence. Submit uses `submit_input` RPC; the overlay is cleared
-/// optimistically since the draft block itself (not a copy) becomes the
-/// submitted message — the mirror will reflect that on the next feed
-/// delivery.
-pub fn handle_compose_input(
-    mut text_events: MessageReader<super::events::TextInputReceived>,
-    mut actions: MessageReader<ActionFired>,
-    mut chat_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        With<crate::cell::InputOverlayMarker>,
-    >,
-    mut shell_overlay: Query<
-        &mut crate::cell::InputOverlay,
-        (
-            With<crate::view::shell_dock::ShellDockMarker>,
-            Without<crate::cell::InputOverlayMarker>,
-        ),
-    >,
-    mut clipboard: Option<ResMut<super::SystemClipboard>>,
-    actor: Option<Res<crate::connection::RpcActor>>,
-    rpc_results: Res<crate::connection::RpcResultChannel>,
-    session_principal: Res<crate::cell::SessionPrincipal>,
-    doc_cache: Res<crate::cell::DocumentCache>,
-    mut focus: ResMut<FocusArea>,
-    surface: Res<super::focus::ActiveSurface>,
-    mut scroll_state: ResMut<ConversationScrollState>,
-) {
-    let mut overlay = if surface.is_shell() {
-        match shell_overlay.single_mut() {
-            Ok(o) => o,
-            Err(_) => return,
-        }
-    } else {
-        match chat_overlay.single_mut() {
-            Ok(o) => o,
-            Err(_) => return,
-        }
-    };
-
-    let ctx_id = overlay.target_context.or(doc_cache.active_id());
-
-    let is_shell = surface.is_shell();
-
-    // Handle text insertion
-    for super::events::TextInputReceived(text) in text_events.read() {
-        if overlay.target_context.is_none() {
-            overlay.target_context = doc_cache.active_id();
-        }
-        let pos_before = overlay.cursor;
-        overlay.insert(text);
-
-        // Only dual-write to the kernel for chat input. Shell input is local-only.
-        if !is_shell
-            && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
-        {
-            let handle = actor.handle.clone();
-            let insert_text = text.clone();
-            let pos = pos_before as u64;
-            bevy::tasks::IoTaskPool::get()
-                .spawn(async move {
-                    if let Err(e) = handle.edit_input(ctx, pos, &insert_text, 0).await {
-                        log::warn!("edit_input (insert) failed: {e}");
-                    }
-                })
-                .detach();
-        }
-    }
-
-    // Handle editing actions
-    for ActionFired { action, .. } in actions.read() {
-        match action {
-            Action::Submit => {
-                if !overlay.is_empty()
-                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
-                {
-                    let Some(principal_id) = session_principal.0 else {
-                        let _ = rpc_results.sender().send(
-                            crate::connection::RpcResultMessage::RpcError {
-                                operation: "submit".into(),
-                                error: "cannot submit until the authenticated connection identity is known".into(),
-                            },
-                        );
-                        continue;
-                    };
-                    let handle = actor.handle.clone();
-
-                    // A local submit (shell or chat) is a strong signal of
-                    // intent to watch the result — re-engage scroll-follow
-                    // even if the user had scrolled away from the bottom.
-                    scroll_state.start_following();
-
-                    if is_shell {
-                        // Shell: call shell_execute directly with local text
-                        let code = overlay.text.clone();
-                        let result_tx = rpc_results.sender();
-                        let span = tracing::info_span!(
-                            "app.submit",
-                            principal.id = %principal_id,
-                            context.id = %ctx,
-                            surface = "shell",
-                        );
-                        bevy::tasks::IoTaskPool::get()
-                            .spawn(async move {
-                                match handle.shell_execute(&code, ctx, true).await {
-                                    Ok(block_id) => {
-                                        log::info!("shell_execute ok: {:?}", block_id)
-                                    }
-                                    Err(e) => {
-                                        log::error!("shell_execute failed: {e}");
-                                        let message = e.to_string();
-                                        let result = if submission_needs_restore(&e) {
-                                            crate::connection::RpcResultMessage::SubmitFailed {
-                                                text: code,
-                                                reason: message,
-                                                is_shell: true,
-                                                context_id: ctx,
-                                                principal_id,
-                                            }
-                                        } else {
-                                            crate::connection::RpcResultMessage::RpcError {
-                                                operation: "shell submit".into(),
-                                                error: message,
-                                            }
-                                        };
-                                        let _ = result_tx.send(result);
-                                    }
-                                }
-                            }.instrument(span))
-                            .detach();
-
-                        // Clear shell overlay locally (no kernel involvement)
-                        overlay.text.clear();
-                        overlay.cursor = 0;
-                        overlay.selection_anchor = None;
-                        overlay.target_context = None;
-                    } else {
-                        // Chat: submit_input flips the draft block's status
-                        // away from Draft, turning it into a regular message
-                        // in place (a status transition, not a copy — see
-                        // `Status::Draft`'s doc comment). The mirror will
-                        // carry that change back on the feed; clear the
-                        // overlay optimistically now so the compose box
-                        // doesn't sit full in the meantime.
-                        let text = overlay.text.clone();
-                        let result_tx = rpc_results.sender();
-                        let span = tracing::info_span!(
-                            "app.submit",
-                            principal.id = %principal_id,
-                            context.id = %ctx,
-                            surface = "chat",
-                        );
-                        bevy::tasks::IoTaskPool::get()
-                            .spawn(async move {
-                                match handle.submit_input(ctx, false).await {
-                                    Ok(result) => {
-                                        log::info!("submit_input ok: {:?}", result.block_id)
-                                    }
-                                    Err(e) => {
-                                        log::error!("submit_input failed: {e}");
-                                        let message = e.to_string();
-                                        let result = if submission_needs_restore(&e) {
-                                            crate::connection::RpcResultMessage::SubmitFailed {
-                                                text,
-                                                reason: message,
-                                                is_shell: false,
-                                                context_id: ctx,
-                                                principal_id,
-                                            }
-                                        } else {
-                                            crate::connection::RpcResultMessage::RpcError {
-                                                operation: "chat submit".into(),
-                                                error: message,
-                                            }
-                                        };
-                                        let _ = result_tx.send(result);
-                                    }
-                                }
-                            }.instrument(span))
-                            .detach();
-
-                        overlay.text.clear();
-                        overlay.cursor = 0;
-                        overlay.selection_anchor = None;
-                        overlay.target_context = None;
-                    }
-
-                    // Dismiss overlay by transitioning focus
-                    *focus = FocusArea::Conversation;
-                }
-                // No else — if not connected, do nothing (no offline fallback)
-            }
-            Action::InsertNewline => {
-                let pos_before = overlay.cursor;
-                overlay.insert("\n");
-
-                if !is_shell && let (Some(actor), Some(ctx)) = (&actor, ctx_id) {
-                    let handle = actor.handle.clone();
-                    let pos = pos_before as u64;
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.edit_input(ctx, pos, "\n", 0).await {
-                                log::warn!("edit_input (newline) failed: {e}");
-                            }
-                        })
-                        .detach();
-                }
-            }
-            Action::Backspace => {
-                let had_selection = overlay.selection_range().is_some();
-                let (del_pos, del_len) = if had_selection {
-                    let range = overlay.selection_range().unwrap();
-                    (range.start, range.end - range.start)
-                } else if overlay.cursor > 0 {
-                    let prev = overlay.text[..overlay.cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    (prev, overlay.cursor - prev)
-                } else {
-                    (0, 0)
-                };
-
-                overlay.backspace();
-
-                if !is_shell
-                    && del_len > 0
-                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
-                {
-                    let handle = actor.handle.clone();
-                    let pos = del_pos as u64;
-                    let delete = del_len as u64;
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
-                                log::warn!("edit_input (backspace) failed: {e}");
-                            }
-                        })
-                        .detach();
-                }
-            }
-            Action::Delete => {
-                let had_selection = overlay.selection_range().is_some();
-                let (del_pos, del_len) = if had_selection {
-                    let range = overlay.selection_range().unwrap();
-                    (range.start, range.end - range.start)
-                } else if overlay.cursor < overlay.text.len() {
-                    let next = overlay.text[overlay.cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map(|(i, _)| overlay.cursor + i)
-                        .unwrap_or(overlay.text.len());
-                    (overlay.cursor, next - overlay.cursor)
-                } else {
-                    (0, 0)
-                };
-
-                overlay.delete();
-
-                if !is_shell
-                    && del_len > 0
-                    && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
-                {
-                    let handle = actor.handle.clone();
-                    let pos = del_pos as u64;
-                    let delete = del_len as u64;
-                    bevy::tasks::IoTaskPool::get()
-                        .spawn(async move {
-                            if let Err(e) = handle.edit_input(ctx, pos, "", delete).await {
-                                log::warn!("edit_input (delete) failed: {e}");
-                            }
-                        })
-                        .detach();
-                }
-            }
-            Action::CursorLeft => overlay.move_left(),
-            Action::CursorRight => overlay.move_right(),
-            // Xterm-style paste (docs/input.md): Ctrl+V reads CLIPBOARD;
-            // middle-click reads PRIMARY (Linux), falling back to CLIPBOARD
-            // where no primary selection exists.
-            Action::Paste | Action::PastePrimary => {
-                if let Some(ref mut clip) = clipboard {
-                    let fetched = if matches!(action, Action::PastePrimary) {
-                        primary_selection_text(&mut clip.0)
-                    } else {
-                        clip.0.get_text()
-                    };
-                    match fetched {
-                        Ok(text) => {
-                            let sel_range = overlay.selection_range();
-                            let pos_before = if let Some(ref range) = sel_range {
-                                range.start
-                            } else {
-                                overlay.cursor
-                            };
-                            let del_len = sel_range.as_ref().map(|r| r.end - r.start).unwrap_or(0);
-
-                            overlay.insert(&text);
-
-                            if !is_shell
-                                && let (Some(actor), Some(ctx)) = (&actor, ctx_id)
-                            {
-                                let handle = actor.handle.clone();
-                                let pos = pos_before as u64;
-                                let delete = del_len as u64;
-                                let insert_text = text.clone();
-                                bevy::tasks::IoTaskPool::get()
-                                    .spawn(async move {
-                                        if let Err(e) =
-                                            handle
-                                                .edit_input(ctx, pos, &insert_text, delete)
-                                                .await
-                                        {
-                                            log::warn!("edit_input (paste) failed: {e}");
-                                        }
-                                    })
-                                    .detach();
-                            }
-                        }
-                        Err(e) => warn!("Paste failed: {e}"),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
 
 /// The PRIMARY selection on Linux (X11/Wayland); other platforms have no
 /// primary selection, so middle-click falls back to the ordinary clipboard.
@@ -1209,25 +635,10 @@ pub(crate) fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<St
 mod tests {
     use super::{
         NavigationDirection, find_latest_error_block, handle_navigate_blocks, next_focus_index,
-        scroll_to_rect_visible, submission_needs_restore,
+        scroll_to_rect_visible,
     };
     use crate::cell::ConversationScrollState;
     use kaijutsu_types::{BlockId, BlockKind, BlockSnapshotBuilder, ContextId, PrincipalId, Status};
-
-    #[test]
-    fn pending_refusal_is_visible_without_restoring_a_retryable_submission() {
-        let pending = kaijutsu_client::CallError::Refused(kaijutsu_types::Refusal {
-            kind: kaijutsu_types::RefusalKind::Pending,
-            reason: "review pending".into(),
-            subject: "shell".into(),
-            ask: None,
-            remedy: None,
-        });
-        let fault = kaijutsu_client::CallError::Rpc("connection reset".into());
-
-        assert!(!submission_needs_restore(&pending));
-        assert!(submission_needs_restore(&fault));
-    }
 
     /// `c` must toggle collapse with NOTHING but `EditorEntities.main_cell`
     /// set. The handler used to key off `FocusTarget.entity`, whose only

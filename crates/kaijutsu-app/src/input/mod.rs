@@ -18,7 +18,7 @@
 //!     ├──────────┬───────────────┐
 //!     ▼          ▼               ▼
 //! ActionFired  GrabbedKey    AnalogInput
-//!     │          │ (compose VimMachine / vi editor session)
+//!     │          │ (compose EditorCore / vi editor session / diff viewer)
 //!     ▼          ▼
 //! Domain handlers consume actions; grab owners consume keys
 //! ```
@@ -31,6 +31,7 @@
 //! - `ActiveInputContexts` — which contexts are active
 
 pub mod binding;
+pub mod compose;
 pub mod context;
 pub mod defaults;
 pub mod dispatch;
@@ -53,7 +54,7 @@ pub use kaijutsu_present::action::Action;
 #[allow(unused_imports)]
 pub use context::InputContext;
 #[allow(unused_imports)]
-pub use events::{ActionFired, TextInputReceived};
+pub use events::ActionFired;
 pub use focus::FocusArea;
 #[allow(unused_imports)]
 pub use map::InputMap;
@@ -131,7 +132,7 @@ impl ClipboardWriter {
 pub enum InputPhase {
     /// Derive active contexts from focus state + sync from screen
     SyncContext,
-    /// Dispatch raw input → ActionFired / TextInputReceived
+    /// Dispatch raw input → ActionFired / GrabbedKey
     Dispatch,
     /// Handle actions (focus cycling, debug, etc.)
     Handle,
@@ -140,8 +141,8 @@ pub enum InputPhase {
 /// Plugin that registers the focus-based input dispatch system.
 ///
 /// Handles keyboard, mouse wheel, and gamepad input. All raw input flows
-/// through `dispatch_input` which emits `ActionFired` / `TextInputReceived`
-/// messages for domain systems to consume.
+/// through `dispatch_input` which emits `ActionFired` / `GrabbedKey`
+/// messages for domain systems and grab owners to consume.
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
@@ -151,7 +152,6 @@ impl Plugin for InputPlugin {
 
         // Register messages
         app.add_message::<events::ActionFired>()
-            .add_message::<events::TextInputReceived>()
             .add_message::<events::GrabbedKey>()
             .add_message::<events::LiteralPrefix>();
 
@@ -182,9 +182,8 @@ impl Plugin for InputPlugin {
             .init_resource::<events::AnalogInput>()
             .init_resource::<interrupt::InterruptState>()
             .init_resource::<scroll_config::ScrollConfig>()
-            .insert_resource(vim::VimMachineResource::new())
-            .init_resource::<vim::dispatch::VimMotionState>()
-            .init_resource::<vim::dismiss::EscapeDismissState>();
+            .init_resource::<compose::ComposeState>()
+            .init_resource::<compose::outbox::DraftOutboxState>();
 
         // Register types for BRP reflection
         app.register_type::<focus::FocusArea>()
@@ -195,7 +194,6 @@ impl Plugin for InputPlugin {
             .register_type::<context::KeyboardGrab>()
             .register_type::<events::AnalogInput>()
             .register_type::<events::ActionFired>()
-            .register_type::<events::TextInputReceived>()
             .register_type::<Action>()
             .register_type::<binding::Binding>()
             .register_type::<binding::InputSource>()
@@ -212,25 +210,24 @@ impl Plugin for InputPlugin {
             ),
         );
 
-        // SyncContext phase: derive focus + contexts
+        // SyncContext phase: derive focus + contexts, and keep the draft
+        // outbox on the current connection before any key needs it.
         app.add_systems(
             Update,
-            (context::sync_input_context,).in_set(InputPhase::SyncContext),
+            (context::sync_input_context, compose::outbox::sync_draft_outbox)
+                .in_set(InputPhase::SyncContext),
         );
 
         // Dispatch phase: raw input → ActionFired/GrabbedKey.
         // dispatch_input is the only raw-keyboard reader; grab owners consume
         // the GrabbedKey stream it emits, so they must run after it to see
         // this frame's keys (the vi editor orders itself the same way).
+        // Compose reads every frame and acts only while it holds the grab.
         app.add_systems(
             Update,
             (
                 dispatch::dispatch_input,
-                vim::dispatch::vim_dispatch_compose
-                    .run_if(bevy::ecs::prelude::resource_equals(
-                        context::KeyboardGrab::ComposeVim,
-                    ))
-                    .after(dispatch::dispatch_input),
+                compose::systems::compose_dispatch_keys.after(dispatch::dispatch_input),
             )
                 .in_set(InputPhase::Dispatch),
         );
@@ -246,11 +243,12 @@ impl Plugin for InputPlugin {
             (
                 // Focus management (global)
                 systems::handle_focus_cycle,
-                systems::handle_focus_compose,
-                systems::handle_toggle_surface,
-                systems::handle_pop_level,
+                compose::systems::handle_focus_compose,
+                compose::systems::handle_toggle_surface,
+                compose::systems::handle_pop_level,
                 systems::handle_detach,
-                systems::handle_prompt_prefill,
+                compose::systems::handle_prompt_prefill,
+                compose::systems::handle_compose_paste,
                 systems::handle_interrupt,
                 // App-level actions (global)
                 systems::handle_quit,
@@ -265,11 +263,24 @@ impl Plugin for InputPlugin {
                 systems::handle_toggle_block_excluded.run_if(focus::in_conversation),
                 // Scrolling (multi-context)
                 systems::handle_scroll.run_if(focus::scroll_context_active),
-                // Text input context
-                systems::handle_compose_input.run_if(focus::in_compose),
             )
                 .in_set(InputPhase::Handle),
         );
 
+        // The chat draft: load it for the context on screen, take the
+        // feed's copy and our acks, then draw both surfaces. After the feed
+        // drain, so the draft is reconciled against this frame's mirror.
+        app.add_systems(
+            Update,
+            (
+                compose::systems::follow_draft_context,
+                compose::systems::drain_draft_acks,
+                compose::systems::reconcile_chat_draft,
+                compose::systems::project_compose_overlays,
+            )
+                .chain()
+                .after(InputPhase::Handle)
+                .after(crate::view::sync::drain_context_feeds),
+        );
     }
 }

@@ -3,9 +3,9 @@
 //!
 //! Each frame `sync_input_context` derives the active `InputContext` set and
 //! the active `KeyboardGrab`. The dispatcher checks bindings against active
-//! contexts to determine matches; the grab (vi editor session, compose
-//! VimMachine) receives the raw keyboard stream that the dispatcher doesn't
-//! claim. See `docs/input.md`.
+//! contexts to determine matches; the grab (vi editor session, compose,
+//! diff viewer) receives the raw keyboard stream that the dispatcher
+//! doesn't claim. See `docs/input.md`.
 
 use bevy::prelude::*;
 
@@ -21,7 +21,8 @@ use crate::view::room::nav::Station;
 pub enum InputContext {
     /// Always active regardless of focus: F1, F12, tiling keys
     Global,
-    /// Active when Compose or EditingBlock has focus: text chars, editing actions
+    /// Active while compose or a dialog has focus. Compose holds a keyboard
+    /// grab, so its keys never reach this context's bindings.
     TextInput,
     /// Active when Conversation block list has focus: j/k, f, Tab
     Navigation,
@@ -71,12 +72,13 @@ pub enum KeyboardGrab {
     /// No grab — bindings match across all active contexts.
     #[default]
     None,
-    /// The compose overlay's VimMachine (chat or shell surface).
+    /// The compose surfaces' `EditorCore` (chat or shell,
+    /// `input::compose`).
     ComposeVim,
     /// The in-app vi editor forwarding to a kernel editor session.
     EditorSession,
     /// The full diff viewer's app-local `DiffCore` (`view::diff_view`) — the
-    /// `ComposeVim` precedent: a modalkit machine behind the grab, so Global
+    /// `ComposeVim` precedent: a vi engine behind the grab, so Global
     /// bindings and the Ctrl+A prefix still win, and Esc reaches the vi
     /// surface instead of popping the screen.
     DiffView,
@@ -148,7 +150,7 @@ pub fn derive_contexts(
     // An approval surface takes the keyboard on the screens it can raise on:
     // its own context and nothing else beneath it, so `a`/`d` cannot also
     // mean archive or demote, and `KeyboardGrab::None`, which suspends the
-    // compose VimMachine and is what holds typed text (docs/tui.md, "Asks").
+    // compose grab and is what holds typed text (docs/tui.md, "Asks").
     //
     // Never on `Editor` or `Diff`: a vi surface owns the keys wherever it is
     // live, and under its grab only Global bindings match anyway. The raise
@@ -208,7 +210,7 @@ pub fn derive_contexts(
     match focus {
         FocusArea::Compose => {
             contexts.push(InputContext::TextInput);
-            // The VimMachine owns the keyboard while composing.
+            // Compose's vi engine owns the keyboard while composing.
             return (contexts, KeyboardGrab::ComposeVim);
         }
         FocusArea::Conversation => {
@@ -310,8 +312,8 @@ mod tests {
     #[test]
     fn diff_view_grab_holds_even_with_compose_focus() {
         // A stale FocusArea::Compose (e.g. the viewer opened from a state that
-        // hadn't parked focus yet) must not hand the keyboard to the compose
-        // VimMachine — the screen decides, not the focus.
+        // hadn't parked focus yet) must not hand the keyboard to compose —
+        // the screen decides, not the focus.
         let (_, grab) = derive_contexts(Screen::Diff, None, &FocusArea::Compose, false, surfaces(false, false));
         assert_eq!(grab, KeyboardGrab::DiffView);
     }

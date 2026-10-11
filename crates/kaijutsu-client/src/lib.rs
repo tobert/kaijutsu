@@ -9,6 +9,7 @@ pub mod constants;
 pub mod context_create;
 pub mod context_feed;
 pub mod document_store;
+pub mod draft_ledger;
 pub mod draft_outbox;
 pub mod editor_outbox;
 pub mod kernel_clock;

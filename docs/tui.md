@@ -434,8 +434,8 @@ Rules the figure carries:
   0 kaijutsu*  1 kaish@  2 scout  3 exo        │  -- INSERT --  17.3/128k  91%  4m
 ```
 
-Compose is a modalkit `VimMachine` over the kernel-owned input block
-(`edit_input` / `submit_input`), as the app's compose overlay is. The draft is
+Compose runs `kaijutsu-editor`'s `EditorCore` over the kernel-owned draft
+block (`edit_input` / `submit_input`), as the app's compose overlay does. The draft is
 a shared block: a sibling's typing shows. `Enter` in normal mode submits;
 `Esc Enter` is the way out of insert mode and into a submit
 (`compose::Compose::press`). A second `Esc` is
@@ -478,7 +478,8 @@ Rules the figure carries:
   than applied — otherwise our own echo, arriving one keystroke behind, would
   delete what was just typed. While our edits are in flight no mirror can
   be known to carry them, so the newest one is held and checked again when
-  the last edit lands (`Compose::landed`). The feed and the acks travel
+  the last edit lands (`kaijutsu_client::draft_ledger`, shared with the
+  app). The feed and the acks travel
   separately, so the echo can arrive before its ack.
 - **A long line wraps, and the band grows for the draft.** A logical line
   wraps at the width by character, as vim wraps, and continuation rows
@@ -970,7 +971,6 @@ needs rather than being cropped into a fixed region.
     [a]llow once  [A]llow always (global)  [c] always for coder  [C] coder, command family  [d]eny  [e]scalate  [v]iew ledger  Esc aside
 ```
 
-**A new card arms late.** It is drawn disarmed, its key line reading
 The key line is the viewer's own, wrapped by width between keys. The
 reviewer sees the line above; `[c]` and `[C]` appear only when the ask
 carries its shell program (`AskSummary::can_remember_for_character`), and
@@ -1002,6 +1002,7 @@ again before it lands reports `already being reassigned`. The card stays up; the
 shows the new reviewer on it. A key the viewer does not have posts a notice
 and changes nothing.
 
+**A new card arms late.** It is drawn disarmed, its key line reading
 `arming… keys still go to the draft`, and every key goes where it would
 with no card up: a letter typed as the card appears lands in the draft,
 and `Esc` stays vi's. The card arms 100 ms after it first draws; each key
@@ -1102,13 +1103,13 @@ Rules the figure carries:
 - The status line carries the pending count as `!n` next to the rank, so an
   ask in a context you are not looking at is visible from anywhere; the seat
   it belongs to carries `!`.
-- `Enter` shows one ask in full (`get_ask`), including the hook that
 - The key line follows the selected pending row: `a` `A` `d` when the
   viewer reviews it, plus `c` `C` when the row carries its program, `e`
   when the viewer may escalate, and `t` when the viewer is the lineage
   root. An answered row or an empty ledger offers navigation only. Opening
   the ledger sets a card that is up aside, so the keys act on what is drawn. The keys mean what they mean
   on the ask card. A reassignment closes the view like an answer.
+- `Enter` shows one ask in full (`get_ask`), including the hook that
   raised it and the statement as the gate saw it.
 - Answered rows keep the answering principal and redemption. Redemption means
   the answer was consumed; it does not prove execution. An invocation retired
@@ -1338,12 +1339,12 @@ Over the full-screen editor the prefix moves between seats and nothing else
 are chords the prefix already claims; the notice on the status line names
 what each will do — close-and-demote, detach — until this client builds
 them. `h` is not this client's yet either and has no notice of its
-own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Five
-chords are this client's own, with no app equivalent yet: `Ctrl+A r` rotates,
-`Ctrl+A v` opens the
-diff viewer, `Ctrl+A l` opens the ledger, `Ctrl+A ]` pastes the copy-mode
-yank buffer, and `Ctrl+A [` leaves the live tail without moving ("Copy mode
-(scroll, or `Ctrl+A [`)"). The legend takes the
+own: an unbound chord, named the plain way (`Ctrl+A h is not bound`). Three
+chords are this client's own, with no app equivalent yet: `Ctrl+A v` opens
+the diff viewer (the app opens it with `v` from its block list), `Ctrl+A ]`
+pastes the copy-mode yank buffer, and `Ctrl+A [` leaves the live tail
+without moving ("Copy mode (scroll, or `Ctrl+A [`)"). `Ctrl+A r` and
+`Ctrl+A l` work in both clients (`docs/input.md`, "The prefix table"). The legend takes the
 compose row while a prefix is pending — never the status line, whose seat digits are
 what the player is about to press (Amy: *"by the time I read that, the
 number was gone"*); there is no separate `?` overlay. `Ctrl+C` is the

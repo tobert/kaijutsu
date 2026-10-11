@@ -258,147 +258,29 @@ pub enum InputMode {
     Shell,
 }
 
-#[allow(dead_code)] // Phase 3: used by overlay systems
-impl InputMode {
-    /// Human-readable label for the mode ring indicator.
-    pub fn label(&self) -> &'static str {
-        match self {
-            InputMode::Chat => "chat",
-            InputMode::Shell => "shell",
-        }
-    }
-
-    /// Cycle to the next mode in the ring.
-    pub fn next(&self) -> Self {
-        match self {
-            InputMode::Chat => InputMode::Shell,
-            InputMode::Shell => InputMode::Chat,
-        }
-    }
-}
-
-/// Ephemeral input overlay — summoned on demand, dismissed after use.
+/// One compose surface as drawn: the chat overlay, or the shell dock row.
 ///
-/// Text lives here temporarily while the overlay is visible. On submit,
-/// text is routed through the existing `submit_input` RPC. On dismiss
-/// (Escape), text stays in the draft block (Status::Draft + ephemeral) for
-/// recall.
-///
-/// Think rofi/dmenu:
-/// summon → orient (mode ring) → act → gone.
+/// A projection of the surface's `input::compose::ComposeBuffer`, rewritten
+/// by `input::compose::systems::project_compose_overlays` whenever the
+/// buffer moves. Nothing edits it directly; the text lives in the buffer
+/// and, for chat, in the context's kernel draft.
 #[derive(Component, Reflect, Default)]
 #[reflect(Component)]
 pub struct InputOverlay {
-    /// Current text content.
+    /// The text drawn: the buffer, or the `/`·`?`·`:` bar's line while it
+    /// is open.
     pub text: String,
-    /// Cursor position within the text (byte offset).
+    /// Cursor position within `text` (byte offset).
     pub cursor: usize,
-    /// Selection anchor (byte offset). When Some, selection spans anchor..cursor.
-    pub selection_anchor: Option<usize>,
+    /// The visual-mode selection's first span as a byte range of `text`.
+    pub selection: Option<(usize, usize)>,
     /// Current input mode (chat vs shell).
     pub mode: InputMode,
-    /// Vim mode display string (e.g. "-- INSERT --", None = Normal).
-    /// Updated by vim_dispatch_compose each frame.
+    /// Vim mode banner (e.g. "-- INSERT --"); `None` is normal mode.
     pub vim_mode: Option<String>,
-    /// Context that owns this input. Set when text first enters the overlay
-    /// and retained through a context switch until the text is submitted or
-    /// recovered.
-    #[reflect(ignore)]
-    pub target_context: Option<ContextId>,
 }
 
 impl InputOverlay {
-    /// Get the selected range (ordered start..end), or None if no selection.
-    pub fn selection_range(&self) -> Option<std::ops::Range<usize>> {
-        self.selection_anchor.map(|anchor| {
-            let start = anchor.min(self.cursor);
-            let end = anchor.max(self.cursor);
-            start..end
-        })
-    }
-
-
-    /// Delete the current selection and return the deleted text.
-    pub fn delete_selection(&mut self) -> Option<String> {
-        let range = self.selection_range()?;
-        let deleted: String = self.text[range.clone()].to_string();
-        self.text.drain(range.clone());
-        self.cursor = range.start;
-        self.selection_anchor = None;
-        Some(deleted)
-    }
-
-    /// Clear selection without modifying text.
-    pub fn clear_selection(&mut self) {
-        self.selection_anchor = None;
-    }
-
-    /// Insert text at cursor position. Replaces selection if active.
-    pub fn insert(&mut self, s: &str) {
-        if self.selection_range().is_some() {
-            self.delete_selection();
-        }
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
-    }
-
-    /// Delete character before cursor (backspace). Deletes selection if active.
-    pub fn backspace(&mut self) {
-        if self.selection_range().is_some() {
-            self.delete_selection();
-            return;
-        }
-        if self.cursor > 0 {
-            let prev = self.text[..self.cursor]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.text.drain(prev..self.cursor);
-            self.cursor = prev;
-        }
-    }
-
-    /// Delete character after cursor (delete). Deletes selection if active.
-    pub fn delete(&mut self) {
-        if self.selection_range().is_some() {
-            self.delete_selection();
-            return;
-        }
-        if self.cursor < self.text.len() {
-            let next = self.text[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.text.len());
-            self.text.drain(self.cursor..next);
-        }
-    }
-
-    /// Move cursor left. Clears selection.
-    pub fn move_left(&mut self) {
-        self.clear_selection();
-        if self.cursor > 0 {
-            self.cursor = self.text[..self.cursor]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    /// Move cursor right. Clears selection.
-    pub fn move_right(&mut self) {
-        self.clear_selection();
-        if self.cursor < self.text.len() {
-            self.cursor = self.text[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.text.len());
-        }
-    }
-
     /// Check if the overlay is empty.
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
@@ -452,9 +334,9 @@ pub struct OverlayCursorGeometry {
     pub selection_y: f64,
     pub selection_width: f64,
     pub selection_height: f64,
-    /// Anchor byte offset used to compute the selection rect — lets the
-    /// glyph system detect anchor-only changes without re-running layout.
-    pub last_selection_anchor: Option<usize>,
+    /// Selection byte range used to compute the selection rect — lets the
+    /// glyph system detect selection-only changes without re-running layout.
+    pub last_selection: Option<(usize, usize)>,
 }
 
 /// Marker for the main conversation view cell.
@@ -467,14 +349,15 @@ pub struct OverlayCursorGeometry {
 #[reflect(Component)]
 pub struct MainCell;
 
-/// Message fired when prompt submission fails (e.g. disconnected).
+/// Message fired when a shell submission fails (e.g. disconnected).
 ///
-/// Carries the original text so it can be restored to the compose block.
+/// Carries the line so it can be restored to the shell surface. A chat
+/// submit needs no copy: the kernel keeps a draft whose submit failed, and
+/// compose reads it back.
 #[derive(Message, Clone)]
 pub struct SubmitFailed {
     pub text: String,
     pub reason: String,
-    pub is_shell: bool,
     pub context_id: ContextId,
     pub principal_id: PrincipalId,
 }
@@ -485,9 +368,10 @@ pub struct SubmitFailed {
 #[derive(Resource, Default)]
 pub struct PendingSubmitRecoveries(pub Vec<SubmitFailed>);
 
-/// A proven connection identity replaced another while compose text was
-/// visible. The submit handler moves that text into recoverable storage
-/// before the new principal can submit it.
+/// A proven connection identity replaced another while shell text was
+/// typed. The submit handler moves that text into recoverable storage
+/// before the new principal can run it. The chat draft is the kernel's,
+/// kept per principal; compose loads the new principal's own.
 #[derive(Resource, Default)]
 pub struct PendingIdentityTransition(pub Option<(PrincipalId, Option<PrincipalId>)>);
 

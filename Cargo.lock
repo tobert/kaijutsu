@@ -6736,6 +6736,7 @@ dependencies = [
  "kaijutsu-cas",
  "kaijutsu-client",
  "kaijutsu-diff",
+ "kaijutsu-editor",
  "kaijutsu-kernel",
  "kaijutsu-present",
  "kaijutsu-telemetry",

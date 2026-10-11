@@ -185,38 +185,53 @@ pub fn spawn_local(sink: impl DraftSink) -> (DraftOutbox, mpsc::UnboundedReceive
 impl DraftOutbox {
     /// Queue one edit behind every call already sent.
     pub fn edit(&self, context_id: ContextId, generation: u64, edit: DraftEdit) -> Result<(), OutboxError> {
-        self.sender()?
-            .send(Outgoing::Edit { context_id, generation, edit })
-            .map_err(|_| OutboxError::Stopped("draft"))
+        self.send(Outgoing::Edit { context_id, generation, edit })
     }
 
     /// Resolve once every edit queued before this call has reached the
-    /// kernel and been answered.
-    pub async fn flush(&self) -> Result<(), OutboxError> {
+    /// kernel and been answered. The flush takes its place in the queue when
+    /// called; the future only waits.
+    pub fn flush(&self) -> impl Future<Output = Result<(), OutboxError>> + use<> {
         let (done, wait) = oneshot::channel();
-        self.sender()?.send(Outgoing::Flush(done)).map_err(|_| OutboxError::Stopped("draft"))?;
-        wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))
+        let queued = self.send(Outgoing::Flush(done));
+        async move {
+            queued?;
+            wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))
+        }
     }
 
     /// Submit `context_id`'s draft as a turn, behind every call already
-    /// queued. An edit queued after this call goes out after the submit.
-    /// `edge` is the newest block the player had shown.
-    pub async fn submit(&self, context_id: ContextId, edge: Option<InputEdge>) -> Result<BlockId, OutboxError> {
+    /// queued. The submit takes its place in the queue when this is called,
+    /// so an edit queued after the call goes out after the submit; the
+    /// returned future only waits for the answer. `edge` is the newest block
+    /// the player had shown.
+    pub fn submit(
+        &self,
+        context_id: ContextId,
+        edge: Option<InputEdge>,
+    ) -> impl Future<Output = Result<BlockId, OutboxError>> + use<> {
         let (done, wait) = oneshot::channel();
-        self.sender()?
-            .send(Outgoing::Submit { context_id, edge, done })
-            .map_err(|_| OutboxError::Stopped("draft"))?;
-        wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))?.map_err(OutboxError::Refused)
+        let queued = self.send(Outgoing::Submit { context_id, edge, done });
+        async move {
+            queued?;
+            wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))?.map_err(OutboxError::Refused)
+        }
     }
 
     /// Read `context_id`'s draft text from the kernel, behind every call
-    /// already queued, so it holds every edit queued before this call.
-    pub async fn read(&self, context_id: ContextId) -> Result<String, OutboxError> {
+    /// already queued, so it holds every edit queued before this call and
+    /// none queued after it.
+    pub fn read(&self, context_id: ContextId) -> impl Future<Output = Result<String, OutboxError>> + use<> {
         let (done, wait) = oneshot::channel();
-        self.sender()?
-            .send(Outgoing::Read { context_id, done })
-            .map_err(|_| OutboxError::Stopped("draft"))?;
-        wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))?.map_err(OutboxError::Refused)
+        let queued = self.send(Outgoing::Read { context_id, done });
+        async move {
+            queued?;
+            wait.await.map_err(|_| OutboxError::StoppedBeforeReply("draft"))?.map_err(OutboxError::Refused)
+        }
+    }
+
+    fn send(&self, outgoing: Outgoing) -> Result<(), OutboxError> {
+        self.sender()?.send(outgoing).map_err(|_| OutboxError::Stopped("draft"))
     }
 
     fn sender(&self) -> Result<&mpsc::UnboundedSender<Outgoing>, OutboxError> {
@@ -432,7 +447,7 @@ mod tests {
             outbox.edit(ctx, 1, op(1, "b")).unwrap();
             outbox.edit(ctx, 1, op(2, "c")).unwrap();
             outbox.flush().await.unwrap();
-            assert_eq!(*sink.seen.borrow(), ["a", "b", "c"], "the flush returned before the edits did");
+            assert_eq!(*sink.seen.borrow(), ["a", "b", "c"], "every edit reaches the sink before the flush resolves");
             for version in 1..=3 {
                 let got = landed.try_recv().expect("acked before the flush resolved");
                 assert_eq!(got.result, Ok(version));
@@ -516,6 +531,31 @@ mod tests {
             assert_eq!(submit.await.unwrap().unwrap(), block(ctx));
             outbox.flush().await.unwrap();
             assert_eq!(*sink.log.borrow(), ["edit:a", "submit:start", "submit:end", "edit:b"]);
+        });
+    }
+
+    /// A submit and a read take their place in the queue when they are
+    /// called, not when their future is first polled. A client that spawns
+    /// the future on another executor (the Bevy app) and goes on queueing
+    /// edits on its own thread keeps the order it called them in.
+    #[test]
+    fn a_submit_and_a_read_queue_when_called_not_when_polled() {
+        local(async {
+            let sink = LogSink::new();
+            let (outbox, _landed) = spawn_local(sink.clone());
+            let ctx = ContextId::new();
+            outbox.edit(ctx, 1, op(0, "a")).unwrap();
+            let submit = outbox.submit(ctx, None);
+            outbox.edit(ctx, 2, op(0, "b")).unwrap();
+            let read = outbox.read(ctx);
+            outbox.edit(ctx, 2, op(1, "c")).unwrap();
+            assert_eq!(submit.await.unwrap(), block(ctx));
+            assert_eq!(read.await.unwrap(), "ab", "the read saw b and not c");
+            outbox.flush().await.unwrap();
+            assert_eq!(
+                *sink.log.borrow(),
+                ["edit:a", "submit:start", "submit:end", "edit:b", "read", "edit:c"]
+            );
         });
     }
 

@@ -466,6 +466,84 @@ pub fn handle_server_context_switch(
     }
 }
 
+/// Where a `kj` result run against `current` moves the view. A structured
+/// run stays addressed to its context, so a verb that moves the player
+/// names the move in its data: `switched_to` (`kj context switch`, `kj
+/// fork`), or `rotated_from` with `context_id` when the seat that rotated is
+/// `current`. Rotating another seat by label moves nothing. An id that does
+/// not parse is an error, never a stay. The tui follows the same rule
+/// (`kaijutsu-tui`'s `run::follow_target`).
+pub fn follow_target(data: Option<&serde_json::Value>, current: ContextId) -> Result<Option<ContextId>, String> {
+    let Some(data) = data else { return Ok(None) };
+    let id_at = |key: &str| -> Result<Option<ContextId>, String> {
+        match data.get(key) {
+            None => Ok(None),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| format!("`{key}` is not a string"))
+                .and_then(|hex| ContextId::parse(hex).map_err(|e| format!("`{key}` {hex:?}: {e}")))
+                .map(Some),
+        }
+    };
+    if let Some(target) = id_at("switched_to")? {
+        return Ok((target != current).then_some(target));
+    }
+    if id_at("rotated_from")? == Some(current) {
+        return id_at("context_id")?
+            .map(Some)
+            .ok_or_else(|| "rotate result names no successor".to_string());
+    }
+    Ok(None)
+}
+
+/// Follow a finished `kj` line from the shell surface (`Ctrl+A r`'s
+/// `kj context rotate`, a typed `kj context switch`): switch to the context
+/// its data names, but only while the context it ran against is still the
+/// one on screen. The hints line says what the tui's status row says: a
+/// latch's message, else the first stdout line. A failed run, or data that
+/// cannot be followed, says why.
+pub fn follow_kj_results(
+    mut results: MessageReader<RpcResultMessage>,
+    doc_cache: Res<crate::cell::DocumentCache>,
+    mut switch_writer: MessageWriter<crate::cell::ContextSwitchRequested>,
+    mut notice: ResMut<crate::ui::ask_sheet::AskNotice>,
+    time: Res<Time>,
+) {
+    let now = time.elapsed_secs_f64();
+    for result in results.read() {
+        let RpcResultMessage::KjLineFinished { from, result } = result else {
+            continue;
+        };
+        if result.exit_code != 0 {
+            let why = result.stderr.lines().next().unwrap_or("").trim();
+            let text = format!("kj failed (exit {}){}{why}", result.exit_code, if why.is_empty() { "" } else { ": " });
+            log::warn!("{text}");
+            notice.say(text, now);
+            continue;
+        }
+        if let Some(latch) = &result.latch {
+            notice.say(latch.message.clone(), now);
+            continue;
+        }
+        let said = result.stdout.lines().next().unwrap_or("done");
+        match follow_target(result.data.as_ref(), *from) {
+            Ok(Some(target)) if doc_cache.active_id() == Some(*from) => {
+                info!("kj: following {} -> {}", from.short(), target.short());
+                notice.say(said, now);
+                switch_writer.write(crate::cell::ContextSwitchRequested { context_id: target });
+            }
+            Ok(Some(target)) => {
+                notice.say(format!("{said}; {} moved to {}, the view stayed", from.short(), target.short()), now);
+            }
+            Ok(None) => notice.say(said, now),
+            Err(e) => {
+                log::warn!("kj result from {} cannot be followed: {e}", from.short());
+                notice.say(format!("{said}; cannot follow: {e}"), now);
+            }
+        }
+    }
+}
+
 // `check_cache_staleness` (the old poll-driven re-fetch) is gone —
 // `drain_context_feeds`, above, replaces it. Each followed context now gets
 // its own precise recovery signal straight from its change feed instead of a
@@ -512,6 +590,128 @@ mod tests {
         assert_eq!(
             screen_revealing_switched_context(Screen::Room),
             Some(Screen::Conversation)
+        );
+    }
+
+    fn rotate_data(from: ContextId, successor: ContextId) -> serde_json::Value {
+        serde_json::json!({"context_id": successor.to_hex(), "rotated_from": from.to_hex()})
+    }
+
+    /// Rotating the seat on screen follows its successor; rotating another
+    /// seat by label leaves the view where it is.
+    #[test]
+    fn a_rotate_result_follows_only_the_seat_it_ran_against() {
+        let (from, next, other) = (ContextId::new(), ContextId::new(), ContextId::new());
+        assert_eq!(follow_target(Some(&rotate_data(from, next)), from), Ok(Some(next)));
+        assert_eq!(follow_target(Some(&rotate_data(other, next)), from), Ok(None));
+        let no_successor = serde_json::json!({"rotated_from": from.to_hex()});
+        assert!(follow_target(Some(&no_successor), from).is_err());
+    }
+
+    #[test]
+    fn a_switch_result_follows_its_target_and_other_results_stay() {
+        let (here, there) = (ContextId::new(), ContextId::new());
+        let switched = serde_json::json!({"switched_to": there.to_hex()});
+        assert_eq!(follow_target(Some(&switched), here), Ok(Some(there)));
+        let info = serde_json::json!({"context_id": there.to_hex(), "label": "x"});
+        assert_eq!(follow_target(Some(&info), here), Ok(None));
+        assert_eq!(follow_target(None, here), Ok(None));
+        let bad = serde_json::json!({"switched_to": "not-an-id"});
+        assert!(follow_target(Some(&bad), here).is_err());
+    }
+
+    fn kj_app(active: ContextId) -> App {
+        let mut app = App::new();
+        app.add_message::<RpcResultMessage>()
+            .add_message::<crate::cell::ContextSwitchRequested>()
+            .init_resource::<crate::ui::ask_sheet::AskNotice>()
+            .init_resource::<Time>()
+            .init_resource::<crate::cell::DocumentCache>()
+            .add_systems(Update, follow_kj_results);
+        app.world_mut()
+            .resource_mut::<crate::cell::DocumentCache>()
+            .set_active(active);
+        app
+    }
+
+    fn finished(from: ContextId, exit_code: i32, stderr: &str, data: Option<serde_json::Value>) -> RpcResultMessage {
+        RpcResultMessage::KjLineFinished {
+            from,
+            result: kaijutsu_client::rpc::KjExecutionResult {
+                exit_code,
+                stdout: String::new(),
+                stderr: stderr.into(),
+                command_block_id: None,
+                latch: None,
+                data,
+            },
+        }
+    }
+
+    fn switches(app: &mut App) -> Vec<ContextId> {
+        let msgs = app.world().resource::<Messages<crate::cell::ContextSwitchRequested>>();
+        msgs.iter_current_update_messages().map(|m| m.context_id).collect()
+    }
+
+    #[test]
+    fn a_rotation_of_the_seat_on_screen_switches_to_the_successor() {
+        let (from, next) = (ContextId::new(), ContextId::new());
+        let mut app = kj_app(from);
+        app.world_mut().write_message(finished(from, 0, "", Some(rotate_data(from, next))));
+        app.update();
+        assert_eq!(switches(&mut app), vec![next]);
+    }
+
+    #[test]
+    fn a_rotation_of_a_seat_no_longer_on_screen_does_not_move_the_view() {
+        let (from, next, here) = (ContextId::new(), ContextId::new(), ContextId::new());
+        let mut app = kj_app(here);
+        app.world_mut().write_message(finished(from, 0, "", Some(rotate_data(from, next))));
+        app.update();
+        assert!(switches(&mut app).is_empty());
+    }
+
+    fn notice(app: &App) -> Option<String> {
+        app.world().resource::<crate::ui::ask_sheet::AskNotice>().current(0.0).map(str::to_string)
+    }
+
+    /// As the tui says it: the first stdout line, or a latch's own message.
+    #[test]
+    fn a_finished_line_says_its_first_stdout_line_or_its_latch() {
+        let here = ContextId::new();
+        let mut app = kj_app(here);
+        let mut said = finished(here, 0, "", None);
+        if let RpcResultMessage::KjLineFinished { result, .. } = &mut said {
+            result.stdout = "renamed to banto\nmore".into();
+        }
+        app.world_mut().write_message(said);
+        app.update();
+        assert_eq!(notice(&app).as_deref(), Some("renamed to banto"));
+        let mut latched = finished(here, 0, "", None);
+        if let RpcResultMessage::KjLineFinished { result, .. } = &mut latched {
+            result.latch = Some(kaijutsu_client::rpc::KjLatch {
+                command: "archive".into(),
+                target: "x".into(),
+                message: "run it again to confirm".into(),
+            });
+        }
+        app.world_mut().write_message(latched);
+        app.update();
+        assert_eq!(notice(&app).as_deref(), Some("run it again to confirm"));
+    }
+
+    #[test]
+    fn a_failed_rotation_says_why_and_stays() {
+        let from = ContextId::new();
+        let mut app = kj_app(from);
+        app.world_mut()
+            .write_message(finished(from, 1, "kj context rotate: lacks the 'operator' capability\n", None));
+        app.update();
+        assert!(switches(&mut app).is_empty());
+        let notice = app.world().resource::<crate::ui::ask_sheet::AskNotice>();
+        assert_eq!(
+            notice.current(0.0),
+            Some("kj failed (exit 1): kj context rotate: lacks the 'operator' capability")
         );
     }
 }
