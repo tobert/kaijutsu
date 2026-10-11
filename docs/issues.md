@@ -2193,8 +2193,9 @@ that only changes the probe's waits is suspect too.
 `report_audio_inventory` bumping a revision every 10 s. Fix is the same as
 the app's entry above: `watch_contexts` for the set the mux shows. The
 draft and the editor no longer block the key path on a call
-(`crate::outbox`, `crate::editor_outbox`), but neither has a per-call
-timeout: under an IO stall their queues grow instead of failing. The
+(`kaijutsu_client::draft_outbox`, `kaijutsu_client::editor_outbox`), but
+neither has a per-call timeout: under an IO stall their queues grow instead
+of failing. The
 "kernel events lost" notices are in the tui's log file (`docs/tui.md`,
 "Every way out restores the terminal") since 2026-09-13.
 

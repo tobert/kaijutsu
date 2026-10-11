@@ -35,8 +35,9 @@ use crate::inflight;
 use crate::bridge::KernelBridge;
 use crate::cmdline::{self, ColonVerb};
 use crate::compose::{Compose, CursorShape};
-use crate::outbox::{self, Landed};
-use crate::editor_outbox;
+use kaijutsu_client::DraftEdit;
+use kaijutsu_client::draft_outbox::{self, Landed};
+use kaijutsu_client::editor_outbox;
 use crate::completion;
 use crate::interrupt::{self, Step as InterruptStep};
 use crate::keys::{Intent, Keys};
@@ -227,9 +228,9 @@ struct Wires {
     /// `open_editor` peer signals — the only notification that a vi session
     /// opened. See [`attach_editor_peer`].
     editor_opens: mpsc::Receiver<EditorOpen>,
-    /// Acks for our own draft edits ([`crate::outbox`]).
+    /// Acks for our own draft edits ([`kaijutsu_client::draft_outbox`]).
     draft_landed: mpsc::UnboundedReceiver<Landed>,
-    /// Answers to our own editor keys and pastes ([`crate::editor_outbox`]).
+    /// Answers to our own editor keys and pastes ([`kaijutsu_client::editor_outbox`]).
     editor_landed: mpsc::UnboundedReceiver<editor_outbox::Landed>,
 }
 
@@ -293,9 +294,9 @@ pub async fn run(
     app.identity = identity.display_name;
     app.principal = Some(identity.principal_id);
     app.compose = Compose::over(&bridge.read_input(start.id).await.unwrap_or_default());
-    let (drafts, draft_landed) = outbox::spawn(bridge.clone());
+    let (drafts, draft_landed) = draft_outbox::spawn_local(bridge.actor().clone());
     app.drafts = drafts;
-    let (editor_keys, editor_landed) = editor_outbox::spawn(bridge.clone());
+    let (editor_keys, editor_landed) = editor_outbox::spawn_local(bridge.actor().clone());
     app.editor_keys = editor_keys;
 
     // A panic on this thread, outside any task, past this point unwinds
@@ -1632,7 +1633,7 @@ fn paste_target(app: &App) -> PasteTarget {
 /// takes it as one edit at the cursor, like `Ctrl+A ]`; the `:` bar takes
 /// it flattened onto one line at its end; an open editor session takes it
 /// as one `editorInsert` call, queued on the editor outbox behind the keys
-/// before it (`crate::editor_outbox`).
+/// before it (`kaijutsu_client::editor_outbox`).
 fn paste_text(app: &mut App, text: String) {
     let text = normalize_paste(&text);
     // A paste is typing: past a disarmed ask card it lands in the draft and
@@ -1685,11 +1686,8 @@ async fn switch_seat(
         return;
     }
     // Switching back to a context whose last keystrokes are still on the
-    // wire would read the draft without them.
-    if let Err(e) = app.drafts.flush().await {
-        app.note(format!("draft edits may be lost: {e:#}"));
-    }
-    let draft = bridge.read_input(id).await;
+    // wire would read the draft without them, so the read queues behind them.
+    let draft = app.drafts.read(id).await;
     app.switch_to(id);
     app.compose.load_draft(draft.as_deref().unwrap_or(""));
     // The switch moved both ends of the hot set — the context on screen and
@@ -1723,14 +1721,18 @@ fn hydrating_notice(app: &App, id: ContextId) -> String {
 fn mirror_ops(app: &mut App, ctx: ContextId, ops: &[kaijutsu_editor::EditOp]) {
     for op in ops {
         let generation = app.compose.sent();
-        if let Err(e) = app.drafts.edit(ctx, generation, op.clone()) {
+        if let Err(e) = app.drafts.edit(
+            ctx,
+            generation,
+            DraftEdit { offset: op.offset as u64, insert: op.insert.clone(), delete: op.delete as u64 },
+        ) {
             app.compose.landed(generation, None);
             app.note(draft_edit_failure(&e));
         }
     }
 }
 
-/// One of our draft edits came back from the kernel ([`crate::outbox`]).
+/// One of our draft edits came back from the kernel ([`kaijutsu_client::draft_outbox`]).
 /// Returns whether the screen changed.
 fn land_draft_edit(app: &mut App, landed: Landed) -> bool {
     match landed.result {
@@ -1740,13 +1742,13 @@ fn land_draft_edit(app: &mut App, landed: Landed) -> bool {
         // longer going anywhere.
         Err(e) => {
             app.compose.landed(landed.generation, None);
-            app.note(draft_edit_failure(&anyhow::anyhow!(e)));
+            app.note(draft_edit_failure(&e));
             true
         }
     }
 }
 
-fn draft_edit_failure(error: &anyhow::Error) -> String {
+fn draft_edit_failure(error: &dyn std::fmt::Display) -> String {
     format!("draft edit failed: {error:#}")
 }
 
@@ -1778,13 +1780,9 @@ async fn compose_key(
         // view after the kernel has already moved it (`docs/prompts.md`,
         // "The submit verb").
         let edge = app.views.get(&ctx).and_then(|view| view.edge());
-        // The kernel snapshots its own copy of the draft, so every keystroke
-        // still on the wire must land first.
-        if let Err(e) = app.drafts.flush().await {
-            app.note(format!("submit failed: {e:#}"));
-            return Ok(());
-        }
-        match bridge.submit_input(ctx, edge).await {
+        // The kernel snapshots its own copy of the draft, so the submit queues
+        // behind every keystroke still on the wire.
+        match app.drafts.submit(ctx, edge).await {
             Ok(block_id) => {
                 app.mark_submitted(block_id);
                 app.compose.reset();
@@ -1819,7 +1817,9 @@ fn land_editor_answer(app: &mut App, landed: editor_outbox::Landed) -> bool {
         }
         Err(message) => {
             tracing::warn!(session = landed.session, sent = %landed.sent, error = %message, "editor call failed");
-            false
+            // The alternate screen hides the log, so the status row says it.
+            app.note(format!("editor call failed: {message}"));
+            true
         }
     }
 }
@@ -2841,6 +2841,39 @@ mod tests {
         ContextChange, ContextDelivery, ContextMirror, TurnCompletedStopReason, TurnOrigin, VersionedChange,
     };
     use kaijutsu_types::{BlockId, BlockSnapshot, PrincipalId, Role};
+
+    /// An edit the writer lost when it stopped lands as a failure the player
+    /// sees, and it settles the compose count of edits in flight.
+    #[test]
+    fn an_edit_lost_with_the_writer_is_noted_on_the_status_row() {
+        let mut app = App::new("amy");
+        let generation = app.compose.sent();
+        assert_eq!(app.compose.edits_in_flight(), 1);
+        let landed = Landed {
+            context_id: ContextId::new(),
+            generation,
+            result: Err("the draft writer stopped before this edit was acknowledged".into()),
+        };
+        assert!(land_draft_edit(&mut app, landed));
+        assert_eq!(app.compose.edits_in_flight(), 0, "the lost edit was counted as landed");
+        let note = app.notice().unwrap_or_default().to_string();
+        assert!(note.contains("draft edit failed") && note.contains("writer stopped"), "{note}");
+    }
+
+    /// An editor call that failed for any reason other than a lost session
+    /// shows on the status row, since the alternate screen hides the log.
+    #[test]
+    fn an_editor_call_lost_with_the_writer_is_noted_on_the_status_row() {
+        let mut app = App::new("amy");
+        let landed = editor_outbox::Landed {
+            session: 4,
+            sent: "ab".into(),
+            result: Err("the editor writer stopped before this call was answered".into()),
+        };
+        assert!(land_editor_answer(&mut app, landed));
+        let note = app.notice().unwrap_or_default().to_string();
+        assert!(note.contains("editor call failed") && note.contains("writer stopped"), "{note}");
+    }
 
     #[test]
     fn a_draft_edit_failure_names_the_underlying_refusal() {

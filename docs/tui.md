@@ -455,12 +455,14 @@ Rules the figure carries:
 - **The key path never waits on the kernel.** The screen draws the local
   buffer as soon as the loop has read every key waiting, not on the next
   80 ms tick. Each `edit_input` goes on the draft outbox
-  (`crate::outbox`): one writer task sends them in typed order, one at a
-  time, because each op is addressed against the text the ones before it
-  left. A submit and a seat switch first wait for the outbox to drain, so
-  the kernel holds every keystroke the player saw before it snapshots the
-  draft or is asked for it; the third `Ctrl+C` queues its delete behind
-  them.
+  (`kaijutsu_client::draft_outbox`, shared with the app): one writer sends
+  them in typed order, one at a time, because each op is addressed against
+  the text the ones before it left. A submit and a seat switch's read of the
+  draft go on the same queue, so the kernel holds every keystroke the player
+  saw before it snapshots the draft or is asked for it, and a keystroke
+  typed after them goes out after; the third `Ctrl+C` queues its delete
+  behind them. If the writer stops, each edit it had not finished lands as a
+  failure on the status row.
 - A fresh draft rests in normal mode, as vim opens a buffer; `i`, `a` or
   `o` start typing, and a submit returns to normal mode. A resumed draft
   opens with the cursor on its last character, so `a` continues it. The
@@ -1193,8 +1195,9 @@ space, and `<C-x>`; a function key, and a navigation key held with Ctrl, Alt
 or Shift, have no token and are refused rather than sent and silently dropped.
 
 **Keys never wait on the kernel.** They go on the editor outbox
-(`crate::editor_outbox`): one writer keeps one call in flight, and the keys
-that queue behind it go out as one `editor_keys` batch, since vim notation
+(`kaijutsu_client::editor_outbox`, shared with the app): one writer keeps one
+call in flight, and the keys that queue behind it go out as one `editor_keys`
+batch, since vim notation
 concatenates. A paste is its own `editorInsert` and keeps its place: the keys
 before it go first, and a batch never reaches across it. The kernel still
 owns the mode and the buffer, so nothing is drawn ahead of it. Each state,

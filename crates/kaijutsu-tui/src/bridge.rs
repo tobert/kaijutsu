@@ -12,7 +12,7 @@ use kaijutsu_client::rpc::KjExecutionResult;
 use kaijutsu_client::{
     ActorHandle, ContextInfo, ContextMirror, FeedEvent, SshConfig, connect_ssh, spawn_actor,
 };
-use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, InputEdge, PrincipalId};
+use kaijutsu_types::{BlockId, BlockQuery, BlockSnapshot, ContextId, PrincipalId};
 use tokio::sync::mpsc;
 
 /// Per-process subscription identity.
@@ -281,37 +281,6 @@ impl KernelBridge {
             .await
             .context("read input doc")?
             .content)
-    }
-
-    /// One edit against the context's draft block. `pos` and `delete` are
-    /// **character** offsets, matching `kaijutsu_editor::EditOp`; a byte
-    /// length truncates or over-deletes the moment anyone types non-ASCII.
-    /// Returns the context version the kernel acknowledged.
-    pub async fn edit_input(
-        &self,
-        context_id: ContextId,
-        pos: u64,
-        insert: &str,
-        delete: u64,
-    ) -> Result<u64> {
-        self.actor
-            .edit_input(context_id, pos, insert, delete)
-            .await
-            .context("edit input doc")
-    }
-
-    /// Submit the draft as a chat turn. The kernel snapshots it into a block
-    /// and clears the draft. `edge` is the newest block the player had shown
-    /// when they pressed Enter (`ContextView::edge`, `docs/prompts.md`,
-    /// "The submit verb"); `None`
-    /// when the caller cannot say.
-    pub async fn submit_input(&self, context_id: ContextId, edge: Option<InputEdge>) -> Result<BlockId> {
-        let result = self
-            .actor
-            .submit_input_with_edge(context_id, false, edge)
-            .await
-            .context("submit input")?;
-        Ok(result.block_id)
     }
 
     /// Run one kaish statement as the human — the gated path,

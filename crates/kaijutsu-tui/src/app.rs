@@ -17,8 +17,7 @@ use kaijutsu_types::{
 use kaijutsu_viz::layout::Band;
 
 use crate::compose::Compose;
-use crate::editor_outbox::EditorOutbox;
-use crate::outbox::DraftOutbox;
+use kaijutsu_client::{DraftOutbox, EditorOutbox};
 use crate::present::{BlockView, Palette, WrapCache, collapses_by_default};
 use crate::status::{CacheHealth, SeatCell, StatusModel, cache_health};
 

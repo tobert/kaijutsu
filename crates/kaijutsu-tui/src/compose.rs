@@ -300,6 +300,11 @@ impl Compose {
         CursorShape::for_mode(self.editor.mode().as_deref())
     }
 
+    /// Edits sent for this draft and not yet landed.
+    pub fn edits_in_flight(&self) -> usize {
+        self.in_flight
+    }
+
     /// Count one edit as sent for this draft. Returns the draft generation
     /// to hand back to [`Self::landed`].
     pub fn sent(&mut self) -> u64 {

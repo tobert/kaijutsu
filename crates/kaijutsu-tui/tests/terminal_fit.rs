@@ -150,7 +150,7 @@ fn typing_lands_on_the_compose_row() {
 
 /// A burst of typing reaches the kernel's draft whole and in typed order,
 /// backspaces included. The key path queues each edit without waiting for
-/// the kernel (`kaijutsu_tui::outbox`), so this probes that the queue keeps
+/// the kernel (`kaijutsu_client::draft_outbox`), so this probes that the queue keeps
 /// order end to end and that the kernel's echo of the draft never rewinds
 /// the line on screen.
 #[test]

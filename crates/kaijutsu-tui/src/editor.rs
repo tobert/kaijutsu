@@ -3,8 +3,8 @@
 //! The kernel owns the editor session; this module is a renderer and a key
 //! forwarder, exactly as the Bevy app is (`docs/vi.md`, "App renderer"). Every
 //! key travels to `editor_keys` in the kernel's vi notation, batched on the
-//! editor outbox (`crate::editor_outbox`), and the resulting [`EditorState`]
-//! is what gets drawn. There is no local VimMachine, no mode
+//! editor outbox (`kaijutsu_client::editor_outbox`), and the resulting
+//! [`EditorState`] is what gets drawn. There is no local VimMachine, no mode
 //! detection, and no quit detection: `ZZ`/`ZQ`/`:q` are ordinary keys, and the
 //! kernel answers them with an `EditorClosed` push.
 //!
