@@ -49,8 +49,12 @@
 //! pending. A cancelled prompt is an answer: it records
 //! [`AskVerdict::PromptCancelled`], a denial.
 //!
+//! The pump confirms each ask in the ledger before prompting. An ask the
+//! ledger does not have is not offered. A ledger read that fails does not
+//! withhold the ask: the request names the ask instead of its tool call.
+//!
 //! A round trip that ends with no answer reaching the ledger (the ledger
-//! could not read the ask, the prompt failed, an unplaceable option, or
+//! has no such ask, the prompt failed, an unplaceable option, or
 //! the answer call failed) releases its ask after [`REOFFER_AFTER`], and
 //! the pump offers it again if it is still ours. A failure that repeats
 //! re-offers at that pace.
@@ -400,7 +404,7 @@ async fn answer_ask<K: AskKernel>(
 ) -> RoundTrip {
     let request_id = ask.request_id;
     let tool_call = match kernel.get_ask(request_id.clone()).await {
-        Ok(Some(detail)) => tool_call_for(detail.tool_call_block_id, session.context_id),
+        Ok(Some(_)) => tool_call_for(ask.tool_call_block_id, session.context_id),
         Ok(None) => {
             tracing::warn!(request = %request_id, "the ledger has no such ask; not offering it now");
             return RoundTrip::Unanswered;
@@ -754,7 +758,7 @@ mod tests {
             request_id: id.into(), status: AskStatus::Pending, origin: AskOrigin::ShellGate,
             context_id: Some(ContextId::new()), description: format!("run {id}"), statements: Vec::new(),
             requester: None, performer: Some(reference(PrincipalId::new())), reviewer: reviewer.map(reference),
-            created_at_ms: 0, decided_at_ms: None,
+            created_at_ms: 0, decided_at_ms: None, tool_call_block_id: None, lineage_root: None, has_exec_source: false,
         }
     }
 
@@ -991,12 +995,14 @@ mod tests {
     }
 
     /// A kernel whose answers the test scripts: `get_ask` returns `None`
-    /// for its first `missing` calls, and `decide_ask` records each verdict.
+    /// for its first `missing` calls and an error for its first `faults`
+    /// calls, and `decide_ask` records each verdict.
     #[derive(Clone)]
     struct ScriptedKernel {
         me: PrincipalId,
         ask: AskSummary,
         missing: Arc<std::sync::Mutex<usize>>,
+        faults: Arc<std::sync::Mutex<usize>>,
         decided: Arc<std::sync::Mutex<Vec<AskVerdict>>>,
     }
 
@@ -1006,6 +1012,13 @@ mod tests {
         }
 
         async fn get_ask(&self, _request_id: String) -> Result<Option<AskDetail>, String> {
+            {
+                let mut faults = self.faults.lock().unwrap();
+                if *faults > 0 {
+                    *faults -= 1;
+                    return Err("ledger read failed".into());
+                }
+            }
             let mut missing = self.missing.lock().unwrap();
             if *missing > 0 {
                 *missing -= 1;
@@ -1013,7 +1026,7 @@ mod tests {
             }
             Ok(Some(AskDetail {
                 summary: self.ask.clone(), instance: None, tool: None, hook_id: None, label: None,
-                tool_call_block_id: None, exec_source: None, cwd: None, env: Vec::new(), decision: None,
+                exec_source: None, cwd: None, env: Vec::new(), decision: None,
                 redeemed_at_ms: None, publication_abandoned: None, reassignments: Vec::new(),
             }))
         }
@@ -1034,6 +1047,16 @@ mod tests {
         answer: impl Fn(usize) -> Result<RequestPermissionResponse, ()> + Send + Sync + 'static,
         drive: impl AsyncFnOnce(Arc<std::sync::Mutex<Seen>>, Arc<std::sync::Mutex<Vec<AskVerdict>>>) + Send + 'static,
     ) {
+        pump_against_scripted(missing, 0, answer, drive).await
+    }
+
+    /// [`pump_against_client`], with `get_ask` also failing its first `faults` calls.
+    async fn pump_against_scripted(
+        missing: usize,
+        faults: usize,
+        answer: impl Fn(usize) -> Result<RequestPermissionResponse, ()> + Send + Sync + 'static,
+        drive: impl AsyncFnOnce(Arc<std::sync::Mutex<Seen>>, Arc<std::sync::Mutex<Vec<AskVerdict>>>) + Send + 'static,
+    ) {
         use agent_client_protocol::{Agent, Responder};
 
         let me = PrincipalId::new();
@@ -1044,6 +1067,7 @@ mod tests {
             me,
             ask: ask.clone(),
             missing: Arc::new(std::sync::Mutex::new(missing)),
+            faults: Arc::new(std::sync::Mutex::new(faults)),
             decided: Arc::default(),
         };
         let decided = Arc::clone(&kernel.decided);
@@ -1113,6 +1137,17 @@ mod tests {
     async fn an_ask_the_ledger_could_not_read_is_offered_again() {
         pump_against_client(1, |_| Ok(selected(OPT_DENY)), async |seen, decided| {
             until_decided(&decided, &[AskVerdict::Deny]).await;
+            assert_eq!(seen.lock().unwrap().requests, ["req-1"]);
+        })
+        .await;
+    }
+
+    /// A ledger read that fails does not withhold the ask: it is offered
+    /// anyway, naming the ask rather than its tool call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ask_whose_ledger_read_failed_is_still_offered() {
+        pump_against_scripted(0, usize::MAX / 2, |_| Ok(selected(OPT_ALLOW)), async |seen, decided| {
+            until_decided(&decided, &[AskVerdict::Allow]).await;
             assert_eq!(seen.lock().unwrap().requests, ["req-1"]);
         })
         .await;

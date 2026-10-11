@@ -1133,6 +1133,9 @@ pub(crate) mod fixtures {
             reviewer: None,
             created_at_ms: 0,
             decided_at_ms: None,
+            tool_call_block_id: None,
+            lineage_root: None,
+            has_exec_source: false,
         }
     }
 
@@ -1143,7 +1146,6 @@ pub(crate) mod fixtures {
             tool: Some("shell_write".to_string()),
             hook_id: None,
             label: None,
-            tool_call_block_id: None,
             exec_source: None,
             cwd: None,
             env: Vec::new(),

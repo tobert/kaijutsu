@@ -71,6 +71,15 @@ pub struct AskSummary {
     pub created_at_ms: i64,
     /// Unix-epoch milliseconds; `None` while open.
     pub decided_at_ms: Option<i64>,
+    /// The model's ToolCall block whose invocation raised the ask. `None`
+    /// when no tool call did.
+    pub tool_call_block_id: Option<BlockId>,
+    /// The root character of the ask's lineage (named as the sheet names it now), who may take the ask from
+    /// its reviewer. `None` when the lineage has no live root.
+    pub lineage_root: Option<PrincipalRef>,
+    /// Whether the ask carries the shell program an approval would run.
+    /// A standing rule for a character is learned only from such an ask.
+    pub has_exec_source: bool,
 }
 
 impl AskSummary {
@@ -81,6 +90,33 @@ impl AskSummary {
     pub fn answerable_by(&self, principal: PrincipalId) -> bool {
         self.status.is_open() && self.performer.is_some()
             && self.reviewer.as_ref().is_some_and(|reviewer| reviewer.id == principal)
+    }
+
+    /// Whether `principal` may answer with a standing rule for the
+    /// performing character: it may answer, and the ask carries the shell
+    /// program the kernel checks that rule against.
+    pub fn can_remember_for_character(&self, principal: PrincipalId) -> bool {
+        self.answerable_by(principal) && self.has_exec_source
+    }
+
+    /// Whether `principal` may hand this ask to another reviewer: it is the
+    /// assigned reviewer of an ask still pending. The kernel refuses a
+    /// claimed ask, and refuses a performer as the new reviewer, which
+    /// the target choice has to respect.
+    pub fn can_escalate(&self, principal: PrincipalId) -> bool {
+        self.status == AskStatus::Pending && self.answerable_by(principal)
+    }
+
+    /// Whether `principal` may take this ask for itself: it is the lineage
+    /// root, the ask is pending, and `principal` is neither the performer
+    /// (the kernel refuses a performer as reviewer) nor already the
+    /// reviewer.
+    pub fn can_take_over(&self, principal: PrincipalId) -> bool {
+        let is = |who: &Option<PrincipalRef>| who.as_ref().is_some_and(|p| p.id == principal);
+        self.status == AskStatus::Pending
+            && is(&self.lineage_root)
+            && !is(&self.performer)
+            && !is(&self.reviewer)
     }
 }
 
@@ -113,8 +149,6 @@ pub struct AskDetail {
     pub tool: Option<String>,
     pub hook_id: Option<String>,
     pub label: Option<String>,
-    /// The model's ToolCall block whose invocation raised the ask.
-    pub tool_call_block_id: Option<BlockId>,
     pub exec_source: Option<String>,
     pub cwd: Option<String>,
     pub env: Vec<AskEnv>,
@@ -246,3 +280,68 @@ impl std::fmt::Display for AskAnswerFailure {
 }
 
 impl std::error::Error for AskAnswerFailure {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(id: PrincipalId) -> PrincipalRef {
+        PrincipalRef { id, name: id.short() }
+    }
+
+    /// An open ask: `performer` did the work, `reviewer` answers it, `root`
+    /// is the lineage root.
+    fn ask(performer: PrincipalId, reviewer: PrincipalId, root: PrincipalId) -> AskSummary {
+        AskSummary {
+            request_id: "r".into(), status: AskStatus::Pending, origin: AskOrigin::ShellGate, context_id: None,
+            description: String::new(), statements: Vec::new(), requester: None,
+            performer: Some(named(performer)), reviewer: Some(named(reviewer)),
+            created_at_ms: 0, decided_at_ms: None, tool_call_block_id: None,
+            lineage_root: Some(named(root)), has_exec_source: true,
+        }
+    }
+
+    #[test]
+    fn take_over_is_offered_to_the_root_and_not_to_the_reviewer_or_performer() {
+        let (performer, reviewer, root, other) =
+            (PrincipalId::new(), PrincipalId::new(), PrincipalId::new(), PrincipalId::new());
+        let a = ask(performer, reviewer, root);
+        assert!(a.can_take_over(root));
+        assert!(!a.can_take_over(reviewer), "the reviewer already holds it");
+        assert!(!a.can_take_over(performer), "the kernel refuses a performer as reviewer");
+        assert!(!a.can_take_over(other), "only the lineage root may take it");
+        // A root that is also the reviewer or the performer cannot take over.
+        assert!(!ask(performer, root, root).can_take_over(root));
+        assert!(!ask(root, reviewer, root).can_take_over(root));
+        let mut no_root = a.clone();
+        no_root.lineage_root = None;
+        assert!(!no_root.can_take_over(root));
+        let mut decided = a;
+        decided.status = AskStatus::Allowed;
+        assert!(!decided.can_take_over(root), "a decided ask has nothing to take");
+    }
+
+    #[test]
+    fn escalate_and_remember_are_offered_to_the_answering_reviewer_only() {
+        let (performer, reviewer, root) = (PrincipalId::new(), PrincipalId::new(), PrincipalId::new());
+        let a = ask(performer, reviewer, root);
+        assert!(a.can_escalate(reviewer));
+        assert!(a.can_remember_for_character(reviewer));
+        for not_reviewer in [root, performer, PrincipalId::new()] {
+            assert!(!a.can_escalate(not_reviewer));
+            assert!(!a.can_remember_for_character(not_reviewer));
+        }
+        let mut no_program = a.clone();
+        no_program.has_exec_source = false;
+        assert!(no_program.can_escalate(reviewer));
+        assert!(!no_program.can_remember_for_character(reviewer), "a character rule needs the ask's program");
+        let mut claimed = a.clone();
+        claimed.status = AskStatus::Claimed;
+        assert!(claimed.answerable_by(reviewer));
+        assert!(!claimed.can_escalate(reviewer), "the kernel refuses to reassign a claimed ask");
+        let mut decided = a;
+        decided.status = AskStatus::Denied;
+        assert!(!decided.can_escalate(reviewer));
+        assert!(!decided.can_remember_for_character(reviewer));
+    }
+}

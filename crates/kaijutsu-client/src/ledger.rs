@@ -70,7 +70,8 @@ mod tests {
         AskSummary {
             request_id: id.into(), status, origin: AskOrigin::ShellGate, context_id: None,
             description: String::new(), statements: Vec::new(), requester: None, performer: None,
-            reviewer: None, created_at_ms: 0, decided_at_ms: None,
+            reviewer: None, created_at_ms: 0, decided_at_ms: None, tool_call_block_id: None, lineage_root: None,
+            has_exec_source: false,
         }
     }
 

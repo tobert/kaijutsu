@@ -820,8 +820,10 @@ impl KjDispatcher {
                 None => lines.push(format!("{label} -")),
             }
         }
+        lines.push(format!("lineage_root: {}", ask.lineage_root.as_ref().map_or_else(
+            || "-".to_string(), |root| format!("{} ({})", root.id, root.name))));
         lines.push(format!("description: {}", ask.description));
-        if let Some(call) = &detail.tool_call_block_id {
+        if let Some(call) = &ask.tool_call_block_id {
             lines.push(format!("tool_call:  {}", call.to_key()));
         }
         for statement in &ask.statements {
@@ -904,6 +906,7 @@ impl KjDispatcher {
         let principal = |p: Option<&kaijutsu_types::PrincipalRef>| (p.map(|p| p.id.to_string()), p.map(|p| p.name.clone()));
         let (actor_id, actor_name) = principal(ask.performer.as_ref());
         let (reviewer_id, reviewer_name) = principal(ask.reviewer.as_ref());
+        let (lineage_root_id, lineage_root_name) = principal(ask.lineage_root.as_ref());
         let (decided_by, decided_by_name) = principal(decision.and_then(|d| d.decided_by.as_ref()));
         let mut data = serde_json::json!({
             "request_id": ask.request_id,
@@ -914,6 +917,8 @@ impl KjDispatcher {
             "actor_name": actor_name,
             "reviewer_id": reviewer_id,
             "reviewer_name": reviewer_name,
+            "lineage_root_id": lineage_root_id,
+            "lineage_root_name": lineage_root_name,
             "created_at": ask.created_at_ms,
             "decided_at": ask.decided_at_ms,
             "decided_by": decided_by,
@@ -928,7 +933,7 @@ impl KjDispatcher {
             "instance": detail.instance,
             "tool": detail.tool,
             "hook_id": detail.hook_id,
-            "tool_call_block_id": detail.tool_call_block_id.map(|b| b.to_key()),
+            "tool_call_block_id": ask.tool_call_block_id.map(|b| b.to_key()),
             "description": ask.description,
             "authorized_label": detail.label,
             "statements": ask.statements,
@@ -1765,7 +1770,7 @@ pub fn decide_ask(
         // A missing context row reads as not archived: `approvals.context_id`
         // has no foreign key, and an ask may outlive its context.
         if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id)
-            && db.get_context(ask_ctx).ok().flatten().is_some_and(|c| c.is_archived())
+            && context_is_archived(&db, ask_ctx, request_id)?
         {
             return Err(failure(AskAnswerFailureKind::Archived, format!(
                 "ask {request_id} belongs to context {}, which is archived — an archived context runs \
@@ -1912,13 +1917,13 @@ pub fn escalate_ask(
             Err(e) => return Err(failure(AskAnswerFailureKind::Refused, format!("could not read ask '{request_id}': {e}"))),
         };
         // When the lineage has no root, only the assigned reviewer may escalate.
-        let root_authority = ContextId::try_from_slice(&row.context_id).and_then(|context| match db.lineage_root(context) {
-            Ok(root) => Some(root),
-            Err(error) => {
-                tracing::warn!(%error, "ask has no lineage root; only the assigned reviewer may escalate");
-                None
-            }
-        });
+        let root_authority = match ContextId::try_from_slice(&row.context_id).map(|context| db.live_lineage_root(context)) {
+            Some(Ok(root)) => root,
+            Some(Err(error)) => return Err(failure(AskAnswerFailureKind::Refused, format!(
+                "could not find the lineage root of ask '{request_id}': {error}"
+            ))),
+            None => None,
+        };
         let target = match to {
             Some(target) => match db.get_character(target) {
                 Ok(Some(character)) if character.retired_at.is_none() => target,
@@ -1929,7 +1934,7 @@ pub fn escalate_ask(
             None => next_reviewer_above(&db, request_id, &row)?,
         };
         if let Some(ask_ctx) = ContextId::try_from_slice(&row.context_id)
-            && db.get_context(ask_ctx).ok().flatten().is_some_and(|c| c.is_archived())
+            && context_is_archived(&db, ask_ctx, request_id)?
         {
             return Err(failure(AskAnswerFailureKind::Archived, format!(
                 "ask {request_id} belongs to context {}, which is archived; nobody can answer it",
@@ -2034,6 +2039,16 @@ fn character_allow_learnable(conn: &Connection, request_id: &str) -> Result<(), 
         Some(why) => Err(why),
         None => Ok(()),
     }
+}
+
+/// Whether the ask's context is archived. A missing row reads as not
+/// archived; a failed read refuses the answer rather than reading as live.
+fn context_is_archived(db: &crate::kernel_db::KernelDb, context: ContextId, request_id: &str) -> Result<bool, AskAnswerFailure> {
+    db.get_context(context)
+        .map(|row| row.is_some_and(|c| c.is_archived()))
+        .map_err(|e| failure(AskAnswerFailureKind::Refused, format!(
+            "could not read the context of ask '{request_id}': {e}"
+        )))
 }
 
 fn failure(kind: AskAnswerFailureKind, message: impl Into<String>) -> AskAnswerFailure {
@@ -2616,6 +2631,91 @@ mod tests {
         let refused = gate_once(&d, &c, foreign).await;
         assert_eq!(refused.verdict, crate::kj::gate::GateVerdict::Unavailable, "{}", refused.reason);
         assert!(refused.ask.is_none());
+    }
+
+    /// The first listing and the first push carry the tool call that raised
+    /// the ask; an ask no call raised carries none.
+    #[tokio::test]
+    async fn a_listed_ask_names_the_tool_call_that_raised_it() {
+        let d = test_dispatcher().await;
+        let c = registered_caller(&d);
+        let context = c.context_id.expect("the test caller has a context");
+        let call = kaijutsu_types::BlockId::new(context, c.actor_id, 7);
+        let mut raised = spec();
+        raised.tool_call = Some(call);
+        let from_call = gate_once(&d, &c, raised).await.ask.expect("a pending ask").request_id;
+        let direct = gate_once(&d, &c, spec()).await.ask.expect("a pending ask").request_id;
+
+        let db = d.kernel_db().lock();
+        let listing = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap();
+        let of = |id: &str| listing.asks.iter().find(|a| a.request_id == id).expect("listed").clone();
+        assert_eq!(of(&from_call).tool_call_block_id, Some(call));
+        assert_eq!(of(&direct).tool_call_block_id, None);
+        let (_, pushed) = crate::ledger_view::asks_changed_since(&db, 0).unwrap();
+        assert_eq!(pushed.iter().find(|a| a.request_id == from_call).unwrap().tool_call_block_id, Some(call));
+        let detail = crate::ledger_view::get_ask(&db, &from_call).unwrap().unwrap();
+        assert_eq!(detail.summary.tool_call_block_id, Some(call));
+    }
+
+    /// A summary names the lineage root, and names none when the lineage
+    /// has no live root. It says whether the ask carries a program.
+    #[tokio::test]
+    async fn a_listed_ask_names_its_lineage_root_and_whether_it_carries_a_program() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let c = registered_caller(&d);
+        let mut with_program = spec();
+        with_program.exec_source = Some("echo hi".into());
+        let program = gate_once(&d, &c, with_program).await.ask.unwrap().request_id;
+        let plain = gate_once(&d, &c, spec()).await.ask.unwrap().request_id;
+
+        {
+            let db = d.kernel_db().lock();
+            let listing = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap();
+            for ask in &listing.asks {
+                assert_eq!(ask.lineage_root.as_ref().map(|r| r.id), Some(amy), "{ask:?}");
+            }
+            let of = |id: &str| listing.asks.iter().find(|a| a.request_id == id).unwrap().clone();
+            assert!(of(&program).has_exec_source);
+            assert!(!of(&plain).has_exec_source);
+        }
+
+        // The root retires: the lineage has none, and the card says so.
+        d.kernel_db().lock().conn_for_ledger().execute(
+            "UPDATE characters SET retired_at = 1 WHERE principal_id = ?1", [amy.as_bytes().as_slice()],
+        ).unwrap();
+        let db = d.kernel_db().lock();
+        let listing = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap();
+        assert!(!listing.asks.is_empty());
+        assert!(listing.asks.iter().all(|a| a.lineage_root.is_none()), "{listing:?}");
+    }
+
+    /// A broken context forest is a fault, not a lineage without a root: the
+    /// listing and an escalation refuse and name it, instead of reading as
+    /// "no root" (which would turn into a misleading authorization error).
+    #[tokio::test]
+    async fn a_forked_from_cycle_fails_the_listing_and_the_escalation_loudly() {
+        let d = test_dispatcher().await;
+        let amy = crate::kj::test_helpers::test_reviewer_principal();
+        let c = registered_caller(&d);
+        let ctx = c.context_id.unwrap();
+        let ask = gate_once(&d, &c, spec()).await.ask.unwrap();
+        {
+            // The root context now forks from its own descendant.
+            let db = d.kernel_db().lock();
+            let root = db.get_context(ctx).unwrap().unwrap().forked_from.expect("the caller's context has a parent");
+            db.conn_for_ledger().execute(
+                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                rusqlite::params![ctx.as_bytes().as_slice(), root.as_bytes().as_slice()],
+            ).unwrap();
+            let error = crate::ledger_view::list_asks(&db, &AskFilter::default()).unwrap_err();
+            assert!(error.contains("cycle") && error.contains(&ask.request_id), "{error}");
+        }
+        let reviewer = c.clone().with_actor(amy, Some(amy));
+        let refused = d.dispatch(&[s("ledger"), s("escalate"), ask.request_id.clone(), s("--to"), s("amy")], &reviewer).await;
+        assert!(!refused.is_ok());
+        assert!(refused.message().contains("cycle"), "a fault is named, not reported as missing authority: {}", refused.message());
+        assert!(!refused.message().contains("only be escalated by its assigned reviewer"), "{}", refused.message());
     }
 
     #[tokio::test]

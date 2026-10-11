@@ -2264,26 +2264,50 @@ impl KernelDb {
     /// responsible character, a non-root, or a retired root refuses, and
     /// a broken chain is the same corruption the reviewer walk refuses.
     pub fn lineage_root(&self, context_id: ContextId) -> KernelDbResult<PrincipalId> {
+        match self.lineage_root_or_reason(context_id)? {
+            Ok(root) => Ok(root),
+            Err(reason) => Err(KernelDbError::Validation(reason)),
+        }
+    }
+
+    /// The lineage root, or `None` when the lineage legitimately has no live
+    /// root: the top has no responsible character, that character is not a
+    /// root, is retired, or has no sheet, and when `context_id` itself has no
+    /// row (`approvals.context_id` has no foreign key, so an ask may outlive
+    /// its context). A fault (a missing ancestor, a `forked_from` cycle, a
+    /// database error) is an `Err`, never `None`.
+    pub fn live_lineage_root(&self, context_id: ContextId) -> KernelDbResult<Option<PrincipalId>> {
+        if self.get_context(context_id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(self.lineage_root_or_reason(context_id)?.ok())
+    }
+
+    /// The outer `Err` is a fault; the inner `Err` says why the lineage has no
+    /// live root.
+    fn lineage_root_or_reason(&self, context_id: ContextId) -> KernelDbResult<Result<PrincipalId, String>> {
         let top = self.lineage_top_row(context_id)?;
-        let responsible = top.played_by.or(top.director_id).ok_or_else(|| KernelDbError::Validation(format!(
-            "context {} tops a lineage with no responsible character, so no root holds authority over it",
-            top.context_id.short()
-        )))?;
-        match self.get_character(responsible)? {
-            Some(sheet) if !sheet.root => Err(KernelDbError::Validation(format!(
+        let Some(responsible) = top.played_by.or(top.director_id) else {
+            return Ok(Err(format!(
+                "context {} tops a lineage with no responsible character, so no root holds authority over it",
+                top.context_id.short()
+            )));
+        };
+        Ok(match self.get_character(responsible)? {
+            Some(sheet) if !sheet.root => Err(format!(
                 "{} is responsible for context {} at the top of this lineage and is not a root character",
                 sheet.name, top.context_id.short()
-            ))),
-            Some(sheet) if sheet.retired_at.is_some() => Err(KernelDbError::Validation(format!(
+            )),
+            Some(sheet) if sheet.retired_at.is_some() => Err(format!(
                 "root character {} is retired, so context {} has no lineage root",
                 sheet.name, top.context_id.short()
-            ))),
+            )),
             Some(_) => Ok(responsible),
-            None => Err(KernelDbError::Validation(format!(
+            None => Err(format!(
                 "the character responsible for context {} has no character sheet",
                 top.context_id.short()
-            ))),
-        }
+            )),
+        })
     }
 
     /// The context id at the top of `context_id`'s `forked_from` chain —
@@ -11485,6 +11509,47 @@ mod tests {
 
         let error = db.lineage_root_context(a.context_id).unwrap_err();
         assert!(matches!(error, KernelDbError::Validation(_)), "{error}");
+        assert!(error.to_string().contains("cycle"), "{error}");
+    }
+
+    /// `live_lineage_root` separates a lineage with no live root (`None`)
+    /// from a fault (`Err`): a cycle is a fault.
+    #[test]
+    fn live_lineage_root_is_none_without_a_root_and_an_error_on_a_fault() {
+        let db = KernelDb::temporary().unwrap();
+        let ws_id = setup_test_db(&db);
+        let [banto, amy] = seed_characters(&db, &["banto", "amy"])[..] else { unreachable!() };
+
+        let bare = make_context_row(Some("nobody-top"));
+        insert_context_with_doc(&db, &bare, ws_id);
+        assert_eq!(db.live_lineage_root(bare.context_id).unwrap(), None, "no responsible character");
+
+        let mut seat = make_context_row(Some("not-root"));
+        seat.played_by = Some(banto);
+        insert_context_with_doc(&db, &seat, ws_id);
+        assert_eq!(db.live_lineage_root(seat.context_id).unwrap(), None, "a non-root at the top");
+
+        db.update_character_root(amy, true).unwrap();
+        let mut root = make_context_row(Some("amy"));
+        root.played_by = Some(amy);
+        insert_context_with_doc(&db, &root, ws_id);
+        assert_eq!(db.live_lineage_root(root.context_id).unwrap(), Some(amy));
+        assert!(db.retire_character(amy, 1).unwrap());
+        assert_eq!(db.live_lineage_root(root.context_id).unwrap(), None, "a retired root");
+
+        assert_eq!(db.live_lineage_root(ContextId::new()).unwrap(), None, "an ask may outlive its context");
+
+        let a = make_context_row(Some("cycle-a"));
+        let b = make_context_row(Some("cycle-b"));
+        insert_context_with_doc(&db, &a, ws_id);
+        insert_context_with_doc(&db, &b, ws_id);
+        for (child, parent) in [(a.context_id, b.context_id), (b.context_id, a.context_id)] {
+            db.conn.execute(
+                "UPDATE contexts SET forked_from = ?1 WHERE context_id = ?2",
+                params![blob_param(parent.as_bytes()), blob_param(child.as_bytes())],
+            ).unwrap();
+        }
+        let error = db.live_lineage_root(a.context_id).unwrap_err();
         assert!(error.to_string().contains("cycle"), "{error}");
     }
 

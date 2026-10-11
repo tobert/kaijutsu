@@ -281,7 +281,6 @@ pub fn summary_record(summary: &AskSummary) -> AskDetail {
         tool: None,
         hook_id: None,
         label: None,
-        tool_call_block_id: None,
         exec_source: None,
         cwd: None,
         env: Vec::new(),
@@ -763,6 +762,9 @@ mod tests {
             reviewer: None,
             created_at_ms,
             decided_at_ms: None,
+            tool_call_block_id: None,
+            lineage_root: None,
+            has_exec_source: false,
         }
     }
 

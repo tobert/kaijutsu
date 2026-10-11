@@ -83,6 +83,13 @@ pub(crate) fn set_ask_summary(mut builder: ask_summary::Builder<'_>, ask: &kaiju
         builder.set_decided_at_ms(at);
         builder.set_has_decided_at(true);
     }
+    if let Some(block) = &ask.tool_call_block_id {
+        crate::rpc::set_block_id_builder(&mut builder.reborrow().init_tool_call_block_id(), block);
+    }
+    if let Some(p) = &ask.lineage_root {
+        set_principal(builder.reborrow().init_lineage_root(), p);
+    }
+    builder.set_has_exec_source(ask.has_exec_source);
 }
 
 pub(crate) fn set_ask_detail(mut builder: ask_detail::Builder<'_>, ask: &kaijutsu_types::AskDetail) {
@@ -91,9 +98,6 @@ pub(crate) fn set_ask_detail(mut builder: ask_detail::Builder<'_>, ask: &kaijuts
     if let Some(v) = &ask.tool { builder.set_tool(v); }
     if let Some(v) = &ask.hook_id { builder.set_hook_id(v); }
     if let Some(v) = &ask.label { builder.set_label(v); }
-    if let Some(block) = &ask.tool_call_block_id {
-        crate::rpc::set_block_id_builder(&mut builder.reborrow().init_tool_call_block_id(), block);
-    }
     if let Some(v) = &ask.exec_source { builder.set_exec_source(v); }
     if let Some(v) = &ask.cwd { builder.set_cwd(v); }
     let mut env = builder.reborrow().init_env(ask.env.len() as u32);
@@ -205,9 +209,10 @@ mod tests {
                 request_id: "r".into(), status: kaijutsu_types::AskStatus::Pending,
                 origin: kaijutsu_types::AskOrigin::ShellGate, context_id: None, description: String::new(),
                 statements: Vec::new(), requester: None, performer: None, reviewer: None,
-                created_at_ms: 0, decided_at_ms: None,
+                created_at_ms: 0, decided_at_ms: None, tool_call_block_id: None, lineage_root: None,
+                has_exec_source: false,
             },
-            instance: None, tool: None, hook_id: None, label: None, tool_call_block_id: None,
+            instance: None, tool: None, hook_id: None, label: None,
             exec_source: None, cwd: None,
             env: vec![
                 kaijutsu_types::AskEnv { name: "EMPTY".into(), value: Some(String::new()) },
@@ -221,5 +226,39 @@ mod tests {
         let env = reader.get_env().unwrap();
         assert!(env.get(0).has_value(), "an empty value must stay present");
         assert!(!env.get(1).has_value(), "an unset value must stay absent");
+    }
+
+    /// A card's tool call, lineage root and program flag reach the wire, and
+    /// an absent one stays absent.
+    #[test]
+    fn a_card_writes_its_tool_call_lineage_root_and_program_flag() {
+        let call = kaijutsu_types::BlockId::new(kaijutsu_types::ContextId::new(), kaijutsu_types::PrincipalId::new(), 7);
+        let root = kaijutsu_types::PrincipalId::new();
+        let mut card = kaijutsu_types::AskSummary {
+            request_id: "r".into(), status: kaijutsu_types::AskStatus::Pending,
+            origin: kaijutsu_types::AskOrigin::ShellGate, context_id: None, description: String::new(),
+            statements: Vec::new(), requester: None, performer: None, reviewer: None,
+            created_at_ms: 0, decided_at_ms: None, tool_call_block_id: Some(call),
+            lineage_root: Some(kaijutsu_types::PrincipalRef { id: root, name: "amy".into() }),
+            has_exec_source: true,
+        };
+        let mut message = capnp::message::Builder::new_default();
+        set_ask_summary(message.init_root::<ask_summary::Builder<'_>>(), &card);
+        let r = message.get_root_as_reader::<ask_summary::Reader<'_>>().unwrap();
+        let block = r.get_tool_call_block_id().unwrap();
+        assert_eq!(block.get_context_id().unwrap(), call.context_id.as_bytes());
+        assert_eq!(block.get_seq(), 7);
+        let who = r.get_lineage_root().unwrap();
+        assert_eq!(who.get_id().unwrap(), root.as_bytes());
+        assert_eq!(who.get_name().unwrap().to_str().unwrap(), "amy");
+        assert!(r.get_has_exec_source());
+
+        card.tool_call_block_id = None;
+        card.lineage_root = None;
+        card.has_exec_source = false;
+        let mut bare = capnp::message::Builder::new_default();
+        set_ask_summary(bare.init_root::<ask_summary::Builder<'_>>(), &card);
+        let r = bare.get_root_as_reader::<ask_summary::Reader<'_>>().unwrap();
+        assert!(!r.has_tool_call_block_id() && !r.has_lineage_root() && !r.get_has_exec_source());
     }
 }

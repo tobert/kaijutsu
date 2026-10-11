@@ -39,6 +39,7 @@ fn add_character(kernel: &SharedKernel, id: PrincipalId, name: &str) {
 /// Amy (root), a coder who performs, and a lead who can be made reviewer.
 struct Rig {
     kernel: SharedKernel,
+    db_path: std::path::PathBuf,
     amy: PrincipalId,
     coder: PrincipalId,
     lead: PrincipalId,
@@ -58,7 +59,8 @@ impl Rig {
         let addr = listener.local_addr().unwrap();
         let mut config = SshServerConfig::ephemeral_with_root(addr.port(), "amy");
         common::allow_in_shipped_gate(&config, &["kj context create"]);
-        let amy = kaijutsu_kernel::KernelDb::open(config.data_dir.as_ref().unwrap().join("kernel.db"))
+        let db_path = config.data_dir.as_ref().unwrap().join("kernel.db");
+        let amy = kaijutsu_kernel::KernelDb::open(&db_path)
             .unwrap().get_character_by_name("amy").unwrap().expect("amy is root").principal_id;
         let coder = PrincipalId::new();
         let lead = PrincipalId::new();
@@ -93,7 +95,7 @@ impl Rig {
         });
         coder_kj.join_context(work, "ledger-rpc-work").await.unwrap();
         Rig {
-            kernel, amy, coder, lead, amy_kj, coder_kj, lead_kj, work,
+            kernel, db_path, amy, coder, lead, amy_kj, coder_kj, lead_kj, work,
             _clients: vec![amy_client, coder_client, lead_client],
         }
     }
@@ -143,12 +145,28 @@ fn a_reviewer_reads_and_answers_the_ledger_without_a_context() {
         assert_eq!(card.performer.as_ref().map(|p| (p.id, p.name.as_str())), Some((rig.coder, "coder")));
         assert_eq!(card.reviewer.as_ref().map(|p| p.id), Some(rig.amy));
         assert!(card.answerable_by(rig.amy) && !card.answerable_by(rig.coder));
+        assert_eq!(card.lineage_root.as_ref().map(|p| (p.id, p.name.as_str())), Some((rig.amy, "amy")));
+        assert_eq!(card.tool_call_block_id, None, "a hook ask raised outside a model tool call names none");
+        assert!(card.has_exec_source, "the rig's hook ask carries the program the shell tool submitted");
 
         let detail = rig.amy_kj.get_ask(&request_id).await.unwrap().expect("the ask exists");
         assert_eq!(&detail.summary, card);
+        assert_eq!(detail.exec_source.is_some(), card.has_exec_source, "the card and the record agree");
         assert_eq!(detail.tool.as_deref(), Some("shell_write"));
         assert!(detail.decision.is_none());
         assert!(rig.amy_kj.get_ask("no-such-ask").await.unwrap().is_none());
+
+        // A model's tool call that raised the ask rides on its card, in a
+        // listing and in a get. The gate records it with the ask; here the
+        // row is written directly, since the wire cannot raise a model call.
+        let call = kaijutsu_types::BlockId::new(rig.work, rig.coder, 5);
+        rusqlite::Connection::open(&rig.db_path).unwrap().execute(
+            "INSERT INTO approval_tool_calls(request_id, block_id) VALUES (?1, ?2)",
+            rusqlite::params![request_id, call.to_key()],
+        ).unwrap();
+        let listed = rig.amy_kj.list_asks(&AskFilter::default()).await.unwrap();
+        assert_eq!(listed.asks[0].tool_call_block_id, Some(call));
+        assert_eq!(rig.amy_kj.get_ask(&request_id).await.unwrap().unwrap().summary.tool_call_block_id, Some(call));
 
         let (callback, mut pushes) = ledger_events_channel(16);
         rig.amy_kj.subscribe_ledger_events(callback, listing.generation).await.unwrap();
@@ -192,6 +210,9 @@ fn a_takeover_is_a_recorded_reassignment_then_an_answer() {
         let request_id = rig.raise("echo take-over").await;
         let card = rig.amy_kj.get_ask(&request_id).await.unwrap().unwrap().summary;
         assert_eq!(card.reviewer.as_ref().map(|p| p.id), Some(rig.lead));
+        assert!(card.can_take_over(rig.amy), "the lineage root takes it from lead");
+        assert!(!card.can_take_over(rig.lead) && !card.can_take_over(rig.coder));
+        assert!(card.can_escalate(rig.lead) && !card.can_escalate(rig.amy));
 
         let refused = rig.amy_kj.decide_ask(&request_id, AskVerdict::Allow, None).await.unwrap()
             .expect_err("strict: only the assigned reviewer answers");
@@ -200,6 +221,7 @@ fn a_takeover_is_a_recorded_reassignment_then_an_answer() {
         let moved = rig.amy_kj.escalate_ask(&request_id, Some(rig.amy)).await.unwrap()
             .expect("the lineage root reclaims");
         assert_eq!(moved.summary.reviewer.as_ref().map(|p| p.id), Some(rig.amy));
+        assert!(!moved.summary.can_take_over(rig.amy), "the root already holds it");
         let refused = rig.lead_kj.decide_ask(&request_id, AskVerdict::Allow, None).await.unwrap()
             .expect_err("the former reviewer no longer answers");
         assert_eq!(refused.kind, AskAnswerFailureKind::NotReviewer);

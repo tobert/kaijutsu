@@ -8,7 +8,7 @@
 
 use approval_ledger::types::{ApprovalRow, ApprovalStatus, Origin};
 use kaijutsu_types::{
-    AskDecision, AskDetail, AskEnv, AskFilter, AskOrigin, AskReassignment, AskStatus, AskSummary, AskView, BlockId, ContextId,
+    AskDecision, AskDetail, AskEnv, AskFilter, AskOrigin, AskReassignment, AskStatus, AskSummary, AskView, ContextId,
     PrincipalId, PrincipalRef,
 };
 
@@ -63,7 +63,6 @@ pub fn get_ask(db: &KernelDb, request_id: &str) -> Result<Option<AskDetail>, Str
         .into_iter().map(|e| AskEnv { name: e.name, value: e.value }).collect();
     let redeemed_at_ms = approval_ledger::ask::redeemed_at(conn, request_id).map_err(|e| e.to_string())?;
     let publication_abandoned = db.approval_pair_abandoned_reason(request_id).map_err(|e| e.to_string())?;
-    let tool_call_block_id: Option<BlockId> = db.approval_tool_call(request_id).map_err(|e| e.to_string())?;
     // A cancellation records who cancelled and `cancel`; an expiry or a
     // restart sweep records neither.
     let decision = if row.decided_by.is_some() || row.decided_option.is_some() || row.auto_reason.is_some() {
@@ -98,7 +97,6 @@ pub fn get_ask(db: &KernelDb, request_id: &str) -> Result<Option<AskDetail>, Str
         tool: row.tool,
         hook_id: row.hook_id,
         label: row.authorized_label,
-        tool_call_block_id,
         exec_source: row.exec_source,
         cwd: row.cwd,
         env,
@@ -125,6 +123,17 @@ pub(crate) fn summary(db: &KernelDb, row: &ApprovalRow) -> Result<AskSummary, St
     let statements = approval_ledger::ask::load_ask_statements(db.conn_for_ledger(), &row.request_id)
         .map_err(|e| e.to_string())?
         .into_iter().map(|s| s.statement.rendered).collect();
+    // A lineage with no live root has none to name; the assigned reviewer
+    // alone may reassign such an ask, as `kj ledger escalate` decides.
+    let lineage_root = match ContextId::try_from_slice(&row.context_id)
+        .map(|context| db.live_lineage_root(context))
+        .transpose()
+        .map_err(|e| format!("could not find the lineage root of ask '{}': {e}", row.request_id))?
+        .flatten()
+    {
+        Some(root) => Some(principal_ref(db, root.as_bytes())?),
+        None => None,
+    };
     Ok(AskSummary {
         request_id: row.request_id.clone(),
         status: crate::kj::gate::ask_status(row.status),
@@ -137,6 +146,9 @@ pub(crate) fn summary(db: &KernelDb, row: &ApprovalRow) -> Result<AskSummary, St
         reviewer: row.reviewer_id.as_deref().map(|raw| principal_ref(db, raw)).transpose()?,
         created_at_ms: row.created_at,
         decided_at_ms: row.decided_at,
+        tool_call_block_id: db.approval_tool_call(&row.request_id).map_err(|e| e.to_string())?,
+        lineage_root,
+        has_exec_source: row.exec_source.is_some(),
     })
 }
 

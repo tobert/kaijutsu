@@ -75,6 +75,13 @@ pub(crate) fn ask_summary(reader: wire::ask_summary::Reader<'_>) -> Result<AskSu
         reviewer: if reader.has_reviewer() { Some(principal(reader.get_reviewer()?)?) } else { None },
         created_at_ms: reader.get_created_at_ms(),
         decided_at_ms: reader.get_has_decided_at().then(|| reader.get_decided_at_ms()),
+        tool_call_block_id: if reader.has_tool_call_block_id() {
+            Some(crate::rpc::parse_block_id(&reader.get_tool_call_block_id()?)?)
+        } else {
+            None
+        },
+        lineage_root: if reader.has_lineage_root() { Some(principal(reader.get_lineage_root()?)?) } else { None },
+        has_exec_source: reader.get_has_exec_source(),
     })
 }
 
@@ -102,11 +109,6 @@ pub(crate) fn ask_detail(reader: wire::ask_detail::Reader<'_>) -> Result<AskDeta
         tool: opt(reader.has_tool(), reader.get_tool())?,
         hook_id: opt(reader.has_hook_id(), reader.get_hook_id())?,
         label: opt(reader.has_label(), reader.get_label())?,
-        tool_call_block_id: if reader.has_tool_call_block_id() {
-            Some(crate::rpc::parse_block_id(&reader.get_tool_call_block_id()?)?)
-        } else {
-            None
-        },
         exec_source: opt(reader.has_exec_source(), reader.get_exec_source())?,
         cwd: opt(reader.has_cwd(), reader.get_cwd())?,
         env,
@@ -191,4 +193,41 @@ pub(crate) fn set_remember(mut builder: wire::remember::Builder<'_>, remember: R
         RememberScope::Character => wire::RememberScope::Character,
     });
     builder.set_family(remember.family);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kaijutsu_types::BlockId;
+
+    /// The three fields of a card that sit beside the ones every ask has
+    /// decode as the server's builder writes them, and read as absent when
+    /// the server wrote none.
+    #[test]
+    fn a_card_reads_its_tool_call_lineage_root_and_program_flag() {
+        let call = BlockId::new(ContextId::new(), PrincipalId::new(), 7);
+        let root = PrincipalId::new();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut b = message.init_root::<wire::ask_summary::Builder<'_>>();
+            b.set_request_id("r");
+            let mut block = b.reborrow().init_tool_call_block_id();
+            block.set_context_id(call.context_id.as_bytes());
+            block.set_principal_id(call.principal_id.as_bytes());
+            block.set_seq(call.seq);
+            let mut who = b.reborrow().init_lineage_root();
+            who.set_id(root.as_bytes());
+            who.set_name("amy");
+            b.set_has_exec_source(true);
+        }
+        let card = ask_summary(message.get_root_as_reader().unwrap()).unwrap();
+        assert_eq!(card.tool_call_block_id, Some(call));
+        assert_eq!(card.lineage_root, Some(PrincipalRef { id: root, name: "amy".into() }));
+        assert!(card.has_exec_source);
+
+        let mut bare = capnp::message::Builder::new_default();
+        bare.init_root::<wire::ask_summary::Builder<'_>>().set_request_id("r");
+        let card = ask_summary(bare.get_root_as_reader().unwrap()).unwrap();
+        assert_eq!((card.tool_call_block_id, card.lineage_root, card.has_exec_source), (None, None, false));
+    }
 }

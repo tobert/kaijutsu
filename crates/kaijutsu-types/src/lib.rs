@@ -107,10 +107,15 @@ pub const SSH_SHARE_SUBSYSTEM: &str = "kaijutsu-share";
 /// permission-approval feature instead of failing, and cost a morning to
 /// diagnose.
 ///
+/// Version 4: `AskDetail.toolCallBlockId @5` went unset and
+/// `AskSummary.toolCallBlockId @12` carries the call; a version 3 client
+/// would read every ask as raised by no tool call, and an ACP client would
+/// attach no permission prompt to its call.
+///
 /// Starts at 1. 0 is reserved as the "old client that predates this field"
 /// sentinel (capnp's struct default for an unset `UInt32`) and must never be
 /// a real version.
-pub const WIRE_VERSION: u32 = 3;
+pub const WIRE_VERSION: u32 = 4;
 
 /// Build the human-facing diagnosis for a `bindKernel` [`WIRE_VERSION`]
 /// mismatch — names both sides and points the remedy at whichever one is

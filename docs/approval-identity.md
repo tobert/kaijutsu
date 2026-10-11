@@ -194,7 +194,16 @@ and `kj ledger show` lists them as `reassigned:` lines; a caller who names
 itself took the ask over.
 
 The TUI displays the authenticated character and offers approval controls only
-to the assigned reviewer. A second context is unnecessary. The global ledger
+to the assigned reviewer. Each card carries the ask's tool call, the lineage
+root, and whether the ask has a program, and `AskSummary` supplies the rules
+clients gate on: `can_escalate` (the pending ask's reviewer),
+`can_take_over` (the lineage root, when it is neither reviewer nor performer),
+and `can_remember_for_character` (a reviewer of an ask with a program).
+In a client the root's way to reassign is a takeover, an escalation to itself;
+the kernel also lets the root reassign to a third character through `kj ledger
+escalate --to`. The card does not carry whether the context is archived, so
+the kernel's refusal stands for that case. `kj ledger show` prints the lineage
+root. A second context is unnecessary. The global ledger
 also exposes asks raised in other contexts. ACP permission prompts follow the
 same eligibility rule; the kernel remains authoritative if the assignment
 changes while a prompt is open. Timeouts, cancelled ACP prompts, and transport

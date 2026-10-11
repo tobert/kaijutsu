@@ -493,6 +493,14 @@ struct AskSummary {
   createdAtMs @9 :Int64;
   decidedAtMs @10 :Int64;
   hasDecidedAt @11 :Bool;
+  # The model's ToolCall block whose invocation raised the ask. Absent when
+  # no tool call did.
+  toolCallBlockId @12 :BlockId;
+  # The root character of the ask's lineage. Absent when the lineage has no
+  # live root, so only the assigned reviewer may reassign the ask.
+  lineageRoot @13 :PrincipalRef;
+  # Whether the ask carries the shell program an approval would run.
+  hasExecSource @14 :Bool;
 }
 
 # One free variable's value at ask time.
@@ -517,7 +525,8 @@ struct AskDetail {
   tool @2 :Text;
   hookId @3 :Text;
   label @4 :Text;
-  # The model's ToolCall block whose invocation raised the ask.
+  # Unused: `AskSummary.toolCallBlockId` carries it. A schema field cannot
+  # be removed, so this one stays unset.
   toolCallBlockId @5 :BlockId;
   execSource @6 :Text;
   cwd @7 :Text;
