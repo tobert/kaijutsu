@@ -1189,7 +1189,7 @@ pub fn handle_compose_input(
 
 /// The PRIMARY selection on Linux (X11/Wayland); other platforms have no
 /// primary selection, so middle-click falls back to the ordinary clipboard.
-fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<String, arboard::Error> {
+pub(crate) fn primary_selection_text(clip: &mut arboard::Clipboard) -> Result<String, arboard::Error> {
     #[cfg(target_os = "linux")]
     {
         use arboard::{GetExtLinux, LinuxClipboardKind};

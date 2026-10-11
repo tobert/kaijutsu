@@ -999,8 +999,13 @@ fn mirror_ops(
     Ok(())
 }
 
+/// The text every "unknown editor session" error starts with. A client
+/// matches it to tell a kernel that lost the session (a restart) from a
+/// transient failure.
+pub const NO_SUCH_SESSION: &str = "editor: no such session";
+
 fn no_session(id: EditorSessionId) -> String {
-    format!("editor: no such session {}", id.0)
+    format!("{NO_SUCH_SESSION} {}", id.0)
 }
 
 /// Read the current text of a specific `(context, block)`.

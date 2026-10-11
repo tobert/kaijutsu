@@ -32,10 +32,11 @@ use bevy::render::render_resource::ShaderType;
 /// How many rects one surface can composite at once.
 ///
 /// A contiguous selection coalesces to at most three
-/// ([`coalesce_selection_rects`]), so this is headroom for the shapes that do
-/// not coalesce — bidi runs splitting a row, and the multi-cursor/search-match
-/// highlighting a later slice may want — not a bound anything normal reaches.
-pub const MAX_SELECTION_RECTS: usize = 16;
+/// ([`coalesce_selection_rects`]) and a blockwise one merges its uniform rows
+/// ([`merge_stacked_rects`]), so this is headroom for ragged blocks taller
+/// than a screen of short lines, bidi runs splitting a row, and the
+/// multi-cursor/search-match highlighting a later slice may want.
+pub const MAX_SELECTION_RECTS: usize = 64;
 
 /// One selection rectangle, in whatever space its producer works in —
 /// surface-local **logical** pixels on the way in, UV on the way out of
@@ -89,7 +90,7 @@ impl SelectionRect {
 ///
 /// Fixed-size rather than a storage buffer on purpose — a uniform array is
 /// portable everywhere wgpu runs, and [`MAX_SELECTION_RECTS`] rects is a
-/// quarter of a kilobyte. The shader loops to `count`, not to the capacity, so
+/// kilobyte. The shader loops to `count`, not to the capacity, so
 /// the usual one-or-three-rect case costs three iterations.
 #[derive(ShaderType, Debug, Clone)]
 pub struct SelectionRects {
@@ -172,6 +173,31 @@ pub fn coalesce_selection_rects(
             out
         }
     }
+}
+
+/// Merge vertically adjacent rects that share a column range into one, in
+/// order. A blockwise selection is one rect per row; over uniform rows this
+/// shrinks it to one rect however tall it is, so the uniform's capacity is
+/// spent on the ragged rows only.
+pub fn merge_stacked_rects(rects: &[SelectionRect]) -> Vec<SelectionRect> {
+    const EPS: f32 = 0.5;
+    let mut out: Vec<SelectionRect> = Vec::new();
+    for rect in rects.iter().filter(|r| r.is_visible()) {
+        match out.last_mut() {
+            Some(prev)
+                if (prev.x - rect.x).abs() <= EPS
+                    && (prev.width - rect.width).abs() <= EPS
+                    && rect.y >= prev.y
+                    && rect.y - prev.bottom() <= EPS =>
+            {
+                // Parley's row boxes may overlap a pixel; the union is still
+                // one column of rows.
+                prev.height = prev.bottom().max(rect.bottom()) - prev.y;
+            }
+            _ => out.push(*rect),
+        }
+    }
+    out
 }
 
 /// Convert pixel-space rects into the material's UV-space uniform.
@@ -322,6 +348,62 @@ mod tests {
         let many = rows(MAX_SELECTION_RECTS + 7, 100.0);
         let packed = pack_selection_rects(&many, 800.0, 600.0);
         assert_eq!(packed.count as usize, MAX_SELECTION_RECTS);
+    }
+
+    /// The shader's array size is a second copy of [`MAX_SELECTION_RECTS`]; a
+    /// mismatch would read past the uniform or silently cap the selection.
+    #[test]
+    fn the_shader_array_matches_the_capacity() {
+        let wesl = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/shaders/block_fx.wesl"
+        ))
+        .expect("block_fx.wesl must be present");
+        let n = MAX_SELECTION_RECTS;
+        assert!(wesl.contains(&format!("const MAX_SELECTION_RECTS: u32 = {n}u;")), "const out of sync");
+        assert!(wesl.contains(&format!("array<vec4<f32>, {n}>")), "array size out of sync");
+    }
+
+    /// A blockwise selection over rows of one column range is one rectangle,
+    /// however many rows it spans.
+    #[test]
+    fn stacked_rows_of_one_column_range_merge() {
+        let out = merge_stacked_rects(&rows(100, 40.0));
+        assert_eq!(out, vec![SelectionRect::new(0.0, 0.0, 40.0, 1000.0)]);
+    }
+
+    /// Parley's row boxes can overlap by a pixel; they still stack.
+    #[test]
+    fn overlapping_rows_still_merge() {
+        let input = [SelectionRect::new(5.0, 0.0, 40.0, 11.0), SelectionRect::new(5.0, 10.0, 40.0, 11.0)];
+        assert_eq!(merge_stacked_rects(&input), vec![SelectionRect::new(5.0, 0.0, 40.0, 21.0)]);
+    }
+
+    /// A short line breaks the stack: its row has a different width, and the
+    /// rows around it must not grow over it.
+    #[test]
+    fn a_ragged_row_splits_the_merge() {
+        let mut input = rows(5, 40.0);
+        input[2] = SelectionRect::new(0.0, 20.0, 15.0, 10.0);
+        let out = merge_stacked_rects(&input);
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].height, 20.0);
+        assert_eq!(out[1].width, 15.0);
+        assert_eq!(out[2].height, 20.0);
+    }
+
+    /// Same width but a different left edge is another column range.
+    #[test]
+    fn rows_of_one_width_at_different_columns_do_not_merge() {
+        let input = [SelectionRect::new(0.0, 0.0, 40.0, 10.0), SelectionRect::new(8.0, 10.0, 40.0, 10.0)];
+        assert_eq!(merge_stacked_rects(&input).len(), 2);
+    }
+
+    /// Rows that do not touch (a gap, e.g. clipped rows) stay separate.
+    #[test]
+    fn a_gap_between_rows_splits_the_merge() {
+        let input = [SelectionRect::new(0.0, 0.0, 40.0, 10.0), SelectionRect::new(0.0, 30.0, 40.0, 10.0)];
+        assert_eq!(merge_stacked_rects(&input).len(), 2);
     }
 
     /// The empty selection is the default, and it is what "draw nothing"

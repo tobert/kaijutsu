@@ -44,6 +44,9 @@ impl EditorSink for ActorHandle {
     }
 }
 
+/// The error a call lands with when the writer stopped before answering it.
+pub const WRITER_STOPPED: &str = "the editor writer stopped before this call was answered";
+
 /// One call's answer.
 #[derive(Debug)]
 pub struct Landed {
@@ -82,7 +85,7 @@ struct Writer {
 
 impl Writer {
     fn lost(&self, session: u64, sent: String) {
-        let result = Err("the editor writer stopped before this call was answered".to_string());
+        let result = Err(WRITER_STOPPED.to_string());
         let _ = self.landed_tx.send(Landed { session, sent, result });
     }
 }

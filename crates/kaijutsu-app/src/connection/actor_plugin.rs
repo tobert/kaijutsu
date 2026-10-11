@@ -391,18 +391,6 @@ pub enum RpcResultMessage {
         blocks: Vec<kaijutsu_types::BlockSnapshot>,
         version: u64,
     },
-    /// An open editor's kernel session is gone: a keystroke to `editor_keys`
-    /// came back `no such session`. The session is in-memory kernel state and
-    /// does not survive a kernel restart (the persisted `kernel_id` is unchanged,
-    /// so a restart is invisible at the connection layer). Drained by
-    /// `view::editor` to drop the stale session and pop back to the conversation.
-    EditorSessionLost { session: u64 },
-    /// An in-flight `editor_keys` batch resolved: `ok` on a normal return,
-    /// `!ok` on a *transient* failure (a session-lost failure sends
-    /// [`EditorSessionLost`](Self::EditorSessionLost) instead). Drained by
-    /// `view::editor` to advance its ordered keystroke pipe — ship the next
-    /// batch, or retry/drop the failed one.
-    EditorKeysOutcome { session: u64, ok: bool },
     /// The per-client metronome config (`/config/client/<id>/metronome.toml`,
     /// cascading to the shared `/config/client/default/metronome.toml`), fetched over RPC on
     /// (re)connect. Drained by [`crate::metronome::apply_metronome_config`] into

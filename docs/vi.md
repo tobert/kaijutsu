@@ -230,16 +230,33 @@ scope):
   with an MSDF text child on `BlockFxMaterial` — the same material the
   conversation/compose surfaces use, so the cursor/selection shader path is
   shared via `shaders::cursor_selection_uniforms`.
-- Text is laid out with the mono font at the conversation's `cell_font_size`;
-  the `:`-strip (command line or transient message) is appended to the same
-  glyph buffer near the page bottom.
+- Text is laid out with the mono font at the conversation's `cell_font_size`,
+  wrapped at the page width. The page is three bands: the body, the mode line
+  (path and `[+]` on the left; mode and `row,col` on the right, as in the
+  tui), and the `:`-strip (command line, else the kernel's message, else a
+  local notice such as a lost key batch). All of it goes into one glyph
+  buffer. The viewport follows the cursor (`view/editor/viewport.rs`): the
+  window moves only when the cursor leaves it, lands on a line top, and keeps
+  the cursor row clear of the mode line and strip. Rows outside the body band
+  are not drawn, and a `~` marks each empty row below the text.
 - Cursor geometry is computed via parley (`Cursor::from_byte_index(..).geometry`)
   into `OverlayCursorGeometry`, pushed to the material by `sync_editor_cursor`.
   Selection rects (`editor_selection_rects`) ride `EditorSelectionGeometry`
-  on the same surface and reach the material in the same system.
+  on the same surface and reach the material in the same system, clipped to
+  the body band. A blockwise selection merges stacked rows of one column range
+  into one rect, and the selection uniform holds 64 rects.
 - `editor_dispatch_keys` (gated `in_state(Screen::Editor)`) drains
-  `KeyboardInput`, translates to modalkit key notation, and ships *every* key
-  to `editor_keys`. The push subscription returns the new state.
+  `GrabbedKey`, translates to the kernel's key notation (`keys.rs`: arrows,
+  `<Home>`, `<End>`, page keys, `<Del>`, `<lt>`; a navigation key held with
+  Ctrl, Alt or Shift is refused), and queues *every* key on the
+  `kaijutsu_client::editor_outbox` outbox. The outbox keeps one call in
+  flight and sends keys that queue behind it as one `editor_keys` batch, in
+  press order, never resending a batch. The push subscription returns the new
+  state. A failed answer is never silent: `no such session` pops back to the
+  conversation, a stopped writer is replaced by a fresh outbox, and any other
+  failure shows in the strip.
+- A paste is `editor_insert`, not keys: Ctrl+Shift+V reads CLIPBOARD and
+  middle-click reads PRIMARY. Plain Ctrl+V stays vi's visual-block key.
 
 The 3D viewer adds **no editing logic** — it renders kernel state and forwards
 keys. The app never detects mode: app-side mode detection races the mode push

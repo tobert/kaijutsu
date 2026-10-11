@@ -18,9 +18,9 @@ use bevy::prelude::*;
 use bevy::ui::ComputedNode;
 use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
-use super::ActiveEditor;
+use super::{ActiveEditor, viewport};
 use crate::input::vim::mode_kind;
-use crate::shaders::selection::coalesce_selection_rects;
+use crate::shaders::selection::{coalesce_selection_rects, merge_stacked_rects};
 use crate::shaders::{BlockFxMaterial, SelectionRect, pack_selection_rects};
 use crate::text::msdf::{FontDataMap, MsdfAtlas, MsdfBlockGlyphs, collect_msdf_glyphs};
 use crate::text::shaping::{VelloFont, VelloTextAlign, VelloTextStyle};
@@ -74,9 +74,9 @@ fn selection_byte_ranges(text: &str, selection: &EditorSelection) -> Vec<Range<u
 /// coalesce to at most three, the middle band spanning `0..content_width`.
 /// A blockwise selection keeps one rect per row: its rows are separate
 /// column ranges, and a full-width band would cover columns outside the
-/// block. More than [`crate::shaders::selection::MAX_SELECTION_RECTS`] blockwise rows
-/// overflow the uniform, and `pack_selection_rects` drops the rest with a
-/// warning.
+/// block. Rows of one column range merge into one rect
+/// ([`merge_stacked_rects`]); only ragged rows spend more of the uniform's
+/// [`crate::shaders::selection::MAX_SELECTION_RECTS`].
 pub(crate) fn editor_selection_rects<B: parley::Brush>(
     layout: &parley::Layout<B>,
     text: &str,
@@ -92,11 +92,13 @@ pub(crate) fn editor_selection_rects<B: parley::Brush>(
                 .collect();
             coalesce_selection_rects(&rows, 0.0, content_width)
         }
-        SelectionShape::Blockwise => ranges
-            .into_iter()
-            .flat_map(|bytes| crate::text::diff::layout_rects(layout, bytes))
-            .filter(|rect| rect.is_visible())
-            .collect(),
+        SelectionShape::Blockwise => {
+            let rows: Vec<SelectionRect> = ranges
+                .into_iter()
+                .flat_map(|bytes| crate::text::diff::layout_rects(layout, bytes))
+                .collect();
+            merge_stacked_rects(&rows)
+        }
     }
 }
 
@@ -108,6 +110,13 @@ pub struct EditorSelectionGeometry {
     pub rects: Vec<SelectionRect>,
     /// The selection the rects were built from, to detect a change.
     pub last: Option<EditorSelection>,
+}
+
+/// How far the text is scrolled, in layout-space logical px. Always a line
+/// top; [`viewport::follow_cursor`] moves it when the cursor leaves the window.
+#[derive(Component, Default)]
+pub struct EditorViewport {
+    pub scroll_y: f32,
 }
 
 /// Spawn the editor surface on entering `Screen::Editor`: a full-window page node
@@ -142,6 +151,7 @@ pub fn spawn_editor_panel(
                 crate::view::block_render::msdf_surface_bundle(material),
                 OverlayCursorGeometry::default(),
                 EditorSelectionGeometry::default(),
+                EditorViewport::default(),
                 Node {
                     width: Val::Percent(100.0),
                     height: Val::Percent(100.0),
@@ -159,15 +169,40 @@ pub fn despawn_editor_panel(mut commands: Commands, roots: Query<Entity, With<Ed
     }
 }
 
+/// Register `layout`'s fonts and collect its glyphs at `offset` into `out`.
+fn append_glyphs(
+    layout: &parley::Layout<peniko::Brush>,
+    brush: &peniko::Brush,
+    offset: (f64, f64),
+    atlas: &mut MsdfAtlas,
+    font_data_map: &mut FontDataMap,
+    out: &mut Vec<crate::text::msdf::PositionedGlyph>,
+) {
+    for line in layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
+                font_data_map.register(gr.run().font());
+            }
+        }
+    }
+    out.append(&mut collect_msdf_glyphs(layout, &[], brush, offset, atlas));
+}
+
 /// Lay out the active session's text into the surface's MSDF glyphs and compute
 /// the cursor geometry. Runs in PostUpdate after `UiSystems::Layout` so the
 /// surface's `ComputedNode` (full-window size) is available. Rebuilds glyphs only
-/// on a text/size change; recomputes cursor geometry on any change.
+/// when the text, size, `:`-strip, mode line, or scroll changes; recomputes
+/// cursor geometry on any change.
+///
+/// The page is the body band (text rows, `~` filler past the end), the mode
+/// line, and the `:`-strip. The whole text is laid out, the viewport follows
+/// the cursor ([`viewport::follow_cursor`]), and only the glyphs on rows inside
+/// the band are kept.
 pub fn build_editor_surface(
     active: Res<ActiveEditor>,
-    // Last-rendered `:`-line, so a strip change (typing, submit) rebuilds the
+    // The last-rendered chrome (`:`-line, mode line), so a change rebuilds the
     // glyphs even when the document text is unchanged.
-    mut last_cmdline: Local<Option<String>>,
+    mut last_chrome: Local<Option<String>>,
     mut surfaces: Query<
         (
             &mut BlockScene,
@@ -176,6 +211,7 @@ pub fn build_editor_surface(
             &ComputedNode,
             &mut OverlayCursorGeometry,
             &mut EditorSelectionGeometry,
+            &mut EditorViewport,
         ),
         With<EditorSurface>,
     >,
@@ -191,8 +227,15 @@ pub fn build_editor_surface(
     let Some(view) = active.session.as_ref() else {
         return;
     };
-    let Ok((mut scene, mut rtt, mut glyphs, computed, mut cursor_geom, mut selection_geom)) =
-        surfaces.single_mut()
+    let Ok((
+        mut scene,
+        mut rtt,
+        mut glyphs,
+        computed,
+        mut cursor_geom,
+        mut selection_geom,
+        mut viewport_state,
+    )) = surfaces.single_mut()
     else {
         return;
     };
@@ -211,28 +254,39 @@ pub fn build_editor_surface(
     let text = &view.state.text;
     let cursor_byte = char_to_byte(text, view.state.cursor as usize);
     let kind = mode_kind(view.state.mode.as_deref());
+    let (row, col) = viewport::cursor_row_col(text, view.state.cursor);
     // The bottom strip shows the in-progress `:`-line while typing, else a
-    // transient status/error message (vim E492) after a bad `:`-submit. The
-    // command line takes precedence — you're actively typing it.
+    // transient status/error message (vim E492) after a bad `:`-submit, else a
+    // local notice (a lost key batch). The command line takes precedence:
+    // you're actively typing it.
     let cmdline = view
         .state
         .command_line
         .as_ref()
         .or(view.state.message.as_ref())
+        .or(active.notice.as_ref())
         .cloned();
+    let (mode_left, mode_right) = viewport::mode_line_parts(
+        &view.path,
+        view.state.dirty,
+        view.state.mode.as_deref(),
+        row,
+        col,
+    );
+    let chrome = format!("{cmdline:?}\0{mode_left}\0{mode_right}");
 
     let size_changed =
         (rtt.built_width - width).abs() > 1.0 || (rtt.built_height - height).abs() > 1.0;
     let text_changed = scene.text != *text;
     let cursor_changed = cursor_geom.last_cursor_offset != cursor_byte;
     let kind_changed = cursor_geom.kind != kind;
-    let cmdline_changed = last_cmdline.as_ref() != cmdline.as_ref();
+    let chrome_changed = last_chrome.as_ref() != Some(&chrome);
     let selection_changed = selection_geom.last != view.state.selection;
     if !text_changed
         && !size_changed
         && !cursor_changed
         && !kind_changed
-        && !cmdline_changed
+        && !chrome_changed
         && !selection_changed
     {
         return;
@@ -241,42 +295,125 @@ pub fn build_editor_surface(
     // Light text on the dark page.
     let text_color = Color::srgb(0.90, 0.93, 0.98);
     let brush = bevy_color_to_brush(text_color);
+    let dim_brush = bevy_color_to_brush(Color::srgb(0.45, 0.50, 0.62));
     let content_width = (width - 2.0 * PAD).max(0.0);
     let style = VelloTextStyle {
-        brush,
+        brush: brush.clone(),
         font_size: text_metrics.cell_font_size,
         ..default()
     };
+    let dim_style = VelloTextStyle {
+        brush: dim_brush.clone(),
+        ..style.clone()
+    };
     let layout = font.layout(text, &style, VelloTextAlign::Left, Some(content_width));
 
-    let text_offset = (PAD as f64, TOP_MARGIN as f64);
+    // Page geometry, surface-space logical px: body band, then the mode line,
+    // then the `:`-strip.
+    let probe = font.layout("M", &style, VelloTextAlign::Left, None);
+    let probe_metrics = probe.lines().next().map(|l| *l.metrics());
+    let line_h = probe_metrics
+        .map(|m| m.line_height)
+        .filter(|h| *h > 0.0)
+        .unwrap_or(text_metrics.cell_font_size * 1.3);
+    // How far a row extends below its baseline: a row is whole inside the
+    // band only when its baseline clears the band's bottom by this much.
+    let below_baseline = probe_metrics
+        .map(|m| m.block_max_coord - m.baseline)
+        .filter(|d| *d >= 0.0)
+        .unwrap_or(line_h * 0.25);
+    let strip_y = height - CMDLINE_BOTTOM_MARGIN;
+    let mode_y = strip_y - line_h;
+    let body_bottom = (mode_y).max(TOP_MARGIN + line_h);
+    let body_h = body_bottom - TOP_MARGIN;
 
-    if text_changed || size_changed || cmdline_changed {
-        for line in layout.lines() {
-            for item in line.items() {
-                if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                    font_data_map.register(gr.run().font());
-                }
-            }
+    // Follow the cursor.
+    let cursor = parley::editing::Cursor::from_byte_index(
+        &layout,
+        cursor_byte,
+        parley::layout::Affinity::Upstream,
+    );
+    let geom = cursor.geometry(&layout, 2.0);
+    let spans: Vec<viewport::LineSpan> = layout
+        .lines()
+        .map(|l| {
+            let m = l.metrics();
+            (m.block_min_coord, m.block_max_coord)
+        })
+        .collect();
+    let scroll = viewport::follow_cursor(
+        viewport_state.scroll_y,
+        &spans,
+        ((geom.y0 + geom.y1) / 2.0) as f32,
+        body_h,
+    );
+    let scroll_changed = (scroll - viewport_state.scroll_y).abs() > 0.01;
+    viewport_state.scroll_y = scroll;
+
+    let text_offset = (PAD as f64, (TOP_MARGIN - scroll) as f64);
+
+    if text_changed || size_changed || chrome_changed || scroll_changed {
+        let mut g = Vec::new();
+        append_glyphs(&layout, &style.brush, text_offset, atlas, &mut font_data_map, &mut g);
+        // Keep the rows inside the body band: the page above it holds the HUD
+        // title, the page below it the mode line and strip.
+        g.retain(|glyph| {
+            viewport::baseline_in_body(glyph.y, TOP_MARGIN, body_bottom - below_baseline)
+        });
+
+        // vi's empty-line marker below the end, so "past the end" is never
+        // mistaken for a run of blank lines in the file.
+        let text_end = spans.last().map(|s| s.1).unwrap_or(0.0) + TOP_MARGIN - scroll;
+        let filler = viewport::filler_rows(text_end, body_bottom, line_h);
+        if filler > 0 {
+            let marks = vec!["~"; filler].join("\n");
+            let filler_layout =
+                font.layout(&marks, &dim_style, VelloTextAlign::Left, Some(content_width));
+            append_glyphs(
+                &filler_layout,
+                &dim_style.brush,
+                (PAD as f64, text_end as f64),
+                atlas,
+                &mut font_data_map,
+                &mut g,
+            );
         }
-        let mut g = collect_msdf_glyphs(&layout, &[], &style.brush, text_offset, atlas);
 
-        // The `:`-command strip (Slice 3): laid out with the same mono font and
-        // appended to the same glyph buffer near the page bottom — so the editor
-        // draws its command line read-only, no second surface, no mode tracking.
-        // Also carries the status/error message (vim E492) after a bad submit.
+        // The mode line: path left, mode and position right.
+        let left_layout =
+            font.layout(&mode_left, &dim_style, VelloTextAlign::Left, Some(content_width));
+        append_glyphs(
+            &left_layout,
+            &dim_style.brush,
+            (PAD as f64, mode_y as f64),
+            atlas,
+            &mut font_data_map,
+            &mut g,
+        );
+        let right_layout =
+            font.layout(&mode_right, &dim_style, VelloTextAlign::Right, Some(content_width));
+        append_glyphs(
+            &right_layout,
+            &dim_style.brush,
+            (PAD as f64, mode_y as f64),
+            atlas,
+            &mut font_data_map,
+            &mut g,
+        );
+
+        // The `:`-command strip: laid out with the same mono font and appended
+        // to the same glyph buffer, so the editor draws its command line
+        // read-only, no second surface, no mode tracking.
         if let Some(cl) = &cmdline {
             let strip_layout = font.layout(cl, &style, VelloTextAlign::Left, Some(content_width));
-            for line in strip_layout.lines() {
-                for item in line.items() {
-                    if let parley::PositionedLayoutItem::GlyphRun(gr) = item {
-                        font_data_map.register(gr.run().font());
-                    }
-                }
-            }
-            let strip_offset = (PAD as f64, (height - CMDLINE_BOTTOM_MARGIN) as f64);
-            let mut strip = collect_msdf_glyphs(&strip_layout, &[], &style.brush, strip_offset, atlas);
-            g.append(&mut strip);
+            append_glyphs(
+                &strip_layout,
+                &style.brush,
+                (PAD as f64, strip_y as f64),
+                atlas,
+                &mut font_data_map,
+                &mut g,
+            );
         }
 
         glyphs.glyphs = g;
@@ -288,26 +425,25 @@ pub fn build_editor_surface(
         scene.color = text_color;
         scene.content_version = scene.content_version.wrapping_add(1);
         scene.last_built_version = scene.content_version;
-        *last_cmdline = cmdline.clone();
+        *last_chrome = Some(chrome);
     }
 
-    // Selection rects, moved from layout space onto the surface.
+    // Selection rects, moved from layout space onto the surface and clipped to
+    // the body band.
     selection_geom.rects = match &view.state.selection {
-        Some(selection) => editor_selection_rects(&layout, text, selection, content_width)
-            .into_iter()
-            .map(|r| SelectionRect::new(r.x + PAD, r.y + TOP_MARGIN, r.width, r.height))
-            .collect(),
+        Some(selection) => viewport::clip_rects_to_band(
+            editor_selection_rects(&layout, text, selection, content_width)
+                .into_iter()
+                .map(|r| SelectionRect::new(r.x + PAD, r.y + TOP_MARGIN - scroll, r.width, r.height))
+                .collect(),
+            TOP_MARGIN,
+            body_bottom,
+        ),
         None => Vec::new(),
     };
     selection_geom.last = view.state.selection.clone();
 
     // Cursor geometry (pushed to the material by sync_editor_cursor).
-    let cursor = parley::editing::Cursor::from_byte_index(
-        &layout,
-        cursor_byte,
-        parley::layout::Affinity::Upstream,
-    );
-    let geom = cursor.geometry(&layout, 2.0);
     cursor_geom.x = text_offset.0 + geom.x0;
     cursor_geom.y = text_offset.1 + geom.y0;
     cursor_geom.height = geom.y1 - geom.y0;
@@ -419,6 +555,18 @@ mod tests {
         assert!(rects[2].right() < 400.0, "the tail stops at its last selected char");
     }
 
+    /// A tall block over equal-length rows is one rect, not one per row, so
+    /// it can never overflow the uniform.
+    #[test]
+    fn a_tall_blockwise_selection_merges_into_one_rect() {
+        let text = vec!["abcdef"; 100].join("\n");
+        let layout = laid_out(&text, None);
+        let spans: Vec<Range<usize>> = (0..100).map(|i| i * 7 + 1..i * 7 + 4).collect();
+        let rects = editor_selection_rects(&layout, &text, &selection(SelectionShape::Blockwise, spans), 400.0);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert!(rects[0].height > 100.0 * 10.0);
+    }
+
     #[test]
     fn a_blockwise_selection_keeps_one_rect_per_row() {
         let text = "abcd\nx\nefgh";
@@ -442,6 +590,10 @@ mod tests {
         let text = "a\n\nb";
         let layout = laid_out(text, None);
         let rects = editor_selection_rects(&layout, text, &selection(SelectionShape::Linewise, vec![2..3]), 400.0);
-        assert!(rects.iter().any(|r| r.is_visible()), "{rects:?}");
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert!(rects[0].is_visible() && rects[0].width > 0.0);
+        let row_h = rects[0].height;
+        // The row after "a\n" starts one line down, and the rect covers that line only.
+        assert!(rects[0].y > 0.5 * row_h && rects[0].bottom() < 2.5 * row_h, "{rects:?}");
     }
 }

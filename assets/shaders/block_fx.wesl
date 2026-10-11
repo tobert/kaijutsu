@@ -19,7 +19,7 @@
 //     label_inset_top/bottom: >0 moves border inward for fieldset/legend labels; 0=default (1px)
 //   border_insets    - [pad_top, pad_bottom, pad_left, pad_right] in pixels
 //   border_color     - RGBA color for border stroke (linear)
-//   selection_rects  - up to 16 UV-space [x, y, w, h] rects + a live count
+//   selection_rects  - up to 64 UV-space [x, y, w, h] rects + a live count
 //     One selection is many rects — see `shaders::selection` for why, and for
 //     the coalescing that keeps a contiguous selection down to three.
 
@@ -45,9 +45,9 @@ import bevy_render::globals::Globals;
 // whole middle rows, and a ragged last row. `count` is how many of `rects` are
 // live — the loop is bounded by it, not by the capacity, so the ordinary
 // one-to-three-rect selection costs three iterations.
-const MAX_SELECTION_RECTS: u32 = 16u;
+const MAX_SELECTION_RECTS: u32 = 64u;
 struct SelectionRects {
-    rects: array<vec4<f32>, 16>,
+    rects: array<vec4<f32>, 64>,
     count: u32,
 }
 @group(1) @binding(12) var<uniform> selection_rects: SelectionRects;
