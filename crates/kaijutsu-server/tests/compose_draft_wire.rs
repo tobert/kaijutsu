@@ -880,3 +880,67 @@ fn a_draft_submitted_during_a_turn_reaches_its_next_request_with_its_edge() {
         assert!(live_kernel.kernel.turns().active_count(context_id) == 0);
     });
 }
+
+/// A fork leaves the player's unsent draft with its parent. The child must
+/// hold no draft, its submit has nothing to send, and no request a model sees
+/// carries the parent's half-typed text. The parent keeps the draft.
+#[test]
+fn a_fork_never_carries_the_parents_unsent_draft() {
+    run_local(async {
+        use kaijutsu_kernel::llm::{MessageContent, MockClient, Provider, stream::StreamEvent};
+
+        const SECRET: &str = "half-typed-secret-do-not-send";
+        let (addr, live_kernel) = start_server_with_mock_llm_kernel_handle().await;
+        let done = StreamEvent::Done { stop_reason: Some("end_turn".into()), input_tokens: None, output_tokens: None, extra: None };
+        let (mock, sent) = MockClient::new("")
+            .with_scripted_stream(vec![vec![
+                StreamEvent::TextStart, StreamEvent::TextDelta("ok".into()), StreamEvent::TextEnd, done,
+            ]])
+            .recording_sent_messages();
+        live_kernel.kernel.llm().write().await.register("mock", std::sync::Arc::new(Provider::Mock(mock)));
+
+        let client = connect_client(addr).await;
+        let kernel = bind(&client).await;
+        let parent = open_context(&kernel, "draft-fork-parent").await;
+        live_kernel.documents.insert_block(parent, None, None, Role::User, BlockKind::Text,
+            "an earlier sent message", Status::Done, ContentType::Plain).unwrap();
+        kernel.edit_input(parent, 0, SECRET, 0).await.unwrap();
+
+        let forked = kernel.execute_kj(parent, &["fork".into(), "--name".into(), "draft-fork-child".into()])
+            .await.unwrap();
+        assert_eq!(forked.exit_code, 0, "fork failed: {}", forked.stderr);
+        let child = kernel.list_contexts().await.unwrap().into_iter()
+            .find(|row| row.label == "draft-fork-child").expect("forked child").id;
+
+        let child_blocks = blocks(&kernel, child).await;
+        assert!(child_blocks.iter().all(|b| b.status != Status::Draft), "child holds no draft: {child_blocks:#?}");
+        assert!(child_blocks.iter().all(|b| !b.content.contains(SECRET)), "child holds no draft text");
+        assert!(child_blocks.iter().any(|b| b.content == "an earlier sent message"), "history still forks");
+
+        let kept = draft(&kernel, parent).await.expect("the parent keeps its draft");
+        assert_eq!(kept.content, SECRET);
+
+        // The child's own submit has nothing of the parent's to send.
+        seed_turn_identity(&live_kernel, child);
+        kernel.join_context(child, "draft-test").await.unwrap();
+        assert!(kernel.submit_input(child, false).await.is_err(), "child has no draft to submit");
+        kernel.edit_input(child, 0, "fresh child prompt", 0).await.unwrap();
+        kernel.submit_input(child, false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !blocks(&kernel, child).await.iter().any(|b| b.content == "ok" && b.status == Status::Done) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the child's turn finishes");
+
+        let sent = sent.lock().clone();
+        assert!(!sent.is_empty(), "the child turn reached the model");
+        for request in &sent {
+            for message in request {
+                if let MessageContent::Text(text) = &message.content {
+                    assert!(!text.contains(SECRET), "the parent's draft reached a model: {text}");
+                }
+            }
+        }
+        assert!(draft(&kernel, parent).await.is_some_and(|d| d.content == SECRET), "parent draft untouched");
+    });
+}

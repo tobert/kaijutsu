@@ -422,6 +422,47 @@ operator and motion) closes the gap. Scrolls other than page and half page
   go to the first line; a settled window height would need a session-level
   size from the client.
 
+## Unsent drafts have no dead-letter record (2026-10-11)
+
+Forks leave a draft with the parent and log its metadata
+(`blocks/block_store.rs`, `leave_draft_behind`). No path keeps the text of a
+draft that is dropped or orphaned. Amy's question: log them, and keep a dead
+letter queue that no model can read. Where a draft's text goes today:
+
+| path | draft text |
+|---|---|
+| fork, `--compact`, filtered, preset | left in the parent; every draft in the fork universe logs metadata once |
+| `clear_draft` (`block_store.rs:2728`, RPC `rpc.rs:5830`) | deleted; returned to the caller only, not logged |
+| `consume_draft` (`block_store.rs:2583`) | deleted after an accepted shell submit; the text became a command block |
+| `submit_draft` refused (empty) | kept in place |
+| `kj context archive` (`kj/context.rs:2315`, `kernel_db.rs:4484`) | stays in the archived context's blocks; live again on `promote` |
+| `kj context rotate` (`kj/context.rs:2428`) | copies no blocks; stays in the archived predecessor |
+| `kj character retire` (`kernel_db.rs:8199`) | contexts archive; same as archive |
+| context switch / client restart | stays in the context's document |
+| kernel restart (`block_store.rs:3086`) | restored from the document snapshot, then the journaled ops replayed over it |
+| `kj stage exclude` (`kj/stage.rs:218`, matches drafts by key) | `excluded` set, text kept; hydration skips it anyway |
+| `delete_block` (`block_store.rs:2841`) | deleted. Callers: `kaish_backend.rs:532` (refuses drafts first) and the Error-child cleanup (`block_store.rs:3608`, error blocks only) |
+| whole-document delete (`BlockStore::delete_document`, `block_store.rs:809`) | in a persistent store a context document is refused (`kernel_db.rs:3816`), so a draft there survives. Reachable through VFS `remove` with `recursive` (`kaish_backend.rs:505-525`, `mount_backend.rs:1474`); `kj doc delete` refuses context documents (`kj/doc.rs:394`). Whether an ordinary player's shell reaches that VFS path is unchecked. A non-persistent store (tests) deletes it. |
+
+Open: where the dead letter lives (a `kernel.db` table or a CAS blob),
+which paths write it (`clear_draft`, fork, archive), and who may read it.
+Distillation (`drift.rs:1510`) and hydration (`llm/hydrate.rs:105`) already
+skip drafts.
+
+---
+
+## `kj fork` selects and copies from two reads (2026-10-11)
+
+`fork_full` resolves the selection from one block read
+(`kj/fork.rs:190-196`) and copies from a later one (`kj/fork.rs:531-534`)
+with no version check. A deletion between them, `clear_draft` included,
+shifts every later position, so the copy can keep the wrong blocks. The
+compact path rejects this by passing the source version to
+`fork_document_filtered_checked` (`block_store.rs:904`). Pass the version
+from the selection read through the full path too.
+
+---
+
 ## Context verbs read a lineage-root fault as "not the root" (2026-10-11)
 
 `kj/context.rs` checks review and egress authority with

@@ -783,7 +783,7 @@ impl KjDispatcher {
         // re-marks downstream.
         let mut notes: Vec<String> = Vec::new();
         if parent_policy.is_some() && !policy_travels {
-            notes.push("hydration policy not carried (marker fell outside the selection)".to_string());
+            notes.push("hydration policy not carried (marker fell outside the selection or was an unsent draft)".to_string());
         }
         if closed_at_fork > 0 {
             notes.push(format!(

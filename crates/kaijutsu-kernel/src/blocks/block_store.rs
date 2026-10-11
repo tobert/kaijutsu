@@ -36,6 +36,9 @@ pub struct ForkBlockFilter {
     /// excludes above still apply on top. Positions are resolved upstream
     /// (preset + CLI ranges + include-invariant check), so applying it here is
     /// infallible.
+    ///
+    /// Whatever the filter says, a fork never copies an unsent draft
+    /// (`Status::Draft`): it stays with the parent and is logged.
     pub selection: Option<IntervalSet>,
 }
 
@@ -1443,7 +1446,7 @@ impl BlockDocument {
     /// [`kaijutsu_types::BlockSnapshot::edge_block`]) into the child context.
     /// `edge_target_copied` says whether the block `edge_block` names was
     /// itself copied into the fork. When it was not — excluded by a filter,
-    /// excluded by the version cutoff, deleted, or naming a block that was
+    /// excluded by the version cutoff, deleted, left behind as a draft, or naming a block that was
     /// never in the parent at all (the kernel does not validate
     /// `edge_block`) — the edge is cleared rather than carried forward
     /// pointing at nothing in the new context, and `edge_shown` is cleared
@@ -1463,125 +1466,43 @@ impl BlockDocument {
         }
     }
 
+    /// True when `block` is a player's unsent draft, which a fork leaves with
+    /// its parent. An incomplete prompt must never reach a context a model
+    /// reads. Logs one line per draft left behind: ids, principal, length and
+    /// a short content hash, never the text.
+    fn leave_draft_behind(&self, new_context_id: ContextId, block: &BlockContent) -> bool {
+        if block.header().status != Status::Draft {
+            return false;
+        }
+        use sha2::{Digest, Sha256};
+        let text = block.text();
+        let digest = Sha256::digest(text.as_bytes());
+        let hash: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+        let id = block.header().id;
+        tracing::warn!(
+            parent_context = %self.context_id,
+            child_context = %new_context_id,
+            principal = %id.principal_id,
+            block_id = %id.to_key(),
+            chars = text.chars().count(),
+            content_hash = %hash,
+            "fork left an unsent draft with its parent"
+        );
+        true
+    }
+
     /// Fork the store, creating a copy with a new context ID.
     ///
     /// Each block gets a fresh copy of its current text. This is
     /// intentional: forks are isolated explorations. Content that "merges
     /// back" travels via drift blocks, never a text merge.
     pub fn fork(&self, new_context_id: ContextId, new_principal_id: PrincipalId) -> Self {
-        let mut forked = Self::new(new_context_id, new_principal_id);
-
-        for block in self.blocks.values() {
-            if block.is_deleted() {
-                continue;
-            }
-            let snap = block.snapshot();
-
-            // Remap IDs: only context_id changes
-            let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
-            let new_parent_id = snap
-                .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
-            let new_tool_call_id = snap
-                .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
-            let edge_target_copied = snap
-                .edge_block
-                .is_some_and(|id| self.blocks.get(&id).is_some_and(|b| !b.is_deleted()));
-            let (new_edge_block, new_edge_shown) =
-                Self::remap_edge(snap.edge_block, snap.edge_shown, new_context_id, edge_target_copied);
-
-            // Seed the forked store's seq lane for EVERY copied block's principal
-            // (not just the fork principal) and advance next_tick past the copied
-            // tick. Chameleon rotation is a shallow fork with a hard tick-
-            // continuity invariant — without all-principal lane + tick seeding,
-            // a rotated head re-mints duplicate low ids/ticks (design §2.4).
-            forked.observe_seq(snap.id.principal_id, snap.id.seq);
-            if let Some(t) = snap.tick {
-                forked.next_tick = forked.next_tick.max(t.get() + 1);
-            }
-
-            let mut remapped = snap;
-            remapped.id = new_id;
-            remapped.parent_id = new_parent_id;
-            remapped.tool_call_id = new_tool_call_id;
-            remapped.edge_block = new_edge_block;
-            remapped.edge_shown = new_edge_shown;
-
-            let order_key = block.order_key().to_string();
-            let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
-            forked.blocks.insert(new_id, content);
-        }
-
-        forked.version = 1;
-        forked
-    }
-
-    /// Fork the store, excluding blocks with `created_at` after `before_timestamp` (wall-clock millis).
-    ///
-    /// Preserves original authorship — see [`fork`] for details.
-    pub fn fork_at_version(
-        &self,
-        new_context_id: ContextId,
-        new_principal_id: PrincipalId,
-        before_timestamp: u64,
-    ) -> Self {
-        let mut forked = Self::new(new_context_id, new_principal_id);
-
-        for block in self.blocks.values() {
-            if block.is_deleted() {
-                continue;
-            }
-            if block.header().created_at > before_timestamp {
-                continue;
-            }
-            let snap = block.snapshot();
-
-            // Remap IDs: only context_id changes
-            let new_id = BlockId::new(new_context_id, snap.id.principal_id, snap.id.seq);
-            let new_parent_id = snap
-                .parent_id
-                .map(|pid| BlockId::new(new_context_id, pid.principal_id, pid.seq));
-            let new_tool_call_id = snap
-                .tool_call_id
-                .map(|tcid| BlockId::new(new_context_id, tcid.principal_id, tcid.seq));
-            let edge_target_copied = snap.edge_block.is_some_and(|id| {
-                self.blocks
-                    .get(&id)
-                    .is_some_and(|b| !b.is_deleted() && b.header().created_at <= before_timestamp)
-            });
-            let (new_edge_block, new_edge_shown) =
-                Self::remap_edge(snap.edge_block, snap.edge_shown, new_context_id, edge_target_copied);
-
-            // Seed the forked store's seq lane for EVERY copied block's principal
-            // (not just the fork principal) and advance next_tick past the copied
-            // tick. Chameleon rotation is a shallow fork with a hard tick-
-            // continuity invariant — without all-principal lane + tick seeding,
-            // a rotated head re-mints duplicate low ids/ticks (design §2.4).
-            forked.observe_seq(snap.id.principal_id, snap.id.seq);
-            if let Some(t) = snap.tick {
-                forked.next_tick = forked.next_tick.max(t.get() + 1);
-            }
-
-            let mut remapped = snap;
-            remapped.id = new_id;
-            remapped.parent_id = new_parent_id;
-            remapped.tool_call_id = new_tool_call_id;
-            remapped.edge_block = new_edge_block;
-            remapped.edge_shown = new_edge_shown;
-
-            let order_key = block.order_key().to_string();
-            let content = BlockContent::from_snapshot(&remapped, new_principal_id, order_key);
-            forked.blocks.insert(new_id, content);
-        }
-
-        forked.version = 1;
-        forked
+        self.fork_filtered(new_context_id, new_principal_id, u64::MAX, &ForkBlockFilter::default())
     }
 
     /// Fork the store with block filtering, excluding blocks with `created_at` after `before_timestamp` (wall-clock millis).
     ///
-    /// Like [`fork_at_version`] but additionally filters blocks via `BlockFilter`.
+    /// Excludes blocks created after `before_timestamp` and filters via `ForkBlockFilter`.
     /// Blocks that don't pass the filter (positional `selection` and/or the
     /// predicate excludes) are left out of the fork.
     pub fn fork_filtered(
@@ -1610,6 +1531,13 @@ impl BlockDocument {
         // (kind/role/id). Both are subtractions and compose.
         let mut passing: Vec<(&BlockContent, BlockSnapshot)> = Vec::new();
         for (pos, (_id, block)) in universe.iter().enumerate() {
+            // Checked before the selection and predicate so every draft in the
+            // universe logs once, whatever else would have dropped it. `pos`
+            // is the universe index either way, so interval positions still
+            // address the same log the caller resolved them against.
+            if self.leave_draft_behind(new_context_id, block) {
+                continue;
+            }
             if let Some(sel) = &filter.selection
                 && !sel.contains_position(pos)
             {
@@ -3357,6 +3285,182 @@ mod tests {
     // fork_filtered tests
     // =====================================================================
 
+    /// A store holding one sent message and one unsent draft.
+    fn store_with_unsent_draft() -> (BlockDocument, BlockId) {
+        let mut store = test_store();
+        let sent = store
+            .insert_block(
+                None, None, Role::User, BlockKind::Text,
+                "sent message", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        let draft = store
+            .insert_block(
+                Some(&sent), Some(&sent), Role::User, BlockKind::Text,
+                "half-typed prompt", Status::Draft, ContentType::Plain,
+            )
+            .unwrap();
+        (store, draft)
+    }
+
+    fn assert_fork_dropped_draft(parent: &BlockDocument, draft: &BlockId, forked: &BlockDocument) {
+        assert!(
+            forked.blocks_ordered().iter().all(|b| b.status != Status::Draft),
+            "a fork must never carry a player's unsent draft"
+        );
+        assert!(
+            forked.blocks_ordered().iter().all(|b| !b.content.contains("half-typed")),
+            "the draft text must not appear in the child"
+        );
+        assert_eq!(forked.block_count(), 1, "the sent message still forks");
+        let kept = parent.get_block_snapshot(draft).expect("parent keeps its draft");
+        assert_eq!(kept.status, Status::Draft);
+        assert_eq!(kept.content, "half-typed prompt");
+    }
+
+    #[test]
+    fn fork_drops_unsent_draft_and_parent_keeps_it() {
+        let (store, draft) = store_with_unsent_draft();
+        let forked = store.fork(ContextId::new(), PrincipalId::new());
+        assert_fork_dropped_draft(&store, &draft, &forked);
+    }
+
+    /// Capture the `warn` lines a closure emits.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_dropped_draft_logs_ids_length_and_hash_but_not_text() {
+        let (store, draft) = store_with_unsent_draft();
+        let child = ContextId::new();
+        let logs = capture_logs(|| {
+            store.fork(child, PrincipalId::new());
+        });
+        assert_eq!(logs.lines().count(), 1, "one line per dropped draft: {logs}");
+        assert!(logs.contains("fork left an unsent draft with its parent"), "{logs}");
+        for needle in [
+            format!("parent_context={}", store.context_id()),
+            format!("child_context={child}"),
+            format!("principal={}", draft.principal_id),
+            format!("block_id={}", draft.to_key()),
+            "chars=17".to_string(),
+            "content_hash=".to_string(),
+        ] {
+            assert!(logs.contains(&needle), "missing {needle} in {logs}");
+        }
+        assert!(!logs.contains("half-typed"), "the text must not be logged: {logs}");
+    }
+
+    #[test]
+    fn a_draft_the_selection_or_predicate_already_excludes_still_logs_once() {
+        let (store, _draft) = store_with_unsent_draft();
+        // Position 0 is the sent message; the selection leaves the draft out.
+        let by_selection = ForkBlockFilter {
+            selection: Some(IntervalSet::from_ranges([0..1])),
+            ..Default::default()
+        };
+        // The predicate drops every user block, the draft included.
+        let by_predicate = ForkBlockFilter {
+            exclude_roles: ["User".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        for filter in [by_selection, by_predicate] {
+            let logs = capture_logs(|| {
+                store.fork_filtered(ContextId::new(), PrincipalId::new(), u64::MAX, &filter);
+            });
+            assert_eq!(logs.lines().count(), 1, "{logs}");
+        }
+    }
+
+    #[test]
+    fn dropping_a_draft_does_not_shift_selection_positions() {
+        let mut store = test_store();
+        let mut last = None;
+        for (text, status) in [
+            ("a", Status::Done), ("b", Status::Done), ("half-typed", Status::Draft), ("c", Status::Done),
+        ] {
+            let id = store
+                .insert_block(last.as_ref(), last.as_ref(), Role::User, BlockKind::Text, text, status, ContentType::Plain)
+                .unwrap();
+            last = Some(id);
+        }
+        // Position 3 is "c" in the parent's log, draft included.
+        let filter = ForkBlockFilter {
+            selection: Some(IntervalSet::from_ranges([3..4])),
+            ..Default::default()
+        };
+        let forked = store.fork_filtered(ContextId::new(), PrincipalId::new(), u64::MAX, &filter);
+        let texts: Vec<_> = forked.blocks_ordered().into_iter().map(|b| b.content).collect();
+        assert_eq!(texts, vec!["c".to_string()]);
+    }
+
+    /// A sent message that names a draft as parent and edge target.
+    fn store_with_links_to_a_draft() -> (BlockDocument, BlockId) {
+        let (mut store, draft) = store_with_unsent_draft();
+        let linked = store
+            .insert_block(
+                Some(&draft), Some(&draft), Role::Model, BlockKind::Text,
+                "linked", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        store
+            .set_edge(&linked, Some(InputEdge { block: draft, shown: Some(3) }))
+            .unwrap();
+        (store, linked)
+    }
+
+    fn assert_links_cleared(forked: &BlockDocument, linked: &BlockId) {
+        let copy = forked
+            .get_block_snapshot(&BlockId::new(forked.context_id(), linked.principal_id, linked.seq))
+            .expect("the linked block forks");
+        assert_eq!(copy.parent_id, None, "parent link to a dropped draft is cleared");
+        assert_eq!(copy.edge_block, None, "edge to a dropped draft is cleared");
+        assert_eq!(copy.edge_shown, None);
+    }
+
+    #[test]
+    fn fork_clears_links_to_a_dropped_draft() {
+        let (store, linked) = store_with_links_to_a_draft();
+        assert_links_cleared(&store.fork(ContextId::new(), PrincipalId::new()), &linked);
+    }
+
+    #[test]
+    fn fork_filtered_clears_links_to_a_dropped_draft() {
+        let (store, linked) = store_with_links_to_a_draft();
+        let forked = store.fork_filtered(
+            ContextId::new(), PrincipalId::new(), u64::MAX, &ForkBlockFilter::default(),
+        );
+        assert_links_cleared(&forked, &linked);
+    }
+
+    #[test]
+    fn fork_filtered_drops_unsent_draft() {
+        let (store, draft) = store_with_unsent_draft();
+        let forked = store.fork_filtered(
+            ContextId::new(), PrincipalId::new(), u64::MAX, &ForkBlockFilter::default(),
+        );
+        assert_fork_dropped_draft(&store, &draft, &forked);
+    }
+
     #[test]
     fn test_fork_filtered_empty_filter_includes_all() {
         let mut store = test_store();
@@ -3980,116 +4084,8 @@ mod tests {
     }
 
     // =====================================================================
-    // fork_at_version / fork_filtered timestamp semantics
+    // fork_filtered timestamp semantics
     // =====================================================================
-
-    #[test]
-    fn test_fork_at_version_uses_wall_clock_timestamp() {
-        // Create blocks with explicit wall-clock timestamps to verify
-        // fork_at_version filters by created_at (millis), not by version counter.
-        let ctx = ContextId::new();
-        let agent = PrincipalId::new();
-        let mut store = BlockDocument::new(ctx, agent);
-
-        // Insert 3 blocks with distinct created_at timestamps.
-        // We construct BlockContent directly so we can control created_at.
-        let ts_early = 1_000_000u64; // 1 second after epoch
-        let ts_mid = 2_000_000u64; // 2 seconds
-        let ts_late = 3_000_000u64; // 3 seconds
-
-        let id1 = store.new_block_id();
-        let h1 = BlockHeader {
-            id: id1,
-            parent_id: None,
-            role: Role::User,
-            kind: BlockKind::Text,
-            status: Status::Done,
-            collapsed: false,
-            ephemeral: false,
-            excluded: false,
-            created_at: ts_early,
-            updated_at: 0,
-            tool_kind: None,
-            exit_code: None,
-            is_error: false,
-            content_type: ContentType::Plain,
-            task_status: TaskStatus::default(),
-        };
-        let b1 = BlockContent::with_content(h1, "early", agent, "V".to_string(), None);
-        store.blocks.insert(id1, b1);
-        store.version += 1;
-
-        let id2 = store.new_block_id();
-        let h2 = BlockHeader {
-            id: id2,
-            parent_id: Some(id1),
-            role: Role::Model,
-            kind: BlockKind::Text,
-            status: Status::Done,
-            collapsed: false,
-            ephemeral: false,
-            excluded: false,
-            created_at: ts_mid,
-            updated_at: 0,
-            tool_kind: None,
-            exit_code: None,
-            is_error: false,
-            content_type: ContentType::Plain,
-            task_status: TaskStatus::default(),
-        };
-        let b2 = BlockContent::with_content(h2, "mid", agent, "W".to_string(), None);
-        store.blocks.insert(id2, b2);
-        store.version += 1;
-
-        let id3 = store.new_block_id();
-        let h3 = BlockHeader {
-            id: id3,
-            parent_id: Some(id2),
-            role: Role::User,
-            kind: BlockKind::Text,
-            status: Status::Done,
-            collapsed: false,
-            ephemeral: false,
-            excluded: false,
-            created_at: ts_late,
-            updated_at: 0,
-            tool_kind: None,
-            exit_code: None,
-            is_error: false,
-            content_type: ContentType::Plain,
-            task_status: TaskStatus::default(),
-        };
-        let b3 = BlockContent::with_content(h3, "late", agent, "X".to_string(), None);
-        store.blocks.insert(id3, b3);
-        store.version += 1;
-
-        assert_eq!(store.block_count(), 3);
-        assert_eq!(store.version(), 3);
-
-        // Fork at a timestamp between ts_mid and ts_late.
-        // Should include "early" and "mid", exclude "late".
-        let cutoff = 2_500_000u64;
-        let new_ctx = ContextId::new();
-        let new_agent = PrincipalId::new();
-        let forked = store.fork_at_version(new_ctx, new_agent, cutoff);
-
-        assert_eq!(
-            forked.block_count(),
-            2,
-            "Fork at timestamp {} should include 2 blocks (created_at {} and {}), not block with created_at {}",
-            cutoff,
-            ts_early,
-            ts_mid,
-            ts_late
-        );
-
-        // Verify the correct blocks are present by checking content
-        let snaps: Vec<BlockSnapshot> = forked.blocks_ordered();
-        let contents: Vec<&str> = snaps.iter().map(|s| s.content.as_str()).collect();
-        assert!(contents.contains(&"early"), "Should include early block");
-        assert!(contents.contains(&"mid"), "Should include mid block");
-        assert!(!contents.contains(&"late"), "Should NOT include late block");
-    }
 
     #[test]
     fn test_fork_filtered_uses_wall_clock_timestamp() {
@@ -4489,7 +4485,7 @@ mod tests {
     }
 
     /// T4 — fork variants seed tick + seq lanes. Parameterized over fork /
-    /// fork_at_version / fork_filtered. Fails today (Self::new + own-principal
+    /// fork_filtered. Fails today (Self::new + own-principal
     /// guards). The rotation-critical graft (design §2.4, §3). ("Seq lanes" =
     /// per-principal id counters; "lane" the track concept is unrelated.)
     #[test]
@@ -4497,11 +4493,10 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Variant {
             Fork,
-            AtVersion,
             Filtered,
         }
 
-        for variant in [Variant::Fork, Variant::AtVersion, Variant::Filtered] {
+        for variant in [Variant::Fork, Variant::Filtered] {
             let ctx = ContextId::new();
             let prin = PrincipalId::new();
             let other = PrincipalId::new(); // P != fork principal
@@ -4519,7 +4514,6 @@ mod tests {
             let fork_prin = PrincipalId::new();
             let forked = match variant {
                 Variant::Fork => store.fork(new_ctx, fork_prin),
-                Variant::AtVersion => store.fork_at_version(new_ctx, fork_prin, u64::MAX),
                 Variant::Filtered => {
                     store.fork_filtered(new_ctx, fork_prin, u64::MAX, &ForkBlockFilter::default())
                 }

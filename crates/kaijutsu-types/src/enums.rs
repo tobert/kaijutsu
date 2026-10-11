@@ -18,7 +18,8 @@ use strum::EnumString;
 #[serde(rename_all = "lowercase")]
 #[strum(ascii_case_insensitive)]
 pub enum ForkKind {
-    /// Full deep copy of parent state.
+    /// Deep copy of the parent's blocks, except unsent drafts, which stay
+    /// with the parent.
     #[default]
     Full,
     /// Selection-driven fork — a subset of the parent's blocks chosen by an

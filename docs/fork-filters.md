@@ -42,6 +42,19 @@ mechanism but rejects `--include`, `--exclude`, and `--preset`; see
 `docs/prompts.md`, "Compact forks". A filtered copy preserves a block parent
 or tool-call link only when its referenced block survives the selection.
 
+Every fork shape leaves a player's unsent draft with the parent: the copy
+skips `Status::Draft` blocks whatever the selection, predicate, or
+`--include` says. The check runs before the selection, so each draft in the
+fork universe logs once even when a range already excluded it, and interval
+positions still index the same log (the universe index counts drafts). The
+include invariant above does not apply to drafts: an `--include` range that
+covers a draft drops it and logs. Links to a dropped draft (`parent_id`,
+`tool_call_id`, `edge_block`) are cleared in the child, as for any block the
+selection leaves out. The child starts with no draft; the parent keeps its
+own. Each draft left behind logs one `warn` line with the parent and child
+contexts, principal, block id, character count, and a short content hash;
+the text is never logged.
+
 ## The primitive
 
 A fork-time **interval selection** over the order-key-sorted, non-deleted

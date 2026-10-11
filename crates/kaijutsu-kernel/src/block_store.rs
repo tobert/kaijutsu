@@ -870,71 +870,9 @@ impl BlockStore {
         self.publish_fork(new_id, entry)
     }
 
-    /// Fork a document at a specific timestamp, creating a copy with only blocks up to that time.
-    ///
-    /// This creates a new document containing only blocks with `created_at <= before_timestamp`,
-    /// useful for timeline branching and "what if" explorations.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_id` - ID of the document to fork
-    /// * `new_id` - ID for the forked document
-    /// * `before_timestamp` - Only include blocks with `created_at` <= this value (wall-clock millis)
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success, Err if source not found, target exists, or timestamp in the future.
-    pub fn fork_document_at_version(
-        &self,
-        source_id: ContextId,
-        new_id: ContextId,
-        before_timestamp: u64,
-    ) -> BlockStoreResult<()> {
-        if self.documents.contains_key(&new_id) {
-            return Err(BlockStoreError::DocumentAlreadyExists(new_id));
-        }
-
-        let source_entry = self
-            .get(source_id)
-            .ok_or(BlockStoreError::DocumentNotFound(source_id))?;
-
-        // Validate timestamp is not in the future
-        let now = kaijutsu_types::now_millis();
-        if before_timestamp > now {
-            return Err(BlockStoreError::Validation(format!(
-                "Requested timestamp {} is in the future (now: {})",
-                before_timestamp, now
-            )));
-        }
-
-        let principal_id = self.principal_id();
-        let forked_store = source_entry
-            .doc
-            .fork_at_version(new_id, principal_id, before_timestamp);
-        let kind = source_entry.kind;
-        let language = source_entry.language.clone();
-        drop(source_entry); // Release the read lock
-
-        let version = forked_store.version();
-        let entry = DocumentEntry {
-            doc: forked_store,
-            poisoned: false,
-            kind,
-            language,
-            version: AtomicU64::new(version),
-            last_agent: RwLock::new(principal_id),
-            sync_generation: AtomicU64::new(0),
-            next_journal_seq: AtomicU64::new(0),
-            uncompacted_count: AtomicU64::new(0),
-            uncompacted_bytes: AtomicU64::new(0),
-            activity_stamped_at: AtomicI64::new(0),
-        };
-        self.publish_fork(new_id, entry)
-    }
-
     /// Fork a document at a specific timestamp with block filtering.
     ///
-    /// Like [`fork_document_at_version`] but additionally filters blocks via `ForkBlockFilter`.
+    /// Keeps only blocks created at or before `before_timestamp`, filtered via `ForkBlockFilter`.
     /// Blocks that don't pass the filter are excluded from the fork.
     pub fn fork_document_filtered(
         &self,
