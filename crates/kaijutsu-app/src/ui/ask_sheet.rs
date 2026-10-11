@@ -1156,7 +1156,7 @@ pub fn render_ask_sheet(
     session: Res<crate::cell::SessionPrincipal>,
     theme: Res<Theme>,
     time: Res<Time>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    viewport: Res<panel::LayoutViewport>,
     mut fonts: crate::ui::msdf_panel::PanelFonts,
     mut surface: Query<(&mut MsdfBlockGlyphs, &mut UiRttTexture, &mut Node), With<AskSheetSurface>>,
     mut container: Query<&mut Node, (With<AskSheetPanel>, Without<AskSheetSurface>)>,
@@ -1169,16 +1169,18 @@ pub fn render_ask_sheet(
     // The waiting age is the only thing that moves on its own, and it moves
     // at second resolution at best.
     let stale = now_secs - *last_build >= 1.0;
-    if !state.is_changed() && !mirror.is_changed() && !theme.is_changed() && !stale {
+    if !state.is_changed()
+        && !mirror.is_changed()
+        && !theme.is_changed()
+        && !viewport.is_changed()
+        && !stale
+    {
         return;
     }
     let Some(ask) = mirror.record(&showing) else {
         return;
     };
     let gap = mirror.record_gap(&showing);
-    let Ok(window) = windows.single() else {
-        return;
-    };
     let Ok((mut glyphs_out, mut rtt, mut node)) = surface.single_mut() else {
         return;
     };
@@ -1190,8 +1192,8 @@ pub fn render_ask_sheet(
     };
     *last_build = now_secs;
 
-    let width = panel::panel_width(window.width()) as f64;
-    let max_height = (window.height() * panel::PANEL_MAX_HEIGHT_FRACTION) as f64;
+    let width = panel::panel_width(viewport.size.x) as f64;
+    let max_height = (viewport.size.y * panel::PANEL_MAX_HEIGHT_FRACTION) as f64;
     let cols = columns(width, measure_char_width(font));
     let rows = rows_for_height(max_height);
 
@@ -1217,7 +1219,7 @@ pub fn render_ask_sheet(
     node.width = Val::Px(width as f32);
     node.height = Val::Px(height as f32);
     if let Ok(mut outer) = container.single_mut() {
-        outer.left = Val::Px(panel::panel_left(window.width()));
+        outer.left = Val::Px(panel::panel_left(viewport.size.x));
         outer.width = Val::Px(width as f32);
     }
 }
@@ -1227,27 +1229,23 @@ pub fn render_ask_sheet(
 pub fn clamp_ask_sheet_scroll(
     mirror: Res<LedgerMirror>,
     session: Res<crate::cell::SessionPrincipal>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    viewport: Res<panel::LayoutViewport>,
     fonts: Res<Assets<crate::text::shaping::VelloFont>>,
     handles: Res<crate::text::ShapingFonts>,
     mut state: ResMut<AskSheetState>,
 ) {
-    if !state.is_changed() || state.scroll == 0 {
+    if !(state.is_changed() || viewport.is_changed()) || state.scroll == 0 {
         return;
     }
     let Some(showing) = state.showing.clone() else {
         return;
     };
-    let (Some(ask), Ok(window), Some(font)) = (
-        mirror.record(&showing),
-        windows.single(),
-        fonts.get(&handles.mono),
-    ) else {
+    let (Some(ask), Some(font)) = (mirror.record(&showing), fonts.get(&handles.mono)) else {
         return;
     };
-    let width = panel::panel_width(window.width()) as f64;
+    let width = panel::panel_width(viewport.size.x) as f64;
     let cols = columns(width, measure_char_width(font));
-    let rows = rows_for_height((window.height() * panel::PANEL_MAX_HEIGHT_FRACTION) as f64);
+    let rows = rows_for_height((viewport.size.y * panel::PANEL_MAX_HEIGHT_FRACTION) as f64);
     let limit = sheet_max_scroll(
         &ask,
         mirror.record_gap(&showing).as_deref(),

@@ -382,6 +382,23 @@ operator's address, not the identity hashes that were dropped on
 bumps need a council port to a chat backend, and whether a flavor also
 differs by rubric.
 
+## VR prep: layout viewport follow-ups (2026-10-10)
+
+Found while adding `LayoutViewport` (`ui/msdf_panel.rs`); the viewport itself
+shipped, these did not.
+
+- **DPI readers still query the window.** `ScrollInput::scale_factor`
+  (`input/dispatch.rs`) and `sync_text_metrics_from_window` (`text/plugin.rs`)
+  read `PrimaryWindow` for scale factor. Step 2 of VR prep moves them onto the
+  same resource source.
+- **Ask-sheet clamp can miss a resize.** `clamp_ask_sheet_scroll` gates on
+  `state` or `viewport` changes only, with no 1-second stale tick. If its
+  font or record is not loaded on the resize frame, the flag is consumed and
+  the stored scroll stays past the new limit until the next state change.
+  Pre-existing gate hole; the drawn window is still clamped by `scroll_window`.
+- **Viewport is only `Res`-checked.** A missing viewport is a loud Bevy panic
+  at system run; no test covers the message, only the window case.
+
 ## Dead test helpers in `mcp/servers/file.rs` (2026-10-08)
 
 `cargo check -p kaijutsu-kernel --tests` warns that `broker_with_vfs_file`

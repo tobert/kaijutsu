@@ -289,6 +289,7 @@ fn main() {
         // it. Both read `LedgerMirror` and send their decisions through it, so they
         // must come after LedgerMirrorPlugin; the dock's hints line reads
         // `AskNotice`, which AskSheetPlugin owns.
+        .add_plugins(ui::msdf_panel::LayoutViewportPlugin)
         .add_plugins(ui::ask_sheet::AskSheetPlugin)
         .add_plugins(ui::ledger_ribbon::LedgerRibbonPlugin)
         // Drift state - context list + staged queue polling

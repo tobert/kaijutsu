@@ -67,6 +67,66 @@ pub const PANEL_BG_ALPHA: f32 = 1.0;
 pub const ELLIPSIS: char = '\u{2026}';
 
 // ============================================================================
+// LAYOUT VIEWPORT
+// ============================================================================
+
+/// The logical size of the frame the centered panels lay out in.
+///
+/// Panels take their width and height from here, not from a `Window`, so a
+/// frame that is not a window (a VR view later) can supply its own size. The
+/// size is logical pixels, the unit the geometry helpers use.
+///
+/// There is no default size. [`sync_layout_viewport`] inserts the resource
+/// from the primary window on its first run, and fails loudly when there is
+/// no primary window to read.
+///
+/// Consumers gate their rebuilds on `is_changed()`. A real size change sets
+/// it, and so does the first insert.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct LayoutViewport {
+    pub size: Vec2,
+}
+
+/// Copy the primary window's logical size into [`LayoutViewport`].
+///
+/// Writes only when the size differs, so the resource's change flag means a
+/// real resize and not one frame of polling.
+///
+/// # Panics
+///
+/// Panics when there is not exactly one primary window. Layout without a
+/// frame to lay out in is a broken app, and a guessed size would hide that.
+pub fn sync_layout_viewport(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    viewport: Option<ResMut<LayoutViewport>>,
+    mut commands: Commands,
+) {
+    let window = windows
+        .single()
+        .expect("LayoutViewport needs exactly one PrimaryWindow");
+    let size = Vec2::new(window.width(), window.height());
+    match viewport {
+        Some(mut viewport) => {
+            if viewport.size != size {
+                viewport.size = size;
+            }
+        }
+        None => commands.insert_resource(LayoutViewport { size }),
+    }
+}
+
+/// Keeps [`LayoutViewport`] in step with the primary window. Runs in
+/// `PreUpdate`, so every `Update` and `PostUpdate` consumer sees the size of
+/// the frame it is laying out.
+pub struct LayoutViewportPlugin;
+
+impl Plugin for LayoutViewportPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(PreUpdate, sync_layout_viewport);
+    }
+}
+
+// ============================================================================
 // GEOMETRY (pure)
 // ============================================================================
 
@@ -313,6 +373,102 @@ mod tests {
             text: text.to_string(),
             tone: LineTone::Row,
         }
+    }
+
+    // ── layout viewport ───────────────────────────────────────────────────
+
+    fn viewport_app(width: u32, height: u32) -> App {
+        let mut app = App::new();
+        app.add_plugins(LayoutViewportPlugin);
+        app.world_mut().spawn((
+            Window {
+                resolution: (width, height).into(),
+                ..default()
+            },
+            bevy::window::PrimaryWindow,
+        ));
+        app
+    }
+
+    fn resize(app: &mut App, width: f32, height: f32) {
+        let mut q = app
+            .world_mut()
+            .query_filtered::<&mut Window, With<bevy::window::PrimaryWindow>>();
+        q.single_mut(app.world_mut())
+            .unwrap()
+            .resolution
+            .set(width, height);
+    }
+
+    /// The viewport is the primary window's logical size, not its physical
+    /// one. The panel helpers take logical pixels, so a HiDPI window must
+    /// report the logical size.
+    #[test]
+    fn layout_viewport_is_the_logical_size_of_the_primary_window() {
+        let mut app = viewport_app(1280, 720);
+        // A 2x display: 2560x1440 physical pixels is 1280x720 logical.
+        {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&mut Window, With<bevy::window::PrimaryWindow>>();
+            let mut window = q.single_mut(app.world_mut()).unwrap();
+            window.resolution.set_scale_factor_override(Some(2.0));
+            window.resolution.set_physical_resolution(2560, 1440);
+        }
+        app.update();
+        let window = app
+            .world_mut()
+            .query_filtered::<&Window, With<bevy::window::PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        assert_eq!(window.physical_width(), 2560, "precondition: HiDPI window");
+        let vp = app.world().resource::<LayoutViewport>();
+        assert_eq!(vp.size, Vec2::new(1280.0, 720.0));
+    }
+
+    #[test]
+    fn layout_viewport_follows_a_resize() {
+        let mut app = viewport_app(1280, 720);
+        app.update();
+        resize(&mut app, 2400.0, 1000.0);
+        app.update();
+        let vp = app.world().resource::<LayoutViewport>();
+        assert_eq!(vp.size, Vec2::new(2400.0, 1000.0));
+    }
+
+    /// Consumers gate their rebuilds on `is_changed()`. The first insert and
+    /// each real resize must set it. An unchanged window must not.
+    #[test]
+    fn layout_viewport_is_marked_changed_by_insert_and_resize_only() {
+        #[derive(Resource, Default)]
+        struct Seen(Vec<bool>);
+        fn record(vp: Res<LayoutViewport>, mut seen: ResMut<Seen>) {
+            seen.0.push(vp.is_changed());
+        }
+
+        let mut app = viewport_app(1280, 720);
+        app.init_resource::<Seen>();
+        app.add_systems(Update, record);
+        app.update(); // insert
+        app.update(); // unchanged
+        app.update(); // unchanged
+        resize(&mut app, 1600.0, 900.0);
+        app.update(); // resize
+        app.update(); // unchanged
+        assert_eq!(
+            app.world().resource::<Seen>().0,
+            vec![true, false, false, true, false],
+        );
+    }
+
+    /// No primary window is a broken frame, not an empty one. Layout must stop
+    /// loudly instead of quietly drawing at some guessed size.
+    #[test]
+    #[should_panic(expected = "PrimaryWindow")]
+    fn layout_viewport_panics_without_a_primary_window() {
+        let mut app = App::new();
+        app.add_plugins(LayoutViewportPlugin);
+        app.update();
     }
 
     // ── geometry ──────────────────────────────────────────────────────────

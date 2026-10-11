@@ -809,7 +809,7 @@ pub fn render_ledger_ribbon(
     drift: Res<crate::connection::drift::DriftState>,
     theme: Res<Theme>,
     time: Res<Time>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    viewport: Res<panel::LayoutViewport>,
     mut fonts: crate::ui::msdf_panel::PanelFonts,
     mut surface: Query<
         (&mut MsdfBlockGlyphs, &mut UiRttTexture, &mut Node),
@@ -823,12 +823,14 @@ pub fn render_ledger_ribbon(
     }
     let now_secs = time.elapsed_secs_f64();
     let stale = now_secs - *last_build >= 1.0;
-    if !ribbon.is_changed() && !mirror.is_changed() && !theme.is_changed() && !stale {
+    if !ribbon.is_changed()
+        && !mirror.is_changed()
+        && !theme.is_changed()
+        && !viewport.is_changed()
+        && !stale
+    {
         return;
     }
-    let Ok(window) = windows.single() else {
-        return;
-    };
     let Ok((mut glyphs_out, mut rtt, mut node)) = surface.single_mut() else {
         return;
     };
@@ -840,9 +842,9 @@ pub fn render_ledger_ribbon(
     };
     *last_build = now_secs;
 
-    let width = panel::panel_width(window.width()) as f64;
+    let width = panel::panel_width(viewport.size.x) as f64;
     let cols = columns(width, measure_char_width(font));
-    let rows = rows_for_height((window.height() * panel::PANEL_MAX_HEIGHT_FRACTION) as f64);
+    let rows = rows_for_height((viewport.size.y * panel::PANEL_MAX_HEIGHT_FRACTION) as f64);
     let open = mirror.open_records();
     let lines = ribbon_rows(
         &RibbonView {
@@ -870,7 +872,7 @@ pub fn render_ledger_ribbon(
     node.width = Val::Px(width as f32);
     node.height = Val::Px(height as f32);
     if let Ok(mut outer) = container.single_mut() {
-        outer.left = Val::Px(panel::panel_left(window.width()));
+        outer.left = Val::Px(panel::panel_left(viewport.size.x));
         outer.width = Val::Px(width as f32);
     }
 }
