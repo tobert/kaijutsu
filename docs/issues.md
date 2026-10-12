@@ -2841,7 +2841,7 @@ must agree and are set in different places).
 structured output loses the anchor. Adding it is a schema change plus all five
 artifacts rebuilt — its own decision.
 
-Something now wants it: kaish's coming `edit` and hashline work (Amy,
+Something now wants it: kaish 0.18.1's `edit` and hashline work (Amy,
 2026-09-25) marks which file line each output row is and has the kernel hash
 it. kaish's draft brief (`~/exomemory/kaish/edit-hashline-brief.md`) sends
 the hash as a typed field rather than having clients recompute it, since an
@@ -2978,10 +2978,10 @@ Bring these to that session:
 
 - kaish emits a `line` anchor under `--json` (kaish `aafc0ee4`), and the wire
   drops it: see "The wire drops kaish's output line anchor".
-- kaish is getting an `edit` builtin and hashline anchors. Amy,
-  2026-09-25: "kaish gets edit and hashline support throughout." Once they
-  ship, the MCP `read` and `edit` tools reduce onto kaish. Decided on the
-  kaish side so far (kaish-25, 2026-09-25):
+- kaish ships an `edit` builtin and hashline anchors (0.18.1; Amy,
+  2026-09-25: "kaish gets edit and hashline support throughout"). The MCP
+  `read` and `edit` tools still reduce onto kaish; that part is open. The
+  design, as decided on the kaish side (kaish-25, 2026-09-25):
   - An anchor looks like `42:cafe`, with no algorithm name in it.
   - Builtins mark which file line each output row is; the kernel computes
     the hash.
@@ -2992,9 +2992,8 @@ Bring these to that session:
     a batch all or nothing. It never falls back to replacing the whole file.
   - The CLI grammar is not designed yet.
 
-  The builtin needs our `edit` alias for vi gone first: see "`edit` still
-  names two different things on two surfaces". Nothing in kaijutsu depends
-  on the MCP `edit` tool's string mode (`old_string`): no rc script, prompt,
+  Our `edit` alias for vi is gone (`d0b9c2f0`), and kaish 0.18.1 is pinned
+  (`6bb5be81`). Nothing in kaijutsu depends on the MCP `edit` tool's string mode (`old_string`): no rc script, prompt,
   or other code uses it; models find it only through the tool schema.
 - Our anchor edit inserts multi-line text as given (`plan_anchor_edit`,
   `format!("{new}{terminator}")`), so a multi-line replacement inside a
@@ -3024,22 +3023,6 @@ CONFLICT`) and `edit_text`'s oplog journal write are still separate
 statements, not one transaction — confirmed. A crash between them either loses
 the marker (cold path reconciles the unsaved work away) or leaves a marker
 pointing at content never written.
-
-## `edit` still names two different things on two surfaces (2026-08-18)
-
-Confirmed unchanged: kaish builtin `edit <path>` (`runtime/context_shell.rs:171`,
-registered alongside `vi`) opens an interactive vi session; MCP tool `edit`
-(`mcp/servers/file.rs:163`) is a surgical, non-interactive hashline/string
-edit. Same name, same coder, opposite mechanism.
-
-kaish will ship its own `edit` builtin (Amy, 2026-09-25: "kaish gets edit
-and hashline support throughout"), and our alias would shadow it. Dropping
-the alias is now a prerequisite for taking that kaish release, not an option.
-`vi` is already the documented front door (`docs/vi.md`). The alias is also
-named in `runtime/embedded_kaish.rs:400` (read-only denial),
-`runtime/vi_builtin.rs:180` (test registration), and the front-door test at
-`runtime/context_shell.rs:505`. Check rc scripts and help text for callers
-first.
 
 ## `write` has no staleness guard (2026-08-18)
 
