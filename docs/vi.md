@@ -6,7 +6,7 @@ tool-shaped surface; the Bevy app is one
 *renderer* of it, a model is another *player* of it, and a headless test is a
 third *driver* of it. Same surface for all three.
 
-Every input mutation carries the current player's identity. `kj editor` uses
+Every input mutation carries the current player's identity. `kj vi` uses
 its invoking performer; RPC keys, paste, and rollback use the authenticated
 connection's principal. Opening a shared editor does not make its opener the
 author of later players' edits. The original block author stays unchanged.
@@ -27,8 +27,9 @@ hazard real.
 resolver → `kaijutsu-editor` `EditorCore` (pure modalkit vim) → kernel
 `EditorSessions` → capnp wire surface (`editorOpen/Keys/State/Save/Quit @74–78`
 + push `subscribeEditor @79` + `editorInsert @105`) → `Screen::Editor` MSDF
-renderer with a real cursor quad → key forwarding. Front doors: the `vi`/`edit` kaish builtin and
-`kj editor` verbs — both funneling to one `Kernel::editor_open` and one
+renderer with a real cursor quad → key forwarding. Front doors: the `vi` kaish builtin
+(in-app: the shell, the TUI's and app's `:vi`) and the `kj vi` verbs (agents and
+scripts) — both funneling to one `Kernel::editor_open` and one
 `EditorState::to_json` shape. The `:` command dialect shipped (core verbs, a
 hand-rolled `:s`, `:r <file>` / `:r !cmd`),
 as did Ctrl+Z suspend / `fg` resume. The cache-coherence and restart-staleness
@@ -51,7 +52,7 @@ and dot-repeat" under the `:` dialect).
   selection travels end to end: `EditorCore::selection()` reads modalkit's
   anchor and cursor, the kernel's `EditorState.selection` and the capnp
   `EditorState.selection @7` carry it as an `EditorSelection` (shape plus
-  half-open char spans, `kaijutsu-types/src/editor.rs`), and `kj editor`
+  half-open char spans, `kaijutsu-types/src/editor.rs`), and `kj vi`
   emits it in `to_json`. The tui draws it (`docs/tui.md`, "Editor and
   diff"). The app builds rects through `Selection::geometry` →
   `layout_rects` → `coalesce_selection_rects` → `pack_selection_rects` →
@@ -87,7 +88,7 @@ and dot-repeat" under the `:` dialect).
 - **Terminator byte-fidelity.** The session preserves a single trailing
   newline across open/`ZQ`; exotic/CRLF terminators tie into the
   hashline/CRLF preservation work.
-- **MCP tools** — deferred; a model already drives via `kj editor` through the
+- **MCP tools** — deferred; a model already drives via `kj vi` through the
   shell (the hybrid kj-rich/MCP-narrow stance). Add a narrow wrapper only if a
   non-shell driver needs it.
 - **Render polish** — a long document underlaps the floating `:` strip (vim
@@ -285,11 +286,20 @@ The same surface a test drives is what a model plays.
 
 ## Decisions
 
-1. **Dispatch is a kaish builtin.** `vi`/`edit <path>` is a real kaish `Tool`
-   (`runtime/vi_builtin.rs`, registered in `runtime/context_shell.rs`) — not a
-   `kj editor open` alias. `kj editor` reaches the editor through the same
-   shared `Kernel::editor_open` primitive; two front doors, one kernel
-   method, one `EditorState::to_json` shape.
+1. **The in-app door is the `vi` kaish builtin; `kj vi` is the agent door.**
+   `vi <path>` is a real kaish `Tool` (`runtime/vi_builtin.rs`, registered in
+   `runtime/context_shell.rs`). Players reach it through the shell: the shell
+   surface, and the TUI's and app's `:vi <args>`, which run the statement
+   `vi <args>` as `:!vi <args>` does, so quotes and `$vars` follow shell rules.
+   `kj vi` is the programmatic door for agents and scripts. It takes structured
+   argv, so a path is one word with no quoting, and it is not an in-app entry.
+   Both reach the same `Kernel::editor_open`. `kj vi` is a clap verb named
+   `vi`; its module is still `kj/editor.rs`.
+   `edit` is kaish's hashline editor, not a vi front door, and the builtin is
+   not registered under that name.
+   The builtin takes one path. kaish splits on whitespace, so `vi my notes.md`
+   is two words and is refused. Quote a path with a space: `vi "my notes.md"`,
+   in the shell and in the bars alike.
 2. **Save model: the session buffer binds to the block.** Typing lands as
    range edits (`block_store.edit_text`), never a whole-file replace. The
    kernel sequences every write, so concurrent merge into a block is
@@ -463,9 +473,11 @@ push channel; the app renders it read-only.
   `:r <file>`. Caller cancellation and kernel shutdown stop the shell read.
   Local cwd/export changes in that shell are not written back. Read-only model
   shells refuse editor opens and input; use `shell_write` to drive an editor.
-- **No `:!`, deliberately.** It was the entire source of complexity — nested
-  editor sessions, a return stack, ephemeral-block lifecycle. The **shell is
-  already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —
+- **No `:!` in the app, deliberately.** The app's `:` bar runs one thing,
+  `:vi <args>`, as the shell statement `vi <args>`; every other `:` line is
+  refused. The TUI's bar also takes `:!<statement>` (`docs/tui.md`, "The `:`
+  line"). Nested editor sessions, a return stack, and ephemeral-block lifecycle
+  are still out of scope. The **shell is already a surface a keystroke away**: **Ctrl+Z** (a local app intercept —
   don't forward the key; leave to the shell but keep `ActiveEditor`; the
   kernel session is untouched, and local means it doubles as the hung-kernel
   escape hatch) and **`fg`** (a kaish builtin: `Kernel::resume_editor` finds
@@ -517,8 +529,8 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Editor sessions + resolver + state shape | `kaijutsu-kernel/src/editor.rs` (`resolve_editor_target`, `EditorSessions`, `EditorState::to_json`, `APP_PEER_NICK`) |
 | Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`, `selection`) |
 | Selection value | `kaijutsu-types/src/editor.rs` (`EditorSelection`, `SelectionShape`) |
-| `vi`/`edit` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `runtime/context_shell.rs` |
-| `kj editor` | `kaijutsu-kernel/src/kj/editor.rs` |
+| `vi` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `runtime/context_shell.rs` |
+| `kj vi` (clap verb `vi`) | `kaijutsu-kernel/src/kj/editor.rs` |
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |

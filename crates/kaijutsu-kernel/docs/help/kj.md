@@ -86,7 +86,7 @@ character       create, list, show, retire — the sheet a name resolves to
                 and is idempotent on the name; retire concludes and archives
                 every live context the character plays
 config          Read or reset files under /config/kernel and /config/client.
-                Edit them with the file tools or `kj editor`. For model
+                Edit them with the file tools or `kj vi`. For model
                 configuration, see `kj backend`, `kj cast`, and `kj alias`.
 context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
                 set, unset, log, move, rename, rotate, archive, conclude, promote,
@@ -105,9 +105,6 @@ diff            <a> [<b>] — unified diff as a typed block: one path diffs disk
 doc             list, tree, create, delete — storage layer (all kinds, not just conversation)
 drift           push, pull, merge, flush, queue, cancel, history, edge rm
 drive           Clock one autonomous turn on a context (--prompt)
-editor          open, keys, state, save, quit, list — kernel-owned vi editor sessions
-                (save needs the `editor` capability; open/keys/state/quit/list
-                are ungated)
 fork            Fork current context (--name, --prompt, --preset, --model,
                 --include/--exclude ranges, --compact, --as, --stage, --switch)
 handoff         note [--for <character>], tail [--window] — a character's
@@ -185,6 +182,10 @@ transport       list, attach, detach, play, pause, stop, tempo <bpm>,
                 shows as `dormant`
 vfs             snapshot <path> (--depth, --max-entries), activity [path] —
                 recursive listing + generation stamps / per-directory heat totals
+vi              open, keys, insert, state, save, quit, list — kernel-owned vi
+                editor sessions for agents and scripts (save needs the `editor`
+                capability; open/keys/state/quit/list are ungated). In-app editing
+                is the `vi` builtin, not this verb.
 wait            [<target>] [--since, --timeout, --max-blocks, --max-bytes,
                 --include text|tools|all] — park until a context's turn
                 finishes and report what it produced since you last looked;

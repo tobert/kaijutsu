@@ -11,7 +11,8 @@ use modalkit::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers};
 
 use super::outbox::DraftOutboxState;
 use super::{
-    ComposeAction, ComposeBuffer, ComposeState, DraftTarget, HeldInput, LoadStarted, byte_offset, shell_kj_argv,
+    ComposeAction, ComposeBuffer, ComposeState, DraftTarget, HeldInput, LoadStarted, byte_offset, colon_vi_statement,
+    shell_kj_argv,
 };
 use crate::cell::{
     ComposeError, ConversationScrollState, DocumentCache, InputOverlay, InputOverlayMarker, SessionPrincipal,
@@ -78,7 +79,10 @@ impl ComposeIo<'_, '_> {
             self.send_chat_ops(&action.ops);
         }
         if let Some(line) = action.command {
-            self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z is the shell"));
+            match colon_vi_statement(&line) {
+                Some(statement) => self.run_colon_vi(statement),
+                None => self.error("compose", format!("{line}: compose runs no `:` commands; Ctrl+Z is the shell")),
+            }
         }
         if let Some(notice) = action.notice {
             self.error("compose", notice);
@@ -92,6 +96,29 @@ impl ComposeIo<'_, '_> {
         if action.dismiss {
             self.fired.push(Action::PopLevel);
         }
+    }
+
+    /// `:vi <args>` from the `:` bar: the shell statement `vi <args>`, run the
+    /// way the shell surface runs any line. The builtin opens the editor, and
+    /// its kernel open signal lands the editor on this window.
+    fn run_colon_vi(&mut self, statement: String) {
+        let (Some(actor), Some(context)) = (self.actor.as_ref(), self.doc_cache.active_id()) else {
+            self.error("vi", "not connected; no editor was opened");
+            return;
+        };
+        let handle = actor.handle.clone();
+        let tx = self.rpc_results.sender();
+        let span = tracing::info_span!("app.vi", context.id = %context);
+        IoTaskPool::get()
+            .spawn(tracing::Instrument::instrument(
+                async move {
+                    if let Err(e) = handle.shell_execute(&statement, context, true).await {
+                        let _ = tx.send(RpcResultMessage::RpcError { operation: "vi".into(), error: e.to_string() });
+                    }
+                },
+                span,
+            ))
+            .detach();
     }
 
     /// Feed one key to the active surface.

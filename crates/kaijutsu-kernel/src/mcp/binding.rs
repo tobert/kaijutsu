@@ -186,7 +186,7 @@ pub enum Capability {
     /// need it (musician, toolie) never carry the footgun.
     Exec,
     /// May *write* through the kernel-owned interactive editor (`docs/vi.md`)
-    /// — `kj editor save`, and a `kj editor keys` batch that submits a write
+    /// — `kj vi save`, and a `kj vi keys` batch that submits a write
     /// (`:w`, `:w!`, `:wq`, `:x`, `ZZ`). `open`/`keys` otherwise/`state`/
     /// `quit`/`list` stay ungated: opening and reading the buffer is benign,
     /// like reading the compose draft.

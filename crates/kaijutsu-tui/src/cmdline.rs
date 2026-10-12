@@ -38,6 +38,14 @@ pub fn parse(line: &str) -> ColonVerb {
     if let Some(statement) = body.strip_prefix('!') {
         return ColonVerb::Shell(statement.to_string());
     }
+    // `:vi <args>` is `:!vi <args>`: the same shell statement, so the
+    // builtin's own argument rules apply.
+    if body == "vi" {
+        return ColonVerb::Shell("vi".to_string());
+    }
+    if let Some(rest) = body.strip_prefix("vi ") {
+        return ColonVerb::Shell(format!("vi {}", rest.trim()));
+    }
     if let Some(rest) = body.strip_prefix("kj") {
         // A space must separate the verb from its argv — `:kjunk` is not
         // `:kj unk`, and `:kj` alone is a valid empty-argv call.
@@ -84,6 +92,25 @@ mod tests {
     #[test]
     fn bare_bang_is_an_empty_statement() {
         assert_eq!(parse(":!"), ColonVerb::Shell(String::new()));
+    }
+
+    /// `:vi` is `:!vi`: the rest of the line goes to the shell, so quotes
+    /// and `$vars` mean what they mean in the shell.
+    #[test]
+    fn vi_runs_the_builtin_through_the_shell() {
+        assert_eq!(parse(":vi notes.md"), ColonVerb::Shell("vi notes.md".to_string()));
+        assert_eq!(parse(":vi"), ColonVerb::Shell("vi".to_string()));
+        assert_eq!(parse(":vi   rc/S00.kai  "), ColonVerb::Shell("vi rc/S00.kai".to_string()));
+        assert_eq!(parse(":vi \"my notes.md\""), ColonVerb::Shell("vi \"my notes.md\"".to_string()));
+        assert_eq!(parse(":vi"), parse(":!vi"));
+    }
+
+    /// `:vim` and `:vi!` are not `vi` with a path — a prefix match alone
+    /// would open the wrong thing on a typo.
+    #[test]
+    fn vi_needs_a_space_or_nothing_after_it() {
+        assert_eq!(parse(":vim notes.md"), ColonVerb::Unknown);
+        assert_eq!(parse(":vi!"), ColonVerb::Unknown);
     }
 
     #[test]

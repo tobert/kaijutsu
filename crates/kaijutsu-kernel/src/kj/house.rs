@@ -21,8 +21,8 @@ pub(crate) const HOUSE_VERBS: &[&str] = &[
 /// which is what makes a new verb choose a table.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const WORKER_VERBS: &[&str] = &[
-    "block", "cache", "cas", "context", "diff", "drift", "editor", "fork", "stage", "handoff",
-    "kaish", "model", "models", "search", "synth", "vfs", "wait", "workspace",
+    "block", "cache", "cas", "context", "diff", "drift", "fork", "stage", "handoff",
+    "kaish", "model", "models", "search", "synth", "vfs", "vi", "wait", "workspace",
 ];
 
 /// Short forms of top-level verbs, and the verb each one names.

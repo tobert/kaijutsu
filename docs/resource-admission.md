@@ -119,7 +119,7 @@ is a bound on model spend, which needs its own count of provider requests.
   calling `request_turn`, which only reserves for its own admission mint;
   covering their writes too is out of this slice.
 - **Blocking re-entry paths**, all of which must reach `spawn_runtime_task` on
-  a worker thread for rule 3 to hold: the editor read from `kj editor keys`;
+  a worker thread for rule 3 to hold: the editor read from `kj vi keys`;
   a shell call that waits inside a turn; `Broker::emit_notification_block` from
   the bindings tool and the `kj binding` and `kj mcp` verbs; an inline kaish
   hook body; an approved command run inline by the delivery task.

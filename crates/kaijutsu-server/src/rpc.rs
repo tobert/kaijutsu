@@ -2904,7 +2904,7 @@ impl kernel::Server for KernelImpl {
         Promise::ok(())
     }
 
-    // ── In-app editor sessions (the vi/edit builtin; see docs/vi.md) ────────
+    // ── In-app editor sessions (the vi builtin; see docs/vi.md) ────────
     // Thin wire wrappers over the kernel's `editor_*` primitives. Session ids
     // are global; the path resolves the owning kernel block. Edits mirror onto
     // that block — rc/config permission errors surface here loudly.

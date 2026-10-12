@@ -1,5 +1,5 @@
-//! `vi` and `edit` open kernel-owned editor sessions through the same entry
-//! point as `kj editor open`. The opener retains the invocation identity and
+//! `vi` opens kernel-owned editor sessions through the same entry
+//! point as `kj vi open`. The opener retains the invocation identity and
 //! context at open; editor signals target the requester. See `docs/vi.md`.
 
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use super::context_engine::{SessionContextExt, SessionContextMap};
 
 /// kaish builtin that opens an editor session via `Kernel::editor_open`.
 ///
-/// Registered once per user-facing name (`vi`, `edit`) so both resolve to the
-/// same behavior; `name` is the registry key this instance answers to.
+/// Registered under the name `vi`; `name` is the registry key this instance
+/// answers to.
 ///
 /// Requester, performer, reviewer, and session remain fixed for the invocation.
 /// Resolve its current context when opening, then retain that complete opener
@@ -49,7 +49,7 @@ impl Tool for ViBuiltin {
         ToolSchema::new(
             self.name,
             "Open a vi editor session on a file or rc/config path (kernel-owned; \
-             drive it with `kj editor keys/state/save/quit`).",
+             drive it with `kj vi keys/state/save/quit`).",
         )
         .param(
             ParamSchema::required("path", "string", "File or rc/config path to edit").positional(),
@@ -61,6 +61,19 @@ impl Tool for ViBuiltin {
     }
 
     async fn execute(&self, args: ToolArgs, _ctx: &mut dyn ToolCtx) -> ExecResult {
+        // kaish splits on whitespace, so a path with a space arrives as
+        // several words. Taking only the first would open the wrong file.
+        if args.positional.len() > 1 {
+            return ExecResult::failure(
+                2,
+                format!(
+                    "{}: takes one path, got {} words — quote a path with spaces\nusage: {} <path>",
+                    self.name,
+                    args.positional.len(),
+                    self.name,
+                ),
+            );
+        }
         let path = match args.positional.first() {
             Some(Value::String(s)) => s.clone(),
             Some(other) => format!("{other:?}"),
@@ -89,11 +102,11 @@ impl Tool for ViBuiltin {
                 let session = id.as_u64();
                 let mut result = ExecResult::success(format!(
                     "opened editor session {session} on {path} \
-                     — drive it with `kj editor keys {session} …`",
+                     — drive it with `kj vi keys {session} …`",
                 ));
                 // The one shared editor-state shape (`EditorState::to_json`), so
                 // a driver reads the session id + buffer the same way it would
-                // from `kj editor open`.
+                // from `kj vi open`.
                 result.data = Some(kaish_kernel::interpreter::json_to_value(st.to_json(id)));
                 result
             }
@@ -161,7 +174,7 @@ mod tests {
     /// Unique rc path (parse_rc_path needs SXX-name form), off the seeded tree.
     const P: &str = "/config/rc/vitest/create/S00-foo.kai";
 
-    /// Build an `EmbeddedKaish` wired with the `vi` + `edit` builtins against the
+    /// Build an `EmbeddedKaish` wired with the `vi` builtin against the
     /// rc dispatcher (so `/config/rc` is the real seeded host-directory mount).
     async fn embedded_with_vi(dispatcher: Arc<KjDispatcher>, ctx: ContextId) -> EmbeddedKaish {
         let blocks = dispatcher.block_store().clone();
@@ -176,8 +189,7 @@ mod tests {
                   tools: &mut kaish_kernel::ToolRegistry| {
                 let identity = ShellIdentity { requester: PrincipalId::system(), performer: PrincipalId::system(),
                     reviewer: None, context: ctx, session: sid };
-                tools.register(ViBuiltin::new(dispatcher.clone(), "vi", identity, _scm.clone()));
-                tools.register(ViBuiltin::new(dispatcher.clone(), "edit", identity, _scm));
+                tools.register(ViBuiltin::new(dispatcher.clone(), "vi", identity, _scm));
             };
 
         EmbeddedKaish::with_identity(
@@ -196,7 +208,7 @@ mod tests {
 
     /// `vi <rc path>` opens a real session on the owning block: the message names
     /// a session id and the structured `.data` carries the block's current text.
-    /// This is the front-door equivalent of the `kj editor open` e2e.
+    /// This is the front-door equivalent of the `kj vi open` e2e.
     #[tokio::test]
     async fn vi_opens_a_session_on_the_owning_rc_block() {
         let d = Arc::new(test_dispatcher_rc().await);
@@ -228,23 +240,37 @@ mod tests {
         );
     }
 
-    /// `edit` is the same behaviour under a second name.
+    /// `vi my notes.md` is two words to kaish. The builtin takes one path, so
+    /// it must refuse the second word and say to quote it — not open `my`.
     #[tokio::test]
-    async fn edit_is_an_alias_for_vi() {
+    async fn vi_with_two_unquoted_words_fails_loud_and_names_the_fix() {
         let d = Arc::new(test_dispatcher_rc().await);
-        let c = test_caller();
-        let s = |v: &str| v.to_string();
-        d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("world")], &c)
-            .await;
-
         let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
         let res = kaish
-            .execute_with_options(&format!("edit {P}"), ExecuteOptions::default())
+            .execute_with_options(&format!("vi {P} extra"), ExecuteOptions::default())
             .await
             .expect("kaish exec");
 
-        assert!(res.ok(), "edit should succeed: {res:?}");
-        assert!(res.text_out().contains("opened editor session"));
+        assert!(!res.ok(), "two path words must not open a session: {res:?}");
+        let err = res.err.clone();
+        assert!(err.contains("one path"), "the refusal names the rule: {err}");
+        assert!(err.contains("quote"), "the refusal names the fix: {err}");
+        assert!(!res.text_out().contains("opened editor session"));
+    }
+
+    /// A quoted path with a space is one word, so the word-count guard does
+    /// not refuse it. It fails here only because the file is not there.
+    #[tokio::test]
+    async fn vi_with_a_quoted_path_with_a_space_is_one_word() {
+        let d = Arc::new(test_dispatcher_rc().await);
+        let kaish = embedded_with_vi(d.clone(), ContextId::new()).await;
+        let res = kaish
+            .execute_with_options("vi \"/config/rc/vitest/create/S99 nope.kai\"", ExecuteOptions::default())
+            .await
+            .expect("kaish exec");
+
+        assert!(!res.ok());
+        assert!(!res.err.contains("takes one path"), "one quoted word is one path: {}", res.err);
     }
 
     /// A path that resolves to nothing fails loud (no empty editor) — the

@@ -601,14 +601,14 @@ impl KjDispatcher {
         if cmd == "rc" {
             return self.dispatch_rc(&argv[1..], caller).await;
         }
-        // `kj editor` drives kernel-owned editor sessions by path; the session
+        // `kj vi` drives kernel-owned editor sessions by path; the session
         // binds to whatever block owns the path, so no active context is needed
         // (same exemption as `kj rc`).
-        if cmd == "editor" {
+        if cmd == "vi" {
             return self.dispatch_editor(&argv[1..], caller).await;
         }
         // `kj swap` addresses a recovered file buffer by path, same as
-        // `kj editor`/`kj diff` — no active context needed to look one up.
+        // `kj vi`/`kj diff` — no active context needed to look one up.
         if cmd == "swap" {
             return self.dispatch_swap(&argv[1..], caller).await;
         }

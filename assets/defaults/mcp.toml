@@ -79,7 +79,7 @@
 # their configured servers stay exactly as they are.
 #
 # Add one by editing this file. It is an ordinary host file under
-# /config/kernel (docs/config-namespace.md), so the file tools, `kj editor`,
+# /config/kernel (docs/config-namespace.md), so the file tools, `kj vi`,
 # vim and git all reach it. Then run `kj mcp reload`.
 #
 # The two we actually run on moltar, for reference:

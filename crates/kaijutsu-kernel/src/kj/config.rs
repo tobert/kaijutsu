@@ -5,7 +5,7 @@
 //! `/config/client`.
 //!
 //! **There is no write verb here, deliberately.** Config is a file: write it
-//! with the ordinary file tools, or open it with `kj editor <path>` / the `vi`
+//! with the ordinary file tools, or open it with `kj vi <path>` / the `vi`
 //! builtin. `set` and `edit` existed only because `/config/kernel` used to be
 //! unreachable from `builtin.file:write` — once that flat deny was narrowed to
 //! the host's own `/etc`, they were a second way to do one thing, with a
@@ -35,7 +35,7 @@ use super::{KjCaller, KjDispatcher, KjResult, clap_help_for};
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
-    about = "Read or reset files under /config/kernel and /config/client. Edit them with the file tools or `kj editor`. For model configuration, see `kj backend`, `kj cast`, and `kj alias`.",
+    about = "Read or reset files under /config/kernel and /config/client. Edit them with the file tools or `kj vi`. For model configuration, see `kj backend`, `kj cast`, and `kj alias`.",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -60,7 +60,7 @@ enum ConfigCommand {
         raw: bool,
     },
     // `set` and `edit` are deliberately absent. Config is a file: write it with
-    // the ordinary file tools, or open it with `kj editor <path>` / the `vi`
+    // the ordinary file tools, or open it with `kj vi <path>` / the `vi`
     // builtin, exactly as you would any other file. Config is not a special
     // category owed its own write verbs (Amy, 2026-08-15). `show --raw` still
     // round-trips byte-identical, now into `builtin.file:write` rather than

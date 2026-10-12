@@ -22,7 +22,7 @@
 //!   • `admin`                     — binding-admin (write any context's loadout)
 //!   • `drive`/`fork`/`drift`/`transport`/`operator`/`editor` — kj verb
 //!     authorities (escalation-relevant kj subcommands; explicit, NOT implied
-//!     by `*`) — `editor` gates a write through `kj editor` (docs/vi.md)
+//!     by `*`) — `editor` gates a write through `kj vi` (docs/vi.md)
 //!
 //! Semantics: **deny-by-default** — a context with no binding grants nothing.
 //! The rc `create`/`fork` lifecycle assigns the initial loadout (broad roles

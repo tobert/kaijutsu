@@ -1341,7 +1341,7 @@ impl KernelHandle {
     }
 
     // =========================================================================
-    // In-app editor sessions (the vi/edit builtin; see docs/vi.md)
+    // In-app editor sessions (the vi builtin; see docs/vi.md)
     // =========================================================================
 
     /// Open an editor session on `path`, binding to the kernel block that owns its
@@ -4581,7 +4581,7 @@ pub struct InputState {
     pub version: u64,
 }
 
-/// Renderer-facing snapshot of an in-app editor session (the vi/edit builtin).
+/// Renderer-facing snapshot of an in-app editor session (the vi builtin).
 /// The client form of the kernel's `EditorState` (see docs/vi.md). `mode` is
 /// `None` when the wire `mode` is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]

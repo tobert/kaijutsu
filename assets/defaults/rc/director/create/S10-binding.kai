@@ -41,7 +41,7 @@ kj binding allow "house"
 # reach (aconnect/pw-cli wiring, quick host inspection). A subprocess bypasses
 # the VFS, so it's a dedicated authority, not implied by anything above.
 kj binding allow "exec"
-# The kernel-owned interactive editor's WRITE path (kj editor save, and a
+# The kernel-owned interactive editor's WRITE path (kj vi save, and a
 # `keys` batch that submits :w/:w!/:wq/:x/ZZ) — a director already holds
 # file:write/edit above for governance artifacts, so it also gets the
 # editor's write surface. Dedicated authority, not implied by anything above

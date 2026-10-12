@@ -159,7 +159,7 @@ pub struct Kernel {
     /// Each model endpoint's limit, in-flight slots, and cooldown, shared by
     /// every provider and council call (`llm/endpoint.rs`).
     endpoints: crate::llm::endpoint::Endpoints,
-    /// Open in-app editor sessions (`vi`/`kj editor`). The registry is
+    /// Open in-app editor sessions (`vi`/`kj vi`). The registry is
     /// kernel-owned so any peer can drive it and the app renders it. Behind a
     /// sync mutex because every editor op is synchronous — modalkit's `!Send`
     /// `EditorCore` never crosses an await (see [`crate::editor::SendSessions`]).
@@ -1520,7 +1520,7 @@ impl Kernel {
     /// Open an editor recording the [`EditorOpener`](crate::editor::EditorOpener)
     /// on the session, so `fg` can re-foreground it for that principal and
     /// `:r !cmd` can shell out in the opener's context. The signaled front doors
-    /// (`vi`/`edit`, `kj editor`) pass the caller here.
+    /// (`vi`, `kj vi`) pass the caller here.
     ///
     /// Pins the file-document cache entry for the session's lifetime (P1,
     /// `docs/issues.md` "Tech-debt audits, 2026-08-20"; `docs/file-buffers.md`).
@@ -1576,7 +1576,7 @@ impl Kernel {
     }
 
     /// [`editor_keys`](Self::editor_keys), gated: `can_write` is the caller's
-    /// `Capability::Editor` check, computed once by the caller (`kj editor
+    /// `Capability::Editor` check, computed once by the caller (`kj vi
     /// keys`) and carried through. A write intent in this batch refuses
     /// inside [`EditorSessions::keys_checked`] when `can_write` is false — the
     /// buffer stays dirty and open, and its message names the missing
@@ -1823,7 +1823,7 @@ impl Kernel {
                 let opener = opener.ok_or_else(|| {
                     format!(
                         "editor: ':r !{cmd}' needs an opener context — open via \
-                         vi/edit, or use Ctrl+Z to the shell"
+                         vi, or use Ctrl+Z to the shell"
                     )
                 })?;
                 let dispatcher = self.broker.kj_dispatcher().await.ok_or_else(|| {
@@ -1845,7 +1845,7 @@ impl Kernel {
         self.editor_sessions.lock().0.state(id)
     }
 
-    /// A census of every open editor session — `kj editor list`'s data source.
+    /// A census of every open editor session — `kj vi list`'s data source.
     pub fn editor_list(&self) -> Vec<crate::editor::EditorSessionInfo> {
         self.editor_sessions.lock().0.list()
     }
@@ -1858,7 +1858,7 @@ impl Kernel {
     /// success, still dirty on failure.
     ///
     /// The session stays open on a flush failure: this is the direct-call
-    /// path (the wire `editorSave`, `kj editor save`), not a `ZZ`/`:wq` that
+    /// path (the wire `editorSave`, `kj vi save`), not a `ZZ`/`:wq` that
     /// already dropped the session — so, unlike `editor_keys`' `Closed` arm,
     /// there is somewhere to report it. Mirrors `run_commands`' `Quit{force}`
     /// dialect-level refusal: the status line gets the message and the call
@@ -1866,7 +1866,7 @@ impl Kernel {
     /// failure — see `editor_keys`'s `Updated` arm for why this differs from
     /// `mount_backend.rs`'s *external*-write rollback.
     ///
-    /// **Not gated by `can_write` here.** `kj editor save` is the only
+    /// **Not gated by `can_write` here.** `kj vi save` is the only
     /// production caller and it already denies at the dispatcher
     /// (`kj::editor::dispatch_editor`'s `Save` arm calls `require_cap` and
     /// returns before ever reaching the kernel), and the wire `editorSave`
@@ -1892,7 +1892,7 @@ impl Kernel {
         };
         if let Some(fp) = file_path.as_deref() {
             // Guarded, unforced: this direct-call path (the wire
-            // `editorSave`, `kj editor save`) carries no bang, so it is a
+            // `editorSave`, `kj vi save`) carries no bang, so it is a
             // plain `:w` and refuses on the W12 changed-under-us
             // condition (docs/file-buffers.md rule 3).
             if let Err(e) = self.file_cache.flush_one_guarded(fp, false).await {
@@ -2197,7 +2197,7 @@ impl Kernel {
     ///
     /// Best-effort: the editor session is already open, so a missing or
     /// unreachable renderer is **logged, never fatal** — a headless driver
-    /// (`kj editor keys …`) needs no app. Observable (a warn line), not silent.
+    /// (`kj vi keys …`) needs no app. Observable (a warn line), not silent.
     ///
     /// Exact-window targeting (by the submitter's `instance`) is a follow-up:
     /// the app's `instance` is not yet threaded onto the execute path
@@ -2242,7 +2242,7 @@ impl Kernel {
         if targets.is_empty() {
             tracing::warn!(
                 "open_editor: no app peer to signal for session {} (headless?) — \
-                 the session is open; drive it with `kj editor keys {0} …`",
+                 the session is open; drive it with `kj vi keys {0} …`",
                 session.as_u64()
             );
             return;
@@ -2257,8 +2257,8 @@ impl Kernel {
     }
 
     /// [`editor_open`](Self::editor_open) **plus** the `open_editor` peer signal
-    /// to the submitter's app windows. The ergonomic front doors (`vi`/`edit`,
-    /// `kj editor open`) use this so a human's `vi foo` pops a
+    /// to the submitter's app windows. The ergonomic front doors (`vi`,
+    /// `kj vi open`) use this so a human's `vi foo` pops a
     /// renderer; the wire `editorOpen` handler and tests call the plain
     /// `editor_open` (they are the renderer / a driver and need no nudge). One
     /// signal site, threaded the submitter principal from each door's caller.

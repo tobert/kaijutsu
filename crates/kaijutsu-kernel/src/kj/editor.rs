@@ -1,4 +1,4 @@
-//! `kj editor` — drive the kernel-owned editor sessions over the kj surface.
+//! `kj vi` — drive the kernel-owned editor sessions over the kj surface.
 //!
 //! The programmatic face of the in-app editor (`docs/vi.md`): `open` resolves a
 //! path to its owning kernel block and starts a session; `keys` feeds vim input
@@ -17,8 +17,8 @@ use crate::mcp::Capability;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "editor",
-    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list)",
+    name = "vi",
+    about = "Drive kernel-owned vi editor sessions (open/keys/insert/state/save/quit/list); the agent and scripting door, not the in-app entry",
     disable_help_subcommand = true,
     no_binary_name = true
 )]
@@ -42,7 +42,7 @@ enum EditorCommand {
     /// that submits a write (`:w`, `:w!`, `:wq`, `:x`, `ZZ`, …) needs the
     /// `editor` capability; plain edits and navigation don't.
     Keys {
-        /// Session handle from `kj editor open`.
+        /// Session handle from `kj vi open`.
         session: u64,
         /// Key sequence in vim notation; a literal `<` is `<lt>`.
         keys: String,
@@ -55,7 +55,7 @@ enum EditorCommand {
     /// command line is open. No capability is needed: a paste carries no
     /// write intent, the same as a plain `keys` edit.
     Insert {
-        /// Session handle from `kj editor open`.
+        /// Session handle from `kj vi open`.
         session: u64,
         /// Text to splice at the cursor.
         text: String,
@@ -81,8 +81,8 @@ enum EditorCommand {
     List,
 }
 
-/// The capability `kj editor save` gates on. A write reached through
-/// `kj editor keys` (`:w`, `ZZ`) is refused at the flush inside the kernel,
+/// The capability `kj vi save` gates on. A write reached through
+/// `kj vi keys` (`:w`, `ZZ`) is refused at the flush inside the kernel,
 /// not by re-parsing keystrokes here. See [`Capability::Editor`] for why this
 /// is a dedicated authority rather than a reuse of `Tool{builtin.file, edit}`.
 fn write_cap() -> Capability {
@@ -113,7 +113,7 @@ impl KjDispatcher {
                         kaijutsu_types::ContentType::Plain,
                     );
                 }
-                return KjResult::Err(format!("kj editor: {e}"));
+                return KjResult::Err(format!("kj vi: {e}"));
             }
         };
 
@@ -137,7 +137,7 @@ impl KjDispatcher {
                     format!("opened editor session {} on {path}", id.as_u64()),
                     st.to_json(id),
                 ),
-                Err(e) => KjResult::Err(format!("kj editor open: {e}")),
+                Err(e) => KjResult::Err(format!("kj vi open: {e}")),
             },
             EditorCommand::Keys { session, keys } => {
                 let id = EditorSessionId::from_u64(session);
@@ -162,7 +162,7 @@ impl KjDispatcher {
                         }
                         KjResult::ok_with_data(line, st.to_json(id))
                     }
-                    Err(e) => KjResult::Err(format!("kj editor keys: {e}")),
+                    Err(e) => KjResult::Err(format!("kj vi keys: {e}")),
                 }
             }
             EditorCommand::Insert { session, text } => {
@@ -183,7 +183,7 @@ impl KjDispatcher {
                         }
                         KjResult::ok_with_data(line, st.to_json(id))
                     }
-                    Err(e) => KjResult::Err(format!("kj editor insert: {e}")),
+                    Err(e) => KjResult::Err(format!("kj vi insert: {e}")),
                 }
             }
             EditorCommand::State { session } => {
@@ -197,7 +197,7 @@ impl KjDispatcher {
                         ),
                         st.to_json(id),
                     ),
-                    Err(e) => KjResult::Err(format!("kj editor state: {e}")),
+                    Err(e) => KjResult::Err(format!("kj vi state: {e}")),
                 }
             }
             EditorCommand::Save { session } => {
@@ -216,7 +216,7 @@ impl KjDispatcher {
                         }
                         KjResult::ok_with_data(line, st.to_json(id))
                     }
-                    Err(e) => KjResult::Err(format!("kj editor save: {e}")),
+                    Err(e) => KjResult::Err(format!("kj vi save: {e}")),
                 }
             }
             EditorCommand::Quit { session } => {
@@ -225,7 +225,7 @@ impl KjDispatcher {
                     Ok(()) => KjResult::ok(format!(
                         "session {session}: closed (rolled back to checkpoint)"
                     )),
-                    Err(e) => KjResult::Err(format!("kj editor quit: {e}")),
+                    Err(e) => KjResult::Err(format!("kj vi quit: {e}")),
                 }
             }
             EditorCommand::List => {
@@ -337,13 +337,13 @@ mod tests {
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c)
             .await;
 
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &c).await;
         let id = session_of(&opened);
 
         // Type "X" at the start; the edit mirrors onto the owning block, but
         // a plain edit alone must not reach disk — only `:w`/`:wq`/`ZZ`
         // flush (docs/file-buffers.md).
-        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &c)
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("iX<Esc>")], &c)
             .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
@@ -353,7 +353,7 @@ mod tests {
 
         // State reports the live buffer + dirty.
         let st = d
-            .dispatch(&[s("editor"), s("state"), id.to_string()], &c)
+            .dispatch(&[s("vi"), s("state"), id.to_string()], &c)
             .await;
         match st {
             KjResult::Ok { data: Some(dd), .. } => {
@@ -364,27 +364,27 @@ mod tests {
         }
 
         // `:w` flushes the edit to the rc doc on disk-of-record.
-        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s(":w<CR>")], &c)
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s(":w<CR>")], &c)
             .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
             Some("Xhello"),
-            "kj editor keys ':w' must flush the edit to the owning rc doc"
+            "kj vi keys ':w' must flush the edit to the owning rc doc"
         );
 
         // A further, unsaved edit; ZQ rolls the block back to the last save.
-        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iY<Esc>")], &c)
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("iY<Esc>")], &c)
             .await;
-        d.dispatch(&[s("editor"), s("quit"), id.to_string()], &c)
+        d.dispatch(&[s("vi"), s("quit"), id.to_string()], &c)
             .await;
         assert_eq!(
             read_rc(&d, P).await.as_deref(),
             Some("Xhello"),
-            "kj editor quit must roll the rc doc back to the last save"
+            "kj vi quit must roll the rc doc back to the last save"
         );
     }
 
-    /// `kj editor insert` is the paste path: it lands text at the cursor and
+    /// `kj vi insert` is the paste path: it lands text at the cursor and
     /// leaves the vim mode exactly as it was. Discriminates against `keys`
     /// with the same text, which would type it as vim input — landing "iX"
     /// in the buffer verbatim and stranding the session in INSERT mode —
@@ -397,11 +397,11 @@ mod tests {
 
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("ab")], &c)
             .await;
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &c).await;
         let id = session_of(&opened);
 
         let inserted = d
-            .dispatch(&[s("editor"), s("insert"), id.to_string(), s("iX")], &c)
+            .dispatch(&[s("vi"), s("insert"), id.to_string(), s("iX")], &c)
             .await;
         match inserted {
             KjResult::Ok { data: Some(dd), .. } => {
@@ -434,7 +434,7 @@ mod tests {
 
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &opener)
             .await;
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &opener).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &opener).await;
         let id = session_of(&opened);
         let target = crate::editor::resolve_editor_target(P, d.kernel().file_cache())
             .await
@@ -449,7 +449,7 @@ mod tests {
         };
 
         let keyed = d
-            .dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &editor)
+            .dispatch(&[s("vi"), s("keys"), id.to_string(), s("iX<Esc>")], &editor)
             .await;
         assert!(matches!(keyed, KjResult::Ok { .. }), "keys failed: {keyed:?}");
         assert_eq!(text(), "Xhello", "keys must change the block");
@@ -461,7 +461,7 @@ mod tests {
         );
 
         let pasted = d
-            .dispatch(&[s("editor"), s("insert"), id.to_string(), s("paste")], &editor)
+            .dispatch(&[s("vi"), s("insert"), id.to_string(), s("paste")], &editor)
             .await;
         assert!(matches!(pasted, KjResult::Ok { .. }), "paste failed: {pasted:?}");
         assert!(text().contains("paste"), "paste must change the block: {}", text());
@@ -473,7 +473,7 @@ mod tests {
 
         let before_read = text().len();
         let read = d
-            .dispatch(&[s("editor"), s("keys"), id.to_string(), format!(":r {P}<CR>")], &editor)
+            .dispatch(&[s("vi"), s("keys"), id.to_string(), format!(":r {P}<CR>")], &editor)
             .await;
         assert!(matches!(read, KjResult::Ok { .. }), ":r failed: {read:?}");
         assert!(text().len() > before_read, ":r must splice file content: {}", text());
@@ -483,7 +483,7 @@ mod tests {
             "the input actor owns the asynchronous :r splice"
         );
 
-        let quit = d.dispatch(&[s("editor"), s("quit"), id.to_string()], &editor).await;
+        let quit = d.dispatch(&[s("vi"), s("quit"), id.to_string()], &editor).await;
         assert!(matches!(quit, KjResult::Ok { .. }), "quit failed: {quit:?}");
         assert_eq!(text(), "hello", "quit must restore the original block");
         assert_eq!(
@@ -493,7 +493,7 @@ mod tests {
         );
     }
 
-    /// `kj editor insert` refuses while the `:` command line is open — the
+    /// `kj vi insert` refuses while the `:` command line is open — the
     /// buffer is left unchanged and the reason rides the status message, not
     /// a hard error.
     #[tokio::test]
@@ -504,16 +504,16 @@ mod tests {
 
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("ab")], &c)
             .await;
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &c).await;
         let id = session_of(&opened);
 
         // Open the ':' bar without submitting.
-        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s(":")], &c)
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s(":")], &c)
             .await;
 
         let inserted = d
             .dispatch(
-                &[s("editor"), s("insert"), id.to_string(), s("PASTE")],
+                &[s("vi"), s("insert"), id.to_string(), s("PASTE")],
                 &c,
             )
             .await;
@@ -529,7 +529,7 @@ mod tests {
         }
     }
 
-    /// `kj editor list` is the census: an open session, however it was
+    /// `kj vi list` is the census: an open session, however it was
     /// opened, must show up with its session id and path.
     #[tokio::test]
     async fn kj_editor_list_reports_the_open_session() {
@@ -539,10 +539,10 @@ mod tests {
 
         d.dispatch(&[s("rc"), s("add"), s(P), s("--content"), s("hello")], &c)
             .await;
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P)], &c).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P)], &c).await;
         let id = session_of(&opened);
 
-        let listed = d.dispatch(&[s("editor"), s("list")], &c).await;
+        let listed = d.dispatch(&[s("vi"), s("list")], &c).await;
         match listed {
             KjResult::Ok { data: Some(dd), .. } => {
                 let arr = dd.as_array().expect("list data is a JSON array");
@@ -598,21 +598,21 @@ mod tests {
         let (_ctx, caller) = uncapable_caller(&d).await;
 
         // Opening is ungated — no capability required at all.
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P2)], &caller).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P2)], &caller).await;
         let id = session_of(&opened);
 
         // A plain edit (no write verb) is ungated too.
         let edited = d
-            .dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
+            .dispatch(&[s("vi"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
             .await;
         assert!(
             !matches!(edited, KjResult::Err(_)),
             "a plain edit must not require the editor capability: {edited:?}"
         );
 
-        // `kj editor save` is denied the same way.
+        // `kj vi save` is denied the same way.
         let denied_save = d
-            .dispatch(&[s("editor"), s("save"), id.to_string()], &caller)
+            .dispatch(&[s("vi"), s("save"), id.to_string()], &caller)
             .await;
         assert!(
             matches!(denied_save, KjResult::Err(_)),
@@ -631,18 +631,18 @@ mod tests {
         let (ctx, caller) = uncapable_caller(&d).await;
         grant_editor(&d, ctx);
 
-        let opened = d.dispatch(&[s("editor"), s("open"), s(P2)], &caller).await;
+        let opened = d.dispatch(&[s("vi"), s("open"), s(P2)], &caller).await;
         let id = session_of(&opened);
 
         let saved = d
-            .dispatch(&[s("editor"), s("save"), id.to_string()], &caller)
+            .dispatch(&[s("vi"), s("save"), id.to_string()], &caller)
             .await;
         assert!(!matches!(saved, KjResult::Err(_)), "save should succeed: {saved:?}");
 
-        d.dispatch(&[s("editor"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
+        d.dispatch(&[s("vi"), s("keys"), id.to_string(), s("iX<Esc>")], &caller)
             .await;
         let written = d
-            .dispatch(&[s("editor"), s("keys"), id.to_string(), s(":w<CR>")], &caller)
+            .dispatch(&[s("vi"), s("keys"), id.to_string(), s(":w<CR>")], &caller)
             .await;
         assert!(
             !matches!(written, KjResult::Err(_)),
@@ -661,7 +661,7 @@ mod tests {
         d
     }
 
-    /// `kj editor keys` refuses a write intent at the flush, not by
+    /// `kj vi keys` refuses a write intent at the flush, not by
     /// pre-parsing the key text: `iX<Esc>:w<CR>` is one batch, the edit
     /// mirrors onto the block same as always (that's the buffer, not the
     /// file), and only the write half is refused — disk is untouched, the
@@ -683,13 +683,13 @@ mod tests {
 
         let (_ctx, caller) = uncapable_caller(&d).await;
         let opened = d
-            .dispatch(&[s("editor"), s("open"), s("/mem/note.txt")], &caller)
+            .dispatch(&[s("vi"), s("open"), s("/mem/note.txt")], &caller)
             .await;
         let id = session_of(&opened);
 
         let result = d
             .dispatch(
-                &[s("editor"), s("keys"), id.to_string(), s("iX<Esc>:w<CR>")],
+                &[s("vi"), s("keys"), id.to_string(), s("iX<Esc>:w<CR>")],
                 &caller,
             )
             .await;
@@ -732,12 +732,12 @@ mod tests {
         let (ctx2, caller2) = uncapable_caller(&d).await;
         grant_editor(&d, ctx2);
         let opened2 = d
-            .dispatch(&[s("editor"), s("open"), s("/mem/note2.txt")], &caller2)
+            .dispatch(&[s("vi"), s("open"), s("/mem/note2.txt")], &caller2)
             .await;
         let id2 = session_of(&opened2);
         let written = d
             .dispatch(
-                &[s("editor"), s("keys"), id2.to_string(), s("iY<Esc>:w<CR>")],
+                &[s("vi"), s("keys"), id2.to_string(), s("iY<Esc>:w<CR>")],
                 &caller2,
             )
             .await;

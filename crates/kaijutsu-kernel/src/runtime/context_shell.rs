@@ -158,9 +158,6 @@ impl EmbeddedKaish {
                 tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
                     d.clone(), "vi", identity, scm.clone(),
                 ));
-                tools.register(crate::runtime::vi_builtin::ViBuiltin::new(
-                    d.clone(), "edit", identity, scm.clone(),
-                ));
                 // `fg` — job-control resume of an editor suspended with Ctrl+Z.
                 tools.register(crate::runtime::vi_builtin::FgBuiltin::new(
                     d.clone(),
@@ -678,9 +675,29 @@ mod tests {
         assert!(d.block_store().block_snapshots(initial).unwrap().is_empty());
     }
 
+    /// `edit` is kaish's hashline editor, not a vi front door. Production
+    /// construction must not route it to a vi session, whatever its arguments.
+    #[tokio::test]
+    async fn edit_is_kaish_hashline_and_opens_no_vi_session() {
+        let d = dispatcher_with_full_broker().await;
+        let requester = PrincipalId::new();
+        let context = register_context(&d, Some("edit-not-vi"), None, requester);
+        grant_broad_binding(&d, context, false).await;
+        d.block_store().create_document(context, kaijutsu_types::DocKind::Conversation, None).unwrap();
+        use crate::vfs::VfsOps;
+        d.kernel().vfs().write_all(std::path::Path::new("/config/kernel/edit-not-vi.txt"), b"original").await.unwrap();
+        let identity = ShellIdentity {
+            requester, performer: requester, reviewer: None, context, session: SessionId::new(),
+        };
+        let kaish = EmbeddedKaish::for_context(&d, "edit-not-vi", identity,
+            ShellPolicy::Agent, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+        let _ = kaish.execute_with_options("edit /config/kernel/edit-not-vi.txt", ExecuteOptions::default()).await.unwrap();
+        assert!(d.kernel().editor_list().is_empty(), "edit must not allocate a vi session");
+    }
+
     #[tokio::test]
     async fn editor_reads_preserve_performer_and_context_at_open() {
-        for front_door in ["vi", "edit", "kj editor open"] {
+        for front_door in ["vi", "kj vi open"] {
             let d = dispatcher_with_full_broker().await;
             let requester = PrincipalId::new();
             let performer = PrincipalId::new();
@@ -757,7 +774,7 @@ mod tests {
             "block_create --role user --kind text --content readonly-must-not-write".to_string(),
             format!("vi {path}"),
             format!("edit {path}"),
-            format!("kj editor keys {} ':r !echo readonly-must-not-write<CR>'", editor.as_u64()),
+            format!("kj vi keys {} ':r !echo readonly-must-not-write<CR>'", editor.as_u64()),
             "curl -X POST http://127.0.0.1:9".to_string(),
         ] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
@@ -773,9 +790,9 @@ mod tests {
         assert!(wrong.is_empty(), "mutating tools must refuse before dispatch:\n{}", wrong.join("\n"));
         assert!(!d.block_store().block_snapshots(context).unwrap().iter().any(|b| b.content == "readonly-must-not-write"));
         assert_eq!(d.kernel().editor_state(editor).unwrap().text, "original");
-        assert_eq!(d.kernel().editor_list().len(), 1, "refused vi/edit must not allocate sessions");
+        assert_eq!(d.kernel().editor_list().len(), 1, "refused vi must not allocate sessions");
         let mut failed_reads = Vec::new();
-        for command in ["kj context list", "kj block list", "kj editor open --help", "cat /config/kernel/readonly-editor.txt",
+        for command in ["kj context list", "kj block list", "kj vi open --help", "cat /config/kernel/readonly-editor.txt",
             "kj help", "kj context create help", "kj synth status", "kj synth help", "kj synth --help"] {
             let result = d.kernel().broker().call_tool(KernelCallParams {
                 instance: InstanceId::new(crate::mcp::servers::shell::ShellServer::INSTANCE), tool: "shell".into(),

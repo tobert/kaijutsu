@@ -117,7 +117,7 @@ watch the room. For a live A/B without a reconnect, use BRP
   `ScenePalette` (add one if genuinely new) × a tier; live signals get a gain.
   UI → add a `theme.toml` key + `Theme` field; no literals in view code.
 - **Re-skin the app**: edit `/config/kernel/theme.toml` directly — with the
-  file tools, `kj editor /config/kernel/theme.toml`, or vim — then reconnect
+  file tools, `kj vi /config/kernel/theme.toml`, or vim — then reconnect
   the app (UI + post apply on `ThemeReceived`; there is no live push, so a
   running app keeps the old theme until it reconnects). Re-enter the room for
   scene hues, which are read at spawn time. The shipped default skin lives in

@@ -439,6 +439,20 @@ operator and motion) closes the gap. Scrolls other than page and half page
   go to the first line; a settled window height would need a session-level
   size from the client.
 
+## The `:` line parses vi paths in two places (2026-10-12)
+
+`:vi <args>` landed in both clients as the shell statement `vi <args>`. The
+tui's `cmdline::parse` and the app's `colon_vi_statement`
+(`input/compose/mod.rs`) each carry the same rule. Nothing shares the function,
+because the tui does not depend on the app's Bevy stack. Both carry tests for
+the rule. A shared home (`kaijutsu-types` or `kaijutsu-client`) would remove
+the second copy; `:kj` is parsed the same two ways.
+
+Open: what a second `:vi` does while a session is already on screen
+(replace, refuse, or stack). Neither client decides it yet.
+
+---
+
 ## Unsent drafts have no dead-letter record (2026-10-11)
 
 Forks leave a draft with the parent and log its metadata

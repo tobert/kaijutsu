@@ -180,8 +180,11 @@ insert-mode box lands as text after the loaded draft. Held keys always go
 to the chat draft they were typed for, even after `Ctrl+Z`; a second switch
 before the first draft loads drops them, and an error toast says how many. A `:` line is
 refused with a notice: compose runs no ex commands, and the shell is
-`Ctrl+Z`. A failed edit or submit shows as an error toast; a failed chat
-submit reads the kernel's draft back, since the kernel keeps it.
+`Ctrl+Z`. The one exception is `:vi <args>`, which runs as the shell statement
+`vi <args>` (the same as the tui's `:vi`), and the editor opens on this window
+through the kernel's open signal. A failed edit or submit shows as an error
+toast; a failed chat submit reads the kernel's draft back, since the kernel
+keeps it.
 
 ## Escape — two meanings total
 

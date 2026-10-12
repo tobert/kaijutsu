@@ -1582,7 +1582,7 @@ mod tests {
 
     /// Coverage map for the editing surface the e2e can drive end to end. Each
     /// case is real modalkit vim flowing through `apply_keys` → buffer; the
-    /// *whole* `kj editor`/kernel-session stack observes exactly these
+    /// *whole* `kj vi`/kernel-session stack observes exactly these
     /// text/cursor/mode changes. This battery IS the answer to "how much of vi
     /// can we test headless" — the normal-mode editing surface, in full.
     mod coverage {

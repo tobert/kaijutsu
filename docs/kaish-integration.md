@@ -136,7 +136,7 @@ These are source observations, not promises that all paths behave alike.
   current scope.
 - `runtime/editor_read.rs` owns `:r !cmd` on the existing kernel worker. Caller
   drop and shutdown cancel the read and allow kaish to finish cleanup; nested
-  `kj editor keys` can re-enter without blocking that worker. The editor receives
+  `kj vi keys` can re-enter without blocking that worker. The editor receives
   complete UTF-8 text or an error before splicing. Truncated output is refused
   explicitly; shell scope changes remain local. No command hooks or transcript
   pair are added to this consumer.
@@ -510,7 +510,7 @@ performer and the block store's atomic whole-text replacement. Editor input
 uses its current actor through keys, paste, asynchronous read insertion, and
 rollback. The opener remains the owner of `:r !` execution; the read result's
 insertion belongs to whoever submitted the keys. RPC input uses the connection
-principal and `kj editor` uses its invoking performer. Original block IDs and
+principal and `kj vi` uses its invoking performer. Original block IDs and
 authors remain unchanged. Durable per-edit provenance remains separate work.
 
 ## Wrapped python

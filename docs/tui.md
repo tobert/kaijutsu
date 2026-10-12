@@ -685,6 +685,7 @@ compose's bar.
 ```text
   :kj fork --name alt              run kj, blocks land like a player's own
   :!git status                     one kaish statement, the gated human path
+  :vi notes/draft.md               open the kernel-owned vi on a path
   :q                               quit, unless a turn is known running
   :kj con█                         the bar draws on the compose row
   :!git status█                    a shell line, drawn as typed
@@ -703,14 +704,18 @@ compose's bar.
   way it always did); its `Ok`/`Err` is drained via `take_commands()` and
   never surfaced — the core's `Err("Not an editor command")` for a line like
   `:kj fork` is not this parse's failure.
-- Three verbs, whitespace-split (no shell-style quoting — MVP):
-  `:kj <argv>` runs through `execute_kj` (a player's command, so it authors
-  its block pair); `:!<statement>` runs through `shell_execute`, the gated
-  path a key press already took on the old shell surface, and joins its
-  history; `:q` quits unless this client knows of a turn still running,
-  which warns instead (`:q!` quits regardless — the turn keeps running in
-  the kernel). Anything else is a status-line notice naming the line
-  verbatim, and the draft is untouched.
+- Four verbs. `:kj <argv>` is whitespace-split (no shell-style quoting —
+  MVP) and runs through `execute_kj` (a player's command, so it authors its
+  block pair); `:!<statement>` runs through `shell_execute`, the gated path a
+  key press already took on the old shell surface, and joins its history;
+  `:vi <args>` is `:!vi <args>`: the rest of the line runs as one shell
+  statement, so quotes follow shell rules (`:vi "my notes.md"`), and the
+  builtin opens the editor and takes the alternate screen (`docs/vi.md`). A
+  failed open lands in the command block, as any `:!` failure does;
+  `:q` quits unless this client knows of a turn still running, which warns
+  instead (`:q!` quits regardless — the turn keeps running in the kernel).
+  Anything else is a status-line notice naming the line verbatim, and the
+  draft is untouched.
 - The bar keeps a local history (`compose.rs`'s `ColonHistory` — the core
   surfaces no history hook of its own, so this is hand-rolled the way
   `shell.rs`'s used to be), walked by `Up`/`Down`. `:kj` and `:!` lines
@@ -1188,7 +1193,8 @@ this slice exposes, it does not guess.
 
 ### Editor and diff
 
-`vi <path>` and `kj editor` open the kernel-owned editor session; the TUI
+`vi <path>` (in the shell, or `:vi` on the bar) and `kj vi` open the
+kernel-owned editor session; the TUI
 forwards keys through `editor_keys` and draws the pushed `EditorState`
 (`kaijutsu.capnp`, `EditorState`). Both take the alternate screen and return
 on `:q`. `kaijutsu-editor` drives modalkit on

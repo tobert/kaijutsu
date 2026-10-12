@@ -14,7 +14,7 @@ use super::embedded_kaish::EmbeddedKaish;
 
 /// Keep execution alive through cooperative cancellation when the read's caller
 /// disappears. The existing runtime joins this task on shutdown, including when
-/// a `kj editor keys` call re-enters from another task on that same runtime.
+/// a `kj vi keys` call re-enters from another task on that same runtime.
 pub(crate) async fn read_shell(
     dispatcher: Arc<KjDispatcher>, identity: ShellIdentity, code: String,
 ) -> Result<String, String> {

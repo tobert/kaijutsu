@@ -281,6 +281,20 @@ fn a_kj_line_runs_structured_and_anything_else_runs_in_the_shell() {
     assert_eq!(shell_kj_argv("echo kj"), None);
 }
 
+/// `:vi <args>` on the `:` bar is the shell statement `vi <args>`, the same
+/// as `:!vi <args>` in the tui: quotes and `$vars` mean what they mean in the
+/// shell. `:vim` and every other `:` line are not a vi open.
+#[test]
+fn colon_vi_runs_the_builtin_through_the_shell() {
+    assert_eq!(colon_vi_statement(":vi notes.md").as_deref(), Some("vi notes.md"));
+    assert_eq!(colon_vi_statement(":vi   rc/S00.kai  ").as_deref(), Some("vi rc/S00.kai"));
+    assert_eq!(colon_vi_statement(":vi \"my notes.md\"").as_deref(), Some("vi \"my notes.md\""));
+    assert_eq!(colon_vi_statement(":vi").as_deref(), Some("vi"));
+    assert_eq!(colon_vi_statement(":vim notes.md"), None);
+    assert_eq!(colon_vi_statement(":w"), None);
+    assert_eq!(colon_vi_statement("vi notes.md"), None);
+}
+
 #[test]
 fn byte_offsets_count_multibyte_chars() {
     assert_eq!(byte_offset("café!", 4), 5);

@@ -1,4 +1,4 @@
-//! In-app editor: the kernel-owned editing surface (the `vi`/`edit` builtin +
+//! In-app editor: the kernel-owned editing surface (the `vi` builtin +
 //! `vi` default).
 //!
 //! Two parts:
@@ -79,7 +79,7 @@ use std::collections::HashMap;
 use kaijutsu_editor::{CloseRequest, CommandRequest, EditorCore, EditorIo};
 pub use kaijutsu_types::editor::{EditorSelection, SelectionShape};
 
-/// A one-line census entry for an open session — what `kj editor list` shows.
+/// A one-line census entry for an open session — what `kj vi list` shows.
 /// Full ids (never truncated), matching the `.data` convention every other
 /// `kj` list surface uses (`kj block list`, `kj doc list`, …) so a driver can
 /// round-trip these back into other kj commands without re-resolving.
@@ -171,7 +171,7 @@ impl KeysOutcome {
 pub struct EditorSessionId(u64);
 
 impl EditorSessionId {
-    /// The raw handle value — the currency the `kj editor` / wire surface uses.
+    /// The raw handle value — the currency the `kj vi` / wire surface uses.
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -209,7 +209,7 @@ pub struct EditorState {
 
 impl EditorState {
     /// Structured `.data` for one session, stamped with its handle — the single
-    /// shape every editor front door emits (`kj editor`, the `vi`/`edit`
+    /// shape every editor front door emits (`kj vi`, the `vi`
     /// builtin). Object form (inspect-style) so a driver reads one
     /// record. Keeping it here means the shape can't drift between front doors.
     pub fn to_json(&self, session: EditorSessionId) -> serde_json::Value {
@@ -227,7 +227,7 @@ impl EditorState {
 }
 
 /// Who opened a session, and the shell context they opened from — captured at
-/// the front door (`vi`/`edit`, `kj editor`) and recorded on the
+/// the front door (`vi`, `kj vi`) and recorded on the
 /// session. Two consumers:
 ///
 /// - **`fg`** re-foregrounds the caller's most-recent session by `principal`.
@@ -858,7 +858,7 @@ impl EditorSessions {
         self.sessions.contains_key(&id)
     }
 
-    /// A census of every open session — `kj editor list`'s data. A session
+    /// A census of every open session — `kj vi list`'s data. A session
     /// whose opener walked away (a model that opened and never quit, a dead
     /// headless driver) is otherwise invisible and immortal; this makes it
     /// visible. No GC/eviction here — observability first, judgment later.
@@ -1223,7 +1223,7 @@ mod session_tests {
         // `unpin`), and `Kernel::editor_quit`/`editor_keys_checked` both
         // propagate this `Err` via `?` before reaching their own `unpin`
         // call. A session that's still open here is a session a caller can
-        // still see (`kj editor list`), still holds its rightful pin, and
+        // still see (`kj vi list`), still holds its rightful pin, and
         // can still be retried or otherwise resolved — not an orphan.
         assert!(
             sessions.is_open(id),
@@ -1753,7 +1753,7 @@ mod session_tests {
 
     #[tokio::test]
     async fn list_censuses_every_open_session_by_id_dirty_and_opener() {
-        // `kj editor list`'s data source: a leaked session (an opener who
+        // `kj vi list`'s data source: a leaked session (an opener who
         // walked away) must show up here, since there is no other way to see
         // it. Two sessions on the same block, only one dirtied — and without
         // a reconcile the sibling's own buffer stays untouched (that's the

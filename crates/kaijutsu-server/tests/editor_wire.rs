@@ -553,7 +553,7 @@ fn editor_shell_reads_complete_text_and_refuses_binary_over_the_wire() {
         let client = connect_client(addr).await;
         let (kernel, _) = client.bind_kernel().await.unwrap();
         let context = create_context(&kernel, "editor-read").await.unwrap();
-        let opened = kernel.execute_kj(context, &["editor".into(), "open".into(), RC_PATH.into()]).await.unwrap();
+        let opened = kernel.execute_kj(context, &["vi".into(), "open".into(), RC_PATH.into()]).await.unwrap();
         assert_eq!(opened.exit_code, 0, "{opened:?}");
         let session = opened.data.unwrap()["session"].as_u64().unwrap();
         let original = kernel.editor_state(session).await.unwrap();
@@ -582,12 +582,12 @@ fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
         let contexts = kernel.list_contexts().await.unwrap();
         let context = kaijutsu_client::choose_parent(None, &contexts).unwrap().context_id;
         kernel.join_context(context, "readonly-editor").await.unwrap();
-        let opened = kernel.execute_kj(context, &["editor".into(), "open".into(), RC_PATH.into()]).await.unwrap();
+        let opened = kernel.execute_kj(context, &["vi".into(), "open".into(), RC_PATH.into()]).await.unwrap();
         assert_eq!(opened.exit_code, 0, "{opened:?}");
         let session = opened.data.unwrap()["session"].as_u64().unwrap();
         let original = kernel.editor_state(session).await.unwrap();
         for command in [
-            format!("kj editor keys {session} ':r !echo must-not-land<CR>'"),
+            format!("kj vi keys {session} ':r !echo must-not-land<CR>'"),
             "kj block $(echo create) --role user --kind text --content must-not-land".to_string(),
             "block_create --role user --kind text --content must-not-land".to_string(),
         ] {
@@ -601,7 +601,7 @@ fn read_only_model_shell_cannot_drive_editor_mutations_over_the_wire() {
         assert_eq!(unchanged.text, original.text);
         assert_eq!(unchanged.dirty, original.dirty);
         let (_, content, status) = common::shell_exec_wait(&kernel,
-            "shell --command 'kj editor list'", context).await;
+            "shell --command 'kj vi list'", context).await;
         assert_eq!(status, kaijutsu_types::Status::Done, "{content}");
         let direct = kernel.editor_keys(session, ":r !echo direct-read<CR>").await.unwrap();
         assert_eq!(direct.text, format!("direct-read\n{}", original.text));

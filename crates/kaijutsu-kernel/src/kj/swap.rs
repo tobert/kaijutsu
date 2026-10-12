@@ -54,7 +54,7 @@ enum SwapCommand {
 /// The write capability `kj swap ack`/`discard` gate on — the same
 /// `builtin.file` `edit` tool capability that governs every other write to a
 /// file buffer through this cache (`mcp/servers/file.rs`'s hashline `edit`).
-/// `kj editor save` flushes through this same `FileDocumentCache` but the kj
+/// `kj vi save` flushes through this same `FileDocumentCache` but the kj
 /// front door does not yet gate it (a separate, already-known gap); this verb
 /// does not repeat that gap.
 fn write_cap() -> Capability {

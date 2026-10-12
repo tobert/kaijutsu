@@ -476,6 +476,17 @@ pub fn shell_kj_argv(line: &str) -> Option<Vec<String>> {
     (words.next()? == "kj").then(|| words.map(str::to_string).collect())
 }
 
+/// The shell statement a `:vi <args>` line on the `:` bar runs: `vi <args>`,
+/// trimmed, the same as `:!vi <args>` in the tui (`kaijutsu-tui`'s
+/// `cmdline::parse`). `None` for any other line, `:vim` included.
+pub fn colon_vi_statement(line: &str) -> Option<String> {
+    let body = line.strip_prefix(':')?;
+    if body == "vi" {
+        return Some("vi".to_string());
+    }
+    body.strip_prefix("vi ").map(|args| format!("vi {}", args.trim()))
+}
+
 /// A char offset into `text` as a byte offset, for the parley layout.
 pub fn byte_offset(text: &str, chars: usize) -> usize {
     text.char_indices().nth(chars).map_or(text.len(), |(byte, _)| byte)

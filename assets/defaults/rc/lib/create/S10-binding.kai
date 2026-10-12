@@ -17,7 +17,7 @@ kj binding allow "house"
 # subprocess bypasses the VFS entirely, so it's a dedicated authority — the
 # narrow roles (musician, toolie) never carry it.
 kj binding allow "exec"
-# The kernel-owned interactive editor's WRITE path (kj editor save, and a
+# The kernel-owned interactive editor's WRITE path (kj vi save, and a
 # `keys` batch that submits :w/:w!/:wq/:x/ZZ) — open/keys(otherwise)/state/
 # quit/list stay ungated. Dedicated authority, not implied by "*"
 # (docs/vi.md; Amy, 2026-08-20 — experiment ahead of a capability-names

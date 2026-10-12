@@ -2659,7 +2659,7 @@ pub fn restore_terminal() {
 /// between the app and a headless `vi`.
 const PEER_NICK: &str = "kaijutsu-tui";
 
-/// Attach as a peer so `vi <path>` and `kj editor` reach this terminal.
+/// Attach as a peer so `vi <path>` and `kj vi` reach this terminal.
 ///
 /// This is the **only** notification that an editor session opened. The
 /// `subscribeEditor` push channel carries state changes and closes; the kernel
