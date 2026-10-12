@@ -3,8 +3,9 @@
 //! The tool records the model's verdict; the turn loop gives it its effect
 //! (`runtime/llm_stream.rs`, `DONE_TOOL`). A context that is offered `done`
 //! ends its turn by calling it: a successful call ends the turn after its
-//! batch, and a reply with no tool call is answered with a notice instead of
-//! ending the turn. The call and its result are ordinary durable blocks, so a
+//! batch. In a driven turn (`TurnOrigin::Autonomous`), a reply with no tool
+//! call is answered with a notice instead of ending the turn; a turn a person
+//! prompted ends on that reply. The call and its result are ordinary durable blocks, so a
 //! driver reading the context (`kj wait`, an ACP client) reads the verdict
 //! there.
 //!
@@ -99,8 +100,8 @@ impl McpServerLike for BuiltinTurnServer {
                 "End the task and report how it ended. Call it when the task is complete and \
                  checked, when you are blocked on something only someone else can give, when \
                  you are giving up, or when you refuse a task that is unsafe or too ambiguous to \
-                 do safely. The turn ends after this call; a reply without a tool call does not \
-                 end it."
+                 do safely. The turn ends after this call. In a task you were given to run on \
+                 your own, a reply without a tool call does not end it."
                     .to_string(),
             ),
             input_schema: tool_input_schema::<DoneParams>(),

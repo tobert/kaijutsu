@@ -178,19 +178,19 @@ text = "make the directory"
 tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done", status = "completed" }]
 ```
 
-An ACP session runs a coder context, which is offered `done`, so a scripted
-model ends each task the way a coder must: its last reply calls `done`, and
-that prompt's `tool_calls` lists it. A reply with no tool call does not end
-the turn. The kernel answers it with a notice and takes another reply, at
-most twice (`docs/conversation-session.md`, "Ending a task with done"); a
-script with no reply left then fails the prompt, and the agent's stderr
-says the mock script was exhausted. The runner adds no `done` of its own.
+An ACP session runs a coder context, which is offered `done`. A scripted
+model usually ends each task by calling it, and that prompt's `tool_calls`
+lists it. An ACP prompt is a person's turn (`TurnOrigin::Interactive`), so a
+reply with no tool call also ends it, with no notice
+(`docs/conversation-session.md`, "Ending a task with done"). The runner adds
+no `done` of its own.
 
-The notice is a `(System, Notification)` block, which the bridge sends as
-`agent_message_chunk` text. `fleet/done-nudge.toml` shows the whole shape: a
-text-only reply, the notice, then a reply that calls `done`, and
+`fleet/done-prompted.toml` shows both endings: a text-only reply ends the
+first prompt, and a reply that calls `done` ends the second, each with
 `stopReason: end_turn`. The `done` call arrives with no `kind`, which ACP
-reads as `other`, so Harbor names the step by its title, `done`.
+reads as `other`, so Harbor names the step by its title, `done`. A headless
+ACP client that wants the notice has no way to ask for it yet
+(`docs/issues.md`).
 
 A turn that ends another way needs no `done`. A cancelled turn ends at the
 cancel (`fleet/cancel.toml`). A background completion starts a turn of its

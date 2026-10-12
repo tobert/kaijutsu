@@ -3248,11 +3248,14 @@ async fn run_llm_stream(
             {
                 continue 'agentic;
             }
-            // A context offered `done` ends its task by calling it. Text alone
-            // is narration, not an ending: ask for a tool call or `done`, up to
-            // `MAX_DONE_NUDGES` times. The guards are the ceiling's: no notice
-            // for an inference that will not run.
-            if offers_done && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
+            // A driven turn in a context offered `done` ends its task by
+            // calling it. Text alone is narration, not an ending: ask for a
+            // tool call or `done`, up to `MAX_DONE_NUDGES` times. A turn a
+            // person prompted ends on text, because the person answers it.
+            // The other guards are the ceiling's: no notice for an inference
+            // that will not run.
+            if offers_done && origin == TurnOrigin::Autonomous
+                && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
                 && !stop.timed_delivery && !stop.cancelled && !stop.stopping_after_turn
             {
                 done_nudges += 1;
@@ -3269,7 +3272,7 @@ async fn run_llm_stream(
                 messages.push(LlmMessage::user(notice.to_string()));
                 continue 'agentic;
             }
-            if offers_done {
+            if offers_done && origin == TurnOrigin::Autonomous {
                 tracing::warn!(%context_id, nudges = done_nudges, "The turn ended without `done`");
             }
             tracing::debug!("Agentic loop complete - no tool calls this iteration");
@@ -4184,12 +4187,19 @@ mod publish_tests {
         ]
     }
 
+    /// A driven turn in a context offered `done`, as `kj drive` starts one.
     async fn turn_offering_done(name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
+        -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
+    {
+        turn_offering_done_from(TurnOrigin::Autonomous, name, script).await
+    }
+
+    async fn turn_offering_done_from(origin: TurnOrigin, name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
         -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
     {
         let kernel = Arc::new(Kernel::new_ephemeral(name).await);
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Interactive, kernel.clone(),
+        let (documents, ctx, _player) = drive_turn_offering(origin, kernel.clone(),
             Provider::Mock(MockClient::new("unused").with_scripted_stream(script)), |_| {}, 0, vec![done_tool()], vec![]).await;
         let reason = match completed.try_recv().expect("the turn completes once").payload {
             TurnFlow::Completed { reason, .. } => reason,
@@ -4217,9 +4227,9 @@ mod publish_tests {
         }).await;
     }
 
-    /// Text with no tool call does not end a turn that was offered `done`. The
-    /// kernel asks for a tool call or `done`, and a model that then calls it
-    /// ends there.
+    /// Text with no tool call does not end a driven turn that was offered
+    /// `done`. The kernel asks for a tool call or `done`, and a model that
+    /// then calls it ends there.
     #[tokio::test]
     async fn text_without_done_is_nudged_and_done_then_ends_the_turn() {
         tokio::task::LocalSet::new().run_until(async {
@@ -4230,6 +4240,25 @@ mod publish_tests {
             let nudge = blocks.iter().find(|b| b.kind == BlockKind::Notification).unwrap();
             assert_eq!(nudge.role, Role::System, "a kernel fact, not model text");
             assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")));
+        }).await;
+    }
+
+    /// A turn a person prompted ends on a text-only reply even when `done` is
+    /// offered: the person reads the reply and answers it. `done` still ends
+    /// such a turn when the model calls it.
+    #[tokio::test]
+    async fn an_interactive_turn_ends_on_text_without_a_nudge() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (reason, blocks) = turn_offering_done_from(TurnOrigin::Interactive, "done-interactive",
+                vec![text_reply("Which branch should I use?"), text_reply("SHOULD NOT RUN")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert_eq!(nudges(&blocks), 0, "no nudge on a prompted turn");
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")), "the text reply ended the turn");
+
+            let (reason, blocks) = turn_offering_done_from(TurnOrigin::Interactive, "done-interactive-call",
+                vec![done_call("call_done"), text_reply("SHOULD NOT RUN")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")), "done ended the turn");
         }).await;
     }
 

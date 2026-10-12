@@ -1,0 +1,22 @@
+description = "An ACP prompt is a person's turn: a coder's text-only reply ends it with no notice, and the next prompt's done call ends that one."
+
+# The first reply asks a question and calls no tool. The turn ends there. If
+# the kernel answered it with a notice instead, prompt 1 would take the
+# second reply and its done call, and prompt 2 would exhaust the script.
+[[model]]
+text = "Which test suite should I run?"
+[[model]]
+text = "The tests pass."
+tool_calls = [{ name = "done", input = { status = "done", feedback = "the tests pass" } }]
+
+[[prompt]]
+text = "run the tests"
+text_contains = ["Which test suite should I run?"]
+tool_calls = []
+
+# Harbor names a call of kind `other` by its title, so `done` reaches its
+# trajectory as `done` with the verdict as output.
+[[prompt]]
+text = "the unit tests"
+text_contains = ["The tests pass."]
+tool_calls = [{ title = "done", kind = "other", status = "completed", output_contains = "done: the tests pass" }]

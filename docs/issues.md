@@ -1324,12 +1324,18 @@ more readily than other agents". Open, most costly first:
   client see the verdict; nothing pushes it (a drift to the parent) to a
   driver that does not wait. Build the push when a driver needs it.
 - **Over ACP, a kernel notice reads as the model's own words.** The bridge
-  sends a `(System, Notification)` block (the `done` nudge, the ceiling
-  notice) as `agent_message_chunk` text with no separator, so a client shows
-  "Next I'll run the tests.You replied without a tool call…" and Harbor's
-  trajectory records the notice as model output. A thought chunk or a
-  separated, labeled message would read honestly
-  (`fleet/done-nudge.toml` pins today's shape).
+  sends a `(System, Notification)` block (the ceiling notice) as
+  `agent_message_chunk` text with no separator, so Harbor's trajectory
+  records the notice as model output. A thought chunk or a separated,
+  labeled message would read honestly. No fleet scenario pins this shape
+  since ACP prompts stopped getting the `done` notice.
+- **An ACP client cannot say it runs headless.** Every ACP prompt is an
+  interactive turn, so a coder driven by Harbor ends on a text-only reply
+  instead of being asked for a tool call or `done` (2026-10-12). Amy wants a
+  way for a client to mark its session headless; headless sessions need
+  affordances an interactive one should not get. The ACP session filters
+  turn events on `TurnOrigin::Interactive` (`kaijutsu-acp/src/session.rs`),
+  so a driven ACP turn touches that too.
 - **A background completion after `done` starts a turn that calls `done`
   again.** `kj wait` and `classify_run.py` read the last verdict, so they
   report the follow-up turn's, not the task's. Harbor reads the first.
