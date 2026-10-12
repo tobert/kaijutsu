@@ -555,7 +555,7 @@ fn short_id(id: &str) -> String {
         return ctx.short();
     }
     if id.len() > 12 {
-        format!("{}…", &id[..12])
+        format!("{}…", &id[..id.floor_char_boundary(12)])
     } else {
         id.to_string()
     }
@@ -669,5 +669,17 @@ impl Plugin for TilingReconcilerPlugin {
                 )
                     .in_set(TilingPhase::PostReconcile),
             );
+    }
+}
+
+#[cfg(test)]
+mod short_id_tests {
+    use super::short_id;
+
+    #[test]
+    fn short_id_cuts_on_a_char_boundary() {
+        // '—' spans bytes 11..14, across the 12-byte cut.
+        let id = format!("{}—tail", "x".repeat(11));
+        assert_eq!(short_id(&id), format!("{}…", "x".repeat(11)));
     }
 }
