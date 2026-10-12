@@ -549,6 +549,15 @@ the line to be sent or cleared, not only for a pause in typing.
   The outbox keeps that cost off the key path, but a long burst still
   drains at that rate.
 
+## Directory listing costs one `getattr` per entry (2026-10-12)
+
+`MountBackend::list` calls `getattr` on each entry after `readdir`, so
+`ls -l` reports real sizes, times, and permissions. A directory of N
+entries costs N + 1 VFS calls, made one at a time, even for a plain `ls`
+that shows only names. Open: whether the VFS `readdir` should return
+attributes, or `list` should run its `getattr` calls concurrently, if a
+large directory or slow mount makes this visible.
+
 ## kaish argument globs skip `build/`, and say only "no matches" (2026-10-10)
 
 In a coder seat, `cat build/obj/*.o` fails with `no matches:

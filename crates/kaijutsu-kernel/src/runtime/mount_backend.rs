@@ -265,7 +265,8 @@ fn file_attr_to_dir_entry(name: &str, attr: &crate::vfs::FileAttr) -> DirEntry {
     }
 }
 
-/// Convert a kaijutsu `DirEntry` to a kaish `DirEntry`.
+/// Convert a kaijutsu `DirEntry` to a kaish `DirEntry` that carries only a
+/// name and kind, for an entry whose attributes are refused.
 fn kj_dir_entry_to_kaish(entry: &crate::vfs::DirEntry) -> DirEntry {
     let kind = match entry.kind {
         FileType::File => DirEntryKind::File,
@@ -516,13 +517,26 @@ impl KernelBackend for MountBackend {
     // Directory Operations
     // =========================================================================
 
+    /// List a directory with each entry's attributes, as `lstat` reports
+    /// them, because `ls -l` reads sizes and times from these entries. An
+    /// entry that vanishes after `readdir` is skipped. An entry whose
+    /// attributes are refused keeps only its name and kind.
     async fn list(&self, path: &Path) -> BackendResult<Vec<DirEntry>> {
         let entries = self
             .mount_table
             .readdir(path)
             .await
             .map_err(vfs_to_backend)?;
-        Ok(entries.iter().map(kj_dir_entry_to_kaish).collect())
+        let mut listed = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match self.mount_table.getattr(&path.join(&entry.name)).await {
+                Ok(attr) => listed.push(file_attr_to_dir_entry(&entry.name, &attr)),
+                Err(e) if e.is_not_found() => continue,
+                Err(e) if e.is_permission_denied() => listed.push(kj_dir_entry_to_kaish(entry)),
+                Err(e) => return Err(vfs_to_backend(e)),
+            }
+        }
+        Ok(listed)
     }
 
     /// Follow a final symlink, as `stat(2)` does. Each target resolves in
@@ -1193,6 +1207,25 @@ mod tests {
         backend.remove(Path::new("/tmp/relative"), true).await.unwrap();
         assert!(backend.lstat(Path::new("/tmp/absolute")).await.is_err(), "the link is gone");
         assert!(backend.stat(Path::new("/tmp/real/kept.txt")).await.unwrap().is_file(), "the target is spared");
+    }
+
+    /// `ls -l <dir>` reads sizes from `list`, so each entry must carry the
+    /// size `stat` reports, binary files included.
+    #[tokio::test]
+    async fn list_reports_entry_sizes() {
+        let backend = test_mount_backend().await;
+        backend.mkdir(Path::new("/tmp/media")).await.unwrap();
+        let video = vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', 0xff, 0xfe];
+        backend.write(Path::new("/tmp/media/clip.mp4"), &video, WriteMode::Overwrite).await.unwrap();
+        backend.write(Path::new("/tmp/media/notes.txt"), b"hello", WriteMode::Overwrite).await.unwrap();
+
+        let entries = backend.list(Path::new("/tmp/media")).await.unwrap();
+        for (name, expected) in [("clip.mp4", video.len() as u64), ("notes.txt", 5)] {
+            let stat = backend.stat(&Path::new("/tmp/media").join(name)).await.unwrap();
+            assert_eq!(stat.size, expected, "{name}: stat size");
+            let listed = entries.iter().find(|e| e.name == name).expect(name);
+            assert_eq!(listed.size, expected, "{name}: list size");
+        }
     }
 
     #[tokio::test]
