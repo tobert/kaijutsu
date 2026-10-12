@@ -20,7 +20,7 @@
 #    the substitution (`|| true`), and `exit 0` is the literal last line.
 #    Under `set -e` a failing `$(...)` assignment aborts the whole script,
 #    and no later line runs. Re-verified live 2026-10-01 on the pinned kaish
-#    0.17.2 (ad293823); pinned by the kernel test
+#    0.18.1 (7630292a); pinned by the kernel test
 #    `set_e_substitution_guards_behave_as_rc_scripts_place_them`.
 #  - NOTIFICATION, never (Role::System, BlockKind::Text). This content
 #    differs on every create, and the System+Text slot folds into the

@@ -100,17 +100,17 @@ kaish-help.workspace = true
 # resolves for anyone who clones, a path dep resolves only on a machine
 # holding that worktree (see the kaish-kernel comment above this block for
 # the cost of getting that wrong). `kaish-extras`' own workspace pins
-# kaish-tool-api/kaish-types to the same "0.15" this workspace pins above, so
+# kaish-tool-api/kaish-types to the same "0.18" this workspace pins above, so
 # the `Tool` trait objects unify — `cargo tree -i kaish-types` must show
 # exactly one version after this is added.
-kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "1a0c30390ce97c59243f5feb8aeee24c07134c1a" }
+kaish-tools-curl = { git = "https://github.com/tobert/kaish-extras", rev = "372c7f52f15367500517f2df84c300825c0f1ef6" }
 
 # Read-only `git` tool for the read-only context shell (docs/kaish-integration.md,
 # runtime/git_tool.rs) — same rev as kaish-tools-curl above, same reasoning.
 # Default features (no `textdiff`): the read-only shell has no need for
 # unified patch text yet. See kaish-extras' docs/embedding-git.md for the
 # read-only guarantees and containment story.
-kaish-tools-git = { git = "https://github.com/tobert/kaish-extras", rev = "1a0c30390ce97c59243f5feb8aeee24c07134c1a" }
+kaish-tools-git = { git = "https://github.com/tobert/kaish-extras", rev = "372c7f52f15367500517f2df84c300825c0f1ef6" }
 
 # gitignore classification for Vfs.snapshot's `ignored` flag (docs/scenes/vfs.md)
 ignore.workspace = true

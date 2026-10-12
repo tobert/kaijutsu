@@ -91,10 +91,10 @@ kaijutsu-mk = { path = "crates/kaijutsu-mk" }
 # Re-linking to a worktree is legitimate when we need to consume kaish work
 # before it releases. If you do it, treat it as temporary, record the rev, and
 # put the crates.io line back the moment the release lands.
-kaish-kernel = { version = "0.17", features = ["subprocess"] }
-kaish-glob = { version = "0.17" }
-kaish-types = { version = "0.17" }
-kaish-help = { version = "0.17" }
+kaish-kernel = { version = "0.18", features = ["subprocess"] }
+kaish-glob = { version = "0.18" }
+kaish-types = { version = "0.18" }
+kaish-help = { version = "0.18" }
 
 # Cap'n Proto
 capnp = "0.25"
@@ -230,14 +230,3 @@ tracing-opentelemetry = "0.32"
 tempfile = "3"
 
 
-# Pre-release kaish stack: kaish main at e69f21fd plus the
-# `one-filesystem-walks` branch (walks stay in their mount region, a note
-# names the mounts a walk skipped, `find -xdev`, and `command -v`/`type`),
-# head c7cdc8ee. Retire this patch when the next kaish release lands.
-[patch.crates-io]
-kaish-kernel = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
-kaish-types = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
-kaish-tool-api = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
-kaish-vfs = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
-kaish-glob = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }
-kaish-help = { git = "https://github.com/tobert/kaish", rev = "ae915794c9f0c510584c17c797d33cee2ebbeb7a" }

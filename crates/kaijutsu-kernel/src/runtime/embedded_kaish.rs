@@ -1232,7 +1232,7 @@ mod tests {
     /// scripts place their `|| true` guards — and which S16's comment got
     /// wrong for a while ("a trailing `||` … kaish never fires it"). That
     /// was true of the older linked kaish and was fixed in the build pinned
-    /// now (0.17.2, ad293823); kaibo's DeepSeek review flagged the stale
+    /// now (0.18.1, 7630292a); kaibo's DeepSeek review flagged the stale
     /// comment on 2026-10-01, and this test is what keeps the corrected
     /// text honest through the next dependency bump.
     ///

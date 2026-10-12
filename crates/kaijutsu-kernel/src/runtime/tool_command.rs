@@ -162,9 +162,14 @@ impl ToolCommand {
 }
 
 /// The refusals a read-only shell gives for a host program (kaish) and for
-/// a git verb it does not offer (kaish-tools-git). Each states only its
-/// condition, since the remedy depends on the embedder's tools.
-const READ_ONLY_REFUSALS: [&str; 2] = ["external commands are disabled on this shell", "git: a verb is required"];
+/// a git write or a verb it does not offer (kaish-tools-git 0.9.0, `spelling.rs`
+/// and `error.rs`). Each states only its condition, since the remedy depends on
+/// the embedder's tools.
+const READ_ONLY_REFUSALS: [&str; 3] = [
+    "external commands are disabled on this shell",
+    "git: a verb is required",
+    "this git is read-only",
+];
 
 /// Append the remedy to a read-only refusal: the write path is `shell_write`.
 fn name_the_write_path(envelope: &mut ShellEnvelope) {
