@@ -96,7 +96,7 @@ fn write_cap() -> Capability {
 /// dialect is this short list, verbatim.
 
 impl KjDispatcher {
-    pub(crate) async fn dispatch_editor(&self, argv: &[String], caller: &KjCaller) -> KjResult {
+    pub(crate) async fn dispatch_vi(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
             return clap_help_for::<EditorArgs>();
         }

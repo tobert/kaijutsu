@@ -294,7 +294,7 @@ The same surface a test drives is what a model plays.
    `kj vi` is the programmatic door for agents and scripts. It takes structured
    argv, so a path is one word with no quoting, and it is not an in-app entry.
    Both reach the same `Kernel::editor_open`. `kj vi` is a clap verb named
-   `vi`; its module is still `kj/editor.rs`.
+   `vi`.
    `edit` is kaish's hashline editor, not a vi front door, and the builtin is
    not registered under that name.
    The builtin takes one path. kaish splits on whitespace, so `vi my notes.md`
@@ -530,7 +530,7 @@ Paths are under `crates/`. Line numbers drift — grep the symbol.
 | Vim engine (pure) | `kaijutsu-editor/src/lib.rs` (`EditorCore`, `EditOp`, `CommandRequest`, `EditorIo`, `selection`) |
 | Selection value | `kaijutsu-types/src/editor.rs` (`EditorSelection`, `SelectionShape`) |
 | `vi` builtin (front door) | `kaijutsu-kernel/src/runtime/vi_builtin.rs`; registered in `runtime/context_shell.rs` |
-| `kj vi` (clap verb `vi`) | `kaijutsu-kernel/src/kj/editor.rs` |
+| `kj vi` (clap verb `vi`) | `kaijutsu-kernel/src/kj/vi.rs` |
 | Block text edit | `kaijutsu-kernel/src/block_store.rs` (`edit_text`/`edit_text_as`) |
 | Peer signal | `kaijutsu-kernel/src/kernel.rs` (`invoke_peer`, `signal_open_editor`, `editor_reconcile_block`) |
 | Remote-merge reconciler | `kaijutsu-server/src/rpc.rs` (`spawn_editor_reconciler`) |

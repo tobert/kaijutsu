@@ -47,7 +47,7 @@ pub mod plan_clauses;
 pub mod play;
 pub mod policy;
 pub mod preset;
-pub mod editor;
+pub mod vi;
 pub mod effect;
 pub(crate) mod readonly;
 pub(crate) mod gate_policy;
@@ -605,7 +605,7 @@ impl KjDispatcher {
         // binds to whatever block owns the path, so no active context is needed
         // (same exemption as `kj rc`).
         if cmd == "vi" {
-            return self.dispatch_editor(&argv[1..], caller).await;
+            return self.dispatch_vi(&argv[1..], caller).await;
         }
         // `kj swap` addresses a recovered file buffer by path, same as
         // `kj vi`/`kj diff` — no active context needed to look one up.

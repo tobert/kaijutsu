@@ -104,7 +104,7 @@ pub(crate) enum KjCommand {
     Cp(super::cp::CpArgs),
     Play(super::play::PlayArgs),
     Rc(super::rc::RcArgs),
-    Vi(super::editor::EditorArgs),
+    Vi(super::vi::EditorArgs),
     Swap(super::swap::SwapArgs),
     System(super::system::SystemArgs),
     Config(super::config::ConfigArgs),

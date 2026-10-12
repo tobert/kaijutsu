@@ -1563,7 +1563,7 @@ impl Kernel {
     /// changed-under-us condition unless `:w!` set `update.forced`.
     ///
     /// Unrestricted (`can_write: true`) — the shape every caller in this
-    /// crate outside `kj/editor.rs` uses. See
+    /// crate outside `kj/vi.rs` uses. See
     /// [`editor_keys_checked`](Self::editor_keys_checked) for the gated
     /// entry point.
     pub async fn editor_keys(
@@ -1868,7 +1868,7 @@ impl Kernel {
     ///
     /// **Not gated by `can_write` here.** `kj vi save` is the only
     /// production caller and it already denies at the dispatcher
-    /// (`kj::editor::dispatch_editor`'s `Save` arm calls `require_cap` and
+    /// (`kj::vi::dispatch_vi`'s `Save` arm calls `require_cap` and
     /// returns before ever reaching the kernel), and the wire `editorSave`
     /// calls this unrestricted too — so a `can_write: false` path through
     /// this function was unreachable in practice. `editor_keys` earns its own
