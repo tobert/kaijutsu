@@ -394,6 +394,15 @@ fn display_json_value(value: &serde_json::Value, indent: usize) -> String {
     }
 }
 
+/// The longest prefix of `s` that is at most `max` bytes and ends on a char boundary.
+fn prefix_at_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Format tool call arguments as compact key: value lines.
 ///
 /// Flat JSON objects render as `key: value` per line (unquoted strings).
@@ -417,13 +426,13 @@ fn format_tool_args(value: &serde_json::Value) -> String {
                 let line_count = s.lines().count();
                 if line_count > 1 {
                     let truncated = if first_line.len() > max_value_len {
-                        format!("{}...", &first_line[..max_value_len])
+                        format!("{}...", prefix_at_boundary(first_line, max_value_len))
                     } else {
                         first_line.to_string()
                     };
                     format!("{} ({} lines)", truncated, line_count)
                 } else if s.len() > max_value_len {
-                    format!("{}...", &s[..max_value_len])
+                    format!("{}...", prefix_at_boundary(s, max_value_len))
                 } else {
                     s.clone()
                 }
@@ -434,7 +443,7 @@ fn format_tool_args(value: &serde_json::Value) -> String {
             other => {
                 let json = serde_json::to_string(other).unwrap_or_default();
                 if json.len() > max_value_len {
-                    format!("{}...", &json[..max_value_len])
+                    format!("{}...", prefix_at_boundary(&json, max_value_len))
                 } else {
                     json
                 }
@@ -973,6 +982,21 @@ mod tests {
         let result = format_tool_args(&input);
         assert!(result.contains("..."));
         assert!(result.len() < 80);
+    }
+
+    #[test]
+    fn test_format_tool_args_truncates_on_char_boundary() {
+        // '—' is 3 bytes; 59 ASCII bytes puts it across the 60-byte cut.
+        let straddle = format!("{}—tail", "x".repeat(59));
+        let input = serde_json::json!({
+            "single": straddle,
+            "multi": format!("{}\nsecond", straddle),
+            "nested": [straddle],
+        });
+        let result = format_tool_args(&input);
+        assert!(result.contains("single: "));
+        assert!(result.contains("(2 lines)"));
+        assert!(result.contains("..."));
     }
 
     #[test]
