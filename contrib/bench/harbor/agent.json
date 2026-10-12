@@ -10,6 +10,7 @@
         "--backend-kind", "deepseek",
         "--model", "deepseek-v4-flash",
         "--state-dir", "/installed-agent/kaijutsu/state",
+        "--headless",
         "--gate-config", "/installed-agent/kaijutsu/gate.toml"
       ],
       "env": { "RUST_LOG": "info" }

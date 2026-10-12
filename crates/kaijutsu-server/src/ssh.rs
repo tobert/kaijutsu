@@ -24,6 +24,7 @@ use russh::{Channel, ChannelId};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use kaijutsu_kernel::KernelMode;
 use kaijutsu_types::{PrincipalId, SSH_RPC_SUBSYSTEM, SSH_SFTP_SUBSYSTEM, SSH_SHARE_SUBSYSTEM};
 
 use crate::auth_db::AuthDb;
@@ -129,6 +130,8 @@ pub struct SshServerConfig {
     /// does (`docs/mounts.md`, "Unlisted paths"). Checked by
     /// [`validate_unlisted`] at boot. Empty by default.
     pub unlisted: Vec<PathBuf>,
+    /// Interactive or headless (`--headless`). Default: interactive.
+    pub mode: KernelMode,
     /// Maximum number of concurrent SSH connections. Default: 100.
     pub max_connections: usize,
     /// RAII guard for an `ephemeral()` test dir: removes the dir when the config
@@ -354,6 +357,7 @@ impl SshServerConfig {
             data_dir: Some(path.clone()),
             rw_mounts: Vec::new(),
             unlisted: Vec::new(),
+            mode: KernelMode::Interactive,
             max_connections: 100,
             _cleanup: Some(std::sync::Arc::new(TempDirGuard(path))),
             root_key: Some(std::sync::Arc::new(root_key)),
@@ -394,6 +398,7 @@ impl SshServerConfig {
             data_dir: None,   // Use XDG default
             rw_mounts: Vec::new(),
             unlisted: Vec::new(),
+            mode: KernelMode::Interactive,
             max_connections: 100,
             _cleanup: None,
             root_key: None,
@@ -582,7 +587,8 @@ impl SshServer {
 
         // Create the shared kernel at server startup — 会の場所 (the meeting place).
         // All connections share this single kernel.
-        let shared_kernel = crate::rpc::create_shared_kernel(
+        let shared_kernel = crate::rpc::create_shared_kernel_in(
+            self.config.mode,
             self.config.config_dir.as_deref(),
             &self.config.config_mounts,
             self.config.data_dir.as_deref(),

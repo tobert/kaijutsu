@@ -150,4 +150,6 @@ a collision appears in real prose, not in advance.
 | sequence | verb, noun | What the kernel does to every accepted mutation. There is exactly one sequencer. |
 | fail loudly | verb phrase | An error is explicit and immediate. We never continue on a wrong assumption, and we prefer crashing to corrupting. |
 | character | noun | The persistent someone a name resolves to; human or model. A principal with a sheet (`docs/character.md`). For a text unit say code point, glyph, or `char`, never character. |
+| headless kernel | noun | A kernel started with `--headless` (`KernelMode::Headless`): it runs with little input from people, as under a harness, and turns on behavior an interactive kernel leaves off, such as asking for `done` after a text-only reply. Not a turn property; for a turn the kernel drove, say autonomous turn. |
+| autonomous turn | noun | A turn no person prompted (`TurnOrigin::Autonomous`): `kj drive`, `kj fork --prompt`, drift delivery. Not "headless turn" or "driven turn". |
 | context_type | noun | The rc bundle a context runs, `/config/rc/<type>/<verb>/`. A role, not an individual. Character rc composition is planned; see `docs/character.md`, "Current implementation". |

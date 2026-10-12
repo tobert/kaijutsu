@@ -397,6 +397,9 @@ fn drive(
             if !overlay.is_empty() {
                 command = command.arg("--rc-overlay").arg(scratch.fleet.join("rc"));
             }
+            if scenario.headless {
+                command = command.arg("--headless");
+            }
             if scenario.prompt.iter().any(|p| p.gate.is_some()) {
                 command = command.arg("--state-dir").arg(&scratch.state);
             }
@@ -412,6 +415,9 @@ fn drive(
             args.extend(["--gate-config", &gate]);
             if !overlay.is_empty() {
                 args.extend(["--rc-overlay", &rc]);
+            }
+            if scenario.headless {
+                args.push("--headless");
             }
             let endpoints = contained_endpoints(scenario, council.as_deref())?;
             if !endpoints.is_empty() {

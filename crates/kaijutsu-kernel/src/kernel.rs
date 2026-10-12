@@ -38,6 +38,21 @@ pub struct InterruptOutcome {
     pub continuation_closed: bool,
 }
 
+/// How much a kernel expects of the people at its prompts. Set once when the
+/// kernel is built (`--headless` on `kaijutsu-server` and
+/// `kaijutsu-solo-acp`) and fixed for its lifetime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KernelMode {
+    /// A person reads each reply and answers it. A turn they prompted ends
+    /// on a text-only reply.
+    #[default]
+    Interactive,
+    /// The kernel runs with little input from people, as under a harness:
+    /// every turn in a context offered `done` runs until it calls `done`,
+    /// prompted turns included.
+    Headless,
+}
+
 /// The Kernel: fundamental primitive of kaijutsu.
 ///
 /// Everything is a kernel. A kernel:
@@ -106,6 +121,8 @@ pub struct Kernel {
     /// MCP connect/handshake. Per-instance MCP `call_timeout` overrides live
     /// on `InstancePolicy`.
     timeouts: kaijutsu_types::TimeoutPolicy,
+    /// Interactive or headless; fixed at construction (`with_mode`).
+    mode: KernelMode,
     /// The kernel's block store. Owned at construction (`new`/`with_flows`
     /// take it as a parameter) rather than wired in after the fact — a
     /// `Kernel` that hands out `file_cache()` before anything else can reach
@@ -432,6 +449,7 @@ impl Kernel {
             }),
             context_mcp: crate::mcp::ContextMcpServers::new(),
             timeouts: kaijutsu_types::TimeoutPolicy::default(),
+            mode: KernelMode::default(),
             blocks,
             file_cache,
             db: db.clone(),
@@ -627,6 +645,18 @@ impl Kernel {
     /// load for the non-LLM timeouts would use the same construction shape.
     pub fn with_timeouts(mut self, policy: kaijutsu_types::TimeoutPolicy) -> Self {
         self.timeouts = policy;
+        self
+    }
+
+    /// Whether this kernel runs interactive or headless.
+    pub fn mode(&self) -> KernelMode {
+        self.mode
+    }
+
+    /// Builder-style mode. Must be called pre-`Arc::new`, like
+    /// `with_timeouts`: the mode is fixed for the kernel's lifetime.
+    pub fn with_mode(mut self, mode: KernelMode) -> Self {
+        self.mode = mode;
         self
     }
 

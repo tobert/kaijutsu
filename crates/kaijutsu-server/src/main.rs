@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use kaijutsu_kernel::kernel_db::KernelDb;
+use kaijutsu_kernel::KernelMode;
 use kaijutsu_server::config_mounts::ConfigMounts;
 use kaijutsu_server::constants::DEFAULT_SSH_PORT;
 use kaijutsu_server::offline::{KjRunArgs, run_kj};
@@ -41,6 +42,11 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 struct Cli {
     #[command(flatten)]
     paths: PathArgs,
+    /// Serve a headless kernel: one that runs with little input from people,
+    /// as under a harness. A coder's turn runs until it calls `done`, even
+    /// when a person prompted it. Only the serving default reads this.
+    #[arg(long)]
+    headless: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -232,7 +238,10 @@ async fn async_main() -> ExitCode {
     let PathArgs { config_root, mount, rw_mount, port } = cli.paths;
 
     match cli.command {
-        None => run_server(port, config_root, mount, rw_mount).await,
+        None => {
+            let mode = if cli.headless { KernelMode::Headless } else { KernelMode::Interactive };
+            run_server(port, config_root, mount, rw_mount, mode).await
+        }
         Some(Command::Init { as_name, key }) => cmd_init(as_name, key),
         Some(Command::AddKey { pubkey_file, as_name, rebind }) => {
             cmd_add_key(pubkey_file, as_name, rebind)
@@ -279,6 +288,7 @@ async fn run_server(
     config_root: Option<PathBuf>,
     mount: Vec<String>,
     rw_mount: Vec<PathBuf>,
+    mode: KernelMode,
 ) -> ExitCode {
     // Resolve the config mounts BEFORE announcing a start. A bad declaration
     // is a refusal to boot, and saying "Starting..." first would report a
@@ -301,6 +311,7 @@ async fn run_server(
         }
     };
     config.config_mounts = mounts;
+    config.mode = mode;
     let server = SshServer::new(config);
 
     if let Err(e) = server.run().await {

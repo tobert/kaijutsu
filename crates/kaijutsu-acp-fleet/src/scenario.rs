@@ -32,6 +32,9 @@ pub struct Scenario {
     /// Where the agent runs: on the host, or in a container.
     #[serde(default)]
     pub mode: Mode,
+    /// Run the agent's kernel headless (`--headless`), as Harbor does.
+    #[serde(default)]
+    pub headless: bool,
     /// The gate policy the agent runs under. Default in host mode: the
     /// shipped policy. Default in contained mode: every uncovered statement
     /// is allowed.

@@ -76,6 +76,7 @@ file the backend row names. It never belongs in this file.
 | `--mount <dir>` | Mount a host directory read-write at the same path inside the kernel, so the model's file tools may write there. Repeatable. |
 | `--no-cwd-mount` | Do not mount the directory the agent was launched in. |
 | `--unlist <path>` | Leave a path out of its parent's directory listing, so a walk from above (`find /`, `grep -r PATTERN /`, `ls /`) never reaches it; naming it still does (`docs/mounts.md`, "Unlisted paths"). Repeatable. Must be absolute and not `/`; it need not exist. The Harbor adapter unlists `/logs` and `/installed-agent`. |
+| `--headless` | Run a headless kernel (`docs/writing.md`, "Terms"), for a harness that sends a task and waits for it to end. A coder's turn then runs until it calls `done`: a text-only reply is answered with a notice instead of ending the prompt (`docs/conversation-session.md`, "Ending a task with done"). Leave it off for a client a person types into. The Harbor adapter passes it. |
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
 | `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (DeepSeek's factory rows carry 65536 at effort `high`), else the kernel defaults' 16384. |
 | `--rc-overlay <dir>` | An rc variant to install over the seeded `/config/rc` tree, for A/B instruction sets (`contrib/bench/rc-variants/*/README.md`). The directory mirrors the rc tree's layout and holds only the files that differ; every regular file under it (a top-level `README.md` is skipped) replaces the file at the same relative path, unlinked first so a seeded symlink into `lib/` is replaced rather than written through. Refuses, before anything is replaced, if the directory is missing or empty, contains a symlink or another non-regular file, or names a file whose seeded parent directory does not exist. Idempotent: re-applying the same overlay against a persistent `--state-dir` is safe. |
@@ -166,7 +167,7 @@ Each step fails loudly, with what it was doing:
    and `solo-coder` performs.
 7. Resolve the read-write mounts: `--mount`, plus the launch directory unless
    it was declined or is already writable.
-8. Start the kernel on `127.0.0.1:0`, on its own thread with the server's own
+8. Start the kernel on `127.0.0.1:0`, headless under `--headless`, on its own thread with the server's own
    stack size — boot runs the root context's rc create chain, and a smaller
    stack overflows it. The kernel seeds its `/config` trees on the way up,
    exactly as a fresh install does, and refuses to start on a mount it cannot

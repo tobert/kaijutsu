@@ -728,6 +728,9 @@ class KaijutsuSoloAcp(AcpAgent):
             self._solo_model,
             "--state-dir",
             self._remote_state.as_posix(),
+            # Nobody answers a reply mid-task, so a coder's turn runs until
+            # it calls `done`.
+            "--headless",
             # Out of the model's walks: Harbor's log directory, whose acp.txt
             # is this process's own stderr with the model's thinking in it,
             # and the install directory, which holds the kernel's database.

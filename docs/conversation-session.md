@@ -126,17 +126,19 @@ failure before it can finish. Input that arrived
 meanwhile stays pending for the turn's end. A refused call (an empty
 summary) does not end the turn.
 
-In a context offered `done`, a reply with no tool call does not end a driven
-turn (`TurnOrigin::Autonomous`: `kj drive`, `kj fork --prompt`, drift
-delivery). The loop writes a `(System, Notification)` asking for a tool call or `done`,
+In a context offered `done`, a reply with no tool call does not end an
+autonomous turn (`TurnOrigin::Autonomous`: `kj drive`, `kj fork --prompt`,
+drift delivery), or any turn on a headless kernel (`KernelMode::Headless`,
+started with `--headless`). The loop writes a `(System, Notification)` asking for a tool call or `done`,
 sends it as the next user message, and takes another inference, at most
 `MAX_DONE_NUDGES` (2) times per turn (`runtime/llm_stream.rs`). The next
 text-only reply ends the turn, logged as "The turn ended without `done`". The
 guards are the ceiling continuation's: no nudge after an output-ceiling stop,
-while a beat waits on the turn, or with an interrupt pending. A turn a person
-prompted (`TurnOrigin::Interactive`: `prompt`, `submitInput`, and every ACP
-prompt) ends on a text-only reply, because the person reads it and answers.
-`done` still ends such a turn when the model calls it.
+while a beat waits on the turn, or with an interrupt pending. On an interactive
+kernel, a turn a person prompted (`TurnOrigin::Interactive`: `prompt`,
+`submitInput`, and every ACP prompt) ends on a text-only reply, because the
+person reads it and answers. `done` still ends such a turn when the model
+calls it.
 
 A driver reads the verdict from the context: `kj wait` prints
 `done: STATUS — SUMMARY` and carries it as `done` in its data, and an ACP

@@ -131,6 +131,13 @@ struct Cli {
     #[arg(long)]
     no_cwd_mount: bool,
 
+    /// Run a headless kernel, for a harness that sends a task and waits for
+    /// it to end. A coder's turn runs until it calls `done`: a reply with no
+    /// tool call is answered with a notice instead of ending the prompt.
+    /// Leave it off for a client a person types into.
+    #[arg(long)]
+    headless: bool,
+
     /// Gate policy to install, replacing the shipped default. The file is
     /// copied verbatim into this kernel's `/config/kernel/gate.toml`.
     #[arg(long, value_name = "FILE")]
@@ -309,6 +316,9 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut config = kernel::solo_server_config(&solo, &cli.mount)?;
     config.unlisted = cli.unlist.clone();
+    if cli.headless {
+        config.mode = kaijutsu_kernel::KernelMode::Headless;
+    }
     if !cli.no_cwd_mount {
         match std::env::current_dir() {
             Ok(cwd) => match skip_cwd_reason(&cwd) {

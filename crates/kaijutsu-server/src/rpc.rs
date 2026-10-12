@@ -93,6 +93,7 @@ use kaijutsu_kernel::{
     InvokeRequest,
     InvokeResponse,
     Kernel,
+    KernelMode,
     LocalBackend,
     // Peers (drift navigation transport)
     peer_key,
@@ -1549,12 +1550,25 @@ async fn connect_semantic_index(
     }
 }
 
+/// Create an interactive shared kernel; see [`create_shared_kernel_in`].
+pub async fn create_shared_kernel(
+    config_dir: Option<&Path>,
+    config_mounts: &crate::config_mounts::ConfigMounts,
+    data_dir: Option<&Path>,
+    rw_mounts: &[std::path::PathBuf],
+    unlisted: &[std::path::PathBuf],
+) -> Result<SharedKernel, capnp::Error> {
+    create_shared_kernel_in(KernelMode::Interactive, config_dir, config_mounts, data_dir, rw_mounts, unlisted).await
+}
+
 /// Create the shared kernel at server startup.
 ///
 /// This performs all kernel initialization: VFS mounts, block store with DB
 /// persistence, default context, config backend, block tools, LLM, and MCP.
 /// The returned `SharedKernel` is shared across all connections via `Arc`.
-pub async fn create_shared_kernel(
+pub async fn create_shared_kernel_in(
+    // Interactive or headless, fixed for the kernel's lifetime.
+    mode: KernelMode,
     // One-time config seed source on a fresh kernel (see the /config/kernel
     // mount below). NOT ongoing ownership: production passes None (embedded
     // defaults; the kernel never reads the user's host config). Tests point it
@@ -1679,7 +1693,8 @@ pub async fn create_shared_kernel(
         documents.clone(),
         kernel_db_arc.clone(),
     )
-    .await;
+    .await
+    .with_mode(mode);
 
     // Read-only root — whole system visible (ls /usr/bin, cargo, etc.)
     kernel.mount("/", LocalBackend::read_only("/")).await;

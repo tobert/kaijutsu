@@ -180,17 +180,21 @@ tool_calls = [{ title = "shell_write", status = "completed" }, { title = "done",
 
 An ACP session runs a coder context, which is offered `done`. A scripted
 model usually ends each task by calling it, and that prompt's `tool_calls`
-lists it. An ACP prompt is a person's turn (`TurnOrigin::Interactive`), so a
-reply with no tool call also ends it, with no notice
-(`docs/conversation-session.md`, "Ending a task with done"). The runner adds
-no `done` of its own.
+lists it. An ACP prompt is a person's turn (`TurnOrigin::Interactive`), so
+on an interactive kernel a reply with no tool call also ends it, with no
+notice. A scenario with `headless = true` starts the agent with
+`--headless`, as Harbor does; there a text-only reply is answered with a
+notice and the turn goes on, at most twice
+(`docs/conversation-session.md`, "Ending a task with done"). A script with
+no reply left then fails the prompt, and the agent's stderr says the mock
+script was exhausted. The runner adds no `done` of its own.
 
-`fleet/done-prompted.toml` shows both endings: a text-only reply ends the
-first prompt, and a reply that calls `done` ends the second, each with
-`stopReason: end_turn`. The `done` call arrives with no `kind`, which ACP
-reads as `other`, so Harbor names the step by its title, `done`. A headless
-ACP client that wants the notice has no way to ask for it yet
-(`docs/issues.md`).
+`fleet/done-prompted.toml` shows the interactive endings: a text-only reply
+ends the first prompt, and a reply that calls `done` ends the second.
+`fleet/done-headless.toml` shows the headless one: a text-only reply, the
+notice, then a reply that calls `done`. Each ends with `stopReason:
+end_turn`. The `done` call arrives with no `kind`, which ACP reads as
+`other`, so Harbor names the step by its title, `done`.
 
 A turn that ends another way needs no `done`. A cancelled turn ends at the
 cancel (`fleet/cancel.toml`). A background completion starts a turn of its

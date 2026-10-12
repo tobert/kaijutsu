@@ -2465,6 +2465,10 @@ async fn run_llm_stream(
     // `MAX_OUTPUT_CEILING_CONTINUATIONS`.
     let mut ceiling_continuations: u32 = 0;
     let offers_done = tools.iter().any(|tool| tool.name == DONE_TOOL);
+    // Whether a text-only reply leaves the task open: in an autonomous
+    // turn, or in any turn on a headless kernel, nobody answers it.
+    let runs_to_done = offers_done
+        && (origin == TurnOrigin::Autonomous || kernel.mode() == crate::KernelMode::Headless);
     let mut done_nudges: u32 = 0;
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
@@ -3248,14 +3252,13 @@ async fn run_llm_stream(
             {
                 continue 'agentic;
             }
-            // A driven turn in a context offered `done` ends its task by
-            // calling it. Text alone is narration, not an ending: ask for a
-            // tool call or `done`, up to `MAX_DONE_NUDGES` times. A turn a
-            // person prompted ends on text, because the person answers it.
-            // The other guards are the ceiling's: no notice for an inference
-            // that will not run.
-            if offers_done && origin == TurnOrigin::Autonomous
-                && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
+            // A turn that runs to `done` ends its task by calling it. Text
+            // alone is narration, not an ending: ask for a tool call or
+            // `done`, up to `MAX_DONE_NUDGES` times. A turn a person prompted
+            // on an interactive kernel ends on text, because the person
+            // answers it. The other guards are the ceiling's: no notice for
+            // an inference that will not run.
+            if runs_to_done && !output_ceiling_hit && done_nudges < MAX_DONE_NUDGES
                 && !stop.timed_delivery && !stop.cancelled && !stop.stopping_after_turn
             {
                 done_nudges += 1;
@@ -3272,7 +3275,7 @@ async fn run_llm_stream(
                 messages.push(LlmMessage::user(notice.to_string()));
                 continue 'agentic;
             }
-            if offers_done && origin == TurnOrigin::Autonomous {
+            if runs_to_done {
                 tracing::warn!(%context_id, nudges = done_nudges, "The turn ended without `done`");
             }
             tracing::debug!("Agentic loop complete - no tool calls this iteration");
@@ -4187,7 +4190,7 @@ mod publish_tests {
         ]
     }
 
-    /// A driven turn in a context offered `done`, as `kj drive` starts one.
+    /// An autonomous turn in a context offered `done`, as `kj drive` starts one.
     async fn turn_offering_done(name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
         -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
     {
@@ -4197,7 +4200,13 @@ mod publish_tests {
     async fn turn_offering_done_from(origin: TurnOrigin, name: &str, script: Vec<Vec<crate::llm::StreamEvent>>)
         -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
     {
-        let kernel = Arc::new(Kernel::new_ephemeral(name).await);
+        turn_offering_done_in(crate::KernelMode::Interactive, origin, name, script).await
+    }
+
+    async fn turn_offering_done_in(mode: crate::KernelMode, origin: TurnOrigin, name: &str,
+        script: Vec<Vec<crate::llm::StreamEvent>>) -> (TurnStopReason, Vec<kaijutsu_types::BlockSnapshot>)
+    {
+        let kernel = Arc::new(Kernel::new_ephemeral(name).await.with_mode(mode));
         let mut completed = kernel.turn_flows().subscribe("turn.completed");
         let (documents, ctx, _player) = drive_turn_offering(origin, kernel.clone(),
             Provider::Mock(MockClient::new("unused").with_scripted_stream(script)), |_| {}, 0, vec![done_tool()], vec![]).await;
@@ -4227,8 +4236,8 @@ mod publish_tests {
         }).await;
     }
 
-    /// Text with no tool call does not end a driven turn that was offered
-    /// `done`. The kernel asks for a tool call or `done`, and a model that
+    /// Text with no tool call does not end an autonomous turn that was
+    /// offered `done`. The kernel asks for a tool call or `done`, and a model that
     /// then calls it ends there.
     #[tokio::test]
     async fn text_without_done_is_nudged_and_done_then_ends_the_turn() {
@@ -4258,6 +4267,20 @@ mod publish_tests {
             let (reason, blocks) = turn_offering_done_from(TurnOrigin::Interactive, "done-interactive-call",
                 vec![done_call("call_done"), text_reply("SHOULD NOT RUN")]).await;
             assert_eq!(reason, TurnStopReason::EndTurn);
+            assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")), "done ended the turn");
+        }).await;
+    }
+
+    /// A headless kernel asks for `done` in a prompted turn too: nobody
+    /// answers a text-only reply, so it is narration, not an ending.
+    #[tokio::test]
+    async fn a_headless_kernel_nudges_a_prompted_turn() {
+        tokio::task::LocalSet::new().run_until(async {
+            let (reason, blocks) = turn_offering_done_in(crate::KernelMode::Headless, TurnOrigin::Interactive,
+                "done-headless", vec![text_reply("Next I'll run the tests."), done_call("call_done"),
+                    text_reply("SHOULD NOT RUN")]).await;
+            assert_eq!(reason, TurnStopReason::EndTurn);
+            assert_eq!(nudges(&blocks), 1, "one text-only reply, one nudge");
             assert!(!blocks.iter().any(|b| b.content.contains("SHOULD NOT RUN")), "done ended the turn");
         }).await;
     }

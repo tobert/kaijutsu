@@ -549,6 +549,16 @@ the line to be sent or cleared, not only for a pause in typing.
   The outbox keeps that cost off the key path, but a long burst still
   drains at that rate.
 
+## "Headless turn" and "driven turn" still name autonomous turns (2026-10-12)
+
+`docs/writing.md` now owns two terms: a headless kernel (`--headless`,
+`KernelMode::Headless`) and an autonomous turn (`TurnOrigin::Autonomous`).
+Older prose says "headless turn" or "driven turn" for the second: for
+example `docs/conversation-session.md:26`, `docs/architecture/kernel.md:24`,
+`docs/kaish-integration.md:768`, `docs/character.md:208`,
+`runtime/mod.rs:4`, and test text in `runtime/llm_stream.rs` and
+`runtime/turn_request.rs`. Rename them as each file is next edited.
+
 ## Directory listing costs one `getattr` per entry (2026-10-12)
 
 `MountBackend::list` calls `getattr` on each entry after `readdir`, so
@@ -1327,15 +1337,8 @@ more readily than other agents". Open, most costly first:
   sends a `(System, Notification)` block (the ceiling notice) as
   `agent_message_chunk` text with no separator, so Harbor's trajectory
   records the notice as model output. A thought chunk or a separated,
-  labeled message would read honestly. No fleet scenario pins this shape
-  since ACP prompts stopped getting the `done` notice.
-- **An ACP client cannot say it runs headless.** Every ACP prompt is an
-  interactive turn, so a coder driven by Harbor ends on a text-only reply
-  instead of being asked for a tool call or `done` (2026-10-12). Amy wants a
-  way for a client to mark its session headless; headless sessions need
-  affordances an interactive one should not get. The ACP session filters
-  turn events on `TurnOrigin::Interactive` (`kaijutsu-acp/src/session.rs`),
-  so a driven ACP turn touches that too.
+  labeled message would read honestly (`fleet/done-headless.toml` pins
+  today's shape).
 - **A background completion after `done` starts a turn that calls `done`
   again.** `kj wait` and `classify_run.py` read the last verdict, so they
   report the follow-up turn's, not the task's. Harbor reads the first.
