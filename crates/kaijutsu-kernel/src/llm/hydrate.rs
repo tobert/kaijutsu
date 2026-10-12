@@ -94,6 +94,10 @@ pub(crate) struct HydrationState {
     /// Matched to ToolResults via `tool_call_id` for correct pairing
     /// even when blocks interleave with model tool calls.
     user_shell_pending: HashMap<BlockId, String>,
+    /// Image messages that arrived while a tool call was unanswered. A tool
+    /// that attaches an image appends it before its own result lands, so the
+    /// image waits and follows the results to keep the call and result adjacent.
+    pending_images: Vec<Message>,
 }
 
 /// Whether a block belongs in model-visible history.
@@ -139,6 +143,7 @@ impl HydrationState {
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
             user_shell_pending: HashMap::new(),
+            pending_images: Vec::new(),
         }
     }
 
@@ -251,15 +256,20 @@ impl HydrationState {
                 // models as an Image content block; the server-side path
                 // resolves the hash to bytes before the request goes out.
                 if block.content_type == ContentType::Image {
-                    self.flush_all();
-                    self.messages.push(Message {
+                    let message = Message {
                         role: Role::User,
                         content: MessageContent::Blocks(vec![ContentBlock::Image {
                             hash: block.content.clone(),
                             media_type: ContentType::Image.as_mime().to_string(),
                             data_base64: None,
                         }]),
-                    });
+                    };
+                    if self.tool_uses.is_empty() && self.tool_results.is_empty() {
+                        self.flush_all();
+                        self.messages.push(message);
+                    } else {
+                        self.pending_images.push(message);
+                    }
                 }
                 // Other Asset content types stay skipped (no current producer).
             }
@@ -565,11 +575,11 @@ impl HydrationState {
 
     /// Flush any pending tool results into a user message.
     fn flush_tool_results(&mut self) {
-        if self.tool_results.is_empty() {
-            return;
+        if !self.tool_results.is_empty() {
+            let results = std::mem::take(&mut self.tool_results);
+            self.messages.push(Message::tool_results(results));
         }
-        let results = std::mem::take(&mut self.tool_results);
-        self.messages.push(Message::tool_results(results));
+        self.messages.append(&mut self.pending_images);
     }
 
     /// Flush everything pending (assistant then tool results).
@@ -802,6 +812,32 @@ mod pairing_repair_tests {
         let MessageContent::Blocks(blocks) = &messages[1].content else { panic!("{wire:#}") };
         assert!(matches!(&blocks[..], [ContentBlock::ToolResult { content, is_error: true, .. }]
             if content == "{\"stdout\":\"the model read this\"}"), "{wire:#}");
+    }
+
+    /// A tool that attaches an image appends the Asset block while its own
+    /// call is still running, so the log reads call, image, result. The model
+    /// must still get its real result next to the call, with the image after.
+    #[test]
+    fn an_image_appended_during_a_tool_call_follows_its_result() {
+        use kaijutsu_types::{BlockId, BlockSnapshotBuilder, ContextId, PrincipalId, Role as BlockRole};
+        let (ctx, who) = (ContextId::new(), PrincipalId::new());
+        let call = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 1), BlockKind::ToolCall)
+            .role(BlockRole::Model).tool_name("view_image").tool_input("{}").tool_use_id("t1").build();
+        let image = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 2), BlockKind::Text)
+            .role(BlockRole::Asset).content_type(ContentType::Image).content("deadbeef").build();
+        let result = BlockSnapshotBuilder::new(BlockId::new(ctx, who, 3), BlockKind::ToolResult)
+            .role(BlockRole::Tool).parent_id(call.id).tool_call_id(call.id).tool_use_id("t1")
+            .content("image attached").build();
+
+        let messages = crate::llm::hydrate_from_blocks(&[call, image, result]);
+        let wire = serde_json::to_value(&messages).unwrap();
+        validate_tool_pairing(&messages).unwrap_or_else(|e| panic!("{e}\n{wire:#}"));
+        let MessageContent::Blocks(results) = &messages[1].content else { panic!("{wire:#}") };
+        assert!(matches!(&results[..], [ContentBlock::ToolResult { content, is_error: false, .. }]
+            if content == "image attached"), "the real result, not a synthesized one: {wire:#}");
+        let MessageContent::Blocks(tail) = &messages[2].content else { panic!("{wire:#}") };
+        assert!(matches!(&tail[..], [ContentBlock::Image { hash, .. }] if hash == "deadbeef"), "{wire:#}");
+        assert_eq!(messages.len(), 3, "{wire:#}");
     }
 
     #[test]

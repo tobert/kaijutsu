@@ -6,6 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use kaijutsu_cas::{ContentStore, FileStore};
+use kaijutsu_types::{ContentType, Role};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +18,7 @@ use crate::file_tools::{
     hashline::line_hash,
     vfs_walker::VfsWalkerAdapter,
 };
+use crate::block_store::SharedBlockStore;
 use crate::vfs::{MountTable, VfsOps};
 use crate::execution::{ExecContext, ExecResult};
 
@@ -43,6 +46,18 @@ pub struct ReadParams {
     #[serde(default)]
     pub limit: Option<u32>,
 }
+
+/// Parameters for the `view_image` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ViewImageParams {
+    /// Image file path (png, jpg, webp, or gif). Relative paths resolve
+    /// against the context cwd.
+    pub path: String,
+}
+
+/// Largest image `view_image` attaches. Providers reject larger images.
+const MAX_VIEW_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Parameters for the `edit` tool. Two addressing modes — pass exactly one of
 /// `old_string` (string mode) or `anchor` (hashline mode).
@@ -98,6 +113,9 @@ pub struct FileToolsServer {
     cache: Arc<FileDocumentCache>,
     vfs: Arc<MountTable>,
     guard: Option<WorkspaceGuard>,
+    /// Where `view_image` appends the image block.
+    documents: SharedBlockStore,
+    cas: Arc<FileStore>,
     notif_tx: broadcast::Sender<ServerNotification>,
     /// Runs once between planning an edit and applying it, so a test can
     /// write the file the way a concurrent caller would.
@@ -112,6 +130,8 @@ impl FileToolsServer {
         cache: Arc<FileDocumentCache>,
         vfs: Arc<MountTable>,
         guard: Option<WorkspaceGuard>,
+        documents: SharedBlockStore,
+        cas: Arc<FileStore>,
     ) -> Self {
         let (notif_tx, _) = broadcast::channel(16);
         Self {
@@ -119,6 +139,8 @@ impl FileToolsServer {
             cache,
             vfs,
             guard,
+            documents,
+            cas,
             notif_tx,
             #[cfg(test)]
             after_plan: parking_lot::Mutex::new(None),
@@ -149,6 +171,9 @@ impl McpServerLike for FileToolsServer {
         Ok(vec![
             tool_def::<ReadParams>(&self.instance_id, "read", 
                 "Read file content. Each line is shown as `LINE:hash→ content`; the `LINE:hash` prefix is metadata (not file bytes) — pass it to `edit` as an `anchor` to replace that line without retyping it. Supports windowing via offset/limit."
+            )?,
+            tool_def::<ViewImageParams>(&self.instance_id, "view_image",
+                "Look at an image file (png, jpg, webp, gif; up to 5 MB). The result confirms the attachment, and the image itself follows the result as a user message. Needs a model that accepts images."
             )?,
             tool_def::<EditParams>(&self.instance_id, "edit",
                 "Edit a file. String mode: exact `old_string`→`new_string` substring replacement (whitespace-exact; set replace_all for many). Hashline mode: pass `anchor` (`N:hash` or `N:hash..M:hash`, the anchors `read` prints) to replace a line/range by reference — the hash is reverified before writing, so a stale edit fails loud instead of corrupting. In hashline mode `new_string` is the full new line content (empty deletes)."
@@ -203,6 +228,18 @@ impl McpServerLike for FileToolsServer {
                         ),
                         Err(CacheReadError::Backend(e)) => ExecResult::failure(1, e),
                     }
+                }
+            }
+            "view_image" => {
+                let p: ViewImageParams =
+                    serde_json::from_value(params.arguments).map_err(McpError::InvalidParams)?;
+                let path = resolve_str(&cwd, &p.path).map_err(|e| McpError::Protocol(e.to_string()))?;
+                if let Some(ref guard) = self.guard
+                    && let Err(denied) = guard.check_read(&tool_ctx, &path)
+                {
+                    denied
+                } else {
+                    self.view_image(&path, &tool_ctx).await?
                 }
             }
             "edit" => {
@@ -315,6 +352,42 @@ impl McpServerLike for FileToolsServer {
 }
 
 impl FileToolsServer {
+    /// Store the image in CAS and append it to the calling context's log as an
+    /// Asset block; hydration places it after this call's result.
+    async fn view_image(&self, path: &str, tool_ctx: &ExecContext) -> McpResult<ExecResult> {
+        let mime = crate::kj::cas::mime_from_extension(path);
+        if !matches!(mime, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+            return Ok(ExecResult::failure(
+                1,
+                format!("{path}: view_image takes png, jpg, webp, or gif files"),
+            ));
+        }
+        let target = std::path::Path::new(path);
+        let size = match self.vfs.getattr(target).await {
+            Ok(attr) => attr.size,
+            Err(e) => return Ok(ExecResult::failure(1, format!("{path}: {e}"))),
+        };
+        if size > MAX_VIEW_IMAGE_BYTES {
+            return Ok(ExecResult::failure(
+                1,
+                format!("{path}: {size} bytes is over the {MAX_VIEW_IMAGE_BYTES} byte image limit"),
+            ));
+        }
+        let data = match self.vfs.read_all(target).await {
+            Ok(d) => d,
+            Err(e) => return Ok(ExecResult::failure(1, format!("{path}: {e}"))),
+        };
+        if let Err(e) = crate::kj::cas::validate_image_bytes(mime, &data) {
+            return Ok(ExecResult::failure(1, format!("{path}: {e}")));
+        }
+        let hash = self.cas.store(&data, mime).map_err(|e| McpError::Protocol(format!("CAS error: {e}")))?;
+        super::block::append_to_context(&self.documents, tool_ctx, Role::Asset, &hash.to_string(), ContentType::Image)?;
+        Ok(ExecResult::success(format!(
+            "attached {path} ({mime}, {} bytes); the image follows this result",
+            data.len()
+        )))
+    }
+
     /// Take a write whose flush failed back out of the cache
     /// (`FileDocumentCache::roll_back_failed_write`) and say how that went,
     /// for the tool's failure message. A rollback that cannot happen leaves
@@ -935,13 +1008,26 @@ fn normalizes_to_filesystem_root(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_store::{shared_block_store, shared_block_store_with_db};
+    use crate::block_store::{shared_block_store, shared_block_store_with_db, DocumentKind};
     use crate::file_tools::FileDocumentCache;
     use crate::kernel_db::KernelDb;
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
     use crate::vfs::backends::MemoryBackend;
     use crate::vfs::MountTable;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_cas::FileStore;
+    use kaijutsu_types::{ContentType, PrincipalId, Role};
+
+    /// A file server over throwaway block and CAS stores.
+    fn file_server(cache: Arc<FileDocumentCache>, vfs: Arc<MountTable>) -> FileToolsServer {
+        let cas_dir = tempfile::tempdir().unwrap().keep();
+        FileToolsServer::new(
+            cache,
+            vfs,
+            None,
+            shared_block_store(PrincipalId::system()),
+            Arc::new(FileStore::at_path(cas_dir)),
+        )
+    }
 
     /// A fresh temporary `KernelDb` for tests that don't otherwise need one —
     /// `FileDocumentCache` requires a handle to back its durable swap-file
@@ -954,14 +1040,14 @@ mod tests {
     /// that could be stale, and the shell's `grep` reads the files
     /// (`docs/file-buffers.md`, "`grep` is removed").
     #[tokio::test]
-    async fn the_file_tools_are_read_edit_write_and_glob() {
+    async fn the_file_tools_are_read_view_image_edit_write_and_glob() {
         let blocks = shared_block_store(PrincipalId::system());
         let vfs = Arc::new(MountTable::new());
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        let server = FileToolsServer::new(cache, vfs, None);
+        let server = file_server(cache, vfs);
         let names: Vec<String> = server.list_tools(&CallContext::test()).await.unwrap()
             .into_iter().map(|t| t.name).collect();
-        assert_eq!(names, ["read", "edit", "write", "glob"]);
+        assert_eq!(names, ["read", "view_image", "edit", "write", "glob"]);
     }
 
     async fn broker_with_file(path: &str, content: &str) -> (Arc<Broker>, Arc<FileDocumentCache>) {
@@ -971,7 +1057,7 @@ mod tests {
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
         cache.create_or_replace(path, content, PrincipalId::system()).await.unwrap();
 
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let server = Arc::new(file_server(cache.clone(), vfs));
         let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())
@@ -1056,7 +1142,7 @@ mod tests {
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
         cache.create_or_replace(path, "alpha beta gamma\n", PrincipalId::system()).await.unwrap();
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let server = Arc::new(file_server(cache.clone(), vfs));
         let (ctx_id, block_id) = cache.try_get_or_load(path).await.unwrap();
         let writer = cache.block_store().clone();
         *server.after_plan.lock() = Some(Box::new(move || {
@@ -1090,7 +1176,7 @@ mod tests {
         cache.create_or_replace(path, "one two unsaved\n", PrincipalId::system()).await.unwrap();
         cache.mark_dirty(path).unwrap();
         vfs.write_all(std::path::Path::new(path), b"external\n").await.unwrap();
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs.clone(), None));
+        let server = Arc::new(file_server(cache.clone(), vfs.clone()));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
 
@@ -1124,7 +1210,7 @@ mod tests {
         vfs.write_all(std::path::Path::new(path), content.as_bytes()).await.unwrap();
         let db = test_kernel_db();
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), db.clone()));
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs.clone(), None));
+        let server = Arc::new(file_server(cache.clone(), vfs.clone()));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
         (broker, cache, vfs, db, faults)
@@ -1513,7 +1599,7 @@ mod tests {
         // `dirty_file_buffers` row survive.
         cache.invalidate(path).unwrap();
 
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
+        let server = Arc::new(file_server(cache.clone(), vfs));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
 
@@ -1576,7 +1662,7 @@ mod tests {
         let vfs = Arc::new(MountTable::new());
         let cache = Arc::new(FileDocumentCache::new(store, vfs.clone(), db));
 
-        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let server = Arc::new(file_server(cache, vfs));
         let broker = Arc::new(Broker::new());
         broker
             .register(server, InstancePolicy::default())
@@ -1867,7 +1953,7 @@ mod tests {
         vfs.mount(tmp.path().to_str().unwrap(), LocalBackend::read_only(tmp.path()))
             .await;
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let server = Arc::new(file_server(cache, vfs));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
 
@@ -1999,7 +2085,7 @@ mod tests {
         vfs.mount("/app", LocalBackend::new(app.path())).await;
         vfs.mount("/tmp", MemoryBackend::new()).await;
         let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
+        let server = Arc::new(file_server(cache, vfs));
         let broker = Arc::new(Broker::new());
         broker.register(server, InstancePolicy::default()).await.unwrap();
         let ctx = CallContext::test().with_cwd(std::path::PathBuf::from("/app"));
@@ -2037,5 +2123,74 @@ mod tests {
         .await;
         assert!(!ok.is_error, "a write to a writable mount still succeeds: {}", text_of(&ok));
         assert_eq!(std::fs::read_to_string(app.path().join("hooks.txt")).unwrap(), "ok\n");
+    }
+
+    const TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\nview-image-test";
+
+    /// A server wired to one context's document, with the image on a mounted
+    /// backend. Returns the broker, the call context, and the block store.
+    async fn broker_with_image(
+        path: &str,
+        bytes: &[u8],
+    ) -> (Arc<Broker>, CallContext, crate::block_store::SharedBlockStore) {
+        let blocks = shared_block_store(PrincipalId::system());
+        let ctx = default_ctx();
+        blocks.create_document(ctx.context_id, DocumentKind::File, None).unwrap();
+        let vfs = Arc::new(MountTable::new());
+        vfs.mount("/tmp", MemoryBackend::new()).await;
+        vfs.write_all(std::path::Path::new(path), bytes).await.unwrap();
+        let cache = Arc::new(FileDocumentCache::new(blocks.clone(), vfs.clone(), test_kernel_db()));
+        let cas_dir = tempfile::tempdir().unwrap().keep();
+        let server = Arc::new(FileToolsServer::new(
+            cache, vfs, None, blocks.clone(), Arc::new(FileStore::at_path(cas_dir)),
+        ));
+        let broker = Arc::new(Broker::new());
+        broker.register(server, InstancePolicy::default()).await.unwrap();
+        (broker, ctx, blocks)
+    }
+
+    #[tokio::test]
+    async fn view_image_appends_an_image_asset_block_to_the_calling_context() {
+        let (broker, ctx, blocks) = broker_with_image("/tmp/pixel.png", TEST_PNG).await;
+        let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "pixel.png" }), &ctx).await;
+        assert!(!result.is_error, "{}", text_of(&result));
+        let snaps = blocks.block_snapshots(ctx.context_id).unwrap();
+        let image = snaps.iter().find(|b| b.role == Role::Asset).expect("an Asset block");
+        assert_eq!(image.content_type, ContentType::Image);
+        assert_eq!(image.content, kaijutsu_cas::ContentHash::from_data(TEST_PNG).to_string());
+    }
+
+    #[tokio::test]
+    async fn view_image_refuses_bytes_that_are_not_the_named_image_type() {
+        let (broker, ctx, blocks) = broker_with_image("/tmp/fake.png", b"plain text pretending").await;
+        let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "fake.png" }), &ctx).await;
+        assert!(result.is_error, "{}", text_of(&result));
+        assert!(blocks.block_snapshots(ctx.context_id).unwrap().iter().all(|b| b.role != Role::Asset));
+    }
+
+    #[tokio::test]
+    async fn view_image_refuses_a_file_that_is_not_a_raster_image() {
+        let (broker, ctx, _blocks) = broker_with_image("/tmp/a.svg", b"<svg xmlns='x'/>").await;
+        let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "a.svg" }), &ctx).await;
+        assert!(result.is_error);
+        assert!(text_of(&result).contains("png, jpg, webp, or gif"), "{}", text_of(&result));
+    }
+
+    #[tokio::test]
+    async fn view_image_refuses_an_image_over_the_size_limit() {
+        let mut big = TEST_PNG.to_vec();
+        big.resize(MAX_VIEW_IMAGE_BYTES as usize + 1, 0);
+        let (broker, ctx, blocks) = broker_with_image("/tmp/big.png", &big).await;
+        let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "big.png" }), &ctx).await;
+        assert!(result.is_error);
+        assert!(text_of(&result).contains("limit"), "{}", text_of(&result));
+        assert!(blocks.block_snapshots(ctx.context_id).unwrap().iter().all(|b| b.role != Role::Asset));
+    }
+
+    #[tokio::test]
+    async fn view_image_reports_a_missing_file() {
+        let (broker, ctx, _blocks) = broker_with_image("/tmp/pixel.png", TEST_PNG).await;
+        let result = call_with_ctx(&broker, "view_image", serde_json::json!({ "path": "nope.png" }), &ctx).await;
+        assert!(result.is_error);
     }
 }

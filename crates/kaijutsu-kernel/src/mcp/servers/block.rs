@@ -275,6 +275,41 @@ impl BlockToolsServer {
     }
 }
 
+/// Append a finished text block at the end of the calling context's log and
+/// return its key. `view_image` shares this with the block tools.
+pub(super) fn append_to_context(
+    documents: &SharedBlockStore,
+    ctx: &ExecContext,
+    role: Role,
+    content: &str,
+    content_type: ContentType,
+) -> McpResult<String> {
+    let context_id = ctx.context_id;
+    if !documents.contains(context_id) {
+        return Err(McpError::Protocol(format!("no document for context {}", context_id.short())));
+    }
+
+    let last_block_id = {
+        let entry = documents.get(context_id);
+        entry.and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id))
+    };
+
+    documents
+        .insert_block_as(
+            context_id,
+            None,
+            last_block_id.as_ref(),
+            role,
+            BlockKind::Text,
+            content,
+            Status::Done,
+            content_type,
+            Some(ctx.actor_id),
+        )
+        .map(|id| id.to_key())
+        .map_err(|e| McpError::Protocol(e.to_string()))
+}
+
 fn tool_def<P: JsonSchema + 'static>(
     instance: &InstanceId,
     name: &str,
@@ -973,30 +1008,7 @@ impl BlockToolsServer {
         content: &str,
         content_type: ContentType,
     ) -> McpResult<String> {
-        let context_id = ctx.context_id;
-        if !self.documents.contains(context_id) {
-            return Err(McpError::Protocol(format!("no document for context {}", context_id.short())));
-        }
-
-        let last_block_id = {
-            let entry = self.documents.get(context_id);
-            entry.and_then(|doc| doc.doc.blocks_ordered().last().map(|b| b.id))
-        };
-
-        self.documents
-            .insert_block_as(
-                context_id,
-                None,
-                last_block_id.as_ref(),
-                role,
-                BlockKind::Text,
-                content,
-                Status::Done,
-                content_type,
-                Some(ctx.actor_id),
-            )
-            .map(|id| id.to_key())
-            .map_err(|e| McpError::Protocol(e.to_string()))
+        append_to_context(&self.documents, ctx, role, content, content_type)
     }
 
     /// Applies one line-based edit operation to `content` in memory,

@@ -925,7 +925,7 @@ impl Kernel {
         // module doc for why it's a separate curated instance.
         self.broker
             .register_silently(
-                Arc::new(BuiltinTasksServer::new(documents)),
+                Arc::new(BuiltinTasksServer::new(documents.clone())),
                 InstancePolicy::for_kernel(self),
             )
             .await?;
@@ -936,6 +936,8 @@ impl Kernel {
                     file_cache,
                     self.vfs.clone(),
                     workspace_guard,
+                    documents,
+                    self.cas.clone(),
                 )),
                 InstancePolicy::for_kernel(self),
             )

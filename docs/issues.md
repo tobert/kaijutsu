@@ -2979,10 +2979,22 @@ Re-verified against the tree the same day:
   one `ComposeIo` parameter (`input/compose/systems.rs`); the rest of the app
   still threads them separately.
 
+## `view_image` has no end-to-end run yet
+
+`builtin.file` `view_image` attaches an image through an Asset block, and
+hydration holds the image until after the call's result so the tool pair stays
+adjacent (`llm/hydrate.rs`, `an_image_appended_during_a_tool_call_follows_its_result`).
+Unit tests cover both halves. Not yet run: a coder context on a vision model
+(`tenchi/qwen3.8-27b` answers image input directly over vLLM) calling the tool
+in a real turn. Still open: no per-model "accepts images" check, so a
+text-only provider gets the image block and drops it (`mk` writes a text
+marker). Also, `mcp/servers/file.rs` tests `broker_with_vfs_file` and
+`broker_with_vfs_files` have no callers.
+
 ## File buffers: reduce the MCP file tools to kaish (low priority)
 
 Slices 1-3 of `docs/file-buffers.md` shipped. `mcp/servers/file.rs` still
-registers `read`, `edit`, `write`, and `glob`; `grep` was removed 2026-10-03
+registers `read`, `view_image`, `edit`, `write`, and `glob`; `grep` was removed 2026-10-03
 and the coder's person-input facades with it (Amy: "we'll get the final
 kaish edit work going tomorrow"). Amy, 2026-08-21: remove
 them outright, "It's ok if we don't have them for a short period while we
