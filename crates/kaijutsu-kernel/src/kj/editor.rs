@@ -65,7 +65,8 @@ enum EditorCommand {
         /// Session handle.
         session: u64,
     },
-    /// Checkpoint the buffer as saved (`ZZ`); for a file, also flush to disk.
+    /// Checkpoint the buffer as saved (like `:w`; the session stays open); for a
+    /// file, also flush to disk.
     /// Needs the `editor` capability.
     Save {
         /// Session handle.
@@ -78,13 +79,6 @@ enum EditorCommand {
     },
     /// List open editor sessions (session, path, dirty, mode, opener).
     List,
-}
-
-/// Structured `.data` for one session's state — an object (inspect-style), so
-/// `kj editor state --json` yields a single record a driver can read. The shape
-/// lives on [`EditorState`] so every editor front door emits the same record.
-fn state_json(id: EditorSessionId, st: &EditorState) -> serde_json::Value {
-    st.to_json(id)
 }
 
 /// The capability `kj editor save` gates on. A write reached through
@@ -141,7 +135,7 @@ impl KjDispatcher {
             {
                 Ok((id, st)) => KjResult::ok_with_data(
                     format!("opened editor session {} on {path}", id.as_u64()),
-                    state_json(id, &st),
+                    st.to_json(id),
                 ),
                 Err(e) => KjResult::Err(format!("kj editor open: {e}")),
             },
@@ -166,7 +160,7 @@ impl KjDispatcher {
                         if let Some(msg) = &st.message {
                             line.push_str(&format!(" — {msg}"));
                         }
-                        KjResult::ok_with_data(line, state_json(id, &st))
+                        KjResult::ok_with_data(line, st.to_json(id))
                     }
                     Err(e) => KjResult::Err(format!("kj editor keys: {e}")),
                 }
@@ -187,7 +181,7 @@ impl KjDispatcher {
                         if let Some(msg) = &st.message {
                             line.push_str(&format!(" — {msg}"));
                         }
-                        KjResult::ok_with_data(line, state_json(id, &st))
+                        KjResult::ok_with_data(line, st.to_json(id))
                     }
                     Err(e) => KjResult::Err(format!("kj editor insert: {e}")),
                 }
@@ -201,7 +195,7 @@ impl KjDispatcher {
                             mode_label(&st),
                             if st.dirty { ", modified" } else { "" }
                         ),
-                        state_json(id, &st),
+                        st.to_json(id),
                     ),
                     Err(e) => KjResult::Err(format!("kj editor state: {e}")),
                 }
@@ -220,7 +214,7 @@ impl KjDispatcher {
                         if let Some(msg) = &st.message {
                             line.push_str(&format!(" — {msg}"));
                         }
-                        KjResult::ok_with_data(line, state_json(id, &st))
+                        KjResult::ok_with_data(line, st.to_json(id))
                     }
                     Err(e) => KjResult::Err(format!("kj editor save: {e}")),
                 }

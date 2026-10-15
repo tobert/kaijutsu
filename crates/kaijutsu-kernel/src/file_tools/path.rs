@@ -41,7 +41,7 @@ impl std::error::Error for PathError {}
 ///
 /// - Absolute `path` (leading `/`) ignores `cwd`.
 /// - Relative `path` is joined onto `cwd` (which is expected to be absolute;
-///   it defaults to `/` everywhere a context lacks one).
+///   a context without a cwd is refused by the caller, never defaulted).
 /// - `.` and `..` are normalized lexically; `..` above root errors.
 pub fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, PathError> {
     let raw = if path.starts_with('/') {

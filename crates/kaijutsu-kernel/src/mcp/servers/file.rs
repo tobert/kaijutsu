@@ -935,7 +935,7 @@ fn normalizes_to_filesystem_root(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_store::{shared_block_store, shared_block_store_with_db, DocumentKind};
+    use crate::block_store::{shared_block_store, shared_block_store_with_db};
     use crate::file_tools::FileDocumentCache;
     use crate::kernel_db::KernelDb;
     use crate::mcp::{Broker, InstancePolicy, ToolContent};
@@ -1347,51 +1347,6 @@ mod tests {
         }
     }
 
-    /// A file mounted directly on the raw VFS backend, so `readdir` (the
-    /// walker's traversal primitive) actually sees it — unlike
-    /// `broker_with_file`, whose `cache.create_or_replace` lands content in
-    /// the block store without flushing through to the backend, which is
-    /// why the walker-based `glob`/`grep` tests elsewhere assert only that
-    /// no error fired, never that a match was found.
-    async fn broker_with_vfs_file(path: &str, content: &str) -> Arc<Broker> {
-        let blocks = shared_block_store(PrincipalId::system());
-        let vfs = Arc::new(MountTable::new());
-        vfs.mount("/tmp", MemoryBackend::new()).await;
-        vfs.write_all(std::path::Path::new(path), content.as_bytes())
-            .await
-            .unwrap();
-        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        let server = Arc::new(FileToolsServer::new(cache, vfs, None));
-        let broker = Arc::new(Broker::new());
-        broker
-            .register(server, InstancePolicy::default())
-            .await
-            .unwrap();
-        broker
-    }
-
-
-    /// Mounts several files directly on the VFS backend, the way
-    /// `broker_with_vfs_file` does for one file, so the walker `grep` and
-    /// `glob` use actually finds them (unlike `broker_with_file`, whose
-    /// cached content never reaches the backend).
-    async fn broker_with_vfs_files(files: &[(&str, &str)]) -> (Arc<Broker>, Arc<FileDocumentCache>) {
-        let blocks = shared_block_store(PrincipalId::system());
-        let vfs = Arc::new(MountTable::new());
-        vfs.mount("/tmp", MemoryBackend::new()).await;
-        for (path, content) in files {
-            vfs.write_all(std::path::Path::new(path), content.as_bytes())
-                .await
-                .unwrap();
-        }
-        let cache = Arc::new(FileDocumentCache::new(blocks, vfs.clone(), test_kernel_db()));
-        let server = Arc::new(FileToolsServer::new(cache.clone(), vfs, None));
-        let broker = Arc::new(Broker::new());
-        broker.register(server, InstancePolicy::default()).await.unwrap();
-        (broker, cache)
-    }
-
-
     /// The guard must not over-refuse: an explicit path is let through.
     /// Without this, "refuse the root" could be satisfied by refusing
     /// everything.
@@ -1617,7 +1572,6 @@ mod tests {
             .get_or_create_default_workspace(creator)
             .unwrap();
         let store = shared_block_store_with_db(db.clone(), ws_id, creator);
-        let _ = (&store, DocumentKind::File);
 
         let vfs = Arc::new(MountTable::new());
         let cache = Arc::new(FileDocumentCache::new(store, vfs.clone(), db));

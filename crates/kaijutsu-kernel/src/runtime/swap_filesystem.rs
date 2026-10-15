@@ -118,7 +118,7 @@ impl SwapFilesystem {
 
     /// The real absolute path `rest`'s components name, joined with a
     /// leading `/` (mirroring is exact — no flattening, no escaping).
-    fn real_path(rest: &[String]) -> String {
+    fn mirrored_path(rest: &[String]) -> String {
         format!("/{}", rest.join("/"))
     }
 
@@ -145,7 +145,7 @@ impl SwapFilesystem {
             components.push(name.clone());
             let size = match self
                 .file_cache
-                .try_read_content(&Self::real_path(&components))
+                .try_read_content(&Self::mirrored_path(&components))
                 .await
             {
                 Ok(content) => content.len() as u64,
@@ -187,7 +187,7 @@ impl Filesystem for SwapFilesystem {
             ));
         }
 
-        let real = Self::real_path(&rest);
+        let real = Self::mirrored_path(&rest);
         let dirty = self.dirty_paths()?;
         if !dirty.iter().any(|d| d.path == real) {
             return Err(io::Error::new(
@@ -259,7 +259,7 @@ impl Filesystem for SwapFilesystem {
         if !any_under {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no swap under {}", Self::real_path(&rest)),
+                format!("no swap under {}", Self::mirrored_path(&rest)),
             ));
         }
 
@@ -276,7 +276,7 @@ impl Filesystem for SwapFilesystem {
             return Ok(DirEntry::directory(kernel_seg));
         }
 
-        let real = Self::real_path(&rest);
+        let real = Self::mirrored_path(&rest);
         let dirty = self.dirty_paths()?;
         if let Some(buf) = dirty.iter().find(|d| d.path == real) {
             let content = self

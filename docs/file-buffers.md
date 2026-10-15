@@ -50,7 +50,7 @@ We had already built most of vim's *write* side and none of its *read* side.
 | vim | kaijutsu today |
 |---|---|
 | buffer dirty flag | `CachedFileDoc.dirty`, `EditorSessionInfo.dirty` |
-| `:w` / `ZZ` | `editor_save`, `flush_one`, `flush_dirty` |
+| `:w` / `ZZ` | `editor_save`, `flush_one` |
 | last-written state | `EditorSession.saved_content` (the checkpoint) |
 | swap file | durable file document — but **silent**, which is the bug |
 | `W12` changed-under-us | `flush_one_guarded` — `:w` refuses when disk moved past the buffer's load generation, `:w!` overrides |

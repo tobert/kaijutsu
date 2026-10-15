@@ -165,7 +165,7 @@ The contract everything else is tested against:
 - Intent drains: `take_close()` (`ZZ`/`ZQ`), `take_commands()` (`:` verbs),
   `take_io()` (`:r` fetches) — the editor surfaces *intent*; the kernel acts.
 - State accessors: `text()`, `cursor()`, `mode()`, `command_line()`,
-  `selection()`, `dirty()`. `selection()` is `None` outside visual mode.
+  `selection()`. Dirtiness is computed kernel-side against the checkpoint. `selection()` is `None` outside visual mode.
   Charwise (`v`) and linewise (`V`) give one span; blockwise (`<C-v>`) gives
   one span per row that reaches the block's left column. A selected line
   break is part of a span. A peer merge (`apply_remote_text`) moves the

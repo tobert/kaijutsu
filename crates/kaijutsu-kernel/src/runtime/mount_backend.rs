@@ -1337,8 +1337,6 @@ mod tests {
         // And the rejected write must not have poisoned anything: a fresh read
         // still returns the on-disk content, not the phantom edit.
         assert_eq!(backend.read(&file, None).await.unwrap(), b"on-disk");
-
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// `new_read_only` is the structural read-only *mode* (for the toolie's
@@ -1460,15 +1458,7 @@ mod tests {
         // Destroy the kernel document from the block store to simulate a Backend
         // error on the next read — the in-memory cache entry still points to
         // the now-gone context_id.
-        let ctx_id = {
-            use uuid::Uuid;
-            use kaijutsu_types::ContextId;
-            let uuid = Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                b"kaijutsu:file:/tmp/nowipe.txt",
-            );
-            ContextId::from_bytes(*uuid.as_bytes())
-        };
+        let ctx_id = crate::file_tools::cache::file_context_id("/tmp/nowipe.txt");
         file_cache
             .block_store()
             .delete_document(ctx_id)
@@ -1527,12 +1517,7 @@ mod tests {
             .unwrap();
 
         // Destroy the kernel document to force a Backend error on next read.
-        let ctx_id = {
-            use uuid::Uuid;
-            use kaijutsu_types::ContextId;
-            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"kaijutsu:file:/tmp/stale.txt");
-            ContextId::from_bytes(*uuid.as_bytes())
-        };
+        let ctx_id = crate::file_tools::cache::file_context_id("/tmp/stale.txt");
         file_cache
             .block_store()
             .delete_document(ctx_id)

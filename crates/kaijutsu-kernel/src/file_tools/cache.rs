@@ -105,12 +105,9 @@ impl std::error::Error for FlushError {}
 
 /// A cached file backed by a kernel document.
 struct CachedFileDoc {
-    /// Deterministic ContextId derived from the file path. Every caller that
-    /// needs the path back already holds it (it's the map key's preimage, and
-    /// `flush_one`/`mark_dirty`/etc. all take `path` as a parameter directly)
-    /// — no field kept it redundantly here after `flush_dirty` (the one
-    /// reader that walked the whole cache and needed each entry's own path)
-    /// was deleted as dead code.
+    /// Deterministic ContextId derived from the file path. The path is not
+    /// stored: it is the map key's preimage, and `flush_one`, `mark_dirty`,
+    /// and the other callers take it as a parameter.
     context_id: ContextId,
     /// The single block holding file content.
     block_id: BlockId,

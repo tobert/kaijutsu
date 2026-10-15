@@ -1,8 +1,8 @@
 //! File-level tools for kernel-owned file editing.
 //!
-//! Provides read, edit, write, and glob tools that operate through
-//! the VFS and cache files as kernel documents. This enables concurrent
-//! editing of source files with the same operational semantics as block editing.
+//! Supports the file tools in `mcp/servers/file.rs` (read, edit, write, glob,
+//! grep): the kernel-document cache, write guard, hashline anchors, path
+//! resolution, and the VFS walker.
 //!
 //! # Architecture
 //!
@@ -13,8 +13,7 @@
 //!                      │ Tool calls (JSON params)
 //!                      ▼
 //! ┌─────────────────────────────────────────┐
-//! │         File Tool Engines               │
-//! │   (read, edit, write, glob, grep)       │
+//! │   MCP file tools (mcp/servers/file.rs)  │
 //! └────────────────────┬────────────────────┘
 //!                      │
 //!            ┌─────────┴──────────┐

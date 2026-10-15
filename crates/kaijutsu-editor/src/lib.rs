@@ -270,10 +270,9 @@ impl EditorCore {
     ///
     /// modalkit's `EditRope` is line-terminated — it always ends in `\n` — so a
     /// file `"hello"` becomes `"hello\n"` internally. We strip one trailing
-    /// newline here. **Tech debt (sweep before done):** this cannot distinguish
-    /// `"hello"` from `"hello\n"`; faithful trailing-newline round-tripping must
-    /// live in the kernel binding (remember the loaded terminator, re-apply on
-    /// save). See `docs/vi.md`.
+    /// newline here, so this cannot distinguish `"hello"` from `"hello\n"`. The
+    /// kernel binding owns terminator fidelity: it remembers the loaded
+    /// terminator and re-applies it on save. See `docs/vi.md`.
     pub fn text(&self) -> String {
         strip_one_trailing_newline(&self.buffer.get_text())
     }
