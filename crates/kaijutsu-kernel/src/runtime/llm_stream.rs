@@ -323,7 +323,7 @@ async fn wake_undelivered_input(
 fn hydrate_messages(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_types::BlockId,
+    after_block_id: &mut kaijutsu_types::BlockId,
     mailbox: &mut crate::ConversationMailbox,
     // The hydration window policy `(marker, window)`, or `None` to hydrate the
     // whole history (the default; every non-musician context). When set, the
@@ -344,14 +344,14 @@ fn hydrate_messages(
 fn handle_hydration_outcome(
     documents: &SharedBlockStore,
     context_id: ContextId,
-    after_block_id: &kaijutsu_types::BlockId,
+    after_block_id: &mut kaijutsu_types::BlockId,
     read: crate::BlockStoreResult<Vec<kaijutsu_types::BlockSnapshot>>,
     mailbox: &mut crate::ConversationMailbox,
     policy: Option<(kaijutsu_types::BlockId, u32)>,
 ) -> Result<Vec<LlmMessage>, ()> {
     match read {
         Ok(blocks) => {
-            match policy {
+            let snapshot = match policy {
                 // Windowed context: rebuild `[0, marker] ∪ last-window` each turn
                 // (a sliding tail can drop a block, which the append-only
                 // catch_up can't express). Applies on cold start too — this is
@@ -366,7 +366,7 @@ fn handle_hydration_outcome(
                         blocks.len(),
                         snapshot.len(),
                     );
-                    Ok(snapshot)
+                    snapshot
                 }
                 None => {
                     let new_blocks = mailbox.catch_up(&blocks);
@@ -377,9 +377,22 @@ fn handle_hydration_outcome(
                         snapshot.len(),
                         context_id
                     );
-                    Ok(snapshot)
+                    snapshot
                 }
+            };
+            // If eligible blocks landed after `after_block_id` before hydration
+            // ran (e.g. a queued turn or a caller that anchored earlier in the
+            // log), they are now part of the prompt this turn answers; advance
+            // the write point so the model's reply lands after them rather than
+            // burying them at the tail. Unsent drafts stay unseen and ineligible.
+            if let Some(pos) = blocks.iter().position(|b| b.id == *after_block_id)
+                && let Some(tail) = blocks[pos + 1..].iter().rfind(|b| {
+                    mailbox.has_seen(&b.id) && crate::llm::hydrate::is_history_eligible(b)
+                })
+            {
+                *after_block_id = tail.id;
             }
+            Ok(snapshot)
         }
         Err(e) => {
             // Hydration failed. Do NOT fall back to the mailbox snapshot +
@@ -1177,7 +1190,7 @@ mod hydration_tests {
             .expect("create document");
 
         // Anchor block: the user's just-inserted prompt.
-        let user_block_id = documents
+        let mut user_block_id = documents
             .insert_block_as(
                 context_id,
                 None,
@@ -1198,7 +1211,7 @@ mod hydration_tests {
         let result = handle_hydration_outcome(
             &documents,
             context_id,
-            &user_block_id,
+            &mut user_block_id,
             read,
             &mut mailbox,
             None,
@@ -1238,7 +1251,7 @@ mod hydration_tests {
         documents
             .create_document(context_id, DocumentKind::Conversation, None)
             .expect("create document");
-        let user_block_id = documents
+        let mut user_block_id = documents
             .insert_block_as(
                 context_id,
                 None,
@@ -1254,7 +1267,7 @@ mod hydration_tests {
 
         let mut mailbox = crate::ConversationMailbox::new();
         let result =
-            hydrate_messages(&documents, context_id, &user_block_id, &mut mailbox, None);
+            hydrate_messages(&documents, context_id, &mut user_block_id, &mut mailbox, None);
         let messages = result.expect("successful hydration");
         assert!(
             !messages.is_empty(),
@@ -1294,11 +1307,11 @@ mod hydration_tests {
         insert(Role::User, "q1-ARCHIVED");
         insert(Role::Model, "a1-ARCHIVED");
         insert(Role::User, "q2");
-        let last = insert(Role::Model, "a2"); // tail (window 2) = [q2, a2]
+        let mut last = insert(Role::Model, "a2"); // tail (window 2) = [q2, a2]
 
         let mut mailbox = crate::ConversationMailbox::new();
         let messages =
-            hydrate_messages(&documents, context_id, &last, &mut mailbox, Some((marker, 2)))
+            hydrate_messages(&documents, context_id, &mut last, &mut mailbox, Some((marker, 2)))
                 .expect("windowed hydration");
         let wire: String = messages
             .iter()
@@ -2276,7 +2289,7 @@ async fn run_llm_stream(
     kernel: Arc<Kernel>,
     kernel_db: Arc<parking_lot::Mutex<KernelDb>>,
     tools: Vec<ToolDefinition>,
-    after_block_id: kaijutsu_types::BlockId,
+    mut after_block_id: kaijutsu_types::BlockId,
     system_prompt: String,
     max_output_tokens: u64,
     // This backend's total and idle guards (`StreamTimeouts::resolve`).
@@ -2368,7 +2381,7 @@ async fn run_llm_stream(
     let mut messages = match hydrate_messages(
         &documents,
         context_id,
-        &after_block_id,
+        &mut after_block_id,
         mailbox,
         hydration_policy,
     ) {
@@ -8774,6 +8787,115 @@ mod lifetime_tests {
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert_eq!(user_text(sent[1].last().unwrap()), Some("Shell operation op-1 completed"));
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_draft_started_before_a_turn_runs_submits_at_the_tail_and_hydrates_in_order() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            text_reply("first reply"),
+            text_reply("second reply"),
+        ]).recording_sent_messages();
+        let (kernel, context, _after, call) = fixture(Some(mock)).await;
+        let dispatcher = Arc::new(crate::KjDispatcher::new(
+            kernel.drift().clone(),
+            kernel.blocks().clone(),
+            kernel.kernel_db().clone(),
+            kernel.clone(),
+        ));
+        dispatcher.set_self_arc();
+        kernel.broker().set_kj_dispatcher(&dispatcher).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+        // Player starts composing a draft before the first turn's blocks land.
+        kernel.blocks().edit_draft(context, call.principal_id, 0, "follow-up from draft", 0).unwrap();
+
+        // First turn runs and writes its user + assistant blocks while the draft is still unsent.
+        submit_text(&kernel, context, call.principal_id, "first prompt").await;
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        // Player presses Enter to submit the draft.
+        crate::runtime::prompt::submit(
+            &kernel,
+            context,
+            call.principal_id,
+            SessionId::new(),
+            crate::runtime::prompt::PromptSource::Draft { edge: None },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            user_text(sent[1].last().unwrap()),
+            Some("follow-up from draft"),
+            "the promoted draft must be the final user message on the second turn, not buried before the first turn's reply: {:#?}",
+            sent[1]
+        );
+        let mut expected = sent[1].clone();
+        expected.push(LlmMessage::assistant("second reply"));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
+        kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_turn_anchored_before_a_later_hydrated_block_places_its_reply_after_that_block() {
+        let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
+            text_reply("answered both"),
+        ]).recording_sent_messages();
+        let (kernel, context, after, call) = fixture(Some(mock)).await;
+        let mut completed = kernel.turn_flows().subscribe("turn.completed");
+
+        // A second user block lands after `after` before the turn hydrates `context`.
+        let later_user = kernel.blocks().insert_block_as(
+            context,
+            None,
+            Some(&after),
+            Role::User,
+            BlockKind::Text,
+            "second user prompt",
+            Status::Done,
+            ContentType::Plain,
+            Some(call.principal_id),
+        ).unwrap();
+
+        // Start the turn anchored at `after` (preceding `later_user`).
+        start_fixture_turn(
+            &kernel,
+            kernel.admit_context(context).unwrap(),
+            None,
+            &after,
+            call.clone(),
+            call.principal_id,
+            TurnOrigin::Interactive,
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+
+        let sent = sent.lock().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            mentions(&sent[0], "second user prompt"),
+            "hydration folded the later user block into the turn's request"
+        );
+
+        let blocks = kernel.blocks().non_draft_snapshots(context).unwrap();
+        assert_eq!(
+            blocks.last().map(|b| (b.role, b.content.as_str())),
+            Some((Role::Model, "answered both")),
+            "the model reply must land after every block the turn hydrated, never leaving the hydrated user block at the tail: {blocks:#?}"
+        );
+        let pos = |id: &BlockId| blocks.iter().position(|b| &b.id == id).unwrap();
+        let reply_id = blocks.iter().find(|b| b.role == Role::Model).unwrap().id;
+        assert!(pos(&after) < pos(&later_user) && pos(&later_user) < pos(&reply_id));
+
+        let mut expected = sent[0].clone();
+        expected.push(LlmMessage::assistant("answered both"));
+        assert_same_wire(&rehydrated(&kernel, context), &expected);
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

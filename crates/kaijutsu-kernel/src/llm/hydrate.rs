@@ -194,16 +194,25 @@ impl HydrationState {
                     return;
                 };
                 // A new assistant turn begins — flush any pending tool results
-                // from the prior turn, same as Model/Text below.
+                // from the prior turn, and if the prior assistant turn ended on
+                // unanswered tool calls (e.g. interrupted before results ran),
+                // flush that assistant batch first so the two turns do not merge.
                 self.flush_tool_results();
+                if !self.tool_uses.is_empty() {
+                    self.flush_assistant();
+                }
                 // One entry per Thinking block — preserved separately so each
                 // signature stays paired with its own text (no merging).
                 self.assistant_reasoning
                     .push((block.content.clone(), Some(signature)));
             }
             (BlockRole::Model, BlockKind::Text) => {
-                // Flush pending tool results before accumulating assistant text
+                // Flush pending tool results (or an unanswered tool-call batch
+                // from a prior turn) before accumulating assistant text.
                 self.flush_tool_results();
+                if !self.tool_uses.is_empty() {
+                    self.flush_assistant();
+                }
                 match &mut self.assistant_text {
                     Some(text) => {
                         text.push('\n');
@@ -1077,6 +1086,87 @@ mod pairing_repair_tests {
 
         let out = state.into_messages();
         assert_well_paired(&out);
+    }
+
+    /// Local OpenAI-compatible servers (`llama.cpp`, `vLLM`, `ollama`) often
+    /// synthesize `call_0` on every inference. When an assistant turn is
+    /// interrupted after emitting `(Model, ToolCall, id="call_0")` (leaving no
+    /// `ToolResult`) and a subsequent turn emits `(Model, Thinking)` or
+    /// `(Model, Text)` followed by another `(Model, ToolCall, id="call_0")` and
+    /// its `ToolResult`, `HydrationState` must flush the first assistant turn
+    /// before accumulating the second turn's reasoning/text. Merging both turns
+    /// into one assistant message puts two `call_0` `ToolUse` blocks in the
+    /// same batch, which `validate_tool_pairing` then refuses every turn.
+    #[test]
+    fn unanswered_tool_call_flushes_before_next_assistant_thinking_or_text() {
+        let ctx = kaijutsu_types::ContextId::new();
+        let model = kaijutsu_types::PrincipalId::new();
+        let user = kaijutsu_types::PrincipalId::new();
+        let id = |p, seq| BlockId::new(ctx, p, seq);
+
+        for start_with_thinking in [false, true] {
+            let mut blocks = vec![
+                kaijutsu_types::BlockSnapshot::text(
+                    id(user, 1),
+                    None,
+                    BlockRole::User,
+                    "run check",
+                ),
+                {
+                    let mut tc = kaijutsu_types::BlockSnapshot::tool_call(
+                        id(model, 1),
+                        None,
+                        kaijutsu_types::ToolKind::Shell,
+                        "bash",
+                        serde_json::json!({"command": "first"}),
+                        BlockRole::Model,
+                        Some("call_0".into()),
+                    );
+                    tc.status = kaijutsu_types::Status::Error;
+                    tc
+                },
+            ];
+            if start_with_thinking {
+                let mut th = kaijutsu_types::BlockSnapshot::thinking(
+                    id(model, 2),
+                    None,
+                    "retrying after interrupt",
+                );
+                th.signature = Some("openai-compat-reasoning-v1".into());
+                blocks.push(th);
+            }
+            blocks.push(kaijutsu_types::BlockSnapshot::text(
+                id(model, 3),
+                None,
+                BlockRole::Model,
+                "let me try again",
+            ));
+            blocks.push(kaijutsu_types::BlockSnapshot::tool_call(
+                id(model, 4),
+                None,
+                kaijutsu_types::ToolKind::Shell,
+                "bash",
+                serde_json::json!({"command": "second"}),
+                BlockRole::Model,
+                Some("call_0".into()),
+            ));
+            blocks.push(kaijutsu_types::BlockSnapshot::tool_result(
+                id(user, 2),
+                id(model, 4),
+                kaijutsu_types::ToolKind::Shell,
+                "ok",
+                false,
+                Some(0),
+                Some("call_0".into()),
+            ));
+
+            let hydrated = crate::hydrate_from_blocks(&blocks);
+            assert_well_paired(&hydrated);
+            assert!(
+                validate_tool_pairing(&hydrated).is_ok(),
+                "start_with_thinking={start_with_thinking}: hydrated messages must pass tool pairing validation: {hydrated:?}"
+            );
+        }
     }
 }
 

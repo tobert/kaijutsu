@@ -947,13 +947,25 @@ impl BlockStore {
         self.documents.len()
     }
 
-    /// Get the last block ID in a document (for ordering new blocks at the end).
+    /// Get the last non-draft block ID in a document (for ordering new blocks at the end).
     pub fn last_block_id(&self, context_id: ContextId) -> Option<BlockId> {
         let entry = self.get(context_id)?;
-        // `block_ids_ordered()`, not `blocks_ordered()`: only the id is
-        // needed, so skip building `BlockSnapshot`s (and the `text()`
-        // materialization each one carries) entirely.
-        entry.doc.block_ids_ordered().last().copied()
+        // `block_ids_ordered()` + `get_block_header()`, not `blocks_ordered()`:
+        // only the id and status are needed, so skip building `BlockSnapshot`s
+        // (and the `text()` materialization each one carries) entirely. An
+        // unsent draft belongs only to its author and stays at the tail until
+        // submitted, so new blocks anchor before it.
+        entry
+            .doc
+            .block_ids_ordered()
+            .into_iter()
+            .rev()
+            .find(|id| {
+                entry
+                    .doc
+                    .get_block_header(id)
+                    .is_some_and(|h| h.status != Status::Draft)
+            })
     }
 
     /// The newest block in `context_id` other than `exclude` that is not a
@@ -2673,49 +2685,71 @@ impl BlockStore {
     ) -> BlockStoreResult<(BlockId, String)> {
         let (id, text, content_type) = self.accept(context_id, |entry| {
             let mut events = Vec::new();
-            let draft = entry.doc.blocks_ordered().into_iter()
-                .find(|block| block.status == Status::Draft && block.id.principal_id == principal_id)
+            let ordered = entry.doc.blocks_ordered();
+            let draft_idx = ordered
+                .iter()
+                .position(|block| block.status == Status::Draft && block.id.principal_id == principal_id)
                 .ok_or(BlockStoreError::NoDraft(context_id, principal_id))?;
+            let draft = &ordered[draft_idx];
+            let draft_id = draft.id;
+            let content_type = draft.content_type;
             let text = draft.content.trim().to_string();
             if text.is_empty() {
                 return Err(BlockStoreError::EmptyDraft(context_id));
             }
-            // All three changes land under one lock and journal as ONE op, so a
+            let moved_after = ordered[draft_idx + 1..]
+                .iter()
+                .rfind(|block| block.status != Status::Draft)
+                .map(|block| block.id);
+            if let Some(after_id) = moved_after {
+                entry.doc.move_block(&draft_id, Some(&after_id))?;
+            }
+            // All changes land under one lock and journal as ONE op, so a
             // crash cannot promote the block without its edge or leave the edge
             // on a block still marked Draft. `status`/`ephemeral` live on
-            // `BlockHeader`, but `edge_block`/`edge_shown` do not, so the full
-            // post-mutation snapshot is journaled (mirrors `set_summary`/
-            // `set_stderr`): a header-only payload cannot carry the edge through
-            // oplog replay. The events follow: `StatusChanged` then
-            // `MetadataChanged`, batched into one change-feed delivery.
-            entry.doc.set_ephemeral(&draft.id, false)?;
-            entry.doc.set_status(&draft.id, Status::Done)?;
-            entry.doc.set_edge(&draft.id, edge)?;
+            // `BlockHeader`, but `order_key` and `edge_block`/`edge_shown` do not,
+            // so the full post-mutation snapshot is journaled (mirrors
+            // `move_block`/`set_summary`/`set_stderr`): a header-only payload
+            // cannot carry them through oplog replay. The events follow: `Moved`
+            // (when blocks landed after the draft while typing), `StatusChanged`,
+            // then `MetadataChanged`, batched into one change-feed delivery.
+            entry.doc.set_ephemeral(&draft_id, false)?;
+            entry.doc.set_status(&draft_id, Status::Done)?;
+            entry.doc.set_edge(&draft_id, edge)?;
             entry.touch(self.principal_id());
             let version = entry.version();
-            let snapshot = entry.doc.get_block_snapshot(&draft.id).expect(
+            let snapshot = entry.doc.get_block_snapshot(&draft_id).expect(
                 "block must exist: the mutations against it just succeeded under this same guard",
             );
             let ops = SyncPayload::from_updated_snapshot(snapshot);
 
+            if let Some(after_id) = moved_after {
+                events.push(BlockFlow::Moved {
+                    context_id,
+                    block_id: draft_id,
+                    after_id: Some(after_id),
+                    version,
+                    source: OpSource::Local,
+                });
+            }
             events.push(BlockFlow::StatusChanged {
                 context_id,
-                block_id: draft.id,
+                block_id: draft_id,
                 status: Status::Done,
                 version,
                 source: OpSource::Local,
             });
-            let metadata = entry.doc.get_block_snapshot(&draft.id)
+            let metadata = entry.doc.get_block_snapshot(&draft_id)
                 .expect("the accepted block exists under this guard").metadata();
             events.push(BlockFlow::MetadataChanged {
                 context_id,
-                block_id: draft.id,
+                block_id: draft_id,
                 metadata,
                 version,
                 source: OpSource::Local,
             });
 
-            Ok((ops, events, (draft.id, text, draft.content_type)))
+            Ok((ops, events, (draft_id, text, content_type)))
         })?;
         if matches!(content_type, ContentType::Abc | ContentType::Svg | ContentType::Diff) {
             let _ = self.validate_content_and_attach_errors(context_id, &id);
@@ -8091,6 +8125,86 @@ mod tests {
         assert!(store.draft_block(ctx, me).unwrap().is_none());
         // Clearing nothing is not an error.
         assert_eq!(store.clear_draft(ctx, me).unwrap(), "");
+    }
+
+    /// A draft is created at the tail when the player starts typing, but
+    /// other blocks (a running turn's reply, a drift, a shell command) can
+    /// land before the player presses Enter. `last_block_id` must name the
+    /// last committed (non-draft) block so callers that anchor at the tail do
+    /// not insert after an unsent draft, and `submit_draft` must move the
+    /// promoted block after any non-draft blocks that landed after it so the
+    /// sent message is always at the end of the committed log.
+    #[test]
+    fn submitting_a_draft_moves_it_after_blocks_inserted_while_typing_and_last_block_id_skips_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, store, ctx, ws) = fresh_db_store(dir.path());
+        let amy = PrincipalId::new();
+        let coplayer = PrincipalId::new();
+
+        let b0 = store
+            .insert_block(
+                ctx, None, None, Role::User, BlockKind::Text,
+                "first prompt", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        let draft = store.edit_draft(ctx, amy, 0, "second prompt", 0).unwrap();
+
+        assert_eq!(
+            store.last_block_id(ctx),
+            Some(b0),
+            "last_block_id must skip unsent drafts so new blocks anchor at the committed tail"
+        );
+
+        // Even when a block is appended with `after: None` (landing after the
+        // draft in raw key order) and another player also holds an unsent draft,
+        // promoting `amy`'s draft moves it after the last non-draft block and
+        // leaves the other player's unsent draft behind it.
+        let b1 = store
+            .insert_block(
+                ctx, None, None, Role::Model, BlockKind::Text,
+                "first reply", Status::Done, ContentType::Plain,
+            )
+            .unwrap();
+        let other_draft = store.edit_draft(ctx, coplayer, 0, "still typing", 0).unwrap();
+
+        let (submitted, text) = store.submit_draft(ctx, amy, None).unwrap();
+        assert_eq!(submitted, draft);
+        assert_eq!(text, "second prompt");
+
+        let non_draft_ids: Vec<BlockId> = store
+            .non_draft_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            non_draft_ids,
+            vec![b0, b1, submitted],
+            "the promoted draft must sit at the end of the committed log, after blocks inserted while typing"
+        );
+
+        let all_ids: Vec<BlockId> = store
+            .block_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            all_ids,
+            vec![b0, b1, submitted, other_draft],
+            "another player's unsent draft stays after the newly committed message"
+        );
+
+        // Oplog replay across a restart preserves the post-submit order.
+        drop(store);
+        let store2 = drop_and_reload(db, ws);
+        let replayed_ids: Vec<BlockId> = store2
+            .non_draft_snapshots(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(replayed_ids, vec![b0, b1, submitted]);
     }
 
     /// A draft sits at the END of the document, which is exactly where a naive
