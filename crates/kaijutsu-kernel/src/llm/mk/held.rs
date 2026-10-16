@@ -201,7 +201,10 @@ impl Client {
             match opened {
                 Ok((slot, Some(inner))) => break (slot, inner),
                 // The server no longer holds the context: send it whole.
-                Ok((_, None)) if !fresh => {
+                // The 404's slot goes first: the PUT takes one of its own,
+                // and a backend of one slot would wait on itself.
+                Ok((slot, None)) if !fresh => {
+                    drop(slot);
                     self.held.lock().remove(&held.context);
                     base = self.put_held(&turn, &identity, held, false, &tools, thinking, &messages[..split]).await?;
                     fresh = true;

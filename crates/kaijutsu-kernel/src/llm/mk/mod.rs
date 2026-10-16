@@ -753,6 +753,38 @@ mod tests {
         assert_eq!(held::record(&c, ctx).unwrap().head.as_str(), snap_id(4));
     }
 
+    /// A lost context is sent whole again on a backend of one slot: the
+    /// 404's slot is let go before the PUT takes its own.
+    ///
+    /// Falsified by holding the 404's slot through the PUT, which waits on
+    /// itself until the turn's deadline.
+    #[tokio::test]
+    async fn a_lost_context_is_sent_again_on_a_backend_of_one_slot() {
+        let ctx = ContextId::new();
+        let lost = http(404, json!({"error": {"type": "not_found", "message": "no such context"}}).to_string());
+        let (base, _) = serve(vec![
+            v2_identity(json!(["generate"])),
+            put_reply(1, &[(0, 1)]),
+            generation("r1", json!([]), 2, &[(0, 1), (1, 2)]),
+            lost,
+            put_reply(3, &[(0, 1), (1, 2)]),
+            generation("r2", json!([]), 4, &[(0, 1), (1, 2), (3, 4)]),
+        ])
+        .await;
+        let endpoints = crate::llm::endpoint::Endpoints::default();
+        let mut backend = crate::llm::BackendConfig::new("zorak-mk", crate::llm::BackendKind::Mk);
+        backend.base_url = Some(base.clone());
+        backend.max_concurrent = Some(1);
+        endpoints.configure(&[backend]);
+        let endpoint = endpoints.for_url(&base).unwrap();
+        let c = Client::new("zorak-mk", &base, Duration::from_secs(5), HashMap::new()).unwrap().with_endpoint(endpoint);
+        drain(&mut c.stream(held_opts(ctx, None), vec![Message::user("u1")]).await.unwrap()).await;
+        let turn = c.stream(held_opts(ctx, None), vec![Message::user("u1"), said("r1"), Message::user("u2")]);
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), turn).await.expect("the PUT waited on the 404's slot").unwrap();
+        let events = drain(&mut stream).await;
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "r2")), "{events:?}");
+    }
+
     #[test]
     fn admission_lowers_max_tokens_to_the_room_and_refuses_no_room() {
         assert_eq!(admit("b", 1000, 32768, 4096).unwrap(), 4096);
