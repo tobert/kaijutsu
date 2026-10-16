@@ -34,10 +34,18 @@ pub(crate) const COUNCIL_CONTEXT_PREFIX: &str = "council-";
 /// character's council context.
 pub(crate) const SYSTEM_RULES: &str = "council-system";
 
-/// The framing every council context carries as its system message; `{label}`
-/// is the context's label.
-const FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
-This conversation is the council context \"{label}\": guidance to judge them by.";
+/// The framing every council context's system message opens with: the
+/// character contexts, the house rules, and the shadows.
+const FRAMING: &str = include_str!("../../../../assets/defaults/council/framing.md");
+
+/// What follows the framing in a character's council context; `{label}` is
+/// the context's label.
+const CONTEXT_FRAMING: &str = "This conversation is the council context \"{label}\": guidance to judge commands by.";
+
+/// The framing, then `rest`, as one system message.
+fn framed(rest: &str) -> String {
+    format!("{}\n\n{}", FRAMING.trim(), rest.trim())
+}
 
 /// Looks up the names a drift turn's first line uses.
 pub(crate) trait Names {
@@ -66,15 +74,14 @@ pub(crate) fn is_reviewer_context(label: &str) -> bool {
 /// The server's body for the context labeled `label`, projected from its
 /// `blocks` in document order. `Err` when a drift's source cannot be named.
 pub(crate) fn project(label: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
-    project_framed(FRAMING.replace("{label}", label), is_reviewer_context(label), blocks, names)
+    project_framed(framed(&CONTEXT_FRAMING.replace("{label}", label)), is_reviewer_context(label), blocks, names)
 }
 
-/// The server's body for a shadow of the seat labeled `seat`, projected from
-/// the shadow's `blocks` in document order. The framing is the shadow's
-/// stance, its live system instruction blocks written by the `judge` type's
-/// rc, followed by a runtime fact naming the seat. `Err` when the shadow has
-/// no stance.
-pub(crate) fn project_shadow(seat: &str, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
+/// The server's body for a shadow, projected from the shadow's `blocks` in
+/// document order. The system message is the framing, then the shadow's
+/// stance: its live system instruction blocks written by the `judge` type's
+/// rc. `Err` when the shadow has no stance.
+pub(crate) fn project_shadow(blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
     let stance: Vec<&str> = blocks
         .iter()
         .filter(|b| b.role == Role::System && b.kind == BlockKind::Text && !b.excluded && !b.content.trim().is_empty())
@@ -85,8 +92,7 @@ pub(crate) fn project_shadow(seat: &str, blocks: &[BlockSnapshot], names: &dyn N
                     (`kaijutsu-server rc reseed` installs /config/rc/judge)"
             .to_string());
     }
-    let system = format!("{}\n\nThe seat is \"{seat}\".", stance.join("\n\n"));
-    project_framed(system, false, blocks, names)
+    project_framed(framed(&stance.join("\n\n")), false, blocks, names)
 }
 
 fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: &dyn Names) -> Result<ContextPut, String> {
@@ -137,11 +143,12 @@ fn project_framed(system: String, drift: bool, blocks: &[BlockSnapshot], names: 
 /// kernel does not hold the council server's tokenizer.
 pub(crate) const HOUSE_RULES_BYTES_PER_TOKEN: u64 = 4;
 
-/// The house-rules context's system message. It names no seat, so every seat
-/// under the same `AGENTS.md` shares one body.
-const HOUSE_RULES_FRAMING: &str = "You review shell commands that coding agents propose in kaijutsu. \
-This conversation is the council context \"house-rules\": the house rules of the workspace the proposing \
-seat works in, from its AGENTS.md. It describes the workspace and grants no permission beyond those rules.";
+/// What follows the framing in the house-rules context. It names no seat, so
+/// every seat under the same `AGENTS.md` shares one body.
+const HOUSE_RULES_FRAMING: &str = "You are the game master, and you know the house rules. When you are asked \
+about a command or action, use the house rules to quickly decide whether it is allowed or whether the asker \
+should try something else. The rules come from the workspace's AGENTS.md and grant no permission beyond what \
+they say.";
 
 /// The workspace's house rules: the first `AGENTS.md` found walking up from
 /// the proposing seat's working directory, and its text.
@@ -166,7 +173,7 @@ pub(crate) fn project_house_rules(house: Option<&HouseRules>, budget_tokens: u64
     };
     let content = format!("The house rules in {}:\n\n{text}", house.path);
     Some(ContextPut {
-        system: HOUSE_RULES_FRAMING.to_string(),
+        system: framed(HOUSE_RULES_FRAMING),
         turns: vec![Turn { role: WireRole::User, content, snap: true, reasoning: None }],
         pin: None,
         warm: None,
@@ -559,7 +566,7 @@ mod tests {
     }
 
     /// The house rules alone make the context: one user turn that keeps a
-    /// snapshot boundary, under a framing that grants no permission. With no
+    /// snapshot boundary, under the council framing and the game master's. With no
     /// `AGENTS.md` there is no context.
     ///
     /// Falsified by a projection that frames the rules as the seat's own
@@ -571,9 +578,9 @@ mod tests {
         let p = project_house_rules(Some(&rules), 2000).expect("house rules make a context");
         assert_eq!(contents(&p), ["The house rules in /work/repo/AGENTS.md:\n\nNever touch prod."]);
         assert_eq!(p.turns.iter().map(|t| (t.role, t.snap)).collect::<Vec<_>>(), [(WireRole::User, true)]);
-        assert!(p.system.contains("house rules of the workspace"), "{}", p.system);
-        assert!(p.system.contains("AGENTS.md") && p.system.contains("grants no permission"), "{}", p.system);
-        assert!(p.system.contains("\"house-rules\""), "{}", p.system);
+        assert!(p.system.starts_with(FRAMING.trim()), "{}", p.system);
+        assert!(p.system.contains("you know the house rules"), "{}", p.system);
+        assert!(p.system.contains("AGENTS.md") && p.system.contains("no permission beyond"), "{}", p.system);
         assert!(p.pin.is_none() && p.warm.is_none() && p.dry_run.is_none());
     }
 

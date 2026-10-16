@@ -368,7 +368,7 @@ impl CouncilSync {
             .blocks()
             .block_snapshots(shadow)
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be read: {e}")))?;
-        let body = project_shadow(seat, &blocks, &*kernel.kernel_db().lock())
+        let body = project_shadow(&blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
         self.hold(&link, &identity, &spec_id, &label, shadow, body, true).await
@@ -1133,7 +1133,7 @@ mod tests {
         let puts = r.mock.puts();
         assert_eq!(puts.len(), 2);
         let body = &puts[1].1;
-        assert!(body["system"].as_str().unwrap().contains("house rules of the workspace"), "{body}");
+        assert!(body["system"].as_str().unwrap().contains("you know the house rules"), "{body}");
         assert_eq!(body["turns"].as_array().unwrap().len(), 1, "{body}");
         assert_eq!(
             body["turns"][0]["content"].as_str().unwrap(),

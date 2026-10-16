@@ -2288,7 +2288,7 @@ async fn a_bump_refuses_with_guidance_and_opens_no_ask() {
         rig.mock.bumper_says(TRY_HARDER);
         let text = refusal_text(via, rig.submit("touch /work/marker").await);
         assert!(text.contains("Bumped by the council (attempt 1 of 3)"), "{via:?}: {text}");
-        assert!(text.contains("the goal is fine, but it needs more care first"), "{via:?}: {text}");
+        assert!(text.contains("the goal is allowed, but it changes an original"), "{via:?}: {text}");
         assert!(text.contains("Try harder, a different approach"), "{via:?}: {text}");
         assert!(rig.asks().is_empty(), "{via:?}: no ask was opened");
         let decisions = rig.decisions();
@@ -2462,7 +2462,7 @@ async fn at_the_bump_limit_the_submission_asks_with_its_history() {
         refusal_text(via, rig.submit("touch /work/a").await);
         rig.mock.bumper_says(DO_LESS);
         let second = refusal_text(via, rig.submit("touch /work/a").await);
-        assert!(second.contains("attempt 2 of 2") && second.contains("reaches past what the task needs"), "{second}");
+        assert!(second.contains("attempt 2 of 2") && second.contains("reaches off this host or past what the task needs"), "{second}");
         assert_pending(via, rig.submit("touch /work/a").await);
         assert_eq!(rig.mock.decisions().len(), 3, "{via:?}");
         let ask = rig.only_ask();
@@ -2776,7 +2776,7 @@ async fn the_bump_template_is_read_at_each_bump() {
         refusal_text(via, rig.submit("touch /work/a").await);
         rig.write("/config/kernel/council/bump.md", "HOLD {flavor} {attempt}/{limit}: {guidance}").await;
         let text = refusal_text(via, rig.submit("touch /work/a").await);
-        assert!(text.contains("HOLD try_harder 2/5: the goal is fine"), "{via:?}: {text}");
+        assert!(text.contains("HOLD try_harder 2/5: the goal is allowed"), "{via:?}: {text}");
         rig.finish().await;
 
         let rig = self::rig(via, Setup { no_bump_template: true, ..bumper(3) }).await;
@@ -2947,13 +2947,13 @@ async fn a_seat_without_a_judge_slot_gets_no_shadow() {
 }
 
 /// A judge on a council server is primed with each call as it arrives: the
-/// shadow is `PUT` whole after the call is recorded, under a framing that
-/// names the seat, and each later `PUT` extends the one before.
+/// shadow is `PUT` whole after the call is recorded, under the council
+/// framing and the judge stance, and each later `PUT` extends the one before.
 /// Each `PUT` may also carry the call's outcome, which can land first.
 ///
 /// Falsified by priming only at decision time (no `PUT` for a static
-/// allow), or by framing the shadow with anything but the `judge` type's
-/// stance and the seat's name.
+/// allow), or by framing the shadow with anything but the council framing
+/// and the `judge` type's stance.
 #[tokio::test]
 async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     let rig = rig(Via::Tool, Setup { global: "allow = [\"echo\"]", ..Setup::default() }).await;
@@ -2965,8 +2965,9 @@ async fn a_judge_on_a_council_server_is_primed_with_each_call() {
     // Priming runs on its own task, so it may read the outcome turn too.
     let turns: Vec<&str> = puts[0].turns.iter().map(|t| t.content.as_str()).collect();
     assert_eq!(turns[0], "shell_write: echo one", "{turns:?}");
-    assert!(puts[0].system.contains("This context is the history of one seat."), "the judge stance frames it: {}", puts[0].system);
-    assert!(puts[0].system.contains("The seat is \"council-seat\"."), "a runtime fact names the seat: {}", puts[0].system);
+    assert!(puts[0].system.contains("Unwind the command before you judge it"), "the council framing opens it: {}", puts[0].system);
+    assert!(puts[0].system.contains("You are a tool interpreter."), "the judge stance follows: {}", puts[0].system);
+    assert!(!puts[0].system.contains("seat"), "the system message names no seat: {}", puts[0].system);
 
     rig.submit("echo two").await.unwrap();
     let puts = rig.mock.wait_for_puts(shadow, 2).await;

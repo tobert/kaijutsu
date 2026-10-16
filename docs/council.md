@@ -276,9 +276,9 @@ context holds those rules and nothing the seat said or did.
   context. Terminal-bench task containers ship no `AGENTS.md`, so a
   benchmark decision reads only its configured contexts.
 - **Its shape.** The label is `house-rules`, in the `reads` log field and in
-  miss causes. A fixed system message says it holds the house rules of the
-  workspace the proposing seat works in, from its `AGENTS.md`, and grants no
-  permission beyond them.
+  miss causes. Its fixed system message is the council framing, then the
+  game master who knows the house rules, which come from the workspace's
+  `AGENTS.md` and grant no permission beyond what they say.
 - **It votes.** It is pooled with the other reads. With `require_agree`,
   every read must top allow on its own, so the rules cannot turn another
   read's ask into an allow.
@@ -426,8 +426,8 @@ shipped. A fresh session resumes at the first step not marked done.
    archived with it (`docs/kaish-integration.md`, the `archive` verb).
    1d. **Done: the stance.** A new shadow runs the `judge` type's `create`
    lifecycle (`rc/judge/create/S00-stance.md`). Its system instruction
-   blocks are the shadow's framing, followed by a runtime fact naming the
-   seat. A shadow with no stance is never sent; priming fails and names
+   blocks follow the council framing (`assets/defaults/council/framing.md`)
+   as the shadow's system message, which names no seat. A shadow with no stance is never sent; priming fails and names
    `rc reseed`. Synthesized 2026-10-09 from the council-shell examples: the
    seat's own earlier work is routine to remove, data it did not create
    is an original, a resend after a bump is a new attempt, and earlier
