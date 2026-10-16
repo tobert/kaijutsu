@@ -97,19 +97,31 @@ pub(crate) struct Submission<'a> {
     pub(crate) planned: &'a [kaish_kernel::PlannedStatement],
     pub(crate) context_type: Option<&'a str>,
     pub(crate) cwd: Option<&'a str>,
+    /// What the kernel resolved about the plan before it runs.
+    pub(crate) facts: &'a super::shell_case::Facts,
 }
 
 #[derive(Serialize)]
 struct CaseState<'a> {
-    command: &'a str,
-    statements: Vec<CaseStatement>,
+    command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_type: Option<&'a str>,
+    cwd: &'a str,
+    statements: Vec<super::shell_case::StatementView>,
+    #[serde(skip_serializing_if = "is_zero")]
+    statements_not_shown: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<&'a str>,
+    mount_access: Option<&'static str>,
     #[serde(skip_serializing_if = "<[ProgramOutcome]>::is_empty")]
     programs: &'a [ProgramOutcome],
 }
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Bytes shown of the submitted command in a shell case.
+const MAX_COMMAND: usize = 8 * 1024;
 
 /// What the shell decision is told about one program the submission runs:
 /// how the program decision ended, or why there was none.
@@ -164,15 +176,6 @@ impl ProgramOutcome {
     }
 }
 
-#[derive(Serialize)]
-struct CaseStatement {
-    index: usize,
-    rendered: String,
-    kind: String,
-    /// One per command, as `KJ_TOOL_PLAN` gives each command its `clause`.
-    clauses: Vec<String>,
-}
-
 /// What one decision reads: its case state, and the text its record's
 /// `submission_digest` hashes and a report names.
 #[derive(Clone, Debug)]
@@ -186,34 +189,30 @@ pub(crate) struct CaseInput {
 pub(crate) const JUDGED_SEPARATELY: &str = "<program judged separately>";
 
 /// `text` with each of `programs` replaced by [`JUDGED_SEPARATELY`].
-fn elide(text: &str, programs: &[&str]) -> String {
+pub(crate) fn elide(text: &str, programs: &[&str]) -> String {
     programs.iter().filter(|p| !p.is_empty()).fold(text.to_string(), |t, p| t.replace(p, JUDGED_SEPARATELY))
 }
 
-/// The case's `state`: the command whole, each statement with the clauses
-/// a classifier reads, the seat's context type, and its working directory,
-/// with members in that order. Each of `judged`, the text of a program the
-/// program decision reads, is shown as [`JUDGED_SEPARATELY`], so the shell
-/// decision judges the invocation and the program decision the text. A
-/// text the submission spells differently, such as with escapes, stays.
+/// The case's `state`: the command whole, the seat's context type, the
+/// directory relative paths resolve against, and each statement with its
+/// commands as kaish planned them and what the kernel resolved about them
+/// (`super::shell_case`), with members in that order. Each of `judged`,
+/// the text of a program the program decision reads, is shown as
+/// [`JUDGED_SEPARATELY`], so the shell decision judges the invocation and
+/// the program decision the text. A text the submission spells
+/// differently, such as with escapes, stays. `mount_access` says what a
+/// mount's access means, once, when a statement names a mount.
 /// `programs`, last, lists how each program's decision ended, so the rest
 /// of the submission is judged with them; it is left out when empty.
 pub(crate) fn case_state(submission: &Submission<'_>, judged: &[&str], programs: &[ProgramOutcome]) -> Json {
-    let command = elide(submission.command, judged);
+    let statements = super::shell_case::statements(submission.command, submission.planned, submission.facts, judged);
     let state = CaseState {
-        command: &command,
-        statements: submission
-            .planned
-            .iter()
-            .map(|s| CaseStatement {
-                index: s.index,
-                rendered: elide(&s.plan.rendered, judged),
-                kind: s.plan.statement_kind.clone(),
-                clauses: crate::kj::plan_clauses::command_clause_texts(s).iter().map(|c| elide(c, judged)).collect(),
-            })
-            .collect(),
+        command: super::shell_case::clip(&elide(submission.command, judged), MAX_COMMAND),
         context_type: submission.context_type,
-        cwd: submission.cwd,
+        cwd: &submission.facts.cwd,
+        statements: statements.shown,
+        statements_not_shown: statements.not_shown,
+        mount_access: statements.names_a_mount.then_some(super::shell_case::MOUNT_ACCESS),
         programs,
     };
     // A struct serializes its fields in declaration order, and `Json` keeps
@@ -1865,13 +1864,15 @@ pub(crate) async fn consult(
         }
         Some(Err(cause)) => (council, Err(cause)),
     };
+    let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
+    let facts = super::shell_case::gather(kernel, caller, context_id, command, &spec.planned, &resolve_cwd).await;
     let submission = Submission {
         command,
         planned: &spec.planned,
         context_type: context_type.as_deref(),
         cwd: cwd.as_deref(),
+        facts: &facts,
     };
-    let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
     let runs = super::programs::programs_in(&spec.planned, &resolve_cwd);
     let read = super::programs::read_programs(kernel.vfs().as_ref(), &resolve_cwd, runs).await;
     let program_spec = council.specs.iter().find(|s| s.case == CouncilCase::Program);
@@ -2305,11 +2306,13 @@ mod tests {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
         let planned = kaish_kernel::plan_program("echo hi > out.txt; git push origin main").unwrap();
+        let facts = super::super::shell_case::Facts::for_test("/src", &[("/", true), ("/src", false)], &[], &[], &planned);
         let state = case_state(&Submission {
             command: "echo hi > out.txt; git push origin main",
             planned: &planned,
             context_type: Some("coder"),
             cwd: Some("/src"),
+            facts: &facts,
         }, &[], &[]);
         let req = decision_request(&p, &council(0.98, -0.05, true), state);
         req.validate().unwrap();
@@ -2322,7 +2325,7 @@ mod tests {
         assert_eq!(body["pool"], serde_json::json!({"method": "loglinear", "weights": "mass"}));
         assert!(body.get("ask").is_none() && body.get("options").is_none(), "the gate never narrows: {body}");
         let text = serde_json::to_string(&req.state).unwrap();
-        let order: Vec<usize> = ["\"command\"", "\"statements\"", "\"context_type\"", "\"cwd\""]
+        let order: Vec<usize> = ["\"command\"", "\"context_type\"", "\"cwd\"", "\"statements\"", "\"mount_access\""]
             .iter()
             .map(|k| text.find(k).unwrap_or_else(|| panic!("{k} missing from {text}")))
             .collect();
@@ -2330,10 +2333,138 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(state["command"], "echo hi > out.txt; git push origin main");
         assert_eq!(state["statements"].as_array().unwrap().len(), 2);
-        assert_eq!(state["statements"][1]["clauses"][0], "git push origin main");
+        assert_eq!(state["statements"][1]["commands"][0]["name"], "git");
+        assert_eq!(state["statements"][1]["commands"][0]["args"], serde_json::json!(["push", "origin", "main"]));
         assert_eq!(state["context_type"], "coder");
         assert_eq!(state["cwd"], "/src");
         assert!(state.get("programs").is_none(), "a submission with no programs has no programs field: {state}");
+    }
+
+    /// The shell case for `command` with the seat in `/home/u/src/proj`,
+    /// `/` and `/dev` read-only, and `/tmp` and `/home/u/src` writable.
+    fn shell_case(command: &str, hosts: &[(&str, &str)], existing: &[&str]) -> serde_json::Value {
+        let planned = kaish_kernel::plan_program(command).unwrap();
+        let mounts = [("/", true), ("/dev", true), ("/tmp", false), ("/home/u/src", false)];
+        let facts = super::super::shell_case::Facts::for_test("/home/u/src/proj", &mounts, hosts, existing, &planned);
+        let state = case_state(&Submission {
+            command,
+            planned: &planned,
+            context_type: Some("coder"),
+            cwd: Some("/home/u/src/proj"),
+            facts: &facts,
+        }, &[], &[]);
+        serde_json::to_value(&state).unwrap()
+    }
+
+    #[test]
+    fn a_shell_case_shows_each_command_with_its_words_and_the_paths_they_name() {
+        let state = shell_case("ls -la src", &[], &["/home/u/src/proj/src"]);
+        assert!(state["statements"][0].get("rendered").is_none(), "one statement is the command: {state}");
+        assert_eq!(state["statements"][0]["commands"][0], serde_json::json!({
+            "name": "ls",
+            "runs": "kaish builtin",
+            "args": ["-la", "src"],
+            "paths": [{"word": "src", "path": "/home/u/src/proj/src", "mount": "/home/u/src", "access": "rw"}],
+        }));
+        assert_eq!(state["mount_access"], super::super::shell_case::MOUNT_ACCESS);
+    }
+
+    #[test]
+    fn a_shell_case_names_the_mount_a_redirect_writes_and_its_access() {
+        let state = shell_case("echo hi > /workspace/out.txt", &[], &[]);
+        assert_eq!(state["statements"][0]["commands"][0]["redirects"], serde_json::json!([
+            {"op": ">", "writes": "/workspace/out.txt", "exists": false, "mount": "/", "access": "ro"},
+        ]));
+        let state = shell_case("echo hi > /tmp/x", &[], &["/tmp/x"]);
+        assert_eq!(state["statements"][0]["commands"][0]["redirects"], serde_json::json!([
+            {"op": ">", "writes": "/tmp/x", "exists": true, "mount": "/tmp", "access": "rw"},
+        ]));
+        let state = shell_case("echo hi > out.txt 2>&1", &[], &[]);
+        assert_eq!(state["statements"][0]["commands"][0]["redirects"], serde_json::json!([
+            {"op": ">", "writes": "/home/u/src/proj/out.txt", "exists": false, "mount": "/home/u/src", "access": "rw"},
+            {"op": "2>&1"},
+        ]));
+    }
+
+    #[test]
+    fn a_shell_case_nests_the_commands_a_substitution_runs_under_it() {
+        let state = shell_case("cat $(find . -name '*.rs')", &[], &["/home/u/src/proj"]);
+        let commands = state["statements"][0]["commands"].as_array().unwrap();
+        assert_eq!(commands.len(), 1, "find runs inside cat's argument: {state}");
+        assert_eq!(commands[0]["args"], serde_json::json!([{"unexpanded": "$(find . -name '*.rs')"}]));
+        assert_eq!(commands[0]["substitutions"][0]["text"], "$(find . -name '*.rs')");
+        let find = &commands[0]["substitutions"][0]["commands"][0];
+        assert_eq!(find["name"], "find");
+        assert_eq!(find["args"], serde_json::json!([".", "-name", "*.rs"]));
+        assert_eq!(find["paths"][0]["path"], "/home/u/src/proj");
+    }
+
+    #[test]
+    fn a_shell_case_shows_a_host_program_with_its_path_and_does_not_misread_a_volume_as_a_path() {
+        let state = shell_case("docker run --rm -v /:/host alpine ls /host", &[("docker", "/usr/bin/docker")], &["/"]);
+        let docker = &state["statements"][0]["commands"][0];
+        assert_eq!(docker["runs"], "host program");
+        assert_eq!(docker["program"], "/usr/bin/docker");
+        assert_eq!(docker["args"], serde_json::json!(["run", "--rm", "-v", "/:/host", "alpine", "ls", "/host"]));
+        assert!(docker.get("paths").is_none(), "/:/host and /host name nothing that exists: {state}");
+        let state = shell_case("rm -rf /tmp/new", &[], &["/tmp"]);
+        assert!(state["statements"][0]["commands"][0].get("paths").is_none(), "a missing path is not shown: {state}");
+        assert_eq!(state["statements"][0]["commands"].as_array().unwrap().len(), 1, "ls is docker's argument: {state}");
+    }
+
+    #[test]
+    fn a_shell_case_shows_background_and_variables() {
+        let state = shell_case("FOO=1 make test &", &[("make", "/usr/bin/make")], &[]);
+        let statement = &state["statements"][0];
+        assert_eq!(statement["commands"][0]["background"], true);
+        assert_eq!(statement["commands"][0]["program"], "/usr/bin/make");
+        assert_eq!(statement["sets_variables"], serde_json::json!(["FOO"]));
+        let state = shell_case("echo $HOME; X=$(pwd)", &[], &[]);
+        assert_eq!(state["statements"][0]["reads_variables"], serde_json::json!(["HOME"]));
+        assert_eq!(state["statements"][0]["commands"][0]["args"], serde_json::json!([{"unexpanded": "${HOME}"}]));
+        assert_eq!(state["statements"][1]["sets_variables"], serde_json::json!(["X"]));
+        assert_eq!(state["statements"][1]["rendered"], "X=$(pwd)");
+    }
+
+    #[test]
+    fn a_shell_case_does_not_resolve_a_relative_path_after_a_cd() {
+        let state = shell_case("cd /tmp && rm -rf build > log", &[], &["/home/u/src/proj/build"]);
+        let rm = &state["statements"][0]["commands"][1];
+        assert_eq!(rm["name"], "rm");
+        assert!(rm.get("paths").is_none(), "build is relative to /tmp now: {state}");
+        assert_eq!(rm["redirects"][0]["writes"], "log");
+        assert!(rm["redirects"][0]["note"].as_str().unwrap().contains("cd"), "{state}");
+    }
+
+    #[test]
+    fn a_shell_case_shows_a_heredoc_and_elides_a_judged_program() {
+        let program = "import os\nprint(os.getcwd())\n";
+        let command = format!("python3 <<'PY'\n{program}PY");
+        let planned = kaish_kernel::plan_program(&command).unwrap();
+        let facts = super::super::shell_case::Facts::for_test("/w", &[("/", true)], &[("python3", "/usr/bin/python3")], &[], &planned);
+        let submission = Submission { command: &command, planned: &planned, context_type: None, cwd: None, facts: &facts };
+        let state = serde_json::to_value(case_state(&submission, &[program], &[])).unwrap();
+        assert_eq!(state["statements"][0]["commands"][0]["heredocs"], serde_json::json!([
+            {"delimiter": "PY", "expands": false, "body": JUDGED_SEPARATELY},
+        ]));
+        assert!(!serde_json::to_string(&state).unwrap().contains("getcwd"), "{state}");
+        let state = serde_json::to_value(case_state(&submission, &[], &[])).unwrap();
+        assert_eq!(state["statements"][0]["commands"][0]["heredocs"][0]["body"], program);
+    }
+
+    #[test]
+    fn a_long_shell_case_is_cut_loudly_and_stays_small() {
+        let word = "x".repeat(2000);
+        let statement = format!("echo {word} {}", "a ".repeat(100));
+        let command = vec![statement; 200].join("; ");
+        let state = shell_case(&command, &[], &[]);
+        let text = serde_json::to_string(&state).unwrap();
+        assert!(text.len() < 32 * 1024, "{} bytes", text.len());
+        assert!(state["command"].as_str().unwrap().ends_with("more bytes not shown]"));
+        let first = &state["statements"][0]["commands"][0];
+        assert!(first["args"][0].as_str().unwrap().ends_with("more bytes not shown]"), "{first}");
+        assert_eq!(first["args_not_shown"], 101 - 48);
+        assert!(state["statements_not_shown"].as_u64().unwrap() > 0, "{text}");
     }
 
     #[test]

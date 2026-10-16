@@ -510,10 +510,11 @@ the spec at boot and whenever the file changes, and treats a server that
 answers with a different id as a fault. A spec change is a new spec id and
 new thresholds.
 
-The case's `state` is a JSON object: the submitted command whole, the
-`KJ_TOOL_PLAN` statements and clauses, from the kernel the seat's context
-type and working directory, and, when the submission runs programs, their
-decisions' outcomes (`programs`, see "Programs").
+The shell case's `state` is a JSON object: the submitted command whole,
+the seat's context type and working directory, each statement's commands
+as kaish planned them with what the kernel resolved about them, and, when
+the submission runs programs, their decisions' outcomes (`programs`, see
+"Programs"). "The shell case" below lists the fields.
 
 - **Programs are cases of their own.** A submission that runs program text
   gets a decision on each program under the program spec, beside the shell
@@ -521,10 +522,73 @@ decisions' outcomes (`programs`, see "Programs").
   program decision allow. Amy: "we will go a bit further like pulling out
   python programs to be evaluated on their own". The next section has the
   rules.
-- **Known plan gaps reach the council.** `docs/issues.md`, "What a
-  replacement risk scorer inherits", lists them: `clause` drops redirects,
-  variables arrive unexpanded. The state carries the submitted command whole
-  beside the clauses for that reason.
+- **Known plan gaps reach the council.** Variables arrive unexpanded:
+  the state names the variables a statement reads, not their values. The
+  state carries the submitted command whole beside the statements.
+
+## The shell case
+
+`ls -la src`, with the seat in `/home/u/src/proj`, is this `state`:
+
+```json
+{"command": "ls -la src", "context_type": "coder", "cwd": "/home/u/src/proj",
+ "statements": [{"index": 0, "kind": "command", "commands": [
+   {"name": "ls", "runs": "kaish builtin", "args": ["-la", "src"],
+    "paths": [{"word": "src", "path": "/home/u/src/proj/src", "mount": "/home/u/src", "access": "rw"}]}]}],
+ "mount_access": "ro mounts refuse writes by kaish builtins and redirects; rw mounts allow them. A host program is not limited by kaijutsu mounts."}
+```
+
+The kernel builds it from the kaish plan before anything runs
+(`council/shell_case.rs`), so the judging model reads what each command
+is instead of working it out from the text. Members keep this order:
+
+- **`command`**: the submission whole, cut at 8 KiB.
+- **`context_type`**, when the seat has one, and **`cwd`**: the directory
+  relative paths resolve against; the home directory when the context has
+  no working directory.
+- **`statements`**: per top-level statement, `index`, `rendered` (kaish's
+  unexpanded rendering, left out when it is the whole `command`), `kind`,
+  `commands`, `reads_variables` (names read and not set by the statement),
+  and `sets_variables` (names the statement binds itself). Values are not
+  shown.
+- **A command**: `name`, `runs`, `program` (a host program's path),
+  `args`, `paths`, `redirects`, `heredocs`, `substitutions`, and
+  `background` (`true` only). Empty members are left out.
+  - `runs` is `kaish builtin`, `kaijutsu builtin` (`kj`, `vi`, `fg`,
+    `ps`, `curl`), `host program`, `kaijutsu tool`, `a tool this
+    submission defines`, `known only when it runs`, a sentence starting
+    with `nothing` when the command fails for want of a builtin, program,
+    or tool, or `not resolved` with a `note` naming why. Names resolve the way the context shell resolves them: on the
+    context's `PATH`, and with its `exec` authority. Aliases and `.kai`
+    scripts are not resolved.
+  - An argument is its word when it is literal, and
+    `{"unexpanded": "<text>"}` when it expands at run time.
+  - `paths` lists the arguments that name an existing file or directory:
+    the word, the absolute path, and the mount and its access (`ro` or
+    `rw`) from the mount table a refused write prints. It says where a
+    word lands, not that the command reads it as a path. A word that names
+    nothing yet, such as `/host` in `docker run -v /:/host`, is not
+    listed, because which words a program treats as paths cannot be told
+    from the plan.
+  - A redirect is `op` with `writes` or `reads` (the absolute path),
+    `exists`, `mount`, and `access`; `2>&1` is `op` alone; `<<<` carries
+    its `text`. After a `cd` in the same submission, a relative path is
+    not resolved, and a `note` says so; `paths` leaves it out.
+  - A heredoc is `delimiter`, `expands` (whether `${...}` and `$(...)` in
+    it expand first), and `body`, cut at 2 KiB.
+  - A substitution is its `text` and the `commands` it runs, nested under
+    the command whose argument or redirect it is. When kaish's plan does
+    not match the substitution text, its commands stay beside the command
+    instead.
+- **`statements_not_shown`**: statements past the size bound. Statements
+  are shown whole up to 16 KiB, then as `index`, a 256-byte `rendered`,
+  `kind`, and `commands_not_shown`, up to 20 KiB. A word is cut at 512
+  bytes, a rendering at 4 KiB, a command at 48 arguments, and a statement
+  at 32 commands; every cut is marked with what it left out.
+- **`mount_access`**: what `ro` and `rw` mean, once, when a statement
+  names a mount. Mounts limit kaish builtins and redirects only
+  (`docs/mounts.md`, "What opacity means here (and what it doesn't)").
+- **`programs`**, last: see "Programs".
 
 ## Programs
 
@@ -557,7 +621,8 @@ does, so the council reads the file too (`council/programs.rs`).
 - **The shell decision does not judge the text again.** A program that
   gets its own decision appears in the shell case as
   `<program judged separately>`: in `command`, each statement's
-  `rendered`, and its clauses. The shell decision judges the invocation,
+  `rendered`, and every argument, heredoc body, and substitution of its
+  commands. The shell decision judges the invocation,
   and the program decision judges the text. This covers `-c` text, a
   heredoc, and a `cat > FILE` heredoc; a file operand's text was never in
   the shell case. Text the submission spells differently, such as with

@@ -93,7 +93,7 @@ const READERS: [&str; 18] = [
 ];
 
 /// Commands that change the working directory.
-const MOVERS: [&str; 3] = ["cd", "pushd", "popd"];
+pub(crate) const MOVERS: [&str; 3] = ["cd", "pushd", "popd"];
 
 fn base_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)

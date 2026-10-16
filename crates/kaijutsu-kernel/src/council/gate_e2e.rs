@@ -759,6 +759,42 @@ async fn a_council_ask_leaves_an_ask_with_a_council_signal() {
     }
 }
 
+/// The shell case says what each command runs and where its paths land,
+/// as the kernel resolves them for the seat.
+///
+/// Falsified by building the case's facts without the kernel: the names
+/// stay unresolved and no path names a mount.
+#[tokio::test]
+async fn the_shell_case_resolves_names_and_paths_against_the_seat() {
+    for via in BOTH {
+        let rig = rig(via, Setup::default()).await;
+        rig.d
+            .kernel_db()
+            .lock()
+            .upsert_context_shell(&crate::kernel_db::ContextShellRow {
+                context_id: rig.ctx.context_id,
+                cwd: Some("/work".into()),
+                updated_at: 0,
+            })
+            .unwrap();
+        rig.write("/work/src/a.rs", "fn main() {}\n").await;
+        rig.mock.answers(&ASK);
+        assert_pending(via, rig.submit("ls -la src > /work/listing.txt; frobnicate --now").await);
+        let sent = rig.mock.decisions();
+        let state = serde_json::to_value(&sent[0].state).unwrap();
+        assert_eq!(state["cwd"], "/work", "{via:?}: {state}");
+        let ls = &state["statements"][0]["commands"][0];
+        assert_eq!(ls["runs"], "kaish builtin", "{via:?}: {state}");
+        assert_eq!(ls["paths"], serde_json::json!([{"word": "src", "path": "/work/src", "mount": "/work", "access": "rw"}]));
+        assert_eq!(ls["redirects"], serde_json::json!([
+            {"op": ">", "writes": "/work/listing.txt", "exists": false, "mount": "/work", "access": "rw"},
+        ]));
+        let frobnicate = &state["statements"][1]["commands"][0];
+        assert!(frobnicate["runs"].as_str().unwrap().starts_with("nothing"), "{via:?}: {state}");
+        rig.finish().await;
+    }
+}
+
 /// What a test subscriber saw: span names with their recorded fields, and
 /// event names with theirs.
 #[derive(Default)]
