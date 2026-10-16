@@ -7,8 +7,13 @@
 //! reply that stops at its output limit is never returned as a whole one.
 //! `cache_breakpoints`, `thinking_budget`, and `thinking_style` do not apply
 //! to this backend and are ignored.
+//!
+//! When the server speaks council v2 and lists `generate`, a turn that
+//! names its kernel context holds the conversation there instead
+//! ([`held`]).
 
 mod build;
+mod held;
 #[cfg(test)]
 mod probes;
 mod reply;
@@ -17,6 +22,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kaijutsu_mk::council::wire::ServerIdentity;
+use kaijutsu_mk::council_v2::GenerationStream;
+use kaijutsu_mk::council_v2::wire::GenerationEvent;
 use kaijutsu_mk::generate::{
     Finish, GenerateEvent, GenerateRequest, GenerateStream, Message as MkMessage, Sample, Source, MAX_TOKENS_LIMIT,
 };
@@ -56,6 +64,12 @@ pub struct Client {
     /// render through the reply. `None` only for a client built directly
     /// rather than by `Provider::from_backend`.
     endpoint: Option<Arc<Endpoint>>,
+    /// The server's council v2 identity when it lists `generate`, `None`
+    /// when it does not; read on the first turn that names its context.
+    v2: Arc<tokio::sync::OnceCell<Option<ServerIdentity>>>,
+    /// What the server holds for each kernel context, on the council v2
+    /// path.
+    held: held::HeldChats,
 }
 
 impl Client {
@@ -63,7 +77,16 @@ impl Client {
     pub fn new(name: impl Into<String>, base_url: &str, timeout: Duration, windows: HashMap<String, u64>) -> LlmResult<Self> {
         let name = name.into();
         let mk = MkClient::new(base_url, timeout).map_err(|e| to_llm(&name, e))?;
-        Ok(Client { name, mk, timeout, windows, max_context: Arc::default(), endpoint: None })
+        Ok(Client {
+            name,
+            mk,
+            timeout,
+            windows,
+            max_context: Arc::default(),
+            endpoint: None,
+            v2: Arc::default(),
+            held: Arc::default(),
+        })
     }
 
     /// Take a slot from `endpoint` for each call to the service.
@@ -151,13 +174,20 @@ impl Client {
         }
     }
 
-    /// A streamed turn. The request is rendered and checked against the
-    /// window before generation starts.
+    /// A streamed turn. On a council v2 server that lists `generate`, a
+    /// turn that names its context (`opts.held`) is a generation on that
+    /// held context. Otherwise the request is rendered and checked against
+    /// the window before `/mk/v1/generate` starts.
     pub async fn stream(&self, opts: BuildOpts, history: Vec<Message>) -> LlmResult<Stream> {
         let (thinking, reasoning_effort) = build::effort(opts.effort.as_deref())?;
+        let turn = self.turn();
+        if let Some(held) = opts.held
+            && let Some(identity) = self.council_v2(&turn).await?
+        {
+            return self.stream_held(opts, history, held, identity, turn).await;
+        }
         let messages = build::messages(opts.system.as_deref(), &history)?;
         let tools = build::tools(&opts.tools)?;
-        let turn = self.turn();
         let max_tokens = self
             .admit_messages(&turn, &opts.model, &messages, &tools, thinking, reasoning_effort, opts.max_tokens)
             .await?;
@@ -185,7 +215,7 @@ impl Client {
         let (slot, inner) = self.call(&turn, true, |_| self.mk.generate_stream(&request, self.timeout)).await?;
         Ok(Stream {
             name: self.name.clone(),
-            inner: Some(inner),
+            inner: Some(Inner::Mk(inner)),
             reply: Some(Reply::new(thinking.unwrap_or(true), has_tools)),
             pending: Default::default(),
             cancel: CancellationToken::new(),
@@ -193,6 +223,7 @@ impl Client {
             started,
             first_token: None,
             slot,
+            held: None,
         })
     }
 
@@ -304,7 +335,7 @@ fn to_llm(name: &str, e: MkError) -> LlmError {
 /// server expects.
 pub struct Stream {
     name: String,
-    inner: Option<GenerateStream>,
+    inner: Option<Inner>,
     reply: Option<Reply>,
     pending: std::collections::VecDeque<StreamEvent>,
     cancel: CancellationToken,
@@ -315,6 +346,38 @@ pub struct Stream {
     /// done event is a completed answer, and an error event with 429 or 503
     /// is a busy one.
     slot: Option<Slot>,
+    /// On the council v2 path, what to record when the reply ends.
+    held: Option<Box<held::HeldUpdate>>,
+}
+
+/// The reply stream: `/mk/v1/generate`, or a council v2 generation.
+enum Inner {
+    Mk(GenerateStream),
+    Held(GenerationStream),
+}
+
+/// One event of either stream.
+enum Event {
+    Token(String),
+    Done(kaijutsu_mk::generate::Done),
+    HeldDone(kaijutsu_mk::council_v2::wire::GenerationDone),
+}
+
+impl Inner {
+    async fn next(&mut self) -> Option<Result<Event, MkError>> {
+        Some(Ok(match self {
+            Inner::Mk(s) => match s.next().await? {
+                Ok(GenerateEvent::Token(t)) => Event::Token(t.piece),
+                Ok(GenerateEvent::Done(d)) => Event::Done(d),
+                Err(e) => return Some(Err(e)),
+            },
+            Inner::Held(s) => match s.next().await? {
+                Ok(GenerationEvent::Token(t)) => Event::Token(t.piece),
+                Ok(GenerationEvent::Done(d)) => Event::HeldDone(d),
+                Err(e) => return Some(Err(e)),
+            },
+        }))
+    }
 }
 
 impl Stream {
@@ -336,15 +399,41 @@ impl Stream {
                 _ = cancel.cancelled() => {
                     self.finished = true;
                     self.inner = None;
+                    if let Some(held) = self.held.take() {
+                        held.failed();
+                    }
                     return Some(StreamEvent::Done { stop_reason: None, input_tokens: None, output_tokens: None, extra: None });
                 }
                 item = inner.next() => match item {
-                    Some(Ok(GenerateEvent::Token(token))) => {
+                    Some(Ok(Event::Token(piece))) => {
                         self.first_token.get_or_insert_with(|| self.started.elapsed());
                         let reply = self.reply.as_mut().expect("the reply lives until done");
-                        self.pending.extend(reply.piece(&token.piece));
+                        self.pending.extend(reply.piece(&piece));
                     }
-                    Some(Ok(GenerateEvent::Done(done))) => {
+                    Some(Ok(Event::HeldDone(done))) => {
+                        self.finished = true;
+                        self.inner = None;
+                        if let Some(slot) = &self.slot {
+                            slot.completed();
+                        }
+                        let timing = Timing {
+                            first_token_ms: self.first_token.unwrap_or_default().as_millis() as u64,
+                            wall_ms: self.started.elapsed().as_millis() as u64,
+                        };
+                        let held = self.held.take().expect("a held stream records its reply");
+                        let reply = self.reply.take().expect("done comes once");
+                        match reply.done_v2(done.clone(), &held.model, &held.weight_hash, timing) {
+                            Ok(events) => {
+                                held.done(&done);
+                                self.pending.extend(events);
+                            }
+                            Err(e) => {
+                                held.failed();
+                                return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name)));
+                            }
+                        }
+                    }
+                    Some(Ok(Event::Done(done))) => {
                         self.finished = true;
                         self.inner = None;
                         if let Some(slot) = &self.slot {
@@ -367,11 +456,17 @@ impl Stream {
                         if let Some(slot) = &self.slot {
                             slot.failed_mk(&e);
                         }
+                        if let Some(held) = self.held.take() {
+                            held.failed();
+                        }
                         return Some(StreamEvent::Error(format!("mk backend '{}': {e}", self.name)));
                     }
                     None => {
                         self.finished = true;
                         self.inner = None;
+                        if let Some(held) = self.held.take() {
+                            held.failed();
+                        }
                         return None;
                     }
                 },
@@ -414,6 +509,7 @@ mod tests {
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             trace: None,
+            held: None,
         }
     }
 
@@ -427,6 +523,234 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    // ---- council v2: held contexts
+
+    use crate::llm::{ContentBlock, HeldContext, MessageContent, Role};
+    use kaijutsu_types::ContextId;
+
+    fn v2_identity(capabilities: serde_json::Value) -> kaijutsu_mk::test_server::Reply {
+        http(
+            200,
+            json!({"model": "gemma-4", "weight_hash": "w4", "tokenizer_hash": "t", "template": "x", "engine": "e",
+                   "limits": {"context_tokens": 32768, "state_bytes": 1000, "contexts_per_decision": 8,
+                              "choice_options": 26, "default_timeout_ms": 2000},
+                   "capabilities": capabilities})
+            .to_string(),
+        )
+    }
+
+    fn no_v2() -> kaijutsu_mk::test_server::Reply {
+        http(404, "no such route")
+    }
+
+    fn snap_id(n: u64) -> String {
+        format!("snap:{n:064x}")
+    }
+
+    /// Snapshots at `(message, n)`.
+    fn snapshots(at: &[(u64, u64)]) -> serde_json::Value {
+        json!(at.iter().map(|(m, n)| json!({"id": snap_id(*n), "message": m, "tokens": 10 * m + 5})).collect::<Vec<_>>())
+    }
+
+    fn put_reply(head: u64, at: &[(u64, u64)]) -> kaijutsu_mk::test_server::Reply {
+        http(200, json!({"id": "x", "head": snap_id(head), "tokens": 40, "kept": 0, "fed": 40, "from": null,
+                         "dry_run": false, "snapshots": snapshots(at)}).to_string())
+    }
+
+    /// A streamed generation: `content` as one answer token, then `done`.
+    fn generation(content: &str, calls: serde_json::Value, head: u64, at: &[(u64, u64)]) -> kaijutsu_mk::test_server::Reply {
+        let mut out = String::new();
+        if !content.is_empty() {
+            let t = json!({"id": 1, "piece": content, "phase": "answer", "p": 0.9, "h": 0.1, "n": 1, "tps": 10.0});
+            out.push_str(&format!("event: token\ndata: {t}\n\n"));
+        }
+        let done = json!({"content": content, "reasoning": "", "tool_calls": calls, "finish": "stop",
+                          "usage": {"kept": 40, "fed": 7, "completion": 3}, "head": snap_id(head), "snapshots": snapshots(at)});
+        out.push_str(&format!("event: done\ndata: {done}\n\n"));
+        sse(out)
+    }
+
+    fn held_opts(context: ContextId, forked_from: Option<ContextId>) -> BuildOpts {
+        let mut o = opts(64);
+        o.held = Some(HeldContext { context, forked_from });
+        o
+    }
+
+    fn said(text: &str) -> Message {
+        Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::Text { text: text.into() }]) }
+    }
+
+    fn bodies(seen: &std::sync::Mutex<Vec<kaijutsu_mk::test_server::Captured>>, path_prefix: &str) -> Vec<serde_json::Value> {
+        seen.lock().unwrap().iter().filter(|c| c.path.starts_with(path_prefix)).map(|c| serde_json::from_str(&c.body).unwrap()).collect()
+    }
+
+    /// A server without council v2, or one whose v2 identity does not list
+    /// `generate`, keeps the `/mk/v1` path, and the client asks once.
+    ///
+    /// Falsified by a provider that holds contexts on a server that cannot
+    /// generate on them, or that asks for the identity every turn.
+    #[tokio::test]
+    async fn without_v2_generate_a_held_turn_keeps_the_mk_v1_path() {
+        let (base, seen) = serve(vec![no_v2(), http(200, MODEL), rendered(10), sse(ANSWER), rendered(10), sse(ANSWER)]).await;
+        let c = client(&base, HashMap::new());
+        for _ in 0..2 {
+            drain(&mut c.stream(held_opts(ContextId::new(), None), vec![Message::user("hi")]).await.unwrap()).await;
+        }
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths, ["/council/v2/identity", "/mk/v1/model", "/mk/v1/render", "/mk/v1/generate", "/mk/v1/render", "/mk/v1/generate"]);
+
+        let (base, seen) = serve(vec![v2_identity(json!(["reads", "fork"])), http(200, MODEL), rendered(10), sse(ANSWER)]).await;
+        drain(&mut client(&base, HashMap::new()).stream(held_opts(ContextId::new(), None), vec![Message::user("hi")]).await.unwrap()).await;
+        assert_eq!(seen.lock().unwrap().last().unwrap().path, "/mk/v1/generate");
+    }
+
+    /// A turn on a council v2 server that lists `generate` holds the chat
+    /// under the kernel's context id: the first turn sends the context with
+    /// its system message, then generates with the user turn; the next turn
+    /// appends only its tool result. The reply's call keeps the server's id,
+    /// which the result then names.
+    ///
+    /// Falsified by a provider that sends the whole history every turn, mints
+    /// its own call ids, or snaps nothing.
+    #[tokio::test]
+    async fn a_v2_server_holds_the_chat_and_each_turn_appends_to_it() {
+        let ctx = ContextId::new();
+        let (base, seen) = serve(vec![
+            v2_identity(json!(["generate", "fork"])),
+            put_reply(1, &[(0, 1)]),
+            generation("", json!([{"id": "c0", "name": "ls", "arguments": {"path": "/tmp"}}]), 2, &[(0, 1), (1, 2)]),
+            generation("Two files.", json!([]), 3, &[(0, 1), (1, 2), (3, 3)]),
+        ])
+        .await;
+        let c = client(&base, HashMap::new());
+        let mut o = held_opts(ctx, None);
+        o.tools = vec![ToolDefinition { name: "ls".into(), description: "List.".into(), input_schema: json!({"type": "object"}) }];
+        let mut history = vec![Message::user("list /tmp")];
+        let first = drain(&mut c.stream(o.clone(), history.clone()).await.unwrap()).await;
+        let Some(StreamEvent::ToolUse { id, name, input }) = first.first().cloned() else { panic!("{first:?}") };
+        assert_eq!((id.as_str(), name.as_str(), input), ("c0", "ls", json!({"path": "/tmp"})));
+        let Some(StreamEvent::Done { stop_reason, input_tokens, extra: Some(crate::llm::UsageExtra::Mk(x)), .. }) = first.last() else {
+            panic!("{first:?}")
+        };
+        assert_eq!((stop_reason.as_deref(), *input_tokens, x.kept, x.seed, x.model.as_str()), (Some("tool_calls"), Some(47), 40, None, "gemma-4"));
+
+        history.push(Message { role: Role::Assistant, content: MessageContent::Blocks(vec![ContentBlock::ToolUse { id, name, input: json!({"path": "/tmp"}) }]) });
+        history.push(Message::tool_results(vec![ContentBlock::ToolResult { tool_use_id: "c0".into(), content: "a\nb".into(), is_error: false }]));
+        let second = drain(&mut c.stream(o, history).await.unwrap()).await;
+        assert!(second.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "Two files.")), "{second:?}");
+
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| format!("{} {}", c.method, c.path)).collect();
+        assert_eq!(
+            paths,
+            [
+                "GET /council/v2/identity".to_string(),
+                format!("PUT /council/v2/contexts/{ctx}"),
+                "POST /council/v2/generations".into(),
+                "POST /council/v2/generations".into(),
+            ]
+        );
+        let put = &bodies(&seen, "/council/v2/contexts/")[0];
+        assert_eq!(put["messages"], json!([{"role": "system", "content": "rules", "snap": true}]));
+        assert_eq!((put["thinking"].clone(), put["tools"][0]["function"]["name"].clone()), (json!(false), json!("ls")));
+        assert!(put.get("fork").is_none(), "{put}");
+        let gens = bodies(&seen, "/council/v2/generations");
+        assert_eq!(
+            gens[0],
+            json!({"context": ctx.to_string(), "messages": [{"role": "user", "content": "list /tmp", "snap": true}],
+                   "max_tokens": 64, "stream": true})
+        );
+        assert_eq!(gens[1]["messages"], json!([{"role": "tool", "tool_call_id": "c0", "content": "a\nb", "snap": true}]));
+        let record = held::record(&c, ctx).unwrap();
+        assert_eq!(record.messages.len(), 5);
+        assert_eq!(record.head.as_str(), snap_id(3));
+    }
+
+    /// A context forked from a held one starts at the parent's last
+    /// snapshot before the first message they differ in, so an excluded
+    /// turn leaves the child and the parent is not changed. When that
+    /// snapshot is gone (409), the child is sent whole.
+    ///
+    /// Falsified by a fork at the parent's head, which still holds the
+    /// excluded turn, or a 409 that fails the turn.
+    #[tokio::test]
+    async fn a_fork_starts_at_the_parents_snapshot_before_the_first_difference() {
+        let (parent, child, again) = (ContextId::new(), ContextId::new(), ContextId::new());
+        let gone = http(409, json!({"error": {"type": "snapshot_gone", "message": "evicted", "head": snap_id(4)}}).to_string());
+        let (base, seen) = serve(vec![
+            v2_identity(json!(["generate", "fork"])),
+            put_reply(1, &[(0, 1)]),
+            generation("r1", json!([]), 2, &[(0, 1), (1, 2)]),
+            generation("r2", json!([]), 3, &[(0, 1), (1, 2), (3, 3)]),
+            put_reply(5, &[(0, 1), (1, 2)]),
+            generation("r3", json!([]), 6, &[(0, 1), (1, 2), (3, 6)]),
+            gone,
+            put_reply(7, &[(0, 1), (1, 2)]),
+            generation("r3", json!([]), 8, &[(0, 1), (1, 2), (3, 8)]),
+        ])
+        .await;
+        let c = client(&base, HashMap::new());
+        drain(&mut c.stream(held_opts(parent, None), vec![Message::user("u1")]).await.unwrap()).await;
+        let parent_history = vec![Message::user("u1"), said("r1"), Message::user("u2")];
+        drain(&mut c.stream(held_opts(parent, None), parent_history).await.unwrap()).await;
+
+        // The child excludes u2 and its reply, and asks u3 instead.
+        let child_history = vec![Message::user("u1"), said("r1"), Message::user("u3")];
+        let events = drain(&mut c.stream(held_opts(child, Some(parent)), child_history.clone()).await.unwrap()).await;
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })), "{events:?}");
+        let puts = bodies(&seen, "/council/v2/contexts/");
+        assert_eq!(puts[1]["fork"], json!({"context": parent.to_string(), "at": snap_id(2)}), "u1's boundary, before r1 and the excluded u2");
+        assert_eq!(puts[1]["messages"].as_array().unwrap().len(), 3, "system, u1, r1");
+        assert_eq!(bodies(&seen, "/council/v2/generations")[2]["messages"], json!([{"role": "user", "content": "u3", "snap": true}]));
+        assert_eq!(held::record(&c, parent).unwrap().messages.len(), 5, "the parent's record is unchanged");
+
+        drain(&mut c.stream(held_opts(again, Some(parent)), child_history).await.unwrap()).await;
+        let puts = bodies(&seen, "/council/v2/contexts/");
+        assert!(puts[2].get("fork").is_some() && puts[3].get("fork").is_none(), "{puts:?}");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(paths.iter().filter(|p| p.ends_with(&again.to_string())).count(), 2, "the fork, then the whole context");
+    }
+
+    /// A generation whose prompt leaves no room is `context_full`, which the
+    /// kernel reads as a full context; the held record stays, since nothing
+    /// ran.
+    ///
+    /// Falsified by a 413 mapped to an invalid request.
+    #[tokio::test]
+    async fn a_context_full_generation_is_a_full_context() {
+        let ctx = ContextId::new();
+        let full = http(413, json!({"error": {"type": "context_full", "message": "the prompt takes 32768 of 32768 tokens"}}).to_string());
+        let (base, _) = serve(vec![v2_identity(json!(["generate"])), put_reply(1, &[(0, 1)]), full]).await;
+        let c = client(&base, HashMap::new());
+        let err = c.stream(held_opts(ctx, None), vec![Message::user("hi")]).await.err().unwrap();
+        assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("32768") && m.contains("fork")), "{err:?}");
+        assert_eq!(err.category_and_code(), (kaijutsu_types::ErrorCategory::Context, Some("full")));
+        assert!(held::record(&c, ctx).is_some());
+    }
+
+    /// A server that lost a held context (404 on an appending generation)
+    /// gets the whole context again, then the generation.
+    #[tokio::test]
+    async fn a_lost_context_is_sent_whole_again() {
+        let ctx = ContextId::new();
+        let lost = http(404, json!({"error": {"type": "not_found", "message": "no such context"}}).to_string());
+        let (base, seen) = serve(vec![
+            v2_identity(json!(["generate"])),
+            put_reply(1, &[(0, 1)]),
+            generation("r1", json!([]), 2, &[(0, 1), (1, 2)]),
+            lost,
+            put_reply(3, &[(0, 1), (1, 2)]),
+            generation("r2", json!([]), 4, &[(0, 1), (1, 2), (3, 4)]),
+        ])
+        .await;
+        let c = client(&base, HashMap::new());
+        drain(&mut c.stream(held_opts(ctx, None), vec![Message::user("u1")]).await.unwrap()).await;
+        let events = drain(&mut c.stream(held_opts(ctx, None), vec![Message::user("u1"), said("r1"), Message::user("u2")]).await.unwrap()).await;
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "r2")), "{events:?}");
+        let puts = bodies(&seen, "/council/v2/contexts/");
+        assert_eq!(puts[1]["messages"].as_array().unwrap().len(), 3, "system, u1, r1");
+        assert_eq!(held::record(&c, ctx).unwrap().head.as_str(), snap_id(4));
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! checks that at the end: a difference is an error, never a block that
 //! disagrees with what the service holds as the reply.
 
+use kaijutsu_mk::Json;
+use kaijutsu_mk::council_v2::wire::{GenerationDone, ReplyToolCall};
 use kaijutsu_mk::generate::{Done, Finish, ToolCall};
 
 use crate::llm::stream::{MkUsageExtra, StreamEvent, UsageExtra};
@@ -106,40 +108,111 @@ impl Reply {
         }
     }
 
-    /// The events that end the reply: the open block closes, the calls
-    /// follow, then `Done`. `id_base` names the calls (`<id_base>-<index>`).
-    pub(super) fn done(mut self, done: Done, id_base: &str, timing: Timing) -> Result<Vec<StreamEvent>, String> {
+    /// The events that end a `/mk/v1` reply: the open block closes, the
+    /// calls follow, then `Done`. `id_base` names the calls
+    /// (`<id_base>-<index>`), since the service has no call ids.
+    pub(super) fn done(self, done: Done, id_base: &str, timing: Timing) -> Result<Vec<StreamEvent>, String> {
+        let calls = done
+            .tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let id = format!("{id_base}-{index}");
+                match call {
+                    ToolCall::Parsed { name, arguments } => Call::Parsed { id, name, arguments },
+                    ToolCall::Unparsed { name, raw, error } => Call::Unparsed { id, name, raw, error },
+                }
+            })
+            .collect();
+        let extra = MkUsageExtra {
+            kept: done.usage.kept.into(),
+            fed: done.usage.fed.into(),
+            prefill_ms: Some(done.ms.prefill.round() as u64),
+            decode_ms: Some(done.ms.decode.round() as u64),
+            first_token_ms: timing.first_token_ms,
+            wall_ms: timing.wall_ms,
+            seed: Some(done.seed),
+            model: done.model.id,
+            weight_hash: done.model.weight_hash,
+        };
+        let usage = (done.usage.prompt.into(), done.usage.completion.into(), extra);
+        self.end(&done.reasoning_content, &done.content, done.finish, calls, usage)
+    }
+
+    /// The events that end a council v2 generation. Its calls keep the ids
+    /// the server gave them, which the context's held reply names, and its
+    /// prompt is the `kept` and `fed` tokens. `model` and `weight_hash` are
+    /// the server's identity.
+    pub(super) fn done_v2(
+        self,
+        done: GenerationDone,
+        model: &str,
+        weight_hash: &str,
+        timing: Timing,
+    ) -> Result<Vec<StreamEvent>, String> {
+        let calls = done
+            .tool_calls
+            .into_iter()
+            .map(|call| match call {
+                ReplyToolCall::Parsed { id, name, arguments } => Call::Parsed { id, name, arguments },
+                ReplyToolCall::Unparsed { id, name, raw, error } => Call::Unparsed { id, name, raw, error },
+            })
+            .collect();
+        let extra = MkUsageExtra {
+            kept: done.usage.kept,
+            fed: done.usage.fed,
+            prefill_ms: None,
+            decode_ms: None,
+            first_token_ms: timing.first_token_ms,
+            wall_ms: timing.wall_ms,
+            seed: None,
+            model: model.to_string(),
+            weight_hash: weight_hash.to_string(),
+        };
+        let usage = (done.usage.kept + done.usage.fed, done.usage.completion, extra);
+        self.end(&done.reasoning, &done.content, done.finish, calls, usage)
+    }
+
+    /// Closes the open block, checks the streamed text against the reply's,
+    /// then emits the calls and `Done` with `(prompt, completion, extra)`.
+    fn end(
+        mut self,
+        reasoning: &str,
+        content: &str,
+        finish: Finish,
+        calls: Vec<Call>,
+        (prompt, completion, extra): (u64, u64, MkUsageExtra),
+    ) -> Result<Vec<StreamEvent>, String> {
         let mut out = Vec::new();
         let held = std::mem::take(&mut self.held);
         self.text(&held, &mut out);
         self.think.close(&mut out);
         self.answer.close(&mut out);
-        if self.think.text != done.reasoning_content {
-            return Err(mismatch("thinking", &self.think.text, &done.reasoning_content));
+        if self.think.text != reasoning {
+            return Err(mismatch("thinking", &self.think.text, reasoning));
         }
-        if self.answer.text != done.content {
-            return Err(mismatch("answer", &self.answer.text, &done.content));
+        if self.answer.text != content {
+            return Err(mismatch("answer", &self.answer.text, content));
         }
-        let stop_reason = match done.finish {
-            Finish::Stop if !done.tool_calls.is_empty() => "tool_calls",
+        let stop_reason = match finish {
+            Finish::Stop if !calls.is_empty() => "tool_calls",
             Finish::Stop => "stop",
             Finish::Length => "length",
             Finish::Cancelled => {
                 return Err("the megakernel cancelled the generation, and the kernel did not ask it to".into());
             }
         };
-        for (index, call) in done.tool_calls.into_iter().enumerate() {
-            let id = format!("{id_base}-{index}");
+        for call in calls {
             out.push(match call {
-                ToolCall::Parsed { name, arguments } => StreamEvent::ToolUse {
+                Call::Parsed { id, name, arguments } => StreamEvent::ToolUse {
                     id,
                     name,
                     input: serde_json::to_value(&arguments).map_err(|e| format!("tool call arguments: {e}"))?,
                 },
-                ToolCall::Unparsed { name: Some(name), raw, error } => {
+                Call::Unparsed { id, name: Some(name), raw, error } => {
                     StreamEvent::ToolUseInvalid { id, name, arguments: raw, error }
                 }
-                ToolCall::Unparsed { name: None, raw, error } => StreamEvent::ToolUseInvalid {
+                Call::Unparsed { id, name: None, raw, error } => StreamEvent::ToolUseInvalid {
                     id,
                     name: UNNAMED_CALL.into(),
                     arguments: raw,
@@ -149,22 +222,18 @@ impl Reply {
         }
         out.push(StreamEvent::Done {
             stop_reason: Some(stop_reason.into()),
-            input_tokens: Some(done.usage.prompt.into()),
-            output_tokens: Some(done.usage.completion.into()),
-            extra: Some(UsageExtra::Mk(MkUsageExtra {
-                kept: done.usage.kept.into(),
-                fed: done.usage.fed.into(),
-                prefill_ms: done.ms.prefill.round() as u64,
-                decode_ms: done.ms.decode.round() as u64,
-                first_token_ms: timing.first_token_ms,
-                wall_ms: timing.wall_ms,
-                seed: done.seed,
-                model: done.model.id,
-                weight_hash: done.model.weight_hash,
-            })),
+            input_tokens: Some(prompt),
+            output_tokens: Some(completion),
+            extra: Some(UsageExtra::Mk(extra)),
         });
         Ok(out)
     }
+}
+
+/// A call the reply made, with the id the kernel records it under.
+enum Call {
+    Parsed { id: String, name: String, arguments: Json },
+    Unparsed { id: String, name: Option<String>, raw: String, error: String },
 }
 
 fn mismatch(what: &str, streamed: &str, done: &str) -> String {
@@ -331,7 +400,7 @@ mod tests {
             panic!("{events:?}")
         };
         assert_eq!((stop_reason.as_deref(), *input_tokens, *output_tokens), (Some("stop"), Some(33), Some(9)));
-        assert_eq!((x.fed, x.seed, x.model.as_str()), (33, 7, "Qwen3.8-Flash-Next-UD-IQ4_XS"));
+        assert_eq!((x.fed, x.seed, x.model.as_str()), (33, Some(7), "Qwen3.8-Flash-Next-UD-IQ4_XS"));
 
         let (pieces, done) = recorded(TOOL);
         let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();

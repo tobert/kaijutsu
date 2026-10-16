@@ -13,4 +13,4 @@
 mod client;
 pub mod wire;
 
-pub use client::CouncilV2;
+pub use client::{CouncilV2, GenerationStream};

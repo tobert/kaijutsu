@@ -73,6 +73,7 @@ fn opts(effort: &str, max_tokens: u64) -> BuildOpts {
         tools: tools(),
         cache_breakpoints: Vec::new(),
         trace: None,
+        held: None,
     }
 }
 
@@ -191,7 +192,7 @@ async fn infer(c: &Client, o: &BuildOpts, history: &[Message]) -> Turn {
 
 fn report(label: &str, i: usize, t: &Turn) {
     println!(
-        "{label} #{i}: stop={} prompt={} kept={} fed={} completion={} prefill_ms={} decode_ms={} first_token_ms={} wall_ms={} calls={} invalid={}",
+        "{label} #{i}: stop={} prompt={} kept={} fed={} completion={} prefill_ms={:?} decode_ms={:?} first_token_ms={} wall_ms={} calls={} invalid={}",
         t.stop, t.prompt, t.usage.kept, t.usage.fed, t.completion, t.usage.prefill_ms, t.usage.decode_ms,
         t.usage.first_token_ms, t.usage.wall_ms, t.calls().len(), t.invalid().len()
     );

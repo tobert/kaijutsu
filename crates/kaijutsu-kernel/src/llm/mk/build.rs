@@ -1,16 +1,18 @@
 //! Translate kaijutsu [`Message`]s, tools, and tunables into a
-//! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping").
+//! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping"), or into
+//! council v2 messages (`docs/council-api-v2.md`).
 //!
 //! - The system prompt is one `system` message, first.
-//! - The service has no tool-call ids. Results go back as `tool` messages in
+//! - `/mk/v1` has no tool-call ids. Results go back as `tool` messages in
 //!   the order of the calls they answer, matched by the kernel's ids; a
 //!   history whose results do not answer exactly the preceding calls is
-//!   refused.
+//!   refused. Council v2 keeps the ids.
 //! - `Reasoning` blocks go back as `reasoning_content`; the template decides
 //!   what to keep.
 //! - The service takes text only. An image becomes a visible marker.
 
 use kaijutsu_mk::Json;
+use kaijutsu_mk::council_v2::wire::{Message as V2Message, Role as V2Role, ToolCall as V2ToolCall};
 use kaijutsu_mk::generate::{Function, Message as MkMessage, ReasoningEffort, Role as MkRole, Tool, ToolCallIn};
 
 use crate::llm::{ContentBlock, LlmError, LlmResult, Message, MessageContent, Role, ToolDefinition};
@@ -53,9 +55,71 @@ pub(super) fn tools(tools: &[ToolDefinition]) -> LlmResult<Vec<Tool>> {
 
 /// The system prompt and history as the service's messages.
 pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<MkMessage>> {
+    Ok(walk(system, history)?
+        .into_iter()
+        .map(|m| match m {
+            Walked::System(text) => MkMessage::system(text),
+            Walked::User(text) => MkMessage::user(text),
+            Walked::Assistant { content, reasoning, calls } => MkMessage {
+                role: MkRole::Assistant,
+                content,
+                reasoning_content: reasoning,
+                tool_calls: calls.into_iter().map(|(_, name, arguments)| ToolCallIn { name, arguments }).collect(),
+            },
+            Walked::Tool { content, .. } => MkMessage::tool(content),
+        })
+        .collect())
+}
+
+/// The system prompt and history as council v2 messages
+/// (`docs/council-api-v2.md`, "Contexts"), with snapshot boundaries.
+///
+/// Calls keep the kernel's ids, and each result names the call it answers.
+/// An assistant message leaves out empty text. `snap` marks the system
+/// message, the last of each run of tool results, and the message that ends
+/// each user turn: the last message before an assistant message, and the
+/// last message of all. A flag depends only on the messages up to the next
+/// assistant message, so a later turn never moves an earlier boundary.
+pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<V2Message>> {
+    let mut out: Vec<V2Message> = walk(system, history)?
+        .into_iter()
+        .map(|m| match m {
+            Walked::System(text) => V2Message::system(text),
+            Walked::User(text) => V2Message::user(text),
+            Walked::Assistant { content, reasoning, calls } => V2Message {
+                content: content.filter(|c| !c.is_empty()),
+                reasoning,
+                tool_calls: calls.into_iter().map(|(id, name, arguments)| V2ToolCall { id, name, arguments }).collect(),
+                ..V2Message::assistant("")
+            },
+            Walked::Tool { id, content } => V2Message::tool(id, content),
+        })
+        .collect();
+    for i in 0..out.len() {
+        let next = out.get(i + 1).map(|m| m.role);
+        out[i].snap = match out[i].role {
+            V2Role::System => true,
+            V2Role::Assistant => false,
+            V2Role::User => matches!(next, None | Some(V2Role::Assistant)),
+            V2Role::Tool => !matches!(next, Some(V2Role::Tool)),
+        };
+    }
+    Ok(out)
+}
+
+/// One message of the walk both shapes are built from.
+enum Walked {
+    System(String),
+    User(String),
+    /// Calls are `(id, name, arguments)`.
+    Assistant { content: Option<String>, reasoning: Option<String>, calls: Vec<(String, String, Json)> },
+    Tool { id: String, content: String },
+}
+
+fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
     let mut out = Vec::new();
     if let Some(system) = system.filter(|s| !s.is_empty()) {
-        out.push(MkMessage::system(system));
+        out.push(Walked::System(system.to_string()));
     }
     // The ids of the calls the last assistant message made, still unanswered.
     let mut calls: Vec<String> = Vec::new();
@@ -83,14 +147,14 @@ fn pairing(index: usize, detail: String) -> LlmError {
 }
 
 /// An assistant message, and the ids of the calls it made.
-fn assistant(index: usize, content: &MessageContent) -> LlmResult<(MkMessage, Vec<String>)> {
-    let mut reply = MkMessage { role: MkRole::Assistant, content: None, reasoning_content: None, tool_calls: Vec::new() };
+fn assistant(index: usize, content: &MessageContent) -> LlmResult<(Walked, Vec<String>)> {
     let mut ids = Vec::new();
-    match content {
-        MessageContent::Text(text) => reply.content = Some(text.clone()),
+    let reply = match content {
+        MessageContent::Text(text) => Walked::Assistant { content: Some(text.clone()), reasoning: None, calls: Vec::new() },
         MessageContent::Blocks(blocks) => {
             let mut text = String::new();
             let mut reasoning = String::new();
+            let mut calls = Vec::new();
             for block in blocks {
                 match block {
                     ContentBlock::Text { text: t } => join(&mut text, t),
@@ -103,28 +167,27 @@ fn assistant(index: usize, content: &MessageContent) -> LlmResult<(MkMessage, Ve
                         }
                         let arguments: Json = serde_json::from_value(input.clone())
                             .map_err(|e| LlmError::InvalidRequest(format!("mk: message {index}: tool call {id}: {e}")))?;
-                        reply.tool_calls.push(ToolCallIn { name: name.clone(), arguments });
+                        calls.push((id.clone(), name.clone(), arguments));
                         ids.push(id.clone());
                     }
                     ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
                 }
             }
-            reply.content = Some(text);
-            reply.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
+            Walked::Assistant { content: Some(text), reasoning: (!reasoning.is_empty()).then_some(reasoning), calls }
         }
-    }
+    };
     Ok((reply, ids))
 }
 
 /// A user message: first the `tool` messages answering `calls` in call order,
 /// then any text as one `user` message.
-fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &mut Vec<MkMessage>) -> LlmResult<()> {
+fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &mut Vec<Walked>) -> LlmResult<()> {
     let blocks = match content {
         MessageContent::Text(text) => {
             if !calls.is_empty() {
                 return Err(pairing(index, format!("a text message follows {} unanswered call(s)", calls.len())));
             }
-            out.push(MkMessage::user(text.clone()));
+            out.push(Walked::User(text.clone()));
             return Ok(());
         }
         MessageContent::Blocks(blocks) => blocks,
@@ -151,10 +214,10 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
         let Some(at) = results.iter().position(|(r, _)| *r == id) else {
             return Err(pairing(index, format!("no result answers call {id}")));
         };
-        out.push(MkMessage::tool(results.swap_remove(at).1));
+        out.push(Walked::Tool { content: results.swap_remove(at).1, id });
     }
     if !text.is_empty() {
-        out.push(MkMessage::user(text));
+        out.push(Walked::User(text));
     }
     Ok(())
 }
@@ -231,6 +294,49 @@ mod tests {
         let m = messages(None, &history).unwrap();
         assert_eq!(wire(&m)[1]["tool_calls"], json!([{"name": "write", "arguments": {"truncated_arguments": "<parameter=path>"}}]));
         assert_eq!(wire(&m)[2], json!({"role": "tool", "content": "[tool error]\nThis call did not run"}));
+    }
+
+    /// Council v2 messages keep the kernel's call ids, and `snap` falls on
+    /// the system message, the end of each run of tool results, and the end
+    /// of each user turn, and stays where it was when a turn is appended.
+    ///
+    /// Falsified by a builder that drops ids, snaps an assistant message, or
+    /// snaps each of several tool results.
+    #[test]
+    fn v2_messages_keep_call_ids_and_snap_the_ends_of_user_turns() {
+        let mut history = vec![
+            Message::user("look"),
+            said(vec![
+                ContentBlock::Reasoning { text: "two calls".into(), signature: None },
+                call("a", "ls", json!({"path": "/"})),
+                call("b", "cat", json!({"path": "/x"})),
+            ]),
+            Message::tool_results(vec![
+                result("b", "no such file", true),
+                result("a", "x", false),
+                ContentBlock::Text { text: "and hurry".into() },
+            ]),
+        ];
+        let first = messages_v2(Some("rules"), &history).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            json!([
+                {"role": "system", "content": "rules", "snap": true},
+                {"role": "user", "content": "look", "snap": true},
+                {"role": "assistant", "reasoning": "two calls",
+                 "tool_calls": [{"id": "a", "name": "ls", "arguments": {"path": "/"}},
+                                {"id": "b", "name": "cat", "arguments": {"path": "/x"}}]},
+                {"role": "tool", "tool_call_id": "a", "content": "x"},
+                {"role": "tool", "tool_call_id": "b", "content": "[tool error]\nno such file", "snap": true},
+                {"role": "user", "content": "and hurry", "snap": true},
+            ])
+        );
+        history.push(said(vec![ContentBlock::Text { text: "done".into() }]));
+        history.push(Message::user("thanks"));
+        let second = messages_v2(Some("rules"), &history).unwrap();
+        assert_eq!(second[..first.len()], first[..], "appending a turn moves no earlier boundary");
+        assert_eq!(serde_json::to_value(&second[6]).unwrap(), json!({"role": "assistant", "content": "done"}));
+        assert!(second[7].snap);
     }
 
     #[test]
