@@ -645,13 +645,13 @@ pub(crate) fn statements(command: &str, planned: &[PlannedStatement], facts: &Fa
     Statements { shown, not_shown, names_a_mount: builder.names_a_mount }
 }
 
-#[cfg(test)]
 impl Facts {
-    /// Facts for a test: `mounts` as `(point, read_only)`, `hosts` as host
+    /// Facts the kernel is not asked for, for tests and the council seat's
+    /// worked examples: `mounts` as `(point, read_only)`, `hosts` as host
     /// program names with their paths, and `existing` absolute paths. Every
     /// other command name resolves as a context shell resolves it with no
     /// kaijutsu tools: a builtin, or nothing.
-    pub(crate) fn for_test(
+    pub(crate) fn offline(
         cwd: &str,
         mounts: &[(&str, bool)],
         hosts: &[(&str, &str)],

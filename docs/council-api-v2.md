@@ -256,7 +256,7 @@ A server serves the model-specific rest under its own prefix and lists it in
 | HIP megakernel `/mk/v1` | Context ids become client-chosen; the content-hash id becomes the snapshot id. `POST /contexts` becomes `PUT /contexts/{id}`. `reads` takes `contexts` and is otherwise the same. `generate`'s `from.context` becomes `generations` on a context, and its reply becomes the head. |
 | lfm2d `/v1/opinion` | Held specs and describe-first carry over as `specs` and `text` questions. Contexts move from a domain-tagged token hash to client ids with `snap` boundaries. |
 | mkviolet | Done: one snapshot store for council v2 contexts, generations, and decisions; each snapshot holds the rows after its parent boundary. `/mk/v1/choices` is gone, replaced by `reads`. v1 contexts and `/mk/v1/generate` keep their own stores. |
-| kaijutsu | The mk provider sends each chat as a held context with `snap` on user turns and tool results, generates on it, and forks with `fork.at` after a context fills or an exclude. The council's seats become agent-loop contexts with a `queue` tool. |
+| kaijutsu | The mk provider sends each chat as a held context with `snap` on user turns and tool results, generates on it, and forks with `fork.at` after a context fills or an exclude. Each council context is held as an agent-loop seat per spec, with a `queue` tool whose `answers` schema is the spec's. |
 
 ## Open questions
 

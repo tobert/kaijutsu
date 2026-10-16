@@ -120,16 +120,17 @@ WAL. Accept `-p`, or have the refusal name the fix.
 ## Council v2 client: what is open (2026-10-16)
 
 The mk provider and the council speak `docs/council-api-v2.md` when a
-server answers `GET /council/v2/identity`; no server does yet, so nothing
-here has run against one.
+server answers `GET /council/v2/identity`. mkviolet serves it; the queue
+seats were checked against it by hand, and no test runs against it.
 
-- **Seats as agent loops.** Council contexts are still v1 projections
-  converted to messages (`ContextPut::from_v1`). Making each seat an agent
-  loop needs: a `queue` tool definition per spec (its `answers` schema is
-  the server's), a projection that ends each context with an assistant call
-  to that tool and replays past cases as call and result pairs, the
-  `thinking` setting per seat, and a decision path that does not send the
-  case as a user turn. Measure against the bench first.
+- **Queue seats.** Each council context is held as a queue seat per spec
+  (`council/seat.rs`), with worked examples for the shipped specs only.
+  Open: past decisions are not replayed as call and result pairs; a seat
+  never sees the spec's own `instructions` or `input_label` (shell-bump's
+  instructions in the task message scored 34 of 36 labels on mkviolet's 13
+  cases, against 36 without); `thinking` is the server's default; a custom
+  spec gets no examples; and the seat's size against
+  `decision_context_tokens` is checked only by the server's `413`.
 - **Held chats are remembered in memory** (`llm/mk/held.rs`). After a
   restart every context's first turn is a whole `PUT`, and a fork whose
   parent was held only before the restart starts without `fork`. A

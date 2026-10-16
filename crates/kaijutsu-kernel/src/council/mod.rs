@@ -3,8 +3,9 @@
 //!
 //! `sync` keeps the council server holding the council contexts and specs;
 //! `projection` turns a kaijutsu context into the server's context body;
-//! `gate` makes one decision for a submission and records it; `shell_case`
-//! builds the statements its shell case shows.
+//! `seat` builds a council v2 queue seat from that body; `gate` makes one
+//! decision for a submission and records it; `shell_case` builds the
+//! statements its shell case shows.
 
 pub(crate) mod gate;
 #[cfg(test)]
@@ -14,6 +15,7 @@ pub(crate) mod programs;
 mod projection;
 pub(crate) mod report_stop;
 pub(crate) mod reviewer_contexts;
+mod seat;
 pub(crate) mod shadow;
 mod shell_case;
 pub(crate) mod sync;

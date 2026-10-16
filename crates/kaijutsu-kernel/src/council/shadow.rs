@@ -151,7 +151,7 @@ fn spawn_prime(kernel: &Arc<crate::Kernel>, judge: &Judge, config: &GateConfigLo
         let deadline = tokio::time::Instant::now() + super::sync::SHADOW_PRIME_TIMEOUT;
         let waits = crate::llm::endpoint::SlotWaits::default();
         match kernel.council_sync().prime_shadow(&kernel, &server, &spec_name, shadow, &seat_name, deadline, &waits).await {
-            Ok(head) => tracing::info!(
+            Ok((_, head)) => tracing::info!(
                 target: "kaijutsu::council",
                 %shadow, %server, head = %head, elapsed_ms = started.elapsed().as_millis() as u64,
                 "shadow primed"
@@ -270,8 +270,8 @@ async fn judge_one(
     };
     let primed =
         kernel.council_sync().prime_shadow(kernel, &server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
-    let head = match tokio::time::timeout_at(deadline, primed).await {
-        Ok(Ok(head)) => head,
+    let (held, head) = match tokio::time::timeout_at(deadline, primed).await {
+        Ok(Ok(primed)) => primed,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
         Err(_) => {
             let cause = match waits.open() {
@@ -286,6 +286,7 @@ async fn judge_one(
     prepared.contexts.push(super::sync::PreparedContext {
         label: label.clone(),
         context_id: read.shadow,
+        held,
         head,
         house_rules: false,
     });
@@ -306,7 +307,7 @@ async fn judge_one(
         engine: response.identity.engine.clone(),
     };
     judged.observation.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
-    let shadow_id = read.shadow.to_string();
+    let shadow_id = held.to_string();
     if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_id.as_str())) {
         judged.observation.snapshot = shadow_read.snapshot.as_ref().map(|s| s.to_string());
         judged.observation.questions =

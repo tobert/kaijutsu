@@ -285,7 +285,7 @@ pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, sta
             prepared
                 .contexts
                 .iter()
-                .map(|c| ContextRef { id: c.context_id.to_string(), at: Some(c.head.clone()) })
+                .map(|c| ContextRef { id: c.held.to_string(), at: Some(c.head.clone()) })
                 .collect(),
         ),
         state,
@@ -646,13 +646,13 @@ fn to_resend(error: &MkError, prepared: &Prepared) -> Resend {
     let named: Vec<ContextId> = prepared
         .contexts
         .iter()
-        .filter(|c| text.contains(&c.context_id.to_string()))
-        .map(|c| c.context_id)
+        .filter(|c| text.contains(&c.held.to_string()))
+        .map(|c| c.held)
         .collect();
     let not_found = status == Some(404);
     let spec_named = not_found && text.contains(prepared.spec_id.as_str());
     match (named.is_empty(), spec_named) {
-        (true, false) => Resend { contexts: prepared.contexts.iter().map(|c| c.context_id).collect(), spec: not_found },
+        (true, false) => Resend { contexts: prepared.contexts.iter().map(|c| c.held).collect(), spec: not_found },
         (_, spec) => Resend { contexts: named, spec },
     }
 }
@@ -1294,14 +1294,20 @@ fn build_verdict(
                 .reads
                 .iter()
                 .map(|read| {
-                    let expected = read.context.as_deref().and_then(|id| {
-                        prepared.contexts.iter().find(|c| c.context_id.to_string() == id).map(|c| c.head.to_string())
-                    });
-                    CouncilRead {
-                        context_id: read
+                    let prepared_context =
+                        read.context.as_deref().and_then(|id| prepared.contexts.iter().find(|c| c.held.to_string() == id));
+                    let expected = prepared_context.map(|c| c.head.to_string());
+                    // The record names the kaijutsu context, not the id
+                    // the server holds its seat under.
+                    let context_id = match prepared_context {
+                        Some(c) => Some(c.context_id.as_bytes().to_vec()),
+                        None => read
                             .context
                             .as_deref()
                             .map(|id| ContextId::parse(id).map(|c| c.as_bytes().to_vec()).unwrap_or_else(|_| id.as_bytes().to_vec())),
+                    };
+                    CouncilRead {
+                        context_id,
                         snapshot: read.snapshot.as_ref().map(|s| s.to_string()).unwrap_or_default(),
                         expected_head: expected,
                         rendered_sha256: read.rendered_sha256.clone(),
@@ -1597,7 +1603,7 @@ async fn decide_inner(
             .iter()
             .map(|read| {
                 let label = read.context.as_deref().and_then(|id| {
-                    prepared.contexts.iter().find(|c| c.context_id.to_string() == id).map(|c| c.label.clone())
+                    prepared.contexts.iter().find(|c| c.held.to_string() == id).map(|c| c.label.clone())
                 });
                 let probabilities = match read.answers.get(VERDICT) {
                     Some(ReadAnswer::Choice(c)) => serde_json::json!(c.probabilities),
@@ -1641,7 +1647,7 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
             let label = read
                 .context
                 .as_deref()
-                .and_then(|id| prepared.contexts.iter().find(|c| c.context_id.to_string() == id).map(|c| c.label.clone()))
+                .and_then(|id| prepared.contexts.iter().find(|c| c.held.to_string() == id).map(|c| c.label.clone()))
                 .unwrap_or_else(|| read.context.clone().unwrap_or_else(|| "spec".into()));
             let answers: Vec<String> = prepared
                 .spec
@@ -2294,6 +2300,7 @@ mod tests {
                 .map(|(i, id)| super::super::sync::PreparedContext {
                     label: format!("c{i}"),
                     context_id: *id,
+                    held: *id,
                     head: kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })
@@ -2306,7 +2313,7 @@ mod tests {
         let ids = [ContextId::new(), ContextId::new()];
         let p = prepared(&ids);
         let planned = kaish_kernel::plan_program("echo hi > out.txt; git push origin main").unwrap();
-        let facts = super::super::shell_case::Facts::for_test("/src", &[("/", true), ("/src", false)], &[], &[], &planned);
+        let facts = super::super::shell_case::Facts::offline("/src", &[("/", true), ("/src", false)], &[], &[], &planned);
         let state = case_state(&Submission {
             command: "echo hi > out.txt; git push origin main",
             planned: &planned,
@@ -2345,7 +2352,7 @@ mod tests {
     fn shell_case(command: &str, hosts: &[(&str, &str)], existing: &[&str]) -> serde_json::Value {
         let planned = kaish_kernel::plan_program(command).unwrap();
         let mounts = [("/", true), ("/dev", true), ("/tmp", false), ("/home/u/src", false)];
-        let facts = super::super::shell_case::Facts::for_test("/home/u/src/proj", &mounts, hosts, existing, &planned);
+        let facts = super::super::shell_case::Facts::offline("/home/u/src/proj", &mounts, hosts, existing, &planned);
         let state = case_state(&Submission {
             command,
             planned: &planned,
@@ -2441,7 +2448,7 @@ mod tests {
         let program = "import os\nprint(os.getcwd())\n";
         let command = format!("python3 <<'PY'\n{program}PY");
         let planned = kaish_kernel::plan_program(&command).unwrap();
-        let facts = super::super::shell_case::Facts::for_test("/w", &[("/", true)], &[("python3", "/usr/bin/python3")], &[], &planned);
+        let facts = super::super::shell_case::Facts::offline("/w", &[("/", true)], &[("python3", "/usr/bin/python3")], &[], &planned);
         let submission = Submission { command: &command, planned: &planned, context_type: None, cwd: None, facts: &facts };
         let state = serde_json::to_value(case_state(&submission, &[program], &[])).unwrap();
         assert_eq!(state["statements"][0]["commands"][0]["heredocs"], serde_json::json!([

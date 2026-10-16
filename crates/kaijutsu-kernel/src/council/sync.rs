@@ -13,9 +13,10 @@
 //! and a 429 is sent again after its cooldown.
 //!
 //! A server that answers `GET /council/v2/identity` is spoken to in council
-//! v2 (`docs/council-api-v2.md`): each projected context goes as v2
-//! messages, the system message first, and specs and decisions go under
-//! `/council/v2`. A server that answers it 404 is spoken to in v1.
+//! v2 (`docs/council-api-v2.md`): each projected context is held as a queue
+//! seat for the decision's spec (`super::seat`), under an id of its own per
+//! spec, and specs and decisions go under `/council/v2`. A server that
+//! answers it 404 is spoken to in v1, each context under its own id.
 //!
 //! The caller bounds `prepare_labels` with the decision's deadline and may
 //! drop it part way. A `PUT` dropped before its answer may still have
@@ -28,7 +29,6 @@ use std::time::Duration;
 
 use kaijutsu_mk::council::canon;
 use kaijutsu_mk::council::wire::{Capability, ContextPut, ServerIdentity, SnapshotId, Spec, SpecId, SpecQuestion};
-use kaijutsu_mk::council_v2::wire::ContextPut as V2ContextPut;
 use kaijutsu_mk::{MkClient, MkError};
 use kaijutsu_types::ContextId;
 use sha2::{Digest, Sha256};
@@ -73,6 +73,10 @@ impl Prepared {
 pub(crate) struct PreparedContext {
     pub(crate) label: String,
     pub(crate) context_id: ContextId,
+    /// The id the server holds it under, which a decision names: the
+    /// context id in v1, its queue seat's id for the spec in v2
+    /// ([`super::seat::held_id`]).
+    pub(crate) held: ContextId,
     /// The head the server reported for the body this kernel sent.
     pub(crate) head: SnapshotId,
     /// The house-rules context (`docs/council.md`, "House rules"), not a
@@ -152,7 +156,8 @@ pub(crate) struct PrepareMiss(pub(crate) String);
 
 #[derive(Clone)]
 struct Held {
-    /// sha256 of the projected body last sent, before any `warm` is added.
+    /// sha256 of the body last sent, the v1 projection or the v2 seat,
+    /// before `warm` or `persist` is added.
     body: [u8; 32],
     head: SnapshotId,
 }
@@ -176,6 +181,12 @@ pub(crate) struct CouncilSync {
     /// priming `PUT` never holds up the gate.
     shadow_serial: tokio::sync::Mutex<()>,
     state: parking_lot::Mutex<State>,
+}
+
+/// A context body in the API its server speaks.
+enum Body {
+    V1(ContextPut),
+    V2(kaijutsu_mk::council_v2::wire::ContextPut),
 }
 
 /// Forgets a context whose `PUT` was dropped before it answered: the server
@@ -342,12 +353,13 @@ impl CouncilSync {
             })?;
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
-            let head = self.hold(&link, wire, &identity, &spec_id, label, context_id, body, true).await?;
-            contexts.push(PreparedContext { label: label.clone(), context_id, head, house_rules: false });
+            let (held, head) = self.hold(&link, wire, &identity, &spec_body, &spec_id, label, context_id, body, true).await?;
+            contexts.push(PreparedContext { label: label.clone(), context_id, held, head, house_rules: false });
         }
         if let Some((context_id, body)) = house {
-            let head = self.hold(&link, wire, &identity, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
-            contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, head, house_rules: true });
+            let (held, head) =
+                self.hold(&link, wire, &identity, &spec_body, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
+            contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, held, head, house_rules: true });
         }
 
         let spec = spec_body;
@@ -356,7 +368,8 @@ impl CouncilSync {
     }
 
     /// Sends the shadow `shadow` of the seat labeled `seat` to `server`, so
-    /// the server holds its dialogue before the next question about it.
+    /// the server holds its dialogue before the next question about it,
+    /// and returns the id the server holds it under and its head.
     /// Warms the spec named `spec_name` when the server can. Sends nothing
     /// when the server already holds this body. Each call waits for a slot
     /// no later than `deadline`, adding its wait to `waits`.
@@ -370,7 +383,7 @@ impl CouncilSync {
         seat: &str,
         deadline: tokio::time::Instant,
         waits: &SlotWaits,
-    ) -> Result<SnapshotId, PrepareMiss> {
+    ) -> Result<(ContextId, SnapshotId), PrepareMiss> {
         let _serial = self.shadow_serial.lock().await;
         let (endpoint, key) = endpoint_of(kernel, server)?;
         let client = MkClient::new(server, SHADOW_PRIME_TIMEOUT).map_err(|e| self.failed(&key, server, "client", e))?;
@@ -386,55 +399,65 @@ impl CouncilSync {
         let body = project_shadow(&blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
-        self.hold(&link, wire, &identity, &spec_id, &label, shadow, body, true).await
+        self.hold(&link, wire, &identity, &spec_body, &spec_id, &label, shadow, body, true).await
     }
 
-    /// Makes the server hold `body` as `context_id` and returns its head,
-    /// sent as v2 messages when the server speaks `wire` v2.
+    /// Makes the server hold `body`, the projection of `context_id`, and
+    /// returns the id it holds it under and its head. A v1 server holds the
+    /// body as `context_id`; a v2 server holds its queue seat for `spec`
+    /// ([`super::seat::queue_seat`]) as [`super::seat::held_id`].
     /// Sends nothing when the server already holds this body. A context that
     /// is not `persistent` is sent with `persist: false` when the server
     /// lists the capability: the kernel sends it again after a restart, so
-    /// the server need not keep it on disk.
+    /// the server need not keep it on disk. A v1 body warms the spec when the
+    /// server can; a v2 queue seat reads no spec layer, so it warms none.
     #[allow(clippy::too_many_arguments)]
     async fn hold(
         &self,
         link: &Link<'_>,
         wire: Wire,
         identity: &ServerIdentity,
+        spec: &Spec,
         spec_id: &SpecId,
         label: &str,
         context_id: ContextId,
         body: ContextPut,
         persistent: bool,
-    ) -> Result<SnapshotId, PrepareMiss> {
+    ) -> Result<(ContextId, SnapshotId), PrepareMiss> {
         let server = link.server;
-        let hash = body_hash(&body)?;
-        let key = (link.key.clone(), context_id);
+        let persist = (!persistent && identity.capabilities.contains(&Capability::Persist)).then_some(false);
+        let (held_id, hash, body) = match wire {
+            Wire::V1 => {
+                let hash = body_hash(&body)?;
+                let mut body = body;
+                if identity.capabilities.contains(&Capability::Warm) {
+                    body.warm = Some(vec![spec_id.clone()]);
+                }
+                body.persist = persist;
+                (context_id, hash, Body::V1(body))
+            }
+            Wire::V2 => {
+                let mut seat = super::seat::queue_seat(body, spec).map_err(|e| {
+                    PrepareMiss(format!("council context \"{label}\" has no council v2 seat for spec {}: {e}", spec.name))
+                })?;
+                let hash = body_hash(&seat)?;
+                seat.persist = persist;
+                (super::seat::held_id(context_id, &spec.name), hash, Body::V2(seat))
+            }
+        };
+        let key = (link.key.clone(), held_id);
         let held = self.state.lock().contexts.get(&key).cloned();
         if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
-            return Ok(h.head.clone());
+            return Ok((held_id, h.head.clone()));
         }
-        let mut body = body;
-        if identity.capabilities.contains(&Capability::Warm) {
-            body.warm = Some(vec![spec_id.clone()]);
-        }
-        if !persistent && identity.capabilities.contains(&Capability::Persist) {
-            body.persist = Some(false);
-        }
-        let v2_body = match wire {
-            Wire::V1 => None,
-            Wire::V2 => Some(V2ContextPut::from_v1(body.clone()).map_err(|e| {
-                PrepareMiss(format!("council context \"{label}\" has no council v2 form: {e}"))
-            })?),
-        };
-        let id = context_id.to_string();
+        let id = held_id.to_string();
         let mut if_match = held.as_ref().map(|h| h.head.clone());
         let in_flight = PutInFlight { state: &self.state, key: Some(key.clone()) };
         let result = loop {
             let put = || async {
-                match &v2_body {
-                    Some(v2) => link.client.v2().put_context(&id, v2, if_match.as_ref()).await.map(|r| r.head),
-                    None => link.client.put_context(&id, &body, if_match.as_ref()).await.map(|r| r.head),
+                match &body {
+                    Body::V1(v1) => link.client.put_context(&id, v1, if_match.as_ref()).await.map(|r| r.head),
+                    Body::V2(v2) => link.client.v2().put_context(&id, v2, if_match.as_ref()).await.map(|r| r.head),
                 }
             };
             match link.send(put).await? {
@@ -448,7 +471,7 @@ impl CouncilSync {
         match result {
             Ok(head) => {
                 self.state.lock().contexts.insert(key, Held { body: hash, head: head.clone() });
-                Ok(head)
+                Ok((held_id, head))
             }
             Err(e) if e.status() == Some(412) => {
                 self.state.lock().contexts.remove(&key);
@@ -462,11 +485,11 @@ impl CouncilSync {
         }
     }
 
-    /// Forgets what the server is believed to hold for `context_id`, so the
-    /// next `prepare_labels` sends it again without `If-Match`. Call it after
-    /// a 404 or 409 from a decision.
-    pub(crate) fn invalidate(&self, context_id: ContextId) {
-        self.state.lock().contexts.retain(|(_, id), _| *id != context_id);
+    /// Forgets what the server is believed to hold under `held`
+    /// ([`PreparedContext::held`]), so the next `prepare_labels` sends it
+    /// again without `If-Match`. Call it after a 404 or 409 from a decision.
+    pub(crate) fn invalidate(&self, held: ContextId) {
+        self.state.lock().contexts.retain(|(_, id), _| *id != held);
     }
 
     /// Forgets that `spec_id` was posted, so the next `prepare_labels` for it
@@ -529,7 +552,7 @@ impl CouncilSync {
     }
 }
 
-fn body_hash(body: &ContextPut) -> Result<[u8; 32], PrepareMiss> {
+fn body_hash(body: &impl serde::Serialize) -> Result<[u8; 32], PrepareMiss> {
     let bytes = serde_json::to_vec(body)
         .map_err(|e| PrepareMiss(format!("council context body does not serialize: {e}")))?;
     Ok(Sha256::digest(&bytes).into())
@@ -878,14 +901,17 @@ mod tests {
     }
 
     /// A server that answers `GET /council/v2/identity` gets council v2:
-    /// the spec under `/council/v2/specs`, each context as messages with the
-    /// system message first and each turn's `snap` and `reasoning` on its
-    /// message, and the decision under `/council/v2/decisions` with no
-    /// `think`. Nothing goes to `/council/v1`.
+    /// the spec under `/council/v2/specs`, each context as a queue seat for
+    /// the spec under its held id (the projection's messages, the system
+    /// message first and each turn's `reasoning` on its message, then the
+    /// task and the queue calls), and the decision under
+    /// `/council/v2/decisions`, naming the held id, with no `think`.
+    /// Nothing goes to `/council/v1`.
     ///
-    /// Falsified by a sync that probes v2 but keeps the v1 body or paths.
+    /// Falsified by a sync that probes v2 but keeps the v1 body or paths,
+    /// or holds the seat under the context's own id.
     #[tokio::test]
-    async fn a_v2_server_holds_contexts_as_messages_and_takes_decisions_under_v2() {
+    async fn a_v2_server_holds_queue_seats_and_takes_decisions_under_v2() {
         let r = rig_on(serve_v2().await).await;
         let ids = r.kernel.blocks().block_snapshots(r.reviewer).unwrap();
         let mut last = ids.last().map(|b| b.id.clone());
@@ -906,15 +932,24 @@ mod tests {
         assert_eq!(p.wire, Wire::V2);
         assert_eq!(r.mock.calls("GET"), ["/council/v2/identity"]);
         assert_eq!(r.mock.calls("POST"), ["/council/v2/specs"]);
+        let held = super::super::seat::held_id(r.reviewer, "shell-gate");
+        assert_eq!(p.contexts[0].context_id, r.reviewer);
+        assert_eq!(p.contexts[0].held, held);
         let puts = r.mock.puts();
-        assert_eq!(r.mock.calls("PUT"), [format!("/council/v2/contexts/{}", r.reviewer)]);
+        assert_eq!(r.mock.calls("PUT"), [format!("/council/v2/contexts/{held}")]);
         let body = &puts[0].1;
         assert!(body.get("system").is_none() && body.get("turns").is_none(), "{body}");
+        assert!(body.get("warm").is_none(), "a queue seat reads no spec layer: {body}");
+        assert_eq!(body["queue"], super::super::seat::QUEUE_TOOL);
         let messages = body["messages"].as_array().unwrap();
         let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
-        assert_eq!(roles, ["system", "user", "assistant", "user", "assistant"]);
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "user", "assistant", "user", "assistant", "tool", "assistant", "tool", "assistant"]
+        );
         assert!(messages[0]["content"].as_str().unwrap().contains("\"reviewer\""), "{body}");
         assert_eq!(messages[4], json!({"role": "assistant", "content": "ask first", "reasoning": "it publishes main"}));
+        assert_eq!(messages.last().unwrap()["tool_calls"][0]["name"], super::super::seat::QUEUE_TOOL);
 
         let council = &r.council;
         let request = super::super::gate::decision_request(&p, council, kaijutsu_mk::Json::from("git push origin main"));
@@ -923,8 +958,37 @@ mod tests {
         let sent = r.mock.bodies("/council/v2/decisions");
         assert_eq!(sent.len(), 1);
         assert!(sent[0].get("think").is_none(), "{}", sent[0]);
-        assert_eq!(sent[0]["contexts"][0]["at"], json!(p.contexts[0].head.as_str()));
+        assert_eq!(sent[0]["contexts"][0], json!({"id": held.to_string(), "at": p.contexts[0].head.as_str()}));
         assert!(r.mock.calls("POST").iter().all(|p| p.starts_with("/council/v2/")));
+    }
+
+    /// One council context read under two specs is two queue seats on a v2
+    /// server, each with its spec's answers schema, and an unchanged seat
+    /// is not sent again.
+    ///
+    /// Falsified by one held seat that each spec overwrites in turn.
+    #[tokio::test]
+    async fn a_v2_server_holds_one_seat_per_spec() {
+        let r = rig_on(serve_v2().await).await;
+        std::fs::write(r.config.path().join("council/program-gate.json"), crate::config_seed::DEFAULT_COUNCIL_PROGRAM_GATE)
+            .unwrap();
+        let waits = SlotWaits::default();
+        let prepare = |spec: &'static str| {
+            r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, spec, &r.council.contexts, None, &[], far(), &waits)
+        };
+        let shell = prepare("shell-gate").await.expect("prepared");
+        let program = prepare("program-gate").await.expect("prepared");
+        prepare("shell-gate").await.expect("prepared");
+        assert_ne!(shell.contexts[0].held, program.contexts[0].held);
+        assert_eq!(program.contexts[0].held, super::super::seat::held_id(r.reviewer, "program-gate"));
+        let puts = r.mock.puts();
+        assert_eq!(puts.len(), 2, "each seat once");
+        let answers = |put: &serde_json::Value| -> Vec<String> {
+            let props = &put["tools"][0]["function"]["parameters"]["properties"]["answers"]["properties"];
+            props.as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(answers(&puts[0].1), ["undo", "verdict"]);
+        assert_eq!(answers(&puts[1].1), ["network", "originals", "verdict"]);
     }
 
     /// A v2 server that fails its identity with anything but a 404 is a
