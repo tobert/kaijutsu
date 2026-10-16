@@ -104,6 +104,27 @@ sudo -u kaijutsu env \
   kaijutsu-server --port 2222
 ```
 
+## Rootless Podman as a systemd user unit
+
+`contrib/kaijutsu.container` is a Quadlet unit with the same isolation flags
+as the run command above. State lives in `~/.local/share/kaijutsu-container`;
+`~/Downloads` is mounted read-write at `/downloads` and passed as
+`--rw-mount`. SSH publishes on `127.0.0.1:2223` so it does not collide with a
+host kernel on 2222.
+
+```bash
+mkdir -p ~/.local/share/kaijutsu-container/{kernel-data,workspace}
+# run `init` once (above), then:
+cp contrib/kaijutsu.container ~/.config/containers/systemd/
+systemctl --user daemon-reload && systemctl --user start kaijutsu
+```
+
+Add `loginctl enable-linger $USER` to start it without a login session.
+
+An HTTP MCP server on the host's tailnet address works from the container
+with default networking (pasta). The host's loopback and LAN addresses are
+refused from inside; use the tailnet name in `mcp.toml`.
+
 ## Kubernetes later
 
 For `/tank` storage pinned to zorak, use statically created `local`

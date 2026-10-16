@@ -1,0 +1,29 @@
+# Rootless Podman Quadlet for an isolated Kaijutsu kernel.
+# Install: cp contrib/kaijutsu.container ~/.config/containers/systemd/
+#          systemctl --user daemon-reload && systemctl --user start kaijutsu
+# State lives in ~/.local/share/kaijutsu-container; see docs/container.md.
+[Unit]
+Description=Kaijutsu kernel (container, isolated)
+
+[Container]
+Image=localhost/kaijutsu:dev
+ContainerName=kaijutsu
+UserNS=keep-id:uid=10001,gid=10001
+User=kaijutsu
+PodmanArgs=--init
+DropCapability=all
+NoNewPrivileges=true
+ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=1g
+PublishPort=127.0.0.1:2223:2222
+Volume=%h/.local/share/kaijutsu-container/kernel-data:/var/lib/kaijutsu
+Volume=%h/.local/share/kaijutsu-container/workspace:/workspace
+Volume=%h/Downloads:/downloads
+Exec=--port 2222 --rw-mount /downloads
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
