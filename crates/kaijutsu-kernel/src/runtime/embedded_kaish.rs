@@ -630,6 +630,12 @@ impl EmbeddedKaish {
         &self.name
     }
 
+    /// The name of every tool registered in this shell.
+    #[cfg(test)]
+    pub(crate) fn tool_names(&self) -> Vec<String> {
+        self.kernel.tool_schemas().into_iter().map(|schema| schema.name).collect()
+    }
+
     /// Snapshot of the kaijutsu kernel's `TimeoutPolicy` taken at this
     /// `EmbeddedKaish`'s construction. Callers that build per-call
     /// `ExecuteOptions` (rc lifecycle, hook bodies) read their bound from here.

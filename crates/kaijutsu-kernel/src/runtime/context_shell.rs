@@ -111,6 +111,12 @@ pub(crate) fn initial_environment(external_exec: &super::embedded_kaish::Externa
     env
 }
 
+/// The commands a writable context shell registers beyond kaish's own
+/// builtins and the wrapped python names: the tools `for_context` registers
+/// in its `configure_tools`. The council's shell case reads it to say what a
+/// command name runs.
+pub(crate) const CONTEXT_SHELL_BUILTINS: [&str; 5] = ["vi", "fg", "ps", "kj", "curl"];
+
 impl EmbeddedKaish {
     /// Construct a contextual shell with explicit identity and execution policy.
     ///
@@ -673,6 +679,32 @@ mod tests {
             assert_eq!(block.author(), performer, "MCP writes belong to the performer: {}", block.content);
         }
         assert!(d.block_store().block_snapshots(initial).unwrap().is_empty());
+    }
+
+    /// The council names a command a kaijutsu builtin from
+    /// `CONTEXT_SHELL_BUILTINS`; it must match what a writable shell
+    /// registers beyond kaish's builtins and the wrapped python names.
+    #[tokio::test]
+    async fn context_shell_builtins_are_what_a_writable_shell_adds_to_kaish() {
+        let d = dispatcher_with_full_broker().await;
+        let requester = PrincipalId::new();
+        let context = register_context(&d, Some("builtin-names"), None, requester);
+        grant_broad_binding(&d, context, true).await;
+        let kaish = EmbeddedKaish::for_context(&d, "builtin-names", ShellIdentity {
+            requester, performer: requester, reviewer: None, context, session: SessionId::new(),
+        }, ShellPolicy::Agent, ShellCwd::Context, None, Arc::new(NoopBlockSource)).await.unwrap();
+        let mut kaish_builtins = kaish_kernel::ToolRegistry::new();
+        kaish_kernel::tools::register_builtins(&mut kaish_builtins);
+        let mut added: Vec<String> = kaish
+            .tool_names()
+            .into_iter()
+            .filter(|name| !crate::runtime::python_tool::PYTHON_NAMES.contains(&name.as_str()))
+            .filter(|name| !kaish_builtins.contains(name) || CONTEXT_SHELL_BUILTINS.contains(&name.as_str()))
+            .collect();
+        added.sort();
+        let mut expected: Vec<String> = CONTEXT_SHELL_BUILTINS.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(added, expected);
     }
 
     /// `edit` is kaish's hashline editor, not a vi front door. Production
