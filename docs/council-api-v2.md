@@ -8,7 +8,8 @@ its council from one store, so the two share KV and one eviction policy.
 This draft replaces `docs/council-api.md` (v1) and the three servers' own
 context routes: the HIP megakernel's `/mk/v1`, lfm2d's `/v1/opinion`, and
 mkviolet, which serves both. "Converting" below says what each one changes.
-Nothing here is built yet.
+mkviolet serves this draft (`src/council_v2.rs`, `src/held.rs`), and
+kaijutsu's mk provider and council speak it on the `council-v2` branch.
 
 ## What changes from v1
 
@@ -91,13 +92,26 @@ PUT /council/v2/contexts/0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12
   compares the body with what the server holds, message by message and flag
   by flag, and feeds from the first difference. It extends only from a
   boundary.
+- **A boundary exists only where the rendering keeps it.** A marked message
+  whose rendering is not a prefix of the whole context is not a boundary,
+  and the reply lists no snapshot for it. In Gemma 4 this is a message
+  inside an agent turn once a later user message follows, because the
+  template then drops that turn's thinking. The end of a user message is
+  always a boundary, and so is the end of a run of tool results until the
+  next user message.
+- **Every call carries an `id`** of letters, digits, and `-_.:`, and a
+  `tool` message names the call it answers in `tool_call_id`, a call of the
+  assistant message before its run of tool messages.
+- **The head is held** after every `PUT`, marked or not, so a decision or
+  a generation starts from it.
+- **`thinking`** absent is the server's default; mkviolet's is on.
 - **`from`** in the reply names the ancestor snapshot the build started
   from, held by this context or another, or `null`. `kept` counts its
   tokens.
 - **`fork: {"context": <id>, "at": <snapshot>}`** in a `PUT` asserts the new
   context's messages extend that snapshot. When they do not, the answer is a
-  `409`; when the snapshot is gone, a `409` naming the context's current
-  head. A client forks after a context fills, after an exclude, or after an
+  `409` of type `fork_mismatch`; when the snapshot is gone, a `409` of type
+  `snapshot_gone` naming the context's current head. A client forks after a context fills, after an exclude, or after an
   edit; the parent is never changed.
 - **`queue`** names a tool in `tools`. When the messages end with an
   assistant call to it, a decision delivers the case as that call's result,
@@ -117,10 +131,22 @@ their exact relations, `leave_one_out`, and the errors.
 
 - **The case goes where the context expects it.** For a context with no
   `queue`, as in v1: in its own user turn after the spec. For a context that
-  ends with a call to its `queue` tool: as that call's result. The server
-  builds the queue tool's `answers` schema from the spec, one property per
-  question with its options as an enum, so the model reads the questions in
-  the tool definition. Either way, how a spec is compiled is `template`.
+  ends with a call to its `queue` tool: as that call's result. Either way,
+  how a spec is compiled is `template`.
+- **The client writes the queue tool's `answers` schema.** The tools render
+  at the top of the context, before any spec, so the server cannot add them
+  at decision time. Each asked question is an `answers` property whose
+  `enum` is the letters of its options in order, `A`, `B`, and so on, with
+  the options described in the property. The server checks this and answers
+  a `400` naming `queue` otherwise.
+- **A queue context's questions read the way the model writes one call:**
+  in the order the template writes the keys, each after the most likely
+  letters of the ones before it. Unlike v1's reads, these answers condition
+  each other. A decision's contexts all end with a call to their queue tool,
+  or none do.
+- **A decision's contexts fit the decision limit,** `decision_context_tokens`
+  in identity, which can be shorter than `context_tokens`. mkviolet reads
+  decisions in a 4,096-position slot.
 - **`think`** sets the thought before the answer: `{"tokens": 0}` closes it,
   as v1 always did; `{"tokens": N}` lets the model think greedily, up to N
   tokens, and each read reports its `thought`. Greedy keeps rule 1: the same
@@ -139,13 +165,16 @@ POST /council/v2/reads
  "letters": ["A", "B", "C"], "top": 5}
 ```
 
-- Each suffix is read after the context's head, which is never changed.
+- Each suffix is read after the context's head, which is never changed, or
+  after `at`, a boundary the context holds.
 - **A suffix is the client's own structure**, so its special-token text
   tokenizes as single ids. This is the one place content may be control;
   `signals.control_text` still reports each hit.
-- Each read returns the letters' log probabilities, their `mass`, and the
-  `top` tokens, so a client sees where the rest of the probability went.
-  With several contexts, the pooled distribution follows the decision rules.
+- Each read returns its `context`, `snapshot`, and `suffix` index, the
+  letters' log probabilities as `logprobs`, their `mass`, and the `top`
+  tokens as `{token, id, logprob}`, so a client sees where the rest of the
+  probability went. Reads are not pooled; a client that pools follows the
+  decision rules.
 
 ## Generations
 
@@ -158,11 +187,21 @@ POST /council/v2/generations
 - **A generation appends to a context.** The messages it adds and the reply
   it writes become the context's new head, with boundaries where they are
   marked; the reply reports the snapshots, as a `PUT` does.
-- **`stream: true`** sends server-sent events: `token`, then `done` with the
-  reply's `content`, `reasoning`, `tool_calls`, `finish`, and `usage`
-  (`kept`, `fed`, `completion`). Closing the stream cancels the reply.
+- **`messages` may be empty:** the reply then follows the context as it is.
+- **`stream: true`** sends server-sent events: `token`, as `/mk/v1`'s, then
+  `done` with the reply's `content`, `reasoning`, `tool_calls`, `finish`,
+  `usage` (`prompt`, `kept`, `fed`, `completion`), and the new `head` and
+  `snapshots`. Closing the stream cancels the reply, and the context stays
+  as it was. Without `stream`, `done` is the JSON response.
+- **The server names each call of the reply** with the `id` a later `tool`
+  message answers. A call that does not parse is kept as written,
+  `{id, name, raw, error}`, and left out of the context's record.
+- **The reply is not a boundary.** The server holds the head after it when
+  that costs at most a few tokens of feeding; a client marks the next user
+  message or tool result `snap`.
 - **A prompt that leaves no room is a `413`** with `error.type`
-  `context_full` and the counts, before anything runs. The client forks.
+  `context_full`, `prompt_tokens`, and `context_tokens`, before anything
+  runs. The client forks.
 
 ## Rules every server keeps
 
@@ -182,8 +221,11 @@ As v1, plus:
 
 | Limit | Means |
 |---|---|
-| `context_tokens` | The longest context, its spec layer, and a case, or a generation's prompt and reply. |
-| `snapshot_bytes` | What one boundary snapshot costs on the device. |
+| `context_tokens` | The longest context, or a generation's prompt and reply. |
+| `decision_context_tokens` | The longest context a decision reads, before its spec layer and case. |
+| `snapshot_bytes` | What one token of a snapshot costs. |
+
+`extensions` lists the server's own route prefixes, such as `["/mk/v1"]`.
 
 | Capability | Means |
 |---|---|
@@ -213,7 +255,7 @@ A server serves the model-specific rest under its own prefix and lists it in
 | council v1 | `system` and `turns` become `messages`, with the system message first. `snap` moves onto messages. Contexts gain `tools`, `thinking`, `queue`, and `fork`. Decisions gain `think`. Paths move to `/council/v2`. |
 | HIP megakernel `/mk/v1` | Context ids become client-chosen; the content-hash id becomes the snapshot id. `POST /contexts` becomes `PUT /contexts/{id}`. `reads` takes `contexts` and is otherwise the same. `generate`'s `from.context` becomes `generations` on a context, and its reply becomes the head. |
 | lfm2d `/v1/opinion` | Held specs and describe-first carry over as `specs` and `text` questions. Contexts move from a domain-tagged token hash to client ids with `snap` boundaries. |
-| mkviolet | One snapshot store for council and generation slots. `/mk/v1/choices` goes, replaced by `reads`. Snapshots record their boundaries, which a sliding-layer ring requires (`docs/07-long-context.md` in mkviolet). |
+| mkviolet | Done: one snapshot store for council v2 contexts, generations, and decisions; each snapshot holds the rows after its parent boundary. `/mk/v1/choices` is gone, replaced by `reads`. v1 contexts and `/mk/v1/generate` keep their own stores. |
 | kaijutsu | The mk provider sends each chat as a held context with `snap` on user turns and tool results, generates on it, and forks with `fork.at` after a context fills or an exclude. The council's seats become agent-loop contexts with a `queue` tool. |
 
 ## Open questions
@@ -224,8 +266,10 @@ A server serves the model-specific rest under its own prefix and lists it in
   tool-call template answers `queue` with a `400`; whether a plain-turn
   delivery should fall back silently is open.
 - **Thinking at decision time.** `think` costs about 21 ms a token on
-  mkviolet. Whether it pays, and at what length, is the bench's next
-  measurement.
+  mkviolet, which does not serve it yet. Whether it pays, and at what
+  length, is the bench's next measurement.
+- **Durable context records.** Snapshots outlive a restart on disk;
+  context records do not, so a client `PUT`s each context again.
 - **Tool-result size.** A tool result is written whole into a context, even
   when the context then has no room for another turn, so a fork can carry
   it. The client's preview and storage rules for large results are its own.
