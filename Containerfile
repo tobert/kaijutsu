@@ -1,5 +1,5 @@
 # Kaijutsu's runtime is intentionally small: the kernel, its protocol bridges,
-# a POSIX shell for agent commands, and CA roots for provider HTTPS. Development
+# a POSIX shell for agent commands, media tools, and CA roots for provider HTTPS. Development
 # tools belong in the devcontainer stage below, not in the kernel image.
 FROM docker.io/library/rust:1.97-alpine3.22 AS build
 
@@ -18,7 +18,10 @@ FROM docker.io/library/alpine:3.22 AS runtime
 # Alpine supplies BusyBox's /bin/sh. Keep that small execution baseline: the
 # kernel's external-exec policy controls what a context may run, while a
 # shell-less image would make ordinary kaish commands fail before that policy.
+# ffmpeg, imagemagick, sox, and exiftool serve media work a context runs
+# through its granted shell; the kernel itself does not link them.
 RUN apk add --no-cache ca-certificates libgcc libstdc++ \
+        ffmpeg imagemagick sox exiftool \
     && addgroup --system --gid 10001 kaijutsu \
     && adduser --system --uid 10001 --ingroup kaijutsu --home /var/lib/kaijutsu kaijutsu \
     && install -d --owner kaijutsu --group kaijutsu --mode 0750 /var/lib/kaijutsu /workspace
