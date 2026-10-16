@@ -434,6 +434,17 @@ shipped, these did not.
 and `broker_with_vfs_files` (`kaijutsu-kernel/src/mcp/servers/file.rs`) are
 unused. Seen while retiring `shellDryRun`; not caused by it.
 
+## `kj backend remove` accepts the default backend (2026-10-16)
+
+`KernelDb::delete_backend` refuses a backend that a cast slot or alias
+names, but not the one `llm_defaults.default_backend` names. The row goes,
+then the registry reload fails with "default backend '<name>' is not
+registered", and every later start logs the same error. A restart used to
+put a factory backend back; since a kernel is offered the factory backends
+once, nothing does. Refusing the removal while the defaults name it is the
+fix; `llm/db_config.rs`'s `missing_default_backend_is_fatal_not_a_silent_fallback`
+reaches that state through this removal and would need another route.
+
 ## A caller already past its deadline still gets a free slot (2026-10-10)
 
 `Endpoint::acquire` (`llm/endpoint.rs`) gives a free slot on the first

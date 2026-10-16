@@ -69,6 +69,32 @@ async fn start_creates_the_root_context_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_restores_no_factory_backend_the_operator_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    support::init_root(tmp.path(), "amy");
+
+    let shared = start(tmp.path()).await.expect("a kernel with a root character starts");
+    let deepseek = {
+        let db = shared.kernel_db.lock();
+        assert!(db.get_backend_by_name("anthropic").unwrap().is_some(), "a fresh kernel offers the factory backends");
+        db.delete_backend("anthropic").unwrap();
+        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
+        assert!(db.delete_backend_model(deepseek.backend_id, "deepseek-v4-pro").unwrap());
+        deepseek
+    };
+    drop(shared);
+
+    let restarted = start(tmp.path()).await.expect("restart");
+    let db = restarted.kernel_db.lock();
+    assert!(db.get_backend_by_name("anthropic").unwrap().is_none(), "a restart must not restore a removed backend");
+    let models = db.list_backend_models(deepseek.backend_id).unwrap();
+    assert!(
+        models.iter().all(|m| m.model_id != "deepseek-v4-pro"),
+        "a restart must not restore a removed model row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_refuses_incomplete_orphan_recovery_and_retries_without_partial_settlement() {
     for fault in ["journal", "approval"] { failed_orphan_boot(fault).await; }
 }

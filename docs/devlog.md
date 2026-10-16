@@ -408,6 +408,9 @@ live on every write. Presets survived on purpose once the code showed they
 are patch recall over verb args: **cast = who plays, preset = the patch.**
 Roles are context_types. Old aliases didn't make the trip — "they were
 guesses" — so every row above the floor is something someone chose.
+The floor itself is offered once: a kernel with an `llm_defaults` row is
+not fresh, so a restart never puts back a backend or model row the
+operator removed (October 16).
 
 ## Errors that were only strings (August 3–4)
 

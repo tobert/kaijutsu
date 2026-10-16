@@ -1,12 +1,12 @@
 //! Factory LLM configuration — the backends, their known context windows, and
 //! the defaults a fresh kernel is born with.
 //!
-//! The backend analogue of [`crate::seed_presets`]: an idempotent floor
-//! ([`ensure_factory_backends`], insert-only-if-absent, so an operator's edits
-//! survive) plus a force-restore ([`reseed_factory_backends`], the `kj backend
-//! reseed` path). The definitions are **Rust-embedded**, not TOML — SQL is the
-//! source of truth for model config and `assets/defaults/models.toml` was
-//! demolished along with the loader that read it.
+//! A fresh kernel is offered the floor once ([`ensure_factory_backends`]); a
+//! restart never restores or changes what the operator removed or edited. The
+//! force-restore is [`reseed_factory_backends`], the `kj backend reseed` path.
+//! The definitions are **Rust-embedded**, not TOML — SQL is the source of
+//! truth for model config and `assets/defaults/models.toml` was demolished
+//! along with the loader that read it.
 //!
 //! What the floor deliberately does NOT ship:
 //!
@@ -180,14 +180,20 @@ pub fn is_factory_backend_name(name: &str) -> bool {
     FACTORY_BACKENDS.iter().any(|b| b.name == name)
 }
 
-/// Idempotently seed the factory floor: a backend, model row, or singleton is
-/// created only when absent, so operator edits survive. Returns how many
-/// backends were newly created.
+/// Offer the factory floor to a fresh kernel, once. A kernel is fresh while it
+/// has no `llm_defaults` row; this function writes that row last, and no verb
+/// deletes it. A kernel that has one gets nothing, so a backend or model row
+/// the operator removed or edited stays that way across restarts.
+/// `kj backend reseed` is the explicit restore. Returns how many backends were
+/// newly created.
 ///
 /// Every failure bubbles. A kernel that silently came up with no backends
 /// would hang the first turn on "no provider configured", which is a much
 /// worse diagnostic than the insert error that caused it.
 pub fn ensure_factory_backends(db: &mut KernelDb, created_by: PrincipalId) -> KernelDbResult<usize> {
+    if db.get_llm_defaults()?.is_some() {
+        return Ok(0);
+    }
     let mut created = 0;
     for fb in FACTORY_BACKENDS {
         let existing = db.get_backend_by_name(fb.name)?;
@@ -199,8 +205,8 @@ pub fn ensure_factory_backends(db: &mut KernelDb, created_by: PrincipalId) -> Ke
                 row.backend_id
             }
         };
-        // Model rows are part of the floor too: absent-only, so a hand-tuned
-        // context_window is never clobbered by a restart.
+        // Absent-only, so a row written before the first start is kept, and a
+        // start interrupted before the defaults row completes on the next one.
         let have: std::collections::HashSet<String> = db
             .list_backend_models(backend_id)?
             .into_iter()
@@ -220,10 +226,7 @@ pub fn ensure_factory_backends(db: &mut KernelDb, created_by: PrincipalId) -> Ke
         }
     }
 
-    if db.get_llm_defaults()?.is_none() {
-        db.set_llm_defaults(&factory_defaults())?;
-    }
-
+    db.set_llm_defaults(&factory_defaults())?;
     Ok(created)
 }
 
@@ -338,6 +341,58 @@ mod tests {
 
         let names: Vec<String> = db.list_backends().unwrap().into_iter().map(|b| b.name).collect();
         assert_eq!(names, vec!["anthropic", "deepseek", "gpt", "ollama"]);
+    }
+
+    #[test]
+    fn a_second_ensure_restores_nothing_the_operator_removed() {
+        let mut db = KernelDb::temporary().unwrap();
+        let who = PrincipalId::system();
+        ensure_factory_backends(&mut db, who).unwrap();
+        db.delete_backend("anthropic").unwrap();
+        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
+        db.delete_backend_model(deepseek.backend_id, "deepseek-v4-pro").unwrap();
+
+        assert_eq!(ensure_factory_backends(&mut db, who).unwrap(), 0);
+        assert!(db.get_backend_by_name("anthropic").unwrap().is_none(), "a removed backend stays removed");
+        assert!(
+            db.list_backend_models(deepseek.backend_id).unwrap().iter()
+                .all(|m| m.model_id != "deepseek-v4-pro"),
+            "a removed model row stays removed"
+        );
+    }
+
+    #[test]
+    fn a_kernel_with_defaults_is_not_fresh_and_gets_no_factory_backends() {
+        // The operator configured this kernel before its first start, so
+        // there is nothing to offer.
+        let mut db = KernelDb::temporary().unwrap();
+        let who = PrincipalId::system();
+        db.upsert_backend(&BackendRow {
+            backend_id: BackendId::new(),
+            name: "zorak".into(),
+            kind: "openai".into(),
+            base_url: Some("http://zorak:8080/v1".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            max_concurrent: None,
+            created_at: 0,
+            created_by: who,
+        })
+        .unwrap();
+        db.set_llm_defaults(&LlmDefaultsRow {
+            default_backend: "zorak".into(),
+            default_model: "qwen".into(),
+            ..factory_defaults()
+        })
+        .unwrap();
+
+        assert_eq!(ensure_factory_backends(&mut db, who).unwrap(), 0);
+        let names: Vec<String> = db.list_backends().unwrap().into_iter().map(|b| b.name).collect();
+        assert_eq!(names, vec!["zorak"]);
+        assert_eq!(db.get_llm_defaults().unwrap().unwrap().default_backend, "zorak");
     }
 
     #[test]

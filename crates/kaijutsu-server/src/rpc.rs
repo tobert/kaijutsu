@@ -1644,12 +1644,12 @@ pub async fn create_shared_kernel_in(
         // ship a kernel where `kj fork --preset` has nothing to recall.
         kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        // Seed the LLM configuration floor — backends, their known context
-        // windows, the `--model` aliases, and the defaults. Same absent-only
-        // floor pattern as the presets above, and the
-        // successor to seeding `models.toml` into the kernel. Fail loud: a
-        // kernel with no backends hangs its first turn on "no provider
-        // configured", which is a far worse diagnostic than this error.
+        // Offer a fresh kernel the LLM configuration floor — backends, their
+        // known context windows, and the defaults — once. A kernel that
+        // already has defaults gets nothing, so removed or edited backends
+        // stay that way. Fail loud: a kernel with no backends hangs its first
+        // turn on "no provider configured", which is a far worse diagnostic
+        // than this error.
         kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         // A kernel belongs to a live root character, created by

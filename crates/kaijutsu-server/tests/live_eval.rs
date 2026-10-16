@@ -349,9 +349,10 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
 /// model. Model config is SQL-native, so this writes the DB directly rather
 /// than a `models.toml` the kernel would have read once at seed time.
 ///
-/// `ensure_factory_backends` runs at server boot and is absent-only, so the
-/// `anthropic` backend it creates (reading `ANTHROPIC_API_KEY`) is exactly the
-/// one these defaults name — we seed both here so the ordering does not matter.
+/// `ensure_factory_backends` offers the factory backends only to a kernel with
+/// no defaults row, so this seeds them here, before the defaults; the
+/// `anthropic` backend it creates (reading `ANTHROPIC_API_KEY`) is the one
+/// these defaults name.
 fn write_haiku_defaults(state_dir: &std::path::Path) {
     use kaijutsu_kernel::kernel_db::KernelDb;
     use kaijutsu_types::PrincipalId;

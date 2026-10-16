@@ -155,9 +155,11 @@ Each step fails loudly, with what it was doing:
 3. Load or generate the connecting character's Ed25519 key.
 4. Make `solo` the root character and bind that key to it. `solo` owns the
    bridge's connection and is the reviewer every approval resolves to.
-5. Seed the factory backends, then point the model defaults at the chosen
-   provider and model. The factory row is left alone unless `--base-url`,
-   `--api-key-env`, or `--no-key` says something different; a row written
+5. Seed the factory backends on a new state directory, then point the model
+   defaults at the chosen provider and model. A reused state directory keeps
+   the backends it has; one removed there stays removed. The factory row is
+   left alone unless `--base-url`, `--api-key-env`, or `--no-key` says
+   something different; a row written
    without `--api-key-env` or `--no-key` keeps the provider's key file. The
    two timeouts change only their own columns of the factory row. `--max-tokens` sets the
    chosen model's own output budget, which outranks the defaults row; left out, the
