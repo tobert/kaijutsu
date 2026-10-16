@@ -284,6 +284,9 @@ fn to_llm(name: &str, e: MkError) -> LlmError {
         MkError::Service { status: 400 | 404 | 413, .. } => LlmError::InvalidRequest(detail),
         MkError::Service { status: 429, .. } => LlmError::RateLimited(detail),
         MkError::Timeout | MkError::Transport(_) => LlmError::NetworkError(detail),
+        MkError::ContextFull { .. } => LlmError::ContextFull(format!(
+            "{detail}; exclude blocks with `kj stage exclude`, then fork"
+        )),
         MkError::Service { .. }
         | MkError::Stream(_)
         | MkError::Truncated(_)

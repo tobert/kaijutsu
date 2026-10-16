@@ -4,6 +4,7 @@
 //!   [`MkError`], which types every failure and never turns one into an
 //!   answer.
 //! - [`council`]: the council API's types, math, and calls.
+//! - [`council_v2`]: council v2's types and calls (`docs/council-api-v2.md`).
 //! - [`generate`]: `/mk/v1/generate` types, the SSE decoder, and the calls.
 //! - [`model`]: the service's model identity and the render call.
 //! - [`json`]: a JSON value that keeps object member order.
@@ -12,6 +13,7 @@ pub mod client;
 #[cfg(test)]
 mod conformance;
 pub mod council;
+pub mod council_v2;
 pub mod generate;
 pub mod json;
 pub mod model;

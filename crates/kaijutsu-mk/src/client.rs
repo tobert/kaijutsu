@@ -11,7 +11,7 @@ use reqwest::header::{HeaderName, HeaderValue, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::council::wire::{ErrorBody, ErrorDetail, InvalidRequest, SnapshotId, SpecId};
+use crate::council::wire::{ErrorBody, ErrorDetail, ErrorType, InvalidRequest, SnapshotId, SpecId};
 use crate::json::Json;
 
 /// Longest slice of a response body kept in an error.
@@ -40,6 +40,14 @@ pub enum MkError {
         error: Option<ServiceError>,
         /// The `Retry-After` header, when it held whole seconds.
         retry_after: Option<Duration>,
+        body: String,
+    },
+    /// A council v2 `413` of type `context_full`: the prompt leaves no room
+    /// for a reply, and nothing ran. The caller forks the context.
+    #[error("megakernel answered 413 context_full: {message}")]
+    ContextFull {
+        message: String,
+        /// The start of the raw body, which carries the server's counts.
         body: String,
     },
     /// The server failed after a stream began and said so in an `error` event.
@@ -84,6 +92,7 @@ impl MkError {
     pub fn status(&self) -> Option<u16> {
         match self {
             MkError::Status { status, .. } | MkError::Service { status, .. } => Some(*status),
+            MkError::ContextFull { .. } => Some(413),
             MkError::Stream(e) => Some(e.code),
             _ => None,
         }
@@ -269,12 +278,15 @@ pub(crate) fn require_object(value: &Json, what: &'static str) -> Result<(), MkE
 
 fn status_error(family: Family, status: StatusCode, retry_after: Option<Duration>, bytes: &[u8]) -> MkError {
     match family {
-        Family::Council => MkError::Status {
-            status: status.as_u16(),
-            error: serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error),
-            retry_after,
-            body: excerpt(bytes),
-        },
+        Family::Council => {
+            let error = serde_json::from_slice::<ErrorBody>(bytes).ok().map(|b| b.error);
+            match error {
+                Some(e) if status.as_u16() == 413 && e.r#type == ErrorType::ContextFull => {
+                    MkError::ContextFull { message: e.message, body: excerpt(bytes) }
+                }
+                error => MkError::Status { status: status.as_u16(), error, retry_after, body: excerpt(bytes) },
+            }
+        }
         Family::Mk => MkError::Service {
             status: status.as_u16(),
             error: serde_json::from_slice::<ServiceErrorBody>(bytes).ok().map(|b| b.error),

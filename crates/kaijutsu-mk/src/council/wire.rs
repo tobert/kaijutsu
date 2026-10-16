@@ -551,6 +551,10 @@ pub struct Read {
     pub answers: IndexMap<QuestionId, ReadAnswer>,
     /// sha256 of the rendered text this read was conditioned on.
     pub rendered_sha256: String,
+    /// Council v2, with `think` above 0 tokens: what the model thought
+    /// before it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -635,6 +639,17 @@ pub enum Capability {
     Persist,
     Describe,
     LeaveOneOut,
+    /// Council v2: `POST /council/v2/reads`.
+    Reads,
+    /// Council v2: `POST /council/v2/generations`.
+    Generate,
+    /// Council v2: decisions accept `think` with `tokens` above 0.
+    Think,
+    /// Council v2: `PUT` accepts `fork`.
+    Fork,
+    /// Council v2: snapshots report `tier`, and pinned snapshots move
+    /// between tiers.
+    Tiers,
     /// A capability this client does not know. A server may add capabilities;
     /// a client built before one keeps working and never uses it.
     #[serde(other)]
@@ -691,6 +706,8 @@ pub enum ErrorType {
     Timeout,
     PinBudget,
     Internal,
+    /// Council v2: a generation's prompt leaves no room for a reply.
+    ContextFull,
 }
 
 /// The inside of an error body.

@@ -602,8 +602,9 @@ pub(crate) fn failure_cause(error: &MkError, deadline_ms: u64) -> String {
         MkError::SpecIdMismatch { computed, server } => {
             format!("the server holds the spec as {server}, not {computed}")
         }
-        // Only `/mk/v1` routes produce these; a council call never does.
-        other @ (MkError::Service { .. } | MkError::Stream(_) | MkError::Truncated(_)) => {
+        // Only `/mk/v1` routes and generations produce these; a decision
+        // never does.
+        other @ (MkError::Service { .. } | MkError::Stream(_) | MkError::Truncated(_) | MkError::ContextFull { .. }) => {
             format!("the megakernel failed outside the council contract: {other}")
         }
     }

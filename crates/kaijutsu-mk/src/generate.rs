@@ -190,13 +190,13 @@ pub struct ToolCallIn {
 }
 
 /// A tool the model may call.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Tool {
     Function { function: Function },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,7 +216,7 @@ pub enum ReasoningEffort {
 }
 
 /// Sampling settings. `temperature: 0` is greedy and reproducible.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -397,7 +397,19 @@ impl MkClient {
     pub async fn generate_stream(&self, request: &GenerateRequest, idle: Duration) -> Result<GenerateStream, MkError> {
         request.validate()?;
         let body = to_body(&Wire { request, stream: true })?;
-        let send = self.send(Family::Mk, Method::POST, "/mk/v1/generate", Some(body), &[], None);
+        self.open_stream(Family::Mk, "/mk/v1/generate", body, idle).await
+    }
+
+    /// Sends `body` to `path` and returns its server-sent events. `idle`
+    /// bounds the wait for the response and then each read.
+    pub(crate) async fn open_stream<T: StreamItem>(
+        &self,
+        family: Family,
+        path: &str,
+        body: Vec<u8>,
+        idle: Duration,
+    ) -> Result<EventStream<T>, MkError> {
+        let send = self.send(family, Method::POST, path, Some(body), &[], None);
         let resp = tokio::time::timeout(idle, send).await.map_err(|_| MkError::Timeout)??;
         if resp.status() != reqwest::StatusCode::OK {
             return Err(MkError::Decode {
@@ -419,29 +431,61 @@ impl MkClient {
                 body: String::new(),
             });
         }
-        Ok(GenerateStream { resp, idle, decoder: SseDecoder::default(), frames: VecDeque::new(), ended: false })
+        Ok(EventStream {
+            resp,
+            idle,
+            decoder: SseDecoder::default(),
+            frames: VecDeque::new(),
+            ended: false,
+            item: std::marker::PhantomData,
+        })
     }
 }
 
-/// A streamed reply. [`next`](Self::next) yields tokens, then `Done`, then
-/// `None`. An error is yielded once, and then the stream is over.
-pub struct GenerateStream {
+/// One decoded event of a reply stream.
+pub trait StreamItem: Sized {
+    /// Decodes one server-sent event. An `error` event is an error.
+    fn decode(frame: &Frame) -> Result<Self, MkError>;
+    /// Whether this event ends the stream.
+    fn is_last(&self) -> bool;
+}
+
+impl StreamItem for GenerateEvent {
+    fn decode(frame: &Frame) -> Result<Self, MkError> {
+        decode_frame(frame)
+    }
+
+    fn is_last(&self) -> bool {
+        matches!(self, GenerateEvent::Done(_))
+    }
+}
+
+/// A `/mk/v1/generate` stream.
+pub type GenerateStream = EventStream<GenerateEvent>;
+
+/// A streamed reply. [`next`](Self::next) yields tokens, then the last
+/// event, then `None`. An error is yielded once, and then the stream is over.
+pub struct EventStream<T> {
     resp: reqwest::Response,
     idle: Duration,
     decoder: SseDecoder,
     frames: VecDeque<Frame>,
     ended: bool,
+    item: std::marker::PhantomData<T>,
 }
 
-impl GenerateStream {
-    pub async fn next(&mut self) -> Option<Result<GenerateEvent, MkError>> {
+impl<T: StreamItem> EventStream<T> {
+    pub async fn next(&mut self) -> Option<Result<T, MkError>> {
         loop {
             if self.ended {
                 return None;
             }
             if let Some(frame) = self.frames.pop_front() {
-                let event = decode_frame(&frame);
-                self.ended = !matches!(event, Ok(GenerateEvent::Token(_)));
+                let event = T::decode(&frame);
+                self.ended = match &event {
+                    Ok(e) => e.is_last(),
+                    Err(_) => true,
+                };
                 return Some(event);
             }
             let chunk = match tokio::time::timeout(self.idle, self.resp.chunk()).await {
@@ -487,9 +531,11 @@ fn decode_frame(frame: &Frame) -> Result<GenerateEvent, MkError> {
 
 /// One server-sent event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Frame {
-    pub(crate) event: String,
-    pub(crate) data: String,
+pub struct Frame {
+    /// The `event` field; `message` when the event named none.
+    pub event: String,
+    /// The `data` lines, joined with newlines.
+    pub data: String,
 }
 
 /// Server-sent events from any chunking of the byte stream: LF, CRLF, or lone
