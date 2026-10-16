@@ -54,7 +54,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
-use super::sync::{PrepareMiss, Prepared, no_slot_cause};
+use super::sync::{PrepareMiss, Prepared, Wire, no_slot_cause};
 use crate::llm::endpoint::SlotWaits;
 use super::reviewer_contexts::{SkippedReviewerContext, ReviewerContextChain};
 use crate::kj::gate::GateSpec;
@@ -716,9 +716,16 @@ pub(crate) async fn ask_within(
         provider = "council", server = %council.server, contexts = prepared.contexts.len(),
         "llm request"
     );
-    let decide = || {
+    // Council v2 takes the v1 request with no `think`: the thought before
+    // the answer stays closed, as v1 always had it.
+    let v2_request = (prepared.wire == Wire::V2)
+        .then(|| kaijutsu_mk::council_v2::wire::DecisionRequest { decision: request.clone(), think: None });
+    let decide = || async {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        prepared.client.decide_traced(request, left, traceparent.as_deref())
+        match &v2_request {
+            Some(v2) => prepared.client.v2().decide_traced(v2, left, traceparent.as_deref()).await,
+            None => prepared.client.decide_traced(request, left, traceparent.as_deref()).await,
+        }
     };
     let answer = tokio::time::timeout_at(deadline, crate::llm::endpoint::mk_call(&prepared.endpoint, deadline, waits, decide)).await;
     match answer {
@@ -2276,6 +2283,7 @@ mod tests {
         Prepared {
             client: kaijutsu_mk::MkClient::new("http://127.0.0.1:1", Duration::from_millis(5)).unwrap(),
             endpoint: crate::llm::endpoint::Endpoints::default().get("http://127.0.0.1:1"),
+            wire: super::super::sync::Wire::V1,
             identity,
             spec_id: kaijutsu_mk::council::canon::spec_id(&spec).unwrap(),
             spec,

@@ -396,8 +396,16 @@ fn record_error(shared: &Shared, message: &str) {
 fn serve_one(mut sock: TcpStream, shared: &Shared) {
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
     let request = read_request(&mut sock);
-    let (status, body) = match request.and_then(|(method, path, body)| route(&method, &path, &body, shared)) {
-        Ok(body) => (200, body.to_string()),
+    let (status, body) = match request.and_then(|(method, path, body)| {
+        // The scripted council speaks council v1. A client asks for v2
+        // first and takes a 404 as v1, so it is not an error.
+        if path.starts_with("/council/v2/") {
+            return Ok(None);
+        }
+        route(&method, &path, &body, shared).map(Some)
+    }) {
+        Ok(Some(body)) => (200, body.to_string()),
+        Ok(None) => (404, json!({"error": {"type": "not_found", "message": "the scripted council speaks council v1"}}).to_string()),
         Err(error) => {
             let status = error.downcast_ref::<TooLarge>().map_or(500, |t| t.0);
             let message = format!("{error:#}");
@@ -626,6 +634,8 @@ mod tests {
             (0..3).map(|_| pooled_choice(&call("POST", "/council/v1/decisions", &decision).1, "verdict")).collect();
         assert_eq!(verdicts, ["proceed", "try_harder", "try_harder"], "a restart answers from its first verdict");
         assert!(council.errors().is_empty(), "{:?}", council.errors());
+        assert_eq!(call("GET", "/council/v2/identity", "").0, 404, "a v1 server, which a client probes for v2");
+        assert!(council.errors().is_empty(), "the v2 probe is not an error: {:?}", council.errors());
         let (status, _) = call("POST", "/council/v1/nowhere", "");
         assert_eq!(status, 500);
         assert_eq!(council.errors().len(), 1, "an unserved request is recorded");

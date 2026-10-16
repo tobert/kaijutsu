@@ -246,6 +246,8 @@ async fn serve() -> Mock {
                         }
                         reply
                     }
+                    // A council v1 server has no v2 routes.
+                    (_, p) if p.starts_with("/council/v2/") => Reply { status: 404, body: "{}".into(), delay: Duration::ZERO },
                     _ => Reply { status: 500, body: "unexpected".into(), delay: Duration::ZERO },
                 };
                 tokio::time::sleep(reply.delay).await;

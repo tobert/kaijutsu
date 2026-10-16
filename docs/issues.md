@@ -117,6 +117,35 @@ kaish also refused `cp -p` ("cp: -p is not supported (see `help cp`)"), so a
 DeepSeek run's whole backup line did not run and its next call destroyed the
 WAL. Accept `-p`, or have the refusal name the fix.
 
+## Council v2 client: what is open (2026-10-16)
+
+The mk provider and the council speak `docs/council-api-v2.md` when a
+server answers `GET /council/v2/identity`; no server does yet, so nothing
+here has run against one.
+
+- **Seats as agent loops.** Council contexts are still v1 projections
+  converted to messages (`ContextPut::from_v1`). Making each seat an agent
+  loop needs: a `queue` tool definition per spec (its `answers` schema is
+  the server's), a projection that ends each context with an assistant call
+  to that tool and replays past cases as call and result pairs, the
+  `thinking` setting per seat, and a decision path that does not send the
+  case as a user turn. Measure against the bench first.
+- **Held chats are remembered in memory** (`llm/mk/held.rs`). After a
+  restart every context's first turn is a whole `PUT`, and a fork whose
+  parent was held only before the restart starts without `fork`. A
+  `kernel.db` table keyed by context and server identity (head, snapshots
+  by message index, a hash of the messages) would keep them.
+- **The context window on v2.** `context_window` still reads
+  `/mk/v1/model`, and a model row's `context_window` smaller than the
+  server's `context_tokens` is not enforced on the v2 path: there is no
+  render to count the prompt, so the server's `context_full` is the check.
+- **Questions for the spec.** Snapshot ids keep v1's `snap:` form; a
+  generation's calls carry server ids; `done` reports `head` and
+  `snapshots`; tokens and stream errors are `/mk/v1`'s; the `reads` reply
+  shape; whether a generation's `messages` may be empty or a `PUT` may hold
+  no messages; whether a generation can mark its reply `snap`; and
+  `reasoning_effort`, which v2 does not carry.
+
 ## Council gate: what 43c4a61c left open (2026-10-04)
 
 - **The observation shares the sync lock with the next decision.** A slow
