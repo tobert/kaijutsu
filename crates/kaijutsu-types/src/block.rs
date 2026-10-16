@@ -473,6 +473,8 @@ pub enum ErrorCategory {
     Validation,
     /// Internal kernel error (block-store corruption, panic recovery).
     Kernel,
+    /// The context does not fit the model's window.
+    Context,
 }
 
 impl ErrorCategory {
@@ -485,6 +487,7 @@ impl ErrorCategory {
             ErrorCategory::Parse => "parse",
             ErrorCategory::Validation => "validation",
             ErrorCategory::Kernel => "kernel",
+            ErrorCategory::Context => "context",
         }
     }
 }

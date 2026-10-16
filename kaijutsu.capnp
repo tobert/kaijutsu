@@ -359,6 +359,7 @@ enum ErrorCategory {
   parse @4;
   validation @5;
   kernel @6;
+  context @7;
 }
 
 # Why a VFS operation refused, carried as a RESULT rather than thrown

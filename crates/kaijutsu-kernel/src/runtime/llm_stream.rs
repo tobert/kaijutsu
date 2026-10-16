@@ -810,6 +810,8 @@ fn retry_disposition(error: &LlmError) -> RetryDisposition {
         LlmError::ApiError(_) => RetryDisposition::Transient,
         LlmError::NetworkError(_) => RetryDisposition::Transient,
         LlmError::CompletionError(_) => RetryDisposition::Transient,
+        // The same history fills the same window on every attempt.
+        LlmError::ContextFull(_) => RetryDisposition::Permanent,
     }
 }
 
@@ -2622,10 +2624,11 @@ async fn run_llm_stream(
                             attempt,
                             e
                         );
+                        let (category, code) = e.category_and_code();
                         let payload = kaijutsu_types::ErrorPayload {
-                            category: kaijutsu_types::ErrorCategory::Stream,
+                            category,
                             severity: kaijutsu_types::ErrorSeverity::Error,
-                            code: None,
+                            code: code.map(str::to_string),
                             detail: Some(format!(
                                 "Failed after {} attempts: {}",
                                 attempt, e

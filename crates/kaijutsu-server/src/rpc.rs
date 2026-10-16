@@ -8381,6 +8381,7 @@ fn error_category_to_capnp(
             crate::kaijutsu_capnp::ErrorCategory::Validation
         }
         kaijutsu_types::ErrorCategory::Kernel => crate::kaijutsu_capnp::ErrorCategory::Kernel,
+        kaijutsu_types::ErrorCategory::Context => crate::kaijutsu_capnp::ErrorCategory::Context,
     }
 }
 

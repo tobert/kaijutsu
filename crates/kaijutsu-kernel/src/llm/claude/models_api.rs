@@ -183,6 +183,7 @@ pub mod test_support {
             LlmError::InvalidRequest(s) => LlmError::InvalidRequest(s.clone()),
             LlmError::Unavailable(s) => LlmError::Unavailable(s.clone()),
             LlmError::CompletionError(s) => LlmError::CompletionError(s.clone()),
+            LlmError::ContextFull(s) => LlmError::ContextFull(s.clone()),
         }
     }
 }

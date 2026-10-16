@@ -4287,6 +4287,7 @@ pub(crate) fn parse_block_snapshot(
             crate::kaijutsu_capnp::ErrorCategory::Parse => ErrorCategory::Parse,
             crate::kaijutsu_capnp::ErrorCategory::Validation => ErrorCategory::Validation,
             crate::kaijutsu_capnp::ErrorCategory::Kernel => ErrorCategory::Kernel,
+            crate::kaijutsu_capnp::ErrorCategory::Context => ErrorCategory::Context,
         };
         let severity = match ep.get_severity()? {
             crate::kaijutsu_capnp::ErrorSeverity::Warning => ErrorSeverity::Warning,

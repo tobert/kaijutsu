@@ -220,6 +220,18 @@ impl Client {
         admit(&self.name, u64::from(rendered.n_tokens), window, asked)
     }
 
+    /// The window a turn on `model` gets ([`Self::window`]), or `None` when
+    /// the service cannot be read or the model row does not fit it.
+    pub async fn context_window(&self, model: &str) -> Option<u64> {
+        match self.window(&self.turn(), model).await {
+            Ok(window) => Some(window),
+            Err(e) => {
+                tracing::warn!(backend = %self.name, error = %e, "mk: the context window is unknown");
+                None
+            }
+        }
+    }
+
     /// The window for `model`: the service's `max_context`, or the model
     /// row's `context_window` when that is smaller. A row larger than the
     /// service is a configuration error.
@@ -249,9 +261,9 @@ impl Client {
 fn admit(name: &str, prompt: u64, window: u64, asked: u64) -> LlmResult<u32> {
     let room = window.saturating_sub(prompt);
     if room == 0 {
-        return Err(LlmError::InvalidRequest(format!(
+        return Err(LlmError::ContextFull(format!(
             "mk backend '{name}': the prompt takes {prompt} of the {window}-token window and leaves no room \
-             for a reply; fork with fewer blocks or exclude some (`kj stage exclude`)"
+             for a reply; exclude blocks with `kj stage exclude`, then fork"
         )));
     }
     if asked == 0 {
@@ -419,8 +431,8 @@ mod tests {
         assert_eq!(admit("b", 1000, 32768, 4096).unwrap(), 4096);
         assert_eq!(admit("b", 30000, 32768, 4096).unwrap(), 2768);
         assert_eq!(admit("b", 0, 65536, 40000).unwrap(), MAX_TOKENS_LIMIT);
-        assert!(matches!(admit("b", 32768, 32768, 10), Err(LlmError::InvalidRequest(m)) if m.contains("leaves no room")));
-        assert!(matches!(admit("b", 40000, 32768, 10), Err(LlmError::InvalidRequest(_))));
+        assert!(matches!(admit("b", 32768, 32768, 10), Err(LlmError::ContextFull(m)) if m.contains("leaves no room")));
+        assert!(matches!(admit("b", 40000, 32768, 10), Err(LlmError::ContextFull(_))));
         assert!(matches!(admit("b", 10, 32768, 0), Err(LlmError::InvalidRequest(_))));
     }
 
@@ -457,7 +469,7 @@ mod tests {
         let mut stream = c.stream(opts(4096), vec![Message::user("hi")]).await.unwrap();
         drain(&mut stream).await;
         let err = c.stream(opts(4096), vec![Message::user("hi")]).await.err().unwrap();
-        assert!(matches!(&err, LlmError::InvalidRequest(m) if m.contains("leaves no room")), "{err:?}");
+        assert!(matches!(&err, LlmError::ContextFull(m) if m.contains("leaves no room")), "{err:?}");
         let seen = seen.lock().unwrap();
         let generate: serde_json::Value = serde_json::from_str(&seen[2].body).unwrap();
         assert_eq!(generate["max_tokens"], json!(192));

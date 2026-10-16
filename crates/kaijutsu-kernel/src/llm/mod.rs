@@ -506,20 +506,36 @@ pub enum LlmError {
     /// Provider-side completion error not covered by the variants above.
     #[error("completion error: {0}")]
     CompletionError(String),
+
+    /// The prompt fills the model's context window and leaves no room for a
+    /// reply. The same history fails the same way until it gets smaller.
+    #[error("{0}")]
+    ContextFull(String),
+}
+
+impl LlmError {
+    /// The category and code an error block carries for this error.
+    pub fn category_and_code(&self) -> (kaijutsu_types::ErrorCategory, Option<&'static str>) {
+        match self {
+            LlmError::ContextFull(_) => (kaijutsu_types::ErrorCategory::Context, Some("full")),
+            _ => (kaijutsu_types::ErrorCategory::Stream, None),
+        }
+    }
 }
 
 impl kaijutsu_types::IntoErrorPayload for LlmError {
     fn into_error_payload(self) -> kaijutsu_types::ErrorPayload {
-        use kaijutsu_types::{ErrorCategory, ErrorPayload, ErrorSeverity};
+        use kaijutsu_types::{ErrorPayload, ErrorSeverity};
         let severity = match &self {
             LlmError::Unavailable(_) => ErrorSeverity::Fatal,
             LlmError::RateLimited(_) => ErrorSeverity::Warning,
             _ => ErrorSeverity::Error,
         };
+        let (category, code) = self.category_and_code();
         ErrorPayload {
-            category: ErrorCategory::Stream,
+            category,
             severity,
-            code: None,
+            code: code.map(str::to_string),
             detail: Some(self.to_string()),
             span: None,
             source_kind: None,
@@ -1416,13 +1432,12 @@ impl LlmRegistry {
     /// Precedence: the config-declared `context_window` (backend_models) is
     /// checked FIRST and, when present, returned immediately — config is
     /// always the override, and no network is attempted if it hits. Only
-    /// when config has no entry AND the resolved provider is Anthropic does
-    /// this fall through to the provider's live `GET /v1/models/{id}`
-    /// lookup (see `claude::Client::context_window`, which caches the
-    /// result for the process lifetime). Every other provider — including
-    /// an unregistered one — falls through to `None`, exactly as
-    /// [`Self::context_window_for`] already did; non-Anthropic providers
-    /// keep the config-only path (this is additive, not a replacement).
+    /// when config has no entry does this ask the provider: Anthropic's live
+    /// `GET /v1/models/{id}` (see `claude::Client::context_window`, which
+    /// caches the result for the process lifetime), or an mk service's
+    /// `max_context` (see `mk::Client::context_window`). Every other
+    /// provider — including an unregistered one — falls through to `None`,
+    /// exactly as [`Self::context_window_for`] already did.
     ///
     /// Never fabricates: a live-lookup failure degrades to `None` (logged
     /// by the client at `warn`), never a guessed number. Callers must keep
@@ -1433,6 +1448,7 @@ impl LlmRegistry {
         }
         match self.get(provider_name).as_deref() {
             Some(Provider::Claude(client)) => client.context_window(model).await,
+            Some(Provider::Mk(client)) => client.context_window(model).await,
             _ => None,
         }
     }
@@ -2138,6 +2154,20 @@ mod tests {
         );
     }
 
+    /// A full context makes a `context` error block with code `full`, not a
+    /// stream error, so it can be told apart from a network fault.
+    ///
+    /// Falsified by a payload that files it under `stream`.
+    #[test]
+    fn a_full_context_is_a_context_error() {
+        use kaijutsu_types::IntoErrorPayload;
+        let e = LlmError::ContextFull("the prompt takes 17760 of the 16384-token window".into());
+        assert_eq!(e.category_and_code(), (kaijutsu_types::ErrorCategory::Context, Some("full")));
+        let p = e.into_error_payload();
+        assert_eq!(p.summary_line(), "context error (full): the prompt takes 17760 of the 16384-token window");
+        assert_eq!(LlmError::NetworkError("x".into()).category_and_code(), (kaijutsu_types::ErrorCategory::Stream, None));
+    }
+
     #[test]
     fn context_window_for_unknown_provider_is_none() {
         let registry = LlmRegistry::new(); // no backends set at all
@@ -2159,6 +2189,20 @@ mod tests {
             let client = claude::Client::new("fake-key").with_capability_source(Arc::new(fake));
             registry.register("anthropic", Arc::new(Provider::Claude(client)));
             registry
+        }
+
+        /// An mk backend's window is the service's `max_context`, read live,
+        /// so the context-window warning has a number for it.
+        ///
+        /// Falsified by a registry that answers `None` for an mk provider.
+        #[tokio::test]
+        async fn an_mk_backend_reports_the_service_window() {
+            let model = include_str!("../../../kaijutsu-mk/tests/fixtures/mk_model.json");
+            let (base, _) = kaijutsu_mk::test_server::serve(vec![kaijutsu_mk::test_server::reply(200, model)]).await;
+            let client = mk::Client::new("zorak-mk", &base, std::time::Duration::from_secs(5), HashMap::new()).unwrap();
+            let mut registry = LlmRegistry::new();
+            registry.register("zorak-mk", Arc::new(Provider::Mk(client)));
+            assert_eq!(registry.context_window_for_live("zorak-mk", "qwen").await, Some(32768));
         }
 
         #[tokio::test]
