@@ -99,7 +99,7 @@ PUT /council/v2/contexts/0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12
   template then drops that turn's thinking. The end of a user message is
   always a boundary, and so is the end of a run of tool results until the
   next user message.
-- **Every call carries an `id`** of letters, digits, and `-_.:`, and a
+- **Every call carries an `id`**, printable text the server never renders, and a
   `tool` message names the call it answers in `tool_call_id`, a call of the
   assistant message before its run of tool messages.
 - **The head is held** after every `PUT`, marked or not, so a decision or
