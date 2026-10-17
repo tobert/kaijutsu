@@ -107,10 +107,10 @@ impl Message {
 
 /// Refuses messages the draft refuses: `reasoning` or `tool_calls` off an
 /// assistant message, a `tool` message without `tool_call_id` or another
-/// message with one, a call with an empty id or name or arguments that are
-/// not an object, and a `system` message anywhere but first. `system_first`
-/// is false for messages a generation appends, which may hold none.
-pub fn validate_messages(messages: &[Message], system_first: bool) -> Result<(), InvalidRequest> {
+/// message with one, and a call with an empty id or name or arguments that
+/// are not an object. A `system` message may come anywhere: after the first
+/// message it is system text at that point in the conversation.
+pub fn validate_messages(messages: &[Message]) -> Result<(), InvalidRequest> {
     let bad = |i: usize, m: &str| Err(InvalidRequest(format!("message {i}: {m}")));
     for (i, m) in messages.iter().enumerate() {
         if m.role != Role::Assistant && m.reasoning.is_some() {
@@ -125,9 +125,6 @@ pub fn validate_messages(messages: &[Message], system_first: bool) -> Result<(),
             (Role::Tool, Some(_)) => {}
             (_, Some(_)) => return bad(i, "only a tool message carries tool_call_id"),
             (_, None) => {}
-        }
-        if m.role == Role::System && !(system_first && i == 0) {
-            return bad(i, "a system message comes first, once");
         }
         for call in &m.tool_calls {
             if call.id.is_empty() || call.name.is_empty() {
@@ -212,7 +209,7 @@ impl ContextPut {
     /// Checks the rules a client can check: the messages
     /// ([`validate_messages`]), and a `queue` that names one of `tools`.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
-        validate_messages(&self.messages, true)?;
+        validate_messages(&self.messages)?;
         crate::generate::validate_tools(&self.tools).map_err(|e| InvalidRequest(e.to_string()))?;
         if let Some(queue) = &self.queue
             && !self.tools.iter().any(|Tool::Function { function }| function.name == *queue)
@@ -401,10 +398,10 @@ pub struct GenerationRequest {
 }
 
 impl GenerationRequest {
-    /// Checks the appended messages ([`validate_messages`], no system
-    /// message) and a positive `max_tokens`.
+    /// Checks the appended messages ([`validate_messages`]) and a positive
+    /// `max_tokens`.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
-        validate_messages(&self.messages, false)?;
+        validate_messages(&self.messages)?;
         if self.max_tokens == Some(0) {
             return Err(InvalidRequest("max_tokens must be at least 1".into()));
         }
@@ -586,17 +583,29 @@ mod tests {
             ("calls on user", vec![Message { tool_calls: vec![call("a", obj())], ..Message::user("u") }]),
             ("tool without id", vec![Message { tool_call_id: None, ..Message::tool("a", "r") }]),
             ("id on user", vec![Message { tool_call_id: Some("a".into()), ..Message::user("u") }]),
-            ("late system", vec![Message::user("u"), Message::system("s")]),
             ("empty call id", vec![Message { tool_calls: vec![call("", obj())], ..Message::assistant("") }]),
             ("string arguments", vec![Message { tool_calls: vec![call("a", Json::from("x"))], ..Message::assistant("") }]),
         ];
         for (name, messages) in cases {
-            assert!(validate_messages(&messages, true).is_err(), "{name}");
+            assert!(validate_messages(&messages).is_err(), "{name}");
         }
-        assert!(validate_messages(&[Message::system("s")], false).is_err(), "a generation appends no system message");
         let mut queue: ContextPut = serde_json::from_value(doc_put()).unwrap();
         queue.queue = Some("missing".into());
         assert!(queue.validate().is_err(), "queue names a tool");
+    }
+
+    /// A system message after the first is system text at that point, in a
+    /// whole context and in the messages a generation appends. It still
+    /// carries no reasoning or calls.
+    #[test]
+    fn a_later_system_message_is_accepted() {
+        let nudge = "You replied without a tool call, so the task is still open.";
+        let context = [Message::system("s"), Message::user("u"), Message::assistant("a"), Message::system(nudge)];
+        validate_messages(&context).unwrap();
+        validate_messages(&[Message::system(nudge)]).unwrap();
+        let generation = GenerationRequest { context: CTX.into(), messages: vec![Message::system(nudge)], max_tokens: None, sample: None };
+        generation.validate().unwrap();
+        assert!(validate_messages(&[Message { reasoning: Some("r".into()), ..Message::system(nudge) }]).is_err());
     }
 
     #[test]

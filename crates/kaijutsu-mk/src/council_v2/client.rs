@@ -253,8 +253,9 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_body_or_id_is_refused_before_it_is_sent() {
         let (base, seen) = serve(vec![]).await;
-        let late_system = ContextPut { messages: vec![Message::user("u"), Message::system("s")], ..ContextPut::default() };
-        assert!(matches!(client(&base).v2().put_context(CTX, &late_system, None).await, Err(MkError::Request(_))));
+        let user_reasoning = Message { reasoning: Some("r".into()), ..Message::user("u") };
+        let bad = ContextPut { messages: vec![user_reasoning], ..ContextPut::default() };
+        assert!(matches!(client(&base).v2().put_context(CTX, &bad, None).await, Err(MkError::Request(_))));
         assert!(matches!(client(&base).v2().get_context("../x").await, Err(MkError::Request(_))));
         let empty = GenerationRequest { max_tokens: Some(0), ..generation() };
         assert!(matches!(client(&base).v2().generate(&empty, Duration::from_secs(1)).await, Err(MkError::Request(_))));

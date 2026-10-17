@@ -83,6 +83,13 @@ PUT /council/v2/contexts/0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12
   `reasoning` (its thinking), and `tool_calls`; a `tool` message names the
   `tool_call_id` it answers. The server renders them with its model's own
   template, so a client never writes template tokens.
+- **A system message may come later.** The first message is usually
+  `system`. A later `system` message, in a context or in the messages a
+  generation appends, is system text at that point in the conversation,
+  such as an instruction from the client's runtime. It is not a user
+  message, so it does not end an agent turn: in Gemma 4 it renders as its
+  own system turn and the turn's thinking before it stays. Like a user
+  message, it carries no `reasoning` or `tool_calls`.
 - **The server renders thinking where the model was trained to see it.**
   For a model whose template drops earlier thinking, such as Gemma 4 and
   Qwen 3, `reasoning` before the last user message is not rendered; inside
