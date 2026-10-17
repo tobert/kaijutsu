@@ -283,9 +283,10 @@ and `persist` do not apply.
   server its cast names; each observing reviewer context under
   `direction-check`; and, with an `mk` judge in its cast, the judge read's
   contexts and house rules on the judge's server. The create and fork
-  lifecycles of coder, default, director, and mcp, and root's create, run
-  it (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
-  builds nothing. A seat with no performer or an unresolved chain builds
+  lifecycles of coder, default, and director run it
+  (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
+  builds nothing. Root, the owner's privileged space, and mcp, the
+  debugging and admin seat, are not put under a council and do not run it. A seat with no performer or an unresolved chain builds
   without the chain, and its first decision builds the rest. What changes
   later, such as an edited `AGENTS.md`, a new reviewer, or a `cd`, is
   built by the next decision. The shadow itself is sent after each call,
