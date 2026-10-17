@@ -3467,3 +3467,19 @@ one delivery point everything from the kernel goes in one
 `get_system_messages` call, in log order, never two calls in a row. Each
 entry names its sender (`"from":"kaijutsu"` or `"from":"context <id>"`), and
 the call id names its first block so held prefixes keep matching.
+
+## The server that kept no records (October 17)
+
+Council v2's first draft held each chat and council seat under a context id,
+with `PUT`, `If-Match`, forks at a snapshot, and "send it whole again" after a
+404. The kernel mirrored that with an in-memory record per context, and every
+way the record and the server could disagree needed its own recovery. The
+draft now keeps no context records: every request carries its context whole,
+and the server starts from the longest snapshot it holds, named by its tokens
+and boundaries. Sharing a prefix is the fork. The mk provider sends the whole
+conversation every turn and keeps nothing; the council builds each seat with
+`POST /council/v2/contexts`, sends it whole in every decision, and pins the
+heads under `kernel-<kernel id>`, renewed every 20 minutes. On mkviolet a
+ten-inference tool loop fed 308 of its 5,912 prompt tokens, so sending
+everything costs rendering, not prefill. See `docs/mk.md`, "Council v2" and
+`docs/council.md`, "Council v2 seats".

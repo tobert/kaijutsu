@@ -243,6 +243,34 @@ Until a liveness event exists, an `mk` backend sets a longer idle timeout
 carrying the token count, or the tool-phase text as it arrives) is open; it
 must not invent a `ToolUse` before `done`.
 
+### Council v2
+
+When the service answers `GET /council/v2/identity` and lists `generate`,
+every streamed turn is one `POST /council/v2/generations`
+(`docs/council-api-v2.md`, "Generations") instead of render and
+`/mk/v1/generate`. The client asks for the identity once; a 404 or an
+identity without `generate` keeps the `/mk/v1` path above.
+
+- **The whole conversation goes with every turn.** The context is the
+  system prompt, the history as v2 messages (`llm/mk/build.rs`,
+  `messages_v2`), the tools, and `thinking`. `snap` marks the system
+  message, the end of each user turn, and the last of each run of tool
+  results. The server keeps no record of the chat; it starts from the
+  longest snapshot it holds along the messages, so a turn that extends the
+  last feeds only its new messages.
+- **Nothing is held by the client.** There is no context id, no `PUT`, and
+  no fork request. A fork, an exclude, or an edit sends the messages as they
+  now stand, and the server reuses the prefix they share with what it holds.
+  A restart costs feeding, never a wrong answer.
+- **Calls keep the server's ids.** The reply's calls carry the `id` the
+  server gave them, and the next turn's results name it.
+- **A full context is a `413` `context_full`**, which the provider reports
+  as `LlmError::ContextFull`, the same as a render with no room. The kernel
+  sends a shorter conversation after `kj stage exclude` and a fork.
+- `max_tokens` is capped at the server's `context_tokens`; the server checks
+  the room. `reasoning_effort` does not apply, and `prompt()` stays on
+  `/mk/v1/generate`.
+
 ### Window and admission
 
 - The window is the service's `max_context` from `GET /mk/v1/model`, read

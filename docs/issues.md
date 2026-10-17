@@ -120,8 +120,9 @@ WAL. Accept `-p`, or have the refusal name the fix.
 ## Council v2 client: what is open (2026-10-16)
 
 The mk provider and the council speak `docs/council-api-v2.md` when a
-server answers `GET /council/v2/identity`. mkviolet serves it; the queue
-seats were checked against it by hand, and no test runs against it.
+server answers `GET /council/v2/identity`. mkviolet serves it. The live
+checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
+(`COUNCIL_URL`) and the mk probes and `live_mk_tool_loop` (`MK_URL`).
 
 - **Queue seats.** Each council context is held as a queue seat per spec
   (`council/seat.rs`), with worked examples for the shipped specs only.
@@ -131,20 +132,24 @@ seats were checked against it by hand, and no test runs against it.
   cases, against 36 without); `thinking` is the server's default; a custom
   spec gets no examples; and the seat's size against
   `decision_context_tokens` is checked only by the server's `413`.
-- **Held chats are remembered in memory** (`llm/mk/held.rs`). After a
-  restart every context's first turn is a whole `PUT`, and a fork whose
-  parent was held only before the restart starts without `fork`. A
-  `kernel.db` table keyed by context and server identity (head, snapshots
-  by message index, a hash of the messages) would keep them.
+- **Pinned house rules accumulate.** A house-rules seat is keyed by its
+  body, so an edited `AGENTS.md` adds a seat, and the old one stays in the
+  kernel's pin set until the kernel restarts. Judge shadows and seats whose
+  council context changed are replaced in place.
+- **Thinking markers in a thinking-off answer.** On mkviolet, a
+  `thinking: false` generation after a tool result answered with
+  `<|channel>thought\n<channel|>` at the start of `content`
+  (`live_mk_tool_loop`, 2026-10-17). `done.content` carried it, so the
+  server did not read it as thinking, and the provider passes it through.
+  The cause is unknown; a plain thinking-off turn answers cleanly.
 - **The context window on v2.** `context_window` still reads
   `/mk/v1/model`, and a model row's `context_window` smaller than the
   server's `context_tokens` is not enforced on the v2 path: there is no
   render to count the prompt, so the server's `context_full` is the check.
-- **Questions for the spec.** Snapshot ids keep v1's `snap:` form; a
-  generation's calls carry server ids; `done` reports `head` and
-  `snapshots`; tokens and stream errors are `/mk/v1`'s; the `reads` reply
-  shape; whether a generation's `messages` may be empty or a `PUT` may hold
-  no messages; whether a generation can mark its reply `snap`; and
+- **Questions for the spec.** Snapshot ids keep v1's `snap:` form; tokens
+  and stream errors are `/mk/v1`'s; the `reads` reply shape; the shape of
+  `GET /council/v2/pins/{owner}`'s `snapshots` (mkviolet lists ids, a `PUT`
+  lists `{id, held}`); whether a generation can mark its reply `snap`; and
   `reasoning_effort`, which v2 does not carry.
 
 ## Council gate: what 43c4a61c left open (2026-10-04)

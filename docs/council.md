@@ -165,9 +165,10 @@ change: `approval_signals` holds one label and score per source
 
 ## Council contexts are kaijutsu contexts
 
-A council context is a kaijutsu context held on the council server under its
-own context id. The server keeps its snapshots; kaijutsu keeps the identity,
-the blocks, and the history. Below, "held context" means the server's copy.
+A council context is a kaijutsu context held on the council server: on v1
+under its own context id, on v2 as the snapshots of its seats ("Council v2
+seats"). The server keeps its snapshots; kaijutsu keeps the identity, the
+blocks, and the history. Below, "held context" means the server's copy.
 
 Amy: "I am thinking 3 context feeds for the adjudicator contexts: a shadow
 context that has my prompts + additional ones I put in or banto drifts in.
@@ -252,6 +253,36 @@ compacting."
 - **A context's id is resolved from its label at decision time.** A label
   that resolves to nothing is a council miss with that cause, not a gate
   refusal, so a missing context cannot stop every seat.
+
+### Council v2 seats
+
+A server that answers `GET /council/v2/identity` is spoken to in council v2
+(`docs/council-api-v2.md`). The bullets above describe v1; on v2 the
+server keeps no context records, so the context ids, `If-Match`, `warm`,
+and `persist` do not apply.
+
+- **A seat is its context value.** Each council context, read under a
+  spec, is a queue seat: the projection as messages, a task message, and
+  calls to the `next_command` queue tool whose `answers` schema is the
+  spec's (`council/seat.rs`). One context under two specs is two seats.
+- **A seat is built when it changes.** The kernel builds a seat with
+  `POST /council/v2/contexts` the first time and whenever its value
+  changes, and remembers the head the server reported.
+- **A decision sends every seat whole.** The answer names each read by its
+  index in `contexts`, which the kernel maps back to the council context.
+  A `404` from a v2 decision is the spec, which the next decision posts
+  again.
+- **Seats are built at startup.** A serving kernel builds the seats its
+  gate config names when it starts: for each council and spec,
+  `[council] contexts` and the spec's own. Reviewer contexts, house rules,
+  and judge shadows depend on the proposing seat and are built by its first
+  decision.
+- **Seats are pinned under the kernel.** When the server lists `pins`, the
+  heads of every seat the kernel built on it are pinned under the owner
+  `kernel-<kernel id>` for an hour. The whole set is sent again when it
+  changes and every 20 minutes, off the decision's path. A pin the server
+  reports `held: false` names a seat it no longer holds, and the next
+  decision builds that seat again. A server without `pins` is not pinned.
 
 ## House rules
 
