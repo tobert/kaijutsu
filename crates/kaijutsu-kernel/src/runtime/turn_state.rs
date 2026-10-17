@@ -286,6 +286,15 @@ impl ConversationSession {
         }
         mailbox
     }
+
+    /// The mailbox, when no turn holds it.
+    pub fn try_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ConversationMailbox>> {
+        let mut mailbox = self.mailbox.try_lock().ok()?;
+        if self.reset_pending.swap(false, Ordering::SeqCst) {
+            *mailbox = ConversationMailbox::new();
+        }
+        Some(mailbox)
+    }
 }
 
 /// Per-context turn ownership and cached conversations.

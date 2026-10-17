@@ -2346,6 +2346,13 @@ async fn process_llm_stream(
                     cleanup_panic = Some(panic);
                 }
             }
+            // A turn stopped before it held the conversation still leaves its
+            // notice when no other turn holds it.
+            let idle = if mailbox.is_none() { session.try_lock() } else { None };
+            if can_record_diagnostic && let Some(mailbox) = mailbox.as_deref().or(idle.as_deref()) {
+                record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event);
+            }
+            drop(idle);
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
             if let Some(panic) = wake_undelivered_input(&kernel, &documents, context_id, undelivered).await {
@@ -2363,10 +2370,62 @@ async fn process_llm_stream(
             let event = TurnFlow::Failed {
                 turn_id, context_id, principal_id: user_principal_id, error: error.into(), origin,
             };
+            if can_record_diagnostic && let Some(mailbox) = mailbox.as_deref()
+                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                    record_turn_end(&documents, context_id, &panic_anchor, mailbox, &event))).is_err() {
+                tracing::error!(%context_id, "recording the turn-end notice after a panic also panicked");
+            }
             turn_lease.finish(&event).await;
             kernel.turn_flows().publish(event);
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+/// The notice a turn that ended without a complete reply leaves for the
+/// next one, or `None` for a turn that finished. It is short, says no reply
+/// was given, and asks the model not to pick the turn up unprompted.
+fn turn_end_notice(event: &TurnFlow) -> Option<String> {
+    const TAIL: &str = "It gave no complete reply; do not resume it unless asked.";
+    match event {
+        TurnFlow::Completed { reason: TurnStopReason::Cancelled { .. }, .. } =>
+            Some(format!("(The previous turn was interrupted before it finished. {TAIL})")),
+        TurnFlow::Failed { error, .. } => {
+            let line = error.lines().next().unwrap_or_default().trim().trim_end_matches('.');
+            let reason: String = line.chars().take(200).collect();
+            let cut = if reason.len() < line.len() { "..." } else { "" };
+            Some(format!("(The previous turn failed before it finished: {reason}{cut}. {TAIL})"))
+        }
+        _ => None,
+    }
+}
+
+/// Record, as a kernel instruction, that the turn ended without a complete
+/// reply. It lands after the turn's own blocks and before the first user
+/// block after `start` that the model never read, so the next turn reads the
+/// prompt, any partial reply, this notice, then the new input. A write fault
+/// is logged: the turn already ended, and its error block still says why.
+fn record_turn_end(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    start: &kaijutsu_types::BlockId,
+    mailbox: &crate::llm::ConversationMailbox,
+    event: &TurnFlow,
+) {
+    let Some(notice) = turn_end_notice(event) else { return };
+    let anchor = documents.block_snapshots(context_id).map(|blocks| {
+        let from = blocks.iter().position(|b| b.id == *start).map_or(0, |i| i + 1);
+        let cut = blocks[from..].iter().position(|b| b.role == Role::User && !mailbox.has_seen(&b.id))
+            .map_or(blocks.len(), |i| from + i);
+        blocks[..cut].last().map(|b| b.id)
+    });
+    let written = match anchor {
+        Ok(after) => documents.insert_block_as(context_id, None, after.as_ref(), Role::System,
+            BlockKind::Notification, &notice, Status::Done, ContentType::Plain, Some(PrincipalId::system())),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = written {
+        tracing::error!(%context_id, %error, "could not record that the turn ended without a reply");
     }
 }
 
@@ -4800,7 +4859,7 @@ mod publish_tests {
                         .block_snapshots(ctx)
                         .unwrap()
                         .iter()
-                        .any(|b| b.kind == BlockKind::Notification),
+                        .any(|b| b.kind == BlockKind::Notification && b.content.contains("output limit")),
                     "no notice for an inference that never ran"
                 );
             })
@@ -8805,6 +8864,63 @@ mod lifetime_tests {
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
+    /// A turn that is interrupted or fails leaves a system notice after its
+    /// partial reply, so the next turn does not read the old prompt as
+    /// unanswered and the reply as finished.
+    #[tokio::test]
+    async fn a_turn_that_ends_without_a_reply_leaves_a_notice() {
+        for (ending, partial) in [("cancel", true), ("cancel", false), ("error", true), ("error", false)] {
+            let mut events = Vec::new();
+            if partial {
+                events.extend([StreamEvent::TextStart, StreamEvent::TextDelta("half an answer".into())]);
+            }
+            if ending == "error" {
+                events.push(StreamEvent::Error("provider fell over".into()));
+            }
+            let mock = MockClient::new("").with_scripted_stream(vec![events]);
+            let mock = if ending == "cancel" { mock.hangs_when_exhausted() } else { mock };
+            let (kernel, context, _after, call) = fixture(Some(mock)).await;
+            let mut completed = kernel.turn_flows().subscribe("turn.completed");
+            let mut failed = kernel.turn_flows().subscribe("turn.failed");
+            submit_text(&kernel, context, call.principal_id, "go").await;
+            if ending == "cancel" {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !kernel.turn_in_flight(context)
+                        || (partial && !kernel.blocks().block_snapshots(context).unwrap().iter().any(|b| b.content == "half an answer"))
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.unwrap();
+                assert!(kernel.turns().interrupt(context, true));
+                tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), failed.recv()).await.unwrap().unwrap();
+            }
+            let history = rehydrated(&kernel, context);
+            let notice = history.last().unwrap();
+            assert_eq!(notice.role, crate::llm::Role::System, "{ending} partial={partial}: {history:#?}");
+            let expected = if ending == "cancel" {
+                "(The previous turn was interrupted before it finished. It gave no complete reply; do not resume it unless asked.)"
+            } else {
+                "(The previous turn failed before it finished: LLM stream error: provider fell over. It gave no complete reply; do not resume it unless asked.)"
+            };
+            assert_eq!(notice.as_text(), Some(expected));
+            let mut before = &history[history.len() - 2];
+            if ending == "error" {
+                assert_eq!(before.role, crate::llm::Role::System, "the stream error is a kernel fact: {history:#?}");
+                assert!(before.as_text().unwrap().contains("provider fell over"));
+                before = &history[history.len() - 3];
+            }
+            if partial {
+                assert_eq!(before.role, crate::llm::Role::Assistant, "{history:#?}");
+                assert!(serde_json::to_string(before).unwrap().contains("half an answer"));
+            } else {
+                assert!(before.role != crate::llm::Role::Assistant, "{history:#?}");
+            }
+            kernel.shutdown_runtime_worker().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_note_accepted_by_a_failing_turn_gets_a_turn_of_its_own() {
         let (mock, sent) = MockClient::new("").with_scripted_stream(vec![
@@ -8827,6 +8943,9 @@ mod lifetime_tests {
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert_eq!(user_text(sent[1].last().unwrap()), Some("a note"), "{:#?}", sent[1]);
+        let notice = &sent[1][sent[1].len() - 2];
+        assert_eq!(notice.role, crate::llm::Role::System, "the failure notice precedes the note: {:#?}", sent[1]);
+        assert!(notice.as_text().unwrap().starts_with("(The previous turn failed before it finished: "), "{notice:?}");
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 
@@ -8855,6 +8974,9 @@ mod lifetime_tests {
         let sent = sent.lock().clone();
         assert_eq!(sent.len(), 2);
         assert_eq!(user_text(sent[1].last().unwrap()), Some("a note"), "{:#?}", sent[1]);
+        let notice = &sent[1][sent[1].len() - 2];
+        assert_eq!(notice.role, crate::llm::Role::System, "the interrupt notice precedes the note: {:#?}", sent[1]);
+        assert!(notice.as_text().unwrap().starts_with("(The previous turn was interrupted"), "{notice:?}");
         kernel.shutdown_runtime_worker().await.unwrap();
     }
 

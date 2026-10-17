@@ -145,6 +145,18 @@ pub(crate) fn is_kernel_instruction(block: &BlockSnapshot) -> bool {
         && block.id.principal_id == kaijutsu_types::PrincipalId::system()
 }
 
+/// A standalone Error block as a message. A model stream error the kernel
+/// recorded is a kernel fact about the turn, so it is system text; every
+/// other error stays a user message.
+fn standalone_error(block: &BlockSnapshot, envelope: String) -> Message {
+    let stream = block.error.as_ref().is_some_and(|e| e.category == kaijutsu_types::ErrorCategory::Stream);
+    if stream && block.role == BlockRole::System && block.id.principal_id == kaijutsu_types::PrincipalId::system() {
+        Message::system(envelope)
+    } else {
+        Message::user(envelope)
+    }
+}
+
 impl HydrationState {
     pub(crate) fn new() -> Self {
         Self {
@@ -426,11 +438,11 @@ impl HydrationState {
                     if !folded {
                         // Parent's tool_result already flushed or not found — standalone
                         self.flush_all();
-                        self.messages.push(Message::user(envelope));
+                        self.messages.push(standalone_error(block, envelope));
                     }
                 } else {
                     self.flush_all();
-                    self.messages.push(Message::user(envelope));
+                    self.messages.push(standalone_error(block, envelope));
                 }
             }
             (_, BlockKind::Notification) if is_kernel_instruction(block) => {

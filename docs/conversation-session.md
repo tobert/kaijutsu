@@ -180,6 +180,26 @@ earlier turn in its thought, and never read the notice as the user's words.
 The system form read it as the user's words 2/16 times and the user form
 16/16 times.
 
+## A turn that ended without a reply
+
+A turn that is interrupted or fails leaves a kernel instruction after its own
+blocks, so the next turn does not read the old prompt as unanswered or the
+partial reply as finished:
+
+```
+(The previous turn was interrupted before it finished. It gave no complete reply; do not resume it unless asked.)
+(The previous turn failed before it finished: LLM stream error: provider fell over. It gave no complete reply; do not resume it unless asked.)
+```
+
+It is a `(System, Notification)` block from the system principal, so it is
+system text in every form (`record_turn_end` in `runtime/llm_stream.rs`). It
+lands before the first user block after the prompt that the model never read,
+so input sent during the turn follows it. A partial reply keeps its text; its
+thinking has no continuity signature and is dropped. The stream error block a
+failed turn records is a kernel fact too, so it hydrates as system text
+before the notice. A turn stopped while another turn holds the conversation
+leaves no notice.
+
 ## Tool results replay as sent
 
 A model's tool result keeps three things. `content` is what people read: a
