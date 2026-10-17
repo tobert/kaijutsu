@@ -848,6 +848,82 @@ pub(crate) const DONE_TOOL: &str = "done";
 /// spin.
 const MAX_DONE_NUDGES: u32 = 2;
 
+/// How a kernel instruction reaches the model inside a turn: the notice
+/// after a text-only reply, or after an output-ceiling stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstructionForm {
+    /// A payload-less `(System, Notification)` block. It hydrates as a
+    /// system message at its point, which each provider sends as system text
+    /// or as user text (`llm::Role::System`).
+    SystemText,
+    /// A `get_system_messages` call by the model and its result, which holds
+    /// the instruction as `{"messages":[...]}`. Only a context offered the
+    /// tool uses it; others get `SystemText`.
+    SystemMessagesTool,
+}
+
+/// The form for contexts offered `done`. `builtin.turn` offers
+/// `get_system_messages` only in the `SystemMessagesTool` form, which reads
+/// best on Gemma 4 over mkviolet; see `docs/conversation-session.md`,
+/// "Kernel instructions".
+pub(crate) const INSTRUCTION_FORM: InstructionForm = InstructionForm::SystemMessagesTool;
+
+/// The tool whose result carries kernel instructions in the
+/// `SystemMessagesTool` form.
+pub(crate) const SYSTEM_MESSAGES_TOOL: &str = "get_system_messages";
+
+/// A `get_system_messages` result: compact JSON, `{"messages":[...]}`.
+pub(crate) fn system_messages_result(messages: &[&str]) -> String {
+    serde_json::json!({ "messages": messages }).to_string()
+}
+
+/// Record a kernel instruction after `last_block_id` and add it to the live
+/// request, in `form`. The durable blocks hydrate to the same messages, so
+/// the next turn reads what this one sent.
+fn instruct(
+    documents: &SharedBlockStore,
+    context_id: ContextId,
+    last_block_id: &mut kaijutsu_types::BlockId,
+    messages: &mut Vec<LlmMessage>,
+    form: InstructionForm,
+    text: &str,
+) -> crate::block_store::BlockStoreResult<()> {
+    match form {
+        InstructionForm::SystemText => {
+            *last_block_id = documents.insert_block_as(context_id, None, Some(last_block_id), Role::System,
+                BlockKind::Notification, text, Status::Done, ContentType::Plain, Some(PrincipalId::system()))?;
+            messages.push(LlmMessage::system(text));
+        }
+        InstructionForm::SystemMessagesTool => {
+            let id = format!("kj_system_{}", uuid::Uuid::new_v4().simple());
+            let input = serde_json::json!({});
+            let call = documents.insert_tool_call_as(context_id, None, Some(last_block_id), SYSTEM_MESSAGES_TOOL,
+                input.clone(), Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone()), None)?;
+            documents.set_status(context_id, &call, Status::Done)?;
+            let content = system_messages_result(&[text]);
+            *last_block_id = documents.insert_tool_result_as(context_id, &call, Some(&call), content.as_str(),
+                Status::Done, None, Some(TypesToolKind::Builtin), Some(PrincipalId::system()), Some(id.clone()))?;
+            // The call joins the reply it answers, as hydration folds a
+            // reply's text and calls into one assistant message.
+            let call = ContentBlock::ToolUse { id: id.clone(), name: SYSTEM_MESSAGES_TOOL.to_string(), input };
+            match messages.last_mut() {
+                Some(reply) if reply.role == crate::llm::Role::Assistant => {
+                    let blocks = match std::mem::replace(&mut reply.content, crate::llm::MessageContent::Blocks(Vec::new())) {
+                        crate::llm::MessageContent::Text(text) => vec![ContentBlock::Text { text }],
+                        crate::llm::MessageContent::Blocks(blocks) => blocks,
+                    };
+                    reply.content = crate::llm::MessageContent::Blocks(blocks.into_iter().chain([call]).collect());
+                }
+                _ => messages.push(LlmMessage::with_tool_uses(None, vec![call])),
+            }
+            messages.push(LlmMessage::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id, content, is_error: false,
+            }]));
+        }
+    }
+    Ok(())
+}
+
 /// The file a call writes, when it is a file tool that names one: `edit` or
 /// `write` with a `path`, made absolute against the call's cwd. Calls in one
 /// batch that write the same file run in call order.
@@ -2496,6 +2572,12 @@ async fn run_llm_stream(
     let runs_to_done = offers_done
         && (origin == TurnOrigin::Autonomous || kernel.mode() == crate::KernelMode::Headless);
     let mut done_nudges: u32 = 0;
+    // A context offered `get_system_messages` reads instructions through it.
+    let instruction_form = if tools.iter().any(|tool| tool.name == SYSTEM_MESSAGES_TOOL) {
+        InstructionForm::SystemMessagesTool
+    } else {
+        InstructionForm::SystemText
+    };
     // Max retries for transient LLM provider failures (network blips, rate limits)
     const MAX_LLM_RETRIES: u32 = 2;
 
@@ -3226,28 +3308,12 @@ async fn run_llm_stream(
                     limit = MAX_OUTPUT_CEILING_CONTINUATIONS,
                     "Inference stopped at the output ceiling; continuing the turn with a notice"
                 );
-                // A `(System, Notification)` block is the durable, visible
-                // carrier the model reads as a user message, live and on the
-                // next hydration alike (`llm/hydrate.rs`).
-                //
                 // A write fault fails the turn, like every other block this
                 // stream authors for the model (`?` on the provider content
-                // writes above): the notice and the message pushed below are
-                // one fact, and continuing with only the wire copy would send
-                // an instruction no later hydration can reproduce.
-                let notice_block = documents.insert_block_as(
-                    context_id,
-                    None,
-                    Some(&last_block_id),
-                    Role::System,
-                    BlockKind::Notification,
-                    &notice,
-                    Status::Done,
-                    ContentType::Plain,
-                    Some(PrincipalId::system()),
-                )?;
-                last_block_id = notice_block;
-                messages.push(LlmMessage::user(notice));
+                // writes above): the notice and the message sent are one
+                // fact, and continuing with only the wire copy would send an
+                // instruction no later hydration can reproduce.
+                instruct(&documents, context_id, &mut last_block_id, &mut messages, instruction_form, &notice)?;
                 continue 'agentic;
             }
             if output_ceiling_hit {
@@ -3295,12 +3361,7 @@ async fn run_llm_stream(
                     continue with a tool call.";
                 tracing::info!(%context_id, nudge = done_nudges, limit = MAX_DONE_NUDGES,
                     "Text-only reply in a context offered `done`; continuing the turn with a notice");
-                // The same durable carrier as the ceiling notice: the model
-                // reads it as a user message, live and on hydration.
-                last_block_id = documents.insert_block_as(context_id, None, Some(&last_block_id),
-                    Role::System, BlockKind::Notification, notice, Status::Done, ContentType::Plain,
-                    Some(PrincipalId::system()))?;
-                messages.push(LlmMessage::user(notice.to_string()));
+                instruct(&documents, context_id, &mut last_block_id, &mut messages, instruction_form, notice)?;
                 continue 'agentic;
             }
             if runs_to_done {
@@ -4280,6 +4341,44 @@ mod publish_tests {
         }).await;
     }
 
+    /// In the `SystemMessagesTool` form the nudge is a `get_system_messages`
+    /// call joined to the text-only reply and a result holding the notice, as
+    /// the request sends it and as the next turn rehydrates it.
+    #[tokio::test]
+    async fn the_nudge_in_the_tool_form_is_a_get_system_messages_call() {
+        tokio::task::LocalSet::new().run_until(async {
+            let kernel = Arc::new(Kernel::new_ephemeral("nudge-tool-form").await);
+            let system_messages = ToolDefinition { name: SYSTEM_MESSAGES_TOOL.into(),
+                description: "runtime messages".into(), input_schema: serde_json::json!({"type": "object", "properties": {}}) };
+            let (mock, sent) = MockClient::new("unused")
+                .with_scripted_stream(vec![text_reply("Next I'll run the tests."), done_call("call_done")])
+                .recording_sent_messages();
+            let (documents, ctx, _player) = drive_turn_offering(TurnOrigin::Autonomous, kernel.clone(),
+                Provider::Mock(mock), |_| {}, 0, vec![done_tool(), system_messages], vec![]).await;
+            let sent = sent.lock();
+            assert_eq!(sent.len(), 2, "the nudge continued the turn once");
+            let request = serde_json::to_value(&sent[1]).unwrap();
+            let n = sent[1].len();
+            let LlmMessage { role: crate::LlmRole::Assistant, content: crate::llm::MessageContent::Blocks(reply) } = &sent[1][n - 2] else {
+                panic!("the call joins the reply: {request}");
+            };
+            assert!(matches!(&reply[..], [crate::llm::ContentBlock::Text { text }, crate::llm::ContentBlock::ToolUse { name, input, .. }]
+                if text == "Next I'll run the tests." && name == SYSTEM_MESSAGES_TOOL && *input == serde_json::json!({})), "{request}");
+            let LlmMessage { role: crate::LlmRole::User, content: crate::llm::MessageContent::Blocks(result) } = &sent[1][n - 1] else {
+                panic!("a result answers the call: {request}");
+            };
+            let [crate::llm::ContentBlock::ToolResult { content, is_error: false, .. }] = &result[..] else { panic!("{request}") };
+            let body: serde_json::Value = serde_json::from_str(content).unwrap();
+            assert!(body["messages"][0].as_str().unwrap().starts_with("You replied without a tool call"), "{content}");
+            assert!(!content.contains(": "), "compact JSON: {content}");
+
+            let blocks = documents.block_snapshots(ctx).unwrap();
+            assert!(!blocks.iter().any(|b| b.kind == BlockKind::Notification), "no notification in the tool form");
+            let rehydrated = crate::llm::hydrate_from_blocks(&blocks);
+            assert_eq!(serde_json::to_value(&rehydrated[..n]).unwrap(), request, "live and rehydrated differ");
+        }).await;
+    }
+
     /// A turn a person prompted ends on a text-only reply even when `done` is
     /// offered: the person reads the reply and answers it. `done` still ends
     /// such a turn when the model calls it.
@@ -4813,7 +4912,7 @@ mod publish_tests {
                         "{shape}: assistant replay"
                     );
                     let last = request.last().expect("the notice is the last message");
-                    assert_eq!(last.role, LlmRole::User);
+                    assert_eq!(last.role, LlmRole::System, "a kernel instruction, not a user message");
                     assert!(
                         last.as_text()
                             .unwrap_or_default()

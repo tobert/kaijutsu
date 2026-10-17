@@ -73,11 +73,10 @@ remains the separate follow-up described below.
 ## When an inference stops at the output ceiling
 
 A turn does not end because one inference did. When the provider stops with
-`max_tokens` or `length` and the model completed no tool call, the loop writes
-a `(System, Notification)` block saying the response stopped at the output
-limit of N tokens and to continue from there, sends it as the next user
-message — the same shape hydration would produce for that block — and takes
-another inference. A driven worker has nobody to say "continue".
+`max_tokens` or `length` and the model completed no tool call, the loop records
+a kernel instruction saying the response stopped at the output limit of N
+tokens and to continue from there (see "Kernel instructions" below), sends it
+in the shape hydration produces for it, and takes another inference. A driven worker has nobody to say "continue".
 
 The turn does **not** continue when any of these holds, and then it ends as it
 did before continuations existed:
@@ -102,7 +101,7 @@ live and rehydrated. Reasoning rides only with its continuity signature. A
 truncated response is replayed only when it has text: reasoning alone is not
 an assistant turn, and it is the common truncation — the whole ceiling goes to
 reasoning before any text arrives. The notice then follows the previous
-message, and the wire merges consecutive user messages.
+message.
 
 A tool call whose arguments do not parse as JSON is recorded with its raw
 text and answered with an error tool result naming the byte count and the
@@ -129,8 +128,9 @@ summary) does not end the turn.
 In a context offered `done`, a reply with no tool call does not end an
 autonomous turn (`TurnOrigin::Autonomous`: `kj drive`, `kj fork --prompt`,
 drift delivery), or any turn on a headless kernel (`KernelMode::Headless`,
-started with `--headless`). The loop writes a `(System, Notification)` asking for a tool call or `done`,
-sends it as the next user message, and takes another inference, at most
+started with `--headless`). The loop records a kernel instruction asking for a
+tool call or `done` (see "Kernel instructions"), sends it, and takes another
+inference, at most
 `MAX_DONE_NUDGES` (2) times per turn (`runtime/llm_stream.rs`). The next
 text-only reply ends the turn, logged as "The turn ended without `done`". The
 guards are the ceiling continuation's: no nudge after an output-ceiling stop,
@@ -145,6 +145,40 @@ A driver reads the verdict from the context: `kj wait` prints
 client sees the `done` call and its result. `contrib/bench/analysis/
 classify_run.py` reports it as the run's verdict (`verdict_source:
 done_tool`).
+
+## Kernel instructions
+
+A kernel instruction is runtime text for the model inside a turn: the notice
+after a text-only reply and the output-ceiling notice. It never reads as a
+user message. A chat template such as Gemma 4's drops the agent turn's
+thinking before the last user message, so a notice sent as one made the
+model treat it as a new user turn and recap the conversation.
+
+`InstructionForm` in `runtime/llm_stream.rs` chooses the shape:
+
+- `SystemMessagesTool`, for a context offered `get_system_messages`. The
+  reply is recorded as calling `get_system_messages` with `{}`, and its result
+  reads `{"messages":["You replied without a tool call, ..."]}`. The call
+  joins the reply's assistant message; the blocks are an ordinary call and
+  result authored by the system principal. `builtin.turn` offers the tool
+  beside `done` while `INSTRUCTION_FORM` is `SystemMessagesTool`, so a
+  context's tools are the same on every turn. A call the model makes itself
+  returns `{"messages":[]}`.
+- `SystemText`, for every other context. A payload-less
+  `(System, Notification)` block from the system principal hydrates as
+  `llm::Role::System` at its point in the history. Council v2 and `/mk/v1`
+  send it as a `system` message, which mkviolet renders as its own system
+  turn. Hosted OpenAI sends a `system` message. Anthropic, DeepSeek, and other
+  OpenAI-compatible servers send it as user text: Anthropic takes system text
+  only in its top-level field, DeepSeek's template moves every system message
+  into the system prompt, and some local templates refuse a later system
+  message. Broker notifications carry a payload and stay user messages.
+
+On Gemma 4 over mkviolet, 16 samples per form, nudged after a text-only reply
+to the fourth prompt: the tool form called `done` 16/16 times, never named an
+earlier turn in its thought, and never read the notice as the user's words.
+The system form read it as the user's words 2/16 times and the user form
+16/16 times.
 
 ## Tool results replay as sent
 

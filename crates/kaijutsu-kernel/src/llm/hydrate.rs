@@ -134,6 +134,17 @@ pub(crate) fn is_history_eligible(block: &BlockSnapshot) -> bool {
         )
 }
 
+/// Whether a block is a kernel instruction to the model: a payload-less
+/// `(System, Notification)` block the kernel authored. It hydrates as a
+/// system message; a broker notification carries a payload and stays a user
+/// message.
+pub(crate) fn is_kernel_instruction(block: &BlockSnapshot) -> bool {
+    block.role == BlockRole::System
+        && block.kind == BlockKind::Notification
+        && block.notification.is_none()
+        && block.id.principal_id == kaijutsu_types::PrincipalId::system()
+}
+
 impl HydrationState {
     pub(crate) fn new() -> Self {
         Self {
@@ -421,6 +432,13 @@ impl HydrationState {
                     self.flush_all();
                     self.messages.push(Message::user(envelope));
                 }
+            }
+            (_, BlockKind::Notification) if is_kernel_instruction(block) => {
+                // A kernel instruction to the model, such as the notice
+                // after a text-only reply, is system text at its point in
+                // the history, not a user message.
+                self.flush_all();
+                self.messages.push(Message::system(&block.content));
             }
             (_, BlockKind::Notification) => {
                 // Notification blocks (D-34): surface broker tool/log events to the
@@ -1015,6 +1033,7 @@ mod pairing_repair_tests {
                     let MessageContent::Blocks(blocks) = &message.content else { unreachable!() };
                     assert!(blocks[..results.len()].iter().all(|b| matches!(b, ContentBlock::ToolResult { .. })), "results must lead at {idx}");
                 }
+                Role::System => assert!(calls.is_empty() && results.is_empty(), "system tool blocks at {idx}"),
             }
         }
     }

@@ -10,6 +10,13 @@
 //! driver reading the context (`kj wait`, an ACP client) reads the verdict
 //! there.
 //!
+//! In the `SystemMessagesTool` form (`llm_stream::INSTRUCTION_FORM`) the
+//! instance also offers `get_system_messages`. The kernel's notice after a
+//! text-only reply is recorded as a call to it and its result, so the model
+//! reads the notice as runtime output rather than as a user message. Every
+//! context offered `done` is offered it on every turn, so its tools stay the
+//! same from turn to turn. A call the model makes itself returns no messages.
+//!
 //! `*` does not cover this instance: a context type opts in with
 //! `kj binding allow builtin.turn`, because offering `done` changes how every
 //! turn in the context ends.
@@ -94,7 +101,7 @@ impl McpServerLike for BuiltinTurnServer {
     }
 
     async fn list_tools(&self, _ctx: &CallContext) -> McpResult<Vec<KernelTool>> {
-        Ok(vec![KernelTool {
+        let mut tools = vec![KernelTool {
             instance: self.instance_id.clone(),
             name: crate::runtime::llm_stream::DONE_TOOL.to_string(),
             description: Some(
@@ -106,7 +113,16 @@ impl McpServerLike for BuiltinTurnServer {
                     .to_string(),
             ),
             input_schema: tool_input_schema::<DoneParams>(),
-        }])
+        }];
+        if crate::runtime::llm_stream::INSTRUCTION_FORM == crate::runtime::llm_stream::InstructionForm::SystemMessagesTool {
+            tools.push(KernelTool {
+                instance: self.instance_id.clone(),
+                name: crate::runtime::llm_stream::SYSTEM_MESSAGES_TOOL.to_string(),
+                description: Some("Returns messages from the kaijutsu runtime about this task.".to_string()),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            });
+        }
+        Ok(tools)
     }
 
     async fn call_tool(
@@ -115,6 +131,9 @@ impl McpServerLike for BuiltinTurnServer {
         _ctx: &CallContext,
         _cancel: CancellationToken,
     ) -> McpResult<KernelToolResult> {
+        if params.tool == crate::runtime::llm_stream::SYSTEM_MESSAGES_TOOL {
+            return Ok(KernelToolResult::text(crate::runtime::llm_stream::system_messages_result(&[])));
+        }
         if params.tool != crate::runtime::llm_stream::DONE_TOOL {
             return Err(McpError::ToolNotFound { instance: self.instance_id.clone(), tool: params.tool });
         }
@@ -184,5 +203,22 @@ mod tests {
         assert!(schema.contains("\"feedback\"") && !schema.contains("\"summary\""), "{schema}");
         assert!(schema.contains("posterity") && schema.contains("words"), "{schema}");
         assert!(schema.contains("refused"), "{schema}");
+    }
+
+    /// In the `SystemMessagesTool` form every context offered `done` is also
+    /// offered `get_system_messages`, and a call the model makes itself
+    /// returns no messages.
+    #[tokio::test]
+    async fn get_system_messages_is_offered_beside_done_and_returns_no_messages() {
+        use crate::runtime::llm_stream::{INSTRUCTION_FORM, InstructionForm, SYSTEM_MESSAGES_TOOL};
+        let server = BuiltinTurnServer::new();
+        let ctx = CallContext::test();
+        let names: Vec<String> = server.list_tools(&ctx).await.unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(names.iter().any(|n| n == SYSTEM_MESSAGES_TOOL), INSTRUCTION_FORM == InstructionForm::SystemMessagesTool, "{names:?}");
+        let params = KernelCallParams { instance: InstanceId::new(BuiltinTurnServer::INSTANCE),
+            tool: SYSTEM_MESSAGES_TOOL.into(), arguments: serde_json::json!({}) };
+        let result = server.call_tool(params, &ctx, CancellationToken::new()).await.unwrap();
+        assert!(matches!(result.content.as_slice(), [crate::mcp::ToolContent::Text(t)] if t == r#"{"messages":[]}"#),
+            "{:?}", result.content);
     }
 }

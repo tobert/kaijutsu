@@ -2,7 +2,9 @@
 //! `/mk/v1/generate` request (`docs/mk.md`, "Request mapping"), or into
 //! council v2 messages (`docs/council-api-v2.md`).
 //!
-//! - The system prompt is one `system` message, first.
+//! - The system prompt is one `system` message, first. A kernel instruction
+//!   later in the history is a `system` message at its point, which the
+//!   service renders as its own system turn.
 //! - `/mk/v1` has no tool-call ids. Results go back as `tool` messages in
 //!   the order of the calls they answer, matched by the kernel's ids; a
 //!   history whose results do not answer exactly the preceding calls is
@@ -78,7 +80,8 @@ pub(super) fn messages(system: Option<&str>, history: &[Message]) -> LlmResult<V
 /// An assistant message leaves out empty text. `snap` marks the system
 /// message, the last of each run of tool results, and the message that ends
 /// each user turn: the last message before an assistant message, and the
-/// last message of all. A flag depends only on the messages up to the next
+/// last message of all. A later system message is marked as a user message
+/// is. A flag depends only on the messages up to the next
 /// assistant message, so a later turn never moves an earlier boundary.
 pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<V2Message>> {
     let mut out: Vec<V2Message> = walk(system, history)?
@@ -98,9 +101,9 @@ pub(super) fn messages_v2(system: Option<&str>, history: &[Message]) -> LlmResul
     for i in 0..out.len() {
         let next = out.get(i + 1).map(|m| m.role);
         out[i].snap = match out[i].role {
-            V2Role::System => true,
+            V2Role::System if i == 0 => true,
             V2Role::Assistant => false,
-            V2Role::User => matches!(next, None | Some(V2Role::Assistant)),
+            V2Role::User | V2Role::System => matches!(next, None | Some(V2Role::Assistant)),
             V2Role::Tool => !matches!(next, Some(V2Role::Tool)),
         };
     }
@@ -134,6 +137,12 @@ fn walk(system: Option<&str>, history: &[Message]) -> LlmResult<Vec<Walked>> {
                 out.push(reply);
             }
             Role::User => user(index, &message.content, &mut calls, &mut out)?,
+            Role::System => {
+                if !calls.is_empty() {
+                    return Err(pairing(index, format!("a system message follows {} unanswered call(s)", calls.len())));
+                }
+                out.push(Walked::System(text(&message.content)));
+            }
         }
     }
     if !calls.is_empty() {
@@ -220,6 +229,22 @@ fn user(index: usize, content: &MessageContent, calls: &mut Vec<String>, out: &m
         out.push(Walked::User(text));
     }
     Ok(())
+}
+
+/// The text blocks of `content`, one per line.
+fn text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Blocks(blocks) => {
+            let mut out = String::new();
+            for block in blocks {
+                if let ContentBlock::Text { text } = block {
+                    join(&mut out, text);
+                }
+            }
+            out
+        }
+    }
 }
 
 fn join(into: &mut String, part: &str) {
@@ -337,6 +362,31 @@ mod tests {
         assert_eq!(second[..first.len()], first[..], "appending a turn moves no earlier boundary");
         assert_eq!(serde_json::to_value(&second[6]).unwrap(), json!({"role": "assistant", "content": "done"}));
         assert!(second[7].snap);
+    }
+
+    /// A kernel instruction is a `system` message at its point in the
+    /// history, in both shapes, and its boundary falls where a user
+    /// message's would.
+    #[test]
+    fn a_kernel_instruction_is_a_system_message_at_its_point() {
+        let history = vec![
+            Message::user("list the files"),
+            said(vec![ContentBlock::Reasoning { text: "one file".into(), signature: None }, ContentBlock::Text { text: "There is a.txt.".into() }]),
+            Message::system("You replied without a tool call."),
+        ];
+        assert_eq!(
+            serde_json::to_value(messages_v2(Some("rules"), &history).unwrap()).unwrap(),
+            json!([
+                {"role": "system", "content": "rules", "snap": true},
+                {"role": "user", "content": "list the files", "snap": true},
+                {"role": "assistant", "content": "There is a.txt.", "reasoning": "one file"},
+                {"role": "system", "content": "You replied without a tool call.", "snap": true},
+            ])
+        );
+        let v1 = wire(&messages(Some("rules"), &history).unwrap());
+        assert_eq!(v1[3], json!({"role": "system", "content": "You replied without a tool call."}));
+        let unanswered = [Message::user("x"), said(vec![call("a", "ls", json!({}))]), Message::system("s")];
+        assert!(matches!(messages(None, &unanswered), Err(LlmError::InvalidRequest(_))));
     }
 
     #[test]

@@ -392,8 +392,10 @@ fn build_system(
 }
 
 fn build_message(msg: &Message) -> RequestMessage {
+    // The Messages API takes system text only in its top-level `system`
+    // field, so a kernel instruction mid-conversation goes as user text.
     let role = match msg.role {
-        Role::User => MessageRole::User,
+        Role::User | Role::System => MessageRole::User,
         Role::Assistant => MessageRole::Assistant,
     };
     let content = match &msg.content {
@@ -487,6 +489,16 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         assert!(req.stream.is_none(), "non-streaming omits stream field");
+    }
+
+    /// The Messages API has no system role mid-conversation, so a kernel
+    /// instruction goes as user text.
+    #[test]
+    fn a_kernel_instruction_is_user_text() {
+        let messages = vec![Message::user("hi"), Message::assistant("hello"), Message::system("call done")];
+        let req = build_request(&opts("claude-haiku-4-5"), &messages, false);
+        assert!(matches!(req.messages[2].role, MessageRole::User));
+        assert!(matches!(&req.messages[2].content, MessageContent::Text(t) if t == "call done"));
     }
 
     #[test]

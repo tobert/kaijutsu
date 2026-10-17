@@ -157,8 +157,10 @@ builds the client. `Provider::stream` wraps the result in a new
 
 Rules:
 
-- The kernel's `Role` has only `User` and `Assistant`; the system prompt
-  arrives as one string in `BuildOpts.system`, so it is always first.
+- The system prompt arrives as one string in `BuildOpts.system`, so it is
+  always first. A kernel instruction later in the history
+  (`llm::Role::System`) is a `system` message at its point; see
+  `docs/conversation-session.md`, "Kernel instructions".
 - An `effort` outside the four tokens above is an error, not a pass-through.
   The tunables cascade (cast slot, model row, `llm_defaults`) chooses it, so
   `thinking: false` for routine turns is a model-row or cast setting.

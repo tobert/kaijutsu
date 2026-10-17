@@ -284,6 +284,10 @@ pub enum Role {
     User,
     /// Assistant/model message.
     Assistant,
+    /// Kernel instruction at its point in the history, after the system
+    /// prompt. Each provider sends it as system text where its wire takes
+    /// one mid-conversation, and as a user message otherwise.
+    System,
 }
 
 /// Content block for structured message content (agentic loops).
@@ -356,6 +360,14 @@ impl Message {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
+            content: MessageContent::Text(content.into()),
+        }
+    }
+
+    /// Create a kernel instruction at this point in the history.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
             content: MessageContent::Text(content.into()),
         }
     }
@@ -782,6 +794,7 @@ fn flatten_codex_messages(messages: &[Message]) -> String {
             let role = match message.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
+                Role::System => "system",
             };
             format!("[{role}] {}", flatten_codex_content(&message.content))
         })
@@ -3850,6 +3863,33 @@ mod tests {
                 1,
                 "System-role Notification must not be filtered out"
             );
+        }
+
+        /// A kernel instruction, a payload-less notification the kernel
+        /// authored, hydrates as a system message after the reply it
+        /// answers, so it does not read as a new user turn. A payload-less
+        /// notification another principal wrote stays a user message.
+        #[test]
+        fn a_kernel_instruction_hydrates_as_a_system_message() {
+            let c = ctx();
+            let m = model();
+            let notice = |principal: PrincipalId, seq: u64, text: &str| {
+                kaijutsu_types::BlockSnapshotBuilder::new(BlockId::new(c, principal, seq), kaijutsu_types::BlockKind::Notification)
+                    .role(BlockRole::System)
+                    .content(text)
+                    .build()
+            };
+            let blocks = vec![
+                BlockSnapshot::text(BlockId::new(c, user(), 0), None, BlockRole::User, "list the files"),
+                BlockSnapshot::text(BlockId::new(c, m, 0), None, BlockRole::Model, "There is a.txt."),
+                notice(system(), 0, "You replied without a tool call, so the task is still open."),
+                notice(PrincipalId::new(), 0, "a handoff note"),
+            ];
+            let msgs = hydrate_from_blocks(&blocks);
+            let roles: Vec<Role> = msgs.iter().map(|m| m.role).collect();
+            assert_eq!(roles, [Role::User, Role::Assistant, Role::System, Role::User]);
+            assert_eq!(msgs[2].as_text(), Some("You replied without a tool call, so the task is still open."));
+            assert_eq!(msgs[3].as_text(), Some("a handoff note"));
         }
 
         // ── (Tool, Text) content-typed blocks (svg_block / abc_block, A1) ──

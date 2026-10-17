@@ -83,6 +83,15 @@ pub fn build_request(
         match msg.role {
             Role::User => translate_user(msg, &mut wire),
             Role::Assistant => translate_assistant(msg, &mut wire, reasoning_required),
+            // Hosted OpenAI takes a `system` message anywhere. Other
+            // dialects may not: DeepSeek's template moves every system
+            // message into the system prompt, and some local templates
+            // refuse a system message after the first. They read it as a
+            // user message.
+            Role::System => match (hosted_openai, &msg.content) {
+                (true, MessageContent::Text(text)) => wire.push(RequestMessage::system(text.clone())),
+                _ => translate_user(msg, &mut wire),
+            },
         }
     }
 
@@ -409,6 +418,19 @@ mod tests {
         reasoning_required: bool,
     ) -> ChatRequest {
         super::build_request(opts, messages, streaming, reasoning_required, false, "test")
+    }
+
+    /// A kernel instruction is a `system` message on hosted OpenAI and a
+    /// user message on every other dialect.
+    #[test]
+    fn a_kernel_instruction_is_system_text_only_on_hosted_openai() {
+        let history = [Message::user("hi"), Message::assistant("hello"), Message::system("call done")];
+        for (hosted, role) in [(true, "system"), (false, "user")] {
+            let req = super::build_request(&opts(), &history, false, !hosted, hosted, "test");
+            let v = serde_json::to_value(&req).unwrap();
+            assert_eq!(v["messages"][2]["role"], role, "hosted={hosted}");
+            assert_eq!(v["messages"][2]["content"], "call done");
+        }
     }
 
     #[test]
