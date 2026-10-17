@@ -970,6 +970,37 @@ mod tests {
         );
     }
 
+    /// Every seat that ships the shell guard can run `shell_write`, so the
+    /// council may gate it: its create lifecycle, and its fork lifecycle
+    /// when it has one, ship `S50-council-seats.kai`, which builds the
+    /// seat's council seats ahead of its first decision. No other seat
+    /// ships it.
+    #[test]
+    fn the_gated_seats_build_their_council_seats_at_create_and_fork() {
+        let seeds = seed_files();
+        let has = |path: String| seeds.iter().any(|(p, _)| *p == path);
+        let mut types: Vec<&str> = seeds
+            .iter()
+            .filter_map(|(p, _)| rc_relpath(p))
+            .filter_map(|rel| rel.split('/').next())
+            .filter(|t| *t != "lib")
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        let mut wrong = Vec::new();
+        for ty in types {
+            let gated = has(format!("{RC_VFS_ROOT}/{ty}/create/S45-shell-guard.kai"));
+            let forks = seeds.iter().any(|(p, _)| p.starts_with(&format!("{RC_VFS_ROOT}/{ty}/fork/")));
+            for (verb, wanted) in [("create", gated), ("fork", gated && forks)] {
+                let path = format!("{RC_VFS_ROOT}/{ty}/{verb}/S50-council-seats.kai");
+                if has(path.clone()) != wanted {
+                    wrong.push((path, wanted));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "council-seat scripts missing (true) or unneeded (false): {wrong:#?}");
+    }
+
     /// A test kernel seeds this tree (`SshServerConfig::ephemeral`), and a
     /// test kernel must never reach the network. No seed body registers or
     /// calls `curl`; an rc hook that needs the network is an operator's own

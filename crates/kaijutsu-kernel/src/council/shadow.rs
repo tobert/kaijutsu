@@ -260,8 +260,7 @@ async fn judge_one(
     council.server = server.clone();
     council.deadline_ms = JUDGE_DEADLINE.as_millis() as u64;
     let deadline = tokio::time::Instant::now() + JUDGE_DEADLINE;
-    let mut labels = council.contexts.clone();
-    labels.extend(spec.contexts.iter().cloned());
+    let labels = judge_labels(&council, &spec);
     let seat = council.house_rules.then_some(read.seat);
     let shadow = std::slice::from_ref(&label);
     let mut prepared = match super::gate::prepare_within(kernel, &council, &spec.name, &labels, seat, shadow, deadline, &waits).await {
@@ -349,7 +348,7 @@ fn add_answer(kernel: &crate::Kernel, read: &JudgeRead, answer: &str) {
 }
 
 /// A judge shadow's label: `judge-` and the seat's name.
-fn shadow_label(seat_name: &str) -> String {
+pub(crate) fn shadow_label(seat_name: &str) -> String {
     format!("{JUDGE}-{seat_name}")
 }
 
@@ -453,13 +452,7 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         let Some(seat_row) = db.get_context(seat)? else {
             return Err(KernelDbError::Validation(format!("seat context {seat} has no row")));
         };
-        let Some((cast_id, backend)) = super::gate::seat_slot_backend(&db, &seat_row, JUDGE)? else { return Ok(None) };
-        // A chat backend's judge is not read yet; an `mk` backend with no
-        // address is a miss on each judge read.
-        let server = match backend.kind.as_str() {
-            "mk" => Some(super::gate::council_address(&backend)),
-            _ => None,
-        };
+        let Some((cast_id, server)) = judge_slot(&db, &seat_row)? else { return Ok(None) };
         let mut judge = Judge {
             shadow: seat,
             seat_name: seat_row.label.clone().unwrap_or_else(|| seat.short()),
@@ -484,6 +477,38 @@ fn judge_shadow(kernel: &crate::Kernel, seat: ContextId) -> KernelDbResult<Optio
         tracing::error!(%seat, shadow = %row.context_id, "shadow: label not registered: {error}");
     }
     Ok(Some((judge, true)))
+}
+
+/// The seat's judge slot: the cast it resolves through, and the council
+/// server the judge reads on, its backend's address when its kind is `mk`,
+/// or why that backend names none. `None` for the server is a chat
+/// backend, whose judge is not read yet. `None` overall: the seat's cast
+/// has no [`JUDGE`] slot.
+fn judge_slot(
+    db: &crate::kernel_db::KernelDb,
+    seat: &ContextRow,
+) -> KernelDbResult<Option<(kaijutsu_types::CastId, Option<Result<String, String>>)>> {
+    let Some((cast_id, backend)) = super::gate::seat_slot_backend(db, seat, JUDGE)? else { return Ok(None) };
+    let server = match backend.kind.as_str() {
+        "mk" => Some(super::gate::council_address(&backend)),
+        _ => None,
+    };
+    Ok(Some((cast_id, server)))
+}
+
+/// The council server a seat's judge reads on, when its cast has a
+/// [`JUDGE`] slot on an `mk` backend with an address.
+pub(crate) fn judge_server(db: &crate::kernel_db::KernelDb, seat: &ContextRow) -> KernelDbResult<Option<String>> {
+    Ok(judge_slot(db, seat)?.and_then(|(_, server)| server).and_then(Result::ok))
+}
+
+/// The labels a judge read sends before the shadow: `[council] contexts`
+/// and the shell spec's own. The reviewer chain does not join a judge read.
+pub(crate) fn judge_labels(
+    council: &crate::kj::gate_policy::CouncilConfig,
+    spec: &crate::kj::gate_policy::CouncilSpec,
+) -> Vec<String> {
+    super::reviewer_contexts::ReviewerContextChain::default().decision_labels(council, spec)
 }
 
 /// A judge shadow's row: a fork child of the seat playing the seat's cast,

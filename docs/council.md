@@ -274,15 +274,37 @@ and `persist` do not apply.
   again.
 - **Seats are built at startup.** A serving kernel builds the seats its
   gate config names when it starts: for each council and spec,
-  `[council] contexts` and the spec's own. Reviewer contexts, house rules,
-  and judge shadows depend on the proposing seat and are built by its first
-  decision.
+  `[council] contexts` and the spec's own.
+- **A seat's own seats are built by its rc.** `kj council build` plans the
+  seats that depend on the proposing seat and builds them in the
+  background, with the prepare a decision runs, so its first decision
+  finds them held: under the shell and program specs, the voting reviewer
+  contexts along its performer's chain and its house rules, routed to the
+  server its cast names; each observing reviewer context under
+  `direction-check`; and, with an `mk` judge in its cast, the judge read's
+  contexts and house rules on the judge's server. The create and fork
+  lifecycles of coder, default, director, and mcp, and root's create, run
+  it (`lib/{create,fork}/S50-council-seats.kai`); a type with no council
+  builds nothing. A seat with no performer or an unresolved chain builds
+  without the chain, and its first decision builds the rest. What changes
+  later, such as an edited `AGENTS.md`, a new reviewer, or a `cd`, is
+  built by the next decision. The shadow itself is sent after each call,
+  off the gate's path.
 - **Seats are pinned under the kernel.** When the server lists `pins`, the
-  heads of every seat the kernel built on it are pinned under the owner
-  `kernel-<kernel id>` for an hour. The whole set is sent again when it
-  changes and every 20 minutes, off the decision's path. A pin the server
-  reports `held: false` names a seat it no longer holds, and the next
-  decision builds that seat again. A server without `pins` is not pinned.
+  heads of every current seat the kernel built on it are pinned under the
+  owner `kernel-<kernel id>` for an hour. The whole set is sent again when
+  it changes and every 20 minutes, off the decision's path. A pin the
+  server reports `held: false` names a seat it no longer holds, and the
+  next decision builds that seat again. A server without `pins` is not
+  pinned; an empty set is a `DELETE`.
+- **Only current seats are pinned.** Each seat has a slot: a labeled
+  context by label, house rules by the `AGENTS.md` path and token budget,
+  a shadow by its id. A new body replaces the slot's old one, so an edited
+  `AGENTS.md` replaces its seat in the set. Before each pin `PUT`, a
+  serving kernel also forgets the seats nothing current reaches: a spec no
+  council declares, a label no council reads or that names no live
+  context, house rules whose file is gone, and an archived shadow. A seat
+  that leaves the set is left to the server's own expiry.
 
 ## House rules
 
@@ -317,8 +339,9 @@ context holds those rules and nothing the seat said or did.
   body, in a namespace fixed in `council/sync.rs`. Every seat under one
   `AGENTS.md` shares one held context and its snapshots, and an edited file
   is a new id. The kernel sends a body only when it changed from the last one
-  it sent under that id, so a seat's work sends nothing. The server keeps
-  the snapshots of an id the file no longer produces; `docs/issues.md`,
+  it sent under that id, so a seat's work sends nothing. It remembers one
+  body per file, so an edit replaces the old id. A v1 server keeps the
+  snapshots of an id the file no longer produces; `docs/issues.md`,
   "Council house rules: what is open", records that.
 - **It is pinned and counted.** The decision pins it with `at`, like every
   context, so it reads the rules as of the submission. `[council] contexts`,

@@ -84,6 +84,12 @@ struct Mock {
     puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>>,
     /// The identity's `contexts_per_decision`.
     context_limit: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the server speaks council v2. The kernel caches the
+    /// identity, so set it before the first call.
+    v2: Arc<std::sync::atomic::AtomicBool>,
+    /// v2: every context built, and every decision's body, in arrival order.
+    built: Arc<Mutex<Vec<serde_json::Value>>>,
+    v2_decisions: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl Mock {
@@ -110,6 +116,16 @@ impl Mock {
     /// caches the identity, so set it before the first call.
     fn limit_contexts(&self, limit: u64) {
         self.context_limit.store(limit, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// v2: the contexts built with `POST /council/v2/contexts`, in order.
+    fn built(&self) -> Vec<serde_json::Value> {
+        self.built.lock().unwrap().clone()
+    }
+
+    /// v2: each decision's body, in order.
+    fn v2_decisions(&self) -> Vec<serde_json::Value> {
+        self.v2_decisions.lock().unwrap().clone()
     }
 
     fn set(&self, behavior: impl Fn(&DecisionRequest) -> Reply + Send + Sync + 'static) {
@@ -151,11 +167,11 @@ impl Mock {
     }
 }
 
-fn server_identity(context_limit: u64) -> String {
+fn server_identity(context_limit: u64, capabilities: serde_json::Value) -> String {
     let mut id = identity();
     id["limits"] = serde_json::json!({"context_tokens": 100000, "state_bytes": 100000, "contexts_per_decision": context_limit,
                                       "choice_options": 8, "default_timeout_ms": 1000});
-    id["capabilities"] = serde_json::json!(["leave_one_out"]);
+    id["capabilities"] = capabilities;
     id.to_string()
 }
 
@@ -202,22 +218,58 @@ async fn serve() -> Mock {
     let hold: Arc<Mutex<Option<Hold>>> = Arc::default();
     let puts: Arc<Mutex<Vec<(String, kaijutsu_mk::council::wire::ContextPut)>>> = Arc::default();
     let context_limit = Arc::new(std::sync::atomic::AtomicU64::new(8));
+    let v2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let built: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let v2_decisions: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let (log, how, seen, held) = (decisions.clone(), behavior.clone(), calls.clone(), put_delays.clone());
     let (holding, bodies, limit) = (hold.clone(), puts.clone(), context_limit.clone());
+    let (speaks_v2, builds, v2_log) = (v2.clone(), built.clone(), v2_decisions.clone());
     tokio::spawn(async move {
         let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
             let (log, how, puts, seen, held) = (log.clone(), how.clone(), puts.clone(), seen.clone(), held.clone());
             let (holding, bodies, limit) = (holding.clone(), bodies.clone(), limit.clone());
+            let (speaks_v2, builds, v2_log) = (speaks_v2.clone(), builds.clone(), v2_log.clone());
             tokio::spawn(async move {
                 let Some((method, path, body)) = read_request(&mut sock).await else { return };
                 seen.lock().unwrap().push((method.clone(), path.clone()));
+                let v2 = speaks_v2.load(std::sync::atomic::Ordering::SeqCst);
                 let reply = match (method.as_str(), path.as_str()) {
                     ("GET", "/council/v1/identity") => {
                         let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
-                        Reply { status: 200, body: server_identity(limit), delay: Duration::ZERO }
+                        Reply { status: 200, body: server_identity(limit, serde_json::json!(["leave_one_out"])), delay: Duration::ZERO }
                     },
+                    ("GET", "/council/v2/identity") if v2 => {
+                        let limit = limit.load(std::sync::atomic::Ordering::SeqCst);
+                        Reply { status: 200, body: server_identity(limit, serde_json::json!(["leave_one_out", "pins"])), delay: Duration::ZERO }
+                    }
+                    ("POST", "/council/v2/specs") if v2 => {
+                        let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
+                        let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
+                        Reply::ok(serde_json::json!({"spec_id": id, "spec": spec, "template": "mk-letters-1:0123456789abcdef"}))
+                    }
+                    ("POST", "/council/v2/contexts") if v2 => {
+                        let n = puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        builds.lock().unwrap().push(serde_json::from_str(&body).unwrap());
+                        let head = format!("snap:{n:064x}");
+                        Reply::ok(serde_json::json!({"head": head, "tokens": 1, "kept": 0, "fed": 1, "from": null, "dry_run": false,
+                                                     "snapshots": [{"id": head, "message": 1, "tokens": 1}]}))
+                    }
+                    ("PUT", p) if v2 && p.starts_with("/council/v2/pins/") => {
+                        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        let held: Vec<serde_json::Value> =
+                            body["snapshots"].as_array().unwrap().iter().map(|id| serde_json::json!({"id": id, "held": true})).collect();
+                        Reply::ok(serde_json::json!({"owner": p.rsplit('/').next().unwrap(), "snapshots": held, "expires_in_s": body["ttl_s"]}))
+                    }
+                    ("POST", "/council/v2/decisions") if v2 => {
+                        let request: kaijutsu_mk::council_v2::wire::DecisionRequest = serde_json::from_str(&body).unwrap();
+                        v2_log.lock().unwrap().push(serde_json::from_str(&body).unwrap());
+                        let view = request.by_index();
+                        log.lock().unwrap().push(view.clone());
+                        let behavior = how.lock().unwrap().clone();
+                        behavior(&view)
+                    }
                     ("POST", "/council/v1/specs") => {
                         let spec: kaijutsu_mk::council::wire::Spec = serde_json::from_str(&body).unwrap();
                         let id = kaijutsu_mk::council::canon::spec_id(&spec).unwrap();
@@ -264,7 +316,7 @@ async fn serve() -> Mock {
             });
         }
     });
-    Mock { base, decisions, behavior, calls, put_delays, hold, puts, context_limit }
+    Mock { base, decisions, behavior, calls, put_delays, hold, puts, context_limit, v2, built, v2_decisions }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,6 +353,8 @@ struct Setup {
     no_bump_template: bool,
     /// `mode = "bump-only"`, reading the `shell-bump` spec.
     bump_only: bool,
+    /// The server speaks council v2.
+    v2: bool,
     /// `[council] escalate`: bumps in a row, within minutes.
     escalate: Option<(u64, u64)>,
 }
@@ -320,6 +374,7 @@ impl Default for Setup {
             no_bump_template: false,
             bump_only: false,
             escalate: None,
+            v2: false,
         }
     }
 }
@@ -408,6 +463,7 @@ async fn rig(via: Via, setup: Setup) -> Rig {
         .await
         .unwrap();
     let mock = serve().await;
+    mock.v2.store(setup.v2, std::sync::atomic::Ordering::SeqCst);
     let server = setup.server.clone().unwrap_or_else(|| mock.base.clone());
     let vfs = d.kernel().vfs();
     vfs.write_all(std::path::Path::new("/config/kernel/gate.toml"), gate_toml(&server, &setup).as_bytes())
@@ -1314,6 +1370,87 @@ async fn a_decision_that_cannot_be_recorded_refuses_the_submission() {
 /// for its context.
 fn latest_decision(rig: &Rig) -> CouncilDecision {
     rig.decisions().into_iter().max_by_key(|d| d.created_at).expect("a council decision")
+}
+
+/// On a council v2 server, a seat's create lifecycle builds the seats that
+/// depend on it before its first decision: Amy's council context on its
+/// reviewer chain and its house rules under the shell spec, and banto's
+/// council context under `direction-check`. The decision and the
+/// observation then send exactly those built contexts and build nothing.
+///
+/// Falsified by a lifecycle that builds nothing (the server sees no build
+/// before the decision), or by a build that differs from what the decision
+/// sends (the decision builds again, or sends other contexts).
+#[tokio::test]
+async fn a_seat_s_create_lifecycle_builds_its_dependent_seats_before_the_first_decision() {
+    let setup = Setup { v2: true, reviewer_contexts: true, chain: true, house_rules: true, ..Setup::default() };
+    let rig = rig(Via::Tool, setup).await;
+    let amy = live_context(rig.d.kernel(), "council-amy");
+    append_dialogue(rig.d.kernel(), amy, &["keep main green"]);
+    let banto = live_context(rig.d.kernel(), "council-banto");
+    append_dialogue(rig.d.kernel(), banto, &["only touch the parser crate"]);
+    rig.d
+        .kernel_db()
+        .lock()
+        .upsert_context_shell(&crate::kernel_db::ContextShellRow { context_id: rig.ctx.context_id, cwd: Some("/work".into()), updated_at: 0 })
+        .unwrap();
+    rig.write("/work/AGENTS.md", "Back up data before changing it.\n").await;
+    crate::kj::test_helpers::install_rc_script_file(
+        &rig.d,
+        "/config/rc/default/create/S50-council-seats.kai",
+        include_str!("../../../../assets/defaults/rc/lib/create/S50-council-seats.kai"),
+    )
+    .await;
+
+    let admission = rig.d.kernel().admit_context(rig.ctx.context_id).unwrap();
+    let caller = crate::KjCaller {
+        principal_id: PrincipalId::system(),
+        actor_id: PrincipalId::system(),
+        reviewer_id: None,
+        context_id: Some(rig.ctx.context_id),
+        session_id: SessionId::new(),
+        confirmed: false,
+        rc_depth: 0,
+        privileged: false,
+        cancel: CancellationToken::new(),
+    };
+    crate::rc::run(&rig.d, crate::rc::RcInvocation::new("create", &admission, &caller.cancel), &caller).await.unwrap();
+    let built = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let built = rig.mock.built();
+            if built.len() >= 4 {
+                return built;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("four seats built ahead, saw {:?}", rig.mock.built()));
+    assert!(rig.mock.decisions().is_empty(), "built before any decision");
+    let first_text = |c: &serde_json::Value| c["context"]["messages"][0]["content"].as_str().unwrap_or("").to_string();
+    assert!(first_text(&built[1]).contains("council-amy"), "{}", first_text(&built[1]));
+    assert!(first_text(&built[2]).contains("house rules"), "{}", first_text(&built[2]));
+    assert!(first_text(&built[3]).contains("council-banto"), "{}", first_text(&built[3]));
+
+    rig.mock.set(|req| {
+        if req.contexts.as_ref().map(Vec::len) == Some(1) {
+            Reply::ok(follows_answer(req, [-2.0, -0.2, -3.0]))
+        } else {
+            allow_each(req)
+        }
+    });
+    rig.submit("echo ahead").await.unwrap_or_else(|e| panic!("the council allows: {e:?}"));
+    let decision = rig.decisions().into_iter().next().expect("a decision");
+    rig.observations(&decision.decision_id, 1).await;
+
+    let sent = rig.mock.v2_decisions();
+    assert_eq!(sent.len(), 2, "the shell decision and banto's observation");
+    let contexts = |i: usize| sent[i]["contexts"].as_array().unwrap().clone();
+    let seats = |range: std::ops::Range<usize>| built[range].iter().map(|b| b["context"].clone()).collect::<Vec<_>>();
+    assert_eq!(contexts(0), seats(0..3), "the decision sends the system rules, Amy's, and the house rules as built");
+    assert_eq!(contexts(1), seats(3..4), "the observation sends banto's as built");
+    assert_eq!(rig.mock.built().len(), 4, "the decisions built nothing");
+    rig.finish().await;
 }
 
 /// With reviewer contexts on, a seat reviewed by banto for Amy reads the system rules

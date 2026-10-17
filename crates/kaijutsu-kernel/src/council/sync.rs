@@ -16,10 +16,13 @@
 //! decision's spec (`super::seat`). A seat is built with
 //! `POST /council/v2/contexts` when its value changes, and each decision
 //! sends every seat whole. When the server lists `pins`, the heads of every
-//! seat this kernel built on it are pinned under one owner named by the
-//! kernel's id ([`pin_owner`]), for [`PIN_TTL`]; the whole set is sent
-//! again when it changes and every [`PIN_RENEW`], off the decision's path.
-//! [`build_seats`] builds the configured seats when the kernel starts.
+//! current seat this kernel built on it are pinned under one owner named
+//! by the kernel's id ([`pin_owner`]), for [`PIN_TTL`]; the whole set is
+//! sent again when it changes and every [`PIN_RENEW`], off the decision's
+//! path. A seat's [`Slot`] keeps only its current body, and a pinner
+//! forgets seats nothing current reaches before it sends the set.
+//! [`build_seats`] builds the configured seats when the kernel starts, and
+//! [`build_context_seats`] the seats that depend on one proposing seat.
 //!
 //! A server that answers the v2 identity 404 is spoken to in v1, each
 //! context under its own id. This kernel is the only writer of its v1
@@ -200,15 +203,32 @@ pub(crate) struct PrepareMiss(pub(crate) String);
 
 #[derive(Clone)]
 struct Held {
+    /// The context the body projects: a labeled context's id, a
+    /// house-rules id, or a shadow's id. In v1 the server holds the body
+    /// under it.
+    id: ContextId,
     /// sha256 of the body last sent, the v1 projection or the v2 seat,
     /// before `warm` or `persist` is added.
     body: [u8; 32],
     head: SnapshotId,
 }
 
-/// A context the server holds: the server's origin, the context, and in
-/// v2 the spec its seat serves.
-type HeldKey = (String, ContextId, Option<String>);
+/// What a held body stands for. The body a slot produces now replaces the
+/// one it produced before, so the kernel keeps, and pins, only current
+/// bodies.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Slot {
+    /// A labeled council context, by its label.
+    Label(String),
+    /// The house rules read from one `AGENTS.md` under one token budget.
+    HouseRules { path: String, tokens: u64 },
+    /// A seat's judge shadow, by the shadow's context id.
+    Shadow(ContextId),
+}
+
+/// A body the server holds: the server's origin, the slot, and in v2 the
+/// spec its seat serves.
+type HeldKey = (String, Slot, Option<String>);
 
 /// Keyed by each server's origin.
 #[derive(Default)]
@@ -243,6 +263,10 @@ pub(crate) struct CouncilSync {
     state: Arc<parking_lot::Mutex<State>>,
     /// How often a pinner sends an unchanged set again, in milliseconds.
     pin_renew_ms: std::sync::atomic::AtomicU64,
+    /// The kernel this sync serves, once it is shared
+    /// ([`CouncilSync::serve`]). Pinners read it to forget unreachable seats
+    /// before each `PUT`.
+    kernel: Arc<std::sync::OnceLock<Weak<crate::Kernel>>>,
 }
 
 impl Default for CouncilSync {
@@ -252,6 +276,7 @@ impl Default for CouncilSync {
             shadow_serial: Default::default(),
             state: Default::default(),
             pin_renew_ms: std::sync::atomic::AtomicU64::new(PIN_RENEW.as_millis() as u64),
+            kernel: Default::default(),
         }
     }
 }
@@ -391,9 +416,12 @@ impl CouncilSync {
             None => None,
             Some(context_id) => {
                 let rules = house_rules(kernel, context_id, council.house_rules_tokens).await;
-                match project_house_rules(rules.as_ref(), council.house_rules_tokens) {
-                    Some(body) => Some((house_rules_id(&body)?, body)),
-                    None => None,
+                match (project_house_rules(rules.as_ref(), council.house_rules_tokens), rules) {
+                    (Some(body), Some(rules)) => {
+                        let slot = Slot::HouseRules { path: rules.path, tokens: council.house_rules_tokens };
+                        Some((house_rules_id(&body)?, slot, body))
+                    }
+                    _ => None,
                 }
             }
         };
@@ -421,12 +449,14 @@ impl CouncilSync {
             })?;
             let body = project(label, &blocks, &*kernel.kernel_db().lock())
                 .map_err(|e| PrepareMiss(format!("council context \"{label}\" cannot be projected: {e}")))?;
-            let (server, head) = self.hold(&link, wire, &identity, &spec_body, &spec_id, label, context_id, body, true).await?;
+            let slot = Slot::Label(label.clone());
+            let (server, head) =
+                self.hold(&link, wire, &identity, &spec_body, &spec_id, slot, label, context_id, body, true).await?;
             contexts.push(PreparedContext { label: label.clone(), context_id, server, head, house_rules: false });
         }
-        if let Some((context_id, body)) = house {
+        if let Some((context_id, slot, body)) = house {
             let (server, head) =
-                self.hold(&link, wire, &identity, &spec_body, &spec_id, HOUSE_RULES_LABEL, context_id, body, false).await?;
+                self.hold(&link, wire, &identity, &spec_body, &spec_id, slot, HOUSE_RULES_LABEL, context_id, body, false).await?;
             contexts.push(PreparedContext { label: HOUSE_RULES_LABEL.to_string(), context_id, server, head, house_rules: true });
         }
         self.pin_seats(&link, &identity);
@@ -468,7 +498,7 @@ impl CouncilSync {
         let body = project_shadow(&blocks, &*kernel.kernel_db().lock())
             .map_err(|e| PrepareMiss(format!("shadow {shadow} cannot be projected: {e}")))?;
         let label = format!("shadow of {seat}");
-        let held = self.hold(&link, wire, &identity, &spec_body, &spec_id, &label, shadow, body, true).await?;
+        let held = self.hold(&link, wire, &identity, &spec_body, &spec_id, Slot::Shadow(shadow), &label, shadow, body, true).await?;
         self.pin_seats(&link, &identity);
         Ok(held)
     }
@@ -478,7 +508,8 @@ impl CouncilSync {
     /// the body as `context_id` ([`Self::hold_v1`]). A v2 server builds the
     /// queue seat for `spec` ([`super::seat::queue_seat`]) with
     /// `POST /council/v2/contexts`, and the decision sends the seat whole.
-    /// Sends nothing when the server already holds this body.
+    /// Sends nothing when the server already holds this body. The body
+    /// replaces whatever `slot` held before on this server and spec.
     #[allow(clippy::too_many_arguments)]
     async fn hold(
         &self,
@@ -487,21 +518,23 @@ impl CouncilSync {
         identity: &ServerIdentity,
         spec: &Spec,
         spec_id: &SpecId,
+        slot: Slot,
         label: &str,
         context_id: ContextId,
         body: ContextPut,
         persistent: bool,
     ) -> Result<(ServerContext, SnapshotId), PrepareMiss> {
         if wire == Wire::V1 {
-            let head = self.hold_v1(link, identity, spec_id, label, context_id, body, persistent).await?;
+            let head = self.hold_v1(link, identity, spec_id, slot, label, context_id, body, persistent).await?;
             return Ok((ServerContext::Held(context_id), head));
         }
         let seat = super::seat::queue_seat(body, spec).map_err(|e| {
             PrepareMiss(format!("council context \"{label}\" has no council v2 seat for spec {}: {e}", spec.name))
         })?;
         let hash = body_hash(&seat)?;
-        let key = (link.key.clone(), context_id, Some(spec.name.clone()));
-        let held = self.state.lock().contexts.get(&key).filter(|h| h.body == hash).map(|h| h.head.clone());
+        let key = (link.key.clone(), slot, Some(spec.name.clone()));
+        let held =
+            self.state.lock().contexts.get(&key).filter(|h| h.id == context_id && h.body == hash).map(|h| h.head.clone());
         if let Some(head) = held {
             return Ok((ServerContext::Seat(Box::new(seat)), head));
         }
@@ -509,7 +542,7 @@ impl CouncilSync {
             .send(|| async { link.client.v2().build_context(&seat, false).await })
             .await?
             .map_err(|e| self.failed(&link.key, link.server, &format!("build of context \"{label}\""), e))?;
-        self.state.lock().contexts.insert(key, Held { body: hash, head: built.head.clone() });
+        self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: built.head.clone() });
         Ok((ServerContext::Seat(Box::new(seat)), built.head))
     }
 
@@ -517,13 +550,15 @@ impl CouncilSync {
     /// A context that is not `persistent` is sent with `persist: false`
     /// when the server lists the capability: the kernel sends it again
     /// after a restart, so the server need not keep it on disk. The body
-    /// warms the spec when the server can.
+    /// warms the spec when the server can. A slot that held another id is
+    /// sent fresh, with no `If-Match`.
     #[allow(clippy::too_many_arguments)]
     async fn hold_v1(
         &self,
         link: &Link<'_>,
         identity: &ServerIdentity,
         spec_id: &SpecId,
+        slot: Slot,
         label: &str,
         context_id: ContextId,
         body: ContextPut,
@@ -536,8 +571,8 @@ impl CouncilSync {
             body.warm = Some(vec![spec_id.clone()]);
         }
         body.persist = (!persistent && identity.capabilities.contains(&Capability::Persist)).then_some(false);
-        let key = (link.key.clone(), context_id, None);
-        let held = self.state.lock().contexts.get(&key).cloned();
+        let key = (link.key.clone(), slot, None);
+        let held = self.state.lock().contexts.get(&key).filter(|h| h.id == context_id).cloned();
         if let Some(h) = held.as_ref().filter(|h| h.body == hash) {
             return Ok(h.head.clone());
         }
@@ -556,7 +591,7 @@ impl CouncilSync {
         in_flight.answered();
         match result {
             Ok(head) => {
-                self.state.lock().contexts.insert(key, Held { body: hash, head: head.clone() });
+                self.state.lock().contexts.insert(key, Held { id: context_id, body: hash, head: head.clone() });
                 Ok(head)
             }
             Err(e) if e.status() == Some(412) => {
@@ -599,9 +634,49 @@ impl CouncilSync {
             endpoint: link.endpoint.clone(),
             owner: link.owner.clone(),
             state: Arc::downgrade(&self.state),
+            kernel: self.kernel.clone(),
             renew: Duration::from_millis(self.pin_renew_ms.load(std::sync::atomic::Ordering::Relaxed)),
         };
         tokio::spawn(pinner.run(rx));
+    }
+
+    /// Lets this sync's pinners reach `kernel`, so each forgets the seats
+    /// nothing current reaches ([`Self::forget_unreachable`]) before it
+    /// sends its set. A serving kernel calls it once, at startup.
+    pub(crate) fn serve(&self, kernel: &Arc<crate::Kernel>) {
+        let _ = self.kernel.set(Arc::downgrade(kernel));
+    }
+
+    /// Forgets every held body that the gate config and the kernel's
+    /// contexts no longer reach ([`reachable`]), so the next pin `PUT`
+    /// leaves it out and the server's own expiry decides what happens to
+    /// it. A gate config that does not load forgets nothing.
+    pub(crate) async fn forget_unreachable(&self, kernel: &crate::Kernel) {
+        let config = match crate::kj::gate_policy::load_config(kernel.vfs()).await {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(error = %e, "council seats are kept: the gate config does not load");
+                return;
+            }
+        };
+        let held: Vec<(HeldKey, Held)> = self.state.lock().contexts.iter().map(|(k, h)| (k.clone(), h.clone())).collect();
+        let mut gone = Vec::new();
+        for (key, held) in held {
+            if !reachable(kernel, &config, &key, held.id).await {
+                gone.push((key, held.head));
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        for (key, head) in &gone {
+            // A body built since the check is the slot's current one.
+            if state.contexts.get(key).is_some_and(|h| h.head == *head) {
+                state.contexts.remove(key);
+            }
+        }
+        tracing::info!(seats = gone.len(), "council seats forgotten: nothing current reaches them");
     }
 
     /// Forgets what the server is believed to hold under `held`
@@ -609,7 +684,7 @@ impl CouncilSync {
     /// `prepare_labels` sends it again without `If-Match`. Call it after a
     /// 404 or 409 from a v1 decision.
     pub(crate) fn invalidate(&self, held: ContextId) {
-        self.state.lock().contexts.retain(|(_, id, spec), _| spec.is_some() || *id != held);
+        self.state.lock().contexts.retain(|(_, _, spec), h| spec.is_some() || h.id != held);
     }
 
     /// Pinners started after this renew an unchanged set every `renew`.
@@ -704,10 +779,14 @@ struct Pinner {
     endpoint: Arc<Endpoint>,
     owner: String,
     state: Weak<parking_lot::Mutex<State>>,
+    kernel: Arc<std::sync::OnceLock<Weak<crate::Kernel>>>,
     renew: Duration,
 }
 
 impl Pinner {
+    /// Each time the set changes, and every `renew` while it does not:
+    /// forget the seats nothing current reaches, when the kernel is
+    /// shared, then send the heads still held.
     async fn run(self, mut set: tokio::sync::watch::Receiver<BTreeSet<SnapshotId>>) {
         let client = match MkClient::new(&self.server, PIN_TIMEOUT) {
             Ok(client) => client,
@@ -717,8 +796,26 @@ impl Pinner {
             }
         };
         loop {
-            let heads: Vec<SnapshotId> = set.borrow_and_update().iter().cloned().collect();
-            self.put(&client, heads).await;
+            set.borrow_and_update();
+            if let Some(kernel) = self.kernel.get().and_then(Weak::upgrade) {
+                kernel.council_sync().forget_unreachable(&kernel).await;
+            }
+            let Some(state) = self.state.upgrade() else { return };
+            let heads = {
+                let state = state.lock();
+                let heads = state.seat_heads(&self.key);
+                // Record the set sent without waking this pinner, so a
+                // later change is measured against it.
+                if let Some(pins) = state.pins.get(&self.key) {
+                    pins.send_if_modified(|sent| {
+                        *sent = heads.clone();
+                        false
+                    });
+                }
+                heads
+            };
+            drop(state);
+            self.put(&client, heads.into_iter().collect()).await;
             tokio::select! {
                 changed = set.changed() => if changed.is_err() { return },
                 _ = tokio::time::sleep(self.renew) => {}
@@ -729,11 +826,21 @@ impl Pinner {
     /// One `PUT` of the whole set. A snapshot the server does not hold is
     /// forgotten, so the next decision builds its seat again; every
     /// failure is logged and the set is sent again at the next change or
-    /// renewal.
+    /// renewal. An empty set drops the owner's pins with `DELETE`.
     async fn put(&self, client: &MkClient, heads: Vec<SnapshotId>) {
-        let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
         let deadline = tokio::time::Instant::now() + PIN_TIMEOUT;
         let waits = SlotWaits::default();
+        if heads.is_empty() {
+            let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.v2().delete_pins(&self.owner).await }).await;
+            match answer {
+                Ok((_slot, Ok(()))) => tracing::info!(server = %self.server, owner = %self.owner, "council pins dropped: no seat is current"),
+                Ok((_slot, Err(e))) if e.status() == Some(404) => {}
+                Ok((_slot, Err(e))) => tracing::warn!(server = %self.server, owner = %self.owner, error = %e, "council pins are not dropped"),
+                Err(no_slot) => tracing::warn!(server = %self.server, owner = %self.owner, endpoint = %no_slot.endpoint, why = %no_slot.why, "council pins are not dropped: no slot at the server"),
+            }
+            return;
+        }
+        let body = PinsPut { snapshots: heads, ttl_s: PIN_TTL.as_secs() };
         let answer = mk_call(&self.endpoint, deadline, &waits, || async { client.v2().put_pins(&self.owner, &body).await }).await;
         let pinned = match answer {
             Ok((_slot, Ok(pinned))) => pinned,
@@ -758,9 +865,8 @@ impl Pinner {
 
 /// Builds every council v2 seat the kernel's gate config names, so the
 /// first decision finds them held and pinned: for each council and each
-/// of its specs, `[council] contexts` and the spec's own. The reviewer
-/// chain and house rules depend on the proposing seat and wait for its
-/// first decision. A v1 server, an absent config, and each failure are
+/// of its specs, `[council] contexts` and the spec's own. The seats that
+/// depend on a proposing seat are [`build_context_seats`]'s. A v1 server, an absent config, and each failure are
 /// logged and leave the seats to the first decision.
 pub(crate) async fn build_seats(kernel: &crate::Kernel) {
     let config = match crate::kj::gate_policy::load_config(kernel.vfs()).await {
@@ -793,6 +899,181 @@ pub(crate) async fn build_seats(kernel: &crate::Kernel) {
                 Ok(prepared) => tracing::info!(server = %council.server, spec = %spec.name, seats = prepared.contexts.len(), "council seats built"),
                 Err(PrepareMiss(cause)) => tracing::warn!(server = %council.server, spec = %spec.name, %cause, "council seats are not built at startup"),
             }
+        }
+    }
+}
+
+/// One decision whose seats [`build_context_seats`] builds ahead: the
+/// council config it goes to, the spec, the labels it reads, the seat whose
+/// house rules it reads, and the contexts its caller adds after them.
+pub(crate) struct SeatBuild {
+    council: CouncilConfig,
+    pub(crate) spec: String,
+    pub(crate) labels: Vec<String>,
+    seat: Option<ContextId>,
+    added: Vec<String>,
+}
+
+impl SeatBuild {
+    /// The council server the seats are built on.
+    pub(crate) fn server(&self) -> &str {
+        &self.council.server
+    }
+
+    /// Whether the decision also reads the house rules.
+    pub(crate) fn house_rules(&self) -> bool {
+        self.seat.is_some()
+    }
+}
+
+/// What the gate's decisions for `context` read on the seats that depend
+/// on it: under each of its council's shell and program specs, the labels
+/// along the reviewer chain of its performer and the house rules of its
+/// workspace, routed to the server its cast names; each observing reviewer
+/// context alone under `direction-check`; and, when its cast has an `mk`
+/// judge, the judge read's labels and house rules on the judge's server.
+/// Empty when its type has no council. Waits on no server.
+///
+/// The second value says why the reviewer chain is left out: a context
+/// with no performer, or a chain that does not resolve yet. The labels are
+/// then `[council] contexts` and the spec's own, which the decision reads
+/// too, so every seat built is one a decision reads.
+pub(crate) async fn plan_context_seats(
+    kernel: &crate::Kernel,
+    context: ContextId,
+) -> Result<(Vec<SeatBuild>, Option<String>), String> {
+    use crate::kj::gate_policy::CouncilCase;
+    let config = crate::kj::gate_policy::load_config(kernel.vfs())
+        .await
+        .map_err(|e| format!("the gate config does not load: {e}"))?;
+    let db = kernel.kernel_db().lock();
+    let row = db
+        .get_context(context)
+        .map_err(|e| format!("context {} cannot be read: {e}", context.short()))?
+        .ok_or_else(|| format!("context {} has no row", context.short()))?;
+    let Some(council) = config.council_for(Some(&row.context_type)) else { return Ok((Vec::new(), None)) };
+    let (routed, chain) = match row.played_by {
+        Some(actor) => super::gate::seat_route(&db, council, context, actor)?,
+        None => (None, Err(format!("context {} has no performer", context.short()))),
+    };
+    let council = routed.as_ref().unwrap_or(council);
+    let (chain, without_chain) = match chain {
+        Ok(chain) => (chain, None),
+        Err(cause) => (super::reviewer_contexts::ReviewerContextChain::default(), Some(cause)),
+    };
+    let seat = council.house_rules.then_some(context);
+    let long = CouncilConfig { deadline_ms: SHADOW_PRIME_TIMEOUT.as_millis() as u64, ..council.clone() };
+    let shell = super::gate::shell_spec(council);
+    let program = council.specs.iter().find(|s| s.case == CouncilCase::Program);
+    let mut builds: Vec<SeatBuild> = shell
+        .into_iter()
+        .chain(program)
+        .map(|spec| SeatBuild {
+            council: long.clone(),
+            spec: spec.name.clone(),
+            labels: chain.decision_labels(council, spec),
+            seat,
+            added: Vec::new(),
+        })
+        .collect();
+    for label in &chain.observing {
+        builds.push(SeatBuild {
+            council: long.clone(),
+            spec: super::observe::DIRECTION_CHECK.to_string(),
+            labels: vec![label.clone()],
+            seat: None,
+            added: Vec::new(),
+        });
+    }
+    let judge = super::shadow::judge_server(&db, &row)
+        .map_err(|e| format!("the judge slot of context {} cannot be read: {e}", context.short()))?;
+    if let (Some(server), Some(spec)) = (judge, shell) {
+        let seat_name = row.label.clone().unwrap_or_else(|| context.short());
+        builds.push(SeatBuild {
+            council: CouncilConfig { server, ..long.clone() },
+            spec: spec.name.clone(),
+            labels: super::shadow::judge_labels(council, spec),
+            seat,
+            added: vec![super::shadow::shadow_label(&seat_name)],
+        });
+    }
+    Ok((builds, without_chain))
+}
+
+/// Builds each planned decision's seats ([`plan_context_seats`]) on a
+/// council v2 server with the prepare the decision runs, so the decision
+/// finds them held, and pins them. A v1 server is left to the first
+/// decision. Each failure is logged.
+pub(crate) async fn build_context_seats(kernel: &crate::Kernel, context: ContextId, builds: Vec<SeatBuild>) {
+    let sync = kernel.council_sync();
+    for build in builds {
+        let deadline = tokio::time::Instant::now() + SHADOW_PRIME_TIMEOUT;
+        let waits = SlotWaits::default();
+        let server = build.server().to_string();
+        match sync.speaks_v2(kernel, &server, deadline, &waits).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(PrepareMiss(cause)) => {
+                tracing::warn!(context = %context.short(), %server, %cause, "council seats are not built ahead");
+                continue;
+            }
+        }
+        let prepared = sync
+            .prepare_labels(kernel, &build.council, &build.spec, &build.labels, build.seat, &build.added, deadline, &waits)
+            .await;
+        match prepared {
+            Ok(p) => tracing::info!(
+                context = %context.short(), %server, spec = %build.spec, seats = p.contexts.len(),
+                house_rules = p.house_rules().is_some(), "council seats built ahead of the first decision"
+            ),
+            Err(PrepareMiss(cause)) => {
+                tracing::warn!(context = %context.short(), %server, spec = %build.spec, %cause, "council seats are not built ahead")
+            }
+        }
+    }
+}
+
+/// Whether anything current still reaches the body held under `key` for
+/// the context `id`: its spec is one a council in `config` declares, or
+/// `direction-check` under `reviewer_contexts`, and
+///
+/// - a label names a live context, `id` itself, that a council reads:
+///   one of its `contexts` or a spec's, or, under `reviewer_contexts`, the
+///   council context of a character who is not retired;
+/// - house rules are read by a council with that token budget, and the
+///   file is still there (an edit replaces the body in place);
+/// - a shadow is not archived.
+async fn reachable(kernel: &crate::Kernel, config: &crate::kj::gate_policy::GateConfig, key: &HeldKey, id: ContextId) -> bool {
+    use crate::vfs::VfsOps;
+    let (_, slot, spec) = key;
+    let councils: Vec<&CouncilConfig> = config.councils().collect();
+    let reviewer_contexts = councils.iter().any(|c| c.reviewer_contexts);
+    if let Some(spec) = spec
+        && !councils.iter().any(|c| c.specs.iter().any(|s| s.name == *spec))
+        && !(reviewer_contexts && spec == super::observe::DIRECTION_CHECK)
+    {
+        return false;
+    }
+    match slot {
+        Slot::Label(label) => {
+            let db = kernel.kernel_db().lock();
+            let live = matches!(db.find_context_by_label(label), Ok(Some(row)) if row.context_id == id);
+            let named = councils.iter().any(|c| c.contexts.contains(label) || c.specs.iter().any(|s| s.contexts.contains(label)));
+            let on_a_chain = || {
+                reviewer_contexts
+                    && label
+                        .strip_prefix(super::projection::COUNCIL_CONTEXT_PREFIX)
+                        .and_then(|name| db.get_character_by_name(name).ok().flatten())
+                        .is_some_and(|sheet| sheet.retired_at.is_none())
+            };
+            live && (named || on_a_chain())
+        }
+        Slot::HouseRules { path, tokens } => {
+            councils.iter().any(|c| c.house_rules && c.house_rules_tokens == *tokens)
+                && kernel.vfs().exists(std::path::Path::new(path)).await
+        }
+        Slot::Shadow(shadow) => {
+            matches!(kernel.kernel_db().lock().get_context(*shadow), Ok(Some(row)) if row.archived_at.is_none())
         }
     }
 }
@@ -1117,7 +1398,7 @@ mod tests {
     const SPEC_WITH_TEXT: &str = include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json");
 
     struct Rig {
-        kernel: Kernel,
+        kernel: Arc<Kernel>,
         mock: Mock,
         council: CouncilConfig,
         spec: CouncilSpec,
@@ -1131,7 +1412,7 @@ mod tests {
 
     /// The rig with `mock` as its council server.
     async fn rig_on(mock: Mock) -> Rig {
-        let kernel = Kernel::new_ephemeral("council-sync").await;
+        let kernel = Arc::new(Kernel::new_ephemeral("council-sync").await);
         let config = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(config.path().join("council")).unwrap();
         std::fs::write(config.path().join("council/shell-gate.json"), SPEC).unwrap();
@@ -1802,6 +2083,74 @@ mod tests {
         assert_eq!(puts[2].0, None, "a new id has no head to match");
     }
 
+    /// An edit to the house rules replaces the house-rules seat in the pin
+    /// set and in what the kernel remembers: the next pin `PUT` names the
+    /// new head and not the old one.
+    ///
+    /// Falsified by a sync that keys a house-rules seat by its body: the
+    /// old head stays pinned beside the new one, and the kernel remembers
+    /// one more seat for each edit.
+    #[tokio::test]
+    async fn an_edit_to_the_house_rules_replaces_the_pinned_seat() {
+        let mut r = rig_on(serve_v2().await).await;
+        r.council.house_rules = true;
+        write_rules(&r, "Back up data before changing it.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo/sub"));
+        let first = prepare_seat(&r, seat).await.expect("prepared");
+        let puts = pin_puts(&r, 1).await;
+        let reviewer = first.contexts[0].head.as_str();
+        let old = first.house_rules().unwrap().head.as_str();
+        assert_eq!(puts[0].1["snapshots"], json!([reviewer, old]));
+
+        write_rules(&r, "Back up data. Never push.").await;
+        let second = prepare_seat(&r, seat).await.expect("prepared");
+        let new = second.house_rules().unwrap().head.as_str();
+        assert_ne!(new, old);
+        let puts = pin_puts(&r, 2).await;
+        assert_eq!(puts.len(), 2, "{puts:?}");
+        assert_eq!(puts[1].1["snapshots"], json!([reviewer, new]), "the edit replaces the old head");
+        assert_eq!(r.kernel.council_sync().state.lock().contexts.len(), 2, "the reviewer and the current rules");
+    }
+
+    /// A seat nothing current reaches leaves the pin set at the next pin
+    /// `PUT` once the kernel is served: a label the gate config no longer
+    /// names is forgotten, and a seat it names stays.
+    ///
+    /// Falsified by a pinner that sends every seat ever built: the dropped
+    /// label's head stays in the set.
+    #[tokio::test]
+    async fn a_seat_the_config_no_longer_reads_leaves_the_pin_set() {
+        let r = rig_on(serve_v2().await).await;
+        r.kernel.council_sync().serve(&r.kernel);
+        let other = live_context(&r.kernel, "other");
+        append_dialogue(&r.kernel, other, &["never delete originals"]);
+        let gate = |label: &str| {
+            format!(
+                "[council]\nserver = \"{}\"\ncontexts = [\"{label}\"]\npool = {{ method = \"linear\", weights = \"uniform\" }}\ndeadline_ms = 5000\n\n\
+                 [[council.spec]]\nname = \"shell-gate\"\ncase = \"shell\"\n\n\
+                 [context_type.coder.council]\nenabled = true\n",
+                r.mock.base
+            )
+        };
+        std::fs::write(r.config.path().join("gate.toml"), gate("reviewer")).unwrap();
+        let first = r.prepare().await.expect("prepared");
+        let puts = pin_puts(&r, 1).await;
+        assert_eq!(puts[0].1["snapshots"], json!([first.contexts[0].head.as_str()]));
+
+        std::fs::write(r.config.path().join("gate.toml"), gate("other")).unwrap();
+        let labels = vec!["other".to_string()];
+        let second = r
+            .kernel
+            .council_sync()
+            .prepare_labels(&r.kernel, &r.council, "shell-gate", &labels, None, &[], far(), &SlotWaits::default())
+            .await
+            .expect("prepared");
+        let puts = pin_puts(&r, 2).await;
+        assert_eq!(puts.len(), 2, "{puts:?}");
+        assert_eq!(puts[1].1["snapshots"], json!([second.contexts[0].head.as_str()]), "the reviewer seat is gone");
+        assert_eq!(r.kernel.council_sync().state.lock().contexts.len(), 1);
+    }
+
     /// With no `AGENTS.md` above the working directory, or no working
     /// directory under a mounted tree that holds one, there is no
     /// house-rules context.
@@ -1865,6 +2214,49 @@ mod tests {
         let miss = r.kernel.council_sync().prepare_labels(&r.kernel, &r.council, "shell-gate", &twice, None, &[], far(), &SlotWaits::default()).await.err().unwrap();
         assert!(miss.0.contains("\"reviewer\" twice"), "{}", miss.0);
         assert!(r.mock.puts().is_empty());
+    }
+
+    /// Live, by hand: an edited `AGENTS.md` replaces its seat in the
+    /// kernel's pin set on the server. Drops the pins at the end.
+    /// `COUNCIL_URL=http://100.65.47.5:8091 cargo test -p kaijutsu-kernel --lib live_council_v2 -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a council v2 server at COUNCIL_URL"]
+    async fn live_council_v2_house_rules_edit_replaces_the_pinned_seat() {
+        let server = std::env::var("COUNCIL_URL").expect("COUNCIL_URL names the server");
+        let mut r = rig_on(serve_v2().await).await;
+        r.council.server = server.clone();
+        r.council.deadline_ms = 120_000;
+        r.council.house_rules = true;
+        let owner = pin_owner(r.kernel.id());
+        let client = MkClient::new(&server, Duration::from_secs(30)).unwrap();
+        let pinned = |want: Vec<SnapshotId>| {
+            let (client, owner) = (&client, &owner);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    match client.v2().get_pins(owner).await {
+                        Ok(pins) if pins.snapshots.iter().collect::<BTreeSet<_>>() == want.iter().collect() => return pins,
+                        _ if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(200)).await,
+                        other => panic!("pins for {owner} never became {want:?}: {other:?}"),
+                    }
+                }
+            }
+        };
+        write_rules(&r, "Back up data before changing it.").await;
+        let seat = seat_in(&r, "lane-a", Some("/work/repo"));
+        let first = prepare_seat(&r, seat).await.expect("prepared");
+        let reviewer = first.contexts[0].head.clone();
+        let old = first.house_rules().unwrap().head.clone();
+        println!("pins: {:?}", pinned(vec![reviewer.clone(), old.clone()]).await);
+
+        write_rules(&r, "Back up data. Never push.").await;
+        let second = prepare_seat(&r, seat).await.expect("prepared");
+        let new = second.house_rules().unwrap().head.clone();
+        assert_ne!(new, old);
+        let pins = pinned(vec![reviewer, new]).await;
+        println!("after the edit: {pins:?}");
+        assert!(!pins.snapshots.contains(&old), "{pins:?}");
+        client.v2().delete_pins(&owner).await.expect("pins dropped");
     }
 
     /// Live, by hand: a council v2 seat built, pinned under the kernel's

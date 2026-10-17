@@ -1529,10 +1529,12 @@ impl Kernel {
     }
 
     /// Builds and pins the council v2 seats the gate config names, in the
-    /// background (`docs/council.md`, "Council v2 seats"). A serving kernel
-    /// calls it once at startup; failures are logged, and the first
-    /// decision builds what is missing.
+    /// background, and lets each pinner forget the seats nothing current
+    /// reaches before it sends its set (`docs/council.md`, "Council v2
+    /// seats"). A serving kernel calls it once at startup; failures are
+    /// logged, and the first decision builds what is missing.
     pub fn start_council_seats(self: &Arc<Self>) {
+        self.council_sync.serve(self);
         let kernel = self.clone();
         tokio::spawn(async move { crate::council::sync::build_seats(&kernel).await });
     }

@@ -90,6 +90,9 @@ character       create, list, show, retire — the sheet a name resolves to
 config          Read or reset files under /config/kernel and /config/client.
                 Edit them with the file tools or `kj vi`. For model
                 configuration, see `kj backend`, `kj cast`, and `kj alias`.
+council         build — build this context's council seats (reviewer chain,
+                house rules, judge) in the background ahead of its first
+                gate decision; the create and fork rc lifecycles call it
 context (ctx)   list, info, prompt, current, switch, create, scratch, rebind,
                 set, unset, log, move, rename, rotate, archive, conclude, promote,
                 demote, pause, resume, retag, hydrate — prompt renders

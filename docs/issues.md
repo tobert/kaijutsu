@@ -132,10 +132,15 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   cases, against 36 without); `thinking` is the server's default; a custom
   spec gets no examples; and the seat's size against
   `decision_context_tokens` is checked only by the server's `413`.
-- **Pinned house rules accumulate.** A house-rules seat is keyed by its
-  body, so an edited `AGENTS.md` adds a seat, and the old one stays in the
-  kernel's pin set until the kernel restarts. Judge shadows and seats whose
-  council context changed are replaced in place.
+- **Seats built ahead are built once.** `kj council build` runs at create
+  and fork. An `AGENTS.md` edited later, a reviewer assigned after create,
+  or a `cd` into another workspace is built by the next decision, on its
+  deadline. Linking the script into `submit` would catch them for turns a
+  person starts, at one rc run per submit; nothing catches them for
+  autonomous turns.
+- **Reachability ignores the server.** The pin sweep keeps a seat that some
+  council reads, without checking that the seat's server is the one that
+  council, a cast's `gate` slot, or a judge routes to.
 - **Thinking markers in a thinking-off answer.** On mkviolet, a
   `thinking: false` generation after a tool result answered with
   `<|channel>thought\n<channel|>` at the start of `content`
@@ -256,10 +261,11 @@ over time)."
 - **The budget is bytes.** `house_rules_tokens` is estimated at four bytes a
   token; the server's tokenizer may disagree. A file larger than the budget
   keeps only its start.
-- **Superseded house-rules ids stay on the server.** An edited `AGENTS.md`
-  is a new id, and the server keeps the old id's snapshots. The kernel
-  keeps one body hash per id in memory. `DELETE` an id the kernel no longer
-  produces, or let the server age it out.
+- **Superseded house-rules ids stay on a v1 server.** An edited
+  `AGENTS.md` is a new id, and a v1 server keeps the old id's snapshots.
+  The kernel remembers one body per file. `DELETE` an id the kernel no
+  longer produces, or let the server age it out. On v2 the old seat leaves
+  the pin set and the server's expiry decides.
 - **The home directory fallback.** A seat with no working directory looks
   for `AGENTS.md` from the kernel host's home directory upward, so a
   benchmark seat that never set one reads the host's file if it has one.

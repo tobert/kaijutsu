@@ -25,6 +25,7 @@ pub mod reflect;
 pub mod cp;
 pub mod config;
 pub mod context;
+pub mod council;
 pub mod db;
 pub mod diff;
 pub mod doc;
@@ -708,6 +709,7 @@ impl KjDispatcher {
             "stage" => self.dispatch_stage(&argv[1..], caller).await,
             "drift" => self.dispatch_drift(&argv[1..], caller).await,
             "cache" => self.dispatch_cache(&argv[1..], caller),
+            "council" => self.dispatch_council(&argv[1..], caller).await,
             other => KjResult::Err(format!(
                 "kj: unknown command '{}'\n\n{}",
                 other,

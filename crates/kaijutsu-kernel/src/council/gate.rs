@@ -49,7 +49,7 @@ use kaijutsu_mk::council::wire::{
     ReadAnswer,
 };
 use kaijutsu_mk::{Json, MkError};
-use kaijutsu_types::ContextId;
+use kaijutsu_types::{ContextId, PrincipalId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::Instrument;
@@ -1813,6 +1813,27 @@ fn cast_council_server(
     Ok(Some(council_address(&backend).map_err(|why| format!("the seat's cast slot `{GATE}` names {why}"))))
 }
 
+/// Where the gate's decisions for `seat` go and what they read along the
+/// reviewer chain of `actor`: `council` routed to the server the seat's cast
+/// names, `None` when it names none, and the chain. A cast slot that names
+/// no council server makes the chain a miss for every decision, before any
+/// server is asked. `Err` is a fault reading the seat's cast.
+pub(crate) fn seat_route(
+    db: &crate::kernel_db::KernelDb,
+    council: &CouncilConfig,
+    seat: ContextId,
+    actor: PrincipalId,
+) -> Result<(Option<CouncilConfig>, Result<ReviewerContextChain, String>), String> {
+    let cast_server = cast_council_server(db, seat)
+        .map_err(|e| format!("the council could not read the seat's cast: {e} (fail-closed — a database fault, not a decision)"))?;
+    let chain = super::reviewer_contexts::reviewer_context_chain(db, council, seat, actor);
+    Ok(match cast_server {
+        None => (None, chain),
+        Some(Ok(server)) => (Some(CouncilConfig { server, ..council.clone() }), chain),
+        Some(Err(cause)) => (None, Err(cause)),
+    })
+}
+
 /// Consult the council for one gate ask, or return `None` and leave the gate
 /// as it is without one. `Err` is a fault reading the gate's own state, and
 /// the caller refuses the submission as gate unavailable.
@@ -1875,24 +1896,8 @@ pub(crate) async fn consult(
     };
     let Some(council) = config.council_for(context_type.as_deref()) else { return Ok(None) };
     let Some(shell) = shell_spec(council) else { return Ok(None) };
-    let (cast_server, chain) = {
-        let db = kernel.kernel_db().lock();
-        let cast_server = cast_council_server(&db, context_id)
-            .map_err(|e| format!("the council could not read the seat's cast: {e} (fail-closed — a database fault, not a decision)"))?;
-        (cast_server, super::reviewer_contexts::reviewer_context_chain(&db, council, context_id, caller.actor_id))
-    };
-    // A seat's cast may name the council server; a slot that names none is
-    // a miss for every decision on this submission, before any server is
-    // asked.
-    let routed;
-    let (council, chain) = match cast_server {
-        None => (council, chain),
-        Some(Ok(server)) => {
-            routed = CouncilConfig { server, ..council.clone() };
-            (&routed, chain)
-        }
-        Some(Err(cause)) => (council, Err(cause)),
-    };
+    let (routed, chain) = seat_route(&kernel.kernel_db().lock(), council, context_id, caller.actor_id)?;
+    let council = routed.as_ref().unwrap_or(council);
     let resolve_cwd = cwd.clone().unwrap_or_else(|| kaish_kernel::home_dir().to_string_lossy().into_owned());
     let facts = super::shell_case::gather(kernel, caller, context_id, command, &spec.planned, &resolve_cwd).await;
     let submission = Submission {
