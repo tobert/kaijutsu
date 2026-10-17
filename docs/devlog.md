@@ -3437,3 +3437,22 @@ Lesson for splitting one tree into per-lane commits: a zero-context patch
 (`-U0`) can place a pure insertion at the wrong spot. Stage with at least
 one line of context, and build the staged index on its own in a scratch
 worktree before committing.
+
+## The nudge that read as the user (October 16)
+
+On Gemma 4 over mkviolet, thinking from an earlier turn showed up while the
+model worked on a new prompt. Two contributing factors: the "call `done`"
+notice reached the model as a user message, and the template drops an agent
+turn's thinking before the last user message, so the model treated the
+notice as a new user turn and recapped the conversation; and an interrupted
+or failed turn left nothing in history, so the next request carried two user
+prompts in a row and the model answered the older one.
+
+Kernel instructions now go through one switch, `InstructionForm`. Amy chose
+the emulated `get_system_messages` call as the default after a measurement on
+mkviolet (16 samples per form): the tool form called `done` 16/16 times and
+never read the notice as the user's words; system text read it so 2/16 times
+and a user message 16/16 times. System text stays available, and is what a
+context not offered the tool gets. A turn that ends without a reply now
+leaves a short system notice saying so. See `docs/conversation-session.md`,
+"Kernel instructions" and "A turn that ended without a reply".
