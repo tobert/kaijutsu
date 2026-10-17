@@ -162,7 +162,9 @@ PUT /council/v2/pins/kernel-7f3a
   characters and without a slash, such as a kernel id. It names pins only.
 - **`PUT` replaces the owner's whole set** and renews its time, so a client
   that restarts sends its set again and drops what it no longer needs.
-  `DELETE` drops the set; `GET` lists it. An owner with no pins is a `404`.
+  `DELETE` drops the set; `GET` lists it as `{owner, snapshots: [<id>…],
+  expires_in_s}`, naming only the snapshots that were held when pinned. An
+  owner with no pins is a `404`.
 - **A pin keeps a snapshot and the snapshots it is built on** from
   eviction, in memory and on disk. A pinned snapshot may move to a slower
   tier; it is never dropped. A pin on a snapshot the server does not hold
