@@ -11,7 +11,7 @@
 //! types choose, and each choice is named on its type: a reply tool call
 //! carries the `id` the server gave it, a generation's `token` events are
 //! `/mk/v1`'s, a `reads` reply is `reads` with each read's `logprobs`,
-//! `mass`, and `top`, and a pin set's `GET` lists its snapshot ids.
+//! `mass`, and `top`.
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -326,30 +326,13 @@ pub struct PinsPutResult {
     pub expires_in_s: Option<u64>,
 }
 
-/// The reply to `GET /council/v2/pins/{owner}`. The draft does not give its
-/// `snapshots` a shape: each entry is read as a snapshot id or as an object
-/// with an `id`.
+/// The reply to `GET /council/v2/pins/{owner}`: the snapshots that were
+/// held when pinned.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct PinSet {
     pub owner: String,
-    #[serde(deserialize_with = "pinned_ids")]
     pub snapshots: Vec<SnapshotId>,
     pub expires_in_s: u64,
-}
-
-fn pinned_ids<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<SnapshotId>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Entry {
-        Id(SnapshotId),
-        Object { id: SnapshotId },
-    }
-    Ok(Vec::<Entry>::deserialize(de)?
-        .into_iter()
-        .map(|e| match e {
-            Entry::Id(id) | Entry::Object { id } => id,
-        })
-        .collect())
 }
 
 // ---- decisions
@@ -674,10 +657,8 @@ mod tests {
         assert_eq!(r.snapshots.iter().map(|s| s.held).collect::<Vec<_>>(), [true, false]);
         let empty: PinsPutResult = serde_json::from_value(json!({"owner": "k", "snapshots": [], "expires_in_s": null})).unwrap();
         assert_eq!(empty.expires_in_s, None);
-        for snapshots in [json!([snap("51d0")]), json!([{"id": snap("51d0"), "held": true}])] {
-            let set: PinSet = serde_json::from_value(json!({"owner": "k", "snapshots": snapshots, "expires_in_s": 10})).unwrap();
-            assert_eq!(set.snapshots, [SnapshotId::parse(snap("51d0")).unwrap()]);
-        }
+        let set: PinSet = serde_json::from_value(json!({"owner": "k", "snapshots": [snap("51d0")], "expires_in_s": 10})).unwrap();
+        assert_eq!(set.snapshots, [SnapshotId::parse(snap("51d0")).unwrap()]);
         validate_owner("kernel-7f3a").unwrap();
         for bad in ["", "a/b", "tab\there", &"k".repeat(129)] {
             assert!(validate_owner(bad).is_err(), "{bad:?}");

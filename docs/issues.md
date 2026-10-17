@@ -147,9 +147,8 @@ checks run by hand: `live_council_v2_seat_is_pinned_and_read_whole`
   server's `context_tokens` is not enforced on the v2 path: there is no
   render to count the prompt, so the server's `context_full` is the check.
 - **Questions for the spec.** Snapshot ids keep v1's `snap:` form; tokens
-  and stream errors are `/mk/v1`'s; the `reads` reply shape; the shape of
-  `GET /council/v2/pins/{owner}`'s `snapshots` (mkviolet lists ids, a `PUT`
-  lists `{id, held}`); whether a generation can mark its reply `snap`; and
+  and stream errors are `/mk/v1`'s; the `reads` reply shape; whether a
+  generation can mark its reply `snap`; and
   `reasoning_effort`, which v2 does not carry.
 
 ## Council gate: what 43c4a61c left open (2026-10-04)
