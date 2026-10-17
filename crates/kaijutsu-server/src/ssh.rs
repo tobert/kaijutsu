@@ -621,6 +621,10 @@ impl SshServer {
         // (see `rpc::start_external_mcp_servers`).
         crate::rpc::start_external_mcp_servers(&shared_kernel.kernel).await;
 
+        // Council v2 seats are built and pinned off the startup path, so a
+        // slow or absent council server never holds up serving.
+        shared_kernel.kernel.start_council_seats();
+
         let auth_db = Arc::new(Mutex::new(auth_db));
         let registry = Arc::new(ServerRegistry {
             kernel: shared_kernel,

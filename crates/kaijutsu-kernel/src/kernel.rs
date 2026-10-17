@@ -1528,6 +1528,15 @@ impl Kernel {
         &self.council_sync
     }
 
+    /// Builds and pins the council v2 seats the gate config names, in the
+    /// background (`docs/council.md`, "Council v2 seats"). A serving kernel
+    /// calls it once at startup; failures are logged, and the first
+    /// decision builds what is missing.
+    pub fn start_council_seats(self: &Arc<Self>) {
+        let kernel = self.clone();
+        tokio::spawn(async move { crate::council::sync::build_seats(&kernel).await });
+    }
+
     /// The kernel's `KernelDb` handle — the same instance `blocks()` and
     /// `file_cache()` are built over, not a second connection. Callers that
     /// need a durable-table query neither of those surfaces exposes (e.g.

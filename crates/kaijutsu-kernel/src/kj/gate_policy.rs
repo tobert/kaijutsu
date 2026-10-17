@@ -944,6 +944,11 @@ impl GateConfig {
         self.council.as_ref()
     }
 
+    /// Every enabled council, one per context type that has one.
+    pub(crate) fn councils(&self) -> impl Iterator<Item = &CouncilConfig> {
+        self.council_by_type.values()
+    }
+
     /// The enabled council for a context type, with its context override.
     pub(crate) fn council_for(&self, context_type: Option<&str>) -> Option<&CouncilConfig> {
         context_type.and_then(|t| self.council_by_type.get(t))

@@ -6,16 +6,17 @@
 //! tolerate fields the draft does not name, as v1's are. Snapshot ids keep
 //! v1's form, `snap:` and 64 lowercase hex digits.
 //!
-//! Where the draft is silent, these types choose, and each choice is named
-//! on its type: a reply tool call carries the `id` the server gave it, a
-//! generation's `done` reports `head` and `snapshots` as a `PUT` reply does,
-//! its `token` events are `/mk/v1`'s, and a `reads` reply is `reads` with
-//! each read's `logprobs`, `mass`, and `top`.
+//! Every request that reads a context carries it whole as a [`Context`];
+//! the server keeps no context records. Where the draft is silent, these
+//! types choose, and each choice is named on its type: a reply tool call
+//! carries the `id` the server gave it, a generation's `token` events are
+//! `/mk/v1`'s, a `reads` reply is `reads` with each read's `logprobs`,
+//! `mass`, and `top`, and a pin set's `GET` lists its snapshot ids.
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::council::wire::{self as v1, ContextId, ContextRef, InvalidRequest, SnapshotId, SpecId};
+use crate::council::wire::{self as v1, ContextRef, InvalidRequest, SnapshotId};
 use crate::generate::{Finish, Sample, TokenEvent, Tool};
 use crate::json::Json;
 
@@ -140,17 +141,11 @@ pub fn validate_messages(messages: &[Message]) -> Result<(), InvalidRequest> {
 
 // ---- contexts
 
-/// `fork` in a `PUT`: the new context's messages extend `at`, a snapshot of
-/// `context`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fork {
-    pub context: ContextId,
-    pub at: SnapshotId,
-}
-
-/// The body of `PUT /council/v2/contexts/{id}`: the whole context.
+/// A chat context, sent whole with every request that reads it. It is a
+/// value, not a record: the client keeps it, and the server starts each
+/// request from the longest snapshot it holds along it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct ContextPut {
+pub struct Context {
     /// Absent: the server's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
@@ -160,23 +155,13 @@ pub struct ContextPut {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
     pub messages: Vec<Message>,
-    /// Requires the `fork` capability.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork: Option<Fork>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pin: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persist: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warm: Option<Vec<SpecId>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dry_run: Option<bool>,
 }
 
-impl ContextPut {
-    /// v1's body as v2's: the system message first, then each turn as a
-    /// message with its `snap` and `reasoning`. A v1 `tool` turn names no
-    /// call, so it has no v2 form and is refused.
+impl Context {
+    /// v1's body as a v2 context: the system message first, then each turn
+    /// as a message with its `snap` and `reasoning`. v1's `pin`, `persist`,
+    /// `warm`, and `dry_run` have no place in a context and are dropped. A
+    /// v1 `tool` turn names no call, so it has no v2 form and is refused.
     pub fn from_v1(body: v1::ContextPut) -> Result<Self, InvalidRequest> {
         let mut messages = vec![Message::system(body.system)];
         for (i, turn) in body.turns.into_iter().enumerate() {
@@ -196,18 +181,12 @@ impl ContextPut {
                 snap: turn.snap,
             });
         }
-        Ok(ContextPut {
-            messages,
-            pin: body.pin,
-            persist: body.persist,
-            warm: body.warm,
-            dry_run: body.dry_run,
-            ..ContextPut::default()
-        })
+        Ok(Context { messages, ..Context::default() })
     }
 
     /// Checks the rules a client can check: the messages
-    /// ([`validate_messages`]), and a `queue` that names one of `tools`.
+    /// ([`validate_messages`]), the tools, and a `queue` that names one of
+    /// `tools`.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
         validate_messages(&self.messages)?;
         crate::generate::validate_tools(&self.tools).map_err(|e| InvalidRequest(e.to_string()))?;
@@ -218,6 +197,15 @@ impl ContextPut {
         }
         Ok(())
     }
+}
+
+/// The body of `POST /council/v2/contexts`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextBuild {
+    pub context: Context,
+    /// Renders and reports `kept`, `fed`, and `from` without feeding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
 }
 
 /// Where a snapshot's state lives. A read from `host` or `disk` loads it
@@ -233,7 +221,8 @@ pub enum Tier {
     Unknown,
 }
 
-/// One held snapshot: the boundary at the end of message `message`.
+/// One held snapshot of a context: the boundary at the end of message
+/// `message`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     pub id: SnapshotId,
@@ -241,46 +230,126 @@ pub struct SnapshotInfo {
     /// counted.
     pub message: u64,
     pub tokens: u64,
-    /// With the `tiers` capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<Tier>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
 }
 
-/// The reply to `PUT /council/v2/contexts/{id}`.
+/// The reply to `POST /council/v2/contexts`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextPutResult {
-    pub id: ContextId,
+pub struct ContextBuilt {
+    /// The snapshot at the context's end.
     pub head: SnapshotId,
     pub tokens: u64,
     /// Tokens reused from `from`.
     pub kept: u64,
     /// Tokens this request ran, or would run under `dry_run`.
     pub fed: u64,
-    /// The ancestor snapshot the build started from, held by this context
-    /// or another, or `null`.
+    /// The snapshot the build started from, held from this context or any
+    /// other, or `null`.
     #[serde(deserialize_with = "required_nullable")]
     pub from: Option<SnapshotId>,
     pub dry_run: bool,
     pub snapshots: Vec<SnapshotInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned: Option<bool>,
 }
 
-/// The reply to `GET /council/v2/contexts/{id}`.
+// ---- snapshots and pins
+
+/// The longest pin a `PUT /council/v2/pins/{owner}` may ask for: a day.
+pub const PIN_TTL_MAX_S: u64 = 86_400;
+
+/// Refuses an owner the draft refuses: empty, over 128 characters, not
+/// printable, or holding a slash.
+pub fn validate_owner(owner: &str) -> Result<(), InvalidRequest> {
+    if owner.is_empty() || owner.chars().count() > 128 || owner.contains('/') || owner.chars().any(char::is_control) {
+        return Err(InvalidRequest(format!(
+            "pin owner {owner:?} is not 1 to 128 printable characters without a slash"
+        )));
+    }
+    Ok(())
+}
+
+/// An owner of a pin on a snapshot, and the seconds its pins have left.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextState {
-    pub id: ContextId,
-    pub head: SnapshotId,
+pub struct PinHolder {
+    pub owner: String,
+    pub expires_in_s: u64,
+}
+
+/// The reply to `GET /council/v2/snapshots/{id}`. `pins` names the owners
+/// that pin this snapshot, not the ones whose pins keep it as part of a
+/// chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotState {
+    pub id: SnapshotId,
     pub tokens: u64,
-    pub snapshots: Vec<SnapshotInfo>,
+    pub tier: Tier,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persist: Option<bool>,
+    pub bytes: Option<u64>,
+    pub pins: Vec<PinHolder>,
+}
+
+/// The body of `PUT /council/v2/pins/{owner}`: the owner's whole set, held
+/// for `ttl_s` seconds from now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinsPut {
+    pub snapshots: Vec<SnapshotId>,
+    pub ttl_s: u64,
+}
+
+impl PinsPut {
+    /// Checks a `ttl_s` of 1 to [`PIN_TTL_MAX_S`].
+    pub fn validate(&self) -> Result<(), InvalidRequest> {
+        if self.ttl_s == 0 || self.ttl_s > PIN_TTL_MAX_S {
+            return Err(InvalidRequest(format!("ttl_s {} is not 1 to {PIN_TTL_MAX_S}", self.ttl_s)));
+        }
+        Ok(())
+    }
+}
+
+/// One snapshot of a `PUT` set. `held: false` holds nothing: the server
+/// does not hold that snapshot, and the client builds its context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinHeld {
+    pub id: SnapshotId,
+    pub held: bool,
+}
+
+/// The reply to `PUT /council/v2/pins/{owner}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinsPutResult {
+    pub owner: String,
+    pub snapshots: Vec<PinHeld>,
+    /// `null` for an empty set, which holds nothing.
+    #[serde(deserialize_with = "required_nullable")]
+    pub expires_in_s: Option<u64>,
+}
+
+/// The reply to `GET /council/v2/pins/{owner}`. The draft does not give its
+/// `snapshots` a shape: each entry is read as a snapshot id or as an object
+/// with an `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct PinSet {
+    pub owner: String,
+    #[serde(deserialize_with = "pinned_ids")]
+    pub snapshots: Vec<SnapshotId>,
+    pub expires_in_s: u64,
+}
+
+fn pinned_ids<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<SnapshotId>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Id(SnapshotId),
+        Object { id: SnapshotId },
+    }
+    Ok(Vec::<Entry>::deserialize(de)?
+        .into_iter()
+        .map(|e| match e {
+            Entry::Id(id) | Entry::Object { id } => id,
+        })
+        .collect())
 }
 
 // ---- decisions
@@ -292,30 +361,58 @@ pub struct Think {
     pub tokens: u64,
 }
 
-/// The body of `POST /council/v2/decisions`: v1's, plus `think`. The answer
-/// is v1's [`v1::DecisionResponse`], each read with its `thought`.
+/// The body of `POST /council/v2/decisions`: v1's without its `contexts`,
+/// the contexts sent whole, and `think`. The answer is v1's
+/// [`v1::DecisionResponse`]; each read names its context by its index in
+/// `contexts`, as do the keys of `leave_one_out`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DecisionRequest {
+    /// Its `contexts` stays `None`.
     #[serde(flatten)]
     pub decision: v1::DecisionRequest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<Context>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<Think>,
 }
 
 impl DecisionRequest {
-    /// v1's checks ([`v1::DecisionRequest::validate`]).
+    /// The request as v1 would name its contexts: each by its index in
+    /// `contexts`, which is how a v2 answer names them. Math checks
+    /// ([`crate::council::math::verify`]) read this view.
+    pub fn by_index(&self) -> v1::DecisionRequest {
+        let names = (!self.contexts.is_empty())
+            .then(|| (0..self.contexts.len()).map(|i| ContextRef { id: i.to_string(), at: None }).collect());
+        v1::DecisionRequest { contexts: names, ..self.decision.clone() }
+    }
+
+    /// v1's checks over [`Self::by_index`], each context's own
+    /// ([`Context::validate`]), and no v1 `contexts`.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
-        self.decision.validate()
+        if self.decision.contexts.is_some() {
+            return Err(InvalidRequest("a council v2 decision sends its contexts whole, not v1 context ids".into()));
+        }
+        self.by_index().validate()?;
+        for (i, c) in self.contexts.iter().enumerate() {
+            c.validate().map_err(|e| InvalidRequest(format!("context {i}: {}", e.0)))?;
+        }
+        Ok(())
+    }
+
+    /// Recomputes `response`'s derived numbers from its raw reads
+    /// ([`crate::council::math::verify`]), its reads named by index.
+    pub fn verify(&self, response: &v1::DecisionResponse) -> Result<(), crate::council::math::Mismatch> {
+        crate::council::math::verify(response, &self.by_index())
     }
 }
 
 // ---- reads
 
 /// The body of `POST /council/v2/reads`: each suffix read after each
-/// context's head. Capability `reads`.
+/// context's end. Capability `reads`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReadsRequest {
-    pub contexts: Vec<ContextRef>,
+    pub contexts: Vec<Context>,
     /// The client's own structure; special-token text tokenizes as single
     /// ids.
     pub suffixes: Vec<String>,
@@ -326,17 +423,15 @@ pub struct ReadsRequest {
 }
 
 impl ReadsRequest {
-    /// Checks 1 to 8 distinct contexts, at least one suffix, and at least
-    /// two distinct letters.
+    /// Checks 1 to 8 valid contexts, at least one suffix, and at least two
+    /// distinct letters.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
         let bad = |m: &str| Err(InvalidRequest(m.to_string()));
         if self.contexts.is_empty() || self.contexts.len() > 8 {
-            return bad("reads name 1 to 8 contexts");
+            return bad("reads send 1 to 8 contexts");
         }
         for (i, c) in self.contexts.iter().enumerate() {
-            if self.contexts[..i].iter().any(|p| p.id == c.id) {
-                return Err(InvalidRequest(format!("context {} repeated", c.id)));
-            }
+            c.validate().map_err(|e| InvalidRequest(format!("context {i}: {}", e.0)))?;
         }
         if self.suffixes.is_empty() {
             return bad("reads need a suffix");
@@ -359,13 +454,12 @@ pub struct TopToken {
 /// One context's read of one suffix.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RawRead {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<ContextId>,
+    /// The index of the context read, in `contexts`.
+    pub context: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotId>,
     /// The index of the suffix read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub suffix: Option<u64>,
+    pub suffix: u64,
     /// Each letter's full-vocabulary log probability.
     pub logprobs: IndexMap<String, f64>,
     /// `log Σ exp(logprobs)`.
@@ -384,13 +478,10 @@ pub struct ReadsResponse {
 // ---- generations
 
 /// The body of `POST /council/v2/generations`, less `stream`, which the
-/// calls set. Capability `generate`.
+/// calls set. The reply follows the context's end. Capability `generate`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
-    pub context: ContextId,
-    /// Appended to the context before the reply, with boundaries where
-    /// marked.
-    pub messages: Vec<Message>,
+    pub context: Context,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,10 +489,10 @@ pub struct GenerationRequest {
 }
 
 impl GenerationRequest {
-    /// Checks the appended messages ([`validate_messages`]) and a positive
+    /// Checks the context ([`Context::validate`]) and a positive
     /// `max_tokens`.
     pub fn validate(&self) -> Result<(), InvalidRequest> {
-        validate_messages(&self.messages)?;
+        self.context.validate()?;
         if self.max_tokens == Some(0) {
             return Err(InvalidRequest("max_tokens must be at least 1".into()));
         }
@@ -456,16 +547,17 @@ impl<'de> Deserialize<'de> for ReplyToolCall {
 }
 
 /// A generation's token counts: `kept` came from held state, `fed` was
-/// prefilled now.
+/// prefilled now, and the two make `prompt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct GenerationUsage {
+    pub prompt: u64,
     pub kept: u64,
     pub fed: u64,
     pub completion: u64,
 }
 
-/// The finished reply, which is now the context's head. It reports the
-/// head and snapshots as a `PUT` reply does.
+/// The finished reply. The client appends it to its own messages for the
+/// next request.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct GenerationDone {
     pub content: String,
@@ -476,7 +568,11 @@ pub struct GenerationDone {
     pub tool_calls: Vec<ReplyToolCall>,
     pub finish: Finish,
     pub usage: GenerationUsage,
-    pub head: SnapshotId,
+    /// The snapshot after the reply when the server holds it, else `null`,
+    /// and the next request starts from the context's last boundary.
+    #[serde(deserialize_with = "required_nullable")]
+    pub head: Option<SnapshotId>,
+    /// The context's snapshots.
     pub snapshots: Vec<SnapshotInfo>,
 }
 
@@ -499,10 +595,8 @@ mod tests {
         format!("snap:{prefix}{}", "0".repeat(64 - prefix.len()))
     }
 
-    const CTX: &str = "0199b3c4-6c1e-7a2b-9f00-3e5d1c2a7b12";
-
-    /// The draft's `PUT` example, with its elisions filled in.
-    fn doc_put() -> serde_json::Value {
+    /// The draft's context example, with its elisions filled in.
+    fn doc_context() -> serde_json::Value {
         json!({"thinking": true,
                "tools": [{"type": "function", "function": {"name": "next_command", "description": "The next command.",
                           "parameters": {"type": "object", "properties": {"answers": {"type": "object"}}}}}],
@@ -518,60 +612,76 @@ mod tests {
                   "snap": true}]})
     }
 
-    fn doc_put_result() -> serde_json::Value {
-        json!({"id": CTX, "head": snap("51d0"), "tokens": 1840, "kept": 0, "fed": 1840,
+    fn doc_built() -> serde_json::Value {
+        json!({"head": snap("51d0"), "tokens": 1840, "kept": 0, "fed": 1840,
                "from": null, "dry_run": false,
-               "snapshots": [{"id": snap("9a1e"), "message": 1, "tokens": 412, "tier": "device"},
-                             {"id": snap("51d0"), "message": 4, "tokens": 1840, "tier": "device"}]})
+               "snapshots": [{"id": snap("9a1e"), "message": 1, "tokens": 412, "tier": "host"},
+                             {"id": snap("51d0"), "message": 4, "tokens": 1840, "tier": "host"}]})
     }
 
     #[test]
-    fn the_drafts_context_put_round_trips_and_validates() {
-        let put: ContextPut = serde_json::from_value(doc_put()).unwrap();
-        put.validate().unwrap();
-        assert_eq!(put.messages.len(), 5);
-        assert_eq!(put.messages[3].tool_call_id.as_deref(), Some("c0"));
-        assert!(put.messages[1].snap && !put.messages[2].snap && put.messages[4].snap);
-        assert_eq!(put.queue.as_deref(), Some("next_command"));
-        assert_eq!(serde_json::to_value(&put).unwrap(), doc_put());
+    fn the_drafts_context_round_trips_and_validates() {
+        let build = json!({"context": doc_context()});
+        let b: ContextBuild = serde_json::from_value(build.clone()).unwrap();
+        b.context.validate().unwrap();
+        assert_eq!(b.context.messages.len(), 5);
+        assert_eq!(b.context.messages[3].tool_call_id.as_deref(), Some("c0"));
+        assert!(b.context.messages[1].snap && !b.context.messages[2].snap && b.context.messages[4].snap);
+        assert_eq!(b.context.queue.as_deref(), Some("next_command"));
+        assert_eq!(serde_json::to_value(&b).unwrap(), build);
+        let dry = ContextBuild { dry_run: Some(true), ..b };
+        assert_eq!(serde_json::to_value(&dry).unwrap()["dry_run"], json!(true));
     }
 
     #[test]
-    fn the_drafts_put_result_decodes_with_from_and_tiers() {
-        let r: ContextPutResult = serde_json::from_value(doc_put_result()).unwrap();
+    fn the_drafts_build_reply_decodes_with_from_and_tiers() {
+        let r: ContextBuilt = serde_json::from_value(doc_built()).unwrap();
         assert_eq!(r.from, None);
-        assert_eq!(r.snapshots.iter().map(|s| (s.message, s.tier)).collect::<Vec<_>>(), [(1, Some(Tier::Device)), (4, Some(Tier::Device))]);
-        assert_eq!(serde_json::to_value(&r).unwrap(), doc_put_result());
-        let mut later = doc_put_result();
+        assert_eq!(r.snapshots.iter().map(|s| (s.message, s.tier)).collect::<Vec<_>>(), [(1, Some(Tier::Host)), (4, Some(Tier::Host))]);
+        assert_eq!(serde_json::to_value(&r).unwrap(), doc_built());
+        let mut later = doc_built();
         later["from"] = json!(snap("9a1e"));
         later["snapshots"][0]["tier"] = json!("nvram");
         later["extra"] = json!(1);
-        let r: ContextPutResult = serde_json::from_value(later).unwrap();
+        let r: ContextBuilt = serde_json::from_value(later).unwrap();
         assert_eq!(r.from.unwrap().as_str(), snap("9a1e"));
         assert_eq!(r.snapshots[0].tier, Some(Tier::Unknown), "a newer tier is not an error");
         for missing in ["from", "kept", "head"] {
-            let mut v = doc_put_result();
+            let mut v = doc_built();
             v.as_object_mut().unwrap().remove(missing);
-            assert!(serde_json::from_value::<ContextPutResult>(v).is_err(), "{missing}");
+            assert!(serde_json::from_value::<ContextBuilt>(v).is_err(), "{missing}");
         }
-        let mut v = doc_put_result();
+        let mut v = doc_built();
         v["snapshots"][0].as_object_mut().unwrap().remove("message");
-        assert!(serde_json::from_value::<ContextPutResult>(v).is_err(), "a snapshot names its message");
+        assert!(serde_json::from_value::<ContextBuilt>(v).is_err(), "a snapshot names its message");
     }
 
     #[test]
-    fn a_fork_and_the_v1_options_serialize_only_when_set() {
-        let put = ContextPut {
-            messages: vec![Message::system("s"), Message::user("u").snapped()],
-            fork: Some(Fork { context: CTX.into(), at: SnapshotId::parse(snap("9a1e")).unwrap() }),
-            persist: Some(false),
-            ..ContextPut::default()
-        };
-        assert_eq!(
-            serde_json::to_value(&put).unwrap(),
-            json!({"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u", "snap": true}],
-                   "fork": {"context": CTX, "at": snap("9a1e")}, "persist": false})
-        );
+    fn the_drafts_snapshot_and_pins_examples_decode() {
+        let state: SnapshotState = serde_json::from_value(json!({"id": snap("51d0"), "tokens": 1840, "tier": "host",
+            "bytes": 829030400u64, "pins": [{"owner": "kernel-7f3a", "expires_in_s": 3412}]}))
+        .unwrap();
+        assert_eq!((state.tier, state.pins[0].owner.as_str(), state.pins[0].expires_in_s), (Tier::Host, "kernel-7f3a", 3412));
+        let put = PinsPut { snapshots: vec![SnapshotId::parse(snap("51d0")).unwrap()], ttl_s: 3600 };
+        put.validate().unwrap();
+        assert_eq!(serde_json::to_value(&put).unwrap(), json!({"snapshots": [snap("51d0")], "ttl_s": 3600}));
+        for ttl_s in [0, PIN_TTL_MAX_S + 1] {
+            assert!(PinsPut { ttl_s, ..put.clone() }.validate().is_err(), "{ttl_s}");
+        }
+        let r: PinsPutResult = serde_json::from_value(json!({"owner": "kernel-7f3a",
+            "snapshots": [{"id": snap("51d0"), "held": true}, {"id": snap("c4e2"), "held": false}], "expires_in_s": 3600}))
+        .unwrap();
+        assert_eq!(r.snapshots.iter().map(|s| s.held).collect::<Vec<_>>(), [true, false]);
+        let empty: PinsPutResult = serde_json::from_value(json!({"owner": "k", "snapshots": [], "expires_in_s": null})).unwrap();
+        assert_eq!(empty.expires_in_s, None);
+        for snapshots in [json!([snap("51d0")]), json!([{"id": snap("51d0"), "held": true}])] {
+            let set: PinSet = serde_json::from_value(json!({"owner": "k", "snapshots": snapshots, "expires_in_s": 10})).unwrap();
+            assert_eq!(set.snapshots, [SnapshotId::parse(snap("51d0")).unwrap()]);
+        }
+        validate_owner("kernel-7f3a").unwrap();
+        for bad in ["", "a/b", "tab\there", &"k".repeat(129)] {
+            assert!(validate_owner(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -589,21 +699,23 @@ mod tests {
         for (name, messages) in cases {
             assert!(validate_messages(&messages).is_err(), "{name}");
         }
-        let mut queue: ContextPut = serde_json::from_value(doc_put()).unwrap();
+        let mut queue: Context = serde_json::from_value(doc_context()).unwrap();
         queue.queue = Some("missing".into());
         assert!(queue.validate().is_err(), "queue names a tool");
     }
 
-    /// A system message after the first is system text at that point, in a
-    /// whole context and in the messages a generation appends. It still
-    /// carries no reasoning or calls.
+    /// A system message after the first is system text at that point. It
+    /// still carries no reasoning or calls.
     #[test]
     fn a_later_system_message_is_accepted() {
         let nudge = "You replied without a tool call, so the task is still open.";
         let context = [Message::system("s"), Message::user("u"), Message::assistant("a"), Message::system(nudge)];
         validate_messages(&context).unwrap();
-        validate_messages(&[Message::system(nudge)]).unwrap();
-        let generation = GenerationRequest { context: CTX.into(), messages: vec![Message::system(nudge)], max_tokens: None, sample: None };
+        let generation = GenerationRequest {
+            context: Context { messages: context.to_vec(), ..Context::default() },
+            max_tokens: None,
+            sample: None,
+        };
         generation.validate().unwrap();
         assert!(validate_messages(&[Message { reasoning: Some("r".into()), ..Message::system(nudge) }]).is_err());
     }
@@ -616,41 +728,54 @@ mod tests {
                 v1::Turn { role: v1::Role::User, content: "a".into(), snap: false, reasoning: None },
                 v1::Turn { role: v1::Role::Assistant, content: "b".into(), snap: true, reasoning: Some("why".into()) },
             ],
-            pin: None,
+            pin: Some(true),
             warm: None,
             dry_run: None,
             persist: Some(false),
         };
-        let put = ContextPut::from_v1(v1_body.clone()).unwrap();
+        let context = Context::from_v1(v1_body.clone()).unwrap();
         assert_eq!(
-            serde_json::to_value(&put).unwrap(),
+            serde_json::to_value(&context).unwrap(),
             json!({"messages": [{"role": "system", "content": "rules"},
                                 {"role": "user", "content": "a"},
-                                {"role": "assistant", "content": "b", "reasoning": "why", "snap": true}],
-                   "persist": false})
+                                {"role": "assistant", "content": "b", "reasoning": "why", "snap": true}]})
         );
         let tool = v1::ContextPut {
             turns: vec![v1::Turn { role: v1::Role::Tool, content: "x".into(), snap: false, reasoning: None }],
             ..v1_body
         };
-        assert!(ContextPut::from_v1(tool).is_err());
+        assert!(Context::from_v1(tool).is_err());
     }
 
+    /// A v2 decision sends its contexts whole and names them by index, so
+    /// its math view names each read's context as the server does.
+    ///
+    /// Falsified by a request that keeps v1 ids or names contexts any other
+    /// way.
     #[test]
-    fn a_decision_is_v1_plus_think() {
-        let text = r#"{"state":"git push","spec_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contexts":[{"id":"c"}],"think":{"tokens":64}}"#;
-        let req: DecisionRequest = serde_json::from_str(text).unwrap();
+    fn a_decision_sends_its_contexts_whole_and_names_them_by_index() {
+        let spec = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let text = json!({"state": "git push", "spec_id": spec, "contexts": [doc_context(), doc_context()], "think": {"tokens": 64}});
+        let req: DecisionRequest = serde_json::from_value(text.clone()).unwrap();
         req.validate().unwrap();
         assert_eq!(req.think, Some(Think { tokens: 64 }));
-        assert_eq!(req.decision.contexts.as_ref().unwrap()[0].id, "c");
-        assert_eq!(serde_json::to_string(&req).unwrap(), text);
-        let plain = DecisionRequest { think: None, ..req };
+        assert_eq!(req.contexts.len(), 2);
+        assert_eq!(req.decision.contexts, None);
+        assert_eq!(serde_json::to_value(&req).unwrap(), text);
+        let ids: Vec<String> = req.by_index().contexts.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["0", "1"]);
+        let plain = DecisionRequest { think: None, ..req.clone() };
         assert!(serde_json::to_value(&plain).unwrap().get("think").is_none());
+        let v1_ids = DecisionRequest {
+            decision: v1::DecisionRequest { contexts: Some(vec![ContextRef { id: "c".into(), at: None }]), ..req.decision.clone() },
+            ..req
+        };
+        assert!(v1_ids.validate().is_err(), "a v1 context id is refused");
     }
 
     #[test]
     fn the_drafts_reads_request_round_trips_and_validates() {
-        let doc = json!({"contexts": [{"id": CTX}],
+        let doc = json!({"contexts": [doc_context()],
                          "suffixes": ["<channel|><|tool_call>call:next_command{answers:{verdict:<|\"|>"],
                          "letters": ["A", "B", "C"], "top": 5});
         let req: ReadsRequest = serde_json::from_value(doc.clone()).unwrap();
@@ -664,17 +789,19 @@ mod tests {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
         let reply: ReadsResponse = serde_json::from_value(json!({"reads": [
-            {"context": CTX, "snapshot": snap("51d0"), "suffix": 0,
+            {"context": 0, "snapshot": snap("51d0"), "suffix": 0,
              "logprobs": {"A": -0.01, "B": -5.0, "C": -6.0}, "mass": -0.003,
              "top": [{"token": "A", "logprob": -0.01}]}]}))
         .unwrap();
+        assert_eq!(reply.reads[0].context, 0);
         assert_eq!(reply.reads[0].logprobs.keys().collect::<Vec<_>>(), ["A", "B", "C"]);
     }
 
     #[test]
     fn the_drafts_generation_request_round_trips() {
-        let doc = json!({"context": CTX, "messages": [{"role": "user", "content": "how did it go?", "snap": true}],
-                         "max_tokens": 2048, "sample": {"temperature": 1.0}});
+        let mut context = doc_context();
+        context["messages"].as_array_mut().unwrap().push(json!({"role": "user", "content": "how did it go?", "snap": true}));
+        let doc = json!({"context": context, "max_tokens": 2048, "sample": {"temperature": 1.0}});
         let req: GenerationRequest = serde_json::from_value(doc.clone()).unwrap();
         req.validate().unwrap();
         assert_eq!(serde_json::to_value(&req).unwrap(), doc);
@@ -684,7 +811,7 @@ mod tests {
     fn done() -> serde_json::Value {
         json!({"content": "", "reasoning": "list it",
                "tool_calls": [{"id": "c2", "name": "ls", "arguments": {"path": "/tmp", "all": true}}],
-               "finish": "stop", "usage": {"kept": 1840, "fed": 12, "completion": 30},
+               "finish": "stop", "usage": {"prompt": 1852, "kept": 1840, "fed": 12, "completion": 30},
                "head": snap("77aa"), "snapshots": [{"id": snap("9a1e"), "message": 1, "tokens": 412}]})
     }
 
@@ -696,7 +823,11 @@ mod tests {
         let [ReplyToolCall::Parsed { id, name, arguments }] = d.tool_calls.as_slice() else { panic!("{:?}", d.tool_calls) };
         assert_eq!((id.as_str(), name.as_str()), ("c2", "ls"));
         assert_eq!(serde_json::to_string(arguments).unwrap(), r#"{"path":"/tmp","all":true}"#);
-        assert_eq!((d.usage.kept, d.usage.fed, d.head.as_str()), (1840, 12, snap("77aa").as_str()));
+        assert_eq!((d.usage.prompt, d.usage.kept, d.usage.fed), (1852, 1840, 12));
+        assert_eq!(d.head.as_ref().map(|h| h.as_str()), Some(snap("77aa").as_str()));
+        let mut unheld = done();
+        unheld["head"] = json!(null);
+        assert_eq!(serde_json::from_value::<GenerationDone>(unheld).unwrap().head, None, "a head the server did not hold");
         let mut unparsed = done();
         unparsed["tool_calls"] = json!([{"id": "c3", "name": null, "raw": "<function=", "error": "no name"}]);
         let d: GenerationDone = serde_json::from_value(unparsed).unwrap();

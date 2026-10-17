@@ -227,19 +227,6 @@ pub struct BuildOpts {
     /// Boxed behind an `Arc` so `BuildOpts` stays small: it sits by value in
     /// every provider stream future.
     pub trace: Option<std::sync::Arc<crate::llm::request_dump::RequestTrace>>,
-    /// The kernel context this request continues, for a provider that holds
-    /// each conversation on its server: the mk backend on a council v2
-    /// server (`docs/council-api-v2.md`). `None` sends the whole
-    /// conversation, as every other provider does.
-    pub held: Option<HeldContext>,
-}
-
-/// The context a held conversation is kept under, and the context it was
-/// forked from, whose held snapshots a fork can start from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeldContext {
-    pub context: kaijutsu_types::ContextId,
-    pub forked_from: Option<kaijutsu_types::ContextId>,
 }
 
 impl BuildOpts {
@@ -256,13 +243,7 @@ impl BuildOpts {
             tools: Vec::new(),
             cache_breakpoints: Vec::new(),
             trace: None,
-            held: None,
         }
-    }
-
-    pub fn with_held(mut self, held: HeldContext) -> Self {
-        self.held = Some(held);
-        self
     }
 
     pub fn with_trace(mut self, trace: crate::llm::request_dump::RequestTrace) -> Self {

@@ -73,7 +73,6 @@ fn opts(effort: &str, max_tokens: u64) -> BuildOpts {
         tools: tools(),
         cache_breakpoints: Vec::new(),
         trace: None,
-        held: None,
     }
 }
 

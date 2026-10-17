@@ -270,7 +270,7 @@ async fn judge_one(
     };
     let primed =
         kernel.council_sync().prime_shadow(kernel, &server, &spec.name, read.shadow, &read.seat_name, deadline, &waits);
-    let (held, head) = match tokio::time::timeout_at(deadline, primed).await {
+    let (server_context, head) = match tokio::time::timeout_at(deadline, primed).await {
         Ok(Ok(primed)) => primed,
         Ok(Err(super::sync::PrepareMiss(cause))) => return miss(judged, cause),
         Err(_) => {
@@ -286,10 +286,11 @@ async fn judge_one(
     prepared.contexts.push(super::sync::PreparedContext {
         label: label.clone(),
         context_id: read.shadow,
-        held,
+        server: server_context,
         head,
         house_rules: false,
     });
+    let shadow_name = prepared.read_name(prepared.contexts.len() - 1);
     let request = super::gate::decision_request(&prepared, &council, state.clone());
     let asked = std::time::Instant::now();
     let response = match super::gate::ask_within(kernel, &prepared, &request, &council, deadline, &waits).await {
@@ -307,8 +308,7 @@ async fn judge_one(
         engine: response.identity.engine.clone(),
     };
     judged.observation.queue_ms = super::gate::queue_ms(&waits, response.queue_ms);
-    let shadow_id = held.to_string();
-    if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_id.as_str())) {
+    if let Some(shadow_read) = response.reads.iter().find(|r| r.context.as_deref() == Some(shadow_name.as_str())) {
         judged.observation.snapshot = shadow_read.snapshot.as_ref().map(|s| s.to_string());
         judged.observation.questions =
             shadow_read.answers.iter().map(|(id, answer)| super::gate::read_question(id, answer)).collect();

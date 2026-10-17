@@ -30,6 +30,21 @@ where
     Option::<T>::deserialize(de)
 }
 
+/// A read's required `context`: `null`, an id, or a council v2 index as
+/// its decimal text.
+fn context_name<'de, D: Deserializer<'de>>(de: D) -> Result<Option<ContextId>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Name {
+        Id(ContextId),
+        Index(u64),
+    }
+    Ok(Option::<Name>::deserialize(de)?.map(|n| match n {
+        Name::Id(id) => id,
+        Name::Index(i) => i.to_string(),
+    }))
+}
+
 fn is_lower_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -37,7 +52,7 @@ fn is_lower_hex(s: &str, len: usize) -> bool {
 macro_rules! prefixed_id {
     ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
         $(#[$doc])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
@@ -540,8 +555,10 @@ pub enum PooledAnswer {
 /// One context's read of the case.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Read {
-    /// The context read, or null for the spec alone.
-    #[serde(deserialize_with = "required_nullable")]
+    /// The context read, or null for the spec alone. A council v2 answer
+    /// names it by its index in the request's `contexts`, read here as
+    /// that index's decimal text.
+    #[serde(deserialize_with = "context_name")]
     pub context: Option<ContextId>,
     /// The snapshot the read started from, or null for inline questions with no context.
     #[serde(deserialize_with = "required_nullable")]
@@ -645,8 +662,8 @@ pub enum Capability {
     Generate,
     /// Council v2: decisions accept `think` with `tokens` above 0.
     Think,
-    /// Council v2: `PUT` accepts `fork`.
-    Fork,
+    /// Council v2: `/council/v2/pins`.
+    Pins,
     /// Council v2: snapshots report `tier`, and pinned snapshots move
     /// between tiers.
     Tiers,

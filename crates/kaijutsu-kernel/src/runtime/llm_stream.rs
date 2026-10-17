@@ -2587,18 +2587,6 @@ async fn run_llm_stream(
 
     // Counts inferences this turn, for logging only.
     let mut iteration: u32 = 0;
-    // A provider that holds the conversation on its server keeps it under
-    // this context, and a fork starts from its parent's held snapshots.
-    let held_context = crate::llm::HeldContext {
-        context: context_id,
-        forked_from: match kernel_db.lock().get_context(context_id) {
-            Ok(row) => row.and_then(|row| row.forked_from),
-            Err(e) => {
-                tracing::warn!("Fork parent read failed for {context_id}: {e}; a held conversation starts without it");
-                None
-            }
-        },
-    };
     // Request sensors: the summary line always, the body dump when
     // `KJ_LLM_REQUEST_DUMP` names a directory. One trace per turn, so a write
     // failure warns once.
@@ -2698,8 +2686,7 @@ async fn run_llm_stream(
                 .with_system(&system_prompt)
                 .with_max_tokens(max_output_tokens)
                 .with_tools(tools.clone())
-                .with_cache_breakpoints(cache_breakpoints)
-                .with_held(held_context),
+                .with_cache_breakpoints(cache_breakpoints),
             &tunables,
         );
 
@@ -7419,15 +7406,6 @@ mod lifetime_tests {
     use std::time::Duration;
 
     async fn fixture(mock: Option<MockClient>) -> (Arc<Kernel>, ContextId, BlockId, crate::ExecContext) {
-        fixture_forked(mock, None).await
-    }
-
-    /// [`fixture`], with the context forked from `parent`, whose row is
-    /// inserted first.
-    async fn fixture_forked(
-        mock: Option<MockClient>,
-        parent: Option<ContextId>,
-    ) -> (Arc<Kernel>, ContextId, BlockId, crate::ExecContext) {
         let kernel = Arc::new(Kernel::new_ephemeral("turn-lifetime").await.with_timeouts(
             kaijutsu_types::TimeoutPolicy {
                 llm_idle_timeout: Duration::from_millis(100),
@@ -7438,9 +7416,6 @@ mod lifetime_tests {
         let actor = PrincipalId::new();
         let reviewer = PrincipalId::new();
         kernel.blocks().create_document(context, DocumentKind::Conversation, None).unwrap();
-        if let Some(parent) = parent {
-            kernel.blocks().create_document(parent, DocumentKind::Conversation, None).unwrap();
-        }
         {
             let db = kernel.kernel_db().lock();
             for (id, name) in [(actor, "performer"), (reviewer, "reviewer")] {
@@ -7449,19 +7424,15 @@ mod lifetime_tests {
                     handoff_ctx: None, root_ctx: None, root: false,
                 }).unwrap();
             }
-            let row = |context_id, forked_from| crate::ContextRow {
-                context_id, label: None, provider: None, model: None, system_prompt: None,
+            db.insert_context(&crate::ContextRow {
+                context_id: context, label: None, provider: None, model: None, system_prompt: None,
                 context_state: ContextState::Live,
                 context_type: "default".into(), created_at: 0, created_by: reviewer,
-                forked_from, fork_kind: None, archived_at: None, workspace_id: None,
+                forked_from: None, fork_kind: None, archived_at: None, workspace_id: None,
                 preset_id: None, concluded_at: None, last_activity_at: None, promoted_at: None,
                 demoted_at: None, paused_at: None, cast_id: None, origin_host: None,
                 played_by: Some(actor), reviewer_id: Some(reviewer), director_id: None,
-            };
-            if let Some(parent) = parent {
-                db.insert_context(&row(parent, None)).unwrap();
-            }
-            db.insert_context(&row(context, parent)).unwrap();
+            }).unwrap();
         }
         if let Some(mock) = mock {
             let mut registry = kernel.llm().write().await;
@@ -8757,24 +8728,6 @@ mod lifetime_tests {
             (crate::llm::Role::User, crate::llm::MessageContent::Text(text)) => Some(text),
             _ => None,
         }
-    }
-
-    /// Every inference names the context it continues and that context's
-    /// fork parent, so a provider that holds conversations on its server
-    /// (the mk backend on council v2) keeps each under the kernel's id and
-    /// starts a fork from its parent's snapshots.
-    ///
-    /// Falsified by a turn that leaves `held` unset or names no parent.
-    #[tokio::test]
-    async fn each_inference_names_its_context_and_fork_parent() {
-        let parent = ContextId::new();
-        let (mock, held) = MockClient::new("").with_scripted_stream(vec![text_reply("ack")]).recording_held();
-        let (kernel, context, _after, call) = fixture_forked(Some(mock), Some(parent)).await;
-        let mut completed = kernel.turn_flows().subscribe("turn.completed");
-        submit_text(&kernel, context, call.principal_id, "go").await;
-        tokio::time::timeout(Duration::from_secs(5), completed.recv()).await.unwrap().unwrap();
-        assert_eq!(*held.lock(), vec![Some(crate::llm::HeldContext { context, forked_from: Some(parent) })]);
-        kernel.shutdown_runtime_worker().await.unwrap();
     }
 
     #[tokio::test]

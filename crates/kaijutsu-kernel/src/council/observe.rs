@@ -237,7 +237,7 @@ fn read_answer(
     {
         return Err(format!("the server read spec {read}, not the spec asked for, {asked}"));
     }
-    let reviewer = prepared.contexts[0].held.to_string();
+    let reviewer = prepared.read_name(0);
     let [read] = response.reads.as_slice() else {
         return Err(format!("the answer has {} reads, not the one context asked for", response.reads.len()));
     };

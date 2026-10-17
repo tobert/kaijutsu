@@ -140,9 +140,8 @@ impl Reply {
     }
 
     /// The events that end a council v2 generation. Its calls keep the ids
-    /// the server gave them, which the context's held reply names, and its
-    /// prompt is the `kept` and `fed` tokens. `model` and `weight_hash` are
-    /// the server's identity.
+    /// the server gave them, which the next turn's tool results name.
+    /// `model` and `weight_hash` are the server's identity.
     pub(super) fn done_v2(
         self,
         done: GenerationDone,
@@ -169,7 +168,7 @@ impl Reply {
             model: model.to_string(),
             weight_hash: weight_hash.to_string(),
         };
-        let usage = (done.usage.kept + done.usage.fed, done.usage.completion, extra);
+        let usage = (done.usage.prompt, done.usage.completion, extra);
         self.end(&done.reasoning, &done.content, done.finish, calls, usage)
     }
 

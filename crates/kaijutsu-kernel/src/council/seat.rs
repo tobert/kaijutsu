@@ -11,8 +11,8 @@
 //! The queue tool's `answers` schema is the spec's: one property per
 //! question, its `enum` the letters of the question's options in order,
 //! with the options described in the property. A seat therefore serves one
-//! spec, and the server holds it under [`held_id`], one id per context and
-//! spec name.
+//! spec. It is a context value: each decision sends it whole, and the
+//! server reads it from the snapshots it holds along it.
 //!
 //! Worked examples are commands the gate's own case builders turn into
 //! cases, so they never drift from the shape a decision sends. Each names
@@ -23,10 +23,9 @@
 use std::sync::OnceLock;
 
 use kaijutsu_mk::council::wire::{ContextPut, Spec, SpecQuestion};
-use kaijutsu_mk::council_v2::wire::{ContextPut as V2ContextPut, Message, Role, ToolCall};
+use kaijutsu_mk::council_v2::wire::{Context, Message, Role, ToolCall};
 use kaijutsu_mk::generate::{Function, Tool};
 use kaijutsu_mk::Json;
-use kaijutsu_types::ContextId;
 use serde_json::json;
 
 use super::gate::{Submission, case_state, program_case_state};
@@ -42,20 +41,6 @@ command from the queue. Leave answers out on the first call.";
 
 /// The `answers` parameter's description.
 const ANSWERS_DESCRIPTION: &str = "One letter for each question about the command you judged.";
-
-/// The namespace of held seat ids: UUIDv5 over the context id's bytes, `/`,
-/// and the spec name.
-const SEAT_NAMESPACE: uuid::Uuid = uuid::uuid!("9b0c6a52-3f1e-4d8a-b7c4-2e5f8a1d6c39");
-
-/// The id the server holds `context`'s seat for the spec named `spec_name`
-/// under. The same context and spec name are the same id, so a changed
-/// context or spec updates the held seat in place.
-pub(crate) fn held_id(context: ContextId, spec_name: &str) -> ContextId {
-    let mut name = context.as_bytes().to_vec();
-    name.push(b'/');
-    name.extend_from_slice(spec_name.as_bytes());
-    ContextId::from(uuid::Uuid::new_v5(&SEAT_NAMESPACE, &name))
-}
 
 /// The task message: what waits in the queue and how to answer it.
 fn task(spec_name: &str) -> &'static str {
@@ -289,10 +274,10 @@ fn queue_call(id: String, arguments: serde_json::Value) -> Result<Message, Strin
 /// `body`, a projected council context, as a council v2 queue seat for
 /// `spec`. `Err` when the spec holds a question a queue seat cannot
 /// answer, or the body has no council v2 form.
-pub(crate) fn queue_seat(body: ContextPut, spec: &Spec) -> Result<V2ContextPut, String> {
+pub(crate) fn queue_seat(body: ContextPut, spec: &Spec) -> Result<Context, String> {
     let questions = questions(spec)?;
     let tool = queue_tool(&questions)?;
-    let mut seat = V2ContextPut::from_v1(body).map_err(|e| e.to_string())?;
+    let mut seat = Context::from_v1(body).map_err(|e| e.to_string())?;
     seat.messages.push(Message::user(task(&spec.name)).snapped());
     seat.messages.push(queue_call("c0".into(), json!({}))?);
     let mut call = 0;
@@ -340,7 +325,7 @@ mod tests {
         }
     }
 
-    fn value(seat: &V2ContextPut) -> serde_json::Value {
+    fn value(seat: &Context) -> serde_json::Value {
         serde_json::to_value(seat).unwrap()
     }
 
@@ -484,14 +469,5 @@ mod tests {
         let spec = spec(include_str!("../../../kaijutsu-mk/tests/fixtures/spec.json"));
         let e = queue_seat(body(), &spec).unwrap_err();
         assert!(e.contains("text question"), "{e}");
-    }
-
-    #[test]
-    fn held_ids_are_per_context_and_spec_name() {
-        let (a, b) = (ContextId::new(), ContextId::new());
-        assert_eq!(held_id(a, "shell-bump"), held_id(a, "shell-bump"));
-        assert_ne!(held_id(a, "shell-bump"), held_id(a, "program-gate"));
-        assert_ne!(held_id(a, "shell-bump"), held_id(b, "shell-bump"));
-        assert_ne!(held_id(a, "shell-bump"), a);
     }
 }

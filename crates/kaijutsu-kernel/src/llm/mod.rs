@@ -51,7 +51,7 @@ pub use config::{
 pub use db_config::{build_llm_registry, load_embedding_config};
 pub use mailbox::ConversationMailbox;
 pub use stream::{
-    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, HeldContext, MkUsageExtra, OpenAiCompatUsageExtra,
+    BuildOpts, CacheTarget, CacheTtl, ClaudeUsageExtra, FinishReason, MkUsageExtra, OpenAiCompatUsageExtra,
     InlineToolResult, StreamError, StreamEvent, UsageExtra, apply_tunables,
     longest_cache_ttl_secs,
 };
@@ -112,9 +112,6 @@ pub struct MockClient {
     /// handed — the only way a test can pin the shape of a request the wire
     /// would have to accept. `None` records nothing.
     sent: Option<Arc<parking_lot::Mutex<Vec<Vec<Message>>>>>,
-    /// The `BuildOpts::held` each `Provider::stream` call received, in call
-    /// order, when a test asked for it with `recording_held`.
-    held: Option<Arc<parking_lot::Mutex<Vec<Option<HeldContext>>>>>,
     /// One `Provider::stream` call, by zero-based index, that waits for the
     /// test to release it; see `holding_call`.
     hold: Option<(usize, Arc<CallHold>)>,
@@ -154,7 +151,6 @@ impl MockClient {
             script_dir: None,
             script_by_model: None,
             sent: None,
-            held: None,
             hold: None,
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -177,14 +173,6 @@ impl MockClient {
         let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.sent = Some(sent.clone());
         (self, sent)
-    }
-
-    /// Builder: record the held context named by every `Provider::stream`
-    /// call. The returned handle reads them in call order.
-    pub fn recording_held(mut self) -> (Self, Arc<parking_lot::Mutex<Vec<Option<HeldContext>>>>) {
-        let held = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        self.held = Some(held.clone());
-        (self, held)
     }
 
     /// Builder: make `prompt`/`prompt_with_system` sleep `delay` before
@@ -1102,9 +1090,6 @@ impl Provider {
             Self::Mock(mock) => {
                 if let Some(sent) = &mock.sent {
                     sent.lock().push(messages.clone());
-                }
-                if let Some(held) = &mock.held {
-                    held.lock().push(opts.held);
                 }
                 let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Some((index, hold)) = &mock.hold

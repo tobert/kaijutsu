@@ -54,7 +54,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::Instrument;
 
-use super::sync::{PrepareMiss, Prepared, Wire, no_slot_cause};
+use super::sync::{PrepareMiss, Prepared, ServerContext, Wire, no_slot_cause};
 use crate::llm::endpoint::SlotWaits;
 use super::reviewer_contexts::{SkippedReviewerContext, ReviewerContextChain};
 use crate::kj::gate::GateSpec;
@@ -277,7 +277,9 @@ pub(crate) fn program_case_state(
 }
 
 /// The decision request for `state` against the prepared contexts, each
-/// pinned to the head the kernel prepared.
+/// named as the answer's reads name it ([`Prepared::read_name`]). A v1
+/// context is pinned to the head the kernel prepared; a v2 seat goes whole
+/// when [`ask_within`] sends the request.
 pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, state: Json) -> DecisionRequest {
     DecisionRequest {
         spec_id: Some(prepared.spec_id.clone()),
@@ -285,7 +287,11 @@ pub(crate) fn decision_request(prepared: &Prepared, council: &CouncilConfig, sta
             prepared
                 .contexts
                 .iter()
-                .map(|c| ContextRef { id: c.held.to_string(), at: Some(c.head.clone()) })
+                .enumerate()
+                .map(|(i, c)| ContextRef {
+                    id: prepared.read_name(i),
+                    at: matches!(c.server, ServerContext::Held(_)).then(|| c.head.clone()),
+                })
                 .collect(),
         ),
         state,
@@ -635,24 +641,31 @@ struct Resend {
 /// names, or, when it names neither, every prepared context, and the spec
 /// too after a 404. The server forgot what it held, and sending either
 /// again is idempotent. A 409 is about a context's snapshot, never the spec.
+/// A v2 server holds no context records, so a 404 from it is the spec.
 fn to_resend(error: &MkError, prepared: &Prepared) -> Resend {
     let status = error.status();
+    if prepared.wire == Wire::V2 {
+        return Resend { contexts: Vec::new(), spec: status == Some(404) };
+    }
     let Some(404 | 409) = status else { return Resend::default() };
     let text = match error {
         MkError::Status { error: Some(d), body, .. } => format!("{} {} {body}", d.message, d.param.as_deref().unwrap_or("")),
         MkError::Status { body, .. } => body.clone(),
         _ => String::new(),
     };
-    let named: Vec<ContextId> = prepared
+    let held: Vec<ContextId> = prepared
         .contexts
         .iter()
-        .filter(|c| text.contains(&c.held.to_string()))
-        .map(|c| c.held)
+        .filter_map(|c| match c.server {
+            ServerContext::Held(id) => Some(id),
+            ServerContext::Seat(_) => None,
+        })
         .collect();
+    let named: Vec<ContextId> = held.iter().copied().filter(|id| text.contains(&id.to_string())).collect();
     let not_found = status == Some(404);
     let spec_named = not_found && text.contains(prepared.spec_id.as_str());
     match (named.is_empty(), spec_named) {
-        (true, false) => Resend { contexts: prepared.contexts.iter().map(|c| c.held).collect(), spec: not_found },
+        (true, false) => Resend { contexts: held, spec: not_found },
         (_, spec) => Resend { contexts: named, spec },
     }
 }
@@ -708,17 +721,27 @@ pub(crate) async fn ask_within(
 ) -> Result<DecisionResponse, String> {
     let (traceparent, _) = kaijutsu_telemetry::inject_trace_context();
     let traceparent = (!traceparent.is_empty()).then_some(traceparent);
-    // A council decision sends context ids, not a message list, so the line
-    // has no text counts. One line per decision; the endpoint's 429 resend is
-    // the same request again.
+    // A council decision's line has no text counts. One line per decision;
+    // the endpoint's 429 resend is the same request again.
     tracing::info!(
         provider = "council", server = %council.server, contexts = prepared.contexts.len(),
         "llm request"
     );
-    // Council v2 takes the v1 request with no `think`: the thought before
-    // the answer stays closed, as v1 always had it.
-    let v2_request = (prepared.wire == Wire::V2)
-        .then(|| kaijutsu_mk::council_v2::wire::DecisionRequest { decision: request.clone(), think: None });
+    // Council v2 takes the v1 request with each seat whole in place of its
+    // name, and no `think`: the thought before the answer stays closed, as
+    // v1 always had it.
+    let v2_request = (prepared.wire == Wire::V2).then(|| kaijutsu_mk::council_v2::wire::DecisionRequest {
+        decision: DecisionRequest { contexts: None, ..request.clone() },
+        contexts: prepared
+            .contexts
+            .iter()
+            .filter_map(|c| match &c.server {
+                ServerContext::Seat(seat) => Some((**seat).clone()),
+                ServerContext::Held(_) => None,
+            })
+            .collect(),
+        think: None,
+    });
     let decide = || async {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         match &v2_request {
@@ -1295,7 +1318,7 @@ fn build_verdict(
                 .iter()
                 .map(|read| {
                     let prepared_context =
-                        read.context.as_deref().and_then(|id| prepared.contexts.iter().find(|c| c.held.to_string() == id));
+                        read.context.as_deref().and_then(|id| prepared.read_context(id));
                     let expected = prepared_context.map(|c| c.head.to_string());
                     // The record names the kaijutsu context, not the id
                     // the server holds its seat under.
@@ -1603,7 +1626,7 @@ async fn decide_inner(
             .iter()
             .map(|read| {
                 let label = read.context.as_deref().and_then(|id| {
-                    prepared.contexts.iter().find(|c| c.held.to_string() == id).map(|c| c.label.clone())
+                    prepared.read_context(id).map(|c| c.label.clone())
                 });
                 let probabilities = match read.answers.get(VERDICT) {
                     Some(ReadAnswer::Choice(c)) => serde_json::json!(c.probabilities),
@@ -1647,7 +1670,7 @@ fn reads_note(prepared: &Prepared, response: &DecisionResponse) -> String {
             let label = read
                 .context
                 .as_deref()
-                .and_then(|id| prepared.contexts.iter().find(|c| c.held.to_string() == id).map(|c| c.label.clone()))
+                .and_then(|id| prepared.read_context(id).map(|c| c.label.clone()))
                 .unwrap_or_else(|| read.context.clone().unwrap_or_else(|| "spec".into()));
             let answers: Vec<String> = prepared
                 .spec
@@ -2300,7 +2323,7 @@ mod tests {
                 .map(|(i, id)| super::super::sync::PreparedContext {
                     label: format!("c{i}"),
                     context_id: *id,
-                    held: *id,
+                    server: ServerContext::Held(*id),
                     head: kaijutsu_mk::council::wire::SnapshotId::parse(format!("snap:{}", i.to_string().repeat(64))).unwrap(),
                     house_rules: false,
                 })
