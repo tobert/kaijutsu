@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{bail, Context, Result};
 use russh::keys::{PrivateKey, ssh_key};
 
-use kaijutsu_kernel::kernel_db::{BackendModelRow, BackendRow, CharacterRow, KernelDb};
-use kaijutsu_kernel::seed_backends;
+use kaijutsu_kernel::kernel_db::{BackendModelRow, BackendRow, CharacterRow, KernelDb, LlmDefaultsRow, ModelTunablesRow};
 use kaijutsu_server::AuthDb;
 use kaijutsu_types::{BackendId, PrincipalId};
 
@@ -211,6 +210,10 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
     Ok(key)
 }
 
+/// The defaults' output budget a solo kernel writes, for a model whose row
+/// sets none.
+const SOLO_MAX_TOKENS: i64 = 16384;
+
 /// Write the identity and model rows a first turn needs, before the kernel
 /// opens the same database.
 ///
@@ -219,15 +222,16 @@ pub fn ensure_client_key(path: &Path) -> Result<PrivateKey> {
 /// - `performer` is the character each ACP session's context is played by. A
 ///   model turn needs a live performer distinct from its reviewer
 ///   (`docs/approval-identity.md`), so these are two characters, never one.
-/// - The model rows start from the kernel's own factory floor, so a solo
-///   kernel's providers, context windows, and tunables are the ones every
-///   other kernel ships.
+/// - A kernel ships no backends, so this writes the chosen backend row, the
+///   chosen model's row when [`crate::provider::known_model`] knows it, and
+///   the defaults. A row a reused state directory already holds stands,
+///   except that `choice.replace_backend_row` replaces the backend row.
 /// - `choice.idle_timeout_secs` and `request_timeout_secs`, when given, land
-///   on the backend row, written or factory.
+///   on the backend row, written or existing.
 /// - `max_tokens`, when given, is the output budget of every turn: it lands
 ///   on the chosen model's own `backend_models` row, which outranks the
 ///   defaults, keeping the row's window and other tunables. Left `None`, the
-///   model's factory budget stands (DeepSeek's rows carry 65536), or the
+///   model's own budget stands (DeepSeek's rows carry 65536), or the
 ///   defaults' 16384 for a model with no budget of its own.
 pub fn prepare_rows(
     state: &SoloState,
@@ -237,7 +241,7 @@ pub fn prepare_rows(
     choice: &ModelChoice,
     max_tokens: Option<i64>,
 ) -> Result<()> {
-    let mut db = KernelDb::open(state.kernel_db_path())
+    let db = KernelDb::open(state.kernel_db_path())
         .with_context(|| format!("open {}", state.kernel_db_path().display()))?;
     let auth = AuthDb::open(state.auth_db_path())
         .with_context(|| format!("open {}", state.auth_db_path().display()))?;
@@ -251,13 +255,10 @@ pub fn prepare_rows(
     )
     .map_err(|e| anyhow::anyhow!("make {root_character} the root character: {e}"))?;
 
-    seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
-        .context("seed the factory backends")?;
-
-    if choice.write_backend_row {
-        let existing = db
-            .get_backend_by_name(&choice.backend)
-            .with_context(|| format!("read the {} backend row", choice.backend))?;
+    let existing = db
+        .get_backend_by_name(&choice.backend)
+        .with_context(|| format!("read the {} backend row", choice.backend))?;
+    if choice.replace_backend_row || existing.is_none() {
         let row = BackendRow {
             backend_id: existing.map_or_else(BackendId::new, |row| row.backend_id),
             name: choice.backend.clone(),
@@ -274,12 +275,10 @@ pub fn prepare_rows(
         };
         db.upsert_backend(&row)
             .with_context(|| format!("write the {} backend row", choice.backend))?;
-    } else if choice.idle_timeout_secs.is_some() || choice.request_timeout_secs.is_some() {
-        // Change only the timeouts: the factory row keeps its key file.
-        let mut row = db
-            .get_backend_by_name(&choice.backend)
-            .with_context(|| format!("read the {} backend row", choice.backend))?
-            .with_context(|| format!("the factory floor wrote no {} row", choice.backend))?;
+    } else if let Some(mut row) = existing
+        && (choice.idle_timeout_secs.is_some() || choice.request_timeout_secs.is_some())
+    {
+        // Change only the timeouts: the existing row keeps its key source.
         if let Some(secs) = choice.idle_timeout_secs {
             row.idle_timeout_secs = Some(secs as i64);
         }
@@ -290,20 +289,53 @@ pub fn prepare_rows(
             .with_context(|| format!("set the {} timeouts", choice.backend))?;
     }
 
-    let mut defaults = db
-        .get_llm_defaults()
-        .context("read the model defaults")?
-        .context("the factory floor wrote no model defaults")?;
-    defaults.default_backend = choice.backend.clone();
-    defaults.default_model = choice.model.clone();
+    let backend = db
+        .get_backend_by_name(&choice.backend)
+        .with_context(|| format!("read the {} backend row", choice.backend))?
+        .with_context(|| format!("no {} backend row after writing it", choice.backend))?;
+    if let Some(known) = crate::provider::known_model(&choice.backend, &choice.model) {
+        let have = db
+            .list_backend_models(backend.backend_id)
+            .with_context(|| format!("read the {} model rows", choice.backend))?
+            .iter()
+            .any(|r| r.model_id == choice.model);
+        if !have {
+            db.set_backend_model(&BackendModelRow {
+                backend_id: backend.backend_id,
+                model_id: choice.model.clone(),
+                context_window: Some(known.context_window as i64),
+                extra: None,
+                tunables: ModelTunablesRow {
+                    max_tokens: known.max_tokens,
+                    effort: known.effort.map(str::to_string),
+                    ..Default::default()
+                },
+            })
+            .with_context(|| format!("write the {}/{} model row", choice.backend, choice.model))?;
+        }
+    }
+
+    let defaults = match db.get_llm_defaults().context("read the model defaults")? {
+        Some(existing) => LlmDefaultsRow {
+            default_backend: choice.backend.clone(),
+            default_model: choice.model.clone(),
+            ..existing
+        },
+        None => LlmDefaultsRow {
+            default_backend: choice.backend.clone(),
+            default_model: choice.model.clone(),
+            max_tokens: Some(SOLO_MAX_TOKENS),
+            temperature: None,
+            top_p: None,
+            effort: None,
+            thinking_budget: None,
+            thinking_style: None,
+        },
+    };
     db.set_llm_defaults(&defaults)
         .context("point the model defaults at the chosen provider")?;
 
     if let Some(max_tokens) = max_tokens {
-        let backend = db
-            .get_backend_by_name(&choice.backend)
-            .with_context(|| format!("read the {} backend row", choice.backend))?
-            .with_context(|| format!("no {} backend row to set a budget on", choice.backend))?;
         let mut row = db
             .list_backend_models(backend.backend_id)
             .with_context(|| format!("read the {} model rows", choice.backend))?
@@ -523,10 +555,9 @@ mod tests {
         refuse_operator_state_dir(&elsewhere).expect("an ordinary directory is fine");
     }
 
-    /// A choice that reuses the `deepseek` factory backend row, so
-    /// `prepare_rows` needs to write nothing but the defaults and the
-    /// performer character.
-    fn factory_choice() -> ModelChoice {
+    /// The choice resolution makes with only `DEEPSEEK_API_KEY` set: no flag
+    /// names an endpoint or key of its own.
+    fn deepseek_choice() -> ModelChoice {
         ModelChoice {
             backend: "deepseek".to_string(),
             kind: "deepseek".to_string(),
@@ -535,7 +566,7 @@ mod tests {
             api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
             api_key_file: Some("~/.deepseek-key".to_string()),
             key_optional: false,
-            write_backend_row: false,
+            replace_backend_row: false,
             idle_timeout_secs: None,
             request_timeout_secs: None,
         }
@@ -558,7 +589,7 @@ mod tests {
     /// The chosen model's row, as the turn path reads it.
     fn chosen_row(state: &SoloState) -> kaijutsu_kernel::kernel_db::BackendModelRow {
         let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
-        let choice = factory_choice();
+        let choice = deepseek_choice();
         let backend = db.get_backend_by_name(&choice.backend).unwrap().expect("the backend row");
         db.list_backend_models(backend.backend_id).unwrap().into_iter()
             .find(|r| r.model_id == choice.model).expect("the chosen model's row")
@@ -571,34 +602,78 @@ mod tests {
     fn a_max_tokens_override_lands_on_the_chosen_models_row() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), Some(4096))
+        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), Some(4096))
             .expect("prepare rows with an override");
 
         let row = chosen_row(&state);
         assert_eq!(row.tunables.max_tokens, Some(4096));
-        assert_eq!(row.tunables.effort.as_deref(), Some("high"), "the factory effort stays");
+        assert_eq!(row.tunables.effort.as_deref(), Some("high"), "the known effort stays");
         assert_eq!(row.context_window, Some(1_000_000), "the window stays");
     }
 
     #[test]
-    fn without_an_override_the_models_factory_budget_stands() {
+    fn without_an_override_the_models_own_budget_stands() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
-        prepare_rows(&state, "solo", "solo-coder", &key, &factory_choice(), None)
+        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None)
             .expect("prepare rows with no override");
-        // DeepSeek's factory rows carry 65536 at effort high
-        // (`seed_backends::DEEPSEEK_TUNING`), documented in docs/solo-acp.md.
+        // DeepSeek's model rows carry 65536 at effort high
+        // (`provider::DEEPSEEK_V4`), documented in docs/solo-acp.md.
         assert_eq!(chosen_row(&state).tunables.max_tokens, Some(65536));
     }
 
+    /// A kernel ships no backends, so a new state directory holds exactly the
+    /// chosen backend, with its key sources, and defaults that name it.
     #[test]
-    fn an_idle_timeout_on_a_factory_row_keeps_its_key_file() {
+    fn a_new_state_directory_gets_only_the_chosen_backend() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("prepare rows");
+
+        let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+        let backends = db.list_backends().expect("list backends");
+        let names: Vec<&str> = backends.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["deepseek"]);
+        assert_eq!(backends[0].kind, "deepseek");
+        assert_eq!(backends[0].api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(backends[0].api_key_file.as_deref(), Some("~/.deepseek-key"));
+        let defaults = db.get_llm_defaults().expect("read defaults").expect("defaults written");
+        assert_eq!((defaults.default_backend.as_str(), defaults.default_model.as_str()), ("deepseek", "deepseek-flash"));
+        assert_eq!(defaults.max_tokens, Some(16384));
+    }
+
+    /// A reused state directory keeps an edit made to its backend row unless
+    /// a flag names an endpoint or key of its own.
+    #[test]
+    fn a_reused_state_directory_keeps_its_backend_row_unless_a_flag_replaces_it() {
+        let (_parent, state) = named_state();
+        let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
+        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("first start");
+        {
+            let db = KernelDb::open(state.kernel_db_path()).expect("reopen the kernel db");
+            let mut row = db.get_backend_by_name("deepseek").unwrap().unwrap();
+            row.base_url = Some("https://gateway.example/v1".to_string());
+            db.upsert_backend(&row).unwrap();
+        }
+        prepare_rows(&state, "solo", "solo-coder", &key, &deepseek_choice(), None).expect("second start");
+        let base_url = |state: &SoloState| {
+            KernelDb::open(state.kernel_db_path()).unwrap().get_backend_by_name("deepseek").unwrap().unwrap().base_url
+        };
+        assert_eq!(base_url(&state).as_deref(), Some("https://gateway.example/v1"), "the edit stands");
+
+        let choice = ModelChoice { replace_backend_row: true, ..deepseek_choice() };
+        prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("third start");
+        assert_eq!(base_url(&state), None, "a flag of its own replaces the row");
+    }
+
+    #[test]
+    fn an_idle_timeout_keeps_the_providers_key_file() {
         let (_parent, state) = named_state();
         let key = ensure_client_key(&state.client_key_path()).expect("generate the client key");
         let choice = ModelChoice {
             idle_timeout_secs: Some(900),
             request_timeout_secs: Some(3600),
-            ..factory_choice()
+            ..deepseek_choice()
         };
         prepare_rows(&state, "solo", "solo-coder", &key, &choice, None).expect("prepare rows");
 
@@ -606,10 +681,10 @@ mod tests {
         let row = db
             .get_backend_by_name("deepseek")
             .expect("read the row")
-            .expect("the factory row exists");
+            .expect("the row was written");
         assert_eq!(row.idle_timeout_secs, Some(900));
         assert_eq!(row.request_timeout_secs, Some(3600));
-        assert!(row.api_key_file.is_some(), "the factory key file must survive: {row:?}");
+        assert!(row.api_key_file.is_some(), "the provider's key file must survive: {row:?}");
     }
 
     #[test]
@@ -624,7 +699,7 @@ mod tests {
             api_key_env: None,
             api_key_file: None,
             key_optional: true,
-            write_backend_row: true,
+            replace_backend_row: true,
             idle_timeout_secs: Some(1800),
             request_timeout_secs: Some(2400),
         };

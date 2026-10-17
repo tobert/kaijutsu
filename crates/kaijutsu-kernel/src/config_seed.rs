@@ -17,7 +17,7 @@ pub const DEFAULT_THEME: &str = include_str!("../../../assets/defaults/theme.tom
 // NOTE: there is deliberately no `models.toml` here. Model configuration is
 // SQL-native — `backends` / `backend_models` / `casts` / `cast_slots` /
 // `model_aliases` / `llm_defaults` / `embedding_config` in `kernel_db.rs` —
-// and the embedded floor lives in `crate::seed_backends`, not in an asset.
+// and a kernel ships none of it: an operator configures backends with `kj`.
 // The `/config/kernel/models.toml` document and its loader were demolished; do
 // not reintroduce a TOML in this path.
 
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn models_toml_is_gone_from_the_config_surface() {
-        // Model config is SQL-native (see crate::seed_backends). A seed entry
+        // Model config is SQL-native (`kj backend`). A seed entry
         // here would resurrect a second, silently-diverging source of truth.
         let files = config_seed_files();
         assert!(

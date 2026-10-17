@@ -53,13 +53,15 @@ audio           devices, keep, keep-status, keep-retry, keep-cancel, beats —
                 recent MIDI in daemon RAM and upload it to CAS (keep), then
                 poll/retry/cancel that job; beats is offline audio analysis
                 (beat/downbeat tracking via beat-this)
-backend         list, show, set, remove, model set|remove, default show|set, reseed —
+backend         list, show, set, remove, model set|remove, default show|set —
                 SQL-native LLM endpoints (`kernel_db`'s `backends`/`backend_models`/
                 `llm_defaults` tables, no TOML, no host file to edit): a
                 free-form `name` plus a closed `kind` (anthropic | deepseek |
-                openai | codex-app), their context windows, and the
-                kernel-wide defaults. No key material is ever stored — only
-                an env-var name or a file path.
+                openai | codex-app | mk), their context windows, and the
+                kernel-wide defaults. A new kernel has none: `kj backend set`
+                adds one and `kj backend default set` makes it the default.
+                No key material is ever stored — only an env-var name or a
+                file path.
 binding         show, allow, revoke, reset — a context's tool-capability allow-set
                 (cap tokens incl. config-write, drive, fork, drift, transport,
                 operator, exec, editor, system, house, admin, or <instance>[:<tool>],

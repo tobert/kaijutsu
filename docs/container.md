@@ -69,6 +69,21 @@ podman run --rm \
 keys later, `add-key <pubkey-file> --as <character>` is safe while the server
 runs: `auth.db` is WAL and never cached.
 
+## Configure a model backend
+
+A new kernel has no model backends and no default model, so a model turn
+fails with how to add one. Configure one from a client's shell after the
+first start:
+
+```bash
+kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY
+kj backend default set --backend deepseek --model deepseek-flash
+```
+
+The key reaches the kernel through the container's environment or a file
+the row names with `--api-key-file`; the row stores only the variable name or
+the path. README.md, "Quick Start" has more examples.
+
 ## Devcontainer
 
 `.devcontainer/devcontainer.json` builds the `devcontainer` stage from the

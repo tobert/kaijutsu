@@ -103,6 +103,25 @@ cargo run -p kaijutsu-server -- list-characters
 cargo run -p kaijutsu-app
 ```
 
+A new kernel has no model backends and no default model, so a model turn
+fails until you configure one. In a client's shell:
+
+```bash
+# DeepSeek, with the key in an environment variable or a file
+kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY --api-key-file ~/.deepseek-key
+kj backend model set deepseek deepseek-flash --context-window 1000000 --max-tokens 65536 --effort high
+kj backend default set --backend deepseek --model deepseek-flash
+
+# Anthropic
+kj backend set anthropic --kind anthropic --api-key-env ANTHROPIC_API_KEY --api-key-file ~/.anthropic-key.txt
+
+# An OpenAI-compatible local server that takes no key
+kj backend set ollama --kind openai --base-url http://localhost:11434/v1 --key-optional
+```
+
+The kernel reads an API key from the variable or the file the row names; it
+never stores the key. `kj backend --help` lists every flag.
+
 ## Code Style
 
 **Do not run `cargo fmt`.** `rustfmt.toml` sets `disable_all_formatting`, so

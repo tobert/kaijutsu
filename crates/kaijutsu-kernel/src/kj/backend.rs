@@ -104,11 +104,6 @@ enum BackendCommand {
     /// Show or set the kernel-wide LLM defaults (`llm_defaults`).
     #[command(subcommand)]
     Default(BackendDefaultCommand),
-    /// Restore the factory backends, their model rows (windows and tunables),
-    /// and the defaults to their embedded definitions, overwriting edits to
-    /// them. Operator-added backends and models, aliases, and casts are left
-    /// alone.
-    Reseed,
 }
 
 #[derive(Subcommand, Debug)]
@@ -145,7 +140,8 @@ enum BackendModelCommand {
 enum BackendDefaultCommand {
     /// Print the current defaults.
     Show,
-    /// Update the defaults. Only the flags you pass change.
+    /// Update the defaults. Only the flags you pass change. With no defaults
+    /// yet, pass both --backend and --model.
     Set {
         /// Default backend name
         #[arg(long)]
@@ -251,6 +247,13 @@ fn model_summary(m: &BackendModelRow) -> String {
     parts.join("  ")
 }
 
+/// How to configure a backend, for a kernel that has none. A kernel ships no
+/// backends; README.md, "Quick Start" has more examples.
+pub(crate) const NO_BACKEND_HINT: &str = "No LLM backend is configured: add one with \
+     `kj backend set` and make it the default with `kj backend default set`. For example, \
+     `kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY`, then \
+     `kj backend default set --backend deepseek --model deepseek-flash`.";
+
 impl KjDispatcher {
     pub(crate) async fn dispatch_backend(&self, argv: &[String], caller: &KjCaller) -> KjResult {
         if argv.is_empty() {
@@ -326,7 +329,6 @@ impl KjDispatcher {
                 model,
                 tunables,
             }) => self.backend_default_set(backend, model, tunables),
-            BackendCommand::Reseed => self.backend_reseed(caller),
         };
 
         if mutating && matches!(result, KjResult::Ok { .. }) {
@@ -381,8 +383,7 @@ impl KjDispatcher {
         );
         if backends.is_empty() {
             return KjResult::ok_with_data(
-                "(no backends configured — `kj backend reseed` restores the factory floor)"
-                    .to_string(),
+                NO_BACKEND_HINT.to_string(),
                 names,
             );
         }
@@ -668,9 +669,7 @@ impl KjDispatcher {
             Ok(d) => d,
             Err(e) => return KjResult::Err(format!("kj backend default: {e}")),
         }) else {
-            return KjResult::Err(
-                "kj backend default: no defaults row — run `kj backend reseed`".to_string(),
-            );
+            return KjResult::Err(format!("kj backend default: no defaults are set. {NO_BACKEND_HINT}"));
         };
         // A NULL knob prints as "(provider default)", not as a number we made
         // up: "unset" is a real answer here.
@@ -717,8 +716,9 @@ impl KjDispatcher {
                 // Nothing to merge onto — require both halves of the identity.
                 let (Some(b), Some(m)) = (backend.clone(), model.clone()) else {
                     return KjResult::Err(
-                        "kj backend default set: no defaults row yet — pass both \
-                         --backend and --model (or run `kj backend reseed`)"
+                        "kj backend default set: no defaults are set yet, so pass both \
+                         --backend and --model: `kj backend default set --backend deepseek \
+                         --model deepseek-flash`"
                             .to_string(),
                     );
                 };
@@ -762,16 +762,6 @@ impl KjDispatcher {
                 next.default_backend, next.default_model
             )),
             Err(e) => KjResult::Err(format!("kj backend default set: {e}")),
-        }
-    }
-
-    fn backend_reseed(&self, caller: &KjCaller) -> KjResult {
-        let mut db = self.kernel_db().lock();
-        match crate::seed_backends::reseed_factory_backends(&mut db, caller.principal_id) {
-            Ok(n) => KjResult::ok(format!(
-                "restored {n} factory backend(s), their model rows, and the defaults"
-            )),
-            Err(e) => KjResult::Err(format!("kj backend reseed: {e}")),
         }
     }
 
@@ -836,7 +826,7 @@ impl Classify for BackendCommand {
     fn effect(&self) -> Effect {
         match self {
             Self::List | Self::Show { .. } => Effect::Read,
-            Self::Set { .. } | Self::Remove { .. } | Self::Reseed => Effect::Write,
+            Self::Set { .. } | Self::Remove { .. } => Effect::Write,
             Self::Model(cmd) => cmd.effect(),
             Self::Default(cmd) => cmd.effect(),
         }
@@ -876,12 +866,8 @@ mod tests {
     async fn seeded() -> KjDispatcher {
         let d = test_dispatcher().await;
         {
-            let mut db = d.kernel_db().lock();
-            crate::seed_backends::ensure_factory_backends(
-                &mut db,
-                kaijutsu_types::PrincipalId::system(),
-            )
-            .unwrap();
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
         d
@@ -899,6 +885,31 @@ mod tests {
             }
             other => panic!("expected list data: {other:?}"),
         }
+    }
+
+    /// A kernel ships no backends, so the empty list and the missing
+    /// defaults say how to configure one.
+    #[tokio::test]
+    async fn a_kernel_with_no_backends_says_how_to_configure_one() {
+        let d = test_dispatcher().await;
+        let c = test_caller();
+        let list = d.dispatch(&argv(&["backend", "list"]), &c).await;
+        assert!(list.is_ok(), "{}", list.message());
+        for verb in ["kj backend set", "kj backend default set"] {
+            assert!(list.message().contains(verb), "{}", list.message());
+        }
+        let show = d.dispatch(&argv(&["backend", "default", "show"]), &c).await;
+        assert!(!show.is_ok());
+        assert!(show.message().contains("kj backend default set"), "{}", show.message());
+    }
+
+    /// There are no factory backends to restore, so `reseed` is not a verb.
+    #[tokio::test]
+    async fn reseed_is_not_a_backend_verb() {
+        let d = test_dispatcher().await;
+        let r = d.dispatch(&argv(&["backend", "reseed"]), &test_caller()).await;
+        assert!(!r.is_ok(), "{}", r.message());
+        assert!(d.kernel_db().lock().list_backends().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1024,7 +1035,7 @@ mod tests {
     async fn remove_is_refused_while_an_alias_points_at_the_backend() {
         let d = seeded().await;
         let c = test_caller();
-        // The floor ships no aliases, so make one first.
+        // A kernel ships no aliases, so make one first.
         d.dispatch(
             &argv(&["alias", "set", "local", "--backend", "ollama", "--model", "gemma4:31b"]),
             &c,

@@ -2737,7 +2737,7 @@ impl KernelDb {
             tracing::warn!("dropped the builtin-model embedding configuration; the semantic index \
                 is off until embedding_config names an embedding service (docs/synthesis.md)");
         }
-        for retired in crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
+        for retired in RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
             let removed = conn.execute("DELETE FROM embedding_config WHERE endpoint = ?1", [retired])?;
             if removed > 0 {
                 tracing::warn!(endpoint = retired,
@@ -3140,8 +3140,8 @@ impl KernelDb {
 
     /// One-shot rollover for the Track A → Track D backend rename (2026-08-03,
     /// design round with Amy — see `docs/devlog.md`). Track A replaced the old
-    /// free-form provider strings with honest backend NAMES sourced from
-    /// `seed_backends.rs` (`anthropic`/`deepseek`/`gpt`/`ollama`); this walks
+    /// free-form provider strings with honest backend NAMES
+    /// (`anthropic`/`deepseek`/`gpt`/`ollama`); this walks
     /// every existing context row's `provider`/`model` columns and rewrites
     /// them so no context is left pointing at a name no backend answers to:
     ///
@@ -7458,6 +7458,14 @@ pub(crate) const RETIRED_CLASSIFIER_HOOK: (&str, &str) = ("lfm2d-advisory", "/co
 /// removes them; nothing reads them.
 pub(crate) const RETIRED_CLASSIFIER_ENV: &[&str] = &["LFM2D_MODE", "LFM2D_BENIGN_LABEL", "LFM2D_URL"];
 
+/// Endpoints earlier kernels seeded into `embedding_config`. A row still
+/// holding one was never an operator's choice: opening the DB removes it and
+/// the semantic index stays off until an operator configures a service.
+pub(crate) const RETIRED_FACTORY_EMBEDDING_ENDPOINTS: &[&str] = &[
+    "http://lfm2d-1.taila4abc.ts.net:8088",
+    "http://lfm2d-system1.taila4abc.ts.net:8088",
+];
+
 /// The singleton `embedding_config` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfigRow {
@@ -7748,9 +7756,9 @@ impl KernelDb {
 
     // ── llm_defaults ────────────────────────────────────────────────────
 
-    /// The singleton defaults row, or `None` on a kernel that has never been
-    /// seeded. `None` is a real state (a bare DB in a unit test), not an
-    /// error — the registry builder reports it as "no default backend".
+    /// The singleton defaults row, or `None` until an operator runs
+    /// `kj backend default set`. `None` is a real state, not an error: a
+    /// kernel ships no defaults, and a model turn reports it.
     pub fn get_llm_defaults(&self) -> KernelDbResult<Option<LlmDefaultsRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT default_backend, default_model, max_tokens, temperature, top_p,
@@ -8932,7 +8940,7 @@ mod tests {
     fn retired_factory_embedding_endpoints_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kernel.db");
-        for retired in crate::seed_backends::RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
+        for retired in RETIRED_FACTORY_EMBEDDING_ENDPOINTS {
             {
                 let db = KernelDb::open(&path).unwrap();
                 db.set_embedding_config(&EmbeddingConfigRow {

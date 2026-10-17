@@ -78,13 +78,13 @@ file the backend row names. It never belongs in this file.
 | `--unlist <path>` | Leave a path out of its parent's directory listing, so a walk from above (`find /`, `grep -r PATTERN /`, `ls /`) never reaches it; naming it still does (`docs/mounts.md`, "Unlisted paths"). Repeatable. Must be absolute and not `/`; it need not exist. The Harbor adapter unlists `/logs` and `/installed-agent`. |
 | `--headless` | Run a headless kernel (`docs/writing.md`, "Terms"), for a harness that sends a task and waits for it to end. A coder's turn then runs until it calls `done`: a text-only reply is answered with a notice instead of ending the prompt (`docs/conversation-session.md`, "Ending a task with done"). Leave it off for a client a person types into. The Harbor adapter passes it. |
 | `--gate-config <file>` | A gate policy to install verbatim, replacing the shipped default. |
-| `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (DeepSeek's factory rows carry 65536 at effort `high`), else the kernel defaults' 16384. |
+| `--max-tokens <N>` | The output token budget of every turn, reasoning included, written onto the chosen model's row. Must be greater than zero; zero and negative values refuse the start. A value above the provider's own per-model ceiling is rejected by the provider, not by this flag. Default: the model's own budget (the DeepSeek model rows this binary writes carry 65536 at effort `high`), else the defaults' 16384. |
 | `--rc-overlay <dir>` | An rc variant to install over the seeded `/config/rc` tree, for A/B instruction sets (`contrib/bench/rc-variants/*/README.md`). The directory mirrors the rc tree's layout and holds only the files that differ; every regular file under it (a top-level `README.md` is skipped) replaces the file at the same relative path, unlinked first so a seeded symlink into `lib/` is replaced rather than written through. Refuses, before anything is replaced, if the directory is missing or empty, contains a symlink or another non-regular file, or names a file whose seeded parent directory does not exist. Idempotent: re-applying the same overlay against a persistent `--state-dir` is safe. |
 
 Zero flags works when exactly one of `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`,
 or `OPENAI_API_KEY` is set. Zero keys, or several, is a refusal naming what to
 set: guessing would send a first prompt to a provider nobody chose. A named
-provider may take its key from the file the factory backend row names
+provider may take its key from the file its backend row names
 (`~/.deepseek-key` and the like) instead of the environment.
 
 ## The key and /proc
@@ -155,15 +155,19 @@ Each step fails loudly, with what it was doing:
 3. Load or generate the connecting character's Ed25519 key.
 4. Make `solo` the root character and bind that key to it. `solo` owns the
    bridge's connection and is the reviewer every approval resolves to.
-5. Seed the factory backends on a new state directory, then point the model
-   defaults at the chosen provider and model. A reused state directory keeps
-   the backends it has; one removed there stays removed. The factory row is
-   left alone unless `--base-url`, `--api-key-env`, or `--no-key` says
-   something different; a row written
-   without `--api-key-env` or `--no-key` keeps the provider's key file. The
-   two timeouts change only their own columns of the factory row. `--max-tokens` sets the
-   chosen model's own output budget, which outranks the defaults row; left out, the
-   model's factory budget stands.
+5. Write the chosen provider's backend row, the chosen model's row, and the
+   model defaults. A kernel ships no backends, so a new state directory holds
+   only this one. The backend row names the provider's key variable and key
+   file (`~/.deepseek-key` and the like). The model row carries the context
+   window this binary knows for the model, and for DeepSeek a 65536 output
+   budget at effort `high`; a model it does not know gets no row. A new
+   defaults row carries a 16384 output budget. A reused state directory keeps
+   the rows it has, with any edit made through `kj`, unless `--base-url`,
+   `--api-key-env`, or `--no-key` says something different, which replaces
+   the backend row; a row written without `--api-key-env` or `--no-key` keeps
+   the provider's key file. The two timeouts change only their own columns of
+   the backend row. `--max-tokens` sets the chosen model's own output budget,
+   which outranks the defaults row; left out, the model's own budget stands.
 6. Create the performer character. A model turn needs a live performer
    distinct from its reviewer (`docs/approval-identity.md`), so `solo` reviews
    and `solo-coder` performs.
@@ -205,7 +209,7 @@ live client. A `--state-dir` you named is never removed.
   databases, host key, `/config` — is named explicitly, so nothing here
   defaults to `~/.config/kaijutsu` or `~/.local/share/kaijutsu`, and a
   `--state-dir` inside either is refused. What it does read is the provider
-  key file a factory backend row names, which is the point of it. A
+  key file its backend row names, which is the point of it. A
   `--state-dir` you name is used exactly as given, so pointing two solo runs
   at one directory points them at one kernel.
 - **It does not configure casts, aliases, or rc.** A solo kernel runs one

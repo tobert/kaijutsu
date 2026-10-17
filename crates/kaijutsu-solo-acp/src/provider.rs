@@ -10,9 +10,8 @@ use anyhow::{Result, bail};
 
 /// A provider this binary can point a solo kernel at.
 ///
-/// The names are the ones a person says. Each maps onto a factory backend
-/// row the kernel already ships (`kaijutsu_kernel::seed_backends`), so a
-/// solo kernel reads its key exactly the way every other kernel does.
+/// The names are the ones a person says. Each maps onto the backend row a
+/// solo kernel writes for it ([`ProviderRow`]): a kernel ships no backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "lower")]
 pub enum BackendKind {
@@ -24,8 +23,8 @@ pub enum BackendKind {
     Mock,
 }
 
-/// What the factory floor knows about one provider.
-struct Factory {
+/// The backend row a solo kernel writes for one provider.
+struct ProviderRow {
     /// The backend row's name, which is also what `kj model` prints.
     backend: &'static str,
     /// The row's kind, which selects the wire the kernel speaks.
@@ -33,39 +32,39 @@ struct Factory {
     /// Where the kernel looks for the key.
     api_key_env: Option<&'static str>,
     api_key_file: Option<&'static str>,
-    /// The model a solo kernel uses when nobody names one. `None` means the
-    /// floor ships no model id we can stand behind, so `--model` is required.
+    /// The model a solo kernel uses when nobody names one. `None` means
+    /// there is no model id we can stand behind, so `--model` is required.
     default_model: Option<&'static str>,
 }
 
 impl BackendKind {
-    fn factory(self) -> Factory {
+    fn row(self) -> ProviderRow {
         match self {
-            Self::Anthropic => Factory {
+            Self::Anthropic => ProviderRow {
                 backend: "anthropic",
                 kind: "anthropic",
                 api_key_env: Some("ANTHROPIC_API_KEY"),
                 api_key_file: Some("~/.anthropic-key.txt"),
                 default_model: Some("claude-sonnet-5-5"),
             },
-            Self::Deepseek => Factory {
+            Self::Deepseek => ProviderRow {
                 backend: "deepseek",
                 kind: "deepseek",
                 api_key_env: Some("DEEPSEEK_API_KEY"),
                 api_key_file: Some("~/.deepseek-key"),
                 default_model: Some("deepseek-flash"),
             },
-            Self::Openai => Factory {
+            Self::Openai => ProviderRow {
                 backend: "gpt",
                 kind: "openai",
                 api_key_env: Some("OPENAI_API_KEY"),
                 api_key_file: Some("~/.openai-key.txt"),
-                // The factory floor ships no model ids for this backend, so
+                // No model id for this backend has a measured window, so
                 // there is nothing here to default to.
                 default_model: None,
             },
             #[cfg(feature = "test-mock")]
-            Self::Mock => Factory {
+            Self::Mock => ProviderRow {
                 backend: "mock",
                 kind: "mock",
                 api_key_env: None,
@@ -84,6 +83,50 @@ const KEY_VARS: &[(&str, BackendKind)] = &[
     ("OPENAI_API_KEY", BackendKind::Openai),
 ];
 
+/// The model row a solo kernel writes for a model it knows: the context
+/// window and, for some models, the output budget and effort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownModel {
+    pub context_window: u64,
+    pub max_tokens: Option<i64>,
+    pub effort: Option<&'static str>,
+}
+
+const ANTHROPIC_200K: KnownModel = KnownModel { context_window: 200_000, max_tokens: None, effort: None };
+const ANTHROPIC_1M: KnownModel = KnownModel { context_window: 1_000_000, max_tokens: None, effort: None };
+
+/// DeepSeek V4 at effort `high` with a 64K output budget, the API's own
+/// default at that effort. Reasoning tokens count against it.
+const DEEPSEEK_V4: KnownModel = KnownModel { context_window: 1_000_000, max_tokens: Some(65536), effort: Some("high") };
+
+/// `(backend, model, row)`. Windows were read from Anthropic's
+/// `GET /v1/models/{id}` (`max_input_tokens`) and from api-docs.deepseek.com.
+/// A model missing here gets no model row, so its window stays unknown.
+const KNOWN_MODELS: &[(&str, &str, KnownModel)] = &[
+    ("anthropic", "claude-haiku-4-5", ANTHROPIC_200K),
+    ("anthropic", "claude-opus-4-5", ANTHROPIC_200K),
+    ("anthropic", "claude-opus-4-7", ANTHROPIC_1M),
+    ("anthropic", "claude-opus-4-8", ANTHROPIC_1M),
+    ("anthropic", "claude-opus-5", ANTHROPIC_1M),
+    ("anthropic", "claude-opus-5-5", ANTHROPIC_1M),
+    ("anthropic", "claude-sonnet-4-6", ANTHROPIC_1M),
+    ("anthropic", "claude-sonnet-5", ANTHROPIC_1M),
+    ("anthropic", "claude-sonnet-5-5", ANTHROPIC_1M),
+    ("anthropic", "claude-fable-5", ANTHROPIC_1M),
+    ("anthropic", "claude-fable-5-1", ANTHROPIC_1M),
+    ("deepseek", "deepseek-flash", DEEPSEEK_V4),
+    ("deepseek", "deepseek-v4-pro", DEEPSEEK_V4),
+];
+
+/// The model row a solo kernel writes for `model` on `backend`, when it
+/// knows the model.
+pub fn known_model(backend: &str, model: &str) -> Option<KnownModel> {
+    KNOWN_MODELS
+        .iter()
+        .find(|(b, m, _)| *b == backend && *m == model)
+        .map(|(_, _, row)| *row)
+}
+
 /// What the solo kernel is told to talk to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelChoice {
@@ -92,13 +135,13 @@ pub struct ModelChoice {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
-    /// The factory key file, kept when the caller named no key variable.
+    /// The provider's key file, kept when the caller named no key variable.
     pub api_key_file: Option<String>,
     pub key_optional: bool,
-    /// True when this choice needs its own backend row written. False leaves
-    /// the factory row alone, which is what keeps a provider's key file
-    /// working.
-    pub write_backend_row: bool,
+    /// True when the flags name an endpoint or key of their own, so a backend
+    /// row a reused state directory already holds is replaced. A state
+    /// directory with no row for this backend always gets one.
+    pub replace_backend_row: bool,
     /// The backend row's idle timeout. `None` keeps the kernel default.
     pub idle_timeout_secs: Option<u64>,
     /// The backend row's request timeout. `None` keeps the kernel default.
@@ -156,15 +199,15 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         Some(kind) => kind,
         None => autodetect(host)?,
     };
-    let factory = kind.factory();
+    let row = kind.row();
 
-    let model = match flags.model.clone().or(factory.default_model.map(Into::into)) {
+    let model = match flags.model.clone().or(row.default_model.map(Into::into)) {
         Some(model) => model,
         None => bail!(
             "--backend-kind {} needs --model <id>: this kernel ships no model id for the \
              {} backend",
             format!("{kind:?}").to_lowercase(),
-            factory.backend,
+            row.backend,
         ),
     };
 
@@ -183,9 +226,9 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         flags
             .api_key_env
             .clone()
-            .or(factory.api_key_env.map(Into::into))
+            .or(row.api_key_env.map(Into::into))
     };
-    let key_optional = flags.no_key || factory.api_key_env.is_none();
+    let key_optional = flags.no_key || row.api_key_env.is_none();
 
     // Say now that the key is missing. The alternative is a kernel that
     // starts, accepts a prompt, and fails the first turn.
@@ -193,41 +236,37 @@ pub fn resolve(flags: &ModelFlags, host: &dyn Host) -> Result<ModelChoice> {
         let named = api_key_env.as_deref().unwrap_or_default();
         let have_env = host.var(named).is_some();
         let have_file = flags.api_key_env.is_none()
-            && factory
+            && row
                 .api_key_file
                 .is_some_and(|path| host.key_file_exists(path));
         if !have_env && !have_file {
-            match factory.api_key_file {
+            match row.api_key_file {
                 Some(file) if flags.api_key_env.is_none() => bail!(
                     "the {} backend has no key: set {named} or write the key to {file}",
-                    factory.backend,
+                    row.backend,
                 ),
-                _ => bail!("{named} is unset, so the {} backend has no key", factory.backend),
+                _ => bail!("{named} is unset, so the {} backend has no key", row.backend),
             }
         }
     }
 
-    // A caller-supplied endpoint or key variable is not what the factory row
-    // says, so the row has to be written. Otherwise leave it alone: the
-    // factory row also names the provider's key FILE, and rewriting it here
-    // would drop that fallback.
-    let write_backend_row = flags.base_url.is_some()
-        || flags.api_key_env.is_some()
-        || flags.no_key
-        || !kaijutsu_kernel::seed_backends::is_factory_backend_name(factory.backend);
+    // A caller-supplied endpoint or key variable may not be what a row the
+    // state directory already holds says, so that row is replaced. Otherwise
+    // an existing row stands, with any edit made to it through `kj`.
+    let replace_backend_row = flags.base_url.is_some() || flags.api_key_env.is_some() || flags.no_key;
 
     Ok(ModelChoice {
-        backend: factory.backend.to_string(),
-        kind: factory.kind.to_string(),
+        backend: row.backend.to_string(),
+        kind: row.kind.to_string(),
         model,
         base_url: flags.base_url.clone(),
         api_key_env,
         api_key_file: (!flags.no_key && flags.api_key_env.is_none())
-            .then_some(factory.api_key_file)
+            .then_some(row.api_key_file)
             .flatten()
             .map(Into::into),
         key_optional,
-        write_backend_row,
+        replace_backend_row,
         idle_timeout_secs: flags.idle_timeout_secs,
         request_timeout_secs: flags.request_timeout_secs,
     })
@@ -263,9 +302,22 @@ fn autodetect(host: &dyn Host) -> Result<BackendKind> {
 
 #[cfg(test)]
 mod tests {
+    /// Every default model has a known model row, so a solo kernel's
+    /// default turn has a window and DeepSeek's has its 64K budget.
+    #[test]
+    fn each_default_model_has_a_known_row() {
+        for kind in [BackendKind::Anthropic, BackendKind::Deepseek] {
+            let row = kind.row();
+            let model = row.default_model.expect("a default model");
+            assert!(known_model(row.backend, model).is_some(), "{model}");
+        }
+        assert_eq!(known_model("deepseek", "deepseek-flash").unwrap().max_tokens, Some(65536));
+        assert_eq!(known_model("gpt", "deepseek-flash"), None, "a row is per backend");
+    }
+
     #[test]
     fn anthropic_defaults_to_the_current_sonnet() {
-        assert_eq!(BackendKind::Anthropic.factory().default_model, Some("claude-sonnet-5-5"));
+        assert_eq!(BackendKind::Anthropic.row().default_model, Some("claude-sonnet-5-5"));
     }
 
     use super::*;
@@ -305,7 +357,7 @@ mod tests {
         let choice = resolve(&ModelFlags::default(), &host).expect("one key resolves");
         assert_eq!(choice.backend, "deepseek");
         assert_eq!(choice.model, "deepseek-flash");
-        assert!(!choice.write_backend_row, "the factory row already says this");
+        assert!(!choice.replace_backend_row, "no flag says anything of its own");
     }
 
     #[test]
@@ -353,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_needs_a_model_because_the_floor_ships_none() {
+    fn openai_needs_a_model_because_there_is_no_default() {
         let host = FakeHost::default().with_var("OPENAI_API_KEY", "sk-x");
         let error = resolve(&ModelFlags::default(), &host).expect_err("no model id to default to");
         assert!(error.to_string().contains("--model"), "{error}");
@@ -379,13 +431,13 @@ mod tests {
             ..ModelFlags::default()
         };
         let choice = resolve(&flags, &host).expect("a local endpoint resolves");
-        assert!(choice.write_backend_row);
+        assert!(choice.replace_backend_row);
         assert_eq!(choice.api_key_env.as_deref(), Some("MY_KEY"));
         assert_eq!(choice.base_url.as_deref(), Some("http://localhost:8080/v1"));
     }
 
     #[test]
-    fn an_endpoint_of_our_own_keeps_the_factory_key_file() {
+    fn an_endpoint_of_our_own_keeps_the_providers_key_file() {
         let host = FakeHost::default().with_key_file("~/.openai-key.txt");
         let flags = ModelFlags {
             backend_kind: Some(BackendKind::Openai),
@@ -394,7 +446,7 @@ mod tests {
             ..ModelFlags::default()
         };
         let choice = resolve(&flags, &host).expect("the key file counts");
-        assert!(choice.write_backend_row);
+        assert!(choice.replace_backend_row);
         assert_eq!(choice.api_key_file.as_deref(), Some("~/.openai-key.txt"),
             "the row written must keep the key file resolution accepted");
     }
@@ -411,7 +463,7 @@ mod tests {
         let choice = resolve(&flags, &FakeHost::default()).expect("a keyless endpoint resolves");
         assert!(choice.key_optional);
         assert_eq!(choice.api_key_env, None, "no key variable to read");
-        assert!(choice.write_backend_row);
+        assert!(choice.replace_backend_row);
     }
 
     #[test]
@@ -448,7 +500,7 @@ mod tests {
             api_key_env: Some("SOMEWHERE_ELSE".to_string()),
             ..ModelFlags::default()
         };
-        // The factory key file must not rescue a variable the caller named.
+        // The provider's key file must not rescue a variable the caller named.
         let host = FakeHost::default().with_key_file("~/.deepseek-key");
         let error = resolve(&flags, &host).expect_err("the named variable is unset");
         assert!(error.to_string().contains("SOMEWHERE_ELSE"), "{error}");

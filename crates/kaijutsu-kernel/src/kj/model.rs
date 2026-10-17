@@ -701,9 +701,8 @@ mod tests {
     async fn model_reports_the_cast_slot_the_turn_path_would_run() {
         let d = test_dispatcher().await;
         {
-            let mut db = d.kernel_db().lock();
-            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
-                .unwrap();
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
         // `context create` forks the structural edge from the caller's
@@ -782,8 +781,8 @@ mod tests {
     async fn model_resolves_through_the_performers_default_cast() {
         let d = test_dispatcher().await;
         {
-            let mut db = d.kernel_db().lock();
-            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
         let principal = PrincipalId::new();
@@ -843,9 +842,8 @@ mod tests {
     async fn model_reports_the_model_row_tunables_without_a_cast() {
         let d = test_dispatcher().await;
         {
-            let mut db = d.kernel_db().lock();
-            crate::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
-                .unwrap();
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
         let principal = PrincipalId::new();

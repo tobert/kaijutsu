@@ -57,10 +57,9 @@ cd /home/atobey/src/wt/kaijutsu-bench
 ./contrib/bench/stop-kernel.sh /home/atobey/src/bench-work/kernels/ds-01
 ```
 
-The kernel reads the DeepSeek key the way it always does — the factory backend
-row names `~/.deepseek-key` and `DEEPSEEK_API_KEY`
-(`crates/kaijutsu-kernel/src/seed_backends.rs`). No key ever reaches these
-scripts.
+`boot-kernel.sh --model deepseek` writes a `deepseek` backend row naming
+`DEEPSEEK_API_KEY` and `~/.deepseek-key`, and the kernel reads the key from
+there. No key ever reaches these scripts.
 
 ## A mock run
 

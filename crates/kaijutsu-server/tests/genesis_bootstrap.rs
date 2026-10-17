@@ -68,30 +68,47 @@ async fn start_creates_the_root_context_once() {
     assert_eq!(contexts.len(), 1, "a restart creates no second root context");
 }
 
+/// A kernel ships no backends: a new kernel starts with no backend, model,
+/// or defaults row, and a restart adds none. An operator's rows survive a
+/// restart as they are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restart_restores_no_factory_backend_the_operator_removed() {
+async fn a_new_kernel_starts_with_no_llm_backend_and_no_default() {
     let tmp = tempfile::tempdir().unwrap();
     support::init_root(tmp.path(), "amy");
 
-    let shared = start(tmp.path()).await.expect("a kernel with a root character starts");
-    let deepseek = {
+    let shared = start(tmp.path()).await.expect("a kernel with no backend starts");
+    {
         let db = shared.kernel_db.lock();
-        assert!(db.get_backend_by_name("anthropic").unwrap().is_some(), "a fresh kernel offers the factory backends");
-        db.delete_backend("anthropic").unwrap();
-        let deepseek = db.get_backend_by_name("deepseek").unwrap().unwrap();
-        assert!(db.delete_backend_model(deepseek.backend_id, "deepseek-v4-pro").unwrap());
-        deepseek
-    };
+        assert!(db.list_backends().unwrap().is_empty(), "a new kernel has no backends");
+        assert_eq!(db.get_llm_defaults().unwrap(), None, "a new kernel has no default model");
+    }
+    assert!(shared.kernel.llm().read().await.list().is_empty());
+    {
+        let db = shared.kernel_db.lock();
+        db.upsert_backend(&kaijutsu_kernel::kernel_db::BackendRow {
+            backend_id: kaijutsu_types::BackendId::new(),
+            name: "zorak".into(),
+            kind: "openai".into(),
+            base_url: Some("http://zorak:8080/v1".into()),
+            api_key_env: None,
+            api_key_file: None,
+            key_optional: true,
+            request_timeout_secs: None,
+            idle_timeout_secs: None,
+            max_concurrent: None,
+            created_at: 0,
+            created_by: PrincipalId::system(),
+        })
+        .unwrap();
+    }
+    shared.kernel.shutdown_runtime_worker().await.unwrap();
     drop(shared);
 
     let restarted = start(tmp.path()).await.expect("restart");
     let db = restarted.kernel_db.lock();
-    assert!(db.get_backend_by_name("anthropic").unwrap().is_none(), "a restart must not restore a removed backend");
-    let models = db.list_backend_models(deepseek.backend_id).unwrap();
-    assert!(
-        models.iter().all(|m| m.model_id != "deepseek-v4-pro"),
-        "a restart must not restore a removed model row"
-    );
+    let names: Vec<String> = db.list_backends().unwrap().into_iter().map(|b| b.name).collect();
+    assert_eq!(names, vec!["zorak"], "a restart adds no backend and keeps the operator's");
+    assert_eq!(db.get_llm_defaults().unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -158,7 +158,11 @@ pub fn resolve_model_choice(
             match registry.default_provider_name() {
                 Some(p) => provider = Some(p.to_string()),
                 None => {
-                    return Err(format!("no provider configured for model '{m}'"));
+                    return Err(format!(
+                        "no provider configured for model '{m}': name its backend as \
+                         '<backend>/{m}', or set a default with `kj backend default set \
+                         --backend <name> --model <model>`"
+                    ));
                 }
             }
         }

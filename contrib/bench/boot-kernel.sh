@@ -247,6 +247,7 @@ if [[ "$MODEL_MODE" == "mock" ]]; then
 else
   echo "== pointing the kernel at deepseek-v4-flash"
   "${KJMCP[@]}" \
+    "kj backend set deepseek --kind deepseek --api-key-env DEEPSEEK_API_KEY --api-key-file ~/.deepseek-key" \
     "kj backend default set --backend deepseek --model deepseek-v4-flash"
 fi
 

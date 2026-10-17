@@ -509,12 +509,8 @@ mod tests {
     async fn seeded() -> KjDispatcher {
         let d = test_dispatcher().await;
         {
-            let mut db = d.kernel_db().lock();
-            crate::seed_backends::ensure_factory_backends(
-                &mut db,
-                kaijutsu_types::PrincipalId::system(),
-            )
-            .unwrap();
+            let db = d.kernel_db().lock();
+            crate::test_backends::example_backends(&db);
         }
         d.reload_llm_registry().await.unwrap();
         d

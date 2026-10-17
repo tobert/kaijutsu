@@ -453,7 +453,7 @@ mod cli_tests {
     #[test]
     fn max_tokens_is_absent_by_default() {
         let cli = parse(&[]).expect("no flags parses");
-        assert_eq!(cli.max_tokens, None, "the factory ceiling must stand unless asked");
+        assert_eq!(cli.max_tokens, None, "the default budget must stand unless asked");
     }
 
     #[test]

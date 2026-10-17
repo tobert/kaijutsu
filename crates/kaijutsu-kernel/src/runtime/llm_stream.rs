@@ -634,7 +634,15 @@ pub(super) async fn spawn_admitted_turn(
                     resolved.backend, resolved.backend
                 )),
             },
-            None => Err("No LLM backend configured (see `kj backend list`)".to_string()),
+            // The rule leads each message: an error block's summary keeps
+            // only the first 200 characters.
+            None if registry.list().is_empty() => Err(crate::kj::backend::NO_BACKEND_HINT.to_string()),
+            None => Err(
+                "No default LLM backend is set and this context names no model: set one \
+                 with `kj backend default set --backend <name> --model <model>`. \
+                 `kj backend list` shows the configured backends."
+                    .to_string(),
+            ),
         }
     };
     let (provider, model_name, max_output_tokens, tunables, stream_timeouts) = match provider_resolution {
@@ -7770,7 +7778,9 @@ mod lifetime_tests {
         assert!(blocks.iter().any(|b| b.id == block && b.content == "landed"));
         let errors: Vec<_> = blocks.iter().filter(|b| b.status == Status::Error).map(|b| &b.content).collect();
         assert_eq!(errors.len(), 1, "one record of the failed startup: {errors:?}");
-        assert!(errors[0].contains("No LLM backend configured"), "{errors:?}");
+        assert!(errors[0].contains("No LLM backend is configured"), "{errors:?}");
+        assert!(errors[0].contains("`kj backend set`") && errors[0].contains("`kj backend default set`"),
+            "the error's summary says how to configure a backend: {errors:?}");
         let failed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let TurnFlow::Failed { .. } = flows.recv().await.unwrap().payload {
@@ -7942,6 +7952,18 @@ mod lifetime_tests {
         drop(existing);
         assert!(!kernel.turn_in_flight(context));
         kernel.shutdown_runtime_worker().await.unwrap();
+    }
+
+    /// A kernel with a backend but no default names the verb that sets one,
+    /// rather than the advice for a kernel with no backend at all.
+    #[tokio::test]
+    async fn a_turn_with_backends_but_no_default_says_to_set_the_default() {
+        let (kernel, context, after, call) = fixture(None).await;
+        kernel.llm().write().await.register("mock", Arc::new(Provider::Mock(MockClient::new("unused"))));
+        let error = start_fixture_turn(&kernel, kernel.admit_context(context).unwrap(), None, &after, call.clone(),
+            call.principal_id, TurnOrigin::Interactive, None).await.unwrap_err();
+        assert!(error.contains("No default LLM backend is set"), "{error}");
+        assert!(error.contains("kj backend default set --backend"), "{error}");
     }
 
     #[tokio::test]

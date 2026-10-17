@@ -6216,6 +6216,7 @@ mod tests {
             "msg: {}",
             result.message()
         );
+        assert!(result.message().contains("kj backend default set"), "msg: {}", result.message());
     }
 
     #[tokio::test]

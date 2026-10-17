@@ -1000,15 +1000,16 @@ fn config_seed_override(config_dir: Option<&Path>, canonical: &str) -> Option<St
 /// Model configuration is SQL-native (`backends` / `backend_models` /
 /// `llm_defaults` / `casts` / `cast_slots` / `model_aliases` /
 /// `embedding_config`). There is no `models.toml`, no kernel config document, and no
-/// host file in this path — the embedded floor lives in
-/// `kaijutsu_kernel::seed_backends` and is applied at kernel construction.
+/// host file in this path. A kernel ships no backends: until an operator runs
+/// `kj backend set` and `kj backend default set`, the registry is empty and a
+/// model turn fails with how to configure one.
 ///
 /// Returns the embedding config if one is set and enabled.
 ///
 /// A build failure here is loud and leaves the registry empty rather than
 /// falling back to some other backend: quietly running a different model than
 /// the operator configured is the exact silent-wrong-answer this project
-/// refuses. Repair with `kj backend reseed`.
+/// refuses.
 async fn initialize_kernel_models(
     kernel: &Arc<Kernel>,
     kernel_db: &Arc<parking_lot::Mutex<KernelDb>>,
@@ -1019,8 +1020,9 @@ async fn initialize_kernel_models(
             Ok(r) => r,
             Err(e) => {
                 log::error!(
-                    "Failed to build the LLM registry from the kernel DB: {e} \
-                     — repair with `kj backend reseed`"
+                    "Failed to build the LLM registry from the kernel DB: {e}. Model turns \
+                     fail until it builds; fix the rows with `kj backend set` and \
+                     `kj backend default set`"
                 );
                 return None;
             }
@@ -1034,6 +1036,12 @@ async fn initialize_kernel_models(
         };
         (registry, embedding)
     };
+    if registry.default_provider_name().is_none() {
+        log::warn!(
+            "No default LLM backend is set, so model turns fail until an operator runs \
+             `kj backend set` and `kj backend default set`"
+        );
+    }
     *kernel.llm().write().await = registry;
     log::info!("Initialized kernel LLM registry from the kernel DB");
     embedding
@@ -1643,14 +1651,6 @@ pub async fn create_shared_kernel_in(
         // floor pattern (insert only if absent). Fail loud on error rather than
         // ship a kernel where `kj fork --preset` has nothing to recall.
         kaijutsu_kernel::seed_presets::ensure_factory_presets(&mut db, PrincipalId::system())
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        // Offer a fresh kernel the LLM configuration floor — backends, their
-        // known context windows, and the defaults — once. A kernel that
-        // already has defaults gets nothing, so removed or edited backends
-        // stay that way. Fail loud: a kernel with no backends hangs its first
-        // turn on "no provider configured", which is a far worse diagnostic
-        // than this error.
-        kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         // A kernel belongs to a live root character, created by
         // `kaijutsu-server init` before the first start (`docs/character.md`,

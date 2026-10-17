@@ -948,10 +948,10 @@ fn max_tokens_overrides_the_written_defaults_row() {
     );
 }
 
-/// Without the flag, the factory ceiling from `seed_backends` stands — the
-/// same default `docs/solo-acp.md` documents.
+/// Without the flag, the defaults row carries the 16384 `docs/solo-acp.md`
+/// documents.
 #[test]
-fn without_max_tokens_the_factory_ceiling_stands_in_the_written_defaults_row() {
+fn without_max_tokens_the_written_defaults_row_carries_16384() {
     let state = scratch_dir("max-tokens-default-state").join("state");
     let mut agent = spawn_mock_with(
         "chat",
@@ -968,7 +968,7 @@ fn without_max_tokens_the_factory_ceiling_stands_in_the_written_defaults_row() {
         .get_llm_defaults()
         .expect("read the model defaults")
         .expect("the binary wrote a defaults row");
-    assert_eq!(defaults.max_tokens, Some(16384), "the factory ceiling stands unless asked");
+    assert_eq!(defaults.max_tokens, Some(16384), "16384 stands unless asked");
 }
 
 #[test]

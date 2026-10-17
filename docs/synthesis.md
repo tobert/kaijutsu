@@ -27,7 +27,7 @@ sqlite3 ~/.local/share/kaijutsu/kernel/kernel.db \
 | max_in_flight | 2 | Maximum concurrent service requests per client |
 | max_context_bytes | 2048 | UTF-8 byte budget of the search projection |
 
-`kj backend reseed` does not touch this row. No `kj` verb writes it yet; see
+No `kj` verb writes this row yet; see
 `docs/issues.md`, "Embedding service configuration has no `kj` verb".
 
 The client is `kaijutsu_index::HttpEmbedder`. Startup discovers exactly one

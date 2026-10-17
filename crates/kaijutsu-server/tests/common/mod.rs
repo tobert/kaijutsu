@@ -108,9 +108,8 @@ pub async fn start_server_with_host_exec() -> SocketAddr {
 ///
 /// Model configuration is SQL-native now (`models.toml` is demolished), so the
 /// injection point is the DB itself rather than a host file the kernel reads
-/// once at seed time. The server opens the same `kernel.db` a moment later;
-/// the `llm_defaults` row written here means the kernel is not fresh, so
-/// `ensure_factory_backends` adds no factory backends and `mock` is the only one.
+/// once at seed time. The server opens the same `kernel.db` a moment later,
+/// and `mock` is its only backend: a kernel ships none.
 #[allow(dead_code)] // Shared helper: not every test binary that compiles `common` uses it.
 pub fn seed_mock_backend(data_dir: &std::path::Path) {
     seed_mock_backend_with_model(data_dir, "mock-model");

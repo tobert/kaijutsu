@@ -62,9 +62,8 @@ fn live_eval_wc_clone_skeleton() {
     fs::create_dir_all(&workdir).expect("create workdir");
     eprintln!("[live_eval] run dir: {}", run_root.display());
 
-    // Point the kernel's SQL model config at Anthropic/Haiku. The factory
-    // floor already ships an `anthropic` backend reading ANTHROPIC_API_KEY;
-    // this only moves the DEFAULT onto it (the shipped default is deepseek).
+    // Give the kernel an `anthropic` backend and make Haiku its default
+    // model. A kernel ships no backends.
     write_haiku_defaults(&state_dir);
 
     // Concatenate the kaish harness sources into one program. No `source`
@@ -345,26 +344,41 @@ fn setup_run_dirs(suffix: &str) -> (PathBuf, PathBuf) {
     (run_root, state_dir)
 }
 
-/// Point the kernel's `llm_defaults` at Anthropic with Haiku as the default
-/// model. Model config is SQL-native, so this writes the DB directly rather
-/// than a `models.toml` the kernel would have read once at seed time.
-///
-/// `ensure_factory_backends` offers the factory backends only to a kernel with
-/// no defaults row, so this seeds them here, before the defaults; the
-/// `anthropic` backend it creates (reading `ANTHROPIC_API_KEY`) is the one
-/// these defaults name.
+/// Write an `anthropic` backend reading `ANTHROPIC_API_KEY` and make Haiku
+/// the default model. Model config is SQL-native, so this writes the DB
+/// before the kernel opens it.
 fn write_haiku_defaults(state_dir: &std::path::Path) {
-    use kaijutsu_kernel::kernel_db::KernelDb;
-    use kaijutsu_types::PrincipalId;
+    use kaijutsu_kernel::kernel_db::{BackendRow, KernelDb, LlmDefaultsRow};
+    use kaijutsu_types::{BackendId, PrincipalId};
 
     fs::create_dir_all(state_dir).expect("create state dir");
-    let mut db = KernelDb::open(state_dir.join("kernel.db")).expect("open kernel db");
-    kaijutsu_kernel::seed_backends::ensure_factory_backends(&mut db, PrincipalId::system())
-        .expect("seed factory backends");
-    let mut defaults = db.get_llm_defaults().unwrap().expect("floor seeds defaults");
-    defaults.default_backend = ANTHROPIC_PROVIDER.to_string();
-    defaults.default_model = HAIKU_MODEL.to_string();
-    db.set_llm_defaults(&defaults).expect("point defaults at anthropic/haiku");
+    let db = KernelDb::open(state_dir.join("kernel.db")).expect("open kernel db");
+    db.upsert_backend(&BackendRow {
+        backend_id: BackendId::new(),
+        name: ANTHROPIC_PROVIDER.to_string(),
+        kind: "anthropic".to_string(),
+        base_url: None,
+        api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+        api_key_file: None,
+        key_optional: false,
+        request_timeout_secs: None,
+        idle_timeout_secs: None,
+        max_concurrent: None,
+        created_at: 0,
+        created_by: PrincipalId::system(),
+    })
+    .expect("write the anthropic backend");
+    db.set_llm_defaults(&LlmDefaultsRow {
+        default_backend: ANTHROPIC_PROVIDER.to_string(),
+        default_model: HAIKU_MODEL.to_string(),
+        max_tokens: Some(16384),
+        temperature: None,
+        top_p: None,
+        effort: None,
+        thinking_budget: None,
+        thinking_style: None,
+    })
+    .expect("point defaults at anthropic/haiku");
 }
 
 /// Local copy of the e2e_kj_workflow `shell_exec_wait_timeout` helper.

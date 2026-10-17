@@ -1433,9 +1433,10 @@ From the first Terminal-Bench 2.0 runs in containers (jobs under
   the design before changing it.
 - **The bench adapter duplicates DeepSeek's output budget.**
   `contrib/bench/harbor/kaijutsu_solo_agent.py` passes 65536 on DeepSeek
-  when `KAIJUTSU_ACP_MAX_TOKENS` is unset. DeepSeek's factory model rows now
-  carry `max_tokens` 65536 at effort `high` (`seed_backends::DEEPSEEK_TUNING`),
-  so the adapter's copy can go once a run confirms the kernel sends 65536.
+  when `KAIJUTSU_ACP_MAX_TOKENS` is unset. The DeepSeek model rows
+  `kaijutsu-solo-acp` writes carry `max_tokens` 65536 at effort `high`
+  (`provider::DEEPSEEK_V4`), so the adapter's copy can go once a run confirms
+  the kernel sends 65536.
 - **Harbor puts the provider key in process arguments.** `run-harbor.sh`
   passes `--ae DEEPSEEK_API_KEY=…`, and Harbor's `docker-compose exec -e
   DEEPSEEK_API_KEY=sk-…` shows the key to anyone running `ps` on the host

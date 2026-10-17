@@ -230,7 +230,7 @@ Settings ride environment variables, each of which has a matching
 
 ### Qwen on Alibaba, and tenchi
 
-Neither is a factory backend. Both are OpenAI-compatible, so a run names the
+Both are OpenAI-compatible, so a run names the
 `openai` provider, the endpoint, and the variable the key travels in. The
 Alibaba workspace endpoint is the one crush uses; read it from there rather
 than writing it into this repository:

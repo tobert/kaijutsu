@@ -159,9 +159,9 @@ pub fn build_llm_registry(db: &KernelDb, endpoints: &Endpoints) -> LlmResult<Llm
             thinking_style: d.thinking_style.clone(),
         });
     } else {
-        // A DB that has never been seeded (a bare unit-test KernelDb). Not an
-        // error here — the caller decides whether a registry with no default
-        // is usable; `ensure_factory_backends` is what gives a real kernel one.
+        // A kernel ships no defaults, so this is the state of every kernel
+        // until an operator runs `kj backend default set`. Not an error here:
+        // a model turn reports it with how to configure a backend.
         tracing::warn!("no llm_defaults row — registry has no default backend/model");
     }
 
@@ -267,17 +267,15 @@ pub fn load_embedding_config(db: &KernelDb) -> LlmResult<Option<EmbeddingModelCo
 mod tests {
     use super::*;
     use crate::kernel_db::{BackendModelRow, EmbeddingConfigRow, LlmDefaultsRow, ModelAliasRow, ModelTunablesRow};
-    use crate::seed_backends::{ensure_factory_backends, reseed_factory_backends};
     use kaijutsu_types::{BackendId, CastId, PrincipalId};
 
     fn seeded_db() -> KernelDb {
-        let mut db = KernelDb::temporary().unwrap();
-        ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
+        let db = KernelDb::temporary().unwrap();
+        crate::test_backends::example_backends(&db);
         db
     }
 
-    /// Add an alias by backend NAME — the floor seeds none (aliases are
-    /// operator data), so every alias test writes its own.
+    /// Add an alias by backend NAME; every alias test writes its own.
     fn alias(db: &KernelDb, alias: &str, backend: &str, model: &str) {
         let b = db.get_backend_by_name(backend).unwrap().unwrap();
         db.set_model_alias(&ModelAliasRow {
@@ -320,15 +318,28 @@ mod tests {
         assert_eq!(status.backends, vec![("mk-zorak".to_string(), None)]);
     }
 
+    /// A kernel ships no backends: a new DB has no backend, model, alias,
+    /// cast, or defaults row, and its registry has no default.
+    #[test]
+    fn a_new_kernel_db_has_no_llm_configuration() {
+        let db = KernelDb::temporary().unwrap();
+        assert!(db.list_backends().unwrap().is_empty());
+        assert_eq!(db.get_llm_defaults().unwrap(), None);
+        assert!(db.list_model_aliases().unwrap().is_empty());
+        assert!(db.list_casts().unwrap().is_empty());
+        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
+        assert!(registry.list().is_empty());
+        assert_eq!(registry.default_provider_name(), None);
+        assert_eq!(registry.default_model(), None);
+    }
+
     #[test]
     fn registry_registers_every_backend_by_name() {
-        // The floor's four backends must all appear under their own NAMES —
-        // including `gpt` and `ollama`, which the old TOML could only express
-        // by making the provider-type string be the name.
+        // Backends appear under their own NAMES, including `gpt` and
+        // `ollama`, which the old TOML could only express by making the
+        // provider-type string be the name.
         let db = seeded_db();
-        // SAFETY: single-threaded test; the openai-kind backends are
-        // key-optional or key-file based, so no env is required for them.
-        let registry = build_llm_registry(&db, &Endpoints::default()).expect("registry builds from the floor");
+        let registry = build_llm_registry(&db, &Endpoints::default()).expect("registry builds");
         let mut names = registry.list();
         names.sort();
         assert!(names.contains(&"ollama"), "names: {names:?}");
@@ -368,17 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_ships_no_aliases() {
-        // The old models.toml alias set was a pile of guesses; aliases are
-        // operator data now, like casts.
-        let db = seeded_db();
-        assert!(db.list_model_aliases().unwrap().is_empty());
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        assert!(registry.model_aliases().is_empty());
-        assert!(registry.resolve_alias("fast").is_none());
-    }
-
-    #[test]
     fn aliases_resolve_to_backend_and_model() {
         let db = seeded_db();
         alias(&db, "opus", "anthropic", "claude-opus-5");
@@ -399,26 +399,21 @@ mod tests {
         assert!(registry.resolve_alias("Opus").is_some());
     }
 
+    /// The defaults row and a model row reach the live registry: the
+    /// defaults' budget and the model row's effort and budget.
     #[test]
-    fn defaults_are_deepseek_flash_with_16k_output() {
+    fn defaults_and_model_rows_reach_the_registry() {
         let db = seeded_db();
         let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
         assert_eq!(registry.default_provider_name(), Some("deepseek"));
         assert_eq!(registry.default_model(), Some("deepseek-flash"));
         assert_eq!(registry.max_output_tokens(), 16384);
         let t = registry.default_tunables();
-        // The floor reaches every backend, so it carries no effort token; the
-        // default model's own row asks for high reasoning with a 64K budget
-        // (`seed_backends::DEEPSEEK_TUNING`). Asserted here as well as at the
-        // seed, because this is the path that carries it into a live
-        // registry — the seed being right buys nothing if the registry drops
-        // it.
         assert_eq!(t.effort, None);
         let model = registry.model_tunables("deepseek", "deepseek-flash");
         assert_eq!(model.effort.as_deref(), Some("high"));
         assert_eq!(model.max_tokens, Some(65536));
-        // Knobs we haven't decided on stay NULL — "provider default" is a
-        // real answer, not a gap to fill with an invented number.
+        // An unset knob stays NULL: "provider default" is a real answer.
         assert_eq!(t.temperature, None);
         assert_eq!(t.top_p, None);
         assert_eq!(t.thinking_budget, None);
@@ -427,12 +422,12 @@ mod tests {
 
     #[test]
     fn missing_default_backend_is_fatal_not_a_silent_fallback() {
-        let mut db = KernelDb::temporary().unwrap();
-        ensure_factory_backends(&mut db, PrincipalId::system()).unwrap();
+        let db = seeded_db();
         // Point the defaults at a backend name nothing registers under.
-        // `set_llm_defaults` refuses a dangling name outright, so get there
-        // the only other way: delete the backend the defaults already name.
-        db.delete_backend("deepseek").unwrap();
+        // `set_llm_defaults` refuses a dangling name and `delete_backend`
+        // refuses the default backend, so delete the row behind both, as an
+        // edit outside the kernel would.
+        db.conn_for_ledger().execute("DELETE FROM backends WHERE name = 'deepseek'", []).unwrap();
         let err = build_llm_registry(&db, &Endpoints::default()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("default backend 'deepseek'"), "{msg}");
@@ -590,17 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn no_factory_casts_are_seeded() {
-        // Casts are operator/agent-configured; the floor ships none.
-        let db = seeded_db();
-        assert!(db.list_casts().unwrap().is_empty());
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        assert!(registry.cast_labels().is_empty());
-    }
-
-    #[test]
-    fn the_floor_configures_no_embedding_service() {
-        let db = seeded_db();
+    fn a_new_kernel_db_configures_no_embedding_service() {
+        let db = KernelDb::temporary().unwrap();
         assert_eq!(db.get_embedding_config().unwrap(), None);
         assert!(load_embedding_config(&db).unwrap().is_none());
     }
@@ -669,42 +655,5 @@ mod tests {
             build_llm_registry(&db, &Endpoints::default()).unwrap().context_window_for("gpt", "gpt-5.6-terra"),
             Some(400_000)
         );
-    }
-
-    #[test]
-    fn reseed_restores_the_floor_after_a_clobber() {
-        let mut db = seeded_db();
-        alias(&db, "opus", "ollama", "wrong");
-        db.set_llm_defaults(&LlmDefaultsRow {
-            default_backend: "ollama".into(),
-            default_model: "gemma4:31b".into(),
-            max_tokens: Some(99),
-            temperature: None,
-            top_p: None,
-            effort: None,
-            thinking_budget: None,
-            thinking_style: None,
-        })
-        .unwrap();
-
-        reseed_factory_backends(&mut db, PrincipalId::system()).unwrap();
-        let registry = build_llm_registry(&db, &Endpoints::default()).unwrap();
-        assert_eq!(registry.default_provider_name(), Some("deepseek"));
-        assert_eq!(registry.max_output_tokens(), 16384);
-        // The operator's alias is NOT part of the floor, so reseed leaves it.
-        assert_eq!(registry.resolve_alias("opus"), Some(("ollama", "wrong")));
-    }
-
-    #[test]
-    fn reseed_leaves_the_embedding_service_alone() {
-        let mut db = seeded_db();
-        let own = EmbeddingConfigRow {
-            enabled: false,
-            endpoint: "http://localhost:9".into(),
-            timeout_ms: 7, max_in_flight: 1, max_context_bytes: 9,
-        };
-        db.set_embedding_config(&own).unwrap();
-        reseed_factory_backends(&mut db, PrincipalId::system()).unwrap();
-        assert_eq!(db.get_embedding_config().unwrap(), Some(own));
     }
 }
